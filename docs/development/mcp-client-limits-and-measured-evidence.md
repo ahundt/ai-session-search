@@ -3,7 +3,7 @@
 
 # MCP client limits and measured evidence
 
-Last measured 2026-08-03 against the executable built from this tree.
+Last measured 2026-08-04 against the executable built from this tree.
 
 What this build emits, measured against every client limit it can breach, and which of
 those clients were actually available to check. A limit that could not be observed is
@@ -16,7 +16,7 @@ Reproduce the measurements with `aise mcp schema-budget --ledger` and
 
 | Client | Version | Schema limits checkable | Result limits checkable |
 |---|---|---|---|
-| Codex | codex-cli 0.146.0 | yes, normalization reimplemented from its source | yes, from a response fixture |
+| Codex | codex-cli 0.146.0 | yes, sanitize and normalization reimplemented from its source, cross-checked by compiling that source | yes, from a response fixture |
 | Claude Code | 2.1.221 (Claude Code) | yes, description caps | yes, from a response fixture |
 | OpenCode | not installed | no | no |
 | VS Code | not installed | no | no |
@@ -35,22 +35,27 @@ the nesting a response has, because a `properties` map is itself a level.
 
 | Tool | inputSchema wire | outputSchema | use-path depth | document depth |
 |---|---:|---:|---:|---:|
-| `search_messages` | 5,489 B | 16,537 B | 6 | 10 |
+| `search_messages` | 5,077 B | 16,537 B | 6 | 10 |
 | `get_session` | 3,775 B | 10,905 B | 5 | 10 |
-| `run_skill_capability` | 5,274 B | 8,227 B | 5 | 9 |
+| `run_skill_capability` | 4,418 B | 8,227 B | 5 | 9 |
 | `get_index_status` | 255 B | 5,729 B | 5 | 9 |
-| `search_sessions` | 3,459 B | 5,361 B | 4 | 8 |
-| `list_sessions` | 3,101 B | 4,212 B | 4 | 8 |
+| `search_sessions` | 3,185 B | 5,361 B | 4 | 8 |
+| `list_sessions` | 2,827 B | 4,212 B | 4 | 8 |
 | `query_session_index` | 1,858 B | 2,996 B | 4 | 8 |
 | `get_resume_command` | 365 B | 2,811 B | 4 | 8 |
 
-Catalogue `tools[]` 87,993 B. Total `outputSchema` 56,778 B, from 60,802 B before the
+Catalogue `tools[]` 87,075 B. Total `outputSchema` 56,778 B, from 60,802 B before the
 shapes on the deepest chains were named. Every tool's descriptions reach the model.
 
 At the baseline this work started from, `search_messages` measured 9,954 bytes as Codex
 counts it and `run_skill_capability` 5,945, both over the 5,000-byte budget, so Codex
-deleted every parameter description on both before any model saw them. Every tool is now
-under, and every description survives.
+deleted every parameter description on both before any model saw them. The first
+shrinking pass brought the gate green while the checker still measured without Codex's
+sanitize pass, so both tools actually shipped at 5,043 and 5,047 bytes — still over,
+still stripped of all 37 and 19 parameter descriptions, with the gate reporting a
+five-byte margin. Every tool is now under as Codex itself measures, every description
+survives, and the sweep asserts survival directly rather than inferring it from a byte
+count.
 
 Document depth was 21, 18 and 12 on the three deepest tools against a guard of 10. Naming
 the repeated shapes on those chains brought every tool inside it. The use-path figures are
@@ -64,11 +69,6 @@ bound schema depth and deliberately prescribes no number.
 ## Limits, and what was actually observed
 
 ```
-WARN    codex-input-schema-margin — Codex 0.146.0, Codex-normalized inputSchema
-        search_messages: 4995 bytes against the 4750 limit (as Codex counts it)
-        run_skill_capability: 4983 bytes against the 4750 limit (as Codex counts it)
-        Raise when: The achievable size drops far enough that a tighter line stays actionable.
-        Lower when: Codex raises its budget and the extra headroom is genuinely available.
 WARN    mcp-output-schema-point-of-use-depth — this repository, outputSchema depth along a use
         path, with $ref as a leaf and $defs excluded
         search_messages: 6 levels against the 6 limit (deepest use path, $ref as a leaf, at
@@ -76,43 +76,63 @@ WARN    mcp-output-schema-point-of-use-depth — this repository, outputSchema d
         Raise when: A response genuinely gains a level of structure. Name the path and the reason
           in the requirements document first; do not raise it to make a test green.
         Lower when: The response shape is flattened and the lower figure holds across a release.
-123 measurements: 120 pass, 3 warn, 0 rules pending, 0 fail
+123 measurements: 122 pass, 1 warn, 0 rules pending, 0 fail
 ```
 
-No rule is pending. The three warnings are margin tripwires that are expected to fire: the
-two input-schema figures sit about 1% under the budget that binds them, and no measured
-route reaches the 4,750-byte warning line, so a warning here means "remeasure before
-adding a field" rather than "something regressed".
+No rule is pending. The one warning is a margin tripwire that is expected to fire: the
+deepest use path sits exactly on the guard, so a warning here means "remeasure before
+adding a level" rather than "something regressed". The two `codex-input-schema-margin`
+warnings that used to sit beside it are gone: both tools now measure under the
+4,750-byte warning line as Codex counts them.
 
-### The input-schema margin is five bytes, and the schema is configuration-dependent
+### Codex sanitizes before it measures, and the checker now does too
 
-`search_messages` measures 4,995 bytes against the 5,000 at which Codex deletes every
-description. That margin is not fixed, because the schema is not fixed: seven of its
-descriptions interpolate a resolved number -- the page, both context counts, the line window,
-and the two view budgets -- so each extra decimal digit an operator configures is an extra
-byte on the wire.
+Codex applies its 5,000-byte budget to the schema after its own sanitize pass
+(`parse_tool_input_schema` → `prepare_tool_input_schema` → `compact_large_tool_schema`),
+and sanitizing can make a schema larger: a bare `enum` with no `type` gets
+`"type": "string"` inferred and written back, 16 bytes each, at three sites in this
+catalogue. The checker previously modeled the deserialization round trip but not the
+sanitize pass, so it reported `search_messages` at 4,995 bytes while Codex measured
+5,043, and `run_skill_capability` at 4,983 against a real 5,047 — both over, so Codex
+silently deleted every parameter description on both before any model saw them, while
+the gate reported a five-byte margin as green.
 
-Measured on the shipped binary, one key at a time:
+Measured by compiling Codex's own `json_schema.rs` — whose content is byte-identical at
+every release tag from `rust-v0.145.0-alpha.18` through `rust-v0.146.0-alpha.13`, the
+newest tagged release — after moving duplicated clauses into `tool.description`, which
+Codex measures separately and never charges against the 5,000:
 
-| Configuration | `search_messages`, as Codex counts it |
-|---|---:|
-| default | 4,995 |
-| `[mcp] search_messages_limit = 1000` | 4,997 |
-| `[mcp] preview_chars = 10000` | 4,997 |
-| `[mcp] lines_per_message = 100` | 4,997 |
-| all three together | **5,001 — breach** |
+| Tool | before | after | margin | descriptions surviving |
+|---|---:|---:|---:|---|
+| `search_messages` | 5,043 **over** | 4,631 | 369 | 37/37 |
+| `run_skill_capability` | 5,047 **over** | 4,191 | 809 | 19/19 |
 
-Three ordinary settings, two bytes each, one byte past the limit. So the answer to whether the
-margin is hit by accident is yes, and the release gate cannot see it: the gate measures the
-catalogue built from the default configuration, and an operator serves the catalogue built from
-theirs.
+The byte rows are a proxy for the property that matters — the caller is shown what we
+wrote. `every_advertised_description_reaches_the_model` asserts that property directly,
+and `every_clause_moved_off_a_parameter_is_published_somewhere_the_caller_reads` pins
+each moved clause to the channel that now carries it, so a fact deleted from both
+channels at once cannot pass both tests.
 
-The breach is silent by construction, so nothing downstream can report it and the server is the
-last component that still knows. It now measures its own emitted catalogue when it builds it,
-once per connection, and writes any enforced breach to stderr where a client shows server
-output. Verified against a live `aise mcp serve`: the default configuration emits nothing, and
-the configuration above emits one line naming the tool, 5,001 against 5,000, and what Codex
-does next. It warns rather than refuses, because the schema is degraded rather than invalid.
+### The schema is configuration-dependent, and purpose bundles are the unbounded knob
+
+The margin is not fixed, because the schema is not fixed. The integer knobs
+(`search_messages_limit`, `preview_chars`, `lines_per_message`) are interpolated into
+descriptions and cost one byte per extra decimal digit — enough to spend the old
+five-byte margin, not enough to reach 369. A configured purpose bundle is a user-chosen
+name landing both in an `enum` Codex keeps and in the prose beside it: the first costs
+about a hundred bytes and each further one about forty-five, and nothing bounds the
+count or the name length. Measured: ten ordinary named bundles put `search_messages`
+past 5,000. The release gate cannot see an operator's configuration — it measures the
+catalogue built from the default — so the breach would be silent by construction.
+
+The server is the last component that still knows. It measures its own emitted catalogue
+when it builds it, once per connection, and writes any enforced breach to stderr where a
+client shows server output. It warns rather than refuses, because the schema is degraded
+rather than invalid. The warning path was verified against a live `aise mcp serve` when
+the margin was five bytes and the three integer knobs breached it; the sweep now pins the
+stronger set property (`no_configuration_breaches_the_budget_without_telling_the_operator`):
+for the shipped default and for a configuration with every schema knob widened, the set
+of tools over the budget and the set the operator is warned about are the same set.
 
 ### A configured ceiling can sit above a silent client cap
 
