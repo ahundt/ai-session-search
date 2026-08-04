@@ -119,6 +119,11 @@ pub struct HarnessLimit {
     pub warn_at: Option<usize>,
     /// True when crossing the budget is a review signal rather than a breach.
     pub warn_only: bool,
+    /// True when the budget is a client constant an operator may track between releases via
+    /// `[mcp.client_limits]`. False for structural and style rows, where the number is not a
+    /// moving cap and an override would silence the checker without changing what the client
+    /// rejects; configuration refuses those by name and [`resolved_budget`] ignores them.
+    pub overridable: bool,
     /// Why this number, and what the caller actually loses past it.
     pub rationale: &'static str,
     /// Where it was read, in what version, on what date.
@@ -141,6 +146,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: true,
         rationale: "MAX_COMPACT_TOOL_SCHEMA_BYTES. Past it Codex runs strip_schema_descriptions at \
                     every depth and hands the model a schema whose parameters have names and types \
                     and nothing else. No marker is emitted, nothing is logged, and no file keeps \
@@ -168,6 +174,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: true,
+        overridable: true,
         rationale: "A tripwire, not a limit. Crossing it breaks nothing; it reports that the margin \
                     against a cliff with no warning is thin. It is expected to fire: no measured \
                     route to a complete 37-field contract reaches it, and the achievable figure is \
@@ -181,20 +188,23 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         client: "Claude Code 2.1.220",
         artifact: "tool.description",
         budget: 2_048,
-        unit: "characters",
+        unit: "UTF-16 units",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::ToolDescription,
         enforced: true,
         enforced_by: "",
         warn_at: Some(1_986),
         warn_only: false,
+        overridable: true,
         rationale: "MAX_MCP_DESCRIPTION_LENGTH. Past it Claude Code appends a truncation marker to \
                     what it keeps, so text beyond this point is paid for and teaches nobody. The \
                     review line sits 62 characters below, the mean length of one conflict rule: the \
                     nine validator rules render verbatim into this channel and are the only part \
                     that grows without anyone editing a description.",
         platform: "Claude Code only; Codex does not cap this channel. services/mcp/client.ts:218, \
-                   confirmed in 2.1.88 source and read again from the 2.1.220 binary.",
+                   confirmed in 2.1.88 source and read again from the 2.1.220 binary. JavaScript \
+                   length counts UTF-16 code units, so the checker counts the same: a \
+                   supplementary-plane character costs two.",
         raise_when: "Claude Code raises MAX_MCP_DESCRIPTION_LENGTH.",
         lower_when: "A second client is found that caps this channel lower.",
     },
@@ -203,13 +213,14 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         client: "VS Code / Copilot, GPT-4o family",
         artifact: "schema-internal description",
         budget: 1_024,
-        unit: "characters",
+        unit: "UTF-16 units",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::ParameterDescription,
         enforced: true,
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: true,
         rationale: "gpt4oMaxStringLength. VS Code truncates every description inside the schema at \
                     this length before sending, so the tail costs wire bytes and reaches no model.",
         platform: "VS Code / Copilot, GPT-4o family only; it does not apply to the tool's own \
@@ -229,6 +240,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "VS Code rejects anyOf, oneOf, allOf, not, if, then and else at an inputSchema \
                     root for every model family, and the tool disappears rather than degrading. The \
                     Claude API rejects the first three at a root as well; Claude Code 2.1.195+ \
@@ -250,6 +262,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "10 is this repository's own guard, not a number the MCP specification states. \
                     The specification tells clients to apply a maximum schema depth to prevent a \
                     denial-of-service vector and deliberately prescribes no value, so a report \
@@ -281,6 +294,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
         warn_at: Some(5),
         warn_only: false,
+        overridable: false,
         rationale: "The resolved-depth guard can be satisfied by moving nesting into $defs without \
                     making anything easier to read, because a named shape is still as deep as it \
                     was. This measures what a reader actually walks: a $ref ends the path, and the \
@@ -307,6 +321,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "A named shape with no description trades a deep document for an opaque one: \
                     the reader who follows the reference arrives somewhere whose name is the only \
                     thing telling them what it holds. This is the specific failure of a mechanical \
@@ -328,6 +343,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "The same specification clause asks clients to cap the total number of \
                     subschemas. search_messages measures 256, so this is a reduction target rather \
                     than headroom. Naming a repeated shape collapses its whole inline subtree to one \
@@ -350,6 +366,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: true,
         rationale: "The Anthropic API is the tightest of the three registries this server must \
                     satisfy: 64 characters and no dots, against the MCP SDK's 128 with dots allowed \
                     and Codex's 64. A name outside it is rejected at registration, not truncated.",
@@ -370,6 +387,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "WP-F-bound-mcp-results-without-silent-reduction",
         warn_at: None,
         warn_only: false,
+        overridable: true,
         rationale: "About 12,000 model tokens at four characters each. Codex is the only measured \
                     client that middle-truncates a result with no marker, which keeps a plausible \
                     head and tail and so looks complete. That, not being the smallest number, is why \
@@ -393,6 +411,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "WP-F-bound-mcp-results-without-silent-reduction",
         warn_at: None,
         warn_only: false,
+        overridable: true,
         rationale: "MAX_MCP_OUTPUT_TOKENS. Over it, Claude Code persists the result to a file, links \
                     it, and supplies jq and grep instructions, so nothing is lost. Recorded so the \
                     difference between an announced overflow and an unannounced one stays measurable.",
@@ -414,6 +433,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         enforced_by: "WP-F-bound-mcp-results-without-silent-reduction",
         warn_at: None,
         warn_only: false,
+        overridable: true,
         rationale: "Numerically the smallest result cap measured, and the reason the default ceiling \
                     is not simply the smallest number: Gemini CLI keeps the first 20% and last 80% \
                     of its budget, saves the rest to a file, and states how many characters it \
@@ -441,6 +461,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "No MCP client is specified to read them and none does, so they are wire bytes \
                     for the twelve registrations that forward schemas verbatim and nothing at all \
                     for the model. Scoped to this prefix rather than to x- generally: MCP 2026-07-28 \
@@ -462,6 +483,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "Codex models enum and does not model const, so a const discriminator reaches no \
                     model and the caller is shown an untyped, valueless tag. JSON Schema 2020-12 \
                     section 6.1.3 makes a single-value enum exactly equivalent, so the replacement \
@@ -484,6 +506,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "i64::MAX rejects nothing a caller could send, so it was never a bound. It \
                     describes the storage type at 30 bytes a site, and both Codex and VS Code delete \
                     the keyword before a model sees it anyway.",
@@ -504,6 +527,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "MCP states that implementations MUST NOT automatically dereference a $ref that \
                     resolves to a network URI, so a non-local ref is unresolvable at the client and \
                     should be rejected rather than treated as permissive.",
@@ -523,6 +547,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         enforced_by: "",
         warn_at: None,
         warn_only: false,
+        overridable: false,
         rationale: "Current Codex prunes definitions no $ref reaches before it measures the schema, \
                     so an unreachable entry is wire bytes that buy nothing. Keeping the emitted set \
                     reachable also keeps the local measurement equal to what the client counts.",
@@ -1082,16 +1107,20 @@ pub fn unreachable_definitions(schema: &Value) -> Vec<String> {
     orphans
 }
 
-fn tool_name_is_acceptable(name: &str) -> bool {
+/// Charset only; length is the row's budget so a configured override can move it.
+fn tool_name_charset_ok(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().count() <= 64
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Measure one row against one tool, returning the number and the site it came from.
-fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
+///
+/// `budget` is the resolved budget the caller will compare against. Only the tool-name row
+/// reads it: a charset violation is rejected at any length, so it must report above whatever
+/// budget is in force rather than as a length a raised budget could admit.
+fn measure(limit: &HarnessLimit, tool: &Value, budget: usize) -> (usize, String) {
     let name = tool["name"].as_str().unwrap_or("?");
     let input = &tool["inputSchema"];
     let output = &tool["outputSchema"];
@@ -1100,19 +1129,28 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
             codex_measured_bytes(input),
             "as Codex counts it, after its own sanitize pass".to_owned(),
         ),
+        // Both description caps live in JavaScript clients, where `.length` counts UTF-16 code
+        // units: a supplementary-plane character costs two against the client's budget, so it
+        // must cost two here or a passing report describes text the client truncates.
         "claude-code-tool-description-chars" => (
             tool["description"]
                 .as_str()
                 .unwrap_or_default()
-                .chars()
+                .encode_utf16()
                 .count(),
-            "characters of tool.description".to_owned(),
+            "UTF-16 units of tool.description, the unit JavaScript length counts".to_owned(),
         ),
         "vscode-parameter-description-chars" => {
             let mut found = Vec::new();
             collect_descriptions(input, "inputSchema", &mut found);
-            match found.iter().max_by_key(|(_, text)| text.chars().count()) {
-                Some((path, text)) => (text.chars().count(), format!("longest at {name}.{path}")),
+            match found
+                .iter()
+                .max_by_key(|(_, text)| text.encode_utf16().count())
+            {
+                Some((path, text)) => (
+                    text.encode_utf16().count(),
+                    format!("longest at {name}.{path}"),
+                ),
                 None => (0, "no parameter description".to_owned()),
             }
         }
@@ -1156,11 +1194,15 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
             "schema positions a validator may enter".to_owned(),
         ),
         "anthropic-tool-name-charset" => {
-            let acceptable = tool_name_is_acceptable(name);
-            (
-                if acceptable { 0 } else { 65 },
-                format!("tool name {name:?}"),
-            )
+            let length = name.chars().count();
+            if tool_name_charset_ok(name) {
+                (length, format!("tool name {name:?}"))
+            } else {
+                (
+                    length.max(budget.saturating_add(1)),
+                    format!("tool name {name:?} has characters outside [A-Za-z0-9_-]"),
+                )
+            }
         }
         "style-no-aise-vendor-keys" => {
             let mut found = Vec::new();
@@ -1279,9 +1321,9 @@ pub fn evaluate(tools: &[Value], overrides: &ClientLimitOverrides, strict: bool)
             continue;
         }
         for tool in tools {
-            let (measured, evidence) = measure(limit, tool);
-            let name = tool["name"].as_str().unwrap_or("?").to_owned();
             let budget = resolved_budget(limit, overrides);
+            let (measured, evidence) = measure(limit, tool, budget);
+            let name = tool["name"].as_str().unwrap_or("?").to_owned();
             let over = measured > budget;
             let status = if !over {
                 match resolved_warn_at(limit, overrides) {
@@ -1317,7 +1359,20 @@ pub type ClientLimitOverrides = std::collections::BTreeMap<String, usize>;
 /// policy moves. Reading it through configuration is what lets an operator track a client that
 /// moved without waiting for a release built against the new value.
 pub fn resolved_budget(limit: &HarnessLimit, overrides: &ClientLimitOverrides) -> usize {
+    if !limit.overridable {
+        // Never silent in practice: configuration rejects an override naming one of these rows,
+        // so ignoring it here is an invariant, not a code path an operator can reach.
+        return limit.budget;
+    }
     overrides.get(limit.name).copied().unwrap_or(limit.budget)
+}
+
+/// Whether one named row takes a `[mcp.client_limits]` override, or `None` for a name that is
+/// no row. Configuration uses it to refuse an override that could only silence the checker.
+pub fn limit_overridable(name: &str) -> Option<bool> {
+    all_limits()
+        .find(|limit| limit.name == name)
+        .map(|limit| limit.overridable)
 }
 
 /// The review line, scaled to a configured budget so it keeps meaning the same thing.
@@ -1399,21 +1454,32 @@ pub fn configured_catalogue_warnings(
         .flat_map(|limit| {
             let budget = resolved_budget(limit, overrides);
             tools.iter().filter_map(move |tool| {
-                let (measured, _) = measure(limit, tool);
+                let (measured, _) = measure(limit, tool, budget);
                 if measured <= budget {
                     return None;
                 }
                 let name = tool["name"].as_str().unwrap_or("?");
+                // A structural rule must not advise the override that validation rejects and
+                // that could not make the schema acceptable anyway.
+                let remedy = if limit.overridable {
+                    format!(
+                        "Set [mcp.client_limits].{} to track a client that moved.",
+                        limit.name
+                    )
+                } else {
+                    "This is a structural rule rather than a client budget: fix the emitted \
+                     schema; no configured number admits it."
+                        .to_owned()
+                };
                 Some(format!(
                     "warning: {name} breaches {}: {} measured {measured} {} against the {budget} \
-                     {} limit of {}. {} Set [mcp.client_limits].{} to track a client that moved.",
+                     {} limit of {}. {} {remedy}",
                     limit.name,
                     limit.artifact,
                     limit.unit,
                     limit.unit,
                     limit.client,
                     limit.rationale,
-                    limit.name,
                 ))
             })
         })
@@ -2797,18 +2863,23 @@ mod tests {
             crate::config::client_limit_env_var(row),
             "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES"
         );
-        let parsed = crate::config::client_limits_from_environment(
+        let captured = crate::config::client_limits_from_environment(
             [(
                 "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES".to_owned(),
                 "7000".to_owned(),
             )]
             .into_iter(),
         );
-        assert_eq!(parsed.get(row).copied(), Some(7_000));
+        // Captured raw; `Config::resolve` owns the parse so a bad value is rejected against
+        // the variable that carried it rather than dropped.
+        assert_eq!(captured.get(row).map(String::as_str), Some("7000"));
 
         // Environment over config file, so one harness can differ from the machine default.
         let mut merged = from_file.clone();
-        merged.extend(parsed);
+        merged.insert(
+            row.to_owned(),
+            captured.get(row).unwrap().parse().expect("numeric fixture"),
+        );
         assert_eq!(
             resolved_budget(shipped, &merged),
             7_000,
@@ -2822,7 +2893,7 @@ mod tests {
     /// it raised one, which is the same defect as a limit that appears configured and is not.
     #[test]
     fn an_environment_variable_naming_no_row_is_rejected() {
-        let parsed = crate::config::client_limits_from_environment(
+        let captured = crate::config::client_limits_from_environment(
             [(
                 "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTE".to_owned(),
                 "7000".to_owned(),
@@ -2830,7 +2901,12 @@ mod tests {
             .into_iter(),
         );
         let mut config = crate::config::Config::default();
-        config.mcp.client_limits.extend(parsed);
+        for (row, raw) in captured {
+            config
+                .mcp
+                .client_limits
+                .insert(row, raw.parse().expect("numeric fixture"));
+        }
         let error = config
             .validate()
             .expect_err("a row name with a typo must not load");
@@ -2838,6 +2914,107 @@ mod tests {
             format!("{error:#}").contains("codex-input-schema-byte"),
             "the error must name the key that failed: {error:#}"
         );
+    }
+
+    /// The tool-name row measures the name it was given, so a configured budget changes the
+    /// verdict in both directions, and a charset violation fails at any budget.
+    ///
+    /// This row's `raise_when` says "The Anthropic API relaxes its pattern", and the only way to
+    /// track that between releases is `[mcp.client_limits]`. A sentinel measurement that never
+    /// reads the budget makes that override dead: a lowered budget admits names it should
+    /// reject, and a raised one admits names whose charset no length can cure.
+    #[test]
+    fn the_tool_name_budget_is_live_rather_than_a_sentinel() {
+        let row = "anthropic-tool-name-charset";
+        let verdict = |tool: Value, overrides: &ClientLimitOverrides| {
+            evaluate(&[tool], overrides, true)
+                .into_iter()
+                .find(|finding| finding.limit.name == row)
+                .expect("the row is swept")
+                .status
+        };
+
+        let mut long_valid = minimal_tool();
+        long_valid["name"] = json!("a".repeat(70));
+        assert_eq!(
+            verdict(long_valid.clone(), &ClientLimitOverrides::new()),
+            Status::Fail,
+            "70 characters is over the shipped 64"
+        );
+        let mut relaxed = ClientLimitOverrides::new();
+        relaxed.insert(row.to_owned(), 100);
+        assert_eq!(
+            verdict(long_valid, &relaxed),
+            Status::Pass,
+            "a raised budget must admit the longer name it was raised for"
+        );
+
+        let mut mid = minimal_tool();
+        mid["name"] = json!("b".repeat(40));
+        let mut tightened = ClientLimitOverrides::new();
+        tightened.insert(row.to_owned(), 32);
+        assert_eq!(
+            verdict(mid, &tightened),
+            Status::Fail,
+            "a lowered budget must reject a name only the shipped one admits"
+        );
+
+        let mut dotted = minimal_tool();
+        dotted["name"] = json!("search.messages");
+        assert_eq!(
+            verdict(dotted, &relaxed),
+            Status::Fail,
+            "characters outside the charset are rejected at registration, and no length budget \
+             admits them"
+        );
+    }
+
+    /// Claude Code and VS Code cap description length in JavaScript, where `.length` counts
+    /// UTF-16 code units, so a supplementary-plane character costs two against the client's
+    /// budget. The checker must count the same units, or it reports PASS on text the client
+    /// silently truncates.
+    #[test]
+    fn description_budgets_count_utf16_units_as_the_javascript_clients_do() {
+        // 1,030 scalar values, 2,060 UTF-16 units: inside the 2,048 cap by scalar count, over
+        // it as Claude Code counts.
+        let mut tool = minimal_tool();
+        tool["description"] = json!("\u{1D11E}".repeat(1_030));
+        assert!(
+            failed_rules(tool).contains(&"claude-code-tool-description-chars"),
+            "2,060 UTF-16 units must breach the 2,048-unit cap"
+        );
+
+        // 513 scalar values, 1,026 UTF-16 units against VS Code's 1,024.
+        let mut tool = minimal_tool();
+        tool["inputSchema"]["properties"]["query"]["description"] = json!("\u{1D11E}".repeat(513));
+        assert!(
+            failed_rules(tool).contains(&"vscode-parameter-description-chars"),
+            "1,026 UTF-16 units must breach the 1,024-unit cap"
+        );
+    }
+
+    /// A structural rule's breach warning must not advise the budget override that validation
+    /// rejects and that could not make the schema acceptable anyway.
+    #[test]
+    fn a_structural_breach_does_not_advise_a_budget_override() {
+        let mut tool = minimal_tool();
+        tool["inputSchema"]["oneOf"] = json!([{ "required": ["query"] }]);
+        let listed = json!([tool]);
+        let warnings = configured_catalogue_warnings(&listed, &ClientLimitOverrides::new());
+        let combinator: Vec<&String> = warnings
+            .iter()
+            .filter(|warning| warning.contains("vscode-no-root-combinator"))
+            .collect();
+        assert!(
+            !combinator.is_empty(),
+            "the breach is reported: {warnings:?}"
+        );
+        for warning in combinator {
+            assert!(
+                !warning.contains("[mcp.client_limits]"),
+                "a structural rule advises fixing the schema, not the number: {warning}"
+            );
+        }
     }
 
     /// A delivery ceiling above a silently-truncating client's cap is reported.

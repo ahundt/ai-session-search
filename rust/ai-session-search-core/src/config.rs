@@ -139,10 +139,12 @@ pub struct ConfigEnvironment {
     /// one. The over-ceiling error names this variable as a remedy, so it has to reach the
     /// resolver rather than only the prose.
     pub max_tool_result_chars: Option<String>,
-    /// Per-row client-limit budgets an MCP registration sets in its own `env` block, keyed by row
-    /// name. Same reason as the ceiling above: these numbers are per client, and a config file is
-    /// per machine.
-    pub client_limits: BTreeMap<String, usize>,
+    /// Per-row client-limit budgets an MCP registration sets in its own `env` block, keyed by
+    /// row name and kept as the raw text each variable carried. Raw because `Config::resolve`
+    /// owns rejection: a value that cannot be honoured is reported against the variable that
+    /// carried it, never dropped here, which would leave the shipped budget silently in force —
+    /// the defect `resolve_max_tool_result_chars` exists to close.
+    pub client_limits: BTreeMap<String, String>,
 }
 
 impl ConfigEnvironment {
@@ -1426,9 +1428,9 @@ impl Config {
         // budget should not silently discard a `[mcp.client_limits]` entry for another client.
         let client_limits_from_registration: Vec<String> =
             environment.client_limits.keys().cloned().collect();
-        // Named here rather than left to `validate`, so a registration typo reports the variable
-        // the operator actually wrote instead of the row name it was translated into.
-        for row in &client_limits_from_registration {
+        // Named here rather than left to `validate`, so a registration mistake reports the
+        // variable the operator actually wrote instead of the row name it was translated into.
+        for (row, raw) in &environment.client_limits {
             if !crate::mcp_schema_budget::declared_limit_names().contains(&row.as_str()) {
                 bail!(
                     "{} names no client limit. Run `aise mcp schema-budget` to list the rows it \
@@ -1437,13 +1439,24 @@ impl Config {
                     client_limit_env_var(row)
                 );
             }
+            if !crate::mcp_schema_budget::limit_overridable(row).unwrap_or(false) {
+                bail!(
+                    "{} names {row}, a structural rule rather than a client budget: overriding \
+                     the number silences the checker while the client still rejects the schema. \
+                     Remove the variable and fix the emitted schema instead.",
+                    client_limit_env_var(row)
+                );
+            }
+            let parsed: usize = raw.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "{} is {raw:?}, which does not parse as a whole number. It overrides the \
+                     {row} budget; correct or remove the variable in this MCP registration's \
+                     `env` block.",
+                    client_limit_env_var(row)
+                )
+            })?;
+            config.mcp.client_limits.insert(row.clone(), parsed);
         }
-        config.mcp.client_limits.extend(
-            environment
-                .client_limits
-                .iter()
-                .map(|(row, budget)| (row.clone(), *budget)),
-        );
 
         config
             .validate()
@@ -1714,6 +1727,15 @@ impl Config {
                      `aise mcp schema-budget` to list the rows it reports; {FIX}"
                 );
             }
+            // A structural row's number is not a moving client cap: accepting an override for
+            // it would silence the checker while the client still rejects the schema outright.
+            if !crate::mcp_schema_budget::limit_overridable(name).unwrap_or(false) {
+                bail!(
+                    "mcp.client_limits.{name:?} is a structural rule rather than a client \
+                     budget: overriding the number silences the checker while the client still \
+                     rejects the schema. Remove the entry and fix the emitted schema; {FIX}"
+                );
+            }
         }
         for (name, purpose) in &self.search.purposes {
             if !crate::message_search::is_dash_separated_phrase(name) {
@@ -1763,6 +1785,15 @@ impl Config {
         if self.mcp.preview_chars == 0 {
             bail!("mcp.preview_chars must be greater than zero; {FIX}");
         }
+        // The same floor the environment path enforces: unlike the sibling knobs where 0 means
+        // disabled, a delivery ceiling of 0 would reject every result including the smallest.
+        if self.mcp.max_tool_result_chars == 0 {
+            bail!(
+                "mcp.max_tool_result_chars must be 1 or greater: it bounds the serialized MCP \
+                 tool result in characters, and a ceiling of 0 would reject every result \
+                 including the smallest. Remove the key to keep the default; {FIX}"
+            );
+        }
         if self.cli.evidence_preview_chars == 0 {
             bail!("cli.evidence_preview_chars must be greater than zero; {FIX}");
         }
@@ -1809,19 +1840,17 @@ pub fn client_limit_env_var(row: &str) -> String {
 
 /// Read every client-limit override out of an environment, keyed back to its row name.
 ///
-/// Every variable carrying the prefix is returned, including one whose suffix names no row.
-/// Dropping it here would leave the shipped budget in force while the registration looked like it
-/// had raised one; `Config::validate` rejects it by name instead. A value that does not parse is
-/// skipped for the same reason it cannot be honoured, and validation reports the key.
-pub fn client_limits_from_environment<I>(vars: I) -> BTreeMap<String, usize>
+/// Every variable carrying the prefix is returned raw, including one whose suffix names no row
+/// and one whose value does not parse. Dropping either here would leave the shipped budget in
+/// force while the registration looked like it had moved one; `Config::resolve` rejects both
+/// against the variable's own name.
+pub fn client_limits_from_environment<I>(vars: I) -> BTreeMap<String, String>
 where
     I: Iterator<Item = (String, String)>,
 {
     vars.filter_map(|(key, value)| {
         let row = key.strip_prefix(CLIENT_LIMIT_ENV_PREFIX)?;
-        let row = row.to_ascii_lowercase().replace('_', "-");
-        let parsed = value.trim().parse::<usize>().ok()?;
-        Some((row, parsed))
+        Some((row.to_ascii_lowercase().replace('_', "-"), value))
     })
     .collect()
 }
@@ -3096,6 +3125,77 @@ mod tests {
                 "state the accepted range: {complaint}"
             );
         }
+    }
+
+    /// The floor stated for the environment path holds for the config file too: a ceiling of
+    /// zero would reject every result including the smallest, and `validate` has to say so
+    /// rather than let every tool call fail at runtime.
+    #[test]
+    fn a_zero_result_ceiling_in_the_config_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[mcp]\nmax_tool_result_chars = 0\n").unwrap();
+        let error = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(path),
+                ..Default::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(chain.contains("mcp.max_tool_result_chars"), "{chain}");
+        assert!(chain.contains("reject every result"), "{chain}");
+    }
+
+    /// A value that does not parse is rejected against the variable that carried it, never
+    /// silently dropped while the shipped budget stays in force. That drop is exactly the
+    /// defect `resolve_max_tool_result_chars` names: a registration that sets a bound and does
+    /// not get it.
+    #[test]
+    fn a_malformed_client_limit_value_is_rejected_rather_than_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.toml");
+        fs::write(&bare, "").unwrap();
+        let mut client_limits = BTreeMap::new();
+        client_limits.insert("codex-input-schema-bytes".to_owned(), "6ooo".to_owned());
+        let error = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(bare),
+                ..Default::default()
+            },
+            ConfigEnvironment {
+                client_limits,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES"),
+            "name the variable the deployment set: {chain}"
+        );
+        assert!(
+            chain.contains("6ooo"),
+            "quote the value that failed: {chain}"
+        );
+    }
+
+    /// A structural row is not a client budget: accepting an override for it silences the
+    /// checker while the client still rejects the schema outright.
+    #[test]
+    fn a_structural_rule_cannot_be_configured_as_a_client_budget() {
+        let mut config = Config::default();
+        config
+            .mcp
+            .client_limits
+            .insert("vscode-no-root-combinator".to_owned(), 1);
+        let error = config
+            .validate()
+            .expect_err("a structural rule must not take a budget override");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("vscode-no-root-combinator"), "{chain}");
+        assert!(chain.contains("structural"), "{chain}");
     }
 
     #[test]
