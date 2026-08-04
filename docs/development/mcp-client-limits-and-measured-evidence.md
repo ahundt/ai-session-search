@@ -17,7 +17,7 @@ Reproduce the measurements with `aise mcp schema-budget --ledger` and
 | Client | Version | Schema limits checkable | Result limits checkable |
 |---|---|---|---|
 | Codex | codex-cli 0.146.0 | yes, normalization reimplemented from its source | yes, from a response fixture |
-| Claude Code | 2.1.220 (Claude Code) | yes, description caps | yes, from a response fixture |
+| Claude Code | 2.1.221 (Claude Code) | yes, description caps | yes, from a response fixture |
 | OpenCode | not installed | no | no |
 | VS Code | not installed | no | no |
 
@@ -92,37 +92,64 @@ Run through `aise mcp serve` as a client launches it, not only in tests.
 
 | Layer | Observed |
 |---|---|
-| Registered binary | `/Users/athundt/.local/bin/aise`, 1.0.0-rc.1, from `uv tool install` |
+| Registered binary | `/Users/athundt/.local/bin/aise`, 1.0.0-rc.1, installed from the release wheel below; Codex and Claude Code both register that exact path |
+| Release artifacts | wheel `e46ecc93c31ff60f9a5e45675af2a7826ffaff14c94923c3b724ddc63ca191ba`, executable `1804bdec7997aebc35ddd4f1c3fea05b3d57256f71b584bcc219dac011245293` |
 | Resolved page | 20, origin `config file` -- an explicit user value, preserved |
 | Resolved ceiling | 48,000, origin `typed default` |
 | Registration override | `AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS=6000` produced an error naming "ceiling of 6000", so the value a registration sets reaches the served result |
-| Default result | `limit=2` returned 4,732 characters with `has_more`, `next_offset`, and exact `get_session` coordinates on every hit |
-| Over-ceiling recovery | `limit=20` and `limit=3` both overflowed 6,000 and both named `limit=2`; `limit=2` then succeeded |
+| Over-ceiling recovery, `search_messages` | `limit=20` overflowed a 6,000 ceiling at 30,759 characters and named `limit=1`; `limit=1` then returned 3,095 |
+| Over-ceiling recovery, `search_sessions` | `limit=0` overflowed the 48,000 ceiling at 154,174 characters and named `limit=23`; `limit=23` then returned 40,563 |
 
-The recovery row is the one worth keeping. The first suggestion this server produced for
-that call was `limit=3`, and `limit=3` measured 6,358 against the same 6,000 ceiling: the
-advice failed on the caller's own next call.
+Both recovery rows were wrong before a cold agent ran the tool, and the second was wrong
+in a way no fixture had reached. `search_sessions(limit=0)` was told **"there is no smaller
+page to ask for"** -- and the same agent then answered the same question with `limit=20`.
+`limit=0` means "every match" on the session tools, and that had been folded into the same
+state as `get_session`, which advertises no `limit` at all. The advice denied the remedy
+the caller went on to use.
 
-It was found by running the installed server rather than by a test, and the reason is
-about proportions rather than correctness. The synthetic fixture holds one session and
-three short messages, so the two parts the estimator was misclassifying -- the per-session
-metadata and the text rendering beside the structured content -- are close to nothing
-there. On the real index the same two parts were 1,021 and 4,729 characters of a 30,518
-character response, which is where a mistake about them decides the answer. A fixture can
-prove the arithmetic; only a real corpus shows which term dominates.
+Two more defects sat behind it, both invisible while only `search_messages` was exercised.
+The count and the items were read from `page.returned` and `results`, which the session
+tools do not have; they report `returned` at the top level and carry `sessions`. And the
+remedies named `context`, `detail` and `receipt_level` on every pageable tool, when
+`search_sessions` and `list_sessions` accept none of the three and instead hold `include`
+and `preview_chars` -- three rejected arguments offered while the two that worked went
+unmentioned. All three are now read from the failed tool's own advertised schema.
+
+## Cold-agent decision tasks
+
+Five tasks, each run in a **fresh process** of each installed client, with a prompt that
+does not contain the answer and ground truth derived separately through the CLI. What is
+scored is what the agent did: the arguments it chose, the hit it selected, the field it
+cited, and whether it reached the answer without raw SQL or configuration changes.
+
+| Task | What it requires | Codex 0.146.0 | Claude Code 2.1.221 |
+|---|---|---|---|
+| Choose the right repository among same-phrase hits | filter or read `repo_root`, not take the top hit | pass, 14 calls | pass, 3 calls |
+| Tell a spawned run from its root | read `parent_session_id` | pass, 5 calls | pass, 2 calls |
+| Continue a page without duplicates | pass the returned `next_offset`, keep `limit` | pass, 2 calls | pass, 2 calls |
+| Expand the exact hit | `get_session(session_id, message_seq)` from the hit | pass, 2 calls | pass, 2 calls |
+| Recover from an over-ceiling call | follow the returned guidance only | pass, 46 calls | pass, 10 calls |
+
+Both clients named the same session for task 1 and cited `repo_root`; both named the same
+spawned run and root for task 2 and cited `parent_session_id`; both returned the same five
+`message_seq` values for task 3 and passed `offset=5` with `limit` unchanged; both reported
+869 characters and the pre-revision estimate for task 4. **No run used SQL, edited
+configuration, or read a transcript file directly.**
+
+Task 1 also corrected this document's own ground truth. The expected answer had been
+derived from the top 200 message hits and named a Claude session; both agents named a
+Codex session that is genuinely more recent in the same repository, which a check against
+the sessions table confirmed.
+
+The task-5 call counts are the honest cost of a deliberately hostile ceiling, not a defect.
+At 6,000 characters the per-session metadata is a large share of the envelope, so `limit=1`
+was the correct maximum for the arguments Codex kept, and it paged twenty times rather than
+trading `include` away. Measured: at that ceiling `include=[]` saves 1,144 characters of a
+10,041-character five-result response, which is real but does not change the page much. The
+shipped default ceiling is 48,000, where the default page of 20 fits.
 
 ## Not verified here, and why
 
-The five cold-agent decision tasks are not recorded. They need a model driving an
-installed client end to end -- choose the right session among several carrying the same
-text, tell a spawned run from its root, continue a second page without duplicates, expand
-the exact message -- and the observation that matters is what the agent did, not what the
-server emitted. That is a separate run against live clients, not something this session
-can honestly self-report.
-
-What is recorded instead is every server-side fact those tasks depend on: the schema
-reaches each client under its budget with descriptions intact, a default result fits every
-published result cap, and a plain query returns the repo, title, recency and parent-run
-evidence needed to choose. Those are asserted by
-`a_default_search_result_fits_every_client_result_cap` and
-`a_plain_query_returns_enough_to_choose_between_sessions` against a synthetic corpus.
+OpenCode and VS Code are not installed on this machine. Their static source-contract checks
+run in the gate, but their cold-agent rows stay `unverified` rather than passing: nothing
+here confirms how those clients treat the artifact.
