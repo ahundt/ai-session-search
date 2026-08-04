@@ -69,22 +69,27 @@ WARN    codex-input-schema-margin — Codex 0.146.0, Codex-normalized inputSchem
         run_skill_capability: 4983 bytes against the 4750 limit (as Codex counts it)
         Raise when: The achievable size drops far enough that a tighter line stays actionable.
         Lower when: Codex raises its budget and the extra headroom is genuinely available.
-WARN    mcp-output-schema-point-of-use-depth — this repository, outputSchema depth along a use path
-        search_messages: 6 levels against the 6 limit
+WARN    mcp-output-schema-point-of-use-depth — this repository, outputSchema depth along a use
+        path, with $ref as a leaf and $defs excluded
+        search_messages: 6 levels against the 6 limit (deepest use path, $ref as a leaf, at
+          /properties/effective_request/properties/presentation/properties/field_view/properties/kind/enum/0)
         Raise when: A response genuinely gains a level of structure. Name the path and the reason
           in the requirements document first; do not raise it to make a test green.
         Lower when: The response shape is flattened and the lower figure holds across a release.
-NOTE    3 response-artifact rows need a tools/call fixture and are not measured here:
-        codex-tool-result-chars: 48000 characters
-        claude-code-tool-result-tokens: 25000 tokens
-        gemini-cli-tool-result-chars: 40000 characters
-120 measurements: 117 pass, 3 warn, 0 rules pending, 0 fail
+123 measurements: 120 pass, 3 warn, 0 rules pending, 0 fail
 ```
 
 No rule is pending. The three warnings are margin tripwires that are expected to fire: the
 two input-schema figures sit about 1% under the budget that binds them, and no measured
 route reaches the 4,750-byte warning line, so a warning here means "remeasure before
 adding a field" rather than "something regressed".
+
+All ten declared rows are measured. The three that bound a `tools/call` result were reported
+as needing a fixture for as long as the checker had none; it now builds the same synthetic
+corpus the stage ledger measures, runs one real search through the production dispatcher, and
+sweeps those rows against the serialized `CallToolResult`. A fixture that fails to build
+leaves them unmeasured and says so on stderr, because a row scored without an artifact is the
+same defect as an unobserved stage reported as zero bytes.
 
 ## Observed against the installed server
 
@@ -147,7 +152,9 @@ At 6,000 characters the per-session metadata is a large share of the envelope, s
 was the correct maximum for the arguments Codex kept, and it paged twenty times rather than
 trading `include` away. Measured: at that ceiling `include=[]` saves 1,144 characters of a
 10,041-character five-result response, which is real but does not change the page much. The
-shipped default ceiling is 48,000, where the default page of 20 fits.
+shipped default ceiling is 48,000, and the `limit=20` page this deployment configures measured
+30,759 characters against it. The shipped default page is smaller still; the generated
+message-search contract table owns that number, so it is not restated here.
 
 ## Not verified here, and why
 
