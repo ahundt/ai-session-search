@@ -3,10 +3,15 @@
 Related contracts: [capability parity](capability-parity.md) and
 [Rust/Python API architecture](rust-python-api-architecture.md).
 
-Historical execution records below preserve the command names used by their
-referenced commits. The current pre-release contract is `aise package
+Historical execution records below preserve the command names and the advertised
+surface counts of their referenced commits, so an entry naming `aise mcp
+serve|recover` or seven MCP tools records what that commit shipped rather than what
+this one does. The current pre-release contract is `aise package
 status|check|update`, `aise integrations install|status|uninstall|recover`,
-`aise config file|example|init|show|origins|paths`, and `aise mcp serve`.
+`aise config file|example|init|show|origins|paths`, and `aise mcp serve`. For the
+current advertised tool set, read the emitted catalogue with
+`aise mcp schema-budget --catalogue`; no count is restated here that could drift
+from it.
 
 ## Objective
 
