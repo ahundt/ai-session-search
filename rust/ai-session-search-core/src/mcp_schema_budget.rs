@@ -1120,6 +1120,30 @@ pub fn evaluate(tools: &[Value], strict: bool) -> Vec<Finding> {
     findings
 }
 
+/// Sweep every row, over every tool, and over a `tools/call` result when one was measured.
+///
+/// [`evaluate`] alone covers seven of the ten declared rows, because a catalogue cannot observe a
+/// response. The three it skips are not unobservable in general, only unobservable from that one
+/// artifact: [`crate::mcp_server::measure_representative_response`] builds a synthetic corpus and
+/// runs a real search through the production dispatcher, and that result is exactly what the
+/// response rows are declared against. Passing it here is what makes the shipped checker measure
+/// its own table rather than most of it.
+///
+/// `response` stays optional because a fixture can fail to build, and a row with no artifact is
+/// omitted so the report can name it as unmeasured. Scoring it as a pass would be the same defect
+/// as reporting an unobserved stage as zero bytes.
+pub fn evaluate_all(
+    tools: &[Value],
+    response: Option<(&str, usize)>,
+    strict: bool,
+) -> Vec<Finding> {
+    let mut findings = evaluate(tools, strict);
+    if let Some((tool, serialized_chars)) = response {
+        findings.extend(evaluate_response(tool, serialized_chars));
+    }
+    findings
+}
+
 /// State the breach, and for a silent cap state that the caller gets no signal.
 pub fn describe_breach(limit: &HarnessLimit, measured: usize) -> String {
     let head = format!(
@@ -1488,15 +1512,20 @@ fn report(findings: &[Finding], strict: bool) -> bool {
         println!("        Lower when: {}", limit.lower_when);
     }
 
+    // Derived from what was scored rather than from the row's kind: the response rows are measured
+    // whenever a fixture built, so a fixed list here would keep announcing a gap that closed.
+    let scored: std::collections::BTreeSet<&str> =
+        findings.iter().map(|finding| finding.limit.name).collect();
     let unmeasured: Vec<&HarnessLimit> = all_limits()
         .filter(|limit| limit.applies_to == AppliesTo::Response)
+        .filter(|limit| !scored.contains(limit.name))
         .collect();
     if !unmeasured.is_empty() {
         println!(
-            "NOTE    {} response-artifact rows need a tools/call fixture and are not measured here;",
+            "NOTE    {} response-artifact rows have no tools/call measurement in this run and are \
+             reported as unmeasured, never as passing:",
             unmeasured.len()
         );
-        println!("        they land with WP-F-bound-mcp-results-without-silent-reduction:");
         for limit in &unmeasured {
             println!("        {}: {} {}", limit.name, limit.budget, limit.unit);
         }
@@ -1570,7 +1599,20 @@ pub fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> anyhow::R
         );
         return Ok(());
     }
-    if !report(&evaluate(tools, args.strict), args.strict) {
+    // The same fixture the ledger measures, so the response rows are swept here too. A fixture
+    // that cannot be built leaves those rows unmeasured and says so, rather than failing a
+    // catalogue check for a reason that has nothing to do with the catalogue.
+    let response = match crate::mcp_server::measure_representative_response(config) {
+        Ok(measured) => Some(measured),
+        Err(error) => {
+            eprintln!("warning: response rows are unmeasured: {error}");
+            None
+        }
+    };
+    let response = response
+        .as_ref()
+        .map(|measured| (measured.tool, measured.call_tool_result_chars));
+    if !report(&evaluate_all(tools, response, args.strict), args.strict) {
         anyhow::bail!("the emitted MCP catalogue breaches an enforced client limit");
     }
     Ok(())
@@ -1987,6 +2029,80 @@ mod tests {
             reparsed["stages"].as_object().expect("stages").len(),
             LEDGER_STAGES.len(),
             "a truncated ledger loses trailing stages, which is what makes it look complete"
+        );
+    }
+
+    /// The sweep measures every row it has an artifact for, response rows included.
+    ///
+    /// The ledger already builds a `tools/call` fixture, so a checker that still reports the three
+    /// response rows as needing one is describing a gap it no longer has. Seven of ten rows
+    /// measured reads as a complete sweep to anyone who does not count them.
+    #[test]
+    fn a_supplied_response_measurement_covers_the_response_rows() {
+        let findings = evaluate_all(&[minimal_tool()], Some(("search_messages", 4_046)), true);
+
+        let measured: std::collections::BTreeSet<&str> = findings
+            .iter()
+            .filter(|finding| finding.limit.applies_to == AppliesTo::Response)
+            .map(|finding| finding.limit.name)
+            .collect();
+        let declared: std::collections::BTreeSet<&str> = all_limits()
+            .filter(|limit| limit.applies_to == AppliesTo::Response)
+            .map(|limit| limit.name)
+            .collect();
+        assert_eq!(
+            measured, declared,
+            "a response row went unmeasured while a fixture measurement was available"
+        );
+        assert!(
+            findings
+                .iter()
+                .filter(|finding| finding.limit.applies_to == AppliesTo::Response)
+                .all(|finding| finding.status == Status::Pass),
+            "4,046 characters is inside every declared client result cap"
+        );
+    }
+
+    /// No fixture means unmeasured, never passing.
+    ///
+    /// This is the same defect as reporting an unobserved stage as zero bytes: a row that silently
+    /// disappears when its artifact is unavailable makes the surface look checked. The report says
+    /// so out loud instead, and that only works if the findings genuinely omit the row.
+    #[test]
+    fn a_missing_response_measurement_leaves_the_rows_unmeasured_rather_than_passing() {
+        let findings = evaluate_all(&[minimal_tool()], None, true);
+
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.limit.applies_to != AppliesTo::Response),
+            "a response row was scored without an artifact to score it against"
+        );
+        assert!(
+            all_limits().any(|limit| limit.applies_to == AppliesTo::Response),
+            "there are response rows to omit in the first place"
+        );
+    }
+
+    /// An over-ceiling response fails the row that is enforced, rather than warning.
+    #[test]
+    fn a_response_past_an_enforced_cap_fails_the_sweep() {
+        let findings = evaluate_all(
+            &[minimal_tool()],
+            Some(("search_messages", 10_000_000)),
+            true,
+        );
+
+        let breached: Vec<&'static str> = findings
+            .iter()
+            .filter(|finding| {
+                finding.limit.applies_to == AppliesTo::Response && finding.status != Status::Pass
+            })
+            .map(|finding| finding.limit.name)
+            .collect();
+        assert!(
+            !breached.is_empty(),
+            "ten million characters breaches every declared result cap"
         );
     }
 }

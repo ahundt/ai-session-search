@@ -7345,7 +7345,7 @@ mod tests {
     #[test]
     fn every_tool_stays_inside_the_limits_its_clients_enforce() {
         use crate::mcp_schema_budget::{
-            ceiling_for, codex_visible_schema, compact_len, evaluate, schema_depth, Status,
+            ceiling_for, codex_visible_schema, compact_len, evaluate_all, schema_depth, Status,
         };
 
         let (dir, _db) = fixture();
@@ -7376,21 +7376,29 @@ mod tests {
              here silently passes"
         );
 
-        let failures: Vec<String> = evaluate(tools, false)
-            .into_iter()
-            .filter(|finding| finding.status == Status::Fail)
-            .map(|finding| {
-                format!(
-                    "{} [{}]: {} {} against {} ({})",
-                    finding.limit.name,
-                    finding.tool,
-                    finding.measured,
-                    finding.limit.unit,
-                    finding.limit.budget,
-                    finding.evidence
-                )
-            })
-            .collect();
+        // The response rows too, against the same fixture the command measures, or "the same
+        // sweep" above would mean seven of the ten declared rows and a developer would pass
+        // locally on a result the release gate rejects.
+        let response = measure_representative_response(&config).expect("the fixture builds");
+        let failures: Vec<String> = evaluate_all(
+            tools,
+            Some((response.tool, response.call_tool_result_chars)),
+            false,
+        )
+        .into_iter()
+        .filter(|finding| finding.status == Status::Fail)
+        .map(|finding| {
+            format!(
+                "{} [{}]: {} {} against {} ({})",
+                finding.limit.name,
+                finding.tool,
+                finding.measured,
+                finding.limit.unit,
+                finding.limit.budget,
+                finding.evidence
+            )
+        })
+        .collect();
         assert!(
             failures.is_empty(),
             "enforced client limits breached: {failures:#?}"
