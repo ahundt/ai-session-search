@@ -114,6 +114,22 @@ output. Verified against a live `aise mcp serve`: the default configuration emit
 the configuration above emits one line naming the tool, 5,001 against 5,000, and what Codex
 does next. It warns rather than refuses, because the schema is degraded rather than invalid.
 
+### A configured ceiling can sit above a silent client cap
+
+`mcp.max_tool_result_chars` decides what this server delivers; a client's own cap decides what
+survives. The shipped 48,000 is Codex's, chosen because Codex truncates from the middle with no
+marker while Claude Code and Gemini CLI announce the overflow and persist it -- which is why
+Gemini's numerically smaller 40,000 was not the number to defend.
+
+Measured: `max_tool_result_chars = 500000` passed the sweep clean. Ten times Codex's cap, no
+signal anywhere, and every layer working as designed -- the result is inside the configured
+ceiling so nothing errors, and no row compared a configured bound against a client bound.
+
+The configured ceiling is now compared against every response row whose failure mode is silent,
+at serve time and in the sweep, reading the configured client cap so an operator tracking a
+client that raised its own states it once. Announced rows are excluded on purpose: exceeding one
+costs a round trip and a file read rather than data.
+
 ### Every declared row is measured
 
 All ten declared rows are measured. The three that bound a `tools/call` result were reported
