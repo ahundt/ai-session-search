@@ -537,29 +537,30 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
     HARNESS_LIMITS.iter().chain(SCHEMA_RULES.iter())
 }
 
-/// Per-tool ceilings for the artifacts this repository has not finished shrinking.
+/// Per-tool ceilings pinning each emitted artifact to today's measurement.
 ///
-/// These are today's measurements, not targets. They exist so a change cannot make an
-/// already-breached artifact worse while the package that fixes it is still pending: the sweep
-/// reports those rules as [`Status::Pending`], and this table is what stops the pending window
-/// being a free-for-all. Each entry lowers as its package lands, and a tool with no entry is a
-/// tool nothing is watching, so [`ceiling_for`] refuses to guess one.
+/// These are measurements, not targets: a ratchet so no change grows an artifact unnoticed.
+/// Re-pin an entry in the same commit as the change that moves it, in either direction — down
+/// when prose is trimmed, up only with the restored documentation that justifies it, as when
+/// the four session tools took back the parameter text a deduplication pass had discarded. A
+/// tool with no entry is a tool nothing is watching, so [`ceiling_for`] refuses to guess one.
 ///
-/// Measured in bytes, which is the unit the client budget is denominated in. That distinction
-/// is not pedantry: `search_sessions` and `list_sessions` each carried one em dash, three UTF-8
-/// bytes that a measurement escaping non-ASCII reports as the six characters `—`. Every
-/// earlier figure for those two tools was three high for exactly that reason, which is one
-/// reason this check lives in the language that counts what the client counts.
+/// Measured in bytes as Codex counts them, after its sanitize pass — the unit the client
+/// budget is denominated in. That distinction is not pedantry: `search_sessions` and
+/// `list_sessions` each carry one em dash, three UTF-8 bytes that a measurement escaping
+/// non-ASCII reports as the six characters `—`. Every earlier figure for those two tools was
+/// three high for exactly that reason, which is one reason this check lives in the language
+/// that counts what the client counts.
 ///
-/// Columns: tool, Codex-normalized `inputSchema` bytes, `outputSchema` depth.
+/// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    ("search_messages", 4_995, 18),
-    ("run_skill_capability", 4_983, 21),
-    ("get_session", 3_567, 12),
-    ("search_sessions", 3_368, 8),
-    ("list_sessions", 3_010, 8),
+    ("search_messages", 4_631, 10),
+    ("run_skill_capability", 4_742, 9),
+    ("get_session", 4_064, 10),
+    ("search_sessions", 4_250, 8),
+    ("list_sessions", 3_892, 8),
     ("query_session_index", 1_724, 8),
-    ("get_resume_command", 348, 8),
+    ("get_resume_command", 374, 8),
     ("get_index_status", 238, 9),
 ];
 

@@ -3190,8 +3190,8 @@ fn set_schema_description(
 /// `kinds`, `seq_from` and `seq_to` are the two ends of one range, `when` sets both time bounds
 /// at once. Keying on this rather than on the field's spelling is what keeps the two meanings of
 /// `since` -- session activity elsewhere, message timestamp here -- from collapsing into one
-/// description, which is the failure `WP-P-share-identical-cross-tool-concepts` guards against
-/// across tools and this enum guards against within one.
+/// description, which `the_two_since_meanings_stay_apart_on_the_wire` guards against across
+/// tools and this enum guards against within one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpFieldRole {
     /// The field is the whole parameter; render from the registry entry alone.
@@ -3589,336 +3589,6 @@ fn message_search_tool_description(config: &Config) -> String {
     text
 }
 
-/// One meaning shared by a parameter name that appears on more than one tool.
-///
-/// Keyed on the concept, never on the spelling, and the two `since` entries are why. `since`
-/// bounds when a *session* was last active on `list_sessions` and `search_sessions`, and when an
-/// individual *message* was written on `search_messages` and `run_skill_capability`. A table
-/// keyed on the string would collapse those into one description that is wrong on two tools --
-/// a worse defect than the divergence it set out to remove.
-///
-/// The enum is closed, so a field mapped to no concept keeps whatever its own builder writes and
-/// a concept with no rendering fails to compile. That is
-/// `REQ044-automate-safe-problem-solving`'s "closed enums, generated descriptions" applied to
-/// the seven tools `MessageSearchParameterRegistry` does not cover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolParameterConcept {
-    /// `since`/`until` over when a session was last active.
-    SessionActivityWindow,
-    /// `since`/`until` over one message's own timestamp.
-    MessageTimestampWindow,
-    /// One period setting both bounds, over session activity.
-    SessionActivityPeriod,
-    /// One period setting both bounds, over message timestamps.
-    MessageTimestampPeriod,
-    ReturnEveryMatch,
-    WorkspacePrefixFilter,
-    SessionSelector,
-    OptionalPayloadGroups,
-    PreviewCharBudget,
-    FieldCharBudget,
-    MatchCharBudget,
-    LineWindow,
-    PresentationPreset,
-    /// The categories a directly supplied capability definition declares, which had no
-    /// description at all: the one genuine undocumented-parameter defect in this catalogue.
-    ExcludedSessionIds,
-    SkillCategorySelector,
-}
-
-/// The one description each concept carries, on every tool that uses it.
-///
-/// Deliberately terse for the same reason the registry's prose is: accepted values travel as
-/// `enum`, which every measured client preserves, and the shared vocabulary a tool needs sits in
-/// its own `tool.description`.
-pub(crate) fn concept_description(concept: ToolParameterConcept) -> &'static str {
-    use ToolParameterConcept as C;
-    match concept {
-        C::SessionActivityWindow => {
-            "Bound on when the session was last active, not on any one message; \
-             RFC 3339 or a relative form, see `aise dates`. Omit for no bound."
-        }
-        // The accepted time formats are shared vocabulary: every tool carrying this concept states
-        // them once in its own `tool.description`, so restating them on both `since` and `until`
-        // is two more copies of a fact the reader already holds.
-        C::MessageTimestampWindow => "Bound on the message's own timestamp; omit for no bound.",
-        C::SessionActivityPeriod => {
-            "One period bounding session activity at both ends; conflicts with since and until."
-        }
-        C::MessageTimestampPeriod => {
-            "One period bounding message timestamps at both ends; conflicts with since and until."
-        }
-        C::ReturnEveryMatch => "true returns every match instead of a page; conflicts with limit.",
-        C::WorkspacePrefixFilter => {
-            "Match the session's cwd or repo root by prefix. Omit for every root."
-        }
-        C::SessionSelector => "One session, by ID or unique prefix.",
-        C::OptionalPayloadGroups => "Optional payload groups; a supplied set replaces the default.",
-        C::PreviewCharBudget => "Characters per preview. Omit for the configured budget.",
-        C::FieldCharBudget => "Character budget for the selected field.",
-        C::MatchCharBudget => "Character budget around the match.",
-        C::LineWindow => {
-            "Line window: positive keeps first N, negative last N, 0 none; conflicts with detail."
-        }
-        C::PresentationPreset => {
-            "Presentation preset; conflicts with lines_per_message, field_view and match_view."
-        }
-        C::ExcludedSessionIds => "Session IDs to exclude. Omit to exclude none.",
-        C::SkillCategorySelector => {
-            "Typed classification categories for this call, replacing the package's own."
-        }
-    }
-}
-
-/// Which advertised field on which tool carries which concept.
-///
-/// A field absent from this table keeps whatever its own builder writes, so adoption is
-/// incremental. `search_messages` is deliberately absent throughout: its registry owns every
-/// description it has, and letting this table write over generated text would put two owners on
-/// one string again, which is the failure the generation work exists to remove.
-pub(crate) const TOOL_FIELD_CONCEPT: &[(&str, &str, ToolParameterConcept)] = &[
-    (
-        "list_sessions",
-        "since",
-        ToolParameterConcept::SessionActivityWindow,
-    ),
-    (
-        "list_sessions",
-        "until",
-        ToolParameterConcept::SessionActivityWindow,
-    ),
-    (
-        "list_sessions",
-        "when",
-        ToolParameterConcept::SessionActivityPeriod,
-    ),
-    (
-        "search_sessions",
-        "since",
-        ToolParameterConcept::SessionActivityWindow,
-    ),
-    (
-        "search_sessions",
-        "until",
-        ToolParameterConcept::SessionActivityWindow,
-    ),
-    (
-        "search_sessions",
-        "when",
-        ToolParameterConcept::SessionActivityPeriod,
-    ),
-    (
-        "run_skill_capability",
-        "since",
-        ToolParameterConcept::MessageTimestampWindow,
-    ),
-    (
-        "run_skill_capability",
-        "until",
-        ToolParameterConcept::MessageTimestampWindow,
-    ),
-    (
-        "run_skill_capability",
-        "when",
-        ToolParameterConcept::MessageTimestampPeriod,
-    ),
-    (
-        "run_skill_capability",
-        "all_results",
-        ToolParameterConcept::ReturnEveryMatch,
-    ),
-    (
-        "list_sessions",
-        "path_prefix",
-        ToolParameterConcept::WorkspacePrefixFilter,
-    ),
-    (
-        "search_sessions",
-        "path_prefix",
-        ToolParameterConcept::WorkspacePrefixFilter,
-    ),
-    (
-        "run_skill_capability",
-        "workspace_path_prefix",
-        ToolParameterConcept::WorkspacePrefixFilter,
-    ),
-    (
-        "get_session",
-        "session_id",
-        ToolParameterConcept::SessionSelector,
-    ),
-    (
-        "get_resume_command",
-        "session_id",
-        ToolParameterConcept::SessionSelector,
-    ),
-    (
-        "run_skill_capability",
-        "session_id",
-        ToolParameterConcept::SessionSelector,
-    ),
-    (
-        "list_sessions",
-        "include",
-        ToolParameterConcept::OptionalPayloadGroups,
-    ),
-    (
-        "search_sessions",
-        "include",
-        ToolParameterConcept::OptionalPayloadGroups,
-    ),
-    (
-        "get_session",
-        "include",
-        ToolParameterConcept::OptionalPayloadGroups,
-    ),
-    (
-        "get_session",
-        "preview_chars",
-        ToolParameterConcept::PreviewCharBudget,
-    ),
-    (
-        "list_sessions",
-        "preview_chars",
-        ToolParameterConcept::PreviewCharBudget,
-    ),
-    (
-        "search_sessions",
-        "preview_chars",
-        ToolParameterConcept::PreviewCharBudget,
-    ),
-    (
-        "list_sessions",
-        "exclude_session_ids",
-        ToolParameterConcept::ExcludedSessionIds,
-    ),
-    (
-        "search_sessions",
-        "exclude_session_ids",
-        ToolParameterConcept::ExcludedSessionIds,
-    ),
-    (
-        "get_session",
-        "lines_per_message",
-        ToolParameterConcept::LineWindow,
-    ),
-    (
-        "run_skill_capability",
-        "field_view",
-        ToolParameterConcept::FieldCharBudget,
-    ),
-    (
-        "run_skill_capability",
-        "match_view",
-        ToolParameterConcept::MatchCharBudget,
-    ),
-    (
-        "run_skill_capability",
-        "detail",
-        ToolParameterConcept::PresentationPreset,
-    ),
-    // Nested, and the one advertised parameter in this catalogue with no description at all.
-    (
-        "run_skill_capability",
-        "definition.categories",
-        ToolParameterConcept::SkillCategorySelector,
-    ),
-];
-
-/// Apply the shared concept descriptions to one tool's advertised properties.
-///
-/// Called before `project_message_search_spec`, so where a `search_messages` field also names a
-/// concept the registry still writes the final text. One owner per string, and the more specific
-/// owner wins.
-fn apply_every_shared_concept_description(response: &mut Value) {
-    let Some(tools) = response
-        .get_mut("result")
-        .and_then(|result| result.get_mut("tools"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    let mut overwritten = Vec::new();
-    for tool in tools {
-        let Some(name) = tool["name"].as_str().map(str::to_owned) else {
-            continue;
-        };
-        if let Some(properties) = tool
-            .get_mut("inputSchema")
-            .and_then(|schema| schema.get_mut("properties"))
-            .and_then(Value::as_object_mut)
-        {
-            overwritten.extend(apply_shared_concept_descriptions(&name, properties));
-        }
-    }
-    // Reported together rather than one per run, because they are fixed together: a maintainer
-    // who has to rebuild between each name learns the count and not the set.
-    OVERWRITTEN_DESCRIPTIONS.with(|cell| *cell.borrow_mut() = overwritten);
-}
-
-thread_local! {
-    /// What the last `tools/list` build replaced, so a test can read it.
-    ///
-    /// Recorded rather than asserted, because these are pre-existing and fixing them is a
-    /// different change from the byte budget: see
-    /// `the_concept_table_does_not_silently_replace_a_tools_own_description`.
-    static OVERWRITTEN_DESCRIPTIONS: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn apply_shared_concept_descriptions(
-    tool_name: &str,
-    properties: &mut serde_json::Map<String, Value>,
-) -> Vec<String> {
-    let mut overwritten = Vec::new();
-    for (tool, field, concept) in TOOL_FIELD_CONCEPT {
-        if *tool != tool_name {
-            continue;
-        }
-        // A dotted path reaches a nested parameter. `definition.categories` is the reason this
-        // exists: it is the one advertised parameter in the catalogue with no description at
-        // all, and it is nested inside an object rather than sitting at the root.
-        let mut cursor = Some(&mut *properties);
-        let segments: Vec<&str> = field.split('.').collect();
-        for (index, segment) in segments.iter().enumerate() {
-            let Some(current) = cursor else { break };
-            let Some(schema) = current.get_mut(*segment).and_then(Value::as_object_mut) else {
-                break;
-            };
-            if index + 1 == segments.len() {
-                // One owner per string, enforced rather than documented. A tool builder that
-                // also writes this field's description has written prose that never reaches the
-                // wire: it is replaced here, so it is free to say something the concept does not,
-                // and a maintainer editing it sees no effect and no error. That is the same
-                // failure class as the vendor keys and the stripped descriptions -- text that
-                // looks published and is not -- and `run_skill_capability.all_results` was a live
-                // instance, still advising "prefer paging when the range is wide" in a literal
-                // that had never shipped.
-                //
-                // `search_messages` is the deliberate exception and cannot reach here: the
-                // registry is the more specific owner, and `project_message_search_spec` runs
-                // after this pass to take the fields it shares with a concept.
-                if let Some(discarded) = schema.get("description").and_then(Value::as_str) {
-                    // The discarded text goes in the message. A maintainer deleting a literal has
-                    // to see what it said to judge whether every fact in it is either in the
-                    // concept text or genuinely not worth publishing, and reading it here is the
-                    // only place it is visible -- by construction it never reaches the wire.
-                    overwritten.push(format!(
-                        "{tool_name}.{field}, owned by ToolParameterConcept::{concept:?}, \
-                         discards: {discarded}"
-                    ));
-                }
-                schema.insert(
-                    "description".to_owned(),
-                    Value::String(concept_description(*concept).to_owned()),
-                );
-                break;
-            }
-            cursor = schema.get_mut("properties").and_then(Value::as_object_mut);
-        }
-    }
-    overwritten
-}
 
 /// The `$defs` name for the one variant `field_view` and `match_view` genuinely share.
 const CHAR_BUDGET_DEF: &str = "CharBudget";
@@ -4337,26 +4007,14 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Keywords, a phrase, or a code snippet to find in session titles and content."
                             },
                             "provider": provider_filter_schema(&provider_values, provider_filter_description),
-                            "path_prefix": {
-                                "type": "string",
-                                "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
-                            },
+                            "path_prefix": session_path_prefix_schema(),
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit. Omit for no path exclusions." },
-                            "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
+                            "exclude_session_ids": session_exclude_ids_schema(),
                             "session_kinds": session_kinds_schema(),
                             "parent_session_id": parent_session_id_schema(),
-                            "since": {
-                                "type": "string",
-                                "description": "Lower bound on session activity: last updated at or after this, or created at or after it when a session has no update time. Not a creation filter — a session started months ago and continued today is inside '7d'. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
-                            },
-                            "until": {
-                                "type": "string",
-                                "description": "Upper bound on the same session-activity timestamp, inclusive. Same precision and timezone rules as since. Default: no upper bound."
-                            },
-                            "when": {
-                                "type": "string",
-                                "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
-                            },
+                            "since": session_activity_since_schema(),
+                            "until": session_activity_until_schema(),
+                            "when": session_activity_when_schema(),
                             "limit": {
                                 "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
@@ -4450,26 +4108,14 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "type": "object",
                         "properties": {
                             "provider": provider_filter_schema(&provider_values, provider_filter_description),
-                            "path_prefix": {
-                                "type": "string",
-                                "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
-                            },
+                            "path_prefix": session_path_prefix_schema(),
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit. Omit for no path exclusions." },
-                            "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
+                            "exclude_session_ids": session_exclude_ids_schema(),
                             "session_kinds": session_kinds_schema(),
                             "parent_session_id": parent_session_id_schema(),
-                            "since": {
-                                "type": "string",
-                                "description": "Lower bound on session activity: last updated at or after this, or created at or after it when a session has no update time. Not a creation filter — a session started months ago and continued today is inside '7d'. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
-                            },
-                            "until": {
-                                "type": "string",
-                                "description": "Upper bound on the same session-activity timestamp, inclusive. Same precision and timezone rules as since. Default: no upper bound."
-                            },
-                            "when": {
-                                "type": "string",
-                                "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
-                            },
+                            "since": session_activity_since_schema(),
+                            "until": session_activity_until_schema(),
+                            "when": session_activity_when_schema(),
                             "limit": {
                                 "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit),
@@ -4605,7 +4251,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     // `tool.description` is a separate field with its own 2,048-character cap that
                     // no measured client charges to the schema. A fact many parameters share also
                     // reads better stated once here than transcribed onto each of them.
-                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. since and until bound the message's own timestamp rather than session activity, and accept an RFC 3339 instant or a relative form; see `aise dates`. session_kinds defaults to user-started sessions only, unlike search_messages and list_sessions which return both classes: in a spawned subagent run, 'user' rows hold the calling agent's delegation prompt rather than text a person entered. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
+                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. since and until bound the message's own timestamp rather than session activity, and accept an RFC 3339 instant or a relative form; see `aise dates`. session_kinds defaults to user-started sessions only, unlike search_messages and list_sessions which return both classes: in a spawned subagent run, 'user' rows hold the calling agent's delegation prompt rather than text a person entered. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -4617,6 +4263,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "properties": {
                                     "categories": {
                                         "type": "array",
+                                        "description": "Typed classification categories for this call, replacing the package's own.",
                                         "minItems": 1,
                                         "items": {
                                             "type": "object",
@@ -4636,9 +4283,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "required": ["categories"],
                                 "additionalProperties": false
                             },
-                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset only. compact returns bounded field and match views; full returns the complete message in field_view while retaining a bounded match-centered view. It never changes classification, ordering, result count, pagination, or digests. Conflicts with field_view and match_view." },
+                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset: compact returns bounded views; full returns the complete message in field_view plus a bounded match view. Conflicts with field_view and match_view." },
                             "field_view": {
-                                "description": format!("Returned-message boundary view budget after full-text classification. no_char_limit returns the complete message; max_chars retains at most that many Unicode scalar characters. The configured MCP default is max_chars={}. Extent metadata and message_ref make every bounded result explicit and exactly recoverable.", config.mcp.preview_chars.max(1)),
+                                "description": format!("View budget for the returned message: no_char_limit returns the complete message; max_chars retains at most that many Unicode scalar characters. The configured MCP default is max_chars={}.", config.mcp.preview_chars.max(1)),
                                 "oneOf": [
                                     {
                                         "type": "object",
@@ -4658,7 +4305,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 ]
                             },
                             "match_view": {
-                                "description": "Independent match-centered view after full-text classification. minimal_span returns the complete regex match; max_chars adds surrounding message text without changing the match coordinates or classification.",
+                                "description": "Independent match-centered view: minimal_span returns the complete regex match; max_chars adds surrounding text without changing the match coordinates.",
                                 "oneOf": [
                                     {
                                         "type": "object",
@@ -4680,13 +4327,13 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Extra packages evaluated after the primary one; all must declare the same capability type." },
                             "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan; omit for user-started sessions only." },
                             "provider": provider_filter_schema(&provider_values, provider_filter_description),
-                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use to scope the capability run to one session found by search_sessions." },
-                            "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path. Use to scope the capability run to one project." },
-                            "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC. Examples: '2026-01-15', '7d', 'yesterday'. Default: no lower bound." },
-                            "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same rules as since. Default: no upper bound." },
-                            "when": { "type": "string", "description": "Single UTC period used as both bounds, e.g. '2026-01', '7d', 'yesterday'. Do not combine with since/until." },
+                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix; scopes the run to one session found by search_sessions." },
+                            "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path; scopes the run to one project." },
+                            "since": { "type": "string", "description": "Lower bound on the message's own timestamp; omit for no bound." },
+                            "until": { "type": "string", "description": "Upper bound on the message's own timestamp, inclusive; omit for no bound." },
+                            "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
                             "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit), "default": config.mcp.run_message_classification_limit },
-                            "all_results": { "type": "boolean", "description": "Return every match rather than one page. Defaults to false; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide.", "default": false },
+                            "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide.", "default": false },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
                         },
                         "required": ["skill"],
@@ -4722,7 +4369,6 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
             ]
         }
     });
-    apply_every_shared_concept_description(&mut response);
     add_index_refresh_controls(&mut response);
     add_not_ready_output_alternatives(&mut response);
     response
@@ -6041,6 +5687,52 @@ fn apply_session_preview_chars(value: &mut Value, preview_chars: Option<usize>) 
         }
         _ => {}
     }
+}
+
+/// Schema for `since` on the session-listing tools, the lower session-activity bound.
+///
+/// One helper per field `search_sessions` and `list_sessions` share, so the two copies cannot
+/// drift apart: when these descriptions were inline literals, the `list_sessions` copy of this
+/// one was missing the whole-month example the `search_sessions` copy carried, and nothing
+/// noticed until the emitted catalogues were diffed.
+fn session_activity_since_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Lower bound on session activity: last updated at or after this, or created at or after it when a session has no update time. Not a creation filter — a session started months ago and continued today is inside '7d'. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
+    })
+}
+
+/// Schema for `until` on the session-listing tools, the inclusive upper session-activity bound.
+fn session_activity_until_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Upper bound on the same session-activity timestamp, inclusive. Same precision and timezone rules as since. Default: no upper bound."
+    })
+}
+
+/// Schema for `when` on the session-listing tools, one period setting both activity bounds.
+fn session_activity_when_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Single UTC period bounding session activity at both ends, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
+    })
+}
+
+/// Schema for `path_prefix` on the session-listing tools.
+fn session_path_prefix_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
+    })
+}
+
+/// Schema for `exclude_session_ids` on the session-listing tools.
+fn session_exclude_ids_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions."
+    })
 }
 
 /// Schema for `preview_chars` on the session-returning tools.
@@ -7461,7 +7153,7 @@ mod tests {
     #[test]
     fn every_tool_stays_inside_the_limits_its_clients_enforce() {
         use crate::mcp_schema_budget::{
-            ceiling_for, codex_visible_schema, compact_len, evaluate_all, schema_depth, Status,
+            ceiling_for, codex_measured_schema, compact_len, evaluate_all, schema_depth, Status,
         };
 
         let (dir, _db) = fixture();
@@ -7484,10 +7176,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "search_messages")
             .expect("search_messages is served");
-        let measured = compact_len(&codex_visible_schema(&search["inputSchema"]));
+        let measured = compact_len(&codex_measured_schema(&search["inputSchema"]));
         assert!(
             measured > 2_000,
-            "codex_visible_schema collapsed search_messages to {measured} B; it must keep \
+            "codex_measured_schema collapsed search_messages to {measured} B; it must keep \
              `properties` KEYS and recurse only into their values, or every budget assertion \
              here silently passes"
         );
@@ -7531,12 +7223,12 @@ mod tests {
                 )
             });
 
-            let bytes = compact_len(&codex_visible_schema(&tool["inputSchema"]));
+            let bytes = compact_len(&codex_measured_schema(&tool["inputSchema"]));
             assert!(
                 bytes <= byte_ceiling,
-                "{name} inputSchema grew to {bytes} B as Codex counts it, above its recorded \
-                 {byte_ceiling} B ceiling. Past 5,000 B Codex deletes every parameter \
-                 description with no marker to the model."
+                "{name} inputSchema grew to {bytes} B as Codex counts it after its sanitize \
+                 pass, above its recorded {byte_ceiling} B ceiling. Past 5,000 B Codex deletes \
+                 every parameter description with no marker to the model."
             );
 
             let depth = schema_depth(&tool["outputSchema"]);
@@ -12458,52 +12150,6 @@ mod tests {
         }
     }
 
-    /// A tool's own description of a parameter must reach the caller, or not exist.
-    ///
-    /// `apply_shared_concept_descriptions` replaces a concept-owned field's description with the
-    /// shared text. Where the tool builder also wrote one, that literal reaches no caller: it is
-    /// overwritten before serialization, so it is free to say something the concept does not, and
-    /// a maintainer editing it sees no effect and no error.
-    ///
-    /// This is not a tidiness complaint. The 28 literals currently discarded carry facts stated
-    /// nowhere else, and the concept text that replaced them is wrong for some of the tools it
-    /// covers:
-    ///
-    /// - `search_sessions.since` explains that it is not a creation filter, so a session started
-    ///   months ago and continued today is inside `7d`. The shared sentence says only "bound on
-    ///   when the session was last active", which invites exactly that misreading.
-    /// - `get_session.include` states `Requires summary=true`, a precondition a caller cannot
-    ///   discover elsewhere. The shared sentence states none.
-    /// - `preview_chars` means different things per tool. `get_session` documents a default of
-    ///   220 that does not apply to transcript output; `search_sessions` documents that omitting
-    ///   it returns the complete text. One sentence cannot be true of both, and the one shipped,
-    ///   "Omit for the configured budget", is true of neither.
-    /// - `path_prefix` matches working directory, git repo, or transcript path on the session
-    ///   tools, and cwd or repo root on `run_skill_capability`. The shared sentence names two of
-    ///   the three.
-    ///
-    /// So the fix is per concept rather than mechanical: enrich the shared text where the
-    /// parameter really is one concept, and drop the row where it is two concepts wearing one
-    /// name. That is the failure `ToolParameterConcept`'s own documentation warns about for
-    /// `since`, and it reached five other concepts anyway.
-    ///
-    /// Ignored rather than deleted or quietly passing: it fails today, for a defect that predates
-    /// the schema-budget work and is a separate change. `unverified is a state, never a pass`.
-    #[test]
-    #[ignore = "pre-existing: 28 discarded literals, restoring them is its own change"]
-    fn the_concept_table_does_not_silently_replace_a_tools_own_description() {
-        let (dir, _db) = fixture();
-        let _ = handle_tools_list(None, &config_for_fixture(&dir));
-        let overwritten = OVERWRITTEN_DESCRIPTIONS.with(|cell| cell.borrow().clone());
-        assert!(
-            overwritten.is_empty(),
-            "{} advertised fields are described twice, and only the concept text reaches a \
-             caller. Restore each discarded fact into the shared text, or drop the field from \
-             TOOL_FIELD_CONCEPT so the tool keeps its own: {overwritten:#?}",
-            overwritten.len()
-        );
-    }
-
     #[test]
     fn tools_list_exposes_expected_tools_each_with_a_schema() {
         let (dir, db) = fixture();
@@ -13849,16 +13495,17 @@ mod tests {
         assert!(crate::mcp_schema_budget::unreachable_definitions(&schema).is_empty());
     }
 
-    /// One concept renders one description, and two concepts sharing a spelling do not.
+    /// The two meanings of `since` stay apart on the wire, and every copy of each is identical.
     ///
-    /// Assertion (b) is the load-bearing one and the reason this test exists at all. The whole
-    /// risk of a shared-description table is that keying it on the string `since` publishes one
-    /// sentence that is wrong on two of the four tools carrying that name: it bounds session
-    /// activity on `list_sessions` and `search_sessions`, and one message's own timestamp on
-    /// `search_messages` and `run_skill_capability`. A future pass that "deduplicates" the two
-    /// into one fails here rather than shipping.
+    /// Four advertised tools spell a parameter `since` with two different meanings: it bounds
+    /// when a *session* was last active on `list_sessions` and `search_sessions`, and one
+    /// *message's* own timestamp on `search_messages` and `run_skill_capability`. A
+    /// deduplication pass keyed on the spelling once published one sentence across tools whose
+    /// semantics differ, and a deduplication test can only prove the copies agree, never that
+    /// the surviving copy is right — so this reads the emitted catalogue and pins the semantic
+    /// each tool's caller is told.
     #[test]
-    fn one_concept_renders_one_description_and_two_concepts_stay_apart() {
+    fn the_two_since_meanings_stay_apart_on_the_wire() {
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
         let listed = handle_tools_list(Some(json!(1)), &config);
@@ -13876,58 +13523,60 @@ mod tests {
             schema["description"].as_str().map(str::to_owned)
         };
 
-        // (a) Every field mapped to one concept renders byte-identical text.
-        for concept_row in TOOL_FIELD_CONCEPT {
-            let (tool, field, concept) = concept_row;
-            let rendered = described(tool, field)
-                .unwrap_or_else(|| panic!("{tool}.{field} has no description"));
+        // The session-activity tools describe session activity, in identical words — the two
+        // copies come from one shared builder, and this holds them to it.
+        for field in ["since", "until", "when"] {
+            let search = described("search_sessions", field)
+                .unwrap_or_else(|| panic!("search_sessions.{field} has a description"));
+            let list = described("list_sessions", field)
+                .unwrap_or_else(|| panic!("list_sessions.{field} has a description"));
             assert_eq!(
-                rendered,
-                concept_description(*concept),
-                "{tool}.{field} does not render its concept's text"
+                search, list,
+                "{field} diverged between the two session tools; both must come from the shared \
+                 session_activity_*_schema builder"
+            );
+            assert!(
+                search.contains("session activity") || search.contains("session-activity"),
+                "search_sessions.{field} must say it bounds session activity: {search}"
             );
         }
+        // `since` is not a creation filter, and the description pre-empts that misreading.
+        let session_since = described("search_sessions", "since").expect("described above");
+        assert!(
+            session_since.contains("Not a creation filter"),
+            "the session `since` must pre-empt the creation-filter misreading: {session_since}"
+        );
 
-        // (b) The two time concepts that share the `since` spelling render different text.
-        let session_activity = concept_description(ToolParameterConcept::SessionActivityWindow);
-        let message_timestamp = concept_description(ToolParameterConcept::MessageTimestampWindow);
+        // The message tools describe the message's own timestamp, not session activity.
+        let capability_since = described("run_skill_capability", "since")
+            .expect("run_skill_capability.since has a description");
+        assert!(
+            capability_since.contains("message's own timestamp"),
+            "run_skill_capability.since bounds the message, not session activity: \
+             {capability_since}"
+        );
         assert_ne!(
-            session_activity, message_timestamp,
-            "the two `since` concepts collapsed into one description, which is wrong on two of \
+            capability_since, session_since,
+            "the two `since` meanings collapsed into one description, which is wrong on two of \
              the four tools that spell the parameter `since`"
         );
-        assert_eq!(
-            described("list_sessions", "since").as_deref(),
-            Some(session_activity)
-        );
-        assert_eq!(
-            described("run_skill_capability", "since").as_deref(),
-            Some(message_timestamp)
+        // `search_messages.since` renders from the registry's shared four-surface contract
+        // ("Lower time bound"), which CLI `--describe` publishes verbatim — so the wire
+        // property to hold is that it never claims the session-activity semantic, not that it
+        // repeats run_skill_capability's phrasing.
+        let message_since = described("search_messages", "since")
+            .expect("search_messages.since has a description");
+        assert!(
+            !message_since.contains("session activity") && !message_since.contains("session-activity"),
+            "search_messages.since bounds the message and must not claim session activity: \
+             {message_since}"
         );
         assert_ne!(
-            concept_description(ToolParameterConcept::SessionActivityPeriod),
-            concept_description(ToolParameterConcept::MessageTimestampPeriod),
-            "the two `when` concepts collapsed the same way"
+            message_since, session_since,
+            "search_messages.since collapsed into the session-activity text"
         );
 
-        // (c) Every mapped pair names a field that exists, so a rename leaves no dead row.
-        for (tool, field, _) in TOOL_FIELD_CONCEPT {
-            assert!(
-                described(tool, field).is_some(),
-                "{tool}.{field} is mapped to a concept but is not advertised"
-            );
-        }
-
-        // `search_messages` is absent throughout: its registry owns every description it has,
-        // and a second writer would put two owners on one string again.
-        assert!(
-            TOOL_FIELD_CONCEPT
-                .iter()
-                .all(|(tool, _, _)| *tool != "search_messages"),
-            "the concept table writes over registry-generated search_messages text"
-        );
-
-        // The one advertised parameter that had no description at all now has one.
+        // The one advertised parameter that once had no description at all keeps one.
         let categories = described("run_skill_capability", "definition.categories")
             .expect("definition.categories is advertised");
         assert!(!categories.trim().is_empty(), "{categories:?}");
