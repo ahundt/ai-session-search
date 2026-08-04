@@ -760,8 +760,9 @@ pub struct MessageSearchArgs {
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
     /// Compact or full presentation preset. Conflicts with explicit line or character budgets.
-    /// Omit for this surface's own policy, which is the complete selected field with a
-    /// 220-character window around the match; presets exist to override that in one word.
+    /// Omit for this surface's own policy, which is the complete selected field with a match
+    /// window of 220 characters unless search.message_search.match_evidence_max_chars sets
+    /// another; presets exist to override that in one word.
     #[arg(long, value_enum, conflicts_with_all = ["lines_per_message", "field_view_chars", "match_view_chars"])]
     pub detail: Option<DetailLevel>,
     /// Selected-field boundary view: no-char-limit or a positive Unicode-scalar count. Omit for
@@ -769,7 +770,7 @@ pub struct MessageSearchArgs {
     #[arg(long)]
     pub field_view_chars: Option<CliFieldViewChars>,
     /// Match-centered view: minimal or a positive Unicode-scalar count. Omit for 220 characters
-    /// around the match.
+    /// around the match, unless search.message_search.match_evidence_max_chars sets another.
     #[arg(long)]
     pub match_view_chars: Option<CliMatchViewChars>,
     /// Print the executable parameter catalogue and configured CLI defaults without searching the
