@@ -34,15 +34,17 @@ pub enum ReindexOutcome {
     SkippedBusy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReindexRun {
     Completed {
         files_seen: usize,
         sessions_updated: usize,
+        discovery_warnings: Vec<crate::source::ProviderDiscoveryWarning>,
     },
     Cancelled {
         files_seen: usize,
         sessions_updated: usize,
+        discovery_warnings: Vec<crate::source::ProviderDiscoveryWarning>,
     },
 }
 
@@ -567,6 +569,7 @@ pub(crate) fn refresh_usable_index_nonblocking(
             Ok(ReindexRun::Completed {
                 files_seen,
                 sessions_updated,
+                ..
             }) => {
                 if schema_backfill_required {
                     db.purge_injected_messages()?;
@@ -619,10 +622,11 @@ pub fn reindex_with_mode(
     }
 }
 
-pub(crate) struct ExplicitReindexOutcome {
-    pub(crate) files_seen: usize,
-    pub(crate) sessions_updated: usize,
-    pub(crate) effective_full: bool,
+pub struct ExplicitReindexOutcome {
+    pub files_seen: usize,
+    pub sessions_updated: usize,
+    pub effective_full: bool,
+    pub discovery_warnings: Vec<crate::source::ProviderDiscoveryWarning>,
 }
 
 /// Full public reindex contract: parser backfill and incompatible message-search migration share
@@ -658,7 +662,17 @@ fn explicit_reindex_with_writer_permit(
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<ExplicitReindexOutcome> {
     let effective_full = requested_full || db.needs_backfill()?;
-    let (files_seen, sessions_updated) = reindex(config, db, effective_full, progress)?;
+    let (files_seen, sessions_updated, discovery_warnings) =
+        match reindex_until(config, db, effective_full, progress, &|| false)? {
+            ReindexRun::Completed {
+                files_seen,
+                sessions_updated,
+                discovery_warnings,
+            } => (files_seen, sessions_updated, discovery_warnings),
+            ReindexRun::Cancelled { .. } => {
+                unreachable!("the default reindex token never cancels")
+            }
+        };
     if effective_full {
         db.purge_injected_messages()?;
         db.mark_schema_current()?;
@@ -668,6 +682,7 @@ fn explicit_reindex_with_writer_permit(
         files_seen,
         sessions_updated,
         effective_full,
+        discovery_warnings,
     })
 }
 
@@ -697,6 +712,7 @@ pub fn reindex(
         ReindexRun::Completed {
             files_seen,
             sessions_updated,
+            ..
         } => Ok((files_seen, sessions_updated)),
         ReindexRun::Cancelled { .. } => unreachable!("the default reindex token never cancels"),
     }
@@ -713,14 +729,18 @@ pub(crate) fn reindex_until(
         return Ok(ReindexRun::Cancelled {
             files_seen: 0,
             sessions_updated: 0,
+            discovery_warnings: Vec::new(),
         });
     }
     let adapters = ProviderSet::new(config);
-    let sources = deduplicate_sources(adapters.discover_enabled(config));
+    let discovery = adapters.discover_enabled(config);
+    let sources = deduplicate_sources(discovery.sources);
+    let discovery_warnings = discovery.warnings;
     if should_cancel() {
         return Ok(ReindexRun::Cancelled {
             files_seen: 0,
             sessions_updated: 0,
+            discovery_warnings,
         });
     }
     let source_reconciliation = source_reconciliation(db, &sources)?;
@@ -728,6 +748,7 @@ pub(crate) fn reindex_until(
         return Ok(ReindexRun::Cancelled {
             files_seen: 0,
             sessions_updated: 0,
+            discovery_warnings,
         });
     }
 
@@ -742,6 +763,7 @@ pub(crate) fn reindex_until(
             return Ok(ReindexRun::Cancelled {
                 files_seen: i,
                 sessions_updated: updated,
+                discovery_warnings,
             });
         }
         let source_path = normalize_path(&source.path);
@@ -852,6 +874,7 @@ pub(crate) fn reindex_until(
         return Ok(ReindexRun::Cancelled {
             files_seen: total,
             sessions_updated: updated,
+            discovery_warnings,
         });
     }
     // Fold the WAL back into the main DB after writing, so the `-wal` file does not accumulate
@@ -870,6 +893,7 @@ pub(crate) fn reindex_until(
     Ok(ReindexRun::Completed {
         files_seen: total,
         sessions_updated: updated,
+        discovery_warnings,
     })
 }
 
@@ -1582,6 +1606,7 @@ mod tests {
         let adapters = ProviderSet::new(&config);
         let source_file = adapters
             .discover_enabled(&config)
+            .sources
             .into_iter()
             .next()
             .unwrap();
@@ -1960,6 +1985,7 @@ mod tests {
             ReindexRun::Cancelled {
                 files_seen: 1,
                 sessions_updated: 1,
+                discovery_warnings: Vec::new(),
             }
         );
     }
@@ -2097,6 +2123,7 @@ mod tests {
         let adapters = ProviderSet::new(&config);
         let source_file = adapters
             .discover_enabled(&config)
+            .sources
             .into_iter()
             .next()
             .unwrap();

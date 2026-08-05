@@ -1611,10 +1611,6 @@ impl Config {
             .collect()
     }
 
-    pub fn codex_home(&self) -> PathBuf {
-        home_dir_fallback().join(".codex")
-    }
-
     pub fn validate(&self) -> Result<()> {
         const FIX: &str = "edit the invalid value in the config file; run `aise config example` \
                            to view the defaults (`aise config init --force` replaces the entire file)";
@@ -2578,6 +2574,10 @@ mod tests {
             DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW
         );
         assert_eq!(cfg.mcp.preview_chars, DEFAULT_MCP_PREVIEW_CHARS);
+        assert_eq!(
+            cfg.mcp.max_tool_result_chars,
+            DEFAULT_MCP_MAX_TOOL_RESULT_CHARS
+        );
         assert_eq!(cfg.mcp.summary_items, DEFAULT_MCP_SUMMARY_ITEMS);
         assert_eq!(
             cfg.mcp.query_max_cell_chars,
@@ -3284,11 +3284,49 @@ mod tests {
     }
 
     #[test]
-    fn explicit_empty_provider_paths_are_not_replaced_by_defaults() {
-        let config: Config =
-            toml::from_str("[providers.codex]\nenabled = true\npaths = []\n").unwrap();
-        assert!(config.providers.codex.paths.is_empty());
-        assert!(!Config::default().providers.codex.paths.is_empty());
+    fn every_provider_preserves_omitted_empty_and_two_root_path_semantics() {
+        fn provider_config(config: &Config, provider: crate::models::Provider) -> &ProviderConfig {
+            match provider {
+                crate::models::Provider::Claude => &config.providers.claude,
+                crate::models::Provider::ClaudeDesktop => &config.providers.claude_desktop,
+                crate::models::Provider::Codex => &config.providers.codex,
+                crate::models::Provider::Cursor => &config.providers.cursor,
+                crate::models::Provider::Antigravity => &config.providers.antigravity,
+                crate::models::Provider::Pi => &config.providers.pi,
+                crate::models::Provider::AiStudio => &config.providers.aistudio,
+                crate::models::Provider::GeminiCli => &config.providers.gemini_cli,
+            }
+        }
+        let defaults = Config::default();
+
+        for provider in crate::source::PROVIDERS {
+            let name = provider.as_str();
+            let omitted: Config =
+                toml::from_str(&format!("[providers.{name}]\nenabled = false\n")).unwrap();
+            assert_eq!(
+                provider_config(&omitted, provider).paths,
+                provider_config(&defaults, provider).paths,
+                "{name}: omitting paths must preserve platform defaults"
+            );
+
+            let empty: Config =
+                toml::from_str(&format!("[providers.{name}]\nenabled = true\npaths = []\n"))
+                    .unwrap();
+            assert!(
+                provider_config(&empty, provider).paths.is_empty(),
+                "{name}: explicit [] must select no roots"
+            );
+
+            let two: Config = toml::from_str(&format!(
+                "[providers.{name}]\nenabled = true\npaths = ['/one', '/two']\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                provider_config(&two, provider).paths,
+                ["/one", "/two"],
+                "{name}: an explicit list must replace defaults without losing order"
+            );
+        }
     }
 
     #[test]

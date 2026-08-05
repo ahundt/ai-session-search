@@ -415,8 +415,8 @@ struct SessionFilterArgs {
     #[arg(long = "session-kind", value_enum)]
     session_kind: Option<SessionKind>,
     /// Session classes to return: user for sessions you started, subagent for runs those
-    /// sessions spawned. Omit for both. Pass subagent to search only delegated work, or user
-    /// to list conversations without the runs beneath them.
+    /// sessions spawned. Omit for both. With --parent-session, use subagent or omit this option;
+    /// user cannot match a spawned run.
     #[arg(
         long = "session-kinds",
         value_enum,
@@ -425,7 +425,8 @@ struct SessionFilterArgs {
         conflicts_with = "session_kind"
     )]
     session_kinds: Vec<SessionKind>,
-    /// Restrict to runs spawned by this exact session id. Omit to include root and spawned runs alike.
+    /// Restrict to runs spawned by this exact session id. Omit to include root and spawned runs
+    /// alike. If a session class is also supplied, it must include subagent.
     #[arg(long = "parent-session")]
     parent_session: Option<String>,
     #[command(flatten)]
@@ -845,6 +846,16 @@ fn execute(cli: Cli) -> Result<()> {
                 "reindex complete: scanned {} files, updated {} sessions",
                 outcome.files_seen, outcome.sessions_updated
             );
+            for warning in &outcome.discovery_warnings {
+                eprintln!(
+                    "aise: discovery warning: {} {} {}: {} {}",
+                    warning.provider,
+                    warning.operation,
+                    warning.path,
+                    warning.message,
+                    warning.guidance
+                );
+            }
             if outcome.effective_full {
                 let allocation = db.storage_allocation()?;
                 if let Some(guidance) = storage_compaction_guidance(allocation) {
@@ -1632,7 +1643,7 @@ fn export_filters_are_empty(filters: &SearchFilters) -> bool {
 
 fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
     let (since, until) = args.dates.resolve_now()?;
-    Ok(SearchFilters {
+    let filters = SearchFilters {
         provider: args.provider,
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         exclude_path_prefixes: args
@@ -1652,7 +1663,9 @@ fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters
         until,
         limit,
         warnings_only: args.warnings_only,
-    })
+    };
+    filters.validate()?;
+    Ok(filters)
 }
 
 fn print_sessions(sessions: &[SessionRecord]) {
@@ -1887,6 +1900,12 @@ fn print_doctor(
         println!("Index refresh next command: {command}");
     }
     println!("Parse warnings indexed: {warnings}");
+    for warning in &diagnostics.discovery_warnings {
+        println!(
+            "Discovery warning: {} {} {}: {} {}",
+            warning.provider, warning.operation, warning.path, warning.message, warning.guidance
+        );
+    }
     for item in health {
         println!("\nProvider: {}", item.provider);
         println!(
@@ -1968,7 +1987,7 @@ struct ConfigPathsReport {
     search_scope: ConfigSearchScopeReport,
     background_refresh_status: PathBuf,
     provider_roots: Vec<ProviderRootsReport>,
-    codex_metadata_home: PathBuf,
+    codex_metadata_homes: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2041,7 +2060,10 @@ fn config_paths_report(
         search_scope,
         background_refresh_status: crate::background_refresh::report_path(config),
         provider_roots,
-        codex_metadata_home: config.codex_home(),
+        codex_metadata_homes: crate::source::provider_roots(config, Provider::Codex)
+            .iter()
+            .map(|root| crate::providers::codex::codex_home_from_session_root(root))
+            .collect(),
     })
 }
 
@@ -2100,18 +2122,54 @@ fn print_config_paths(
             if provider.enabled { "" } else { " (disabled)" }
         )?;
     }
-    writeln!(
-        out,
-        "Codex metadata home: {}",
-        report.codex_metadata_home.display()
-    )?;
+    for line in codex_metadata_home_lines(&report) {
+        writeln!(out, "{line}")?;
+    }
     Ok(())
+}
+
+fn codex_metadata_home_lines(report: &ConfigPathsReport) -> Vec<String> {
+    report
+        .codex_metadata_homes
+        .iter()
+        .map(|home| format!("Codex metadata home: {}", home.display()))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn config_paths_reports_every_root_derived_codex_metadata_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home_a = temp.path().join("home-a");
+        let home_b = temp.path().join("home-b");
+        std::fs::create_dir_all(home_a.join("sessions")).unwrap();
+        std::fs::create_dir_all(home_b.join("sessions")).unwrap();
+        let home_a = std::fs::canonicalize(home_a).unwrap();
+        let home_b = std::fs::canonicalize(home_b).unwrap();
+        let mut config = Config::default();
+        config.providers.codex.paths = vec![
+            home_a.join("sessions").display().to_string(),
+            home_b.join("sessions").display().to_string(),
+        ];
+
+        let report = config_paths_report(&config, &temp.path().join("config.toml")).unwrap();
+
+        assert_eq!(
+            report.codex_metadata_homes,
+            vec![home_a.clone(), home_b.clone()]
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["codex_metadata_homes"],
+            serde_json::json!([home_a, home_b])
+        );
+        assert!(json.get("codex_metadata_home").is_none());
+        assert_eq!(codex_metadata_home_lines(&report).len(), 2);
+    }
 
     fn session_with_raw_metadata() -> SessionRecord {
         SessionRecord {
@@ -2301,6 +2359,25 @@ mod tests {
             filters(&["list", "--parent-session", "claude:abc"]).parent_session_id,
             Some("claude:abc".to_string())
         );
+
+        let cli = Cli::try_parse_from([
+            "aise",
+            "list",
+            "--session-kinds",
+            "user",
+            "--parent-session",
+            "claude:abc",
+        ])
+        .expect("arguments parse before shared semantic validation");
+        let Commands::List(args) = cli.command else {
+            panic!("expected list")
+        };
+        let error = build_filters(&args.filters, 10)
+            .expect_err("a parent cannot have a user-started child session")
+            .to_string();
+        assert!(error.contains("session_kinds"), "{error}");
+        assert!(error.contains("parent_session_id"), "{error}");
+        assert!(error.contains("subagent"), "{error}");
     }
 
     #[test]

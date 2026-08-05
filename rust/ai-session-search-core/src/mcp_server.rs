@@ -2993,9 +2993,27 @@ fn get_index_status_output_schema() -> Value {
             "unindexed_files": { "type": "integer", "minimum": 0, "description": "Discovered files that produced no session at all, so their content is absent from every search result. This is not discovered_files minus indexed_sessions: retained sessions make indexed exceed discovered. Non-zero means the index is incomplete and repair_commands names the repair." },
             "repair_commands": { "type": "array", "description": "Commands applicable to the reported stale schema or discoverable source files; empty means no repair is required.", "items": { "type": "string" } },
             "readiness": index_readiness_output_schema(),
+            "discovery_warnings": { "type": "array", "description": "Non-fatal provider traversal or metadata-sidecar failures. Readable sources remain available.", "items": discovery_warning_output_schema() },
             "providers": { "type": "array", "description": "Discovery, parser, index, and resume status for every supported provider.", "items": provider_health_output_schema() }
         },
-        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "readiness", "providers"],
+        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "readiness", "discovery_warnings", "providers"],
+        "additionalProperties": false
+    })
+}
+
+fn discovery_warning_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "provider": provider_id_output_schema(),
+            "path": { "type": "string" },
+            "operation": { "type": "string" },
+            "message": { "type": "string" },
+            "readable_sources_preserved": { "type": "boolean", "description": "True when other readable sources from this provider remained eligible for indexing despite this failure." },
+            "verification_command": { "type": "string", "description": "Smallest command that verifies current discovery status." },
+            "guidance": { "type": "string", "description": "Shared human-readable preservation and verification guidance." }
+        },
+        "required": ["provider", "path", "operation", "message", "readable_sources_preserved", "verification_command", "guidance"],
         "additionalProperties": false
     })
 }
@@ -5479,7 +5497,7 @@ fn session_kinds_schema() -> Value {
     json!({
         "type": "array",
         "items": { "type": "string", "enum": session_kind_values() },
-        "description": "Which classes of session to return. 'user' is a session a person started; 'subagent' is a run one of those spawned, with parent_session_id naming the spawner and agent_label naming the kind of agent (Explore, general-purpose, a codex agent nickname). Omit for both. Pass ['subagent'] to search only delegated work, or ['user'] to list conversations without the runs beneath them. An empty array matches nothing."
+        "description": "Which classes of session to return. 'user' is a session a person started; 'subagent' is a run one of those spawned, with parent_session_id naming the spawner and agent_label naming the kind of agent (Explore, general-purpose, a codex agent nickname). Omit for both. With parent_session_id, a nonempty set must include 'subagent'. An empty array matches nothing."
     })
 }
 
@@ -5487,7 +5505,7 @@ fn session_kinds_schema() -> Value {
 fn parent_session_id_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Only runs spawned by this exact session, given as that session's id (the `id` field, e.g. 'claude:7e745098-...'). Answers 'what did this session delegate'. Omit to match sessions with any parent or none."
+        "description": "Only runs spawned by this exact session, given as that session's id (the `id` field, e.g. 'claude:7e745098-...'). Answers 'what did this session delegate'. Omit to match sessions with any parent or none. If session_kinds is nonempty, include 'subagent'."
     })
 }
 
@@ -5815,7 +5833,7 @@ fn search_filters_from_args(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<SearchFilters, String> {
     let (since, until) = parse_date_bounds(args, now)?;
-    Ok(SearchFilters {
+    let filters = SearchFilters {
         provider: parse_opt_enum::<Provider>(args, "provider")?,
         path_prefix: args
             .get("path_prefix")
@@ -5838,7 +5856,9 @@ fn search_filters_from_args(
         until,
         limit: mcp_nonnegative_usize_arg(args, "limit", default_limit)?,
         warnings_only: false,
-    })
+    };
+    filters.validate().map_err(|error| error.to_string())?;
+    Ok(filters)
 }
 
 /// Read an optional array-of-enum-names argument.
@@ -6168,7 +6188,11 @@ fn message_search_text_summary(
     };
     let continuation = page.next_offset().map_or_else(
         || "no more results".to_string(),
-        |next_offset| format!("more results: search_messages(offset={next_offset})"),
+        |next_offset| {
+            format!(
+                "more results: repeat the same request with offset={next_offset}; preserve every field in structuredContent.effective_request"
+            )
+        },
     );
     let mut summary = format!(
         "{returned} {noun} at offset {offset}; {continuation}. structuredContent is the authoritative response.\n"
@@ -8509,6 +8533,30 @@ mod tests {
             &db,
         );
         assert_eq!(rejected["result"]["isError"], true);
+    }
+
+    #[test]
+    fn session_tools_reject_user_kind_with_a_parent_as_an_impossible_request() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        for tool in ["list_sessions", "search_sessions"] {
+            let mut arguments = json!({
+                "session_kinds": ["user"],
+                "parent_session_id": "claude:test1"
+            });
+            if tool == "search_sessions" {
+                arguments["query"] = json!("hello");
+            }
+            let response = call_tool(tool, arguments, &config, &db);
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let error = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text error");
+            assert!(error.contains("session_kinds"), "{tool}: {error}");
+            assert!(error.contains("parent_session_id"), "{tool}: {error}");
+            assert!(error.contains("subagent"), "{tool}: {error}");
+        }
     }
 
     #[test]
@@ -13436,6 +13484,44 @@ mod tests {
         assert_ne!(
             first["results"], second["results"],
             "following next_offset returned the same page"
+        );
+    }
+
+    #[test]
+    fn pagination_text_preserves_the_typed_request_instead_of_inventing_a_partial_call() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let response = tool_search_messages(
+            &json!({
+                "query": "hello",
+                "limit": 1,
+                "provider": "claude",
+                "lines_per_message": 1,
+            }),
+            &config,
+            &db,
+        )
+        .expect("search succeeds");
+
+        assert!(
+            response
+                .text
+                .contains("repeat the same request with offset="),
+            "continuation must preserve every query, filter, presentation, and paging field: {}",
+            response.text
+        );
+        assert!(
+            response
+                .text
+                .contains("structuredContent.effective_request"),
+            "continuation must point at the typed request owner: {}",
+            response.text
+        );
+        assert!(
+            !response.text.contains("search_messages(offset="),
+            "a partial call is executable-looking but changes the search: {}",
+            response.text
         );
     }
 

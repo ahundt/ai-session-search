@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::models::{ParsedSession, Provider, SourceFile};
 use crate::providers::snapshot::{parsed_session, source_file, SnapshotMetadata, Turn};
+use crate::providers::{walk_roots, ProviderDiscovery};
 use crate::util::minimal_record;
 
 pub struct AiStudioAdapter {
@@ -21,30 +22,29 @@ impl AiStudioAdapter {
     }
 
     pub fn discover(&self) -> Vec<SourceFile> {
+        self.discover_with_warnings().sources
+    }
+
+    pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut sources = Vec::new();
-        for root in &self.roots {
-            let Ok(entries) = fs::read_dir(root) else {
+        let walked = walk_roots(&self.roots, Some(1));
+        for entry in walked.entries {
+            let path = &entry.path;
+            let supported = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("md")
+                });
+            if !supported || !entry.metadata.is_file() {
                 continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let supported = path
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|extension| {
-                        extension.eq_ignore_ascii_case("json")
-                            || extension.eq_ignore_ascii_case("md")
-                    });
-                if !supported || !path.is_file() {
-                    continue;
-                }
-                if let Ok(metadata) = entry.metadata() {
-                    sources.push(source_file(Provider::AiStudio, path, &metadata));
-                }
             }
+            sources.push(source_file(Provider::AiStudio, entry.path, &entry.metadata));
         }
-        sources.sort_by(|left, right| left.path.cmp(&right.path));
-        sources
+        ProviderDiscovery {
+            sources,
+            warnings: walked.warnings,
+        }
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {

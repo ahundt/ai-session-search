@@ -29,6 +29,7 @@
 //! --restore` never overwrites: it writes to a
 //! collision-safe `<stem>.recovered[.ext]` sibling.
 
+use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -44,12 +45,95 @@ use crate::models::{
 };
 use crate::render::{render, OutputFormat, Row};
 
+pub(crate) type FileMutationPayload = (String, Option<String>, Vec<EditOp>);
+
+#[derive(Default)]
+pub(crate) struct PendingFileMutations {
+    // One parse owns this O(P) state, where P is unresolved mutation calls. Stage/finish are
+    // average O(1); dropping the tracker at EOF discards every outcome that was never proven.
+    by_call_id: HashMap<String, PendingFileMutation>,
+    next_seq: i64,
+}
+
+struct PendingFileMutation {
+    ts: Option<chrono::DateTime<chrono::Utc>>,
+    tool: String,
+    payloads: Vec<FileMutationPayload>,
+}
+
+impl PendingFileMutations {
+    pub(crate) fn stage(
+        &mut self,
+        call_id: Option<&str>,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+        tool: &str,
+        payload: Option<FileMutationPayload>,
+    ) {
+        let Some(payload) = payload else {
+            return;
+        };
+        self.stage_many(call_id, ts, tool, vec![payload]);
+    }
+
+    pub(crate) fn stage_many(
+        &mut self,
+        call_id: Option<&str>,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+        tool: &str,
+        payloads: Vec<FileMutationPayload>,
+    ) {
+        let Some(call_id) = call_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if payloads.is_empty() {
+            return;
+        }
+        self.by_call_id.insert(
+            call_id.to_string(),
+            PendingFileMutation {
+                ts,
+                tool: tool.to_string(),
+                payloads,
+            },
+        );
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        call_id: Option<&str>,
+        succeeded: bool,
+        out: &mut Vec<FileEdit>,
+    ) {
+        let Some(call_id) = call_id else {
+            return;
+        };
+        let Some(pending) = self.by_call_id.remove(call_id) else {
+            return;
+        };
+        if !succeeded {
+            return;
+        }
+        for (file_path, new_content, edits) in pending.payloads {
+            out.push(FileEdit {
+                seq: self.next_seq,
+                ts: pending.ts,
+                tool: pending.tool.clone(),
+                file_name: crate::util::file_basename(&file_path),
+                file_path,
+                new_content,
+                edits,
+            });
+            self.next_seq += 1;
+        }
+    }
+}
+
 /// Reconstruct a file's content as of 1-based `version` by replaying edits forward
 /// from the most recent full `Write` snapshot at or before the target.
 ///
 /// Returns `None` when no complete replay path exists at `version` or when `version` is out of
-/// range. A path-only edit invalidates known content until a later full snapshot. Missing
-/// `old_string`s in an otherwise replayable delta are skipped best-effort (tolerant replay).
+/// range. A path-only edit or replay mismatch invalidates known content until a later full
+/// snapshot; recovery never invents a successful file state from an unapplied mutation.
 pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
     if version == 0 || version > edits.len() {
         return None;
@@ -66,22 +150,24 @@ pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
     content
 }
 
-/// Apply replacements in order. A `replace_all` op replaces every occurrence; otherwise
-/// only the first (== only, for a unique non-`replace_all` Edit). Empty and not-found
-/// `old` strings are skipped (best-effort).
-fn apply_edits(content: &mut String, edits: &[EditOp]) {
+/// Apply replacements in order. Returns false when any requested replacement cannot be replayed.
+fn apply_edits(content: &mut String, edits: &[EditOp]) -> bool {
     for op in edits {
         if op.old.is_empty() {
-            continue;
+            return false;
         }
         if op.replace_all {
-            if content.contains(op.old.as_str()) {
-                *content = content.replace(op.old.as_str(), &op.new);
+            if !content.contains(op.old.as_str()) {
+                return false;
             }
+            *content = content.replace(op.old.as_str(), &op.new);
         } else if let Some(pos) = content.find(op.old.as_str()) {
             content.replace_range(pos..pos + op.old.len(), &op.new);
+        } else {
+            return false;
         }
     }
+    true
 }
 
 /// Advance one reconstruction state without inventing bytes for an unreplayable event.
@@ -89,10 +175,12 @@ fn apply_edits(content: &mut String, edits: &[EditOp]) {
 fn advance_reconstruction(content: &mut Option<String>, edit: &FileEdit) {
     if let Some(full) = &edit.new_content {
         *content = Some(full.clone());
-    } else if edit.edits.is_empty() {
+    } else if edit.edits.is_empty()
+        || !content
+            .as_mut()
+            .is_some_and(|current| apply_edits(current, &edit.edits))
+    {
         *content = None;
-    } else if let Some(current) = content.as_mut() {
-        apply_edits(current, &edit.edits);
     }
 }
 
@@ -1418,10 +1506,13 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_missing_old_string_is_skipped() {
+    fn reconstruct_missing_old_string_invalidates_until_the_next_full_snapshot() {
         let edits = vec![write(0, "a\nb"), edit(1, &[("zzz", "Z")])];
-        // 'zzz' not present → edit is a no-op, content unchanged.
-        assert_eq!(reconstruct(&edits, 2).as_deref(), Some("a\nb"));
+        assert_eq!(
+            reconstruct(&edits, 2),
+            None,
+            "a replay mismatch must not publish bytes that were never proven to exist"
+        );
     }
 
     #[test]

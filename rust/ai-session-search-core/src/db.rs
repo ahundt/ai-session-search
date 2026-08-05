@@ -1633,7 +1633,12 @@ impl Db {
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    Provider::from_db_str(&row.get::<_, String>(0)?),
+                    decode_db_enum(
+                        row.get::<_, String>(0)?,
+                        0,
+                        "sessions.provider",
+                        Provider::from_db_str,
+                    )?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)? as usize,
                     row.get::<_, String>(3)?,
@@ -3377,7 +3382,7 @@ impl Db {
             message_id: i64,
             session_id: String,
             message_seq: i64,
-            provider: String,
+            provider: Provider,
             ts: Option<String>,
             content: String,
             // (absolute start character, start byte, end byte) into `content`.
@@ -3451,7 +3456,12 @@ impl Db {
                         message_id: row.get(0)?,
                         session_id: row.get(1)?,
                         message_seq: row.get(2)?,
-                        provider: row.get(3)?,
+                        provider: decode_db_enum(
+                            row.get::<_, String>(3)?,
+                            3,
+                            "messages.provider",
+                            Provider::from_db_str,
+                        )?,
                         ts: row.get(4)?,
                         content: row.get(5)?,
                         human_parts: (authorship == "mixed").then(Vec::new),
@@ -3547,7 +3557,7 @@ impl Db {
             Some(MessageClassificationMatch {
                 session_id,
                 message_seq,
-                provider: Provider::from_db_str(&provider),
+                provider,
                 ts,
                 policy_name: identity.name.clone(),
                 category: hit.category.to_string(),
@@ -3759,7 +3769,12 @@ impl Db {
                 Ok(FileCrossRef {
                     file_path: row.get(0)?,
                     session_id: row.get(1)?,
-                    provider: Provider::from_db_str(&provider),
+                    provider: decode_db_enum(
+                        provider,
+                        2,
+                        "file_edits.provider",
+                        Provider::from_db_str,
+                    )?,
                     edits: row.get(3)?,
                 })
             })?
@@ -3868,7 +3883,7 @@ impl Db {
             };
             out.push((
                 session_id,
-                Provider::from_db_str(&provider),
+                decode_db_enum(provider, 1, "file_edits.provider", Provider::from_db_str)?,
                 FileEdit {
                     seq,
                     ts: ts.as_deref().and_then(crate::util::parse_datetime),
@@ -4384,14 +4399,17 @@ impl Db {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .filter_map(|(provider, parse_version, source_path)| {
-                let provider = Provider::from_db_str(&provider);
+                let provider =
+                    match decode_db_enum(provider, 0, "sessions.provider", Provider::from_db_str) {
+                        Ok(provider) => provider,
+                        Err(error) => return Some(Err(error.into())),
+                    };
                 (parse_version != crate::util::provider_parse_version(provider))
-                    .then_some((provider, source_path))
+                    .then_some(Ok((provider, source_path)))
             })
-            .collect())
+            .collect()
     }
 
     pub fn session_time_profile(&self, session_id: &str) -> Result<SessionTimeProfile> {
@@ -5281,13 +5299,45 @@ fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
     row_to_message_hit_at(row, 0)
 }
 
+fn decode_db_enum<T>(
+    value: String,
+    column_index: usize,
+    context: &'static str,
+    decode: impl FnOnce(&str) -> std::result::Result<T, String>,
+) -> rusqlite::Result<T> {
+    decode(&value).map_err(|reason| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column_index,
+            rusqlite::types::Type::Text,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{reason} while reading {context}; stop AISE processes, then run \
+                     `aise reindex --full` and retry"
+                ),
+            )
+            .into(),
+        )
+    })
+}
+
 fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<MessageHit> {
     let ts: Option<String> = row.get(offset + 4)?;
     Ok(MessageHit {
         session_id: row.get(offset)?,
-        provider: Provider::from_db_str(&row.get::<_, String>(offset + 1)?),
+        provider: decode_db_enum(
+            row.get::<_, String>(offset + 1)?,
+            offset + 1,
+            "messages.provider",
+            Provider::from_db_str,
+        )?,
         seq: row.get(offset + 2)?,
-        role: Role::from_db_str(&row.get::<_, String>(offset + 3)?),
+        role: decode_db_enum(
+            row.get::<_, String>(offset + 3)?,
+            offset + 3,
+            "messages.role",
+            Role::from_db_str,
+        )?,
         ts: ts.and_then(|value| {
             chrono::DateTime::parse_from_rfc3339(&value)
                 .ok()
@@ -5503,9 +5553,7 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
     let provider: String = row.get(1)?;
     Ok(SessionRecord {
         id: row.get(0)?,
-        provider: provider
-            .parse()
-            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        provider: decode_db_enum(provider, 1, "sessions.provider", Provider::from_db_str)?,
         provider_session_id: row.get(2)?,
         title: row.get(3)?,
         summary: row.get(4)?,
@@ -5542,6 +5590,32 @@ mod tests {
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
+
+    #[test]
+    fn message_row_rejects_corrupt_provider_and_role_with_recovery_context() {
+        let connection = Connection::open_in_memory().unwrap();
+        for (provider, role, bad_value, column) in [
+            (
+                "not-a-provider",
+                "user",
+                "not-a-provider",
+                "messages.provider",
+            ),
+            ("claude", "not-a-role", "not-a-role", "messages.role"),
+        ] {
+            let error = connection
+                .query_row(
+                    "select 'session', ?1, 0, ?2, null, null, 'conversation', null, 'content'",
+                    params![provider, role],
+                    row_to_message_hit,
+                )
+                .unwrap_err();
+            let error = error.to_string();
+            assert!(error.contains(bad_value), "{error}");
+            assert!(error.contains(column), "{error}");
+            assert!(error.contains("aise reindex --full"), "{error}");
+        }
+    }
 
     /// A one-policy set built from ad-hoc `(category, [patterns])` pairs.
     ///

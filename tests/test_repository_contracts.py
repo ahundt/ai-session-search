@@ -269,11 +269,11 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     installation = (ROOT / "docs/development/installation.md").read_text(encoding="utf-8")
     assert "legacy VS Code extension adapter" in installation
     assert "does not install" in installation and "hooks" in installation
-    assert "ChatGPT/Codex App and Codex CLI/IDE" in installation
+    assert "ChatGPT Codex desktop" in installation
     assert "~/.gemini/config/mcp_config.json" in installation
     assert "~/.gemini/antigravity-cli/skills/" in installation
     assert "toml_edit::DocumentMut" in configuration
-    assert "ChatGPT/Codex App and Codex CLI/IDE" in configuration
+    assert "ChatGPT Codex desktop" in configuration
     assert "~/.gemini/config/mcp_config.json" in configuration
     assert "~/.gemini/antigravity-cli/skills/" in configuration
     assert "shared RAII lock" in readme
@@ -283,6 +283,10 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "rust/ai-session-search-core/" in architecture
     assert "Target `abi3-py312` only after" not in architecture
     assert "additionalProperties=false" in parity
+    requirements = (ROOT / "docs/development/maintainer-requirements-and-design-decisions.md").read_text(
+        encoding="utf-8"
+    )
+    assert "peak growth is `O(B_session)`" in requirements
 
 
 def test_message_query_docs_distinguish_query_field_from_tool_filter() -> None:

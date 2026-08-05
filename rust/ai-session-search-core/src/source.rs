@@ -14,6 +14,7 @@ use crate::models::{Provider, SourceFile};
 use crate::providers::{
     aistudio::AiStudioAdapter, antigravity::AntigravityAdapter, claude::ClaudeAdapter,
     codex::CodexAdapter, cursor::CursorAdapter, gemini_cli::GeminiCliAdapter, pi::PiAdapter,
+    ProviderDiscovery,
 };
 use crate::util::normalize_path;
 
@@ -68,11 +69,32 @@ pub struct ProviderSourceStatus {
     pub roots: Vec<String>,
     /// Number of files currently discoverable beneath `roots`.
     pub discovered_files: usize,
+    /// Non-fatal discovery failures. Readable sources remain available when this is non-empty.
+    pub warnings: Vec<ProviderDiscoveryWarning>,
+}
+
+/// One non-fatal filesystem or provider-sidecar discovery failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderDiscoveryWarning {
+    pub provider: Provider,
+    pub path: String,
+    pub operation: String,
+    pub message: String,
+    pub readable_sources_preserved: bool,
+    pub verification_command: String,
+    pub guidance: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryResult {
+    pub(crate) sources: Vec<SourceFile>,
+    pub(crate) warnings: Vec<ProviderDiscoveryWarning>,
 }
 
 pub(crate) struct SourceInventory {
     pub(crate) providers: Vec<ProviderSourceStatus>,
     pub(crate) discovered: HashSet<(Provider, String)>,
+    pub(crate) warnings: Vec<ProviderDiscoveryWarning>,
 }
 
 pub(crate) struct ProviderSet {
@@ -91,7 +113,7 @@ impl ProviderSet {
         Self {
             claude: ClaudeAdapter::new(provider_roots(config, Provider::Claude)),
             claude_desktop: ClaudeAdapter::new(provider_roots(config, Provider::ClaudeDesktop)),
-            codex: CodexAdapter::new(provider_roots(config, Provider::Codex), config.codex_home()),
+            codex: CodexAdapter::new(provider_roots(config, Provider::Codex)),
             cursor: CursorAdapter::new(provider_roots(config, Provider::Cursor)),
             antigravity: AntigravityAdapter::new(provider_roots(config, Provider::Antigravity)),
             pi: PiAdapter::new(provider_roots(config, Provider::Pi)),
@@ -118,34 +140,102 @@ impl ProviderSet {
         }
     }
 
-    pub(crate) fn discover_enabled(&self, config: &Config) -> Vec<SourceFile> {
-        let mut sources = Vec::new();
+    pub(crate) fn discover_enabled(&self, config: &Config) -> DiscoveryResult {
+        let mut discovered = DiscoveryResult::default();
         if config.providers.claude.enabled {
-            sources.extend(self.claude.discover());
+            discovered.extend_provider(Provider::Claude, self.claude.discover_with_warnings());
         }
         if config.providers.claude_desktop.enabled {
-            sources.extend(self.claude_desktop.discover());
+            discovered.extend_provider(
+                Provider::ClaudeDesktop,
+                self.claude_desktop.discover_with_warnings(),
+            );
         }
         if config.providers.codex.enabled {
-            sources.extend(self.codex.discover());
+            discovered.extend_provider(Provider::Codex, self.codex.discover_with_warnings());
         }
         if config.providers.cursor.enabled {
-            sources.extend(self.cursor.discover());
+            discovered.extend_provider(Provider::Cursor, self.cursor.discover_with_warnings());
         }
         if config.providers.antigravity.enabled {
-            sources.extend(self.antigravity.discover());
+            discovered.extend_provider(
+                Provider::Antigravity,
+                self.antigravity.discover_with_warnings(),
+            );
         }
         if config.providers.pi.enabled {
-            sources.extend(self.pi.discover());
+            discovered.extend_provider(Provider::Pi, self.pi.discover_with_warnings());
         }
         if config.providers.aistudio.enabled {
-            sources.extend(self.aistudio.discover());
+            discovered.extend_provider(Provider::AiStudio, self.aistudio.discover_with_warnings());
         }
         if config.providers.gemini_cli.enabled {
-            sources.extend(self.gemini_cli.discover());
+            discovered.extend_provider(
+                Provider::GeminiCli,
+                self.gemini_cli.discover_with_warnings(),
+            );
         }
-        sources
+        deduplicate_warnings(&mut discovered.warnings);
+        discovered
     }
+}
+
+impl DiscoveryResult {
+    fn extend_provider(&mut self, provider: Provider, discovered: ProviderDiscovery) {
+        let readable_sources_preserved = !discovered.sources.is_empty();
+        self.warnings
+            .extend(discovered.warnings.into_iter().map(|warning| {
+                let verification_command = "aise doctor --format json".to_string();
+                ProviderDiscoveryWarning {
+                    provider,
+                    path: normalize_path(&warning.path),
+                    operation: warning.operation.to_string(),
+                    message: warning.message,
+                    readable_sources_preserved,
+                    guidance: discovery_warning_guidance(
+                        readable_sources_preserved,
+                        &verification_command,
+                    ),
+                    verification_command,
+                }
+            }));
+        let mut seen = self
+            .sources
+            .iter()
+            .map(source_identity)
+            .collect::<HashSet<_>>();
+        for source in discovered.sources {
+            if seen.insert(source_identity(&source)) {
+                self.sources.push(source);
+            }
+        }
+    }
+}
+
+fn discovery_warning_guidance(preserved: bool, verification_command: &str) -> String {
+    let preservation = if preserved {
+        "Readable sources from this provider were preserved for indexing."
+    } else {
+        "No readable sources from this provider were discovered."
+    };
+    format!("{preservation} Run `{verification_command}` to verify discovery status.")
+}
+
+fn source_identity(source: &SourceFile) -> (Provider, String) {
+    let path = std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
+    (source.provider, normalize_path(&path))
+}
+
+fn deduplicate_warnings(warnings: &mut Vec<ProviderDiscoveryWarning>) {
+    let mut seen = HashSet::new();
+    warnings.retain(|warning| {
+        seen.insert((
+            warning.provider,
+            warning.path.clone(),
+            warning.operation.clone(),
+            warning.message.clone(),
+        ))
+    });
 }
 
 /// Discover enabled providers and report every provider's effective configuration.
@@ -154,7 +244,7 @@ pub fn inventory(config: &Config) -> Vec<ProviderSourceStatus> {
 }
 
 pub(crate) fn inventory_snapshot(config: &Config) -> SourceInventory {
-    let discovered = ProviderSet::new(config).discover_enabled(config);
+    let DiscoveryResult { sources, warnings } = ProviderSet::new(config).discover_enabled(config);
     let providers = PROVIDERS
         .into_iter()
         .map(|provider| ProviderSourceStatus {
@@ -164,19 +254,25 @@ pub(crate) fn inventory_snapshot(config: &Config) -> SourceInventory {
                 .into_iter()
                 .map(|path| normalize_path(&path))
                 .collect(),
-            discovered_files: discovered
+            discovered_files: sources
                 .iter()
                 .filter(|source| source.provider == provider)
                 .count(),
+            warnings: warnings
+                .iter()
+                .filter(|warning| warning.provider == provider)
+                .cloned()
+                .collect(),
         })
         .collect();
-    let discovered = discovered
+    let discovered = sources
         .into_iter()
         .map(|source| (source.provider, normalize_path(&source.path)))
         .collect();
     SourceInventory {
         providers,
         discovered,
+        warnings,
     }
 }
 
@@ -306,7 +402,7 @@ mod tests {
     #[test]
     fn inventory_canonicalizes_alias_roots_before_discovery() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("aistudio");
+        let root = dir.path().join("claude");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("chat.json"), "{}").unwrap();
         let mut config = Config::default();
@@ -324,5 +420,168 @@ mod tests {
 
         assert_eq!(status.roots.len(), 1);
         assert_eq!(status.discovered_files, 1);
+    }
+
+    #[test]
+    fn discovery_deduplicates_alias_sources_in_first_encounter_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("aistudio");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.json");
+        let second = root.join("second.json");
+        std::fs::write(&first, "{}").unwrap();
+        std::fs::write(&second, "{}").unwrap();
+        let first = std::fs::canonicalize(first).unwrap();
+        let second = std::fs::canonicalize(second).unwrap();
+        let mut config = Config::default();
+        disable_all(&mut config);
+        config.providers.aistudio.enabled = true;
+        config.providers.aistudio.paths = vec![
+            root.to_string_lossy().into_owned(),
+            root.join(".").to_string_lossy().into_owned(),
+        ];
+
+        let discovered = ProviderSet::new(&config).discover_enabled(&config);
+
+        assert_eq!(discovered.sources.len(), 2);
+        assert_eq!(discovered.sources[0].path, first);
+        assert_eq!(discovered.sources[1].path, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_keeps_readable_sources_and_reports_denied_subtrees() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("aistudio");
+        let denied = root.join("denied");
+        std::fs::create_dir_all(&denied).unwrap();
+        let readable = root.join("readable.jsonl");
+        std::fs::write(&readable, "{}").unwrap();
+        let readable = std::fs::canonicalize(readable).unwrap();
+        std::fs::write(denied.join("hidden.jsonl"), "{}").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut config = Config::default();
+        disable_all(&mut config);
+        config.providers.claude.enabled = true;
+        config.providers.claude.paths = vec![root.to_string_lossy().into_owned()];
+
+        let discovered = ProviderSet::new(&config).discover_enabled(&config);
+
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(discovered
+            .sources
+            .iter()
+            .any(|source| source.path == readable));
+        assert!(discovered.warnings.iter().any(|warning| {
+            warning.provider == Provider::Claude
+                && warning.path.contains("denied")
+                && warning.operation == "traverse"
+                && warning.readable_sources_preserved
+                && warning.verification_command == "aise doctor --format json"
+                && warning.guidance.contains("preserved for indexing")
+        }));
+    }
+
+    #[test]
+    fn missing_discovery_roots_remain_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        disable_all(&mut config);
+        config.providers.aistudio.enabled = true;
+        config.providers.aistudio.paths = vec![dir.path().join("absent").display().to_string()];
+
+        let discovered = ProviderSet::new(&config).discover_enabled(&config);
+
+        assert!(discovered.sources.is_empty());
+        assert!(discovered.warnings.is_empty());
+    }
+
+    fn provider_fixture_path(
+        provider: Provider,
+        root: &std::path::Path,
+        label: &str,
+    ) -> std::path::PathBuf {
+        let path = match provider {
+            Provider::Claude => root.join(format!("{label}.jsonl")),
+            Provider::ClaudeDesktop => root
+                .join("local-agent-mode-sessions")
+                .join(format!("local_{label}"))
+                .join("audit.jsonl"),
+            Provider::Codex => root.join(format!(
+                "rollout-2026-08-04T00-00-00-019efd97-d602-7922-89dd-46727210650{}.jsonl",
+                if label == "first" { "5" } else { "6" }
+            )),
+            Provider::Cursor => root
+                .join("agent-transcripts")
+                .join(format!("{label}.jsonl")),
+            Provider::Antigravity => root
+                .join(label)
+                .join(".system_generated/logs/transcript.jsonl"),
+            Provider::Pi => root.join(label).join(format!("{label}.jsonl")),
+            Provider::AiStudio => root.join(format!("{label}.json")),
+            Provider::GeminiCli => root
+                .join(label)
+                .join("chats")
+                .join(format!("session-{label}.json")),
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        path
+    }
+
+    #[test]
+    fn every_provider_discovers_two_root_ordered_union_once() {
+        for provider in PROVIDERS {
+            let dir = tempfile::tempdir().unwrap();
+            // Deliberately reverse lexical order: first encounter, not sorting, is canonical.
+            let first_root = dir.path().join("z-first");
+            let second_root = dir.path().join("a-second");
+            std::fs::create_dir_all(&first_root).unwrap();
+            std::fs::create_dir_all(&second_root).unwrap();
+            let first =
+                std::fs::canonicalize(provider_fixture_path(provider, &first_root, "first"))
+                    .unwrap();
+            let second =
+                std::fs::canonicalize(provider_fixture_path(provider, &second_root, "second"))
+                    .unwrap();
+            let paths = vec![
+                first_root.display().to_string(),
+                first_root.join(".").display().to_string(),
+                second_root.display().to_string(),
+            ];
+            let mut config = Config::default();
+            disable_all(&mut config);
+            let provider_config = match provider {
+                Provider::Claude => &mut config.providers.claude,
+                Provider::ClaudeDesktop => &mut config.providers.claude_desktop,
+                Provider::Codex => &mut config.providers.codex,
+                Provider::Cursor => &mut config.providers.cursor,
+                Provider::Antigravity => &mut config.providers.antigravity,
+                Provider::Pi => &mut config.providers.pi,
+                Provider::AiStudio => &mut config.providers.aistudio,
+                Provider::GeminiCli => &mut config.providers.gemini_cli,
+            };
+            provider_config.enabled = true;
+            provider_config.paths = paths;
+
+            let discovered = ProviderSet::new(&config).discover_enabled(&config);
+
+            assert!(
+                discovered.warnings.is_empty(),
+                "{provider}: {:?}",
+                discovered.warnings
+            );
+            assert_eq!(
+                discovered
+                    .sources
+                    .iter()
+                    .map(|source| (source.provider, source.path.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(provider, first), (provider, second)],
+                "{provider} must preserve configured-root encounter order and dedupe aliases"
+            );
+        }
     }
 }

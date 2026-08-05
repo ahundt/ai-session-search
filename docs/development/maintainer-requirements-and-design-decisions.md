@@ -169,7 +169,7 @@ a timeless latency guarantee.
 
 | Key surface | Current time bound | Current peak/retained memory | Latency, output, and regression guard |
 | --- | --- | --- | --- |
-| Provider discovery and indexing | Discovery `O(F)`; incremental parse/index `O(B_new)`; full rebuild `O(B_all)` | Streaming JSONL parse is `O(longest line + parser state)`; custom trigram rebuild is currently `O(B + P)` | Benchmark cold and incremental refresh separately. Trigram rebuild materializes all message content and postings and is the main known peak-memory cliff. |
+| Provider discovery and indexing | Discovery `O(F)`; incremental parse/index `O(B_new)`; full rebuild `O(B_all)` | Discovery retains `O(F)` source metadata. A full provider parse currently retains normalized messages, transcript lines, file edits, and the joined transcript for one source, so peak growth is `O(B_session)`; custom trigram rebuild is `O(B + P)`. | Benchmark cold and incremental refresh separately. The existing 40 MiB fixture guards full versus incremental time. Measure peak RSS and cancellation latency before claiming a lower parser bound; trigram rebuild remains another known peak-memory cliff. |
 | Session list, resolve, and focused read | Favorable indexed list `O(log N + O + K)` because current paging uses SQL `OFFSET`; zero-limit list `O(N)`; focused read `O(log M + K)` after resolution; current partial-ID resolution `O(N)` | `O(K + D_K)` returned rows plus SQLite cache | Do not call list paging keyset-based. Track offset skipping and the known case-insensitive `LIKE` session-resolution scan; never hide either behind a small output page. |
 | Exact and regex message search | Indexed safe candidates plus authoritative verification `O(C + verified bytes)`; unsafe/no-literal regex worst case `O(B)` | Finite page `O(W + D_W + evidence bytes)`; explicit all-results `O(N + D_K + evidence bytes)` | Row-count bounds alone do not bound retained text bytes. Tool-argument exact/regex currently parses every filtered JSON payload. Context is fetched for retained hits in one batched statement, not N+1 queries. |
 | Fuzzy message search | `O(B + N + W log W)` | `O(D_A + D_W + J × D_max + evidence bytes)`; retained row count is corpus-independent for finite `W`, but text bytes are not | Score the complete eligible corpus, compact retained top-K deterministically, and reject unbounded fuzzy requests. Benchmark exact/regex/fuzzy across content, tool name, and tool arguments, including giant rows. |
@@ -415,7 +415,7 @@ Do not claim end-to-end support from a configured JSON key or an MCP handshake a
 | --- | --- | --- | --- |
 | Claude Code | `~/.claude.json`; legacy `~/.claude/.mcp.json` | `~/.claude/skills` | `~/.claude/CLAUDE.md` |
 | Claude Desktop local agent | platform Claude `claude_desktop_config.json` | shared Claude behavior where supported | Claude guidance |
-| ChatGPT/Codex App, Codex CLI, IDE | shared `~/.codex/config.toml` | `~/.agents/skills` | `~/.codex/AGENTS.md` |
+| ChatGPT Codex desktop and Codex CLI/IDE | shared `~/.codex/config.toml` | `~/.agents/skills` | `~/.codex/AGENTS.md` |
 | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/skills` | `~/.gemini/GEMINI.md` |
 | Antigravity App/IDE/current CLI | `~/.gemini/config/mcp_config.json` | App/IDE: `~/.gemini/config/skills`; CLI: `~/.gemini/antigravity-cli/skills` | shared `~/.gemini/GEMINI.md` |
 | Antigravity compatibility | `~/.gemini/antigravity-cli/settings.json`; `~/.gemini/antigravity/mcp_config.json` | tested compatibility roots only | no duplicate instruction file |
@@ -425,7 +425,7 @@ instruction filename for every harness.
 
 ### REQ020-normalize-provider-records
 
-Claude Code, Claude Desktop local agent, Codex App/CLI/IDE, Cursor, Antigravity App/IDE/CLI, Pi,
+Claude Code, Claude Desktop local agent, ChatGPT Codex desktop and Codex CLI/IDE, Cursor, Antigravity App/IDE/CLI, Pi,
 Google AI Studio, and Gemini CLI local transcripts normalize into the shared session/message model.
 List, show, search, message reads, export, analysis, Python, Rust, CLI, and MCP must operate on those
 canonical records rather than adapter-specific response models.

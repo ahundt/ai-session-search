@@ -127,7 +127,7 @@ The `corrections/` package contains `SKILL.md`, adjacent `capability.toml` with 
 `message-classification` rules executed by `aise skills corrections`, and
 `references/message-classification.md`. Harness-native discovery links point to the canonical
 packages from `~/.claude/skills/` (Claude Code CLI/Desktop),
-`~/.agents/skills/` (ChatGPT/Codex App and Codex CLI/IDE),
+`~/.agents/skills/` (ChatGPT Codex desktop and Codex CLI/IDE),
 `~/.gemini/skills/` (Gemini), `~/.gemini/config/skills/` (Antigravity
 App/IDE), and `~/.gemini/antigravity-cli/skills/` (Antigravity CLI). Selecting several
 harnesses keeps every selected discovery directory; shared destinations are deduplicated. Use
@@ -316,8 +316,8 @@ Zed, OpenCode, Codex TOML, Claude Markdown, Gemini/Antigravity Markdown,
 `AGENTS.md`, and recovery receipt locations; those flags configure
 integrations, not package ownership.
 
-The integration acceptance matrix covers Claude Code/Desktop, ChatGPT/Codex
-App and Codex CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, Cursor,
+The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desktop and Codex
+CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, Cursor,
 Windsurf, VS Code, Zed, **OpenCode**, OpenClaw, and the legacy KiloCode
 adapter. Antigravity App/IDE and CLI share the current
 `~/.gemini/config/mcp_config.json`; the installer also maintains the two

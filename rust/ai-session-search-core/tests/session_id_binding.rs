@@ -96,7 +96,7 @@ fn codex_forked_rollouts_each_keep_a_distinct_session_id() {
         owners.insert(fork_path, fork);
     }
 
-    let adapter = CodexAdapter::new(vec![root], temp.path().join("nonexistent-home"));
+    let adapter = CodexAdapter::new(vec![root]);
     let sources = adapter.discover();
     assert_eq!(sources.len(), 3);
     // Owner comes from the write-side map above, not from re-parsing the filename, so the

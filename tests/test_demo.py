@@ -224,27 +224,43 @@ def _subagent_msg(parent_session_id: str, agent_id: str, role: str, content,
 
 def _tool_write(session_id: str, timestamp: str, file_path: str, content: str,
                 cwd: str | None = None) -> str:
-    """Build an assistant JSONL record containing a Write tool call."""
+    """Build a Write call followed by its correlated successful result."""
     _id = hashlib.md5(f"{session_id}{timestamp}{file_path}".encode()).hexdigest()[:8]
-    return _msg(
+    call_id = f"t-{_id}"
+    call = _msg(
         session_id, "assistant",
-        [{"type": "tool_use", "id": f"t-{_id}", "name": "Write",
+        [{"type": "tool_use", "id": call_id, "name": "Write",
           "input": {"file_path": file_path, "content": content}}],
         timestamp, cwd,
     )
+    result = _msg(
+        session_id, "user",
+        [{"type": "tool_result", "tool_use_id": call_id,
+          "content": "written", "is_error": False}],
+        timestamp, cwd,
+    )
+    return f"{call}\n{result}"
 
 
 def _tool_edit(session_id: str, timestamp: str, file_path: str,
                old_string: str, new_string: str, cwd: str | None = None) -> str:
-    """Build an assistant JSONL record containing an Edit tool call."""
+    """Build an Edit call followed by its correlated successful result."""
     _id = hashlib.md5(f"{session_id}{timestamp}{file_path}edit".encode()).hexdigest()[:8]
-    return _msg(
+    call_id = f"t-{_id}"
+    call = _msg(
         session_id, "assistant",
-        [{"type": "tool_use", "id": f"t-{_id}", "name": "Edit",
+        [{"type": "tool_use", "id": call_id, "name": "Edit",
           "input": {"file_path": file_path,
                     "old_string": old_string, "new_string": new_string}}],
         timestamp, cwd,
     )
+    result = _msg(
+        session_id, "user",
+        [{"type": "tool_result", "tool_use_id": call_id,
+          "content": "edited", "is_error": False}],
+        timestamp, cwd,
+    )
+    return f"{call}\n{result}"
 
 
 def _tool_bash(session_id: str, timestamp: str, command: str,

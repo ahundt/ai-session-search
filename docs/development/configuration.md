@@ -148,7 +148,7 @@ used by index refresh.
 `aise integrations install` writes the
 absolute path of the first `aise` on the installer's PATH plus `mcp serve`; `--binary PATH`
 selects a different installation explicitly. The installer supports Claude
-Code/Desktop, ChatGPT/Codex App and Codex CLI/IDE, Gemini CLI, Antigravity
+Code/Desktop, ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI, Antigravity
 App/IDE/CLI, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode
 VS Code extension. Claude, Codex, OpenCode, Gemini, and Antigravity receive managed instruction-file
 guidance; Gemini and Antigravity share one sentinel-owned `~/.gemini/GEMINI.md` block. The repository

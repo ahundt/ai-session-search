@@ -1840,6 +1840,8 @@ struct NativeProviderSourceStatus {
     roots: Vec<String>,
     #[pyo3(get)]
     discovered_files: usize,
+    #[pyo3(get)]
+    warnings: Vec<NativeProviderDiscoveryWarning>,
 }
 
 /// One message classified by a named capability rule category.
@@ -2148,6 +2150,7 @@ impl From<ai_session_search::source::ProviderSourceStatus> for NativeProviderSou
             enabled: status.enabled,
             roots: status.roots,
             discovered_files: status.discovered_files,
+            warnings: status.warnings.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -2371,24 +2374,23 @@ impl SessionQuery {
     fn into_filters(self) -> PyResult<(SearchFilters, Option<String>)> {
         let (since, until) = self.dates.resolve()?;
         let (exclude_path_prefixes, exclude_session_ids) = self.exclusions.into_filters();
-        Ok((
-            SearchFilters {
-                provider: self.provider,
-                path_prefix: self
-                    .path_prefix
-                    .as_deref()
-                    .map(ai_session_search::util::normalize_path_prefix),
-                exclude_path_prefixes,
-                exclude_session_ids,
-                session_kinds: self.session_kinds,
-                parent_session_id: self.parent_session_id,
-                since,
-                until,
-                limit: self.limit,
-                warnings_only: false,
-            },
-            self.current_repo,
-        ))
+        let filters = SearchFilters {
+            provider: self.provider,
+            path_prefix: self
+                .path_prefix
+                .as_deref()
+                .map(ai_session_search::util::normalize_path_prefix),
+            exclude_path_prefixes,
+            exclude_session_ids,
+            session_kinds: self.session_kinds,
+            parent_session_id: self.parent_session_id,
+            since,
+            until,
+            limit: self.limit,
+            warnings_only: false,
+        };
+        filters.validate().map_err(value_error)?;
+        Ok((filters, self.current_repo))
     }
 }
 
@@ -3897,6 +3899,8 @@ struct NativeReindexOutcome {
     files_seen: usize,
     #[pyo3(get)]
     sessions_updated: usize,
+    #[pyo3(get)]
+    discovery_warnings: Vec<NativeProviderDiscoveryWarning>,
 }
 
 #[derive(Clone)]
@@ -4153,7 +4157,48 @@ struct NativeDiagnosticStatus {
     #[pyo3(get)]
     index_status: NativeIndexStatus,
     #[pyo3(get)]
+    discovery_warnings: Vec<NativeProviderDiscoveryWarning>,
+    #[pyo3(get)]
     providers: Vec<NativeProviderHealth>,
+}
+
+#[derive(Clone)]
+/// One non-fatal provider traversal or metadata-sidecar discovery failure.
+#[pyclass(
+    name = "ProviderDiscoveryWarning",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
+struct NativeProviderDiscoveryWarning {
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    operation: String,
+    #[pyo3(get)]
+    message: String,
+    #[pyo3(get)]
+    readable_sources_preserved: bool,
+    #[pyo3(get)]
+    verification_command: String,
+    #[pyo3(get)]
+    guidance: String,
+}
+
+impl From<ai_session_search::source::ProviderDiscoveryWarning> for NativeProviderDiscoveryWarning {
+    fn from(warning: ai_session_search::source::ProviderDiscoveryWarning) -> Self {
+        Self {
+            provider: warning.provider.as_str().to_string(),
+            path: warning.path,
+            operation: warning.operation,
+            message: warning.message,
+            readable_sources_preserved: warning.readable_sources_preserved,
+            verification_command: warning.verification_command,
+            guidance: warning.guidance,
+        }
+    }
 }
 
 /// Database byte counts before and after successful compaction.
@@ -4809,10 +4854,15 @@ impl SessionSearch {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.index()
-                .reindex(full)
-                .map(|(files_seen, sessions_updated)| NativeReindexOutcome {
-                    files_seen,
-                    sessions_updated,
+                .reindex_report(full)
+                .map(|outcome| NativeReindexOutcome {
+                    files_seen: outcome.files_seen,
+                    sessions_updated: outcome.sessions_updated,
+                    discovery_warnings: outcome
+                        .discovery_warnings
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                 })
                 .map_err(runtime_error)
         })
@@ -4826,6 +4876,11 @@ impl SessionSearch {
                 .map(|status| NativeDiagnosticStatus {
                     db_path: status.db_path,
                     index_status: status.index_status.into(),
+                    discovery_warnings: status
+                        .discovery_warnings
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                     providers: status.providers.into_iter().map(Into::into).collect(),
                 })
                 .map_err(runtime_error)
@@ -4927,6 +4982,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeIndexRefreshStatus>()?;
     module.add_class::<NativeProviderHealth>()?;
     module.add_class::<NativeDiagnosticStatus>()?;
+    module.add_class::<NativeProviderDiscoveryWarning>()?;
     module.add_class::<NativeCompactOutcome>()?;
     Ok(())
 }

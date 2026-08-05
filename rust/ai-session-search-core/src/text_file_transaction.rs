@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Andrew Hundt
 // SPDX-License-Identifier: Apache-2.0
 
-//! Recoverable transactions over a small set of unrelated UTF-8 text files.
+//! Recoverable transactions over unrelated UTF-8 text files and managed discovery symlinks.
 //!
 //! Cross-directory rename atomicity does not exist. This module instead writes one durable
 //! receipt before the first mutation, validates every preimage immediately before publication,
@@ -23,7 +23,8 @@ use crate::durable_fs::{
     AtomicWriteMode,
 };
 
-const RECEIPT_VERSION: u32 = 1;
+const RECEIPT_VERSION: u32 = 2;
+const FIRST_SUPPORTED_RECEIPT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TextFileImage {
@@ -73,6 +74,55 @@ impl TextFileChange {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SymlinkImage {
+    Absent,
+    Directory,
+    Link { target: EncodedPath },
+}
+
+impl SymlinkImage {
+    fn link(target: &Path) -> Self {
+        Self::Link {
+            target: EncodedPath::from_path(target),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymlinkChange {
+    pub(crate) path: PathBuf,
+    pub(crate) before: SymlinkImage,
+    pub(crate) after: SymlinkImage,
+}
+
+impl SymlinkChange {
+    pub(crate) fn install(path: PathBuf, target: PathBuf) -> Self {
+        Self {
+            path,
+            before: SymlinkImage::Absent,
+            after: SymlinkImage::link(&target),
+        }
+    }
+
+    pub(crate) fn replace_directory(path: PathBuf, target: PathBuf) -> Self {
+        Self {
+            path,
+            before: SymlinkImage::Directory,
+            after: SymlinkImage::link(&target),
+        }
+    }
+
+    pub(crate) fn remove(path: PathBuf, target: PathBuf) -> Self {
+        Self {
+            path,
+            before: SymlinkImage::link(&target),
+            after: SymlinkImage::Absent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryOutcome {
     RolledBack { paths: usize },
@@ -91,6 +141,8 @@ struct TransactionReceipt {
     version: u32,
     phase: TransactionPhase,
     changes: Vec<ReceiptChange>,
+    #[serde(default)]
+    symlink_changes: Vec<ReceiptSymlinkChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +150,13 @@ struct ReceiptChange {
     path: EncodedPath,
     before: Option<TextFileImage>,
     after: Option<TextFileImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReceiptSymlinkChange {
+    path: EncodedPath,
+    before: SymlinkImage,
+    after: SymlinkImage,
 }
 
 pub(crate) fn snapshot_utf8_regular_file(path: &Path) -> Result<Option<TextFileImage>> {
@@ -125,6 +184,15 @@ pub(crate) fn publish_text_change(change: &TextFileChange) -> Result<()> {
     apply_image(&change.path, &change.after)
 }
 
+pub(crate) fn publish_symlink_change(change: &SymlinkChange) -> Result<()> {
+    verify_symlink_image(&change.path, &change.before)?;
+    apply_symlink_change_after(change)
+}
+
+pub(crate) fn apply_symlink_change_after(change: &SymlinkChange) -> Result<()> {
+    apply_symlink_image(&change.path, &change.after)
+}
+
 pub(crate) fn execute_text_file_transaction(
     receipt_path: &Path,
     changes: &[TextFileChange],
@@ -132,6 +200,24 @@ pub(crate) fn execute_text_file_transaction(
     execute_text_file_transaction_with(receipt_path, changes, |_, change| {
         publish_text_change(change)
     })
+}
+
+pub(crate) fn execute_text_file_and_symlink_transaction_with<F>(
+    receipt_path: &Path,
+    changes: &[TextFileChange],
+    symlink_changes: &[SymlinkChange],
+    publish_symlink: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &SymlinkChange) -> Result<()>,
+{
+    execute_transaction_with(
+        receipt_path,
+        changes,
+        symlink_changes,
+        |_, change| publish_text_change(change),
+        publish_symlink,
+    )
 }
 
 /// Runs a read-only snapshot while excluding transaction writers for the same receipt.
@@ -184,21 +270,42 @@ pub(crate) fn with_text_file_transaction_read_lock<T>(
 fn execute_text_file_transaction_with<F>(
     receipt_path: &Path,
     changes: &[TextFileChange],
-    mut publish: F,
+    publish: F,
 ) -> Result<()>
 where
     F: FnMut(usize, &TextFileChange) -> Result<()>,
+{
+    execute_transaction_with(receipt_path, changes, &[], publish, |_, _| {
+        unreachable!("a text-only transaction has no symlink changes")
+    })
+}
+
+fn execute_transaction_with<F, G>(
+    receipt_path: &Path,
+    changes: &[TextFileChange],
+    symlink_changes: &[SymlinkChange],
+    mut publish_text: F,
+    mut publish_symlink: G,
+) -> Result<()>
+where
+    F: FnMut(usize, &TextFileChange) -> Result<()>,
+    G: FnMut(usize, &SymlinkChange) -> Result<()>,
 {
     let changes = changes
         .iter()
         .cloned()
         .map(absolutize_change)
         .collect::<Result<Vec<_>>>()?;
-    if changes.is_empty() {
+    let symlink_changes = symlink_changes
+        .iter()
+        .cloned()
+        .map(absolutize_symlink_change)
+        .collect::<Result<Vec<_>>>()?;
+    if changes.is_empty() && symlink_changes.is_empty() {
         return Ok(());
     }
-    validate_changes(&changes)?;
-    validate_control_paths(receipt_path, &changes)?;
+    validate_changes(&changes, &symlink_changes)?;
+    validate_control_paths(receipt_path, &changes, &symlink_changes)?;
     let lock_path = lock_path(receipt_path);
     let mut lock = open_file_lock(&lock_path).with_context(|| {
         format!(
@@ -222,16 +329,28 @@ where
     for change in &changes {
         verify_image(&change.path, &change.before)?;
     }
+    for change in &symlink_changes {
+        verify_symlink_image(&change.path, &change.before)?;
+    }
 
     let mut receipt = TransactionReceipt {
         version: RECEIPT_VERSION,
         phase: TransactionPhase::Prepared,
         changes: changes.iter().map(ReceiptChange::from).collect(),
+        symlink_changes: symlink_changes
+            .iter()
+            .map(ReceiptSymlinkChange::from)
+            .collect(),
     };
     write_receipt(receipt_path, &receipt, AtomicWriteMode::CreateNew)?;
 
     for (index, change) in changes.iter().enumerate() {
-        if let Err(publish_error) = publish(index, change) {
+        if let Err(publish_error) = publish_text(index, change) {
+            return rollback_after_failure(receipt_path, &receipt, publish_error);
+        }
+    }
+    for (index, change) in symlink_changes.iter().enumerate() {
+        if let Err(publish_error) = publish_symlink(index, change) {
             return rollback_after_failure(receipt_path, &receipt, publish_error);
         }
     }
@@ -319,8 +438,17 @@ pub(crate) fn recover_text_file_transaction(receipt_path: &Path) -> Result<Recov
                     )
                 })?;
             }
+            for change in &receipt.symlink_changes {
+                let path = change.path.to_path_buf()?;
+                verify_symlink_image(&path, &change.after).with_context(|| {
+                    format!(
+                        "published integration transaction conflicts with current symlink {}; refusing to discard recovery evidence",
+                        path.display()
+                    )
+                })?;
+            }
             RecoveryOutcome::Finalized {
-                paths: receipt.changes.len(),
+                paths: receipt.changes.len() + receipt.symlink_changes.len(),
             }
         }
     };
@@ -328,7 +456,7 @@ pub(crate) fn recover_text_file_transaction(receipt_path: &Path) -> Result<Recov
     Ok(outcome)
 }
 
-fn validate_changes(changes: &[TextFileChange]) -> Result<()> {
+fn validate_changes(changes: &[TextFileChange], symlink_changes: &[SymlinkChange]) -> Result<()> {
     let mut paths = std::collections::HashSet::new();
     for change in changes {
         if change.before == change.after {
@@ -344,23 +472,44 @@ fn validate_changes(changes: &[TextFileChange]) -> Result<()> {
             );
         }
     }
+    for change in symlink_changes {
+        if change.before == change.after {
+            bail!(
+                "symlink transaction contains a no-op for {}",
+                change.path.display()
+            );
+        }
+        if !paths.insert(change.path.clone()) {
+            bail!(
+                "integration transaction contains duplicate path {}",
+                change.path.display()
+            );
+        }
+    }
     Ok(())
 }
 
-fn validate_control_paths(receipt_path: &Path, changes: &[TextFileChange]) -> Result<()> {
+fn validate_control_paths(
+    receipt_path: &Path,
+    changes: &[TextFileChange],
+    symlink_changes: &[SymlinkChange],
+) -> Result<()> {
     let receipt_path = normalize_transaction_path(receipt_path)?;
     let control_paths = [
         ("transaction receipt", receipt_path.clone()),
         ("adjacent transaction lock", lock_path(&receipt_path)),
     ];
     for (control_role, control_path) in control_paths {
-        if let Some(change) = changes.iter().find(|change| {
-            normalize_transaction_path(&change.path).is_ok_and(|path| path == control_path)
-        }) {
+        let target = changes
+            .iter()
+            .map(|change| &change.path)
+            .chain(symlink_changes.iter().map(|change| &change.path))
+            .find(|path| normalize_transaction_path(path).is_ok_and(|path| path == control_path));
+        if let Some(target) = target {
             bail!(
                 "integration transaction control-path conflict: {control_role} path {} overlaps mutation target path {}; choose a transaction receipt whose receipt and adjacent lock paths are outside every mutation target",
                 control_path.display(),
-                change.path.display()
+                target.display()
             );
         }
     }
@@ -401,9 +550,35 @@ fn absolutize_change(mut change: TextFileChange) -> Result<TextFileChange> {
     Ok(change)
 }
 
+fn absolutize_symlink_change(mut change: SymlinkChange) -> Result<SymlinkChange> {
+    change.path = absolutize_transaction_path(&change.path)?;
+    Ok(change)
+}
+
 fn rollback_prepared(receipt: &TransactionReceipt) -> Result<usize> {
     let mut restored = 0;
     let mut conflicts = Vec::new();
+    for change in receipt.symlink_changes.iter().rev() {
+        let path = change.path.to_path_buf()?;
+        let current = snapshot_symlink_image(&path)?;
+        if current == change.before {
+            continue;
+        }
+        let removed_directory_before_link =
+            matches!(&change.before, SymlinkImage::Directory) && current == SymlinkImage::Absent;
+        if current == change.after || removed_directory_before_link {
+            if let Err(error) = apply_symlink_image(&path, &change.before) {
+                conflicts.push(format!("{}: {error:#}", path.display()));
+            } else {
+                restored += 1;
+            }
+        } else {
+            conflicts.push(format!(
+                "{}: entry differs from both receipt images",
+                path.display()
+            ));
+        }
+    }
     for change in receipt.changes.iter().rev() {
         let path = change.path.to_path_buf()?;
         let current = snapshot_utf8_regular_file(&path)?;
@@ -462,6 +637,102 @@ fn verify_image(path: &Path, expected: &Option<TextFileImage>) -> Result<()> {
     }
 }
 
+pub(crate) fn snapshot_symlink_image(path: &Path) -> Result<SymlinkImage> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(SymlinkImage::Absent),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)
+            .with_context(|| format!("failed to read symlink {}", path.display()))?;
+        return Ok(SymlinkImage::link(&target));
+    }
+    if metadata.is_dir() {
+        return Ok(SymlinkImage::Directory);
+    }
+    bail!(
+        "expected an absent path, directory, or symbolic link, but {} is another entry type",
+        path.display()
+    )
+}
+
+fn verify_symlink_image(path: &Path, expected: &SymlinkImage) -> Result<()> {
+    let current = snapshot_symlink_image(path)?;
+    if &current == expected {
+        Ok(())
+    } else {
+        bail!(
+            "{} changed after discovery-link preflight; refusing to overwrite concurrent edits",
+            path.display()
+        )
+    }
+}
+
+fn apply_symlink_image(path: &Path, image: &SymlinkImage) -> Result<()> {
+    match image {
+        SymlinkImage::Absent => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to remove symlink {}", path.display()))?;
+                Ok(sync_parent(path)?)
+            }
+            Ok(_) => bail!("refusing to remove non-symlink entry {}", path.display()),
+        },
+        SymlinkImage::Directory => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::create_dir_all(path)
+                    .with_context(|| format!("failed to restore directory {}", path.display()))?;
+                Ok(sync_parent(path)?)
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+            }
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to remove symlink {}", path.display()))?;
+                fs::create_dir_all(path)
+                    .with_context(|| format!("failed to restore directory {}", path.display()))?;
+                Ok(sync_parent(path)?)
+            }
+            Ok(_) => bail!("refusing to replace non-directory entry {}", path.display()),
+        },
+        SymlinkImage::Link { target } => {
+            let target = target.to_path_buf()?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create symlink directory {}", parent.display())
+                })?;
+            }
+            create_directory_symlink(&target, path).with_context(|| {
+                format!(
+                    "failed to link discovery entry {} to {}",
+                    path.display(),
+                    target.display()
+                )
+            })?;
+            Ok(sync_parent(path)?)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
 fn apply_image(path: &Path, image: &Option<TextFileImage>) -> Result<()> {
     match image {
         Some(image) => atomic_write_file(
@@ -509,11 +780,12 @@ fn load_receipt(path: &Path) -> Result<TransactionReceipt> {
             path.display()
         )
     })?;
-    if receipt.version != RECEIPT_VERSION {
+    if !(FIRST_SUPPORTED_RECEIPT_VERSION..=RECEIPT_VERSION).contains(&receipt.version) {
         bail!(
-            "unsupported integration transaction receipt version {} in {} (expected {})",
+            "unsupported integration transaction receipt version {} in {} (expected {} through {})",
             receipt.version,
             path.display(),
+            FIRST_SUPPORTED_RECEIPT_VERSION,
             RECEIPT_VERSION
         );
     }
@@ -542,6 +814,16 @@ fn lock_path(receipt_path: &Path) -> PathBuf {
 
 impl From<&TextFileChange> for ReceiptChange {
     fn from(change: &TextFileChange) -> Self {
+        Self {
+            path: EncodedPath::from_path(&change.path),
+            before: change.before.clone(),
+            after: change.after.clone(),
+        }
+    }
+}
+
+impl From<&SymlinkChange> for ReceiptSymlinkChange {
+    fn from(change: &SymlinkChange) -> Self {
         Self {
             path: EncodedPath::from_path(&change.path),
             before: change.before.clone(),
@@ -615,6 +897,70 @@ mod tests {
         assert!(!receipt.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prepared_receipt_recovery_restores_symlink_and_text_preimages() {
+        let dir = tempdir().unwrap();
+        let text = dir.path().join("config.txt");
+        let canonical = dir.path().join("skills/ai-session-search");
+        let link = dir.path().join("harness/skills/ai-session-search");
+        let receipt_path = dir.path().join("receipt.json");
+        fs::write(&text, "after").unwrap();
+        fs::create_dir_all(&canonical).unwrap();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        create_directory_symlink(&canonical, &link).unwrap();
+        let receipt = TransactionReceipt {
+            version: RECEIPT_VERSION,
+            phase: TransactionPhase::Prepared,
+            changes: vec![ReceiptChange::from(&change(
+                &text,
+                Some("before"),
+                Some("after"),
+            ))],
+            symlink_changes: vec![ReceiptSymlinkChange::from(&SymlinkChange::install(
+                link.clone(),
+                canonical,
+            ))],
+        };
+        write_receipt(&receipt_path, &receipt, AtomicWriteMode::CreateNew).unwrap();
+
+        assert_eq!(
+            recover_text_file_transaction(&receipt_path).unwrap(),
+            RecoveryOutcome::RolledBack { paths: 2 }
+        );
+        assert_eq!(fs::read_to_string(text).unwrap(), "before");
+        assert!(!link.exists());
+        assert!(!receipt_path.exists());
+    }
+
+    #[test]
+    fn version_one_text_only_receipt_remains_recoverable() {
+        let dir = tempdir().unwrap();
+        let text = dir.path().join("config.txt");
+        let receipt_path = dir.path().join("receipt.json");
+        fs::write(&text, "after").unwrap();
+        let mut value = serde_json::to_value(TransactionReceipt {
+            version: 1,
+            phase: TransactionPhase::Prepared,
+            changes: vec![ReceiptChange::from(&change(
+                &text,
+                Some("before"),
+                Some("after"),
+            ))],
+            symlink_changes: Vec::new(),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("symlink_changes");
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        assert_eq!(
+            recover_text_file_transaction(&receipt_path).unwrap(),
+            RecoveryOutcome::RolledBack { paths: 1 }
+        );
+        assert_eq!(fs::read_to_string(text).unwrap(), "before");
+        assert!(!receipt_path.exists());
+    }
+
     #[test]
     fn pending_receipt_blocks_new_transaction_before_any_write() {
         let dir = tempdir().unwrap();
@@ -629,6 +975,7 @@ mod tests {
                 Some("before"),
                 Some("after"),
             ))],
+            symlink_changes: Vec::new(),
         };
         write_receipt(&receipt_path, &receipt, AtomicWriteMode::CreateNew).unwrap();
 
@@ -941,6 +1288,7 @@ mod tests {
                 ReceiptChange::from(&change(&first, Some("before"), Some("after"))),
                 ReceiptChange::from(&change(&second, Some("before-2"), Some("after-2"))),
             ],
+            symlink_changes: Vec::new(),
         };
         write_receipt(&receipt_path, &receipt, AtomicWriteMode::CreateNew).unwrap();
 
@@ -967,6 +1315,7 @@ mod tests {
                 Some("before"),
                 Some("after"),
             ))],
+            symlink_changes: Vec::new(),
         };
         write_receipt(&receipt_path, &receipt, AtomicWriteMode::CreateNew).unwrap();
 
@@ -991,6 +1340,7 @@ mod tests {
                 Some("before"),
                 Some("after"),
             ))],
+            symlink_changes: Vec::new(),
         };
         write_receipt(&receipt_path, &receipt, AtomicWriteMode::CreateNew).unwrap();
 

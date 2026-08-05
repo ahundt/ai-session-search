@@ -100,10 +100,14 @@ fn malformed_tool_use_is_skipped_not_extracted() {
     s.push_str(r#"{"type":"assistant","sessionId":"h1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"content":"x"}}]}}"#);
     s.push('\n');
     // tool_use with non-string content → content defaults empty, but still a valid path.
-    s.push_str(r#"{"type":"assistant","sessionId":"h1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/a.txt","content":12345}}]}}"#);
+    s.push_str(r#"{"type":"assistant","sessionId":"h1","message":{"role":"assistant","content":[{"type":"tool_use","id":"write-valid-path","name":"Write","input":{"file_path":"/r/a.txt","content":12345}}]}}"#);
+    s.push('\n');
+    s.push_str(r#"{"type":"user","sessionId":"h1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"write-valid-path","content":"written","is_error":false}]}}"#);
     s.push('\n');
     // Edit missing old/new strings → empty deltas, still recorded with a path.
-    s.push_str(r#"{"type":"assistant","sessionId":"h1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/r/a.txt"}}]}}"#);
+    s.push_str(r#"{"type":"assistant","sessionId":"h1","message":{"role":"assistant","content":[{"type":"tool_use","id":"edit-valid-path","name":"Edit","input":{"file_path":"/r/a.txt"}}]}}"#);
+    s.push('\n');
+    s.push_str(r#"{"type":"user","sessionId":"h1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"edit-valid-path","content":"edited","is_error":false}]}}"#);
     s.push('\n');
     // Unknown tool → ignored entirely.
     s.push_str(r#"{"type":"assistant","sessionId":"h1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#);
@@ -125,8 +129,13 @@ fn unicode_paths_and_content_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
     // Unicode in both the path and the file content (emoji + CJK + combining marks).
-    let line = r#"{"type":"assistant","sessionId":"u1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/café_文件_🚀.txt","content":"héllo 世界 🚀\nsecond line"}}]}}"#;
-    write_session(&projects, "u1.jsonl", format!("{line}\n").as_bytes());
+    let lines = concat!(
+        r#"{"type":"assistant","sessionId":"u1","message":{"role":"assistant","content":[{"type":"tool_use","id":"unicode-write","name":"Write","input":{"file_path":"/r/café_文件_🚀.txt","content":"héllo 世界 🚀\nsecond line"}}]}}"#,
+        "\n",
+        r#"{"type":"user","sessionId":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unicode-write","content":"written","is_error":false}]}}"#,
+        "\n",
+    );
+    write_session(&projects, "u1.jsonl", lines.as_bytes());
 
     let (_cfg, db) = index(&dir);
     let rows = db.file_edits_for("café_文件_🚀.txt", None).unwrap();
@@ -143,10 +152,14 @@ fn reconstruct_handles_multibyte_edit_boundaries() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
     let mut s = String::new();
-    s.push_str(r#"{"type":"assistant","sessionId":"m1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/u.txt","content":"αβγ 世界 end"}}]}}"#);
+    s.push_str(r#"{"type":"assistant","sessionId":"m1","message":{"role":"assistant","content":[{"type":"tool_use","id":"unicode-base","name":"Write","input":{"file_path":"/r/u.txt","content":"αβγ 世界 end"}}]}}"#);
+    s.push('\n');
+    s.push_str(r#"{"type":"user","sessionId":"m1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unicode-base","content":"written","is_error":false}]}}"#);
     s.push('\n');
     // Replace a multibyte substring with another multibyte substring.
-    s.push_str(r#"{"type":"assistant","sessionId":"m1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/r/u.txt","old_string":"世界","new_string":"🌍"}}]}}"#);
+    s.push_str(r#"{"type":"assistant","sessionId":"m1","message":{"role":"assistant","content":[{"type":"tool_use","id":"unicode-edit","name":"Edit","input":{"file_path":"/r/u.txt","old_string":"世界","new_string":"🌍"}}]}}"#);
+    s.push('\n');
+    s.push_str(r#"{"type":"user","sessionId":"m1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unicode-edit","content":"edited","is_error":false}]}}"#);
     s.push('\n');
     write_session(&projects, "m1.jsonl", s.as_bytes());
 
@@ -252,7 +265,9 @@ fn reindex_after_edit_keeps_fts_in_sync_and_drops_stale_content() {
 const TWO_MSG_SESSION: &str = concat!(
     r#"{"type":"user","sessionId":"a1","message":{"role":"user","content":[{"type":"text","text":"first message here"}]}}"#,
     "\n",
-    r#"{"type":"assistant","sessionId":"a1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/x.txt","content":"hi"}}]}}"#,
+    r#"{"type":"assistant","sessionId":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"write-x","name":"Write","input":{"file_path":"/r/x.txt","content":"hi"}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"a1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"write-x","content":"written","is_error":false}]}}"#,
     "\n",
 );
 

@@ -6,15 +6,15 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::files::{FileMutationPayload, PendingFileMutations};
 use crate::models::{
     EditOp, FileEdit, MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord,
     SourceFile,
 };
-use crate::providers::spawn::SpawnOrigin;
+use crate::providers::{spawn::SpawnOrigin, walk_roots, ProviderDiscovery};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
     minimal_record, normalize_path, parse_datetime, preview_from_text, substantive_text,
@@ -36,48 +36,44 @@ impl PiAdapter {
     }
 
     pub fn discover(&self) -> Vec<SourceFile> {
+        self.discover_with_warnings().sources
+    }
+
+    pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
-        for root in &self.roots {
-            if !root.exists() {
+        let walked = walk_roots(&self.roots, None);
+        for entry in walked.entries {
+            let root = &entry.root;
+            let path = &entry.path;
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            let walker = WalkBuilder::new(root)
-                .hidden(false)
-                .ignore(false)
-                .git_ignore(false)
-                .git_exclude(false)
-                .parents(false)
-                .build();
-            for entry in walker.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                // Top-level project sessions live directly under <root>/<encoded-cwd>/<file>.jsonl.
-                // Subagent runs are nested deeper (<encoded-cwd>/<session>/<agent>/run-N/
-                // session.jsonl) and are sessions of their own. Anything nested that names no
-                // parent session directory is neither, so it stays out rather than becoming a
-                // session with an invented identity.
-                if !is_top_level_session(root, path) && self.spawn_origin(root, path).is_none() {
-                    continue;
-                }
-                if let Ok(metadata) = entry.metadata() {
-                    let mtime_ns = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|value| value.as_nanos() as i64)
-                        .unwrap_or_default();
-                    files.push(SourceFile {
-                        provider: Provider::Pi,
-                        path: path.to_path_buf(),
-                        mtime_ns,
-                        size_bytes: metadata.len() as i64,
-                    });
-                }
+            // Top-level project sessions live directly under <root>/<encoded-cwd>/<file>.jsonl.
+            // Subagent runs are nested deeper (<encoded-cwd>/<session>/<agent>/run-N/
+            // session.jsonl) and are sessions of their own. Anything nested that names no
+            // parent session directory is neither, so it stays out rather than becoming a
+            // session with an invented identity.
+            if !is_top_level_session(root, path) && self.spawn_origin(root, path).is_none() {
+                continue;
             }
+            let mtime_ns = entry
+                .metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos() as i64)
+                .unwrap_or_default();
+            files.push(SourceFile {
+                provider: Provider::Pi,
+                path: entry.path,
+                mtime_ns,
+                size_bytes: entry.metadata.len() as i64,
+            });
         }
-        files
+        ProviderDiscovery {
+            sources: files,
+            warnings: walked.warnings,
+        }
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
@@ -103,6 +99,7 @@ impl PiAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
+        let mut malformed_line_count: usize = 0;
         // Pi gives a spawned run a session id from the same space as a top-level one, so the
         // `session` record below binds it either way and no parent qualification is needed —
         // unlike claude, whose subagent records carry only the PARENT's id. The origin is used
@@ -122,7 +119,7 @@ impl PiAdapter {
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
-        let mut file_edit_seq: i64 = 0;
+        let mut pending_file_mutations = PendingFileMutations::default();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -132,7 +129,12 @@ impl PiAdapter {
             }
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(_) => {
+                    if !line.contains(char::REPLACEMENT_CHARACTER) {
+                        malformed_line_count += 1;
+                    }
+                    continue;
+                }
             };
 
             let timestamp = value
@@ -168,13 +170,16 @@ impl PiAdapter {
                     // Capture file-mutating `toolCall` blocks before the empty-text skip,
                     // so a tool-only assistant turn (no text) still records its edits.
                     if role == Some("assistant") {
-                        collect_pi_file_edits(
-                            message,
-                            timestamp,
-                            &mut file_edit_seq,
+                        collect_pi_file_edits(message, timestamp, &mut pending_file_mutations);
+                        append_pi_tool_calls(message, timestamp, &mut messages);
+                    } else if role == Some("toolResult") {
+                        // Pi's persisted ToolResultMessage has an explicit `isError` boolean.
+                        // Missing/non-boolean flags are unknown, so they cannot prove a mutation.
+                        pending_file_mutations.finish(
+                            message.get("toolCallId").and_then(Value::as_str),
+                            message.get("isError").and_then(Value::as_bool) == Some(false),
                             &mut file_edits,
                         );
-                        append_pi_tool_calls(message, timestamp, &mut messages);
                     }
                     let text = extract_text(message);
                     let text = text.trim();
@@ -266,10 +271,14 @@ impl PiAdapter {
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
         let repo_root = cwd.as_deref().and_then(find_repo_root);
-        let raw_metadata_json = Some(serde_json::to_string(&json!({
+        let mut raw_metadata = json!({
             "line_count": line_count,
             "session_path": normalize_path(path),
-        }))?);
+        });
+        if malformed_line_count > 0 {
+            raw_metadata["malformed_line_count"] = json!(malformed_line_count);
+        }
+        let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let session = SessionRecord {
             id: format!("pi:{provider_session_id}"),
@@ -287,7 +296,7 @@ impl PiAdapter {
             message_count: Some(messages.len() as i64),
             parse_version: crate::util::provider_parse_version(Provider::Pi).to_string(),
             raw_metadata_json,
-            parse_warning: None,
+            parse_warning: super::malformed_jsonl_warning(malformed_line_count),
             discovery_source: "jsonl".to_string(),
             parent_session_id: spawned
                 .as_ref()
@@ -427,8 +436,7 @@ fn append_pi_tool_calls(
 fn collect_pi_file_edits(
     message: &Value,
     ts: Option<DateTime<Utc>>,
-    next_seq: &mut i64,
-    out: &mut Vec<FileEdit>,
+    pending: &mut PendingFileMutations,
 ) {
     let Some(content) = message.get("content").and_then(Value::as_array) else {
         return;
@@ -441,21 +449,12 @@ fn collect_pi_file_edits(
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if let Some((file_path, new_content, edits)) =
-            pi_tool_edit_payload(name, block.get("arguments"))
-        {
-            let file_name = crate::util::file_basename(&file_path);
-            out.push(FileEdit {
-                seq: *next_seq,
-                ts,
-                tool: name.to_string(),
-                file_path,
-                file_name,
-                new_content,
-                edits,
-            });
-            *next_seq += 1;
-        }
+        pending.stage(
+            block.get("id").and_then(Value::as_str),
+            ts,
+            name,
+            pi_tool_edit_payload(name, block.get("arguments")),
+        );
     }
 }
 
@@ -465,10 +464,7 @@ fn collect_pi_file_edits(
 /// must be accepted (confirmed by pi's own `edit-tool-legacy-input.test.ts`):
 ///   - legacy flat: `{path, oldText, newText}`
 ///   - current nested: `{path, edits: [{oldText, newText}, ...]}`
-fn pi_tool_edit_payload(
-    name: &str,
-    args: Option<&Value>,
-) -> Option<(String, Option<String>, Vec<EditOp>)> {
+fn pi_tool_edit_payload(name: &str, args: Option<&Value>) -> Option<FileMutationPayload> {
     let args = args?;
     let str_field = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
     match name {
@@ -739,8 +735,11 @@ mod tests {
             r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
 {"type":"message","id":"m1","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"edit some files"}]}}
 {"type":"message","id":"m2","timestamp":"2026-06-18T17:31:36.595Z","message":{"role":"assistant","content":[{"type":"text","text":"writing it"},{"type":"toolCall","id":"t1","name":"write","arguments":{"path":"src/new.ts","content":"export const x = 1;"}}]}}
+{"type":"message","id":"r2","timestamp":"2026-06-18T17:31:38.000Z","message":{"role":"toolResult","toolCallId":"t1","toolName":"write","content":[{"type":"text","text":"written"}],"isError":false}}
 {"type":"message","id":"m3","timestamp":"2026-06-18T17:31:40.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"t2","name":"edit","arguments":{"path":"src/legacy.ts","oldText":"import a","newText":"import b"}}]}}
+{"type":"message","id":"r3","timestamp":"2026-06-18T17:31:42.000Z","message":{"role":"toolResult","toolCallId":"t2","toolName":"edit","content":[{"type":"text","text":"edited"}],"isError":false}}
 {"type":"message","id":"m4","timestamp":"2026-06-18T17:31:44.000Z","message":{"role":"assistant","content":[{"type":"text","text":"and nested"},{"type":"toolCall","id":"t3","name":"edit","arguments":{"path":"src/nested.ts","edits":[{"oldText":"a","newText":"b"},{"oldText":"c","newText":"d"}]}}]}}
+{"type":"message","id":"r4","timestamp":"2026-06-18T17:31:46.000Z","message":{"role":"toolResult","toolCallId":"t3","toolName":"edit","content":[{"type":"text","text":"edited"}],"isError":false}}
 {"type":"message","id":"m5","timestamp":"2026-06-18T17:31:48.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"t4","name":"ls","arguments":{"path":"/tmp"}}]}}
 "#,
         )
@@ -785,6 +784,60 @@ mod tests {
         assert_eq!(
             nested.edits,
             vec![EditOp::new("a", "b"), EditOp::new("c", "d")]
+        );
+    }
+
+    #[test]
+    fn file_edits_commit_only_after_explicit_successful_tool_results() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let project = root.join("--Users-example-src-demo--");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "029edbc9-83df-72a0-a95b-64e6d810ad75";
+        let transcript_path = project.join(format!("session_{session_id}.jsonl"));
+        fs::write(
+            &transcript_path,
+            r#"{"type":"session","version":3,"id":"029edbc9-83df-72a0-a95b-64e6d810ad75","cwd":"/Users/example/src/demo"}
+{"type":"message","id":"c1","message":{"role":"assistant","content":[{"type":"toolCall","id":"write-ok","name":"write","arguments":{"path":"src/a.ts","content":"alpha"}}]}}
+{"type":"message","id":"r1","message":{"role":"toolResult","toolCallId":"write-ok","toolName":"write","content":[{"type":"text","text":"written"}],"isError":false}}
+{"type":"message","id":"c2","message":{"role":"assistant","content":[{"type":"toolCall","id":"edit-ok","name":"edit","arguments":{"path":"src/a.ts","oldText":"alpha","newText":"beta"}}]}}
+{"type":"message","id":"r2","message":{"role":"toolResult","toolCallId":"edit-ok","toolName":"edit","content":[{"type":"text","text":"edited"}],"isError":false}}
+{"type":"message","id":"c3","message":{"role":"assistant","content":[{"type":"toolCall","id":"edit-failed","name":"edit","arguments":{"path":"src/a.ts","oldText":"beta","newText":"corrupt"}}]}}
+{"type":"message","id":"r3","message":{"role":"toolResult","toolCallId":"edit-failed","toolName":"edit","content":[{"type":"text","text":"oldText not found"}],"isError":true}}
+{"type":"message","id":"c4","message":{"role":"assistant","content":[{"type":"toolCall","id":"multi-ok","name":"edit","arguments":{"path":"src/a.ts","edits":[{"oldText":"beta","newText":"gamma"},{"oldText":"gamma","newText":"delta"}]}}]}}
+{"type":"message","id":"r4","message":{"role":"toolResult","toolCallId":"multi-ok","toolName":"edit","content":[{"type":"text","text":"edited"}],"isError":false}}
+{"type":"message","id":"c5","message":{"role":"assistant","content":[{"type":"toolCall","id":"write-later","name":"write","arguments":{"path":"src/a.ts","content":"snapshot"}}]}}
+{"type":"message","id":"r5","message":{"role":"toolResult","toolCallId":"write-later","toolName":"write","content":[{"type":"text","text":"written"}],"isError":false}}
+{"type":"message","id":"c6","message":{"role":"assistant","content":[{"type":"toolCall","id":"edit-unresolved","name":"edit","arguments":{"path":"src/a.ts","oldText":"snapshot","newText":"not observed"}}]}}
+"#,
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        assert_eq!(
+            parsed
+                .file_edits
+                .iter()
+                .map(|edit| (edit.seq, edit.tool.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "write"), (1, "edit"), (2, "edit"), (3, "write")]
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 1).as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 2).as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 3).as_deref(),
+            Some("delta")
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 4).as_deref(),
+            Some("snapshot")
         );
     }
 
@@ -891,6 +944,10 @@ mod tests {
         assert_eq!(roles, vec!["user", "assistant"]);
         assert!(parsed.transcript_text.contains("add pi support"));
         assert!(parsed.transcript_text.contains("will do"));
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
+        );
     }
 
     /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).

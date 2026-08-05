@@ -60,14 +60,11 @@ impl Provider {
 
     /// Parse a `provider` value read back from the index. These columns are written from
     /// [`Provider::as_str`], so a parse failure means index corruption or a variant added without a
-    /// migration — a "can't happen unless there's a bug" case. `debug_assert!` makes that loud in
-    /// dev/test (and CI) while release degrades to `Claude` rather than aborting a whole query over
-    /// one bad row. Prefer this over `parse().unwrap_or(...)` so the invariant is not silent.
-    pub fn from_db_str(value: &str) -> Self {
-        value.parse().unwrap_or_else(|_| {
-            debug_assert!(false, "unrecognized provider in index: {value:?}");
-            Self::Claude
-        })
+    /// migration. Callers must surface that failure rather than silently changing row ownership.
+    pub fn from_db_str(value: &str) -> Result<Self, String> {
+        value
+            .parse()
+            .map_err(|_| format!("unrecognized provider in index: {value:?}"))
     }
 }
 
@@ -123,14 +120,12 @@ impl Role {
     }
 
     /// Parse a `role` value read back from the index. Written from [`Role::as_str`], so a failure
-    /// means index corruption or a variant added without a migration. `debug_assert!` makes that
-    /// loud in dev/test/CI; release degrades to `User` rather than aborting a whole query over one
-    /// bad row. Prefer over `parse().unwrap_or(...)` so the round-trip invariant is not silent.
-    pub fn from_db_str(value: &str) -> Self {
-        value.parse().unwrap_or_else(|_| {
-            debug_assert!(false, "unrecognized role in index: {value:?}");
-            Self::User
-        })
+    /// means index corruption or a variant added without a migration. Callers must surface that
+    /// failure rather than silently changing message authorship.
+    pub fn from_db_str(value: &str) -> Result<Self, String> {
+        value
+            .parse()
+            .map_err(|_| format!("unrecognized role in index: {value:?}"))
     }
 }
 
@@ -957,6 +952,19 @@ impl SearchFilters {
             .clone()
             .unwrap_or_else(SessionKind::default_search_set)
     }
+
+    /// Reject resolved filter combinations that cannot match any session.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let only_user_sessions = self.session_kinds.as_ref().is_some_and(|kinds| {
+            !kinds.is_empty() && kinds.iter().all(|kind| *kind == SessionKind::User)
+        });
+        if self.parent_session_id.is_some() && only_user_sessions {
+            anyhow::bail!(
+                "session_kinds cannot contain only \"user\" when parent_session_id is set; pass [\"subagent\"], omit session_kinds to use both classes, or omit parent_session_id to search user-started sessions"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Product-level population selection for session graph, taxonomy, and phrase analysis.
@@ -992,6 +1000,7 @@ pub struct AnalysisRequest {
 impl AnalysisRequest {
     /// Construct an analysis request without accepting the generic session-list limit by accident.
     pub fn new(scope: SearchFilters, selection: AnalysisSessionSelection) -> anyhow::Result<Self> {
+        scope.validate()?;
         if scope.limit != 0 {
             anyhow::bail!(
                 "analysis does not accept SearchFilters.limit={}; set it to 0 and choose \
@@ -1638,6 +1647,7 @@ pub struct DiagnosticStatus {
     pub db_path: String,
     #[serde(flatten)]
     pub index_status: IndexStatus,
+    pub discovery_warnings: Vec<crate::source::ProviderDiscoveryWarning>,
     pub providers: Vec<ProviderHealth>,
 }
 
@@ -2007,28 +2017,22 @@ mod tests {
         }
     }
 
-    // PATTERN: every `from_db_str` must be LOUD about index corruption rather than silently
-    // degrading. `Provider` and `Role` state the rule in their own doc comments — "Prefer this
-    // over `parse().unwrap_or(...)` so the round-trip invariant is not silent" — and back it with
-    // `debug_assert!`. The rule was documented but never tested, so a refactor to the plain
-    // `unwrap_or` form would have passed CI. These three tests pin the contract for all of them.
-    //
-    // `debug_assert!` compiles out under `--release`, so guard on `debug_assertions`; the repo
-    // runs `cargo test` in debug (run_ci_local.sh:349, ci.yml:58) and these are skipped, not
-    // failed, if that ever changes.
-
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "unrecognized provider in index")]
-    fn unrecognized_provider_spelling_is_loud_in_debug() {
-        let _ = Provider::from_db_str("not_a_provider");
+    fn unrecognized_provider_spelling_is_rejected_in_every_build() {
+        let error = Provider::from_db_str("not_a_provider").unwrap_err();
+        assert!(
+            error.contains("not_a_provider"),
+            "the error must identify the corrupt stored value: {error}"
+        );
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "unrecognized role in index")]
-    fn unrecognized_role_spelling_is_loud_in_debug() {
-        let _ = Role::from_db_str("not_a_role");
+    fn unrecognized_role_spelling_is_rejected_in_every_build() {
+        let error = Role::from_db_str("not_a_role").unwrap_err();
+        assert!(
+            error.contains("not_a_role"),
+            "the error must identify the corrupt stored value: {error}"
+        );
     }
 
     // `MessageKind` is the deliberate exception to the rule above, and this test pins the

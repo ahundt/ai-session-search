@@ -2,18 +2,18 @@
 // SPDX-FileCopyrightText: 2026 Adam Zhao
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ignore::WalkBuilder;
 use serde_json::{json, Value};
 
 use crate::models::{
     ContentPartAuthorship, ContentPartOrigin, FileEdit, MessageAuthorship, MessageContentPart,
     MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
 };
+use crate::providers::{walk_roots, ProviderDiscovery};
 use crate::util::{
     find_repo_root, format_transcript_line, minimal_record, normalize_path, parse_datetime,
     preview_from_text, substantive_text, truncate_for_display, RawMessage,
@@ -29,51 +29,53 @@ impl AntigravityAdapter {
     }
 
     pub fn discover(&self) -> Vec<SourceFile> {
-        let mut files_by_log_dir: BTreeMap<PathBuf, SourceFile> = BTreeMap::new();
-        for root in &self.roots {
-            if !root.exists() {
+        self.discover_with_warnings().sources
+    }
+
+    pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
+        let mut files = Vec::<SourceFile>::new();
+        let mut indexes_by_log_dir = HashMap::<PathBuf, usize>::new();
+        let walked = walk_roots(&self.roots, None);
+        for entry in walked.entries {
+            let path = &entry.path;
+            if antigravity_transcript_priority(path) == 0 {
                 continue;
             }
-            let walker = WalkBuilder::new(root)
-                .hidden(false)
-                .ignore(false)
-                .git_ignore(false)
-                .git_exclude(false)
-                .parents(false)
-                .build();
-            for entry in walker.flatten() {
-                let path = entry.path();
-                if antigravity_transcript_priority(path) == 0 {
-                    continue;
-                }
-                if let Ok(metadata) = entry.metadata() {
-                    let mtime_ns = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|value| value.as_nanos() as i64)
-                        .unwrap_or_default();
-                    let source = SourceFile {
-                        provider: Provider::Antigravity,
-                        path: path.to_path_buf(),
-                        mtime_ns,
-                        size_bytes: metadata.len() as i64,
-                    };
-                    let log_dir = path.parent().unwrap_or(path).to_path_buf();
-                    let replace = files_by_log_dir
-                        .get(&log_dir)
-                        .map(|existing| {
-                            antigravity_transcript_priority(&existing.path)
-                                < antigravity_transcript_priority(&source.path)
-                        })
-                        .unwrap_or(true);
-                    if replace {
-                        files_by_log_dir.insert(log_dir, source);
-                    }
+            let mtime_ns = entry
+                .metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos() as i64)
+                .unwrap_or_default();
+            let source = SourceFile {
+                provider: Provider::Antigravity,
+                path: entry.path.clone(),
+                mtime_ns,
+                size_bytes: entry.metadata.len() as i64,
+            };
+            let log_dir = path.parent().unwrap_or(path).to_path_buf();
+            let existing_index = indexes_by_log_dir.get(&log_dir).copied();
+            let replace = existing_index
+                .map(|index| {
+                    let existing = &files[index];
+                    antigravity_transcript_priority(&existing.path)
+                        < antigravity_transcript_priority(&source.path)
+                })
+                .unwrap_or(true);
+            if replace {
+                if let Some(index) = existing_index {
+                    files[index] = source;
+                } else {
+                    indexes_by_log_dir.insert(log_dir, files.len());
+                    files.push(source);
                 }
             }
         }
-        files_by_log_dir.into_values().collect()
+        ProviderDiscovery {
+            sources: files,
+            warnings: walked.warnings,
+        }
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
@@ -99,6 +101,7 @@ impl AntigravityAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
+        let mut malformed_line_count: usize = 0;
 
         // Extract session ID from path. The path structure is:
         // .../brain/<conversation-id>/.system_generated/logs/transcript.jsonl
@@ -130,7 +133,12 @@ impl AntigravityAdapter {
             }
             let value: Value = match serde_json::from_str(line) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    if !line.contains(char::REPLACEMENT_CHARACTER) {
+                        malformed_line_count += 1;
+                    }
+                    continue;
+                }
             };
 
             let timestamp = value
@@ -229,10 +237,14 @@ impl AntigravityAdapter {
             .unwrap_or_else(|| "(no preview available)".to_string());
 
         let repo_root = cwd.as_deref().and_then(find_repo_root);
-        let raw_metadata_json = Some(serde_json::to_string(&json!({
+        let mut raw_metadata = json!({
             "line_count": line_count,
             "session_path": normalize_path(path),
-        }))?);
+        });
+        if malformed_line_count > 0 {
+            raw_metadata["malformed_line_count"] = json!(malformed_line_count);
+        }
+        let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let session = SessionRecord {
             id: format!("antigravity:{provider_session_id}"),
@@ -250,7 +262,7 @@ impl AntigravityAdapter {
             message_count: Some(messages.len() as i64),
             parse_version: crate::util::provider_parse_version(Provider::Antigravity).to_string(),
             raw_metadata_json,
-            parse_warning: None,
+            parse_warning: super::malformed_jsonl_warning(malformed_line_count),
             discovery_source: "jsonl".to_string(),
             // No spawn concept on this path: subagent runs are either excluded from
             // discovery or unmarked by this provider. See models.rs SessionRecord.
@@ -721,6 +733,10 @@ mod tests {
         assert_eq!(roles, vec![Role::User, Role::Assistant, Role::Tool]);
         assert!(parsed.transcript_text.contains("hello agent"));
         assert!(parsed.transcript_text.contains("hello user"));
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
+        );
     }
 
     /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).

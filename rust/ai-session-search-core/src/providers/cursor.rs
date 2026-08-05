@@ -7,11 +7,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ignore::WalkBuilder;
 use serde_json::{json, Value};
 
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
-use crate::providers::spawn;
+use crate::providers::{spawn, walk_roots, ProviderDiscovery};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
     minimal_record, normalize_path, preview_from_text, substantive_text, truncate_for_display,
@@ -28,49 +27,44 @@ impl CursorAdapter {
     }
 
     pub fn discover(&self) -> Vec<SourceFile> {
+        self.discover_with_warnings().sources
+    }
+
+    pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
-        for root in &self.roots {
-            if !root.exists() {
+        let walked = walk_roots(&self.roots, None);
+        for entry in walked.entries {
+            let path = &entry.path;
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            let walker = WalkBuilder::new(root)
-                .hidden(false)
-                .ignore(false)
-                .git_ignore(false)
-                .git_exclude(false)
-                .parents(false)
-                .build();
-            for entry in walker.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                if !path
-                    .components()
-                    .any(|component| component.as_os_str() == "agent-transcripts")
-                {
-                    continue;
-                }
-                // Nothing filters out `<session-id>/subagents/` here: those runs are sessions
-                // of their own. See `spawn::subagents_dir_origin` for how their identity is
-                // kept off the parent's row.
-                if let Ok(metadata) = entry.metadata() {
-                    let mtime_ns = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|value| value.as_nanos() as i64)
-                        .unwrap_or_default();
-                    files.push(SourceFile {
-                        provider: Provider::Cursor,
-                        path: path.to_path_buf(),
-                        mtime_ns,
-                        size_bytes: metadata.len() as i64,
-                    });
-                }
+            if !path
+                .components()
+                .any(|component| component.as_os_str() == "agent-transcripts")
+            {
+                continue;
             }
+            // Nothing filters out `<session-id>/subagents/` here: those runs are sessions
+            // of their own. See `spawn::subagents_dir_origin` for how their identity is
+            // kept off the parent's row.
+            let mtime_ns = entry
+                .metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos() as i64)
+                .unwrap_or_default();
+            files.push(SourceFile {
+                provider: Provider::Cursor,
+                path: entry.path,
+                mtime_ns,
+                size_bytes: entry.metadata.len() as i64,
+            });
         }
-        files
+        ProviderDiscovery {
+            sources: files,
+            warnings: walked.warnings,
+        }
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
@@ -96,6 +90,7 @@ impl CursorAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
+        let mut malformed_line_count: usize = 0;
         // A top-level cursor transcript is named for its session id, so the stem is the id. A
         // subagent transcript is named for its role instead (`subagents/subagent.jsonl` under
         // every parent), which is unique only within one parent — so it takes the parent's id
@@ -129,7 +124,12 @@ impl CursorAdapter {
             }
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(_) => {
+                    if !line.contains(char::REPLACEMENT_CHARACTER) {
+                        malformed_line_count += 1;
+                    }
+                    continue;
+                }
             };
             let Some(role) = value.get("role").and_then(Value::as_str) else {
                 continue;
@@ -195,10 +195,14 @@ impl CursorAdapter {
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
         let repo_root = cwd.as_deref().and_then(find_repo_root);
-        let raw_metadata_json = Some(serde_json::to_string(&json!({
+        let mut raw_metadata = json!({
             "line_count": line_count,
             "session_path": normalize_path(path),
-        }))?);
+        });
+        if malformed_line_count > 0 {
+            raw_metadata["malformed_line_count"] = json!(malformed_line_count);
+        }
+        let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let session = SessionRecord {
             id: format!("cursor:{provider_session_id}"),
@@ -216,7 +220,7 @@ impl CursorAdapter {
             message_count: Some(messages.len() as i64),
             parse_version: crate::util::provider_parse_version(Provider::Cursor).to_string(),
             raw_metadata_json,
-            parse_warning: None,
+            parse_warning: super::malformed_jsonl_warning(malformed_line_count),
             discovery_source: "jsonl".to_string(),
             parent_session_id: spawned
                 .as_ref()
@@ -659,6 +663,10 @@ mod tests {
         assert_eq!(parsed.file_edits.len(), 1);
         assert_eq!(parsed.file_edits[0].file_path, "/p/a.rs");
         assert_eq!(parsed.file_edits[0].new_content.as_deref(), Some("hello"));
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
+        );
     }
 
     /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).

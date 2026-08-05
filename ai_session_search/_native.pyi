@@ -97,6 +97,7 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "IndexRefreshStatus",
     "ProviderHealth",
     "DiagnosticStatus",
+    "ProviderDiscoveryWarning",
     "CompactOutcome",
 ]
 
@@ -547,6 +548,7 @@ class ProviderSourceStatus:
     enabled: bool
     roots: list[str]
     discovered_files: int
+    warnings: list[ProviderDiscoveryWarning]
 
 @final
 class MessageClassificationMatch:
@@ -1170,6 +1172,7 @@ class ReindexOutcome:
 
     files_seen: int
     sessions_updated: int
+    discovery_warnings: list[ProviderDiscoveryWarning]
 
 @final
 class ProviderParserHealth:
@@ -1250,7 +1253,20 @@ class DiagnosticStatus:
 
     db_path: str
     index_status: IndexStatus
+    discovery_warnings: list[ProviderDiscoveryWarning]
     providers: list[ProviderHealth]
+
+@final
+class ProviderDiscoveryWarning:
+    """One non-fatal provider traversal or metadata-sidecar discovery failure."""
+
+    provider: str
+    path: str
+    operation: str
+    message: str
+    readable_sources_preserved: bool
+    verification_command: str
+    guidance: str
 
 @final
 class CompactOutcome:

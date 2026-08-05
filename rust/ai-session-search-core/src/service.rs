@@ -2113,8 +2113,12 @@ impl<'app> IndexService<'app> {
     }
 
     pub fn reindex(&self, full: bool) -> Result<(usize, usize)> {
-        let outcome = indexer::explicit_reindex_and_migrate(self.config, self.db, full, None)?;
+        let outcome = self.reindex_report(full)?;
         Ok((outcome.files_seen, outcome.sessions_updated))
+    }
+
+    pub fn reindex_report(&self, full: bool) -> Result<indexer::ExplicitReindexOutcome> {
+        indexer::explicit_reindex_and_migrate(self.config, self.db, full, None)
     }
 
     /// Report parser/schema freshness and only repairs applicable to discoverable sources.
@@ -2143,6 +2147,7 @@ impl<'db> CatalogService<'db> {
     /// Returned memory is proportional to the selected rows and their text bytes. A zero limit
     /// intentionally returns the complete filtered corpus.
     pub fn list_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
+        filters.validate()?;
         self.db.list_recent(filters)
     }
 
@@ -2153,6 +2158,7 @@ impl<'db> CatalogService<'db> {
         filters: &SearchFilters,
         offset: usize,
     ) -> Result<Vec<SessionRecord>> {
+        filters.validate()?;
         self.db.list_recent_page(filters, offset)
     }
 
@@ -2172,6 +2178,7 @@ impl<'db> CatalogService<'db> {
         current_repo: Option<&str>,
         scoring: &ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
+        filters.validate()?;
         self.db.search(query, filters, current_repo, scoring)
     }
 
@@ -4356,6 +4363,27 @@ mod tests {
         assert!(files.is_empty());
         assert!(status.parser_health.schema_current);
         assert_eq!(status.parser_health.indexed_sessions, 0);
+    }
+
+    #[test]
+    fn catalog_rejects_a_parent_filter_that_can_match_no_user_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+
+        let error = CatalogService::new(&db)
+            .list_sessions(&SearchFilters {
+                session_kinds: Some(vec![crate::models::SessionKind::User]),
+                parent_session_id: Some("claude:parent".to_string()),
+                ..SearchFilters::default()
+            })
+            .expect_err("a user-started session cannot have a parent")
+            .to_string();
+
+        assert!(error.contains("session_kinds"), "{error}");
+        assert!(error.contains("parent_session_id"), "{error}");
+        assert!(error.contains("subagent"), "{error}");
+        assert!(error.contains("omit session_kinds"), "{error}");
     }
 
     #[test]

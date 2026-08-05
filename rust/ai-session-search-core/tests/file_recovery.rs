@@ -21,11 +21,19 @@ const SESS1: &str = concat!(
     "\n",
     r#"{"type":"assistant","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:00:10Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"w1","name":"Write","input":{"file_path":"/repo/app.py","content":"line1\nline2\nline3"}}]}}"#,
     "\n",
+    r#"{"type":"user","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:00:11Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"w1","content":"written","is_error":false}]}}"#,
+    "\n",
     r#"{"type":"assistant","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:01:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/repo/app.py","old_string":"line2","new_string":"LINE2"}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:01:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"e1","content":"edited","is_error":false}]}}"#,
     "\n",
     r#"{"type":"assistant","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:02:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"m1","name":"MultiEdit","input":{"file_path":"/repo/app.py","edits":[{"old_string":"line1","new_string":"L1"},{"old_string":"line3","new_string":"L3"}]}}]}}"#,
     "\n",
+    r#"{"type":"user","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:02:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"m1","content":"edited","is_error":false}]}}"#,
+    "\n",
     r#"{"type":"assistant","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:03:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"w2","name":"Write","input":{"file_path":"/repo/util.py","content":"a\nb"}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"sess-fr-1","timestamp":"2026-06-02T10:03:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"w2","content":"written","is_error":false}]}}"#,
     "\n",
 );
 
@@ -34,6 +42,8 @@ const SESS2: &str = concat!(
     r#"{"type":"user","sessionId":"sess-fr-2","timestamp":"2026-06-03T09:00:00Z","cwd":"/repo","message":{"role":"user","content":[{"type":"text","text":"rewrite the app file from scratch"}]}}"#,
     "\n",
     r#"{"type":"assistant","sessionId":"sess-fr-2","timestamp":"2026-06-03T09:00:10Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"w3","name":"Write","input":{"file_path":"/repo/app.py","content":"brand new"}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"sess-fr-2","timestamp":"2026-06-03T09:00:11Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"w3","content":"written","is_error":false}]}}"#,
     "\n",
 );
 

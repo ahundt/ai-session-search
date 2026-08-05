@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::models::{MessageCorrelationAuthority, ParsedSession, Provider, SourceFile};
 use crate::providers::snapshot::{parsed_session_from_raw, source_file, SnapshotMetadata};
+use crate::providers::{walk_roots, ProviderDiscovery};
 use crate::util::{minimal_record, parse_datetime, RawMessage};
 
 pub struct GeminiCliAdapter {
@@ -34,33 +35,34 @@ impl GeminiCliAdapter {
     }
 
     pub fn discover(&self) -> Vec<SourceFile> {
+        self.discover_with_warnings().sources
+    }
+
+    pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut sources = Vec::new();
-        for root in &self.roots {
-            let Ok(hash_dirs) = fs::read_dir(root) else {
-                continue;
-            };
-            for hash_dir in hash_dirs.flatten().filter(|entry| entry.path().is_dir()) {
-                let Ok(entries) = fs::read_dir(hash_dir.path().join("chats")) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let supported = path
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with("session-") && name.ends_with(".json")
-                        });
-                    if supported && path.is_file() {
-                        if let Ok(metadata) = entry.metadata() {
-                            sources.push(source_file(Provider::GeminiCli, path, &metadata));
-                        }
-                    }
-                }
+        let walked = walk_roots(&self.roots, Some(3));
+        for entry in walked.entries {
+            let path = &entry.path;
+            let supported = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with("session-") && name.ends_with(".json"));
+            let is_chat = path.parent().and_then(Path::file_name) == Some("chats".as_ref())
+                && path
+                    .strip_prefix(&entry.root)
+                    .is_ok_and(|relative| relative.components().count() == 3);
+            if supported && is_chat && entry.metadata.is_file() {
+                sources.push(source_file(
+                    Provider::GeminiCli,
+                    entry.path,
+                    &entry.metadata,
+                ));
             }
         }
-        sources.sort_by(|left, right| left.path.cmp(&right.path));
-        sources
+        ProviderDiscovery {
+            sources,
+            warnings: walked.warnings,
+        }
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {

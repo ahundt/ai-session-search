@@ -9,7 +9,7 @@ metadata:
 # AI Session Search (`aise`)
 
 Use `aise` instead of scanning raw provider files. It normalizes eight providers into one index.
-The local Codex provider covers ChatGPT/Codex App plus Codex CLI/IDE through
+The local Codex provider covers ChatGPT Codex desktop plus Codex CLI/IDE through
 their shared `~/.codex` host. Claude Code CLI/Desktop share the Claude Code
 provider, while Claude Desktop local-agent sessions use `claude-desktop`.
 Antigravity App/IDE/CLI share the `antigravity` provider. Cloud-only account

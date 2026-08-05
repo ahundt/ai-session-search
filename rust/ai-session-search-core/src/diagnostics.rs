@@ -12,6 +12,7 @@ use crate::util::{normalize_path, which};
 
 pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
     let inventory = crate::source::inventory_snapshot(config);
+    let discovery_warnings = inventory.warnings.clone();
     let parser_health = db.parser_health()?;
     let stale_sources = db.stale_session_sources()?;
     let indexed = indexed_source_set(db)?;
@@ -100,6 +101,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
     Ok(DiagnosticStatus {
         db_path: normalize_path(&config.db_path()),
         index_status,
+        discovery_warnings,
         providers,
     })
 }
@@ -156,7 +158,7 @@ pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>>
 
     let providers = crate::source::ProviderSet::new(config);
     let mut explained = Vec::new();
-    for source in providers.discover_enabled(config) {
+    for source in providers.discover_enabled(config).sources {
         let key = (source.provider, normalize_path(&source.path));
         if indexed.contains(&key) {
             continue;

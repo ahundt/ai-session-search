@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ignore::WalkBuilder;
 use regex::Regex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 
 use crate::models::{
     FileEdit, MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
 };
+use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
     minimal_record, normalize_path, parse_datetime, parse_unix_seconds, preview_from_text,
@@ -33,61 +33,96 @@ struct CodexMetadata {
     raw: serde_json::Map<String, Value>,
 }
 
-pub struct CodexAdapter {
-    roots: Vec<PathBuf>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexSidecarWarning {
+    pub(crate) path: PathBuf,
+    pub(crate) operation: &'static str,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Default)]
+struct CodexRootMetadata {
+    root: PathBuf,
     threads: HashMap<String, CodexMetadata>,
     index_titles: HashMap<String, String>,
+}
+
+pub struct CodexAdapter {
+    roots: Vec<PathBuf>,
+    metadata: Vec<CodexRootMetadata>,
+    sidecar_warnings: Vec<CodexSidecarWarning>,
     id_re: Regex,
 }
 
 impl CodexAdapter {
-    pub fn new(roots: Vec<PathBuf>, codex_home: PathBuf) -> Self {
-        let threads = load_threads(&codex_home.join("state_5.sqlite")).unwrap_or_default();
-        let index_titles =
-            load_index_titles(&codex_home.join("session_index.jsonl")).unwrap_or_default();
+    pub fn new(roots: Vec<PathBuf>) -> Self {
+        let mut metadata = Vec::with_capacity(roots.len());
+        let mut sidecar_warnings = Vec::new();
+        for root in &roots {
+            let home = codex_home_from_session_root(root);
+            let state_path = home.join("state_5.sqlite");
+            let index_path = home.join("session_index.jsonl");
+            let threads = load_sidecar(&state_path, load_threads, &mut sidecar_warnings);
+            let index_titles = load_sidecar(&index_path, load_index_titles, &mut sidecar_warnings);
+            metadata.push(CodexRootMetadata {
+                root: root.clone(),
+                threads,
+                index_titles,
+            });
+        }
         Self {
             roots,
-            threads,
-            index_titles,
+            metadata,
+            sidecar_warnings,
             id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$").expect("valid regex"),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn sidecar_warnings(&self) -> &[CodexSidecarWarning] {
+        &self.sidecar_warnings
+    }
+
     pub fn discover(&self) -> Vec<SourceFile> {
+        self.discover_with_warnings().sources
+    }
+
+    pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
-        for root in &self.roots {
-            if !root.exists() {
+        let walked = walk_roots(&self.roots, None);
+        for entry in walked.entries {
+            let path = &entry.path;
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            let walker = WalkBuilder::new(root)
-                .hidden(false)
-                .ignore(false)
-                .git_ignore(false)
-                .git_exclude(false)
-                .parents(false)
-                .build();
-            for entry in walker.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                if let Ok(metadata) = entry.metadata() {
-                    let mtime_ns = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|value| value.as_nanos() as i64)
-                        .unwrap_or_default();
-                    files.push(SourceFile {
-                        provider: Provider::Codex,
-                        path: path.to_path_buf(),
-                        mtime_ns,
-                        size_bytes: metadata.len() as i64,
-                    });
-                }
-            }
+            let mtime_ns = entry
+                .metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos() as i64)
+                .unwrap_or_default();
+            files.push(SourceFile {
+                provider: Provider::Codex,
+                path: entry.path,
+                mtime_ns,
+                size_bytes: entry.metadata.len() as i64,
+            });
         }
-        files
+        let mut warnings = walked.warnings;
+        warnings.extend(
+            self.sidecar_warnings
+                .iter()
+                .map(|warning| ProviderPathWarning {
+                    path: warning.path.clone(),
+                    operation: warning.operation,
+                    message: warning.message.clone(),
+                }),
+        );
+        ProviderDiscovery {
+            sources: files,
+            warnings,
+        }
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
@@ -113,6 +148,7 @@ impl CodexAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
+        let mut malformed_line_count: usize = 0;
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
@@ -127,7 +163,7 @@ impl CodexAdapter {
         // call_id -> tool name, so a later function_call_output can be tagged with the tool.
         let mut tool_call_names: HashMap<String, String> = HashMap::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
-        let mut file_edit_seq: i64 = 0;
+        let mut pending_file_mutations = crate::files::PendingFileMutations::default();
         let mut first_user = None;
         let mut last_user = None;
         let mut latest_goal: Option<Value> = None;
@@ -140,7 +176,12 @@ impl CodexAdapter {
             }
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(_) => {
+                    if !line.contains(char::REPLACEMENT_CHARACTER) {
+                        malformed_line_count += 1;
+                    }
+                    continue;
+                }
             };
             let timestamp = value
                 .get("timestamp")
@@ -249,14 +290,17 @@ impl CodexAdapter {
                             }
                             messages.push(raw_message);
                         }
-                        // apply_patch carries the file changes inline; extract file edits.
+                        // Stage apply_patch changes until its correlated output proves success.
                         if name == Some("apply_patch") {
                             if let Some(patch) = apply_patch_text(payload) {
-                                collect_apply_patch_edits(
-                                    &patch,
+                                pending_file_mutations.stage_many(
+                                    payload.get("call_id").and_then(Value::as_str),
                                     timestamp,
-                                    &mut file_edit_seq,
-                                    &mut file_edits,
+                                    "apply_patch",
+                                    parse_apply_patch(&patch)
+                                        .into_iter()
+                                        .map(|(path, content)| (path, content, Vec::new()))
+                                        .collect(),
                                 );
                             }
                         }
@@ -268,6 +312,11 @@ impl CodexAdapter {
                         // produced it (correlated by call_id), kept out of the human
                         // transcript/title/preview.
                         let output = codex_output_text(payload.get("output"));
+                        pending_file_mutations.finish(
+                            payload.get("call_id").and_then(Value::as_str),
+                            codex_apply_patch_succeeded(payload.get("output")),
+                            &mut file_edits,
+                        );
                         if !output.trim().is_empty() {
                             updated_at = timestamp.or(updated_at);
                             let tool_name = payload
@@ -317,14 +366,18 @@ impl CodexAdapter {
             }
         }
 
-        let meta = self
-            .threads
-            .get(&provider_session_id)
+        let root_metadata = self.metadata_for_path(path);
+        let meta = root_metadata
+            .and_then(|metadata| metadata.threads.get(&provider_session_id))
             .cloned()
             .unwrap_or_default();
         let title = meta
             .title
-            .or_else(|| self.index_titles.get(&provider_session_id).cloned())
+            .or_else(|| {
+                root_metadata
+                    .and_then(|metadata| metadata.index_titles.get(&provider_session_id))
+                    .cloned()
+            })
             .or_else(|| first_user.clone())
             .map(|text| truncate_for_display(&text, 100));
         let summary = meta
@@ -346,6 +399,9 @@ impl CodexAdapter {
             "rollout_path": meta.rollout_path,
             "session_path": normalize_path(path),
         });
+        if malformed_line_count > 0 {
+            raw_metadata["malformed_line_count"] = json!(malformed_line_count);
+        }
         if let Value::Object(obj) = &mut raw_metadata {
             if let Some(goal) = latest_goal {
                 obj.insert("latest_goal".to_string(), goal);
@@ -379,7 +435,7 @@ impl CodexAdapter {
             message_count: Some(messages.len() as i64),
             parse_version: crate::util::provider_parse_version(Provider::Codex).to_string(),
             raw_metadata_json,
-            parse_warning: None,
+            parse_warning: super::malformed_jsonl_warning(malformed_line_count),
             // A fixed label for what THIS ADAPTER reads (rollout .jsonl plus codex's
             // state_5.sqlite for titles), not computed per-file provenance. Every codex row
             // carries it, including rows built when state_5.sqlite is absent. Reading it as
@@ -408,6 +464,13 @@ impl CodexAdapter {
             messages,
             file_edits,
         })
+    }
+
+    fn metadata_for_path(&self, path: &Path) -> Option<&CodexRootMetadata> {
+        self.metadata
+            .iter()
+            .filter(|metadata| path.starts_with(&metadata.root))
+            .max_by_key(|metadata| metadata.root.components().count())
     }
 
     fn extract_id(&self, path: &Path) -> Option<String> {
@@ -547,28 +610,6 @@ fn parse_apply_patch(patch: &str) -> Vec<(String, Option<String>)> {
     out
 }
 
-/// Append a [`FileEdit`] for each file touched by an apply_patch payload.
-fn collect_apply_patch_edits(
-    patch: &str,
-    ts: Option<DateTime<Utc>>,
-    next_seq: &mut i64,
-    out: &mut Vec<FileEdit>,
-) {
-    for (file_path, new_content) in parse_apply_patch(patch) {
-        let file_name = crate::util::file_basename(&file_path);
-        out.push(FileEdit {
-            seq: *next_seq,
-            ts,
-            tool: "apply_patch".to_string(),
-            file_path,
-            file_name,
-            new_content,
-            edits: Vec::new(),
-        });
-        *next_seq += 1;
-    }
-}
-
 /// Extract the textual output of a codex function/tool-call result. The `output` field is
 /// normally a plain string (stdout plus a short metadata header); when it is structured,
 /// fall back to its nested text/content via [`extract_text`].
@@ -582,6 +623,32 @@ fn codex_output_text<'a>(output: Option<&'a Value>) -> std::borrow::Cow<'a, str>
         Some(other) => std::borrow::Cow::Owned(extract_text(other)),
         None => std::borrow::Cow::Borrowed(""),
     }
+}
+
+/// Codex has persisted apply_patch results as either structured metadata or rendered text.
+/// Only an explicit zero exit code plus the tool's success marker proves the patch landed.
+fn codex_apply_patch_succeeded(output: Option<&Value>) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    if let Some(exit_code) = output
+        .pointer("/metadata/exit_code")
+        .and_then(Value::as_i64)
+    {
+        return exit_code == 0
+            && output
+                .get("output")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.starts_with("Success. Updated the following files:"));
+    }
+    let Some(text) = output.as_str() else {
+        return false;
+    };
+    if let Ok(structured) = serde_json::from_str::<Value>(text) {
+        return codex_apply_patch_succeeded(Some(&structured));
+    }
+    text.starts_with("Exit code: 0\n")
+        && text.contains("\nOutput:\nSuccess. Updated the following files:")
 }
 
 /// True when a role:user codex message is injected context rather than real user
@@ -638,11 +705,56 @@ fn is_codex_injected_context(text: &str) -> bool {
         || head.starts_with("<turn_aborted")
 }
 
-fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
+pub(crate) fn codex_home_from_session_root(root: &Path) -> PathBuf {
+    root.parent().unwrap_or(root).to_path_buf()
+}
+
+struct SidecarLoad<T> {
+    value: T,
+    degraded: Option<String>,
+}
+
+fn load_sidecar<T: Default>(
+    path: &Path,
+    loader: impl FnOnce(&Path) -> Result<SidecarLoad<T>>,
+    warnings: &mut Vec<CodexSidecarWarning>,
+) -> T {
+    match fs::metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Err(error) => {
+            warnings.push(CodexSidecarWarning {
+                path: path.to_path_buf(),
+                operation: "read_sidecar",
+                message: error.to_string(),
+            });
+            return T::default();
+        }
     }
-    let conn = Connection::open(path)?;
+    match loader(path) {
+        Ok(loaded) => {
+            if let Some(message) = loaded.degraded {
+                warnings.push(CodexSidecarWarning {
+                    path: path.to_path_buf(),
+                    operation: "read_sidecar",
+                    message,
+                });
+            }
+            loaded.value
+        }
+        Err(error) => {
+            warnings.push(CodexSidecarWarning {
+                path: path.to_path_buf(),
+                operation: "read_sidecar",
+                message: format!("{error:#}"),
+            });
+            T::default()
+        }
+    }
+}
+
+fn load_threads(path: &Path) -> Result<SidecarLoad<HashMap<String, CodexMetadata>>> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let columns = thread_columns(&conn)?;
     let opt = |name: &str| {
         if columns.iter().any(|column| column == name) {
@@ -737,11 +849,21 @@ fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
     })?;
 
     let mut map = HashMap::new();
+    let mut malformed_rows = 0usize;
     for row in rows {
-        let (id, meta) = row?;
-        map.insert(id, meta);
+        match row {
+            Ok((id, meta)) => {
+                map.insert(id, meta);
+            }
+            Err(_) => malformed_rows += 1,
+        }
     }
-    Ok(map)
+    Ok(SidecarLoad {
+        value: map,
+        degraded: (malformed_rows > 0).then(|| {
+            format!("ignored {malformed_rows} unreadable thread row(s); retained readable rows")
+        }),
+    })
 }
 
 fn thread_columns(conn: &Connection) -> Result<Vec<String>> {
@@ -758,35 +880,123 @@ fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(value)
 }
 
-fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
+fn load_index_titles(path: &Path) -> Result<SidecarLoad<HashMap<String, String>>> {
     // Lossy decode so a stray non-UTF-8 byte in the index sidecar never aborts codex indexing.
-    let raw = String::from_utf8_lossy(&fs::read(path)?).into_owned();
+    let bytes = fs::read(path)?;
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
     let mut map = HashMap::new();
+    let mut malformed_lines = usize::from(raw.contains(char::REPLACEMENT_CHARACTER));
     for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(_) => {
+                malformed_lines += 1;
+                continue;
+            }
         };
         if let (Some(id), Some(title)) = (
             value.get("id").and_then(Value::as_str),
             value.get("thread_name").and_then(Value::as_str),
         ) {
             map.insert(id.to_string(), title.to_string());
+        } else {
+            malformed_lines += 1;
         }
     }
-    Ok(map)
+    Ok(SidecarLoad {
+        value: map,
+        degraded: (malformed_lines > 0).then(|| {
+            format!("ignored {malformed_lines} malformed sidecar line(s); retained readable rows")
+        }),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_output_text, codex_spawn_origin, is_codex_injected_context, CodexAdapter};
+    use super::{
+        codex_apply_patch_succeeded, codex_output_text, codex_spawn_origin,
+        is_codex_injected_context, CodexAdapter,
+    };
     use crate::models::{Provider, Role};
     use serde_json::json;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn write_rollout(root: &Path, session_id: &str, cwd: &str, prompt: &str) -> PathBuf {
+        fs::create_dir_all(root).unwrap();
+        let path = root.join(format!("rollout-2026-08-04T00-00-00-{session_id}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"{cwd}\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{prompt}\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn metadata_is_scoped_to_each_configured_codex_home() {
+        let temp = tempdir().unwrap();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let home_a = temp.path().join("home-a");
+        let home_b = temp.path().join("home-b");
+        let root_a = home_a.join("sessions");
+        let root_b = home_b.join("sessions");
+        let file_a = write_rollout(&root_a, session_id, "/rollout/a", "prompt a");
+        let file_b = write_rollout(&root_b, session_id, "/rollout/b", "prompt b");
+        fs::write(
+            home_a.join("session_index.jsonl"),
+            format!(r#"{{"id":"{session_id}","thread_name":"title a"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            home_b.join("session_index.jsonl"),
+            format!(r#"{{"id":"{session_id}","thread_name":"title b"}}"#),
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root_a, root_b]);
+        let sources = adapter.discover();
+        let parsed_a = adapter.parse(sources.iter().find(|source| source.path == file_a).unwrap());
+        let parsed_b = adapter.parse(sources.iter().find(|source| source.path == file_b).unwrap());
+
+        assert_eq!(parsed_a.session.title.as_deref(), Some("title a"));
+        assert_eq!(parsed_b.session.title.as_deref(), Some("title b"));
+        assert_eq!(parsed_a.session.cwd.as_deref(), Some("/rollout/a"));
+        assert_eq!(parsed_b.session.cwd.as_deref(), Some("/rollout/b"));
+    }
+
+    #[test]
+    fn absent_sidecars_are_quiet_but_malformed_index_is_degraded() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join("sessions");
+        write_rollout(
+            &root,
+            "019efd97-d602-7922-89dd-467272106505",
+            "/rollout",
+            "fallback title",
+        );
+
+        let quiet = CodexAdapter::new(vec![root.clone()]);
+        assert!(quiet.sidecar_warnings().is_empty());
+
+        fs::write(
+            home.join("session_index.jsonl"),
+            "{not json}\n{\"id\":\"kept\",\"thread_name\":\"kept title\"}\n",
+        )
+        .unwrap();
+        let degraded = CodexAdapter::new(vec![root]);
+
+        assert_eq!(degraded.sidecar_warnings().len(), 1);
+        assert_eq!(degraded.sidecar_warnings()[0].operation, "read_sidecar");
+        assert!(degraded.sidecar_warnings()[0].message.contains("malformed"));
+    }
 
     #[test]
     fn codex_output_text_handles_string_and_structured() {
@@ -830,7 +1040,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapter = CodexAdapter::new(vec![root], temp.path().join("nonexistent-home"));
+        let adapter = CodexAdapter::new(vec![root]);
         let sources = adapter.discover();
         assert_eq!(sources.len(), 1);
         let parsed = adapter.parse(&sources[0]);
@@ -861,7 +1071,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapter = CodexAdapter::new(vec![root], temp.path().join("nonexistent-home"));
+        let adapter = CodexAdapter::new(vec![root]);
         let sources = adapter.discover();
         assert_eq!(sources.len(), 1);
         let parsed = adapter.parse(&sources[0]);
@@ -922,11 +1132,24 @@ mod tests {
         // Real codex shape: apply_patch is a custom_tool_call whose `input` is the patch.
         fs::write(
             &file,
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019efd97-d602-7922-89dd-467272106505\",\"timestamp\":\"2026-06-25T07:00:00.000Z\",\"cwd\":\"/p\"}}\n{\"timestamp\":\"2026-06-25T07:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Update File: /p/a.rs\\n@@\\n-old\\n+new\\n*** Add File: /p/b.rs\\n+line1\\n+line2\\n*** Delete File: /p/c.rs\\n*** End Patch\"}}\n",
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","timestamp":"2026-06-25T07:00:00.000Z","cwd":"/p"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: /p/a.rs\n@@\n-old\n+new\n*** Add File: /p/b.rs\n+line1\n+line2\n*** Delete File: /p/c.rs\n*** End Patch"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_1","output":"Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess. Updated the following files:\nM /p/a.rs\nA /p/b.rs\nD /p/c.rs\n"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_failed","name":"apply_patch","input":"*** Begin Patch\n*** Add File: /p/failed.rs\n+wrong\n*** End Patch"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_failed","output":"aborted by user after 53.3s"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_unresolved","name":"apply_patch","input":"*** Begin Patch\n*** Add File: /p/unresolved.rs\n+unknown\n*** End Patch"}}"#,
+                "\n",
+            ),
         )
         .unwrap();
 
-        let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
+        let adapter = CodexAdapter::new(vec![root]);
         let parsed = adapter.parse(&adapter.discover()[0]);
 
         let names: Vec<&str> = parsed
@@ -937,6 +1160,14 @@ mod tests {
         assert!(names.contains(&"a.rs"), "Update File recorded: {names:?}");
         assert!(names.contains(&"b.rs"), "Add File recorded: {names:?}");
         assert!(names.contains(&"c.rs"), "Delete File recorded: {names:?}");
+        assert!(
+            !names.contains(&"failed.rs"),
+            "failed patch excluded: {names:?}"
+        );
+        assert!(
+            !names.contains(&"unresolved.rs"),
+            "unresolved patch excluded: {names:?}"
+        );
         // Added file carries its new content (replayable); update/delete are path-only.
         let added = parsed
             .file_edits
@@ -954,12 +1185,36 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_only_explicit_successful_apply_patch_outputs() {
+        let rendered = json!(
+            "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess. Updated the following files:\nM /p/a.rs\n"
+        );
+        let structured = json!({
+            "output": "Success. Updated the following files:\nM /p/a.rs\n",
+            "metadata": {"exit_code": 0, "duration_seconds": 0.1}
+        });
+        let serialized = json!(structured.to_string());
+        assert!(codex_apply_patch_succeeded(Some(&rendered)));
+        assert!(codex_apply_patch_succeeded(Some(&structured)));
+        assert!(codex_apply_patch_succeeded(Some(&serialized)));
+        for output in [
+            json!("aborted by user after 53.3s"),
+            json!("Exit code: 1\nOutput:\nInvalid Context"),
+            json!({"output": "Success. Updated the following files:\nM /p/a.rs", "metadata": {"exit_code": 1}}),
+            json!({"output": "unknown"}),
+        ] {
+            assert!(!codex_apply_patch_succeeded(Some(&output)), "{output}");
+        }
+        assert!(!codex_apply_patch_succeeded(None));
+    }
+
+    #[test]
     fn indexes_codex_event_metadata_and_thread_columns() {
         let temp = tempdir().unwrap();
-        let root = temp.path().join("sessions");
-        fs::create_dir_all(&root).unwrap();
         let codex_home = temp.path().join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
+        let root = codex_home.join("sessions");
+        fs::create_dir_all(&root).unwrap();
         let session_id = "019efd97-d602-7922-89dd-467272106505";
         let state = codex_home.join("state_5.sqlite");
         let conn = rusqlite::Connection::open(&state).unwrap();
@@ -997,7 +1252,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapter = CodexAdapter::new(vec![root], codex_home);
+        let adapter = CodexAdapter::new(vec![root]);
         let parsed = adapter.parse(&adapter.discover()[0]);
         assert_eq!(
             parsed.session.parse_version,
@@ -1058,7 +1313,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapter = CodexAdapter::new(vec![root], temp.path().join("nonexistent-home"));
+        let adapter = CodexAdapter::new(vec![root]);
         let sources = adapter.discover();
         let parsed = adapter.parse(&sources[0]);
 
@@ -1193,7 +1448,7 @@ mod tests {
         );
         fs::write(&file, content).unwrap();
 
-        let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
+        let adapter = CodexAdapter::new(vec![root]);
         let parsed = adapter.parse(&adapter.discover()[0]);
 
         assert!(
@@ -1222,6 +1477,10 @@ mod tests {
         );
         assert!(parsed.transcript_text.contains("do the thing"));
         assert!(parsed.transcript_text.contains("done"));
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
+        );
     }
 
     /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).
@@ -1235,7 +1494,7 @@ mod tests {
         let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
         fs::write(&file, [b'{', 0xFF, 0xFE, b'}', b'\n']).unwrap();
 
-        let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
+        let adapter = CodexAdapter::new(vec![root]);
         let parsed = adapter.parse(&adapter.discover()[0]);
         assert!(parsed.messages.is_empty());
         assert!(

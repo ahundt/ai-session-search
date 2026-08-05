@@ -5,18 +5,22 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ignore::WalkBuilder;
 use serde_json::{json, Value};
 
+use crate::files::{FileMutationPayload, PendingFileMutations};
 use crate::models::{
     ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, MessageContentPart,
     MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
 };
-use crate::providers::spawn::{self, SpawnOrigin};
+use crate::providers::{
+    spawn::{self, SpawnOrigin},
+    walk_roots, ProviderDiscovery, ProviderPathWarning,
+};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
     minimal_record, normalize_path, parse_datetime, preview_from_text, substantive_text,
@@ -58,61 +62,57 @@ impl ClaudeAdapter {
     }
 
     pub fn discover(&self) -> Vec<SourceFile> {
+        self.discover_with_warnings().sources
+    }
+
+    pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
-        for root in &self.roots {
-            if !root.exists() {
+        let mut walked = walk_roots(&self.roots, None);
+        for entry in walked.entries {
+            let path = &entry.path;
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            let walker = WalkBuilder::new(root)
-                .hidden(false)
-                .ignore(false)
-                .git_ignore(false)
-                .git_exclude(false)
-                .parents(false)
-                .build();
-            for entry in walker.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                if path
-                    .components()
-                    .any(|component| component.as_os_str() == "memory")
-                {
-                    continue;
-                }
-                // Subagent transcripts — `<parent>/subagents/agent-<id>.jsonl` and the flat
-                // `agent-<id>.jsonl` beside their parent — are sessions of their own; see
-                // `ClaudeSpawn` for why, and how their identity is kept off the parent's row.
-                // The workflow engine's `journal.jsonl` sits among them and records agent
-                // return values rather than a conversation, so it is not a session.
-                if path.file_name().and_then(|name| name.to_str()) == Some(WORKFLOW_JOURNAL_FILE)
-                    && spawn::subagents_dir_origin(path).is_some()
-                {
-                    continue;
-                }
-                if let Ok(metadata) = entry.metadata() {
-                    let source_kind = ClaudeSourceKind::from_path(path);
-                    files.push(SourceFile {
-                        provider: source_kind.provider(),
-                        path: path.to_path_buf(),
-                        mtime_ns: mtime_ns(&metadata),
-                        size_bytes: metadata.len() as i64,
-                    });
-                    // Both transcript kinds that carry a JSON sidecar fold it in, so editing
-                    // metadata beside an unchanged transcript still re-parses the session.
-                    let sidecar = if is_claude_desktop_audit(path) {
-                        claude_desktop_sidecar_path(path)
-                    } else {
-                        claude_subagent_sidecar_path(path)
-                    };
-                    if let (Some(sidecar), Some(source)) = (sidecar, files.last_mut()) {
-                        fold_sidecar(source, &sidecar);
-                    }
+            if path
+                .components()
+                .any(|component| component.as_os_str() == "memory")
+            {
+                continue;
+            }
+            // Subagent transcripts — `<parent>/subagents/agent-<id>.jsonl` and the flat
+            // `agent-<id>.jsonl` beside their parent — are sessions of their own; see
+            // `ClaudeSpawn` for why, and how their identity is kept off the parent's row.
+            // The workflow engine's `journal.jsonl` sits among them and records agent
+            // return values rather than a conversation, so it is not a session.
+            if path.file_name().and_then(|name| name.to_str()) == Some(WORKFLOW_JOURNAL_FILE)
+                && spawn::subagents_dir_origin(path).is_some()
+            {
+                continue;
+            }
+            let source_kind = ClaudeSourceKind::from_path(path);
+            let sidecar = if is_claude_desktop_audit(path) {
+                claude_desktop_sidecar_path(path)
+            } else {
+                claude_subagent_sidecar_path(path)
+            };
+            files.push(SourceFile {
+                provider: source_kind.provider(),
+                path: entry.path,
+                mtime_ns: mtime_ns(&entry.metadata),
+                size_bytes: entry.metadata.len() as i64,
+            });
+            // Both transcript kinds that carry a JSON sidecar fold it in, so editing
+            // metadata beside an unchanged transcript still re-parses the session.
+            if let (Some(sidecar), Some(source)) = (sidecar, files.last_mut()) {
+                if let Some(warning) = fold_sidecar(source, &sidecar) {
+                    walked.warnings.push(warning);
                 }
             }
         }
-        files
+        ProviderDiscovery {
+            sources: files,
+            warnings: walked.warnings,
+        }
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
@@ -194,7 +194,7 @@ impl ClaudeAdapter {
         let mut transcript_lines = Vec::new();
         let mut last_prompt = desktop.initial_message.clone();
         let mut file_edits: Vec<FileEdit> = Vec::new();
-        let mut file_edit_seq: i64 = 0;
+        let mut pending_file_mutations = PendingFileMutations::default();
         // tool_use_id -> tool name, so a later tool_result (which references the call by
         // id, not name) can be tagged with the tool it came from.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
@@ -208,7 +208,9 @@ impl ClaudeAdapter {
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => {
-                    malformed_line_count += 1;
+                    if !line.contains(char::REPLACEMENT_CHARACTER) {
+                        malformed_line_count += 1;
+                    }
                     continue;
                 }
             };
@@ -284,7 +286,8 @@ impl ClaudeAdapter {
                 }
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
-                collect_file_edits(message, timestamp, &mut file_edit_seq, &mut file_edits);
+                stage_file_edits(message, timestamp, &mut pending_file_mutations);
+                collect_file_edit_results(message, &mut pending_file_mutations, &mut file_edits);
                 collect_tool_use_names(message, &mut tool_use_names);
                 append_tool_use_messages(message, timestamp, &mut messages);
                 // One scan for the first tool_result block: `tool_result` is true when a block
@@ -486,14 +489,7 @@ impl ClaudeAdapter {
         }
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
-        let parse_warning =
-            if source_kind == ClaudeSourceKind::DesktopLocalAgent && malformed_line_count > 0 {
-                Some(format!(
-                    "skipped {malformed_line_count} malformed JSONL line(s)"
-                ))
-            } else {
-                None
-            };
+        let parse_warning = super::malformed_jsonl_warning(malformed_line_count);
 
         // A subagent's identity is its parent's id plus what distinguishes the run under that
         // parent. Neither half alone works: the records name only the parent, and the agent id
@@ -753,9 +749,34 @@ fn claude_desktop_metadata(path: &Path) -> ClaudeDesktopMetadata {
     }
 }
 
-/// Scan an assistant `message.content` array for `tool_use` blocks that mutate a
-/// file (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`) and append a [`FileEdit`] for
-/// each, assigning monotonic session-local sequence numbers.
+/// Stage file-mutating calls by native id until their corresponding result proves completion.
+fn stage_file_edits(
+    message: &Value,
+    ts: Option<DateTime<Utc>>,
+    pending: &mut PendingFileMutations,
+) {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let name = block
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        pending.stage(
+            block.get("id").and_then(Value::as_str),
+            ts,
+            name,
+            tool_use_payload(name, block.get("input")),
+        );
+    }
+}
+
+/// Extract mutations immediately for provider formats whose edit record is authoritative itself.
+/// Claude Code does not use this path: it stages calls above until a correlated result arrives.
 pub(crate) fn collect_file_edits(
     message: &Value,
     ts: Option<DateTime<Utc>>,
@@ -773,31 +794,50 @@ pub(crate) fn collect_file_edits(
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let input = block.get("input");
-        if let Some((file_path, new_content, edits)) = tool_use_payload(name, input) {
-            let file_name = crate::util::file_basename(&file_path);
-            out.push(FileEdit {
-                seq: *next_seq,
-                ts,
-                tool: name.to_string(),
-                file_path,
-                file_name,
-                new_content,
-                edits,
-            });
-            *next_seq += 1;
-        }
+        let Some((file_path, new_content, edits)) = tool_use_payload(name, block.get("input"))
+        else {
+            continue;
+        };
+        out.push(FileEdit {
+            seq: *next_seq,
+            ts,
+            tool: name.to_string(),
+            file_name: crate::util::file_basename(&file_path),
+            file_path,
+            new_content,
+            edits,
+        });
+        *next_seq += 1;
     }
 }
 
-/// `(file_path, full_content?, edit deltas)` for one file-mutating tool call.
-type ToolEditPayload = (String, Option<String>, Vec<EditOp>);
+fn collect_file_edit_results(
+    message: &Value,
+    pending: &mut PendingFileMutations,
+    out: &mut Vec<FileEdit>,
+) {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        pending.finish(
+            block.get("tool_use_id").and_then(Value::as_str),
+            // Observed Claude Code records use both `is_error:false` and an omitted flag for
+            // successful results; only `is_error:true` is an explicit failure.
+            block.get("is_error").and_then(Value::as_bool) != Some(true),
+            out,
+        );
+    }
+}
 
 /// Map a single file-mutating tool call to `(file_path, full_content?, edits)`.
 /// `Write` yields a full-content snapshot; `Edit`/`MultiEdit` yield delta ops (carrying
 /// the `replace_all` flag); `NotebookEdit` is recorded (path only) so it appears in
 /// history/cross-ref, but carries no replayable delta (cell reconstruction is out of scope).
-fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload> {
+fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<FileMutationPayload> {
     let input = input?;
     let str_field = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
     match name {
@@ -1107,12 +1147,20 @@ fn mtime_ns(metadata: &fs::Metadata) -> i64 {
 /// Fold a sidecar's mtime and size into the transcript's [`SourceFile`], so editing metadata
 /// stored beside an unchanged transcript still re-parses the session. Without this the indexer
 /// compares the transcript alone, sees no change, and keeps the stale row.
-fn fold_sidecar(source: &mut SourceFile, sidecar: &Path) {
-    let Ok(metadata) = sidecar.metadata() else {
-        return;
-    };
-    source.mtime_ns = source.mtime_ns.max(mtime_ns(&metadata));
-    source.size_bytes = source.size_bytes.saturating_add(metadata.len() as i64);
+fn fold_sidecar(source: &mut SourceFile, sidecar: &Path) -> Option<ProviderPathWarning> {
+    match sidecar.metadata() {
+        Ok(metadata) => {
+            source.mtime_ns = source.mtime_ns.max(mtime_ns(&metadata));
+            source.size_bytes = source.size_bytes.saturating_add(metadata.len() as i64);
+            None
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => Some(ProviderPathWarning {
+            path: sidecar.to_path_buf(),
+            operation: "read_sidecar",
+            message: error.to_string(),
+        }),
+    }
 }
 
 fn should_skip_message(value: &Value, text: &str) -> bool {
@@ -1782,6 +1830,10 @@ mod tests {
         // Full structural snapshot (source_path stripped — it is an absolute tempdir path).
         assert_eq!(parsed.session.provider, Provider::Claude);
         assert_eq!(parsed.session.message_count, Some(5));
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
+        );
         let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "tool", "assistant", "tool", "user"]);
         let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
@@ -1809,6 +1861,58 @@ mod tests {
         assert_eq!(parsed.file_edits[0].tool, "Edit");
         assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/proj"));
         assert_eq!(parsed.session.title.as_deref(), Some("second prompt"));
+    }
+
+    #[test]
+    fn file_edits_commit_only_after_correlated_successful_tool_results() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "22222222-3333-4444-5555-666666666666";
+        let file = root.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &file,
+            r#"{"sessionId":"22222222-3333-4444-5555-666666666666","type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"recover the file"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"write-ok","name":"Write","input":{"file_path":"/tmp/proj/a.rs","content":"alpha"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"write-ok","content":"written"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"edit-ok","name":"Edit","input":{"file_path":"/tmp/proj/a.rs","old_string":"alpha","new_string":"beta"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"edit-ok","is_error":false,"content":"edited"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"edit-failed","name":"Edit","input":{"file_path":"/tmp/proj/a.rs","old_string":"beta","new_string":"corrupt"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"edit-failed","is_error":true,"content":"old_string not found"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"multi-ok","name":"MultiEdit","input":{"file_path":"/tmp/proj/a.rs","edits":[{"old_string":"beta","new_string":"gamma"},{"old_string":"gamma","new_string":"delta"}]}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"multi-ok","is_error":false,"content":"edited"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"write-later","name":"Write","input":{"file_path":"/tmp/proj/a.rs","content":"snapshot"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"write-later","is_error":false,"content":"written"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"edit-unresolved","name":"Edit","input":{"file_path":"/tmp/proj/a.rs","old_string":"snapshot","new_string":"not observed"}}]}}
+"#,
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        assert_eq!(
+            parsed
+                .file_edits
+                .iter()
+                .map(|edit| (edit.seq, edit.tool.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "Write"), (1, "Edit"), (2, "MultiEdit"), (3, "Write")]
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 1).as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 2).as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 3).as_deref(),
+            Some("delta")
+        );
+        assert_eq!(
+            crate::files::reconstruct(&parsed.file_edits, 4).as_deref(),
+            Some("snapshot")
+        );
     }
 
     /// Bytes that are not valid UTF-8 must never panic or abort the parse — they are decoded

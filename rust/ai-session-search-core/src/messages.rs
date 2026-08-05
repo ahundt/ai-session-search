@@ -1270,36 +1270,42 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
                 .map(|evidence| ((hit.session_id.clone(), hit.seq), evidence))
         })
         .collect::<BTreeMap<_, _>>();
+    let context_hits = context_hits_in_encounter_order(response.context_windows());
     if include_refs {
-        let mut rows: BTreeMap<(String, i64), ContextRowWithRefs> = BTreeMap::new();
-        for window in response.context_windows() {
-            for ctx in window.iter().cloned() {
-                let key = (ctx.session_id.clone(), ctx.seq);
-                let evidence = match_evidence.get(&key).cloned();
-                rows.entry(key).or_insert_with(|| {
-                    let mut row = ContextRowWithRefs::from_hit(ctx, &matched, lines_per_message);
-                    row.row = row.row.with_match_evidence(evidence);
-                    row
-                });
-            }
-        }
-        let windowed: Vec<ContextRowWithRefs> = rows.into_values().collect();
+        let windowed = context_hits
+            .into_iter()
+            .map(|ctx| {
+                let evidence = match_evidence
+                    .get(&(ctx.session_id.clone(), ctx.seq))
+                    .cloned();
+                let mut row = ContextRowWithRefs::from_hit(ctx, &matched, lines_per_message);
+                row.row = row.row.with_match_evidence(evidence);
+                row
+            })
+            .collect::<Vec<_>>();
         emit(&windowed, format)
     } else {
-        let mut rows: BTreeMap<(String, i64), ContextRow> = BTreeMap::new();
-        for window in response.context_windows() {
-            for ctx in window.iter().cloned() {
-                let key = (ctx.session_id.clone(), ctx.seq);
-                let evidence = match_evidence.get(&key).cloned();
-                rows.entry(key).or_insert_with(|| {
-                    ContextRow::from_hit(ctx, &matched, lines_per_message)
-                        .with_match_evidence(evidence)
-                });
-            }
-        }
-        let windowed: Vec<ContextRow> = rows.into_values().collect();
+        let windowed = context_hits
+            .into_iter()
+            .map(|ctx| {
+                let evidence = match_evidence
+                    .get(&(ctx.session_id.clone(), ctx.seq))
+                    .cloned();
+                ContextRow::from_hit(ctx, &matched, lines_per_message).with_match_evidence(evidence)
+            })
+            .collect::<Vec<_>>();
         emit(&windowed, format)
     }
+}
+
+fn context_hits_in_encounter_order(windows: &[Vec<MessageHit>]) -> Vec<MessageHit> {
+    let mut seen = HashSet::new();
+    windows
+        .iter()
+        .flatten()
+        .filter(|hit| seen.insert((hit.session_id.clone(), hit.seq)))
+        .cloned()
+        .collect()
 }
 
 fn emit_message_search_jsonl_batches(mut batches: crate::MessageSearchBatches) -> Result<()> {
@@ -1868,6 +1874,28 @@ mod tests {
             fuzzy_score: None,
             content: content.to_string(),
         }
+    }
+
+    #[test]
+    fn context_rows_keep_first_canonical_encounter_across_sessions() {
+        let mut ranked_first = sample_hit(1, "ranked first");
+        ranked_first.session_id = "claude:z-ranked-first".to_string();
+        let mut ranked_second = sample_hit(2, "ranked second");
+        ranked_second.session_id = "claude:a-ranked-second".to_string();
+        let duplicate_first = ranked_first.clone();
+
+        let ordered = context_hits_in_encounter_order(&[
+            vec![ranked_first, ranked_second],
+            vec![duplicate_first],
+        ]);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|hit| (hit.session_id.as_str(), hit.seq))
+                .collect::<Vec<_>>(),
+            [("claude:z-ranked-first", 1), ("claude:a-ranked-second", 2),]
+        );
     }
 
     #[test]

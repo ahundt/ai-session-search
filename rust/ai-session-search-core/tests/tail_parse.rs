@@ -110,9 +110,7 @@ fn claude_tail_matches_full_with_cross_boundary_tool_result() {
 #[test]
 fn codex_tail_matches_full_with_cross_boundary_call_output() {
     // function_call (c1) in the prefix; its function_call_output in the tail → "shell" via overlap.
-    let dir = tempfile::tempdir().unwrap();
-    let adapter =
-        ai_session_search::providers::codex::CodexAdapter::new(vec![], dir.path().join("no-home"));
+    let adapter = ai_session_search::providers::codex::CodexAdapter::new(vec![]);
     let initial = concat!(
         r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","timestamp":"2026-06-25T07:00:00.000Z","cwd":"/tmp/proj"}}"#,
         "\n",
@@ -189,7 +187,7 @@ fn pi_tail_matches_full() {
         "\n",
     );
     let appended = concat!(
-        r#"{"type":"message","timestamp":"2026-06-18T17:31:40.000Z","message":{"role":"toolResult","toolName":"write","content":[{"type":"text","text":"file written"}]}}"#,
+        r#"{"type":"message","timestamp":"2026-06-18T17:31:40.000Z","message":{"role":"toolResult","toolCallId":"t1","toolName":"write","content":[{"type":"text","text":"file written"}],"isError":false}}"#,
         "\n",
         r#"{"type":"message","timestamp":"2026-06-18T17:31:44.000Z","message":{"role":"user","content":[{"type":"text","text":"now run the tests"}]}}"#,
         "\n",
@@ -338,8 +336,8 @@ fn tail_append_matches_full_reindex() {
         db.file_edit_count().unwrap(),
         full_db.file_edit_count().unwrap()
     );
-    // The Write edit from line 4 survived (1 file edit, in both).
-    assert_eq!(db.file_edit_count().unwrap(), 1);
+    // The unresolved Write from line 4 is not a proven recoverable file state.
+    assert_eq!(db.file_edit_count().unwrap(), 0);
     // tool_result messages are tagged with the originating tool across the boundary.
     let tools: Vec<_> = tail_rows
         .iter()

@@ -448,6 +448,10 @@ def test_session_query_selects_session_classes_and_follows_the_spawn_link(
     # parent_session_id holds the parent row's whole id, so the value a caller already has
     # from a listing is the value that selects that session's runs.
     assert ids(parent_session_id="claude:parent") == ["claude:parent/agent-a"]
+    with pytest.raises(ValueError, match="session_kinds") as impossible:
+        ids(session_kinds=["user"], parent_session_id="claude:parent")
+    assert "parent_session_id" in str(impossible.value)
+    assert "subagent" in str(impossible.value)
 
     spawned = search.list_sessions(native.SessionQuery(session_kinds=["subagent"]))[0]
     assert spawned.parent_session_id == "claude:parent"
