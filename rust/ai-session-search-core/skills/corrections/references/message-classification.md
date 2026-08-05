@@ -154,6 +154,13 @@ rules ran and found nothing" and "no rules ran" would look identical.
 
 `matched_text` is the substring that matched, **not** the rule that matched it.
 
+CLI JSON and JSONL runs retain complete classified messages by default for scripts that need the
+typed report. For bounded delivery, pass `--detail compact` or explicit
+`--field-view-chars N`/`--match-view-chars N`; bounded matches return `message_ref`, classification
+coordinates, and bounded `presentation` views instead of the full `content`. Use that reference
+with `aise messages get --seq` when the complete turn is needed. These flags affect presentation
+only, never classification, ordering, page membership, or policy receipts.
+
 Page with `--limit` and `--offset` (newest first). `--limit 0` returns every match.
 Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety
 ceiling. If their combined canonical input exceeds it, Aise reports the consumed and attempted byte

@@ -1463,6 +1463,32 @@ mod tests {
     }
 
     #[test]
+    fn skill_execution_accepts_standard_presentation_controls() {
+        let execution = SkillsCmd::Inferred(vec![
+            OsString::from("corrections"),
+            OsString::from("--field-view-chars"),
+            OsString::from("80"),
+            OsString::from("--match-view-chars"),
+            OsString::from("minimal"),
+            OsString::from("--format"),
+            OsString::from("json"),
+        ])
+        .into_execution()
+        .unwrap();
+
+        assert_eq!(
+            execution.args.field_view_chars,
+            Some(crate::messages::CliFieldViewChars::MaxChars(
+                std::num::NonZeroUsize::new(80).unwrap()
+            ))
+        );
+        assert_eq!(
+            execution.args.match_view_chars,
+            Some(crate::messages::CliMatchViewChars::Minimal)
+        );
+    }
+
+    #[test]
     fn selector_lexing_keeps_names_and_explicit_paths_unambiguous() {
         assert!(matches!(
             parse_skill_selector(OsString::from("my-review")).unwrap(),

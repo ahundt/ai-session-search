@@ -1127,7 +1127,7 @@ fn execute(cli: Cli) -> Result<()> {
                     },
                 ),
             })?;
-            crate::analytics::render_skill_run_report(&report, args.format)?;
+            crate::analytics::render_skill_run_report(&report, &config, &args)?;
         }
         Commands::RefreshIndex => unreachable!("background refresh returns before configuration"),
     }

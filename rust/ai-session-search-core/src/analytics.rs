@@ -23,6 +23,10 @@ use serde::Serialize;
 use crate::config::{AnalyticsConfig, Config};
 use crate::dates::DateRange;
 use crate::db::Db;
+use crate::message_search::{
+    DetailLevel, FieldViewBudget, MatchViewBudget, DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
+};
+use crate::messages::{CliFieldViewChars, CliMatchViewChars};
 use crate::models::{
     MessageClassificationMatch, MessageFilters, MessageHit, MessageSearchMode, PlanningCount,
     Provider, Role,
@@ -253,6 +257,23 @@ pub struct CorrectionsArgs {
     /// selected skill. Each value is a catalog name, skill directory, or exact SKILL.md path.
     #[arg(long = "skill", value_name = "NAME_OR_PATH")]
     pub additional_skills: Vec<std::ffi::OsString>,
+    /// Presentation preset for JSON/JSONL results: compact bounds the selected field and match
+    /// view; full keeps the complete field and only the exact match span. Omit to preserve the
+    /// complete typed report. The bounded form keeps the full message recoverable by message_ref.
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with_all = ["field_view_chars", "match_view_chars"]
+    )]
+    pub detail: Option<DetailLevel>,
+    /// Bound the selected classified message field in JSON/JSONL output to this many Unicode
+    /// scalar characters, or use no-char-limit. Omit for the complete field.
+    #[arg(long)]
+    pub field_view_chars: Option<CliFieldViewChars>,
+    /// Bound the match-centered view in JSON/JSONL output to minimal or this many Unicode scalar
+    /// characters. Omit for the standard 220-character match view.
+    #[arg(long)]
+    pub match_view_chars: Option<CliMatchViewChars>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -360,23 +381,117 @@ pub(crate) fn message_classification_filters(
 
 pub(crate) fn render_skill_run_report(
     report: &crate::skill_run::SkillRunReport,
-    format: OutputFormat,
+    config: &Config,
+    args: &CorrectionsArgs,
 ) -> Result<()> {
-    match format {
+    match args.format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(report)?);
+            if let Some((field_budget, match_budget)) = skill_presentation_budgets(config, args) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&bounded_skill_run_value(
+                        report,
+                        field_budget,
+                        match_budget
+                    )?)?
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(report)?);
+            }
             Ok(())
         }
         OutputFormat::Jsonl => {
-            println!("{}", serde_json::to_string(report)?);
+            if let Some((field_budget, match_budget)) = skill_presentation_budgets(config, args) {
+                println!(
+                    "{}",
+                    serde_json::to_string(&bounded_skill_run_value(
+                        report,
+                        field_budget,
+                        match_budget,
+                    )?)?
+                );
+            } else {
+                println!("{}", serde_json::to_string(report)?);
+            }
             Ok(())
         }
         OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain => {
             let crate::skill_run::SkillCapabilityOutput::MessageClassification(result) =
                 &report.output;
-            render_correction_report(&result.report, format)
+            render_correction_report(&result.report, args.format)
         }
     }
+}
+
+fn skill_presentation_budgets(
+    config: &Config,
+    args: &CorrectionsArgs,
+) -> Option<(FieldViewBudget, MatchViewBudget)> {
+    if args.detail.is_none() && args.field_view_chars.is_none() && args.match_view_chars.is_none() {
+        return None;
+    }
+    let field_budget = match args.detail {
+        Some(DetailLevel::Compact) => FieldViewBudget::MaxChars {
+            max_chars: std::num::NonZeroUsize::new(config.cli.evidence_preview_chars)
+                .expect("validated CLI evidence preview chars are positive"),
+        },
+        Some(DetailLevel::Full) => FieldViewBudget::NoCharLimit,
+        None => match args.field_view_chars {
+            Some(CliFieldViewChars::NoCharLimit) | None => FieldViewBudget::NoCharLimit,
+            Some(CliFieldViewChars::MaxChars(max_chars)) => FieldViewBudget::MaxChars { max_chars },
+        },
+    };
+    let match_budget = match args.detail {
+        Some(DetailLevel::Full) => MatchViewBudget::MinimalSpan,
+        Some(DetailLevel::Compact) => MatchViewBudget::MaxChars {
+            max_chars: config
+                .search
+                .message_search
+                .match_evidence_max_chars
+                .unwrap_or_else(|| {
+                    std::num::NonZeroUsize::new(DEFAULT_MATCH_EVIDENCE_MAX_CHARS)
+                        .expect("typed match evidence default is positive")
+                }),
+        },
+        None => match args.match_view_chars {
+            Some(CliMatchViewChars::Minimal) => MatchViewBudget::MinimalSpan,
+            Some(CliMatchViewChars::MaxChars(max_chars)) => MatchViewBudget::MaxChars { max_chars },
+            None => MatchViewBudget::MaxChars {
+                max_chars: config
+                    .search
+                    .message_search
+                    .match_evidence_max_chars
+                    .unwrap_or_else(|| {
+                        std::num::NonZeroUsize::new(DEFAULT_MATCH_EVIDENCE_MAX_CHARS)
+                            .expect("typed match evidence default is positive")
+                    }),
+            },
+        },
+    };
+    Some((field_budget, match_budget))
+}
+
+fn bounded_skill_run_value(
+    report: &crate::skill_run::SkillRunReport,
+    field_budget: FieldViewBudget,
+    match_budget: MatchViewBudget,
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(report)?;
+    let crate::skill_run::SkillCapabilityOutput::MessageClassification(output) = &report.output;
+    let matches = output
+        .report
+        .matches
+        .iter()
+        .map(|matched| {
+            crate::message_search::classification_presentation_document(
+                matched,
+                field_budget,
+                match_budget,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    value["output"]["result"]["report"]["matches"] = serde_json::Value::Array(matches);
+    Ok(value)
 }
 
 fn render_correction_report(

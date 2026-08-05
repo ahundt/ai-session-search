@@ -566,6 +566,73 @@ fn inferred_skill_execution_uses_the_indexed_read_lifecycle_and_structured_repor
 }
 
 #[test]
+fn skill_run_json_can_bound_classified_message_delivery() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+    Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+
+    let conn = rusqlite::Connection::open(root.path().join("index.db")).unwrap();
+    conn.execute_batch(
+        "insert into sessions (
+             id, provider, provider_session_id, preview_text, source_path,
+             parse_version, discovery_source
+         ) values ('claude:bounded-skill', 'claude', 'bounded-skill', '', '/bounded-skill.jsonl', 'test', 'fixture');
+         insert into messages (session_id, provider, seq, role, kind, authorship, record_relation, content)
+         values ('claude:bounded-skill', 'claude', 0, 'user', 'conversation', 'human', 'original',
+                 'prefix prefix prefix prefix prefix prefix prefix prefix prefix prefix you forgot this step suffix suffix suffix suffix suffix suffix suffix suffix suffix');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let output = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "skills",
+            "corrections",
+            "--limit",
+            "1",
+            "--field-view-chars",
+            "40",
+            "--match-view-chars",
+            "minimal",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "presentation controls must be accepted: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let matched = &report["output"]["result"]["report"]["matches"][0];
+    assert_eq!(matched["classification"]["category"], "skip_step");
+    assert_eq!(matched["classification"]["matched_text"], "you forgot");
+    assert!(
+        matched["presentation"]["field_view"]["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 40
+    );
+    assert_eq!(matched["presentation"]["match_view"]["text"], "you forgot");
+    assert!(
+        matched.get("content").is_none(),
+        "bounded delivery must not retain the full classified message"
+    );
+}
+
+#[test]
 fn explicit_skill_path_runs_its_adjacent_typed_capability() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());

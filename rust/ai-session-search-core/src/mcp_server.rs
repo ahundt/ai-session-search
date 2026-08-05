@@ -5082,36 +5082,12 @@ fn tool_run_skill_capability(
         .matches
         .iter()
         .map(|matched| {
-            let (field_view, match_view) = crate::message_search::classification_presentation(
-                &matched.content,
-                matched.match_start_char,
-                matched.match_end_char_exclusive,
+            crate::message_search::classification_presentation_document(
+                matched,
                 field_budget,
                 match_budget,
             )
-            .map_err(|error| format!("{error:#}"))?;
-            Ok(json!({
-                "message_ref": {
-                    "session_id": matched.session_id,
-                    "message_seq": matched.message_seq
-                },
-                "message_metadata": {
-                    "provider": matched.provider,
-                    "timestamp": matched.ts
-                },
-                "classification": {
-                    "policy_name": matched.policy_name,
-                    "category": matched.category,
-                    "matched_text": matched.matched_text,
-                    "field_start_char": matched.match_start_char,
-                    "field_end_char_exclusive": matched.match_end_char_exclusive,
-                    "coordinate_unit": "unicode_scalar"
-                },
-                "presentation": {
-                    "field_view": field_view,
-                    "match_view": match_view
-                }
-            }))
+            .map_err(|error| format!("{error:#}"))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let next_offset = if has_more {

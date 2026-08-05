@@ -3615,6 +3615,45 @@ pub(crate) fn classification_presentation(
     ))
 }
 
+/// Serialize one bounded classification result using the same recovery-oriented shape for CLI
+/// JSON and MCP. The full classified content remains in the typed core report; bounded adapters
+/// return its stable message reference and extent instead of duplicating large text.
+pub(crate) fn classification_presentation_document(
+    matched: &crate::models::MessageClassificationMatch,
+    field_budget: FieldViewBudget,
+    match_budget: MatchViewBudget,
+) -> anyhow::Result<serde_json::Value> {
+    let (field_view, match_view) = classification_presentation(
+        &matched.content,
+        matched.match_start_char,
+        matched.match_end_char_exclusive,
+        field_budget,
+        match_budget,
+    )?;
+    Ok(serde_json::json!({
+        "message_ref": {
+            "session_id": matched.session_id,
+            "message_seq": matched.message_seq
+        },
+        "message_metadata": {
+            "provider": matched.provider,
+            "timestamp": matched.ts
+        },
+        "classification": {
+            "policy_name": matched.policy_name,
+            "category": matched.category,
+            "matched_text": matched.matched_text,
+            "field_start_char": matched.match_start_char,
+            "field_end_char_exclusive": matched.match_end_char_exclusive,
+            "coordinate_unit": "unicode_scalar"
+        },
+        "presentation": {
+            "field_view": field_view,
+            "match_view": match_view
+        }
+    }))
+}
+
 /// Apply presentation after retrieval and match proof have been finalized.
 ///
 /// Let `V` be returned view characters and `D` the selected-field characters inspected to locate
