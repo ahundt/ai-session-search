@@ -964,6 +964,8 @@ impl Db {
             drop index if exists idx_messages_session;
             drop index if exists idx_messages_role;
             create index if not exists idx_messages_session_seq on messages(session_id, seq);
+            create index if not exists idx_messages_provider_session_seq
+                on messages(provider, session_id, seq);
             create index if not exists idx_messages_role_ts on messages(role, ts);
             create index if not exists idx_messages_tool_name
                 on messages(tool_name) where tool_name is not null;
@@ -1018,6 +1020,8 @@ impl Db {
             "drop index if exists idx_messages_authorship_role_provider_ts;
              create index if not exists idx_messages_tool_calls
                  on messages(session_id, seq) where kind = 'tool_call';
+             create index if not exists idx_messages_provider_session_seq
+                 on messages(provider, session_id, seq);
              create index if not exists idx_messages_session_authorship_relation_seq
                  on messages(session_id, authorship, record_relation, seq);
              create index if not exists idx_messages_authorship_relation_ts
@@ -10277,6 +10281,17 @@ mod tests {
         assert!(
             p.contains("idx_messages_session_seq"),
             "session/seq query must use the composite: {p}"
+        );
+
+        // 4. provider + session-sequence page (the common CLI/MCP scoped-page path) must not
+        // scan and sort the whole messages table before honoring LIMIT.
+        let p = plan(
+            "select content from messages where provider = 'claude' \
+             order by session_id, seq limit 2",
+        );
+        assert!(
+            p.contains("idx_messages_provider_session_seq") && !p.contains("USE TEMP B-TREE"),
+            "provider-scoped pages must use the ordered provider composite without a sort: {p}"
         );
     }
 
