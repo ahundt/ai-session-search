@@ -21,10 +21,10 @@
 //! 2. An empty or short catalogue is an error, never a pass. [`evaluate`] is always run against
 //!    a catalogue whose size the caller has asserted.
 //!
-//! Two modes. [`Status::Pending`] is the ratchet: a row measuring a defect this repository has
-//! not fixed yet reports its measurement without failing, and the commit that fixes it sets
-//! `enforced: true` in the same change, so reverting the fix reverts the gate with it. `strict`
-//! enforces every row and is expected to fail until the whole schema sequence has landed.
+//! Two modes. A row whose defect this repository has not fixed yet reports a warning, and the
+//! commit that fixes it sets `fail_on_breach: true` in the same change, so reverting the fix
+//! reverts the gate with it. `strict` makes every measured breach fail until the whole schema
+//! sequence has landed.
 
 use clap::Args;
 use serde_json::{json, Map, Value};
@@ -84,10 +84,10 @@ pub enum AppliesTo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Pass,
-    /// Inside the limit but past its review line.
-    Warn,
-    /// Over the limit, and the package that fixes it has not landed. Reported, never failed.
-    Pending,
+    /// Inside the limit but past its notice line; this is not a client-limit warning.
+    Notice,
+    /// Over a limit configured to report a warning instead of failing.
+    Warning,
     Fail,
 }
 
@@ -95,8 +95,8 @@ impl Status {
     fn label(self) -> &'static str {
         match self {
             Status::Pass => "PASS",
-            Status::Warn => "WARN",
-            Status::Pending => "PENDING",
+            Status::Notice => "NOTICE",
+            Status::Warning => "WARNING",
             Status::Fail => "FAIL",
         }
     }
@@ -106,19 +106,21 @@ impl Status {
 #[derive(Debug, Clone, Copy)]
 pub struct HarnessLimit {
     pub name: &'static str,
-    pub client: &'static str,
+    /// The external client, protocol, or repository policy that owns this rule.
+    pub authority: &'static str,
     pub artifact: &'static str,
     pub budget: usize,
     pub unit: &'static str,
     pub failure_mode: FailureMode,
     pub applies_to: AppliesTo,
-    /// False while the defect this row measures is still scheduled for a later package.
-    pub enforced: bool,
-    /// The package that sets `enforced: true` in the same change that makes the row pass.
-    pub enforced_by: &'static str,
-    pub warn_at: Option<usize>,
-    /// True when crossing the budget is a review signal rather than a breach.
-    pub warn_only: bool,
+    /// True when an over-limit measurement fails this repository's default gate.
+    pub fail_on_breach: bool,
+    /// Descriptive subsystem that owns a future change to make a non-blocking breach fail.
+    pub planned_enforcement: &'static str,
+    /// A measured value strictly above this line receives a non-failing notice; the ceiling remains inclusive.
+    pub notice_at: Option<usize>,
+    /// True when crossing the budget is a warning rather than a failure.
+    pub warning_only: bool,
     /// True when the budget is a client constant an operator may track between releases via
     /// `[mcp.client_limits]`. False for structural and style rows, where the number is not a
     /// moving cap and an override would silence the checker without changing what the client
@@ -136,16 +138,16 @@ pub struct HarnessLimit {
 pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     HarnessLimit {
         name: "codex-input-schema-bytes",
-        client: "Codex 0.146.0",
+        authority: "Codex 0.146.0",
         artifact: "Codex-normalized inputSchema",
         budget: 5_000,
         unit: "bytes",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::InputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: true,
         rationale: "MAX_COMPACT_TOOL_SCHEMA_BYTES. Past it Codex runs strip_schema_descriptions at \
                     every depth and hands the model a schema whose parameters have names and types \
@@ -164,16 +166,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "codex-input-schema-margin",
-        client: "Codex 0.146.0",
+        authority: "Codex 0.146.0",
         artifact: "Codex-normalized inputSchema",
         budget: 4_750,
         unit: "bytes",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::InputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: true,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: true,
         overridable: true,
         rationale: "A tripwire, not a limit. Crossing it breaks nothing; it reports that the margin \
                     against a cliff with no warning is thin. It is expected to fire: no measured \
@@ -185,20 +187,20 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "claude-code-tool-description-chars",
-        client: "Claude Code 2.1.220",
+        authority: "Claude Code 2.1.220",
         artifact: "tool.description",
         budget: 2_048,
         unit: "UTF-16 units",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::ToolDescription,
-        enforced: true,
-        enforced_by: "",
-        warn_at: Some(1_986),
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: Some(1_986),
+        warning_only: false,
         overridable: true,
         rationale: "MAX_MCP_DESCRIPTION_LENGTH. Past it Claude Code appends a truncation marker to \
                     what it keeps, so text beyond this point is paid for and teaches nobody. The \
-                    review line sits 62 characters below, the mean length of one conflict rule: the \
+                    notice threshold sits 62 characters below, the mean length of one conflict rule: the \
                     nine validator rules render verbatim into this channel and are the only part \
                     that grows without anyone editing a description.",
         platform: "Claude Code only; Codex does not cap this channel. services/mcp/client.ts:218, \
@@ -210,16 +212,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "vscode-parameter-description-chars",
-        client: "VS Code / Copilot, GPT-4o family",
+        authority: "VS Code / Copilot, GPT-4o family",
         artifact: "schema-internal description",
         budget: 1_024,
         unit: "UTF-16 units",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::ParameterDescription,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: true,
         rationale: "gpt4oMaxStringLength. VS Code truncates every description inside the schema at \
                     this length before sending, so the tail costs wire bytes and reaches no model.",
@@ -230,16 +232,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "vscode-no-root-combinator",
-        client: "VS Code / Copilot, all model families",
+        authority: "VS Code / Copilot, all model families",
         artifact: "inputSchema root keywords",
         budget: 0,
         unit: "root combinators",
         failure_mode: FailureMode::Rejected,
         applies_to: AppliesTo::InputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "VS Code rejects anyOf, oneOf, allOf, not, if, then and else at an inputSchema \
                     root for every model family, and the tool disappears rather than degrading. The \
@@ -252,16 +254,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "mcp-output-schema-depth",
-        client: "MCP specification",
+        authority: "MCP specification",
         artifact: "outputSchema nesting depth",
         budget: 10,
         unit: "levels",
         failure_mode: FailureMode::Rejected,
         applies_to: AppliesTo::OutputSchema,
-        enforced: true,
-        enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "10 is this repository's own guard, not a number the MCP specification states. \
                     The specification tells clients to apply a maximum schema depth to prevent a \
@@ -270,8 +272,8 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
                     12, 9, 9 and three at 8; now 10, 10, 9, 9 and four at 8, by naming shapes a \
                     reader recognises in the three documents that paid for it. A blanket pass over \
                     every object was measured first and rejected: it reached similar numbers while \
-                    naming two dozen shapes mechanically, without the descriptions \
-                    S3-every-named-type-has-a-description requires, and every consumer navigating \
+                    naming two dozen shapes mechanically, without the descriptions the emitted \
+                    schema policy requires, and every consumer navigating \
                     by path then resolves pointers to shapes with no names. Note what the count \
                     measures: document nesting, where a properties map is itself a level, so the \
                     seven levels of response data under search_messages measured as eighteen.",
@@ -284,16 +286,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "mcp-output-schema-point-of-use-depth",
-        client: "this repository",
+        authority: "this repository's schema policy",
         artifact: "outputSchema depth along a use path, with $ref as a leaf and $defs excluded",
         budget: 6,
         unit: "levels",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::OutputSchema,
-        enforced: true,
-        enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
-        warn_at: Some(5),
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: Some(5),
+        warning_only: false,
         overridable: false,
         rationale: "The resolved-depth guard can be satisfied by moving nesting into $defs without \
                     making anything easier to read, because a named shape is still as deep as it \
@@ -311,38 +313,38 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-named-definitions-are-described",
-        client: "this repository",
+        authority: "this repository's schema policy",
         artifact: "$defs entries without a description",
         budget: 0,
         unit: "undescribed definitions",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::OutputSchema,
-        enforced: true,
-        enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "A named shape with no description trades a deep document for an opaque one: \
                     the reader who follows the reference arrives somewhere whose name is the only \
                     thing telling them what it holds. This is the specific failure of a mechanical \
                     extraction pass, which is why extraction here is by hand and why this is \
                     checked rather than assumed.",
-        platform: "This repository's own guard, matching S3-every-named-type-has-a-description.",
+        platform: "This repository's own guard: every named type has a description.",
         raise_when: "Never. A shape worth naming is worth one sentence.",
         lower_when: "Never; zero is already the floor.",
     },
     HarnessLimit {
         name: "mcp-output-schema-subschemas",
-        client: "MCP specification",
+        authority: "MCP specification",
         artifact: "outputSchema subschema count",
         budget: 250,
         unit: "subschemas",
         failure_mode: FailureMode::Rejected,
         applies_to: AppliesTo::OutputSchema,
-        enforced: false,
-        enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: false,
+        planned_enforcement: "output-schema structure and readability gate",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "The same specification clause asks clients to cap the total number of \
                     subschemas. search_messages measures 256, so this is a reduction target rather \
@@ -356,16 +358,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "anthropic-tool-name-charset",
-        client: "Anthropic API and the MCP SDK",
+        authority: "Anthropic API and the MCP SDK",
         artifact: "tool name",
         budget: 64,
         unit: "characters matching ^[a-zA-Z0-9_-]{1,64}$",
         failure_mode: FailureMode::Rejected,
         applies_to: AppliesTo::ToolName,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: true,
         rationale: "The Anthropic API is the tightest of the three registries this server must \
                     satisfy: 64 characters and no dots, against the MCP SDK's 128 with dots allowed \
@@ -377,16 +379,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "codex-tool-result-chars",
-        client: "Codex 0.146.0",
+        authority: "Codex 0.146.0",
         artifact: "serialized CallToolResult",
         budget: 48_000,
         unit: "characters",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::Response,
-        enforced: false,
-        enforced_by: "WP-F-bound-mcp-results-without-silent-reduction",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: false,
+        planned_enforcement: "bounded response delivery gate",
+        notice_at: None,
+        warning_only: false,
         overridable: true,
         rationale: "About 12,000 model tokens at four characters each. Codex is the only measured \
                     client that middle-truncates a result with no marker, which keeps a plausible \
@@ -401,16 +403,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "claude-code-tool-result-tokens",
-        client: "Claude Code 2.1.220",
+        authority: "Claude Code 2.1.220",
         artifact: "tool-result tokens",
         budget: 25_000,
         unit: "tokens",
         failure_mode: FailureMode::Announced,
         applies_to: AppliesTo::Response,
-        enforced: false,
-        enforced_by: "WP-F-bound-mcp-results-without-silent-reduction",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: false,
+        planned_enforcement: "bounded response delivery gate",
+        notice_at: None,
+        warning_only: false,
         overridable: true,
         rationale: "MAX_MCP_OUTPUT_TOKENS. Over it, Claude Code persists the result to a file, links \
                     it, and supplies jq and grep instructions, so nothing is lost. Recorded so the \
@@ -423,16 +425,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "gemini-cli-tool-result-chars",
-        client: "Gemini CLI (legacy registration)",
+        authority: "Gemini CLI (legacy registration)",
         artifact: "tool-result characters",
         budget: 40_000,
         unit: "characters",
         failure_mode: FailureMode::Announced,
         applies_to: AppliesTo::Response,
-        enforced: false,
-        enforced_by: "WP-F-bound-mcp-results-without-silent-reduction",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: false,
+        planned_enforcement: "bounded response delivery gate",
+        notice_at: None,
+        warning_only: false,
         overridable: true,
         rationale: "Numerically the smallest result cap measured, and the reason the default ceiling \
                     is not simply the smallest number: Gemini CLI keeps the first 20% and last 80% \
@@ -451,16 +453,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
 pub const SCHEMA_RULES: &[HarnessLimit] = &[
     HarnessLimit {
         name: "style-no-aise-vendor-keys",
-        client: "S8-emit-no-aise-vendor-keys",
+        authority: "this repository's schema policy: no project-only vendor keys",
         artifact: "x-aise-* keys anywhere in a tool",
         budget: 0,
         unit: "keys",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::InputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "No MCP client is specified to read them and none does, so they are wire bytes \
                     for the twelve registrations that forward schemas verbatim and nothing at all \
@@ -473,16 +475,16 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-no-input-const",
-        client: "S7-no-fact-lives-only-in-a-stripped-keyword",
+        authority: "this repository's schema policy: use model-visible constraints",
         artifact: "const in an inputSchema",
         budget: 0,
         unit: "sites",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::InputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "Codex models enum and does not model const, so a const discriminator reaches no \
                     model and the caller is shown an untyped, valueless tag. JSON Schema 2020-12 \
@@ -496,16 +498,16 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-no-fake-integer-maxima",
-        client: "S13-every-bound-states-its-origin",
+        authority: "this repository's schema policy: every bound states its origin",
         artifact: "maximum equal to i64::MAX",
         budget: 0,
         unit: "sites",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::InputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "i64::MAX rejects nothing a caller could send, so it was never a bound. It \
                     describes the storage type at 30 bytes a site, and both Codex and VS Code delete \
@@ -517,16 +519,16 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-local-refs-only",
-        client: "S1-every-ref-is-a-local-pointer",
+        authority: "this repository's schema policy: every reference is local",
         artifact: "$ref targets",
         budget: 0,
         unit: "non-local refs",
         failure_mode: FailureMode::Rejected,
         applies_to: AppliesTo::OutputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "MCP states that implementations MUST NOT automatically dereference a $ref that \
                     resolves to a network URI, so a non-local ref is unresolvable at the client and \
@@ -537,16 +539,16 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-reachable-definitions",
-        client: "S4-extract-a-shape-only-above-break-even",
+        authority: "this repository's schema policy: extract only useful shapes",
         artifact: "unreachable $defs entries",
         budget: 0,
         unit: "entries",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::OutputSchema,
-        enforced: true,
-        enforced_by: "",
-        warn_at: None,
-        warn_only: false,
+        fail_on_breach: true,
+        planned_enforcement: "",
+        notice_at: None,
+        warning_only: false,
         overridable: false,
         rationale: "Current Codex prunes definitions no $ref reaches before it measures the schema, \
                     so an unreachable entry is wire bytes that buy nothing. Keeping the emitted set \
@@ -604,6 +606,8 @@ pub struct Finding {
     /// The budget actually applied: what the operator configured, or the measured default.
     /// Reported instead of `limit.budget` so a run says which number it judged against.
     pub budget: usize,
+    /// The resolved notice threshold; notice applies only when measured is strictly above it.
+    pub notice_at: Option<usize>,
     pub tool: String,
     pub measured: usize,
     pub status: Status,
@@ -1275,6 +1279,7 @@ pub fn evaluate_response(
     tool: &str,
     serialized_chars: usize,
     overrides: &ClientLimitOverrides,
+    strict: bool,
 ) -> Vec<Finding> {
     HARNESS_LIMITS
         .iter()
@@ -1289,14 +1294,15 @@ pub fn evaluate_response(
             let over = measured > budget;
             let status = if !over {
                 Status::Pass
-            } else if limit.enforced {
+            } else if strict || (limit.fail_on_breach && !limit.warning_only) {
                 Status::Fail
             } else {
-                Status::Pending
+                Status::Warning
             };
             Finding {
                 limit,
                 budget,
+                notice_at: None,
                 tool: tool.to_owned(),
                 measured,
                 status,
@@ -1324,22 +1330,22 @@ pub fn evaluate(tools: &[Value], overrides: &ClientLimitOverrides, strict: bool)
             let budget = resolved_budget(limit, overrides);
             let (measured, evidence) = measure(limit, tool, budget);
             let name = tool["name"].as_str().unwrap_or("?").to_owned();
+            let notice_at = resolved_notice_at(limit, overrides);
             let over = measured > budget;
             let status = if !over {
-                match resolved_warn_at(limit, overrides) {
-                    Some(line) if measured > line => Status::Warn,
+                match notice_at {
+                    Some(line) if measured > line => Status::Notice,
                     _ => Status::Pass,
                 }
-            } else if limit.warn_only {
-                Status::Warn
-            } else if limit.enforced || strict {
+            } else if strict || (limit.fail_on_breach && !limit.warning_only) {
                 Status::Fail
             } else {
-                Status::Pending
+                Status::Warning
             };
             findings.push(Finding {
                 limit,
                 budget,
+                notice_at,
                 tool: name,
                 measured,
                 status,
@@ -1375,18 +1381,18 @@ pub fn limit_overridable(name: &str) -> Option<bool> {
         .map(|limit| limit.overridable)
 }
 
-/// The review line, scaled to a configured budget so it keeps meaning the same thing.
+/// The notice threshold, scaled to a configured budget so it keeps meaning the same thing.
 ///
-/// The shipped warning lines sit at a fixed fraction below their budget. An operator who raises
-/// the budget and keeps a warning line computed from the old one gets a tripwire that fires on
+/// The shipped notice thresholds sit at a fixed fraction below their budget. An operator who raises
+/// the budget and keeps a threshold computed from the old one gets a tripwire that fires on
 /// every healthy build, which is how a warning channel stops being read.
-fn resolved_warn_at(limit: &HarnessLimit, overrides: &ClientLimitOverrides) -> Option<usize> {
-    let warn_at = limit.warn_at?;
+fn resolved_notice_at(limit: &HarnessLimit, overrides: &ClientLimitOverrides) -> Option<usize> {
+    let notice_at = limit.notice_at?;
     let budget = resolved_budget(limit, overrides);
     if budget == limit.budget {
-        return Some(warn_at);
+        return Some(notice_at);
     }
-    Some((warn_at as u128 * budget as u128 / limit.budget.max(1) as u128) as usize)
+    Some((notice_at as u128 * budget as u128 / limit.budget.max(1) as u128) as usize)
 }
 
 /// Every declared row name, so configuration can reject a key that names no row.
@@ -1417,7 +1423,7 @@ pub fn evaluate_all(
 ) -> Vec<Finding> {
     let mut findings = evaluate(tools, overrides, strict);
     if let Some((tool, serialized_chars)) = response {
-        findings.extend(evaluate_response(tool, serialized_chars, overrides));
+        findings.extend(evaluate_response(tool, serialized_chars, overrides, strict));
     }
     findings
 }
@@ -1449,7 +1455,7 @@ pub fn configured_catalogue_warnings(
         // fire on a healthy build, and an operator who sees it every startup learns to ignore the
         // channel that carries the real breach.
         .filter(|limit| {
-            limit.enforced && !limit.warn_only && limit.applies_to != AppliesTo::Response
+            limit.fail_on_breach && !limit.warning_only && limit.applies_to != AppliesTo::Response
         })
         .flat_map(|limit| {
             let budget = resolved_budget(limit, overrides);
@@ -1478,7 +1484,7 @@ pub fn configured_catalogue_warnings(
                     limit.artifact,
                     limit.unit,
                     limit.unit,
-                    limit.client,
+                    limit.authority,
                     limit.rationale,
                 ))
             })
@@ -1524,7 +1530,7 @@ pub fn configured_ceiling_warnings(
                  delivered by this server and then truncated from the middle by that client with \
                  no marker. Lower the ceiling, or raise [mcp.client_limits].{} if that client \
                  raised its own.",
-                limit.client, limit.name, limit.name,
+                limit.authority, limit.name, limit.name,
             ))
         })
         .collect()
@@ -1534,7 +1540,7 @@ pub fn configured_ceiling_warnings(
 pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> String {
     let head = format!(
         "{} measured {measured} {} against the {budget} {} limit of {}",
-        limit.artifact, limit.unit, limit.unit, limit.client
+        limit.artifact, limit.unit, limit.unit, limit.authority
     );
     match limit.failure_mode {
         FailureMode::Silent => format!(
@@ -1826,13 +1832,13 @@ pub struct SchemaBudgetArgs {
     /// what a client receives rather than only against another measurement.
     #[arg(long)]
     pub catalogue: bool,
-    /// Enforce every rule, including ones a later package is scheduled to fix.
+    /// Fail every measured over-limit rule, including rows not yet in the default failure gate.
     #[arg(long)]
     pub strict: bool,
 }
 
 /// Group the report by rule, so one breach reads as one finding rather than once per tool.
-fn report(findings: &[Finding], strict: bool) -> bool {
+fn report(findings: &[Finding]) -> bool {
     let mut order: Vec<(Status, &'static str)> = Vec::new();
     for finding in findings {
         if finding.status == Status::Pass {
@@ -1846,8 +1852,8 @@ fn report(findings: &[Finding], strict: bool) -> bool {
     order.sort_by_key(|(status, name)| {
         let rank = match status {
             Status::Fail => 0,
-            Status::Pending => 1,
-            Status::Warn => 2,
+            Status::Warning => 1,
+            Status::Notice => 2,
             Status::Pass => 3,
         };
         (rank, *name)
@@ -1861,14 +1867,14 @@ fn report(findings: &[Finding], strict: bool) -> bool {
         let Some(first) = group.first() else { continue };
         let limit = first.limit;
         println!(
-            "{:<7} {} — {}, {}",
+            "{:<10} {} — {}, {}",
             status.label(),
             limit.name,
-            limit.client,
+            limit.authority,
             limit.artifact
         );
         let budget = first.budget;
-        if matches!(status, Status::Fail | Status::Pending) {
+        if matches!(status, Status::Fail | Status::Warning) {
             let worst = group
                 .iter()
                 .map(|finding| finding.measured)
@@ -1879,21 +1885,40 @@ fn report(findings: &[Finding], strict: bool) -> bool {
         let mut sorted = group.clone();
         sorted.sort_by_key(|finding| std::cmp::Reverse(finding.measured));
         for finding in sorted {
-            println!(
-                "        {}: {} {} against the {} limit ({})",
-                finding.tool, finding.measured, limit.unit, finding.budget, finding.evidence
-            );
+            if *status == Status::Notice {
+                println!(
+                    "        {}: {} {}; notice above {}, inclusive ceiling {} {} ({})",
+                    finding.tool,
+                    finding.measured,
+                    limit.unit,
+                    finding.notice_at.unwrap_or(finding.budget),
+                    finding.budget,
+                    limit.unit,
+                    finding.evidence
+                );
+            } else {
+                println!(
+                    "        {}: {} {} against the {} limit ({})",
+                    finding.tool, finding.measured, limit.unit, finding.budget, finding.evidence
+                );
+            }
         }
-        if *status == Status::Pending {
-            println!(
-                "        Not enforced yet; {} sets enforced: true in the same change that makes \
-                 it pass.",
-                if limit.enforced_by.is_empty() {
-                    "a later package"
-                } else {
-                    limit.enforced_by
-                }
-            );
+        if *status == Status::Warning {
+            if limit.warning_only {
+                println!(
+                    "        Non-fatal warning by design; this measurement is over the ceiling."
+                );
+            } else {
+                println!(
+                    "        Default gate is non-blocking; --strict treats this breach as a failure. \
+                     Tracked under {}.",
+                    if limit.planned_enforcement.is_empty() {
+                        "a later enforcement change"
+                    } else {
+                        limit.planned_enforcement
+                    }
+                );
+            }
         }
         println!("        Raise when: {}", limit.raise_when);
         println!("        Lower when: {}", limit.lower_when);
@@ -1926,28 +1951,18 @@ fn report(findings: &[Finding], strict: bool) -> bool {
         .iter()
         .filter(|finding| finding.status == Status::Pass)
         .count();
-    let warns = findings
+    let warnings = findings
         .iter()
-        .filter(|finding| finding.status == Status::Warn)
+        .filter(|finding| finding.status == Status::Warning)
         .count();
-    let mut pending: Vec<&str> = findings
+    let notices = findings
         .iter()
-        .filter(|finding| finding.status == Status::Pending)
-        .map(|finding| finding.limit.name)
-        .collect();
-    pending.sort_unstable();
-    pending.dedup();
+        .filter(|finding| finding.status == Status::Notice)
+        .count();
     println!(
-        "{} measurements: {passes} pass, {warns} warn, {} rules pending, {failures} fail",
-        findings.len(),
-        pending.len()
+        "{} measurements: {passes} pass, {notices} notice, {warnings} warning, {failures} fail",
+        findings.len()
     );
-    if failures == 0 && !pending.is_empty() && !strict {
-        println!(
-            "Pending rules (measured, not yet enforced): {}",
-            pending.join(", ")
-        );
-    }
     failures == 0
 }
 
@@ -2006,10 +2021,7 @@ pub fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> anyhow::R
     for warning in configured_ceiling_warnings(config.mcp.max_tool_result_chars, overrides) {
         println!("{warning}");
     }
-    if !report(
-        &evaluate_all(tools, response, overrides, args.strict),
-        args.strict,
-    ) {
+    if !report(&evaluate_all(tools, response, overrides, args.strict)) {
         anyhow::bail!("the emitted MCP catalogue breaches an enforced client limit");
     }
     Ok(())
@@ -2160,10 +2172,10 @@ mod tests {
                     limit.name
                 );
             }
-            if !limit.enforced {
+            if !limit.fail_on_breach {
                 assert!(
-                    !limit.enforced_by.is_empty(),
-                    "{} is unenforced and names no package that will enforce it, so the ratchet \
+                    !limit.planned_enforcement.is_empty(),
+                    "{} is non-blocking and names no planned enforcement change, so the ratchet \
                      has no way to tighten",
                     limit.name
                 );
@@ -2198,6 +2210,81 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn the_depth_ceiling_reports_a_notice_at_the_margin_without_breaching_the_limit() {
+        let config = crate::config::Config::default();
+        let tools = crate::mcp_server::advertised_tools(&config);
+        let finding = evaluate(
+            tools.as_array().expect("tools list"),
+            &config.mcp.client_limits,
+            true,
+        )
+        .into_iter()
+        .find(|finding| {
+            finding.limit.name == "mcp-output-schema-point-of-use-depth"
+                && finding.tool == "search_messages"
+        })
+        .expect("search_messages depth finding");
+
+        assert_eq!(finding.measured, finding.budget);
+        assert_eq!(finding.notice_at, Some(5));
+        assert_eq!(finding.status, Status::Notice);
+        assert_eq!(Status::Notice.label(), "NOTICE");
+    }
+
+    #[test]
+    fn warning_only_rows_start_after_the_inclusive_limit() {
+        let config = crate::config::Config::default();
+        let margin = all_limits()
+            .find(|limit| limit.name == "codex-input-schema-margin")
+            .expect("Codex margin rule");
+        let mut tool = crate::mcp_server::advertised_tools(&config)
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .cloned()
+            .expect("search_messages tool");
+        let mut at_limit = None;
+        for _ in 0..=margin.budget {
+            let (measured, _) = measure(margin, &tool, margin.budget);
+            if measured == margin.budget {
+                at_limit = Some(tool.clone());
+                break;
+            }
+            let description = tool["inputSchema"]["properties"]["query"]["description"]
+                .as_str()
+                .expect("query description");
+            tool["inputSchema"]["properties"]["query"]["description"] =
+                json!(format!("{description}x"));
+        }
+        let at_limit = at_limit.expect("the margin rule should have a reachable exact boundary");
+        let exact = evaluate(
+            std::slice::from_ref(&at_limit),
+            &ClientLimitOverrides::new(),
+            false,
+        )
+        .into_iter()
+        .find(|finding| finding.limit.name == margin.name)
+        .expect("exact margin finding");
+        assert_eq!(exact.measured, margin.budget);
+        assert_eq!(exact.status, Status::Pass);
+
+        let mut over_limit = at_limit;
+        over_limit["inputSchema"]["properties"]["query"]["description"] = json!(format!(
+            "{}x",
+            over_limit["inputSchema"]["properties"]["query"]["description"]
+                .as_str()
+                .expect("query description")
+        ));
+        let over = evaluate(&[over_limit], &ClientLimitOverrides::new(), false)
+            .into_iter()
+            .find(|finding| finding.limit.name == margin.name)
+            .expect("over-limit margin finding");
+        assert!(over.measured > margin.budget);
+        assert_eq!(over.status, Status::Warning);
     }
 
     fn minimal_tool() -> Value {
@@ -2296,22 +2383,23 @@ mod tests {
         }
     }
 
-    /// The ratchet: an unenforced breach is reported with its measurement, never failed.
+    /// The ratchet: a non-blocking breach is reported as a warning until strict mode is used.
     #[test]
-    fn an_unenforced_breach_is_pending_rather_than_failing() {
-        // Any rule still carrying `enforced: false` will do, so the synthetic tool has to breach
+    fn a_non_blocking_breach_is_a_warning_until_strict_mode() {
+        // Any rule still carrying `fail_on_breach: false` will do, so the synthetic tool has to breach
         // whichever one is picked rather than the one that happened to be first when this was
         // written. It is both deep and wide for that reason: when the depth rule was enforced,
         // selection moved to the subschema rule, which a bare chain of 24 does not breach, and
         // the test failed for a reason that had nothing to do with the ratchet.
-        let Some(rule) =
-            all_limits().find(|limit| !limit.enforced && limit.applies_to != AppliesTo::Response)
+        let Some(rule) = all_limits()
+            .find(|limit| !limit.fail_on_breach && limit.applies_to != AppliesTo::Response)
         else {
             // Every rule is enforced, which is where the ratchet was always heading. There is no
-            // pending state left to exercise, and reporting that as a failure would ask for a
+            // non-blocking state left to exercise, and reporting that as a failure would ask for a
             // defect to be reintroduced so a test about defects could keep passing.
             assert!(
-                all_limits().all(|limit| limit.enforced || limit.applies_to == AppliesTo::Response),
+                all_limits()
+                    .all(|limit| limit.fail_on_breach || limit.applies_to == AppliesTo::Response),
                 "the ratchet is fully tightened"
             );
             return;
@@ -2337,21 +2425,21 @@ mod tests {
             &ClientLimitOverrides::new(),
             false,
         );
-        let pending: Vec<&Finding> = lenient
+        let warnings: Vec<&Finding> = lenient
             .iter()
             .filter(|finding| finding.limit.name == rule.name)
             .collect();
-        assert_eq!(pending.len(), 1, "{}", rule.name);
-        assert_eq!(pending[0].status, Status::Pending, "{}", rule.name);
+        assert_eq!(warnings.len(), 1, "{}", rule.name);
+        assert_eq!(warnings[0].status, Status::Warning, "{}", rule.name);
         assert!(
-            pending[0].measured > rule.budget,
-            "a pending rule must publish the measurement it is waiting on"
+            warnings[0].measured > rule.budget,
+            "a non-blocking rule must publish the measurement it is tracking"
         );
         assert!(
             lenient
                 .iter()
                 .all(|finding| finding.limit.name != rule.name || finding.status != Status::Fail),
-            "an unenforced rule failed the ratchet"
+            "a non-blocking rule failed the lenient ratchet"
         );
 
         let strict = evaluate(&[tool], &ClientLimitOverrides::new(), true);
@@ -3074,7 +3162,7 @@ mod tests {
         );
     }
 
-    /// An over-ceiling response fails the row that is enforced, rather than warning.
+    /// Strict mode fails an over-ceiling response even before the default gate is tightened.
     #[test]
     fn a_response_past_an_enforced_cap_fails_the_sweep() {
         let findings = evaluate_all(
@@ -3094,6 +3182,12 @@ mod tests {
         assert!(
             !breached.is_empty(),
             "ten million characters breaches every declared result cap"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding.limit.applies_to == AppliesTo::Response && finding.status == Status::Fail
+            }),
+            "strict mode must fail a non-blocking response breach"
         );
     }
 }

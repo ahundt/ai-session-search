@@ -3,7 +3,7 @@
 
 # MCP client limits and measured evidence
 
-Last measured 2026-08-04 against the executable built from this tree.
+Last measured 2026-08-05 against the executable built from this tree.
 
 What this build emits, measured against every client limit it can breach, and which of
 those clients were actually available to check. A limit that could not be observed is
@@ -17,7 +17,7 @@ Reproduce the measurements with `aise mcp schema-budget --ledger` and
 | Client | Version | Schema limits checkable | Result limits checkable |
 |---|---|---|---|
 | Codex | codex-cli 0.146.0 | yes, sanitize and normalization reimplemented from its source, cross-checked by compiling that source | yes, from a response fixture |
-| Claude Code | 2.1.221 (Claude Code) | yes, description caps | yes, from a response fixture |
+| Claude Code | 2.1.222 (Claude Code) | yes, description caps | yes, from a response fixture |
 | OpenCode | not installed | no | no |
 | VS Code | not installed | no | no |
 
@@ -48,6 +48,30 @@ canonical where-to-find-it record; this document quotes it but does not replace 
 a client moves first, `[mcp.client_limits]` tracks the new number between releases
 ([configuration guide](configuration.md)).
 
+## Status vocabulary and the inclusive boundary
+
+The checker uses the same boundary rule for every measured unit: `measured == limit` is
+valid, and only `measured > limit` is over the limit. A notice threshold is a separate,
+earlier tripwire; it never turns the inclusive ceiling itself into a breach.
+
+| Status | Condition | Meaning |
+|---|---|---|
+| `PASS` | at or below the notice threshold, or no notice threshold | within the inclusive limit |
+| `NOTICE` | above the notice threshold and at or below the limit | close enough to review, not a breach |
+| `WARNING` | above the limit while the rule is non-blocking | a real breach, reported without stopping the default check |
+| `FAIL` | above the limit in the default gate or strict mode | the check fails |
+
+This separates proximity from severity: `NOTICE` is for an in-limit margin, while
+`WARNING` starts only after an actual limit breach. Whether a warning blocks the default
+check is policy detail, not another user-facing severity level.
+
+There is no ISO-defined universal status scale for this kind of deterministic budget check.
+The closest interoperable conventions are [SARIF 2.1.0's `note`, `warning`, and `error` levels](https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html#def_level)
+and [GitHub Checks' `notice`, `warning`, and `failure` levels](https://docs.github.com/en/enterprise-cloud%40latest/rest/checks/runs).
+This checker uses the GitHub-facing words for the two non-failing levels and keeps `FAIL`
+as the clear gate outcome. Rust's standard library has no generic diagnostic-severity enum;
+`Poll::Pending` means an asynchronous operation is not ready, so it is not appropriate here.
+
 ## Emitted catalogue, per tool
 
 Two depth figures, because one can be satisfied without helping anyone. **Use path** is
@@ -64,9 +88,9 @@ the nesting a response has, because a `properties` map is itself a level.
 | `list_sessions` | 3,983 B | 4,212 B | 4 | 8 |
 | `query_session_index` | 1,858 B | 2,996 B | 4 | 8 |
 | `get_resume_command` | 391 B | 2,811 B | 4 | 8 |
-| `get_index_status` | 255 B | 5,729 B | 5 | 9 |
+| `get_index_status` | 255 B | 6,681 B | 5 | 9 |
 
-Catalogue `tools[]` 90,670 B. Total `outputSchema` 56,778 B, from 60,802 B before the
+Catalogue `tools[]` 91,631 B. Total `outputSchema` 57,730 B, from 60,802 B before the
 shapes on the deepest chains were named. Every tool's descriptions reach the model.
 
 At the baseline this work started from, `search_messages` measured 9,954 bytes as Codex
@@ -87,7 +111,7 @@ covered. Every discarded description is restored: the four tools that always fit
 their full text again (the fields `search_sessions` and `list_sessions` share come
 from shared builder helpers so the copies cannot diverge), and `run_skill_capability`
 restores its facts in streamlined form at 4,742 bytes as Codex measures it, under the
-4,750 warning line. The transferable lesson: a deduplication test proves the copies
+4,750-byte margin threshold. The transferable lesson: a deduplication test proves the copies
 agree, never that the surviving copy is right, so
 `the_two_since_meanings_stay_apart_on_the_wire` now pins each tool's semantics at the
 emitted catalogue instead of copy identity.
@@ -104,21 +128,21 @@ bound schema depth and deliberately prescribes no number.
 ## Limits, and what was actually observed
 
 ```
-WARN    mcp-output-schema-point-of-use-depth — this repository, outputSchema depth along a use
+NOTICE  mcp-output-schema-point-of-use-depth — this repository's schema policy, outputSchema depth along a use
         path, with $ref as a leaf and $defs excluded
-        search_messages: 6 levels against the 6 limit (deepest use path, $ref as a leaf, at
+        search_messages: 6 levels; notice above 5, inclusive ceiling 6 levels (deepest use path, $ref as a leaf, at
           /properties/effective_request/properties/presentation/properties/field_view/properties/kind/enum/0)
         Raise when: A response genuinely gains a level of structure. Name the path and the reason
           in the requirements document first; do not raise it to make a test green.
         Lower when: The response shape is flattened and the lower figure holds across a release.
-123 measurements: 122 pass, 1 warn, 0 rules pending, 0 fail
+123 measurements: 122 pass, 1 notice, 0 warning, 0 fail
 ```
 
-No rule is pending. The one warning is a margin tripwire that is expected to fire: the
-deepest use path sits exactly on the guard, so a warning here means "remeasure before
-adding a level" rather than "something regressed". The two `codex-input-schema-margin`
-warnings that used to sit beside it are gone: both tools now measure under the
-4,750-byte warning line as Codex counts them.
+No measured breach is present. The one notice is a margin tripwire that is expected to fire: the
+deepest use path is at the inclusive ceiling, so the notice means "remeasure before adding
+a level," not "the limit was breached." A warning would begin only above the ceiling.
+The two `codex-input-schema-margin` notices that used to sit beside it are gone: both tools
+now measure under the 4,750-byte margin threshold as Codex counts them.
 
 ### Codex sanitizes before it measures, and the checker now does too
 
@@ -241,8 +265,9 @@ Run through `aise mcp serve` as a client launches it, not only in tests.
 
 | Layer | Observed |
 |---|---|
-| Registered binary | `/Users/athundt/.local/bin/aise`, 1.0.0-rc.1, installed from the release wheel below; Codex and Claude Code both register that exact path |
-| Release artifacts | wheel `6fa873a709791eb9dc0127096ac199ba3d088caf8ead84b63273136a182063ad`, executable `613d6cf5e7a35f0d45626b89af924d8a01ed97f5b663ad17018bb20444f815fb` |
+| Registered binary | `/Users/athundt/.local/bin/aise`, 1.0.0-rc.1, installed from the verified source tree with `uv tool install --force .`; Codex and Claude Code both register that exact path |
+| Current installed hashes | executable `255daf9919dd2bf57487ab83bc5be6cc316664e6be35ed4afaf5d78d4fe882a3`; native module `c4cc938c01f3acef765f8ef5c0e595d69b3b98f21ca7c3a272dfce52b950d632` (arm64) |
+| Retained release artifacts | The b246d1c wheel/sdist and their recorded hashes remain historical; they are not byte-identical to this source-installed follow-up |
 | Artifact the cold-agent runs used | executable `1804bdec7997aebc35ddd4f1c3fea05b3d57256f71b584bcc219dac011245293`, which differs from the release candidate only by two CLI help strings and emits the identical MCP catalogue and results |
 | Resolved page | 20, origin `config file` -- an explicit user value, preserved |
 | Resolved ceiling | 48,000, origin `typed default` |

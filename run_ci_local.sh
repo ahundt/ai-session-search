@@ -342,8 +342,8 @@ build_and_verify_release_executable() {
 
     # Measure the emitted catalogue against every client limit it can silently breach. The
     # release executable builds and measures its own catalogue, so the artifact checked is the
-    # artifact published and no capture can be lost to a closing pipe. Rules a later package is
-    # scheduled to fix report as pending with their measurement; only enforced rules fail.
+    # artifact published and no capture can be lost to a closing pipe. Warning-only breaches
+    # report their measurement; only failing rows stop the gate.
     "$executable" mcp schema-budget || return
 
     # The ledger is only useful if it arrives whole. The saved baseline that prompted this check

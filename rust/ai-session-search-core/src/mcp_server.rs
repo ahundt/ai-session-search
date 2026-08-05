@@ -897,7 +897,7 @@ impl ToolRecovery {
     /// Read the page a call resolved to from the same advertised schema the caller read.
     ///
     /// The schema already carries each pageable tool's configured default in its `limit`
-    /// property, put there so the model can see it (`WP-N-generate-message-search-descriptions`).
+    /// property, put there so the model can see it (the generated message-search schema descriptions).
     /// Deriving from it keeps one owner: a tool that gains or loses pagination changes its schema
     /// and this follows, where a hand-listed table would keep answering for the old surface.
     fn for_call(tool_name: &str, args: &Value, advertised: &Value) -> Self {
@@ -3492,8 +3492,8 @@ fn render_message_search_field_description(
                 ("context", _) => format!("omit for {}.", context.messages_before()),
                 // Neither declares a `default` keyword, so the generic arm below could only say
                 // "omit for the configured default" -- which tells a caller a default exists and
-                // never what it is, the defect `S9-state-every-default-in-the-text` exists to
-                // stop. Both facts are already published in the channel that can state them
+                // never what it is; the emitted schema policy requires every default to be stated.
+                // Both facts are already published in the channel that can state them
                 // properly: `tool.description` says harness_notice is the one class omitted when
                 // `kinds` is omitted, and the validator's own rule "omit detail to compose custom
                 // presentation budgets" is rendered verbatim into the conflict-rule block. The
@@ -3802,8 +3802,8 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         );
         // Every declared default reaches the text, whatever rendered it. `default` is one of the
         // six keywords Codex and VS Code both delete, so a default that lives only in the
-        // keyword is a default no model is ever shown -- rule
-        // `S9-state-every-default-in-the-text`. Appending here rather than in each arm means a
+        // keyword is a default no model is ever shown. The emitted schema policy requires every
+        // default to be stated. Appending here rather than in each arm means a
         // new role cannot forget it.
         if let Some(value) = declared_default.as_ref() {
             if !rendered.contains("omit for") {
@@ -13392,7 +13392,7 @@ mod tests {
 
         // The nine conflict rules used to ship as `x-aise-specification`, which measured zero
         // readers: no client is specified to read a vendor key and no model was ever shown one.
-        // `WP-N-generate-message-search-descriptions` renders them verbatim into
+        // The generated message-search schema descriptions render them verbatim into
         // `tool.description`, the one channel every client forwards and Codex never strips.
         assert!(
             !serde_json::to_string(&schema)
@@ -13688,7 +13688,7 @@ mod tests {
     ///
     /// `evaluate` skips these because a catalogue cannot observe a `tools/call` result, and the
     /// report says so rather than reporting them as passing. This is where they are actually
-    /// checked, and it is the whole reason the ceiling in `WP-F` has a number to defend.
+    /// checked, and it is the whole reason the response-delivery ceiling has a number to defend.
     #[test]
     fn a_default_search_result_fits_every_client_result_cap() {
         use crate::mcp_schema_budget::{evaluate_response, Status};
@@ -13702,7 +13702,12 @@ mod tests {
             .chars()
             .count();
 
-        let findings = evaluate_response("search_messages", measured, &config.mcp.client_limits);
+        let findings = evaluate_response(
+            "search_messages",
+            measured,
+            &config.mcp.client_limits,
+            false,
+        );
         assert_eq!(findings.len(), 3, "three clients declare a result cap");
         let breached: Vec<String> = findings
             .iter()
