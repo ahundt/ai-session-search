@@ -59,7 +59,7 @@ earlier tripwire; it never turns the inclusive ceiling itself into a breach.
 | `PASS` | at or below the notice threshold, or no notice threshold | within the inclusive limit |
 | `NOTICE` | above the notice threshold and at or below the limit | close enough to review, not a breach |
 | `WARNING` | above the limit while the rule is non-blocking | a real breach, reported without stopping the default check |
-| `FAIL` | above the limit in the default gate or strict mode | the check fails |
+| `FAIL` | above the limit when blocking policy applies, or in strict mode | the check fails |
 
 This separates proximity from severity: `NOTICE` is for an in-limit margin, while
 `WARNING` starts only after an actual limit breach. Whether a warning blocks the default
