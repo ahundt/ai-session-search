@@ -223,18 +223,18 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | Surface | Purpose |
 | --- | --- |
 | `aise list`, `aise search`, `aise show` | Find and read sessions |
-| `aise messages search|get|timeline|evidence` | Query normalized conversation turns and tool evidence |
-| `aise files search|history|cross-ref|extract` | Locate and reconstruct edited files |
+| `aise messages search\|get\|timeline\|evidence` | Query normalized conversation turns and tool evidence |
+| `aise files search\|history\|cross-ref\|extract` | Locate and reconstruct edited files |
 | `aise skills corrections`, `aise planning`, `aise stats` | Run deterministic message classification or query other indexed behavioral summaries |
-| `aise skills list|show|validate|create|update|restore` | Inspect, author, and repair skill packages and their adjacent deterministic capabilities |
+| `aise skills list\|show\|validate\|create\|update\|restore` | Inspect, author, and repair skill packages and their adjacent deterministic capabilities |
 | `aise vocab`, `aise repeats` | Count how often a term appears and in how many messages (`--prefix` looks one up), or find recurring phrases |
 | `aise export` | Render one session or publish an explicitly selected bundle |
 | `aise analyze` | Apply a validated policy and publish an immutable analysis bundle |
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |
-| `aise migrate database|config|verify|recover` | Perform verified, reversible migration |
-| `aise config file|example|init|show|origins|paths` | Inspect or initialize TOML configuration and resolved paths |
-| `aise package status|check|update` | Inspect package ownership, check releases, or update through the detected manager |
-| `aise integrations install|status|uninstall|recover`; `aise mcp serve` | Manage executable aliases, MCP registrations, owned instructions and skills, recover integration transactions, or serve MCP |
+| `aise migrate database\|config\|verify\|recover` | Perform verified, reversible migration |
+| `aise config file\|example\|init\|show\|origins\|paths` | Inspect or initialize TOML configuration and resolved paths |
+| `aise package status\|check\|update` | Inspect package ownership, check releases, or update through the detected manager |
+| `aise integrations install\|status\|uninstall\|recover`; `aise mcp serve` | Manage executable aliases, MCP registrations, owned instructions and skills, recover integration transactions, or serve MCP |
 | `aise db` | Execute expert read-only SQL against the index; `aise db query --help` lists the tables and the column values a predicate misreads |
 | `aise tui` | Browse and fuzzy-search session-level records interactively; message-field modes remain in `aise messages search` |
 
@@ -393,7 +393,7 @@ the exact argument path instead of being ignored. Tools returning structured dat
 declare object output schemas; text-only tools use standard MCP text content.
 
 `run_skill_capability` selects one installed or embedded skill identity and
-normally executes its adjacent `capability.toml`. Its optional `definition`
+normally executes its adjacent `aise-capability.toml`. Its optional `definition`
 object supplies typed message-classification categories directly for one call
 without changing the selected skill's name, version, instructions, or path
 authorization. The CLI equivalent is `aise skills NAME --definition-json
@@ -475,8 +475,12 @@ network version-check dependencies:
 
 ```toml
 [dependencies]
-ai-session-search = { version = "1", default-features = false }
+ai-session-search = { version = "1.0.0-rc.1", default-features = false }
 ```
+
+A release candidate must be named exactly. Cargo excludes prerelease versions from an
+ordinary requirement, so `version = "1"` matches no published candidate until `1.0.0` is
+final; after that release, `version = "1"` is the requirement to use.
 
 The default `release-check` feature remains enabled for `cargo install`,
 published Python wheels, and normal CLI builds.
@@ -594,16 +598,35 @@ maintainer and migration references. Start with the
 or the [release guide](docs/development/releasing.md) for
 package preparation and publication.
 
-```bash
-uv lock --check
-uv sync --locked --all-extras
+Set up the environment. `maturin develop` is required: the Python tests import the
+compiled extension and fail without it.
 
-RUSTC_WRAPPER= cargo test --workspace --all-features
-RUSTC_WRAPPER= cargo clippy --workspace --all-targets --all-features -- -D warnings
-RUSTC_WRAPPER= uv run pytest
-RUSTC_WRAPPER= uv run ruff check .
-RUSTC_WRAPPER= uv run mypy ai_session_search tests
-RUSTC_WRAPPER= uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
+```bash
+uv sync --locked --all-extras
+uv run maturin develop --uv
+```
+
+`./run_ci_local.sh` is the authoritative gate and the one to run before proposing a
+commit. It creates isolated config, cache, and database state, so it never touches a real
+user index.
+
+```bash
+./run_ci_local.sh
+```
+
+Run it with no environment prefix. The gate inherits whatever compiler wrapper Cargo is
+configured to use, so an installed [sccache](https://github.com/mozilla/sccache) reuses
+its cache across runs and checkouts; prefixing `RUSTC_WRAPPER=` turns that off and forces
+a cold rebuild of a large workspace.
+
+Focused checks while iterating:
+
+```bash
+cargo test -p ai-session-search <test name>
+uv run pytest tests/<file>.py -k <test name>
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+uv run ruff check . && uv run mypy ai_session_search tests
+uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
 ```
 
 Release gates build wheels, an sdist, Cargo packages, and native archives from
