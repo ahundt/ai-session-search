@@ -646,7 +646,7 @@ fn explicit_skill_path_runs_its_adjacent_typed_capability() {
     )
     .unwrap();
     fs::write(
-        skill.join("capability.toml"),
+        skill.join("aise-capability.toml"),
         "schema_version = 1\nkind = \"message-classification\"\n\n\
          [[categories]]\nname = \"clobber\"\npatterns = ['''\\byou overwrote\\b''']\n",
     )
@@ -1782,7 +1782,7 @@ fn write_test_skill(
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("SKILL.md"), frontmatter).unwrap();
     if let Some(capability) = capability {
-        fs::write(dir.join("capability.toml"), capability).unwrap();
+        fs::write(dir.join("aise-capability.toml"), capability).unwrap();
     }
 }
 
@@ -2327,7 +2327,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         String::from_utf8_lossy(&created.stderr)
     );
     assert!(skill_root.join("SKILL.md").is_file());
-    assert!(skill_root.join("capability.toml").is_file());
+    assert!(skill_root.join("aise-capability.toml").is_file());
     assert!(
         !fs::read_to_string(skill_root.join("SKILL.md"))
             .unwrap()

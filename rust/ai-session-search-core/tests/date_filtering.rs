@@ -205,7 +205,7 @@ fn skill_message_classification_honors_date_window() {
     )
     .unwrap();
     std::fs::write(
-        skill_root.join("capability.toml"),
+        skill_root.join("aise-capability.toml"),
         "schema_version = 1\nkind = \"message-classification\"\n\n\
          [[categories]]\nname = \"test\"\npatterns = [\"cherry\"]\n",
     )

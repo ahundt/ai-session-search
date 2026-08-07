@@ -188,22 +188,7 @@ pub(crate) fn compile_skill_descriptors(
                     frontmatter.name
                 )
             })?;
-        let capability_path = match descriptor.capability {
-            crate::skill_catalog::CapabilityFileState::Available { path } => path,
-            crate::skill_catalog::CapabilityFileState::Absent => {
-                bail!(
-                    "skill {:?} has no adjacent message-classification capability.toml; load its \
-                     SKILL.md in an agent harness instead",
-                    frontmatter.name
-                )
-            }
-            crate::skill_catalog::CapabilityFileState::Invalid { problem, .. } => {
-                bail!(
-                    "skill {:?} has an invalid capability: {problem}",
-                    frontmatter.name
-                )
-            }
-        };
+        let capability_path = descriptor.capability.require_path(&frontmatter.name)?;
         policies.push(load_and_compile_with_budget(
             &capability_path,
             frontmatter.name,
@@ -304,7 +289,7 @@ patterns = ['''\byou overwrote\b''']
     #[test]
     fn capability_file_read_is_bounded_before_toml_or_regex_allocation() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("capability.toml");
+        let path = temp.path().join("aise-capability.toml");
         std::fs::write(&path, vec![b'x'; MAX_LOADED_CAPABILITY_BYTES + 1]).unwrap();
         let error = load_and_compile(&path, "my-review".to_string(), "1.0.0".to_string())
             .expect_err("oversized document must fail")
@@ -397,7 +382,7 @@ patterns = ['''\byou overwrote\b''']
         .unwrap();
 
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("capability.toml");
+        let path = temp.path().join("aise-capability.toml");
         std::fs::write(&path, format!("{VALID}\n# {}\n", "x".repeat(500 * 1024))).unwrap();
         let error = load_and_compile_with_budget(
             &path,
@@ -409,7 +394,7 @@ patterns = ['''\byou overwrote\b''']
         .to_string();
         assert!(
             error.contains("aggregate")
-                && error.contains("capability.toml")
+                && error.contains("aise-capability.toml")
                 && error.contains("bytes were consumed by earlier selections"),
             "{error}"
         );

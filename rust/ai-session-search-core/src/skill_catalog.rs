@@ -49,6 +49,37 @@ pub(crate) enum CapabilityFileState {
     Invalid { path: PathBuf, problem: String },
 }
 
+impl CapabilityFileState {
+    /// The capability file to execute, or an error naming what to add.
+    ///
+    /// One definition because two callers — `AnalysisService::run_skill` and
+    /// `message_classification` — need exactly this decision, and both previously spelled the same
+    /// three-arm match and the same two sentences inline. A filename rename then had to be applied
+    /// twice to stay truthful, which is precisely the drift [`CAPABILITY_FILE`] exists to prevent.
+    pub(crate) fn require_path(self, skill_name: &str) -> Result<PathBuf> {
+        match self {
+            Self::Available { path } => Ok(path),
+            Self::Absent => bail!(
+                "skill {skill_name:?} has no adjacent message-classification capability; add \
+                 {CAPABILITY_FILE} beside its SKILL.md, or load that SKILL.md in an agent harness \
+                 instead"
+            ),
+            Self::Invalid { problem, .. } => {
+                bail!("skill {skill_name:?} has an invalid capability: {problem}")
+            }
+        }
+    }
+}
+
+/// Filename a skill package keeps its deterministic capability in.
+///
+/// Vendor-namespaced because the Agent Skills specification defines no capability concept: this is
+/// an aise extension dropped into a shared directory layout, and the specification's own advice for
+/// `metadata` keys — keep names unique enough to avoid accidental conflicts — applies equally to a
+/// filename. Lowercase rather than styled like the specification's `SKILL.md` anchor, which would
+/// imply standard status it does not have.
+pub(crate) const CAPABILITY_FILE: &str = "aise-capability.toml";
+
 /// One standard-shaped skill package loaded from a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillDescriptor {
@@ -294,20 +325,20 @@ pub(crate) fn load_skill_descriptor(root: &Path) -> Result<SkillDescriptor> {
         },
     };
 
-    let capability_path = canonical_root.join("capability.toml");
+    let capability_path = canonical_root.join(CAPABILITY_FILE);
     let capability = match std::fs::symlink_metadata(&capability_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => CapabilityFileState::Absent,
         Err(error) => CapabilityFileState::Invalid {
             path: capability_path,
-            problem: format!("cannot inspect capability.toml: {error}"),
+            problem: format!("cannot inspect {CAPABILITY_FILE}: {error}"),
         },
         Ok(metadata) if metadata.file_type().is_symlink() => CapabilityFileState::Invalid {
             path: capability_path,
-            problem: "capability.toml must be a regular file, not a symlink".to_string(),
+            problem: format!("{CAPABILITY_FILE} must be a regular file, not a symlink"),
         },
         Ok(metadata) if !metadata.is_file() => CapabilityFileState::Invalid {
             path: capability_path,
-            problem: "capability.toml must be a regular file".to_string(),
+            problem: format!("{CAPABILITY_FILE} must be a regular file"),
         },
         Ok(_) => CapabilityFileState::Available {
             path: capability_path,
@@ -880,7 +911,7 @@ mod tests {
             CapabilityFileState::Absent
         );
 
-        let capability = skill.join("capability.toml");
+        let capability = skill.join(CAPABILITY_FILE);
         std::fs::write(
             &capability,
             "schema_version = 1\nkind = \"message-classification\"\n",

@@ -44,7 +44,7 @@ def _skill(root: Path, name: str, policy: str | None, *, version: str = "0.1.0")
         encoding="utf-8",
     )
     if policy is not None:
-        (directory / "capability.toml").write_text(policy, encoding="utf-8")
+        (directory / "aise-capability.toml").write_text(policy, encoding="utf-8")
     return directory
 
 
@@ -208,7 +208,7 @@ def test_a_malformed_policy_surfaces_the_offending_field_not_just_the_outer_cont
     assert "weights" in message, (
         f"the unknown field must reach Python, or the anyhow chain was flattened: {message}"
     )
-    assert "capability.toml" in message, f"and the file it is in: {message}"
+    assert "aise-capability.toml" in message, f"and the file it is in: {message}"
 
 
 def test_an_unsupported_schema_version_is_rejected_by_name(tmp_path: Path) -> None:

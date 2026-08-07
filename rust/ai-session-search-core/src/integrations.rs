@@ -84,10 +84,20 @@ struct ManagedSkillPackage {
 /// `include_str!` resolves relative to THIS source file, so these read the crate-local mirror
 /// under `rust/ai-session-search-core/skills/`, held byte-identical to the repo-root copy by
 /// `tests/test_repository_contracts.py`.
+/// One package rather than two: the Agent Skills specification requires a skill's `name` to match
+/// its directory name, so a second package called `corrections` necessarily claims that generic
+/// name in every flat skill root (`~/.claude/skills`, `~/.agents/skills`, ...), and its description
+/// is loaded at startup in every session whether or not classification is ever run. The
+/// specification explicitly permits any additional files beside `SKILL.md`, so message
+/// classification ships here as side files instead.
 const AI_SESSION_SEARCH_SKILL_FILES: &[ManagedSkillFile] = &[
     ManagedSkillFile {
         relative_path: "SKILL.md",
         content: include_str!("../skills/ai-session-search/SKILL.md"),
+    },
+    ManagedSkillFile {
+        relative_path: crate::skill_catalog::CAPABILITY_FILE,
+        content: include_str!("../skills/ai-session-search/aise-capability.toml"),
     },
     ManagedSkillFile {
         relative_path: "references/recover-prior-work-with-evidence.md",
@@ -95,35 +105,25 @@ const AI_SESSION_SEARCH_SKILL_FILES: &[ManagedSkillFile] = &[
             "../skills/ai-session-search/references/recover-prior-work-with-evidence.md"
         ),
     },
-];
-pub(crate) const AI_SESSION_SEARCH_SKILL_NAME: &str = "ai-session-search";
-
-/// Every file in the runnable corrections task package.
-const CORRECTIONS_SKILL_FILES: &[ManagedSkillFile] = &[
-    ManagedSkillFile {
-        relative_path: "SKILL.md",
-        content: include_str!("../skills/corrections/SKILL.md"),
-    },
-    ManagedSkillFile {
-        relative_path: "capability.toml",
-        content: include_str!("../skills/corrections/capability.toml"),
-    },
     ManagedSkillFile {
         relative_path: "references/message-classification.md",
-        content: include_str!("../skills/corrections/references/message-classification.md"),
+        content: include_str!("../skills/ai-session-search/references/message-classification.md"),
     },
 ];
+pub(crate) const AI_SESSION_SEARCH_SKILL_NAME: &str = "ai-session-search";
 
 const AI_SESSION_SEARCH_SKILL_PACKAGE: ManagedSkillPackage = ManagedSkillPackage {
     name: AI_SESSION_SEARCH_SKILL_NAME,
     files: AI_SESSION_SEARCH_SKILL_FILES,
 };
-const CORRECTIONS_SKILL_PACKAGE: ManagedSkillPackage = ManagedSkillPackage {
-    name: "corrections",
-    files: CORRECTIONS_SKILL_FILES,
-};
-const MANAGED_SKILL_PACKAGES: &[&ManagedSkillPackage] =
-    &[&AI_SESSION_SEARCH_SKILL_PACKAGE, &CORRECTIONS_SKILL_PACKAGE];
+const MANAGED_SKILL_PACKAGES: &[&ManagedSkillPackage] = &[&AI_SESSION_SEARCH_SKILL_PACKAGE];
+
+/// Sibling package retired when message classification moved into this one.
+///
+/// Removed as a whole skill root rather than file by file: it was installed with its own
+/// `SKILL.md` anchor, so ownership is decided by that anchor's marker and the install manifest,
+/// exactly as uninstall decides it.
+const RETIRED_SKILL_PACKAGE_NAME: &str = "corrections";
 
 /// Paths written by the prerelease layout before message classification became its own package.
 ///
@@ -197,11 +197,11 @@ pub struct IntegrationTargetsArgs {
     /// Repeatable; omit to manage only the discovered instruction files.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
-    /// Exact managed skill DIRECTORY to install into, ending in `ai-session-search` or
-    /// `corrections`, e.g. `~/.config/myagent/skills/ai-session-search`.
+    /// Exact managed skill DIRECTORY to install into, ending in `ai-session-search`,
+    /// e.g. `~/.config/myagent/skills/ai-session-search`.
     ///
     /// The directory itself, not a file inside it. Each skill package keeps SKILL.md, its optional
-    /// adjacent capability.toml, and references together. Repeat for several exact package roots.
+    /// adjacent aise-capability.toml, and references together. Repeat for several exact package roots.
     /// Distinct from `aise skills <name-or-path>`, which runs a selected deterministic capability
     /// rather than naming an installation destination. Omit to install into the discovered
     /// skill roots.
@@ -1917,12 +1917,12 @@ fn custom_skill_targets(paths: &[PathBuf]) -> Result<Vec<SkillTarget>> {
         .map(|path| {
             let root = expand_tilde(path)?;
             let package = match root.file_name().and_then(|name| name.to_str()) {
-                Some("corrections") => &CORRECTIONS_SKILL_PACKAGE,
-                Some("ai-session-search") => &AI_SESSION_SEARCH_SKILL_PACKAGE,
+                Some(AI_SESSION_SEARCH_SKILL_NAME) => &AI_SESSION_SEARCH_SKILL_PACKAGE,
                 _ => {
                     bail!(
-                        "custom skill root {} must end in ai-session-search or corrections",
-                        root.display()
+                        "custom skill root {} must end in {}",
+                        root.display(),
+                        AI_SESSION_SEARCH_SKILL_NAME
                     )
                 }
             };
@@ -2193,6 +2193,11 @@ fn plan_record_skill_manifest(
     let state = crate::skill_manifest::load_manifest(manifest_path)?;
     let mut manifest = state.writable_manifest(manifest_path)?;
     let mut mutations = plan_historical_skill_split(&state, skill_targets)?;
+    let retired_siblings = plan_retire_sibling_package(&state, skill_targets)?;
+    mutations.extend(retired_siblings.mutations);
+    for root in retired_siblings.retired_roots {
+        manifest.forget(&root);
+    }
     for root in retired_roots {
         manifest.forget(root);
     }
@@ -2208,6 +2213,67 @@ fn plan_record_skill_manifest(
     let original = read_optional_utf8_regular_file(manifest_path)?;
     mutations.push(planned_write(manifest_path, &original, manifest.to_json()?));
     Ok(mutations)
+}
+
+/// Remove the sibling `corrections` skill root that earlier releases installed.
+///
+/// Its rules now ship inside this package, so the sibling is dead weight that keeps claiming the
+/// generic top-level name `corrections` in every harness skill directory. It is removed in the same
+/// transaction that writes the replacement.
+///
+/// Ownership rules are uninstall's, not install's: [`plan_remove_skill_file`] refuses unless the
+/// `SKILL.md` marker and the install manifest agree the tree is untouched, so a user edit or an
+/// unmanaged extra file leaves the directory in place and is reported rather than deleted.
+fn plan_retire_sibling_package(
+    manifest: &crate::skill_manifest::ManifestState,
+    skill_targets: &[SkillTarget],
+) -> Result<SkillDiscoveryMigration> {
+    let mut migration = SkillDiscoveryMigration::default();
+    let mut planned = std::collections::BTreeSet::new();
+    for target in skill_targets
+        .iter()
+        .filter(|target| target.package.name == AI_SESSION_SEARCH_SKILL_PACKAGE.name)
+    {
+        let candidates = std::iter::once(&target.root)
+            .chain(target.discovery_links.iter())
+            .filter_map(|path| path.parent())
+            .map(|parent| parent.join(RETIRED_SKILL_PACKAGE_NAME));
+        for root in candidates {
+            // A caller may install into a directory that is itself named `corrections`, via
+            // `--skill-root`. Retiring it would delete the package this very transaction is
+            // writing, so the sibling search never selects the target or one of its own links.
+            if root == target.root || target.discovery_links.contains(&root) {
+                continue;
+            }
+            if !planned.insert(root.clone()) {
+                continue;
+            }
+            let retired = SkillTarget {
+                label: target.label,
+                root: root.clone(),
+                package: &AI_SESSION_SEARCH_SKILL_PACKAGE,
+                discovery_links: Vec::new(),
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            };
+            let removal = plan_remove_skill_file(&retired, manifest, false)?;
+            if !removal.preserved.is_empty() {
+                bail!(
+                    "refusing to retire the superseded corrections skill at {} because it may \
+                     contain changes aise did not write:\n  {}\nmove or delete it yourself, then \
+                     rerun install",
+                    root.display(),
+                    removal.preserved.join("\n  ")
+                );
+            }
+            if removal.mutations.is_empty() {
+                continue;
+            }
+            migration.mutations.extend(removal.mutations);
+            migration.retired_roots.push(root);
+        }
+    }
+    Ok(migration)
 }
 
 #[derive(Debug, Default)]
@@ -2284,10 +2350,6 @@ fn plan_historical_skill_split(
         .iter()
         .filter(|target| target.package.name == AI_SESSION_SEARCH_SKILL_PACKAGE.name)
     {
-        let sibling_is_managed = skill_targets.iter().any(|target| {
-            target.package.name == CORRECTIONS_SKILL_PACKAGE.name
-                && target.root.parent() == general.root.parent()
-        });
         let recorded = manifest.installation(&general.root);
 
         for relative_path in HISTORICAL_CORRECTION_PATHS {
@@ -2298,8 +2360,8 @@ fn plan_historical_skill_split(
                 (None, None) => {}
                 (Some(_), None) => bail!(
                     "refusing to migrate unrecorded historical skill file {}; ownership is \
-                     uncertain, so inspect or move it before installing the split corrections \
-                     package",
+                     uncertain, so inspect or move it before installing the current \
+                     ai-session-search package",
                     path.display()
                 ),
                 (None, Some(_)) => bail!(
@@ -2308,13 +2370,6 @@ fn plan_historical_skill_split(
                     path.display()
                 ),
                 (Some(original), Some(recorded_file)) => {
-                    if !sibling_is_managed {
-                        bail!(
-                            "historical message-classification file {} requires the sibling \
-                             corrections package to be installed in the same transaction",
-                            path.display()
-                        );
-                    }
                     if recorded_file.bytes != original.len()
                         || recorded_file.sha256 != crate::hashing::sha256(original.as_bytes())
                     {
@@ -2821,11 +2876,43 @@ fn plan_remove_skill_file(
         }
     }
 
-    let managed: std::collections::BTreeSet<&str> = target
+    // Files the manifest records that this build no longer ships, as when a package is retired.
+    // They are owned — aise wrote them — but the loop above cannot vet them, because there is no
+    // embedded copy to compare against. Comparing to the recorded digest is what keeps an edit from
+    // being deleted as though it were untouched.
+    let shipped: std::collections::BTreeSet<&str> = target
         .package
         .files
         .iter()
         .map(|file| file.relative_path)
+        .collect();
+    let recorded_only = recorded
+        .into_iter()
+        .flat_map(|installation| installation.files.iter())
+        .filter(|file| !shipped.contains(file.relative_path.as_str()));
+    let mut recorded_only_paths = std::collections::BTreeSet::new();
+    for file in recorded_only {
+        recorded_only_paths.insert(file.relative_path.as_str());
+        let path = target.root.join(&file.relative_path);
+        let Some(text) = read_optional_utf8_regular_file(&path)? else {
+            continue;
+        };
+        if file.sha256 != crate::hashing::sha256(text.as_bytes()) {
+            reasons.push(format!(
+                "{} differs from what install recorded (modified or damaged)",
+                path.display()
+            ));
+        }
+    }
+
+    // What this build ships, plus whatever the manifest records for this root. The manifest is the
+    // ownership authority, so a file aise installed under an earlier layout stays owned even after
+    // it leaves the current package list; judging by the current list alone would report a file
+    // aise itself wrote as "not written by aise" and block its own cleanup.
+    let managed: std::collections::BTreeSet<&str> = shipped
+        .iter()
+        .copied()
+        .chain(recorded_only_paths.iter().copied())
         .collect();
     let unmanaged: Vec<&String> = entries
         .iter()
@@ -4534,7 +4621,7 @@ mod tests {
         let target = skill_target_for_package(
             "test",
             root.clone(),
-            &CORRECTIONS_SKILL_PACKAGE,
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
             Vec::new(),
             Vec::new(),
         );
@@ -4695,7 +4782,7 @@ mod tests {
             skill_target_for_package(
                 "test",
                 corrections_root.clone(),
-                &CORRECTIONS_SKILL_PACKAGE,
+                &AI_SESSION_SEARCH_SKILL_PACKAGE,
                 vec![],
                 vec![],
             ),
@@ -4728,7 +4815,7 @@ mod tests {
                 .iter()
                 .map(|target| target.package.name)
                 .collect::<Vec<_>>(),
-            vec!["ai-session-search", "corrections"]
+            vec!["ai-session-search"]
         );
 
         let receipt = dir.path().join("state/transaction.json");
@@ -4758,27 +4845,76 @@ mod tests {
     }
 
     #[test]
-    fn package_split_migrates_only_exact_historical_manifest_files() {
+    fn retiring_the_sibling_package_refuses_when_one_of_its_files_was_edited() {
         let dir = tempdir().unwrap();
         let parent = dir.path().join("skills");
         let general_root = parent.join("ai-session-search");
-        let corrections_root = parent.join("corrections");
-        let targets = vec![
-            skill_target_for_package(
-                "test",
-                general_root.clone(),
-                &AI_SESSION_SEARCH_SKILL_PACKAGE,
-                vec![],
-                vec![],
-            ),
-            skill_target_for_package(
-                "test",
-                corrections_root.clone(),
-                &CORRECTIONS_SKILL_PACKAGE,
-                vec![],
-                vec![],
-            ),
-        ];
+        let corrections_root = parent.join(RETIRED_SKILL_PACKAGE_NAME);
+        let targets = vec![skill_target_for_package(
+            "test",
+            general_root.clone(),
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
+            vec![],
+            vec![],
+        )];
+        fs::create_dir_all(&general_root).unwrap();
+        fs::write(
+            general_root.join("SKILL.md"),
+            AI_SESSION_SEARCH_SKILL_FILES[0].content,
+        )
+        .unwrap();
+
+        let retired_skill_md = "---\nname: corrections\ndescription: retired\n---\n\
+                                <!-- ai-session-search-managed-skill v1 -->\nbody\n";
+        let recorded_capability = "schema_version = 1\n";
+        fs::create_dir_all(&corrections_root).unwrap();
+        fs::write(corrections_root.join("SKILL.md"), retired_skill_md).unwrap();
+        // Recorded at install, then edited by the user afterwards.
+        fs::write(
+            corrections_root.join("capability.toml"),
+            "schema_version = 1\n# my own rule\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("state/config.toml");
+        let manifest_path = crate::skill_manifest::manifest_path(&config_path);
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let mut manifest = crate::skill_manifest::SkillInstallManifest::default();
+        manifest.record(
+            &corrections_root,
+            &[
+                ("SKILL.md".to_string(), retired_skill_md),
+                ("capability.toml".to_string(), recorded_capability),
+            ],
+        );
+        fs::write(&manifest_path, manifest.to_json().unwrap()).unwrap();
+
+        let error = preflight_install(&[], &[], &targets, Path::new("aise"), Some(&manifest_path))
+            .expect_err("an edited file in the retired package must block its removal");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("capability.toml"),
+            "the refusal must name the edited file: {message}"
+        );
+        assert!(
+            corrections_root.join("capability.toml").is_file(),
+            "the user's edit must survive"
+        );
+    }
+
+    #[test]
+    fn install_retires_the_sibling_corrections_package_and_historical_files() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("skills");
+        let general_root = parent.join("ai-session-search");
+        let corrections_root = parent.join(RETIRED_SKILL_PACKAGE_NAME);
+        let targets = vec![skill_target_for_package(
+            "test",
+            general_root.clone(),
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
+            vec![],
+            vec![],
+        )];
         let historical_policy = "historical policy\n";
         let historical_reference = "historical reference\n";
         fs::create_dir_all(general_root.join("corrections")).unwrap();
@@ -4800,6 +4936,17 @@ mod tests {
         .unwrap();
         fs::write(general_root.join("references/my-notes.md"), "preserve me\n").unwrap();
 
+        // A sibling package installed by an earlier release, marker and all.
+        let retired_skill_md = "---\nname: corrections\ndescription: retired\n---\n                                <!-- ai-session-search-managed-skill v1 -->\nbody\n";
+        let retired_capability = "schema_version = 1\n";
+        fs::create_dir_all(&corrections_root).unwrap();
+        fs::write(corrections_root.join("SKILL.md"), retired_skill_md).unwrap();
+        fs::write(
+            corrections_root.join("aise-capability.toml"),
+            retired_capability,
+        )
+        .unwrap();
+
         let config_path = dir.path().join("state/config.toml");
         let manifest_path = crate::skill_manifest::manifest_path(&config_path);
         fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
@@ -4818,6 +4965,13 @@ mod tests {
                 ),
             ],
         );
+        historical_manifest.record(
+            &corrections_root,
+            &[
+                ("SKILL.md".to_string(), retired_skill_md),
+                ("aise-capability.toml".to_string(), retired_capability),
+            ],
+        );
         fs::write(&manifest_path, historical_manifest.to_json().unwrap()).unwrap();
 
         let mutations =
@@ -4833,9 +4987,25 @@ mod tests {
             fs::read_to_string(general_root.join("references/my-notes.md")).unwrap(),
             "preserve me\n"
         );
-        for file in CORRECTIONS_SKILL_PACKAGE.files {
+        // Every file aise wrote is gone, so the directory is no longer a discoverable skill: the
+        // Agent Skills specification keys discovery on SKILL.md. An emptied directory may remain,
+        // which `prune_emptied_skill_directories` treats as untidy rather than as data loss worth
+        // a recursive delete.
+        assert!(
+            !corrections_root.join("SKILL.md").exists(),
+            "removing the anchor is what stops the retired package being discovered"
+        );
+        assert!(!corrections_root.join("aise-capability.toml").exists());
+        assert_eq!(
+            fs::read_dir(&corrections_root)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "no aise-written file may survive in the retired package"
+        );
+        for file in AI_SESSION_SEARCH_SKILL_PACKAGE.files {
             assert_eq!(
-                fs::read_to_string(corrections_root.join(file.relative_path)).unwrap(),
+                fs::read_to_string(general_root.join(file.relative_path)).unwrap(),
                 file.content
             );
         }
@@ -4853,7 +5023,10 @@ mod tests {
                 .map(|file| file.relative_path)
                 .collect::<Vec<_>>()
         );
-        assert!(migrated.installation(&corrections_root).is_some());
+        assert!(
+            migrated.installation(&corrections_root).is_none(),
+            "the retired root must be forgotten so a later uninstall does not claim it"
+        );
     }
 
     #[test]
@@ -5065,7 +5238,7 @@ mod tests {
             skill_target_for_package(
                 "test",
                 corrections_root.clone(),
-                &CORRECTIONS_SKILL_PACKAGE,
+                &AI_SESSION_SEARCH_SKILL_PACKAGE,
                 vec![],
                 vec![],
             ),
@@ -5094,7 +5267,7 @@ mod tests {
         let corrections_root = parent.join("corrections");
         for (root, package) in [
             (&general_root, &AI_SESSION_SEARCH_SKILL_PACKAGE),
-            (&corrections_root, &CORRECTIONS_SKILL_PACKAGE),
+            (&corrections_root, &AI_SESSION_SEARCH_SKILL_PACKAGE),
         ] {
             for file in package.files {
                 let path = root.join(file.relative_path);
@@ -5126,7 +5299,7 @@ mod tests {
         );
         manifest.record(
             &corrections_root,
-            &CORRECTIONS_SKILL_PACKAGE
+            &AI_SESSION_SEARCH_SKILL_PACKAGE
                 .files
                 .iter()
                 .map(|file| (file.relative_path.to_string(), file.content))
@@ -5135,7 +5308,7 @@ mod tests {
         fs::write(&manifest_path, manifest.to_json().unwrap()).unwrap();
 
         let outcomes = write_owned_skills(
-            &[general_root.clone(), corrections_root.clone()],
+            std::slice::from_ref(&general_root),
             &config_path,
             false,
             false,
@@ -5161,9 +5334,9 @@ mod tests {
     fn update_refuses_a_changed_file_and_restore_is_the_named_repair() {
         let dir = tempdir().unwrap();
         let receipt = dir.path().join("receipt.json");
-        let root = dir.path().join("skills/corrections");
+        let root = dir.path().join("skills/ai-session-search");
         let roots = vec![root.clone()];
-        let policy = root.join("capability.toml");
+        let policy = root.join("aise-capability.toml");
         let user_file = root.join("references/my-notes.md");
 
         // First write creates the tree and records it.
@@ -5203,9 +5376,9 @@ mod tests {
         assert_eq!(outcomes[0].action, "rewritten from modified or damaged");
         assert_eq!(
             fs::read_to_string(&policy).unwrap(),
-            CORRECTIONS_SKILL_FILES
+            AI_SESSION_SEARCH_SKILL_FILES
                 .iter()
-                .find(|file| file.relative_path == "capability.toml")
+                .find(|file| file.relative_path == "aise-capability.toml")
                 .unwrap()
                 .content
         );
@@ -5263,7 +5436,7 @@ mod tests {
         let target = skill_target_for_package(
             CUSTOM_SKILL_TARGET_LABEL,
             root.clone(),
-            &CORRECTIONS_SKILL_PACKAGE,
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
             vec![],
             vec![],
         );
@@ -5297,7 +5470,7 @@ mod tests {
         let target = skill_target_for_package(
             CUSTOM_SKILL_TARGET_LABEL,
             root.clone(),
-            &CORRECTIONS_SKILL_PACKAGE,
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
             vec![],
             vec![],
         );
@@ -5311,7 +5484,7 @@ mod tests {
         )
         .unwrap();
         execute_planned_transaction(&receipt, &mutations).unwrap();
-        fs::write(root.join("capability.toml"), "edited\n").unwrap();
+        fs::write(root.join("aise-capability.toml"), "edited\n").unwrap();
 
         for damaged in [
             "",
@@ -5350,11 +5523,11 @@ mod tests {
             fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
             fs::write(&manifest_path, damaged).unwrap();
 
-            let root = dir.path().join("skills/corrections");
+            let root = dir.path().join("skills/ai-session-search");
             let target = skill_target_for_package(
                 CUSTOM_SKILL_TARGET_LABEL,
                 root.clone(),
-                &CORRECTIONS_SKILL_PACKAGE,
+                &AI_SESSION_SEARCH_SKILL_PACKAGE,
                 vec![],
                 vec![],
             );
@@ -5498,11 +5671,11 @@ mod tests {
         let target = skill_target_for_package(
             "test",
             root.clone(),
-            &CORRECTIONS_SKILL_PACKAGE,
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
             vec![],
             vec![],
         );
-        let policy = root.join("capability.toml");
+        let policy = root.join("aise-capability.toml");
 
         let mutations = preflight_install(
             &[],
@@ -5528,7 +5701,7 @@ mod tests {
                 .files
                 .iter()
                 .map(|file| {
-                    let content = if file.relative_path == "capability.toml" {
+                    let content = if file.relative_path == "aise-capability.toml" {
                         older
                     } else {
                         file.content
@@ -5690,7 +5863,7 @@ mod tests {
         let target = skill_target_for_package(
             "test",
             root.clone(),
-            &CORRECTIONS_SKILL_PACKAGE,
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
             Vec::new(),
             Vec::new(),
         );
@@ -5701,10 +5874,11 @@ mod tests {
         .unwrap();
         assert_eq!(status_skill_file(&target, &absent).unwrap(), "configured");
 
-        let legacy_anchor =
-            CORRECTIONS_SKILL_FILES[0]
-                .content
-                .replacen("# Corrections", "# Older Corrections", 1);
+        let legacy_anchor = AI_SESSION_SEARCH_SKILL_FILES[0].content.replacen(
+            "# AI Session Search",
+            "# Older AI Session Search",
+            1,
+        );
         fs::write(&anchor, legacy_anchor).unwrap();
         assert_eq!(
             status_skill_file(&target, &absent).unwrap(),

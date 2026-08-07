@@ -277,8 +277,19 @@ aise analyze --provider codex --when 7d --limit 50 --output /absolute/new/analys
 
 `aise skills corrections` scans only what a PERSON wrote, in user-started sessions; pass
 `--session-kinds user subagent` to include delegation prompts. `--format json` returns
-a tagged skill-run receipt plus the classification report. The separate managed `corrections`
-skill owns the deterministic categories and their `capability.toml`.
+a tagged skill-run receipt plus the classification report.
+
+Its deterministic categories live in this skill's adjacent `aise-capability.toml`. Categories
+and selected skills are evaluated in declaration order, the first match wins, and every run
+reports the exact capability digest. Point `--skill` at another skill directory to add its
+categories after these:
+
+```sh
+aise skills corrections --skill ./my-review --format json
+```
+
+Read [references/message-classification.md](references/message-classification.md) before
+changing categories or regular expressions.
 
 Search precise correction phrases such as `misunderstood`, `wrong repo`, `you forgot`, and
 `should have`, then add `--context 2`. Treat mirrored provider records as correlated unless their

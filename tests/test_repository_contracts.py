@@ -124,27 +124,39 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
     passes every Rust test, and ships a binary whose embedded policy differs from the
     reviewed file.
 
-    This walks both package trees rather than naming individual files. Message
-    classification is a sibling ``corrections`` package, while the general
-    ``ai-session-search`` package contains harness guidance only.
+    This walks the package tree rather than naming individual files. Message
+    classification ships as a side file inside the one ``ai-session-search`` package:
+    the Agent Skills specification permits any additional files beside ``SKILL.md``,
+    and it requires ``name`` to equal the directory name, so a second package would
+    have to claim the generic top-level name ``corrections`` in every flat skill root.
     """
 
     def tree(root: Path) -> dict[str, bytes]:
         return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
 
-    for package in ("ai-session-search", "corrections"):
-        repository_files = tree(ROOT / "skills" / package)
-        packaged_files = tree(ROOT / "rust/ai-session-search-core/skills" / package)
-        assert repository_files.keys() == packaged_files.keys(), (
-            f"the two {package} copies hold different files; "
-            f"only in repo root: {sorted(repository_files.keys() - packaged_files.keys())}; "
-            f"only in crate: {sorted(packaged_files.keys() - repository_files.keys())}"
-        )
-        differing = [name for name, data in repository_files.items() if packaged_files[name] != data]
-        assert not differing, f"these files differ between the two {package} copies: {differing}"
-        assert "SKILL.md" in repository_files
+    package = "ai-session-search"
+    repository_files = tree(ROOT / "skills" / package)
+    packaged_files = tree(ROOT / "rust/ai-session-search-core/skills" / package)
+    assert repository_files.keys() == packaged_files.keys(), (
+        f"the two {package} copies hold different files; "
+        f"only in repo root: {sorted(repository_files.keys() - packaged_files.keys())}; "
+        f"only in crate: {sorted(packaged_files.keys() - repository_files.keys())}"
+    )
+    differing = [name for name, data in repository_files.items() if packaged_files[name] != data]
+    assert not differing, f"these files differ between the two {package} copies: {differing}"
 
-    assert (ROOT / "skills/corrections/capability.toml").is_file()
+    assert repository_files.keys() == {
+        "SKILL.md",
+        "aise-capability.toml",
+        "references/message-classification.md",
+        "references/recover-prior-work-with-evidence.md",
+    }, f"unexpected shipped skill files: {sorted(repository_files)}"
+
+    # One shipped package. A second directory here becomes a second top-level skill in every
+    # harness skill root, and its description loads at startup whether or not it is ever used.
+    assert [path.name for path in sorted((ROOT / "skills").iterdir()) if path.is_dir()] == [package]
+    assert not (ROOT / "skills/corrections").exists()
+    assert not (ROOT / "rust/ai-session-search-core/skills/corrections").exists()
     delegated_research = ROOT / "skills/ai-session-search/references/recover-prior-work-with-evidence.md"
     assert delegated_research.is_file()
     assert "bounded evidence packet" in delegated_research.read_text(encoding="utf-8")

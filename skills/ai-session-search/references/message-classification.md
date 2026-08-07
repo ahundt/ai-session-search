@@ -1,8 +1,8 @@
 # Message-classification capability
 
 `aise skills corrections` finds messages where a **person** corrected the agent and classifies
-each into a named category. The deterministic rules live in `capability.toml`, directly beside
-`SKILL.md` in the `corrections` skill package.
+each into a named category. The deterministic rules live in `aise-capability.toml`, directly beside
+`SKILL.md` in the `ai-session-search` skill package.
 
 ## How it works
 
@@ -12,7 +12,7 @@ each into a named category. The deterministic rules live in `capability.toml`, d
 3. The **first** matching category wins. The result records the category name and the exact
    substring that matched.
 4. Every result carries package and capability provenance plus a receipt per evaluated rule set:
-   name, version, and the SHA-256 of the exact `capability.toml` bytes.
+   name, version, and the SHA-256 of the exact `aise-capability.toml` bytes.
 
 Three consequences worth knowing before you write rules:
 
@@ -62,7 +62,8 @@ message-classification packages afterward. Argument order is evaluation order:
 aise skills corrections --skill my-review --skill ../team-rules
 ```
 
-The embedded `corrections` package is the product default. Other names are discovered beneath
+The embedded `corrections` capability, shipped in the `ai-session-search` package, is the
+product default. Other names are discovered beneath
 `[skills].search_paths`; explicit paths let a person run a package without adding it to the
 catalog. Being *discovered* is not being *selected*, so adding a directory to a search path never
 silently changes measured output.
@@ -193,7 +194,7 @@ for receipt in report.output.report.policies:
 ```
 
 MCP agents call `run_skill_capability`. It executes only the deterministic
-`message-classification` capability declared by adjacent `capability.toml`; it does not load,
+`message-classification` capability declared by adjacent `aise-capability.toml`; it does not load,
 interpret, or follow the AI instructions in `SKILL.md`. The MCP client or harness interprets
 `SKILL.md`. MCP adds `all_results` and its own page size because a tool result lands directly in a
 context window, and explicit path selectors must be authorized by `[skills].search_paths`.

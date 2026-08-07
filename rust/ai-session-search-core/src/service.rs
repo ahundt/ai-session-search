@@ -114,7 +114,7 @@ mod analysis_service_tests {
         )
         .unwrap();
         std::fs::write(
-            root.join("capability.toml"),
+            root.join("aise-capability.toml"),
             format!(
                 "schema_version = 1\nkind = \"message-classification\"\n\n\
                  [[categories]]\nname = \"{category}\"\npatterns = [\'\'\'{pattern}\'\'\']\n"
@@ -157,7 +157,7 @@ mod analysis_service_tests {
         )
         .unwrap();
         std::fs::write(
-            skill_root.join("capability.toml"),
+            skill_root.join("aise-capability.toml"),
             "schema_version = 1\nkind = \"message-classification\"\n\n\
              [[categories]]\nname = \"clobber\"\npatterns = ['''\\byou overwrote\\b''']\n",
         )
@@ -403,7 +403,7 @@ mod analysis_service_tests {
         let skills_root = dir.path().join("skills");
         write_skill(&skills_root, "primary", "unused", r"\bunused\b");
         write_skill(&skills_root, "additional", "file-rule", r"\bwrong\b");
-        let additional_capability = skills_root.join("additional/capability.toml");
+        let additional_capability = skills_root.join("additional/aise-capability.toml");
         let mut file = std::fs::read_to_string(&additional_capability).unwrap();
         file.push_str(&format!("\n# {}\n", "x".repeat(500 * 1024)));
         std::fs::write(&additional_capability, file).unwrap();
@@ -435,7 +435,7 @@ mod analysis_service_tests {
         let message = error.to_string();
         assert!(
             message.contains("aggregate")
-                && message.contains("additional/capability.toml")
+                && message.contains("additional/aise-capability.toml")
                 && message.contains("bytes were consumed by earlier selections"),
             "{message}"
         );
@@ -1798,25 +1798,11 @@ impl<'app> AnalysisService<'app> {
                 execution_source: if query.definition.is_some() {
                     crate::skill_run::CapabilityExecutionSource::Inline
                 } else {
-                    match &primary.capability {
-                        crate::skill_catalog::CapabilityFileState::Available { path } => {
-                            crate::skill_run::CapabilityExecutionSource::Path {
-                                canonical_capability_toml: path.clone(),
-                            }
-                        }
-                        crate::skill_catalog::CapabilityFileState::Absent => {
-                            bail!(
-                            "skill {:?} has no adjacent message-classification capability.toml; \
-                             load its SKILL.md in an agent harness instead",
-                            frontmatter.name
-                        )
-                        }
-                        crate::skill_catalog::CapabilityFileState::Invalid { problem, .. } => {
-                            bail!(
-                                "skill {:?} has an invalid capability: {problem}",
-                                frontmatter.name
-                            )
-                        }
+                    crate::skill_run::CapabilityExecutionSource::Path {
+                        canonical_capability_toml: primary
+                            .capability
+                            .clone()
+                            .require_path(&frontmatter.name)?,
                     }
                 },
             };

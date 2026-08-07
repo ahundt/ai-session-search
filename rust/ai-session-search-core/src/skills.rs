@@ -288,7 +288,7 @@ pub struct SkillsCreateArgs {
     /// command refuse an existing destination instead of merging into one.
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
-    /// Capability file to create. Accepts `message-classification`, which adds capability.toml
+    /// Capability file to create. Accepts `message-classification`, which adds aise-capability.toml
     /// seeded with the built-in ordered categories; omit this flag to create only SKILL.md for
     /// agent-harness use.
     #[arg(long, value_enum)]
@@ -334,9 +334,9 @@ impl SkillOwnership {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkillCapabilityStatus {
-    /// `capability.toml` is present and compiles.
+    /// `aise-capability.toml` is present and compiles.
     Ok,
-    /// No `capability.toml`. A valid harness-only skill.
+    /// No `aise-capability.toml`. A valid harness-only skill.
     HarnessOnly,
     /// A capability file is present but does not load. `problem` says why.
     Invalid,
@@ -881,21 +881,25 @@ fn validate(path: &Path) -> Result<SkillValidation> {
         .diagnostics
         .iter()
         .map(|problem| {
-            let capability = problem.contains("capability.toml");
+            let capability = problem.contains(crate::skill_catalog::CAPABILITY_FILE);
             SkillDiagnostic {
                 file: if capability {
-                    "capability.toml"
+                    crate::skill_catalog::CAPABILITY_FILE
                 } else {
                     "SKILL.md"
                 }
                 .to_string(),
                 problem: problem.clone(),
                 fix: if capability {
-                    "make capability.toml a readable regular file, or remove it for a harness-only skill"
+                    format!(
+                        "make {} a readable regular file, or remove it for a harness-only skill",
+                        crate::skill_catalog::CAPABILITY_FILE
+                    )
                 } else {
-                    "correct SKILL.md YAML frontmatter so name matches the directory and description is valid"
-                }
-                .to_string(),
+                    "correct SKILL.md YAML frontmatter so name matches the directory and \
+                     description is valid"
+                        .to_string()
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -903,9 +907,9 @@ fn validate(path: &Path) -> Result<SkillValidation> {
         CapabilityFileState::Available { path } if descriptor.diagnostics.is_empty() => {
             if let Err(problem) = load_policy(&descriptor) {
                 diagnostics.push(SkillDiagnostic {
-                    file: "capability.toml".to_string(),
+                    file: "aise-capability.toml".to_string(),
                     problem,
-                    fix: "correct the capability field named above; compare with the built-in corrections/capability.toml"
+                    fix: "correct the capability field named above; compare with the built-in ai-session-search/aise-capability.toml"
                         .to_string(),
                 });
             }
@@ -919,9 +923,9 @@ fn validate(path: &Path) -> Result<SkillValidation> {
             );
             if let Err(error) = result {
                 diagnostics.push(SkillDiagnostic {
-                    file: "capability.toml".to_string(),
+                    file: "aise-capability.toml".to_string(),
                     problem: format!("{error:#}"),
-                    fix: "correct the capability field named above; compare with the built-in corrections/capability.toml"
+                    fix: "correct the capability field named above; compare with the built-in ai-session-search/aise-capability.toml"
                         .to_string(),
                 });
             }
@@ -1193,7 +1197,7 @@ fn scaffold_files(name: &str, capability: Option<ScaffoldCapability>) -> Vec<(Pa
         }
         policy.push_str("]\n");
     }
-    files.push((PathBuf::from("capability.toml"), policy));
+    files.push((PathBuf::from(crate::skill_catalog::CAPABILITY_FILE), policy));
     files
 }
 
@@ -1219,7 +1223,8 @@ fn emit_validation(result: &SkillValidation, format: OutputFormat) -> Result<()>
                 // from a command that silently did nothing.
                 writeln!(
                     out,
-                    "\nvalid: SKILL.md frontmatter and optional capability.toml both check out"
+                    "\nvalid: SKILL.md frontmatter and optional {} both check out",
+                    crate::skill_catalog::CAPABILITY_FILE
                 )?;
             } else {
                 for diagnostic in &result.diagnostics {
@@ -1288,8 +1293,11 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
                 &categories,
                 args.format,
                 &preamble,
-                "\nno deterministic capability: load this harness-only skill's SKILL.md in an \
-                 agent harness, or add capability.toml to make `aise skills <name>` executable.",
+                &format!(
+                    "\nno deterministic capability: load this harness-only skill's SKILL.md in an \
+                     agent harness, or add {} to make `aise skills <name>` executable.",
+                    crate::skill_catalog::CAPABILITY_FILE
+                ),
             )
         }
         SkillsCmd::Validate(args) => {
@@ -1528,7 +1536,7 @@ mod tests {
         )
         .unwrap();
         if let Some(capability) = capability {
-            std::fs::write(dir.join("capability.toml"), capability).unwrap();
+            std::fs::write(dir.join("aise-capability.toml"), capability).unwrap();
         }
         dir
     }
@@ -1636,22 +1644,15 @@ mod tests {
         let app_root = dir.path().join("app");
         let skills_root = app_root.join("skills");
         let general = skills_root.join(crate::integrations::AI_SESSION_SEARCH_SKILL_NAME);
-        let corrections = skills_root.join(crate::corrections::EMBEDDED_POLICY_NAME);
         std::fs::create_dir_all(&general).unwrap();
-        std::fs::create_dir_all(&corrections).unwrap();
         std::fs::write(
             general.join("SKILL.md"),
             include_str!("../skills/ai-session-search/SKILL.md"),
         )
         .unwrap();
         std::fs::write(
-            corrections.join("SKILL.md"),
-            include_str!("../skills/corrections/SKILL.md"),
-        )
-        .unwrap();
-        std::fs::write(
-            corrections.join("capability.toml"),
-            include_str!("../skills/corrections/capability.toml"),
+            general.join(crate::skill_catalog::CAPABILITY_FILE),
+            include_str!("../skills/ai-session-search/aise-capability.toml"),
         )
         .unwrap();
         let receipt = app_root.join(".ai-session-search-mcp-transaction.json");
@@ -1662,18 +1663,16 @@ mod tests {
         );
 
         let rows = summaries_at(&config, Some(&receipt)).unwrap();
-        assert_eq!(rows.len(), 2, "canonical installs replace fallback rows");
+        assert_eq!(rows.len(), 2, "canonical install replaces its fallback row");
         let general_path = general.canonicalize().unwrap().display().to_string();
-        let corrections_path = corrections.canonicalize().unwrap().display().to_string();
         assert_eq!(
             rows.iter()
                 .map(|row| (row.name.as_str(), row.path.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (
-                    crate::corrections::EMBEDDED_POLICY_NAME,
-                    corrections_path.as_str()
-                ),
+                // The embedded classification policy keeps its own row and stays built in: it is a
+                // runnable capability, not a second installed package.
+                (crate::corrections::EMBEDDED_POLICY_NAME, "(built in)"),
                 (
                     crate::integrations::AI_SESSION_SEARCH_SKILL_NAME,
                     general_path.as_str()
@@ -1689,7 +1688,11 @@ mod tests {
         .unwrap();
         assert_eq!(shown.path, general_path);
         assert_eq!(shown.ownership, SkillOwnership::Aise);
-        assert_eq!(shown.capability_status, SkillCapabilityStatus::HarnessOnly);
+        assert_eq!(
+            shown.capability_status,
+            SkillCapabilityStatus::Ok,
+            "the installed package now ships its capability as a side file, so it is runnable"
+        );
         assert_eq!(
             shown.package_version.as_deref(),
             Some(embedded_policy_version()),
@@ -1702,7 +1705,7 @@ mod tests {
             Some(&receipt),
         )
         .unwrap();
-        assert_eq!(shown_corrections.path, corrections_path);
+        assert_eq!(shown_corrections.path, "(built in)");
         assert_eq!(shown_corrections.ownership, SkillOwnership::Aise);
         assert!(
             matches!(
@@ -1744,7 +1747,7 @@ mod tests {
     fn the_bundled_skill_passes_this_build_s_own_validator() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("skills")
-            .join(crate::corrections::EMBEDDED_POLICY_NAME);
+            .join(crate::integrations::AI_SESSION_SEARCH_SKILL_NAME);
         let result = validate(&root).unwrap();
         assert!(
             result.valid,
@@ -1872,7 +1875,7 @@ mod tests {
             serde_json::json!({
                 "kind": "path",
                 "canonical_capability_toml": skill
-                    .join("capability.toml")
+                    .join("aise-capability.toml")
                     .canonicalize()
                     .unwrap()
             })
@@ -1917,7 +1920,7 @@ mod tests {
             "---\nname: other-name\n---\n\nbody\n",
         )
         .unwrap();
-        std::fs::write(skill.join("capability.toml"), "schema_version = 99\n").unwrap();
+        std::fs::write(skill.join("aise-capability.toml"), "schema_version = 99\n").unwrap();
 
         let result = validate(&skill).unwrap();
         assert!(!result.valid);
@@ -1971,7 +1974,8 @@ mod tests {
         .unwrap()
         .publish()
         .unwrap();
-        let text = std::fs::read_to_string(dir.path().join("my-rules/capability.toml")).unwrap();
+        let text =
+            std::fs::read_to_string(dir.path().join("my-rules/aise-capability.toml")).unwrap();
         let policy =
             crate::message_classification::MessageClassificationPolicySpec::parse_toml(&text)
                 .unwrap()
@@ -2080,7 +2084,7 @@ mod tests {
         assert_eq!(plan.root(), dir.path().join("my-rules"));
     }
 
-    /// Boundary shapes capability.toml can take must be reported, never treated as harness-only.
+    /// Boundary shapes aise-capability.toml can take must be reported, never treated as harness-only.
     #[test]
     fn an_empty_directory_or_non_utf8_capability_is_reported_not_ignored() {
         let dir = tempfile::tempdir().unwrap();
@@ -2095,17 +2099,17 @@ mod tests {
         );
 
         let as_dir = write_skill(&root, "dir-policy", "dir-policy", None);
-        std::fs::create_dir_all(as_dir.join("capability.toml")).unwrap();
+        std::fs::create_dir_all(as_dir.join("aise-capability.toml")).unwrap();
         let descriptor = load_skill_descriptor(&as_dir).unwrap();
         assert!(
             matches!(descriptor.capability, CapabilityFileState::Invalid { .. }),
-            "a directory named capability.toml is invalid, not harness-only"
+            "a directory named aise-capability.toml is invalid, not harness-only"
         );
 
         #[cfg(unix)]
         {
             let invalid = write_skill(&root, "binary-policy", "binary-policy", Some(""));
-            let path = invalid.join("capability.toml");
+            let path = invalid.join("aise-capability.toml");
             std::fs::write(&path, [0xff_u8, 0xfe, 0xfd]).unwrap();
             let summary = summarize(&load_skill_descriptor(&invalid).unwrap());
             assert_eq!(summary.capability_status, SkillCapabilityStatus::Invalid);
@@ -2182,7 +2186,7 @@ mod tests {
         // diagnostic into two malformed records -- and a TOML parse error is naturally several
         // lines long. Truncating instead would drop the fix, the only part a caller can act on.
         let diagnostic = SkillDiagnostic {
-            file: "capability.toml".into(),
+            file: "aise-capability.toml".into(),
             problem: "TOML parse error at line 4\n  |\n4 | weights = 3\n  | ^^^^^".into(),
             fix: "correct the field named above;\nthen re-run".into(),
         };

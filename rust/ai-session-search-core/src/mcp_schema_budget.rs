@@ -582,7 +582,11 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 /// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     ("search_messages", 4_631, 10),
-    ("run_skill_capability", 4_742, 9),
+    // 4_742 -> 4_747: naming the capability file `aise-capability.toml` rather than the generic
+    // `capability.toml` costs five bytes across the two descriptions that name it. 253 bytes of
+    // headroom remain before Codex's 5,000-byte cliff, past which it deletes every parameter
+    // description with no marker to the model.
+    ("run_skill_capability", 4_747, 9),
     ("get_session", 4_064, 10),
     ("search_sessions", 4_250, 8),
     ("list_sessions", 3_892, 8),

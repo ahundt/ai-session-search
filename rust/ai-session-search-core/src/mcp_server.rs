@@ -4268,7 +4268,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     // `tool.description` is a separate field with its own 2,048-character cap that
                     // no measured client charges to the schema. A fact many parameters share also
                     // reads better stated once here than transcribed onto each of them.
-                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. since and until bound the message's own timestamp rather than session activity, and accept an RFC 3339 instant or a relative form; see `aise dates`. session_kinds defaults to user-started sessions only, unlike search_messages and list_sessions which return both classes: in a spawned subagent run, 'user' rows hold the calling agent's delegation prompt rather than text a person entered. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
+                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. since and until bound the message's own timestamp rather than session activity, and accept an RFC 3339 instant or a relative form; see `aise dates`. session_kinds defaults to user-started sessions only, unlike search_messages and list_sessions which return both classes: in a spawned subagent run, 'user' rows hold the calling agent's delegation prompt rather than text a person entered. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -4276,7 +4276,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "skill": skill_selector_input_schema(),
                             "definition": {
                                 "type": "object",
-                                "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent capability.toml rules.",
+                                "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent aise-capability.toml rules.",
                                 "properties": {
                                     "categories": {
                                         "type": "array",
@@ -11882,7 +11882,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            skill.join("capability.toml"),
+            skill.join("aise-capability.toml"),
             crate::corrections::EMBEDDED_POLICY_TOML,
         )
         .unwrap();

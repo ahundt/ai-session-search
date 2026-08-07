@@ -4,7 +4,7 @@
 //! CLI adapters for message-classification skills, data-driven repeat mining,
 //! planning-command frequency, and stats.
 //!
-//! The executable correction categories live in the selected skill's `capability.toml`; the
+//! The executable correction categories live in the selected skill's `aise-capability.toml`; the
 //! category helpers below remain only as compatibility test oracles. `analytics.planning_commands`
 //! (regexes over the slash-command token) optionally restricts which commands `planning` counts
 //! (empty = all). `vocab` and `repeats` use config-backed defaults for their public scan/output
@@ -40,7 +40,7 @@ const USER_REQUEST_END: &str = "</USER_REQUEST>";
 
 /// Historical built-in correction categories retained as a compatibility test oracle.
 ///
-/// The executable source is the selected message-classification skill's `capability.toml`.
+/// The executable source is the selected message-classification skill's `aise-capability.toml`.
 /// These patterns remain narrowed to second-person / imperative / demonstrative forms so tests
 /// can compare the current compiled capability with the pre-skills behavior.
 pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
@@ -225,7 +225,7 @@ impl Row for RoleStat {
 #[derive(Debug, Clone, Args)]
 pub struct CorrectionsArgs {
     /// JSON object containing direct `categories` for this run. It replaces the primary selected
-    /// skill's adjacent capability.toml rules while preserving that skill's identity and version.
+    /// skill's adjacent aise-capability.toml rules while preserving that skill's identity and version.
     #[arg(long, value_name = "JSON")]
     pub definition_json: Option<String>,
     /// Exact session id or unique prefix. Use this when chaining from search output.

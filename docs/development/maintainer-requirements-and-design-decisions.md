@@ -441,7 +441,7 @@ record is outside the index and must not be advertised as searchable.
 ### REQ022-separate-guidance-capabilities
 
 Harnesses load and interpret `SKILL.md`. Aise does not execute that prose or invoke a model.
-Deterministic runnable behavior belongs in an adjacent, closed-schema `capability.toml` parsed by
+Deterministic runnable behavior belongs in an adjacent, closed-schema `aise-capability.toml` parsed by
 aise. Skill guidance and machine capability declarations are related package components with
 different execution authorities.
 

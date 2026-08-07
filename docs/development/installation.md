@@ -123,7 +123,7 @@ and Antigravity harnesses. The app owns one canonical copy under
 `~/.ai-session-search/skills/`, beside `~/.ai-session-search/config.toml`. This app directory is a
 sibling of `~/.claude`, not a child of it and not a harness-owned location. The
 `ai-session-search/` package contains general harness guidance.
-The `corrections/` package contains `SKILL.md`, adjacent `capability.toml` with the deterministic
+The `ai-session-search/` package contains `SKILL.md`, adjacent `aise-capability.toml` with the deterministic
 `message-classification` rules executed by `aise skills corrections`, and
 `references/message-classification.md`. Harness-native discovery links point to the canonical
 packages from `~/.claude/skills/` (Claude Code CLI/Desktop),
@@ -247,7 +247,7 @@ carries that intent.
 
 Uninstall removes a skill directory only when every managed file is exactly what install recorded
 and nothing else lives in it. Any other state preserves the WHOLE directory and reports each
-reason: removing an unchanged `SKILL.md` while leaving your edited `capability.toml` would orphan
+reason: removing an unchanged `SKILL.md` while leaving your edited `aise-capability.toml` would orphan
 your file behind a skill that no longer declares itself. `--force-full-cleanup` deletes everything
 under one exact `--skill-root`, including files you wrote; it requires that root, refuses
 `--keep-skill`, and never touches your index, cache, or configuration.

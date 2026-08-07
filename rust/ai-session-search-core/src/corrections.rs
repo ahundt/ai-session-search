@@ -433,15 +433,16 @@ pub(crate) fn embedded_policy() -> Result<CorrectionPolicy> {
         EMBEDDED_POLICY_TOML,
     )?
     .compile(
-        "corrections".to_string(),
+        EMBEDDED_POLICY_NAME.to_string(),
         env!("CARGO_PKG_VERSION").to_string(),
         CorrectionPolicySource::Embedded,
         EMBEDDED_POLICY_TOML.as_bytes(),
     )
 }
 
-/// Bytes of the bundled `corrections/capability.toml`.
-pub(crate) const EMBEDDED_POLICY_TOML: &str = include_str!("../skills/corrections/capability.toml");
+/// Bytes of the bundled `ai-session-search/aise-capability.toml`.
+pub(crate) const EMBEDDED_POLICY_TOML: &str =
+    include_str!("../skills/ai-session-search/aise-capability.toml");
 
 /// Length-delimited encoding of a spec, for policies that have no file to digest.
 ///

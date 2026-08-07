@@ -743,7 +743,7 @@ history-only/build-wiring boundary.
   prerelease consolidation initially nested correction rules under `skills/ai-session-search/`.
   The current layout preserves that ownership guarantee while splitting responsibilities into two
   embedded sibling packages: `skills/ai-session-search/SKILL.md` supplies general harness
-  guidance, while `skills/corrections/` contains `SKILL.md`, adjacent `capability.toml`, and
+  guidance, `SKILL.md`, adjacent `aise-capability.toml`, and
   `references/message-classification.md`. Cargo, uv, pip, native archive, CLI, and MCP
   distributions therefore cannot ship different instructions or deterministic rules.
 - Default `aise install`, `aise status`, and `aise uninstall` include skills for detected Claude,

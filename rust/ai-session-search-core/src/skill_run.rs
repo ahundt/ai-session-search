@@ -28,7 +28,7 @@ pub struct SkillRunQuery {
 /// Direct executable message-classification rules for the selected skill.
 ///
 /// The selected skill continues to own name, version, instructions, authorization, and result
-/// identity. Supplying this value replaces only its adjacent `capability.toml` rules for one run.
+/// identity. Supplying this value replaces only its adjacent `aise-capability.toml` rules for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageClassificationDefinition {
