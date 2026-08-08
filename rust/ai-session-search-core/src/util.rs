@@ -208,6 +208,59 @@ pub fn truncate_for_display(value: &str, max_len: usize) -> String {
     truncate_for_display_with_extent(value, max_len).0
 }
 
+/// A reusable Unicode-caseless substring matcher for one already-lowercased needle.
+///
+/// Rust's [`str::to_lowercase`] can expand one scalar value into several (for example, `İ`), so
+/// byte-wise or scalar-wise case folding would not preserve the existing search contract. The
+/// streaming matcher feeds each scalar's full lowercase expansion through a KMP matcher instead;
+/// it therefore has the same sequence semantics as `haystack.to_lowercase().contains(...)` while
+/// retaining only the lowercased needle and its prefix table.
+pub(crate) struct UnicodeLowerNeedle {
+    pattern: Vec<char>,
+    prefix: Vec<usize>,
+}
+
+impl UnicodeLowerNeedle {
+    pub(crate) fn from_lowered(lowered_needle: &str) -> Self {
+        let pattern = lowered_needle.chars().collect::<Vec<_>>();
+        let mut prefix = vec![0_usize; pattern.len()];
+        for index in 1..pattern.len() {
+            let mut matched = prefix[index - 1];
+            while matched > 0 && pattern[index] != pattern[matched] {
+                matched = prefix[matched - 1];
+            }
+            if pattern[index] == pattern[matched] {
+                matched += 1;
+            }
+            prefix[index] = matched;
+        }
+        Self { pattern, prefix }
+    }
+
+    pub(crate) fn contains(&self, haystack: &str) -> bool {
+        if self.pattern.is_empty() {
+            return true;
+        }
+
+        let mut matched = 0_usize;
+        for lowered in haystack
+            .chars()
+            .flat_map(|character| character.to_lowercase())
+        {
+            while matched > 0 && lowered != self.pattern[matched] {
+                matched = self.prefix[matched - 1];
+            }
+            if lowered == self.pattern[matched] {
+                matched += 1;
+                if matched == self.pattern.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// The compact display string plus whether non-whitespace content was omitted at the end.
 pub fn truncate_for_display_with_extent(value: &str, max_len: usize) -> (String, bool) {
     truncate_compacted_chars(value.chars(), max_len)
@@ -1397,6 +1450,24 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unicode_lower_contains_matches_eager_lowercase_for_unicode_cases() {
+        for (haystack, needle) in [
+            ("The CAFÉ is open", "café"),
+            ("Straße and STRASSE", "strasse"),
+            ("İstanbul", "i\u{307}"),
+            ("prefix", ""),
+            ("emoji 😀 suffix", "😀"),
+            ("short", "longer"),
+        ] {
+            assert_eq!(
+                UnicodeLowerNeedle::from_lowered(&needle.to_lowercase()).contains(haystack),
+                haystack.to_lowercase().contains(&needle.to_lowercase()),
+                "haystack={haystack:?}, needle={needle:?}"
+            );
+        }
+    }
 
     #[test]
     fn windows_executable_names_follow_pathext_without_magic_extensions() {

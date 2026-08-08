@@ -28,7 +28,7 @@ use crate::models::{
     SearchFilters, SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
-use crate::util::snippet_from_match;
+use crate::util::{snippet_from_match, UnicodeLowerNeedle};
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
 /// the upstream session-only release never set SQLite's `pragma user_version`, so any pre-existing
@@ -4142,6 +4142,11 @@ impl Db {
         let matcher = SkimMatcherV2::default().smart_case();
         let query_lower = query.to_lowercase();
         let tokens: Vec<&str> = query_lower.split_whitespace().collect();
+        let query_needle = UnicodeLowerNeedle::from_lowered(&query_lower);
+        let token_needles = tokens
+            .iter()
+            .map(|token| UnicodeLowerNeedle::from_lowered(token))
+            .collect::<Vec<_>>();
         let mut hits = Vec::new();
         let mut sql = format!(
             "select {}, coalesce(t.transcript_text, '') as transcript_text
@@ -4183,14 +4188,9 @@ impl Db {
 
             let mut term_coverage = vec![false; tokens.len()];
             let mut matched = false;
-            // TODO(perf): this lowercases every haystack per candidate, including the full
-            // transcript (~2x candidate transcript bytes of churn per query). A caseless
-            // substring search or a reusable buffer removes the copies without changing
-            // ranking; deferred past rc.1 because it touches scoring behavior.
             for (source, value) in haystacks {
-                let lowered = value.to_lowercase();
                 let mut source_score = 0i64;
-                if lowered.contains(&query_lower) {
+                if query_needle.contains(value) {
                     matched = true;
                     source_score += match source {
                         "title" => scoring.title_score,
@@ -4201,7 +4201,7 @@ impl Db {
                     };
                 }
                 for (index, token) in tokens.iter().enumerate() {
-                    if !token.is_empty() && lowered.contains(token) {
+                    if !token.is_empty() && token_needles[index].contains(value) {
                         matched = true;
                         source_score += scoring.token_bonus;
                         term_coverage[index] = true;
@@ -5371,6 +5371,7 @@ fn score_fuzzy_message_hits(
     query_lower: &str,
     hits: Vec<MessageHit>,
 ) -> Vec<(MessageHit, bool)> {
+    let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
     hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
@@ -5381,7 +5382,7 @@ fn score_fuzzy_message_hits(
                 };
                 score.map(|score| {
                     hit.fuzzy_score = Some(score);
-                    let exact_phrase = hit.content.to_lowercase().contains(query_lower);
+                    let exact_phrase = exact_phrase_needle.contains(&hit.content);
                     (hit, exact_phrase)
                 })
             },
