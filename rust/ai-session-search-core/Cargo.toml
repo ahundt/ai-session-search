@@ -1,6 +1,6 @@
 [package]
 name = "ai-session-search"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc.1"
 edition = "2021"
 rust-version.workspace = true
 description = "Local-first search, inspection, export, recovery, and MCP recall across supported AI coding-agent sessions."

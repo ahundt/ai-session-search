@@ -8,7 +8,7 @@ resolution-markers = [
 
 [[package]]
 name = "ai-session-search"
-version = "1.0.0rc0"
+version = "1.0.0rc1"
 source = { editable = "." }
 
 [package.optional-dependencies]
