@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(
             status.repair_commands,
             ["aise reindex"],
-            "a newly discovered file only needs the ordinary incremental repair"
+            "a newly discovered or newly reclaimable file needs the incremental repair"
         );
 
         // Retained sessions (indexed source no longer discoverable) are NOT unindexed files.

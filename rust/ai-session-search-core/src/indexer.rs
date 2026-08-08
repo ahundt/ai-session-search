@@ -736,6 +736,10 @@ pub(crate) fn reindex_until(
     let discovery = adapters.discover_enabled(config);
     let sources = deduplicate_sources(discovery.sources);
     let discovery_warnings = discovery.warnings;
+    let discovered_source_paths = sources
+        .iter()
+        .map(|source| (source.provider, normalize_path(&source.path)))
+        .collect::<HashSet<_>>();
     if should_cancel() {
         return Ok(ReindexRun::Cancelled {
             files_seen: 0,
@@ -778,7 +782,16 @@ pub(crate) fn reindex_until(
             source.size_bytes,
             parser_version,
         )?;
-        if !full && !requires_reconciliation && refresh_state == SourceFileRefreshState::Current {
+        // A prior ID collision can leave a current files_seen row whose session still points at a
+        // source that has since vanished. Parse that one candidate instead of prescribing an
+        // incremental reindex that skips it forever.
+        let current_without_session =
+            !full && refresh_state == SourceFileRefreshState::Current && reconciliation.is_none();
+        if !full
+            && !requires_reconciliation
+            && !current_without_session
+            && refresh_state == SourceFileRefreshState::Current
+        {
             continue;
         }
         let parser_version_matches = refresh_state == SourceFileRefreshState::ChangedSameParser;
@@ -787,7 +800,7 @@ pub(crate) fn reindex_until(
         // rewritten/rotated), parse + append ONLY the appended bytes instead of re-reading the
         // whole (possibly multi-hundred-MB) file. Each provider reuses its own `parse_reader`
         // over the appended slice; on any doubt it returns `FullParse` and we re-read below.
-        if !full && !requires_reconciliation {
+        if !full && !requires_reconciliation && !current_without_session {
             let outcome = match source.provider {
                 Provider::Claude | Provider::ClaudeDesktop => {
                     try_tail(source, &source_path, expected_session_id, db, |r, p| {
@@ -832,6 +845,18 @@ pub(crate) fn reindex_until(
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
         crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
+        // Do not oscillate between two live files that claim one provider ID. The existing holder
+        // remains canonical until it leaves the configured discovery set.
+        if current_without_session
+            && db
+                .exact_session_source_path(&parsed.session.id)?
+                .is_some_and(|holder| {
+                    discovered_source_paths
+                        .contains(&(source.provider, normalize_path(Path::new(&holder))))
+                })
+        {
+            continue;
+        }
         let aliases = reconciliation.map_or(&[][..], |item| item.aliases.as_slice());
         // Constraint failures are not actionable without the session and source file being
         // applied; retain both in the error chain.
@@ -1430,6 +1455,69 @@ mod tests {
                 "{needle} must still be searchable after its source file is gone"
             );
         }
+    }
+
+    #[test]
+    fn incremental_reindex_reclaims_an_id_from_an_unavailable_holder() {
+        use crate::models::MessageFilters;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        let project = claude_root.join("-tmp-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let shared = "3f260ba5-b3b0-4e79-9488-b9832ded0835";
+        for name in [shared, "aaaaaaaa-1111-2222-3333-444444444444"] {
+            std::fs::write(
+                project.join(format!("{name}.jsonl")),
+                format!(
+                    r#"{{"type":"user","sessionId":"{shared}","cwd":"/tmp/project","message":{{"role":"user","content":"turn in {name}"}}}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, true, None).unwrap();
+        let explanation = crate::diagnostics::explain_unindexed(&config, &db).unwrap();
+        assert_eq!(explanation.len(), 1);
+        let candidate = std::path::PathBuf::from(&explanation[0].path);
+        let holder = std::path::PathBuf::from(
+            explanation[0]
+                .id_already_held_by
+                .as_deref()
+                .expect("the other live file must hold the shared id"),
+        );
+        let (_, updated) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            updated, 0,
+            "two live files claiming one provider id remain an explained collision"
+        );
+        std::fs::remove_file(holder).unwrap();
+
+        let (_, updated) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(updated, 1, "the surviving source must be reclaimed");
+        assert_eq!(
+            crate::diagnostics::collect(&config, &db)
+                .unwrap()
+                .index_status
+                .unindexed_files,
+            0,
+            "incremental repair must not keep prescribing itself after the old holder vanished"
+        );
+        let candidate_name = candidate.file_stem().unwrap().to_string_lossy();
+        assert_eq!(
+            db.search_messages(
+                &format!("turn in {candidate_name}"),
+                &MessageFilters::default()
+            )
+            .unwrap()
+            .len(),
+            1,
+            "the surviving transcript, not merely its source path, must be searchable"
+        );
     }
 
     #[test]

@@ -598,6 +598,9 @@ fn installed_builtin<'a>(
     canonical: &'a crate::skill_catalog::SkillCatalog,
     name: &str,
 ) -> Option<&'a SkillDescriptor> {
+    if name == crate::corrections::EMBEDDED_POLICY_NAME {
+        return None;
+    }
     if configured
         .skills
         .iter()
@@ -907,7 +910,7 @@ fn validate(path: &Path) -> Result<SkillValidation> {
         CapabilityFileState::Available { path } if descriptor.diagnostics.is_empty() => {
             if let Err(problem) = load_policy(&descriptor) {
                 diagnostics.push(SkillDiagnostic {
-                    file: "aise-capability.toml".to_string(),
+                    file: crate::skill_catalog::CAPABILITY_FILE.to_string(),
                     problem,
                     fix: "correct the capability field named above; compare with the built-in ai-session-search/aise-capability.toml"
                         .to_string(),
@@ -923,7 +926,7 @@ fn validate(path: &Path) -> Result<SkillValidation> {
             );
             if let Err(error) = result {
                 diagnostics.push(SkillDiagnostic {
-                    file: "aise-capability.toml".to_string(),
+                    file: crate::skill_catalog::CAPABILITY_FILE.to_string(),
                     problem: format!("{error:#}"),
                     fix: "correct the capability field named above; compare with the built-in ai-session-search/aise-capability.toml"
                         .to_string(),
@@ -1655,6 +1658,12 @@ mod tests {
             include_str!("../skills/ai-session-search/aise-capability.toml"),
         )
         .unwrap();
+        write_skill(
+            &skills_root,
+            crate::corrections::EMBEDDED_POLICY_NAME,
+            crate::corrections::EMBEDDED_POLICY_NAME,
+            None,
+        );
         let receipt = app_root.join(".ai-session-search-mcp-transaction.json");
         let config = Config::default();
         assert!(

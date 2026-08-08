@@ -193,6 +193,7 @@ pub(crate) fn apply_symlink_change_after(change: &SymlinkChange) -> Result<()> {
     apply_symlink_image(&change.path, &change.after)
 }
 
+#[cfg(test)]
 pub(crate) fn execute_text_file_transaction(
     receipt_path: &Path,
     changes: &[TextFileChange],
@@ -267,6 +268,7 @@ pub(crate) fn with_text_file_transaction_read_lock<T>(
     read_snapshot()
 }
 
+#[cfg(test)]
 fn execute_text_file_transaction_with<F>(
     receipt_path: &Path,
     changes: &[TextFileChange],

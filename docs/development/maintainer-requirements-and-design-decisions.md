@@ -367,10 +367,10 @@ paths are migration inputs, not competing canonical roots.
 
 ### REQ015-separate-app-harness-roots
 
-The canonical end-user packages `ai-session-search` and `corrections` live under the resolved AI
-Session Search application root and contain real `SKILL.md` files. Harness-native skill directories
-contain links to those canonical packages where the harness supports links. App ownership and
-harness discovery are separate concepts.
+The canonical end-user package `ai-session-search` lives under the resolved AI Session Search
+application root and contains a real `SKILL.md`. Harness-native skill directories contain links to
+that canonical package where the harness supports links. App ownership and harness discovery are
+separate concepts.
 
 The repository-only `maintain-ai-session-search` skill is canonical under `.agents/skills`.
 Repository-local Claude discovery uses `.claude/skills/maintain-ai-session-search` as a link to that

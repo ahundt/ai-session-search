@@ -11,15 +11,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 
-#[cfg(test)]
-use crate::text_file_transaction::publish_text_change;
 use crate::text_file_transaction::{
     apply_symlink_change_after, execute_text_file_and_symlink_transaction_with,
-    execute_text_file_transaction, publish_symlink_change, recover_text_file_transaction,
-    recovery_guidance, snapshot_symlink_image, snapshot_utf8_regular_file,
-    transaction_recovery_required, with_text_file_transaction_read_lock, RecoveryOutcome,
-    SymlinkChange, SymlinkImage, TextFileChange, TextFileImage,
+    publish_symlink_change, recover_text_file_transaction, recovery_guidance,
+    snapshot_symlink_image, snapshot_utf8_regular_file, transaction_recovery_required,
+    with_text_file_transaction_read_lock, RecoveryOutcome, SymlinkChange, SymlinkImage,
+    TextFileChange, TextFileImage,
 };
+#[cfg(test)]
+use crate::text_file_transaction::{execute_text_file_transaction, publish_text_change};
 use crate::util::{render_posix_shell_command, which};
 
 // Keep the MCP identity aligned with the product and distribution slug. `aise` is the executable;
@@ -124,6 +124,10 @@ const MANAGED_SKILL_PACKAGES: &[&ManagedSkillPackage] = &[&AI_SESSION_SEARCH_SKI
 /// `SKILL.md` anchor, so ownership is decided by that anchor's marker and the install manifest,
 /// exactly as uninstall decides it.
 const RETIRED_SKILL_PACKAGE_NAME: &str = "corrections";
+const RETIRED_SKILL_PACKAGE: ManagedSkillPackage = ManagedSkillPackage {
+    name: RETIRED_SKILL_PACKAGE_NAME,
+    files: AI_SESSION_SEARCH_SKILL_FILES,
+};
 
 /// Paths written by the prerelease layout before message classification became its own package.
 ///
@@ -613,6 +617,7 @@ fn publish_planned_mutations(mutations: &[PlannedFileMutation]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn execute_planned_transaction(receipt: &Path, mutations: &[PlannedFileMutation]) -> Result<()> {
     let changes = mutations
         .iter()
@@ -882,6 +887,11 @@ pub(crate) fn install_with_receipt(
     // The manifest lives beside the resolved config, which `default_receipt` already sits next
     // to, so both durable records land in one place rather than two.
     let manifest = crate::skill_manifest::manifest_path(default_receipt);
+    let retired_skill_roots = plan_retire_sibling_package(
+        &crate::skill_manifest::load_manifest(&manifest)?,
+        &skill_targets,
+    )?
+    .retired_roots;
     let mutations = preflight_install(
         &targets,
         &instruction_targets,
@@ -899,7 +909,12 @@ pub(crate) fn install_with_receipt(
             Ok(package_changes || !migration.mutations.is_empty())
         })
         .collect::<Result<Vec<_>>>()?;
-    let planned_discovery_links = plan_install_skill_discovery_links(&skill_targets)?;
+    let retired_discovery_links = plan_retire_sibling_discovery_links(&skill_targets)?;
+    let mut planned_discovery_links = retired_discovery_links
+        .iter()
+        .map(|(link, expected)| SymlinkChange::remove(link.clone(), expected.clone()))
+        .collect::<Vec<_>>();
+    planned_discovery_links.extend(plan_install_skill_discovery_links(&skill_targets)?);
     let changed_discovery_paths = planned_discovery_links
         .iter()
         .map(|change| change.path.clone())
@@ -927,6 +942,7 @@ pub(crate) fn install_with_receipt(
             &planned_discovery_links,
             |_, change| publish_install_skill_discovery_link(change, &skill_targets),
         )?;
+        prune_retired_skill_directories(&retired_skill_roots);
     }
     if let Some(guard) = alias_guard {
         guard.commit();
@@ -963,6 +979,21 @@ pub(crate) fn install_with_receipt(
                 "configured {} instruction guidance in {}",
                 target.label,
                 target.path.display()
+            );
+        }
+    }
+    for (link, expected) in &retired_discovery_links {
+        if args.dry_run {
+            println!(
+                "dry-run: would remove retired skill discovery link {} -> {}",
+                link.display(),
+                expected.display()
+            );
+        } else {
+            println!(
+                "removed retired skill discovery link {} -> {}",
+                link.display(),
+                expected.display()
             );
         }
     }
@@ -1255,6 +1286,8 @@ pub(crate) fn uninstall_with_receipt(
                 target.root.display()
             );
         }
+    } else {
+        append_retired_sibling_skill_targets(&mut skill_targets)?;
     }
     let discovery_uninstall = prepare_skill_discovery_uninstall(&skill_targets)?;
     let discovery_link_changes = discovery_uninstall
@@ -1389,6 +1422,32 @@ pub(crate) fn uninstall_with_receipt(
         println!("dry-run: no files were modified");
     }
     Ok(())
+}
+
+fn append_retired_sibling_skill_targets(skill_targets: &mut Vec<SkillTarget>) -> Result<()> {
+    let retired = skill_targets
+        .iter()
+        .filter(|target| target.package.name == AI_SESSION_SEARCH_SKILL_PACKAGE.name)
+        .filter_map(|target| {
+            let root = target.root.parent()?.join(RETIRED_SKILL_PACKAGE_NAME);
+            let discovery_links = target
+                .discovery_links
+                .iter()
+                .filter_map(|link| link.parent())
+                .map(|parent| parent.join(RETIRED_SKILL_PACKAGE_NAME))
+                .collect();
+            Some(SkillTarget {
+                label: "retired corrections",
+                root,
+                package: &RETIRED_SKILL_PACKAGE,
+                discovery_links,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    skill_targets.extend(retired);
+    dedupe_skill_targets(skill_targets)
 }
 
 #[derive(Debug, Default)]
@@ -2248,6 +2307,16 @@ fn plan_retire_sibling_package(
             if !planned.insert(root.clone()) {
                 continue;
             }
+            match fs::symlink_metadata(&root) {
+                Ok(metadata) if metadata.file_type().is_symlink() => continue,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect retired skill package {}", root.display())
+                    })
+                }
+            }
             let retired = SkillTarget {
                 label: target.label,
                 root: root.clone(),
@@ -2274,6 +2343,56 @@ fn plan_retire_sibling_package(
         }
     }
     Ok(migration)
+}
+
+fn plan_retire_sibling_discovery_links(
+    skill_targets: &[SkillTarget],
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut links = Vec::new();
+    let mut planned = std::collections::BTreeSet::new();
+    for target in skill_targets
+        .iter()
+        .filter(|target| target.package.name == AI_SESSION_SEARCH_SKILL_PACKAGE.name)
+    {
+        let Some(canonical_parent) = target.root.parent() else {
+            continue;
+        };
+        let expected = canonical_parent.join(RETIRED_SKILL_PACKAGE_NAME);
+        for current_link in &target.discovery_links {
+            let Some(link_parent) = current_link.parent() else {
+                continue;
+            };
+            let link = link_parent.join(RETIRED_SKILL_PACKAGE_NAME);
+            if !planned.insert(link.clone()) {
+                continue;
+            }
+            match fs::symlink_metadata(&link) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect retired skill discovery link {}", link.display())
+                    })
+                }
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let existing = fs::read_link(&link).with_context(|| {
+                        format!("read retired skill discovery link {}", link.display())
+                    })?;
+                    if existing != expected {
+                        bail!(
+                            "refusing to retire skill discovery link {} because it points to {} \
+                             instead of the retired aise package {}; preserve or remove it yourself",
+                            link.display(),
+                            existing.display(),
+                            expected.display()
+                        );
+                    }
+                    links.push((link, expected.clone()));
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+    Ok(links)
 }
 
 #[derive(Debug, Default)]
@@ -2704,24 +2823,66 @@ pub(crate) fn write_owned_skills(
     }
 
     let historical = plan_historical_skill_split(&manifest, &refreshable)?;
+    let retired_siblings = plan_retire_sibling_package(&manifest, &refreshable)?;
+    let retired_discovery_links = plan_retire_sibling_discovery_links(&refreshable)?;
+    let migration_requires_manifest =
+        !historical.is_empty() || !retired_siblings.mutations.is_empty();
     if !historical.is_empty() {
         mutations.extend(historical);
+    }
+    if migration_requires_manifest {
         // Re-record every successfully validated package in this sibling group. This is safe even
-        // when its bytes were already current, and it prevents the old general-package record
-        // from retaining paths that moved into `corrections`.
-        for target in refreshable {
+        // when its bytes were already current, and it prevents a retired package or old general
+        // package record from surviving after its files move.
+        for target in &refreshable {
             if !written.iter().any(|existing| {
                 existing.root == target.root && existing.package.name == target.package.name
             }) {
-                written.push(target);
+                written.push(target.clone());
             }
         }
     }
 
-    if !dry_run && !mutations.is_empty() {
+    if !mutations.is_empty() || !retired_siblings.mutations.is_empty() {
         mutations.extend(plan_record_skill_manifest(&manifest_path, &written, &[])?);
-        let normalized = normalize_planned_mutations(mutations)?;
-        execute_planned_transaction(receipt_path, &normalized)?;
+    }
+    let discovery_link_changes = retired_discovery_links
+        .iter()
+        .map(|(link, expected)| SymlinkChange::remove(link.clone(), expected.clone()))
+        .collect::<Vec<_>>();
+    let normalized = normalize_planned_mutations(mutations)?;
+    if !dry_run && (!normalized.is_empty() || !discovery_link_changes.is_empty()) {
+        execute_planned_transaction_with_links(
+            receipt_path,
+            &normalized,
+            &discovery_link_changes,
+            |_, change| publish_symlink_change(change),
+        )?;
+        prune_retired_skill_directories(&retired_siblings.retired_roots);
+    }
+    for root in retired_siblings.retired_roots {
+        outcomes.push(SkillWriteOutcome {
+            label: "retired corrections".to_string(),
+            root: root.display().to_string(),
+            action: if dry_run {
+                "would remove retired package".to_string()
+            } else {
+                "removed retired package".to_string()
+            },
+            problem: None,
+        });
+    }
+    for (link, _) in retired_discovery_links {
+        outcomes.push(SkillWriteOutcome {
+            label: "retired corrections".to_string(),
+            root: link.display().to_string(),
+            action: if dry_run {
+                "would remove retired discovery link".to_string()
+            } else {
+                "removed retired discovery link".to_string()
+            },
+            problem: None,
+        });
     }
     Ok(outcomes)
 }
@@ -2798,6 +2959,20 @@ fn managed_skill_directories(target: &SkillTarget) -> Vec<PathBuf> {
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     dirs.push(target.root.clone());
     dirs
+}
+
+fn prune_retired_skill_directories(roots: &[PathBuf]) {
+    for root in roots {
+        let target = SkillTarget {
+            label: "retired corrections",
+            root: root.clone(),
+            package: &RETIRED_SKILL_PACKAGE,
+            discovery_links: Vec::new(),
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        };
+        prune_emptied_skill_directories(&managed_skill_directories(&target));
+    }
 }
 
 /// Exact directories that may become empty after removing an already-enumerated skill tree.
@@ -5307,6 +5482,20 @@ mod tests {
         );
         fs::write(&manifest_path, manifest.to_json().unwrap()).unwrap();
 
+        let dry_run = write_owned_skills(
+            std::slice::from_ref(&general_root),
+            &config_path,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(dry_run.iter().any(|outcome| {
+            outcome.root == corrections_root.display().to_string()
+                && outcome.action == "would remove retired package"
+        }));
+        assert!(general_root.join("corrections/policy.toml").exists());
+        assert!(corrections_root.exists());
+
         let outcomes = write_owned_skills(
             std::slice::from_ref(&general_root),
             &config_path,
@@ -5319,6 +5508,7 @@ mod tests {
             "{outcomes:#?}"
         );
         assert!(!general_root.join("corrections/policy.toml").exists());
+        assert!(!corrections_root.exists());
         let migrated = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
         assert_eq!(
             migrated.installation(&general_root).unwrap().files.len(),
@@ -5992,6 +6182,37 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_includes_the_retired_package_and_matching_discovery_links() {
+        let mut current = skill_target(
+            "app",
+            PathBuf::from("/home/test/.ai-session-search/skills/ai-session-search"),
+            vec![],
+            vec![],
+        );
+        current.discovery_links = vec![
+            PathBuf::from("/home/test/.claude/skills/ai-session-search"),
+            PathBuf::from("/home/test/.agents/skills/ai-session-search"),
+        ];
+        let mut targets = vec![current];
+
+        append_retired_sibling_skill_targets(&mut targets).unwrap();
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[1].root,
+            PathBuf::from("/home/test/.ai-session-search/skills/corrections")
+        );
+        assert_eq!(targets[1].package.name, "corrections");
+        assert_eq!(
+            targets[1].discovery_links,
+            vec![
+                PathBuf::from("/home/test/.claude/skills/corrections"),
+                PathBuf::from("/home/test/.agents/skills/corrections"),
+            ]
+        );
+    }
+
+    #[test]
     fn canonical_skill_retention_inventory_includes_antigravity_cli() {
         let layout = ClientLayout::new(
             PathBuf::from("/home/test"),
@@ -6128,6 +6349,75 @@ mod tests {
             .is_symlink());
         assert_eq!(fs::read_link(&link).unwrap(), canonical);
         assert!(link.join("SKILL.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_retires_the_owned_sibling_package_and_its_discovery_symlink() {
+        let dir = tempdir().unwrap();
+        let canonical = dir.path().join("config/skills/ai-session-search");
+        let retired = canonical.parent().unwrap().join(RETIRED_SKILL_PACKAGE_NAME);
+        let link = dir.path().join("harness/skills/ai-session-search");
+        let retired_link = link.parent().unwrap().join(RETIRED_SKILL_PACKAGE_NAME);
+        let mut target = skill_target_for_package(
+            "app",
+            canonical.clone(),
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
+            vec![],
+            vec![],
+        );
+        target.discovery_links.push(link.clone());
+
+        let retired_skill = "---\nname: corrections\ndescription: retired\n---\n\
+                             <!-- ai-session-search-managed-skill v1 -->\nbody\n";
+        let retired_capability = "schema_version = 1\n";
+        fs::create_dir_all(&retired).unwrap();
+        fs::write(retired.join("SKILL.md"), retired_skill).unwrap();
+        fs::write(retired.join("capability.toml"), retired_capability).unwrap();
+        fs::create_dir_all(retired_link.parent().unwrap()).unwrap();
+        create_directory_symlink(&retired, &retired_link).unwrap();
+
+        let manifest = dir.path().join("config/skill-install-manifest.json");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let mut recorded = crate::skill_manifest::SkillInstallManifest::default();
+        recorded.record(
+            &retired,
+            &[
+                ("SKILL.md".to_string(), retired_skill),
+                ("capability.toml".to_string(), retired_capability),
+            ],
+        );
+        fs::write(&manifest, recorded.to_json().unwrap()).unwrap();
+        let receipt = dir.path().join("config/transaction.json");
+
+        let mutations = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&target),
+            Path::new("aise"),
+            Some(&manifest),
+        )
+        .unwrap();
+        let retired_links =
+            plan_retire_sibling_discovery_links(std::slice::from_ref(&target)).unwrap();
+        let mut links = retired_links
+            .iter()
+            .map(|(path, expected)| SymlinkChange::remove(path.clone(), expected.clone()))
+            .collect::<Vec<_>>();
+        links.extend(plan_install_skill_discovery_links(std::slice::from_ref(&target)).unwrap());
+        execute_planned_transaction_with_links(&receipt, &mutations, &links, |_, change| {
+            publish_install_skill_discovery_link(change, std::slice::from_ref(&target))
+        })
+        .unwrap();
+        prune_retired_skill_directories(std::slice::from_ref(&retired));
+
+        assert!(!retired_link.exists());
+        assert!(!retired.join("SKILL.md").exists());
+        assert!(!retired.exists());
+        assert_eq!(fs::read_link(&link).unwrap(), canonical);
+        assert!(canonical
+            .join(crate::skill_catalog::CAPABILITY_FILE)
+            .is_file());
     }
 
     #[cfg(unix)]

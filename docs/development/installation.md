@@ -118,28 +118,29 @@ explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
 `~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
 instruction guidance for Claude, Codex, OpenCode, Gemini, and Antigravity;
 Gemini and Antigravity share `~/.gemini/GEMINI.md`. It does not install hooks.
-It installs two sibling skill packages for detected or explicitly selected Claude, Codex, Gemini,
-and Antigravity harnesses. The app owns one canonical copy under
+It installs one `ai-session-search` skill package for detected or explicitly selected Claude,
+Codex, Gemini, and Antigravity harnesses. The app owns the canonical package under
 `~/.ai-session-search/skills/`, beside `~/.ai-session-search/config.toml`. This app directory is a
 sibling of `~/.claude`, not a child of it and not a harness-owned location. The
-`ai-session-search/` package contains general harness guidance.
-The `ai-session-search/` package contains `SKILL.md`, adjacent `aise-capability.toml` with the deterministic
-`message-classification` rules executed by `aise skills corrections`, and
-`references/message-classification.md`. Harness-native discovery links point to the canonical
-packages from `~/.claude/skills/` (Claude Code CLI/Desktop),
+`ai-session-search/` package contains general harness guidance in `SKILL.md`, adjacent
+`aise-capability.toml` with the deterministic `message-classification` rules executed by
+`aise skills corrections`, and `references/message-classification.md`. Harness-native discovery links
+point to the canonical package from `~/.claude/skills/` (Claude Code CLI/Desktop),
 `~/.agents/skills/` (ChatGPT Codex desktop and Codex CLI/IDE),
 `~/.gemini/skills/` (Gemini), `~/.gemini/config/skills/` (Antigravity
 App/IDE), and `~/.gemini/antigravity-cli/skills/` (Antigravity CLI). Selecting several
 harnesses keeps every selected discovery directory; shared destinations are deduplicated. Use
 repeatable `--skill-root DIR` for one or more exact additional package destinations. Each custom
-directory must end in `ai-session-search` or `corrections`; it names a package directory, not a
-file inside one.
+directory must end in `ai-session-search`; it names a package directory, not a file inside one.
 
 Reinstall replaces a prerelease copied harness package with a discovery link only when the old
 copy is provably app-managed and untouched. A modified file, extra user file, unmanaged directory,
 or retargeted link is preserved and reported instead of overwritten. Uninstall removes a
 discovery entry only while it is still the exact link created by `aise`, and retains the canonical
-package while another supported harness still links to it.
+package while another supported harness still links to it. Install, `aise skills update`, and
+normal uninstall retire the earlier sibling `corrections` package and its discovery links only
+when the ownership manifest, file digests, and exact link targets still match; dry-run reports each
+planned removal without changing the installation.
 Generated guidance introduces the product as **AI Session Search (`aise`)** and
 names the initial MCP tools (`search_sessions`, `search_messages`, and
 `get_session`) rather than assuming that a new user or agent knows what `aise`

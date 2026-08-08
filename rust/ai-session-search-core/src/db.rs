@@ -1652,6 +1652,17 @@ impl Db {
         Ok(rows)
     }
 
+    pub(crate) fn exact_session_source_path(&self, id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "select source_path from sessions where id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn upsert_session(
         &self,
         parsed: &ParsedSession,

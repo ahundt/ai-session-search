@@ -169,7 +169,7 @@ through the same preflight, transaction, status, recovery, and uninstall path. E
 skill destinations use repeatable `--skill-root DIR` (the directory, not a file inside it);
 uninstall preserves them with `--keep-skill`, refuses to remove a directory without the embedded
 ownership marker, and preserves the whole directory whenever any file in it differs from what
-install recorded. Automatic packages live under `~/.ai-session-search/skills/` and are exposed
+install recorded. The automatic package lives under `~/.ai-session-search/skills/` and is exposed
 through separate harness-native discovery links. An explicit `--config` or
 `AI_SESSION_SEARCH_CONFIG` deliberately selects a portable alternate namespace for that invocation.
 Instruction status is content-aware: `configured` means the current generated

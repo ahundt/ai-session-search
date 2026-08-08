@@ -174,6 +174,25 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
         assert glob in attributes, f"missing .gitattributes rule: {glob}"
 
 
+def test_skill_package_documentation_matches_the_one_shipped_package() -> None:
+    """Maintainer and installer docs must not restore the retired sibling package."""
+    documented = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in (
+            "docs/development/configuration.md",
+            "docs/development/installation.md",
+            "docs/development/maintainer-requirements-and-design-decisions.md",
+        )
+    )
+    for retired_claim in (
+        "two sibling skill packages",
+        "canonical end-user packages `ai-session-search` and `corrections`",
+        "must end in `ai-session-search` or `corrections`",
+        "Automatic packages live under",
+    ):
+        assert retired_claim not in documented
+
+
 def test_internal_maintainer_skill_is_project_scoped_and_not_packaged() -> None:
     """Developer guidance has one repo-owned copy and never enters user installs."""
     internal = ROOT / ".agents/skills/maintain-ai-session-search"
