@@ -39,6 +39,7 @@ const PASSIVE_FAILURE_RETRY_INTERVAL_HOURS: u64 = 1;
 
 const ENV_INSTALLER: &str = "AI_SESSION_SEARCH_PYTHON_INSTALLER";
 const ENV_INVOKED_EXECUTABLE: &str = "AI_SESSION_SEARCH_INVOKED_EXECUTABLE";
+const ENV_PYTHON_BASE: &str = "AI_SESSION_SEARCH_PYTHON_BASE_EXECUTABLE";
 const ENV_PYTHON: &str = "AI_SESSION_SEARCH_PYTHON_EXECUTABLE";
 const ENV_PREFIX: &str = "AI_SESSION_SEARCH_PYTHON_PREFIX";
 const ENV_UV_RECEIPT: &str = "AI_SESSION_SEARCH_UV_TOOL_RECEIPT";
@@ -51,6 +52,7 @@ struct InstallEvidence {
     pub executable: PathBuf,
     pub invoked_executable: Option<PathBuf>,
     pub python_installer: Option<String>,
+    pub python_base_executable: Option<PathBuf>,
     pub python_executable: Option<PathBuf>,
     pub python_prefix: Option<PathBuf>,
     pub uv_tool_receipt: Option<PathBuf>,
@@ -65,6 +67,7 @@ impl InstallEvidence {
                 .context("could not resolve the running executable")?,
             invoked_executable: nonempty_env_path(ENV_INVOKED_EXECUTABLE),
             python_installer: nonempty_env(ENV_INSTALLER),
+            python_base_executable: nonempty_env_path(ENV_PYTHON_BASE),
             python_executable: nonempty_env_path(ENV_PYTHON),
             python_prefix: nonempty_env_path(ENV_PREFIX),
             uv_tool_receipt: nonempty_env_path(ENV_UV_RECEIPT),
@@ -86,13 +89,12 @@ pub(crate) fn background_child_executable() -> Result<PathBuf> {
 }
 
 fn background_child_executable_from_evidence(evidence: &InstallEvidence) -> Result<PathBuf> {
-    let Some(python_runtime) = evidence
-        .python_executable
-        .as_deref()
-        .filter(|python_runtime| paths_identify_same_file(&evidence.executable, python_runtime))
-    else {
+    let Some(python_runtime) = evidence.python_executable.as_deref() else {
         return Ok(evidence.executable.clone());
     };
+    if !python_runtime_identifies_process(evidence) {
+        return Ok(evidence.executable.clone());
+    }
     let invoked = evidence.invoked_executable.as_ref().with_context(|| {
         format!(
             "Python runtime {} did not identify the invoked aise console script; run the installed \
@@ -1290,8 +1292,25 @@ fn python_executable_belongs_to_prefix(evidence: &InstallEvidence) -> bool {
         .zip(evidence.python_prefix.as_deref())
         .is_some_and(|(python_executable, python_prefix)| {
             python_executable.starts_with(python_prefix)
-                && paths_identify_same_file(&evidence.executable, python_executable)
+                && python_runtime_identifies_process(evidence)
         })
+}
+
+/// Identify CPython both when `sys.executable` is the process image and when a Windows venv
+/// redirector reports the environment executable while the process runs the base interpreter.
+fn python_runtime_identifies_process(evidence: &InstallEvidence) -> bool {
+    let Some(python_executable) = evidence.python_executable.as_deref() else {
+        return false;
+    };
+    if paths_identify_same_file(&evidence.executable, python_executable) {
+        return true;
+    }
+    evidence
+        .python_base_executable
+        .as_deref()
+        .filter(|base| paths_identify_same_file(&evidence.executable, base))
+        .zip(evidence.python_prefix.as_deref())
+        .is_some_and(|(_, prefix)| python_executable.starts_with(prefix))
 }
 
 fn paths_identify_same_file(left: &Path, right: &Path) -> bool {
@@ -1469,6 +1488,7 @@ mod tests {
             executable,
             invoked_executable: None,
             python_installer: None,
+            python_base_executable: None,
             python_executable: None,
             python_prefix: None,
             uv_tool_receipt: None,
@@ -1537,6 +1557,30 @@ mod tests {
         write_executable(&invoked);
         let mut evidence = evidence(python.clone());
         evidence.python_executable = Some(python);
+        evidence.invoked_executable = Some(invoked.clone());
+
+        assert_eq!(
+            background_child_executable_from_evidence(&evidence).unwrap(),
+            invoked
+        );
+    }
+
+    #[test]
+    fn python_background_child_accepts_a_distinct_venv_redirector_for_the_same_base_process() {
+        let temp = TempDir::new().unwrap();
+        let base_python = temp.path().join("base/python");
+        let prefix = temp.path().join("venv");
+        let venv_python = prefix.join("Scripts/python.exe");
+        let invoked = prefix.join("Scripts/aise.exe");
+        fs::create_dir_all(base_python.parent().unwrap()).unwrap();
+        fs::create_dir_all(venv_python.parent().unwrap()).unwrap();
+        write_executable(&base_python);
+        write_executable(&venv_python);
+        write_executable(&invoked);
+        let mut evidence = evidence(base_python.clone());
+        evidence.python_base_executable = Some(base_python);
+        evidence.python_executable = Some(venv_python);
+        evidence.python_prefix = Some(prefix);
         evidence.invoked_executable = Some(invoked.clone());
 
         assert_eq!(

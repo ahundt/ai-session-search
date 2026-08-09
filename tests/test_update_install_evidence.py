@@ -26,13 +26,14 @@ class _InstalledDistribution:
 def test_direct_source_metadata_and_uv_receipt_are_both_reported(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    invoked_executable = tmp_path / "bin" / "aise"
+    invoked_executable = tmp_path / "bin" / "aise.exe"
     invoked_executable.parent.mkdir()
     invoked_executable.write_text("#!/bin/sh\n", encoding="utf-8")
     (tmp_path / "uv-receipt.toml").write_text("[tool]\n", encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [str(invoked_executable)])
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
     monkeypatch.setattr(sys, "executable", str(tmp_path / "bin" / "python"))
+    monkeypatch.setattr(sys, "_base_executable", str(tmp_path / "base" / "python"))
     monkeypatch.setattr(
         entrypoint,
         "distribution",
@@ -49,6 +50,9 @@ def test_direct_source_metadata_and_uv_receipt_are_both_reported(
     assert evidence["AI_SESSION_SEARCH_PYTHON_INSTALLER"] == "uv"
     assert evidence["AI_SESSION_SEARCH_INVOKED_EXECUTABLE"] == str(
         invoked_executable.resolve()
+    )
+    assert evidence["AI_SESSION_SEARCH_PYTHON_BASE_EXECUTABLE"] == str(
+        tmp_path / "base" / "python"
     )
     assert evidence["AI_SESSION_SEARCH_UV_TOOL_RECEIPT"] == str(
         tmp_path / "uv-receipt.toml"

@@ -18,6 +18,7 @@ EXECUTABLE_NAMES = frozenset({"aise", "aisearch", "ai_session_search"})
 INSTALL_EVIDENCE_ENVIRONMENT_KEYS = (
     "AI_SESSION_SEARCH_INVOKED_EXECUTABLE",
     "AI_SESSION_SEARCH_PYTHON_INSTALLER",
+    "AI_SESSION_SEARCH_PYTHON_BASE_EXECUTABLE",
     "AI_SESSION_SEARCH_PYTHON_EXECUTABLE",
     "AI_SESSION_SEARCH_PYTHON_PREFIX",
     "AI_SESSION_SEARCH_UV_TOOL_RECEIPT",
@@ -32,8 +33,11 @@ def _collect_install_evidence() -> dict[str, str]:
         "AI_SESSION_SEARCH_PYTHON_EXECUTABLE": sys.executable,
         "AI_SESSION_SEARCH_PYTHON_PREFIX": sys.prefix,
     }
+    base_executable = getattr(sys, "_base_executable", None)
+    if base_executable:
+        evidence["AI_SESSION_SEARCH_PYTHON_BASE_EXECUTABLE"] = base_executable
     invoked_path = Path(sys.argv[0])
-    if invoked_path.name in EXECUTABLE_NAMES:
+    if invoked_path.stem in EXECUTABLE_NAMES:
         try:
             evidence["AI_SESSION_SEARCH_INVOKED_EXECUTABLE"] = str(invoked_path.resolve(strict=True))
         except OSError:
