@@ -1359,6 +1359,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn receipt_round_trips_non_utf8_destination_path() {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
 
         let dir = tempdir().unwrap();
