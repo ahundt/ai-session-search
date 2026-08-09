@@ -149,6 +149,7 @@ impl CodexAdapter {
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
+        let mut valid_record_count: usize = 0;
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
@@ -177,12 +178,11 @@ impl CodexAdapter {
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => {
-                    if !line.contains(char::REPLACEMENT_CHARACTER) {
-                        malformed_line_count += 1;
-                    }
+                    malformed_line_count += 1;
                     continue;
                 }
             };
+            valid_record_count += 1;
             let timestamp = value
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -396,6 +396,7 @@ impl CodexAdapter {
             .unwrap_or_else(|| "(no preview available)".to_string());
         let mut raw_metadata = json!({
             "line_count": line_count,
+            "valid_record_count": valid_record_count,
             "rollout_path": meta.rollout_path,
             "session_path": normalize_path(path),
         });
@@ -1487,7 +1488,7 @@ mod tests {
     /// This input is not valid JSON even after lossy decoding, so it yields no messages, but
     /// parsing completes WITHOUT error (lossy recovery is not treated as a parse failure).
     #[test]
-    fn non_utf8_garbage_parses_gracefully_without_error() {
+    fn non_utf8_garbage_is_diagnosed_without_aborting_the_parse() {
         let temp = tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let session_id = "019efd97-d602-7922-89dd-467272106505";
@@ -1497,9 +1498,9 @@ mod tests {
         let adapter = CodexAdapter::new(vec![root]);
         let parsed = adapter.parse(&adapter.discover()[0]);
         assert!(parsed.messages.is_empty());
-        assert!(
-            parsed.session.parse_warning.is_none(),
-            "lossy recovery is not an error, so no parse warning is set"
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
         );
         assert_eq!(parsed.session.message_count, Some(0));
     }

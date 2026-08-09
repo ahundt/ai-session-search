@@ -109,22 +109,35 @@ pub fn complete_prefix_offset(path: &Path) -> Result<i64> {
 }
 
 fn complete_prefix_offset_inner(file: &mut File, size: u64) -> Result<i64> {
+    complete_prefix_offset_inner_until(file, size, &|| false)?.ok_or_else(|| {
+        anyhow::anyhow!("complete-prefix scan cancelled with a non-cancelling token")
+    })
+}
+
+fn complete_prefix_offset_inner_until(
+    file: &mut File,
+    size: u64,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Option<i64>> {
     if size == 0 {
-        return Ok(0);
+        return Ok(Some(0));
     }
     let mut pos = size;
     let mut buf = [0u8; 8192];
     while pos > 0 {
+        if should_cancel() {
+            return Ok(None);
+        }
         let chunk = pos.min(buf.len() as u64);
         pos -= chunk;
         file.seek(SeekFrom::Start(pos))?;
         let slice = &mut buf[..chunk as usize];
         file.read_exact(slice)?;
         if let Some(rel) = slice.iter().rposition(|&b| b == b'\n') {
-            return Ok((pos + rel as u64 + 1) as i64);
+            return Ok(Some((pos + rel as u64 + 1) as i64));
         }
     }
-    Ok(0)
+    Ok(Some(0))
 }
 
 /// New rows discovered by an incremental tail parse (to be appended by `Db::append_tail`).
@@ -145,6 +158,11 @@ pub struct TailParse {
     pub new_fingerprint: String,
 }
 
+pub(crate) enum TailParseRun {
+    Complete(Option<Box<TailParse>>),
+    Cancelled,
+}
+
 /// Parse ONLY the bytes appended to `path` after `checkpoint_offset`, using `parse_slice` (the
 /// provider's real parser run over an in-memory `Cursor`).
 ///
@@ -159,13 +177,34 @@ pub fn tail_parse<F>(
 where
     F: Fn(Cursor<Vec<u8>>, &Path) -> Result<ParsedSession>,
 {
+    match tail_parse_until(path, checkpoint_offset, &|| false, parse_slice)? {
+        TailParseRun::Complete(parsed) => Ok(parsed.map(|parsed| *parsed)),
+        TailParseRun::Cancelled => unreachable!("the default tail-parse token never cancels"),
+    }
+}
+
+pub(crate) fn tail_parse_until<F>(
+    path: &Path,
+    checkpoint_offset: i64,
+    should_cancel: &dyn Fn() -> bool,
+    parse_slice: F,
+) -> Result<TailParseRun>
+where
+    F: Fn(Cursor<Vec<u8>>, &Path) -> Result<ParsedSession>,
+{
+    if should_cancel() {
+        return Ok(TailParseRun::Cancelled);
+    }
     let mut file = File::open(path)?;
     let size = file.seek(SeekFrom::End(0))?;
-    let new_offset = complete_prefix_offset_inner(&mut file, size)?;
+    let Some(new_offset) = complete_prefix_offset_inner_until(&mut file, size, should_cancel)?
+    else {
+        return Ok(TailParseRun::Cancelled);
+    };
     let new_fingerprint = prefix_fingerprint(path)?;
     // No new complete line since the checkpoint → nothing to append yet.
     if new_offset <= checkpoint_offset {
-        return Ok(None);
+        return Ok(TailParseRun::Complete(None));
     }
 
     // Re-read a bounded overlap before the checkpoint so the tool-id→name map (and any other
@@ -179,9 +218,23 @@ where
 
     file.seek(SeekFrom::Start(overlap_start as u64))?;
     let mut buf = vec![0u8; all_len];
-    file.read_exact(&mut buf)?;
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        if should_cancel() {
+            return Ok(TailParseRun::Cancelled);
+        }
+        let end = (filled + 32 * 1024).min(buf.len());
+        file.read_exact(&mut buf[filled..end])?;
+        filled = end;
+    }
 
+    if should_cancel() {
+        return Ok(TailParseRun::Cancelled);
+    }
     let parsed_all = parse_slice(Cursor::new(buf.clone()), path)?;
+    if should_cancel() {
+        return Ok(TailParseRun::Cancelled);
+    }
     let parsed_overlap = parse_slice(Cursor::new(buf[..prefix_len].to_vec()), path)?;
 
     let m0 = parsed_overlap.messages.len();
@@ -199,14 +252,14 @@ where
         .trim_start_matches('\n')
         .to_string();
 
-    Ok(Some(TailParse {
+    Ok(TailParseRun::Complete(Some(Box::new(TailParse {
         new_messages,
         new_file_edits,
         session: parsed_all.session,
         new_transcript,
         new_tail_offset: new_offset,
         new_fingerprint,
-    }))
+    }))))
 }
 
 #[cfg(test)]
@@ -236,6 +289,33 @@ mod tests {
         // Empty file.
         write(&p, b"");
         assert_eq!(complete_prefix_offset(&p).unwrap(), 0);
+    }
+
+    #[test]
+    fn tail_read_stops_between_chunks_when_cancelled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let prefix = b"prefix\n";
+        let mut bytes = prefix.to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 256 * 1024));
+        bytes.push(b'\n');
+        write(&path, &bytes);
+        let checks = std::cell::Cell::new(0usize);
+
+        let run = tail_parse_until(
+            &path,
+            prefix.len() as i64,
+            &|| {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 4
+            },
+            |_, _| unreachable!("the parser must not receive a cancelled tail"),
+        )
+        .unwrap();
+
+        assert!(matches!(run, TailParseRun::Cancelled));
+        assert!(checks.get() >= 4);
     }
 
     #[test]

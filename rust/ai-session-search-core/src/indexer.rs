@@ -740,6 +740,11 @@ pub(crate) fn reindex_until(
         .iter()
         .map(|source| (source.provider, normalize_path(&source.path)))
         .collect::<HashSet<_>>();
+    let indexed_source_paths = db
+        .indexed_source_identities()?
+        .into_iter()
+        .map(|(provider, source_path, _, _)| (provider, source_path))
+        .collect::<HashSet<_>>();
     if should_cancel() {
         return Ok(ReindexRun::Cancelled {
             files_seen: 0,
@@ -794,7 +799,6 @@ pub(crate) fn reindex_until(
         {
             continue;
         }
-        let parser_version_matches = refresh_state == SourceFileRefreshState::ChangedSameParser;
         // Incremental tail-parse fast path: when we hold a checkpoint for this file, it only
         // grew (offset within it → not truncated), and its head bytes are unchanged (not
         // rewritten/rotated), parse + append ONLY the appended bytes instead of re-reading the
@@ -802,29 +806,46 @@ pub(crate) fn reindex_until(
         // over the appended slice; on any doubt it returns `FullParse` and we re-read below.
         if !full && !requires_reconciliation && !current_without_session {
             let outcome = match source.provider {
-                Provider::Claude | Provider::ClaudeDesktop => {
-                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
-                        adapters.claude.parse_reader(r, p)
-                    })?
-                }
-                Provider::Codex => {
-                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
-                        adapters.codex.parse_reader(r, p)
-                    })?
-                }
-                Provider::Cursor => {
-                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
-                        adapters.cursor.parse_reader(r, p)
-                    })?
-                }
-                Provider::Antigravity => {
-                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
-                        adapters.antigravity.parse_reader(r, p)
-                    })?
-                }
-                Provider::Pi => try_tail(source, &source_path, expected_session_id, db, |r, p| {
-                    adapters.pi.parse_reader(r, p)
-                })?,
+                Provider::Claude | Provider::ClaudeDesktop => try_tail(
+                    source,
+                    &source_path,
+                    expected_session_id,
+                    db,
+                    should_cancel,
+                    |r, p| adapters.claude.parse_reader(r, p),
+                )?,
+                Provider::Codex => try_tail(
+                    source,
+                    &source_path,
+                    expected_session_id,
+                    db,
+                    should_cancel,
+                    |r, p| adapters.codex.parse_reader(r, p),
+                )?,
+                Provider::Cursor => try_tail(
+                    source,
+                    &source_path,
+                    expected_session_id,
+                    db,
+                    should_cancel,
+                    |r, p| adapters.cursor.parse_reader(r, p),
+                )?,
+                Provider::Antigravity => try_tail(
+                    source,
+                    &source_path,
+                    expected_session_id,
+                    db,
+                    should_cancel,
+                    |r, p| adapters.antigravity.parse_reader(r, p),
+                )?,
+                Provider::Pi => try_tail(
+                    source,
+                    &source_path,
+                    expected_session_id,
+                    db,
+                    should_cancel,
+                    |r, p| adapters.pi.parse_reader(r, p),
+                )?,
                 Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
             };
             match outcome {
@@ -837,11 +858,39 @@ pub(crate) fn reindex_until(
                 }
                 TailOutcome::NothingNew => continue,
                 TailOutcome::FullParse => {}
+                TailOutcome::Cancelled => {
+                    return Ok(ReindexRun::Cancelled {
+                        files_seen: i,
+                        sessions_updated: updated,
+                        discovery_warnings,
+                    })
+                }
             }
         }
         // Shared with diagnostics::explain_unindexed so a diagnosis parses a file exactly as
         // indexing does; two copies of this dispatch could disagree.
-        let mut parsed = adapters.parse(source);
+        let mut parsed = match adapters.parse_until(source, should_cancel) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => {
+                return Ok(ReindexRun::Cancelled {
+                    files_seen: i,
+                    sessions_updated: updated,
+                    discovery_warnings,
+                })
+            }
+            Err(_)
+                if indexed_source_paths.contains(&(source.provider, source_path.clone()))
+                    || reconciliation.is_some() =>
+            {
+                // A failed refresh is not a new archive state. Keep the last successful rows and
+                // their old files_seen metadata so the next refresh retries this source. A source
+                // reconciliation also proves an existing row through a canonical-path alias.
+                continue;
+            }
+            Err(error) => {
+                crate::util::minimal_record(source.provider, &source.path, format!("{error:#}"))
+            }
+        };
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
         crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
@@ -865,7 +914,7 @@ pub(crate) fn reindex_until(
             source.mtime_ns,
             source.size_bytes,
             aliases,
-            !full && parser_version_matches,
+            false,
         )
         .with_context(|| {
             format!(
@@ -876,18 +925,7 @@ pub(crate) fn reindex_until(
         })?;
         // Record/refresh the tail checkpoint so the next reindex of this grown file can append
         // incrementally from the end of what we just parsed (instead of re-reading it all).
-        let complete_offset = crate::tail::complete_prefix_offset(&source.path)?;
-        // Provider parsers accept a valid final JSONL record without a trailing newline. Such a
-        // record is already present in `parsed`, but `complete_offset` points to its beginning.
-        // Do not let a later append treat that record as new and duplicate it. A zero checkpoint
-        // deliberately makes `try_tail` take the full-parse fallback once; after the record is
-        // terminated, the replacement parse stores a normal append-safe checkpoint.
-        let offset = if complete_offset == source.size_bytes {
-            complete_offset
-        } else {
-            0
-        };
-        let fingerprint = crate::tail::prefix_fingerprint(&source.path)?;
+        let (offset, fingerprint) = full_parse_checkpoint(source)?;
         db.set_file_checkpoint(source.provider, &source_path, offset, &fingerprint)?;
         updated += 1;
         if let Some(cb) = progress.as_deref_mut() {
@@ -920,6 +958,27 @@ pub(crate) fn reindex_until(
         sessions_updated: updated,
         discovery_warnings,
     })
+}
+
+/// Capture a tail checkpoint only when the path still has the exact size discovery supplied to
+/// the parser. A later reopen may observe a concurrent append, but those bytes were not proven to
+/// have crossed the parser's EOF and therefore must force one conservative full parse.
+fn full_parse_checkpoint(source: &SourceFile) -> Result<(i64, String)> {
+    let current_size = std::fs::metadata(&source.path)?.len() as i64;
+    let complete_offset = if current_size == source.size_bytes {
+        crate::tail::complete_prefix_offset(&source.path)?
+    } else {
+        0
+    };
+    // Provider parsers accept a valid final JSONL record without a trailing newline. Such a
+    // record is already present in the parsed session, but complete_prefix_offset points to its
+    // beginning. Store zero so the next change takes a full-parse fallback and cannot duplicate it.
+    let offset = if current_size == source.size_bytes && complete_offset == source.size_bytes {
+        complete_offset
+    } else {
+        0
+    };
+    Ok((offset, crate::tail::prefix_fingerprint(&source.path)?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1046,6 +1105,7 @@ enum TailOutcome {
     /// The fast path is not safe (no checkpoint, truncation, or a rewritten head); the caller
     /// must perform a full parse.
     FullParse,
+    Cancelled,
 }
 
 /// Try to incrementally append only the bytes appended to a session file since its last
@@ -1058,6 +1118,7 @@ fn try_tail<F>(
     source_path: &str,
     expected_session_id: Option<&str>,
     db: &Db,
+    should_cancel: &dyn Fn() -> bool,
     parse_slice: F,
 ) -> Result<TailOutcome>
 where
@@ -1075,15 +1136,15 @@ where
         return Ok(TailOutcome::FullParse);
     }
     // Truncation / copytruncate: the file is now shorter than where we parsed to → re-read whole.
-    if offset <= 0 || source.size_bytes < offset {
+    if offset <= 0 || source.size_bytes <= offset {
         return Ok(TailOutcome::FullParse);
     }
     // Rewrite / rotation: the head bytes changed → the stored offset is meaningless → re-read.
     if !crate::tail::fingerprint_matches(&source.path, &stored_fingerprint)? {
         return Ok(TailOutcome::FullParse);
     }
-    match crate::tail::tail_parse(&source.path, offset, parse_slice) {
-        Ok(Some(mut tail)) => {
+    match crate::tail::tail_parse_until(&source.path, offset, should_cancel, parse_slice) {
+        Ok(crate::tail::TailParseRun::Complete(Some(mut tail))) => {
             // Some providers declare their immutable session ID only near the file head, outside
             // the bounded tail overlap. Never insert child rows under a fallback ID: re-read the
             // complete source so parent replacement and child publication stay one transaction.
@@ -1100,7 +1161,8 @@ where
             db.append_tail(&tail, source.mtime_ns, source.size_bytes)?;
             Ok(TailOutcome::Appended)
         }
-        Ok(None) => Ok(TailOutcome::NothingNew),
+        Ok(crate::tail::TailParseRun::Complete(None)) => Ok(TailOutcome::NothingNew),
+        Ok(crate::tail::TailParseRun::Cancelled) => Ok(TailOutcome::Cancelled),
         // The tail fast path is a pure optimization, so ANY failure parsing the appended slice
         // degrades to a full re-read rather than aborting the reindex (this module's "on any doubt
         // → FullParse" contract). The error is usually a `parse_slice` UTF-8 failure: a tool-output
@@ -1115,6 +1177,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_parse_checkpoint_never_advances_past_the_discovered_snapshot() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, b"first\n").unwrap();
+        let source = SourceFile {
+            provider: Provider::Claude,
+            path: path.clone(),
+            mtime_ns: 0,
+            size_bytes: std::fs::metadata(&path).unwrap().len() as i64,
+        };
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"concurrent append\n")
+            .unwrap();
+
+        let (offset, _) = full_parse_checkpoint(&source).unwrap();
+        assert_eq!(
+            offset, 0,
+            "a later reopen must not checkpoint concurrently appended bytes the parser may not have read"
+        );
+    }
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1703,6 +1792,7 @@ mod tests {
             &source_path,
             Some("claude:migrated-id"),
             &db,
+            &|| false,
             |reader, path| adapters.claude.parse_reader(reader, path),
         )
         .unwrap();
@@ -2059,12 +2149,8 @@ mod tests {
         }
         let config = config_with_single_claude_fixture(&db_path, &claude_root);
         let db = Db::open(&db_path).unwrap();
-        let checks = std::cell::Cell::new(0usize);
-
         let run = reindex_until(&config, &db, false, None, &|| {
-            let current = checks.get();
-            checks.set(current + 1);
-            current >= 4
+            db.message_count().unwrap() >= 1
         })
         .unwrap();
 
@@ -2076,6 +2162,43 @@ mod tests {
                 discovery_warnings: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn cancellable_reindex_stops_during_one_large_provider_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::write(
+            claude_root.join("large.jsonl"),
+            format!(
+                "{{\"sessionId\":\"large\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":{}}}}}\n",
+                serde_json::to_string(&"x".repeat(256 * 1024)).unwrap()
+            ),
+        )
+        .unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        let checks = std::cell::Cell::new(0usize);
+
+        let run = reindex_until(&config, &db, false, None, &|| {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 8
+        })
+        .unwrap();
+
+        assert_eq!(
+            run,
+            ReindexRun::Cancelled {
+                files_seen: 0,
+                sessions_updated: 0,
+                discovery_warnings: Vec::new(),
+            }
+        );
+        assert_eq!(db.message_count().unwrap(), 0);
+        assert!(checks.get() >= 8);
     }
 
     #[test]
@@ -2220,6 +2343,7 @@ mod tests {
             &source_path,
             Some("claude:s1"),
             &db,
+            &|| false,
             |reader, path| adapters.claude.parse_reader(reader, path),
         )
         .unwrap();

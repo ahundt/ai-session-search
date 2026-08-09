@@ -74,6 +74,10 @@ impl GeminiCliAdapter {
     fn parse_path(&self, path: &Path) -> Result<ParsedSession> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read Gemini CLI session {}", path.display()))?;
+        self.parse_raw(path, raw)
+    }
+
+    pub(crate) fn parse_raw(&self, path: &Path, raw: String) -> Result<ParsedSession> {
         let data: Value = serde_json::from_str(&raw).context("invalid Gemini CLI JSON")?;
         let strip_references = referenced_file_block_regex()?;
         let mut messages = Vec::new();

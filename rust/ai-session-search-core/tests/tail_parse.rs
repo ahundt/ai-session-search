@@ -576,6 +576,121 @@ fn rewritten_head_falls_back_to_full_parse() {
     );
 }
 
+fn claude_message_line(content: &str) -> String {
+    format!(
+        "{{\"type\":\"user\",\"sessionId\":\"integrity-sess\",\"timestamp\":\"2026-06-01T10:00:00Z\",\"cwd\":\"/p\",\"message\":{{\"role\":\"user\",\"content\":{}}}}}\n",
+        serde_json::to_string(content).unwrap()
+    )
+}
+
+fn message_contents(db: &Db) -> Vec<String> {
+    db.read_session_messages(
+        &MessageFilters {
+            session_id: Some("claude:integrity-sess".to_string()),
+            ..MessageFilters::default()
+        },
+        ai_session_search::db::MessageOrder::OldestFirst,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|message| message.content)
+    .collect()
+}
+
+#[test]
+fn total_reparse_failure_preserves_the_last_successful_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj")).unwrap();
+    let file = projects.join("proj/integrity-sess.jsonl");
+    std::fs::write(&file, claude_message_line("archived before failure")).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(message_contents(&db), ["archived before failure"]);
+
+    std::fs::write(&file, "{this is a partial JSON write\n").unwrap();
+    let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(updated, 0, "a failed parse must not publish a replacement");
+    assert_eq!(
+        message_contents(&db),
+        ["archived before failure"],
+        "the last successful archive must remain searchable"
+    );
+
+    std::fs::write(&file, claude_message_line("recovered after failure")).unwrap();
+    let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(updated, 1, "the stale checkpoint must retry after recovery");
+    assert_eq!(message_contents(&db), ["recovered after failure"]);
+}
+
+#[test]
+fn same_size_body_rewrite_past_the_head_fingerprint_is_reparsed() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj")).unwrap();
+    let file = projects.join("proj/integrity-sess.jsonl");
+    let stable_head = claude_message_line(&"x".repeat(5_000));
+    let original = format!("{stable_head}{}", claude_message_line("body-aaaa"));
+    let rewritten = format!("{stable_head}{}", claude_message_line("body-bbbb"));
+    assert_eq!(original.len(), rewritten.len());
+    std::fs::write(&file, &original).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    std::fs::write(&file, &rewritten).unwrap();
+    let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
+
+    assert_eq!(updated, 1);
+    let contents = message_contents(&db);
+    assert!(contents.iter().any(|content| content == "body-bbbb"));
+    assert!(!contents.iter().any(|content| content == "body-aaaa"));
+}
+
+#[test]
+fn full_parse_replaces_a_changed_prefix_even_when_its_boundary_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj")).unwrap();
+    let file = projects.join("proj/integrity-sess.jsonl");
+    let initial = ["opening-old", "middle-stable", "boundary-stable"]
+        .into_iter()
+        .map(claude_message_line)
+        .collect::<String>();
+    std::fs::write(&file, initial).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+
+    let rewritten = [
+        "opening-new",
+        "middle-stable",
+        "boundary-stable",
+        "appended-message",
+    ]
+    .into_iter()
+    .map(claude_message_line)
+    .collect::<String>();
+    std::fs::write(&file, rewritten).unwrap();
+    let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
+
+    assert_eq!(updated, 1);
+    assert_eq!(
+        message_contents(&db),
+        [
+            "opening-new",
+            "middle-stable",
+            "boundary-stable",
+            "appended-message",
+        ]
+    );
+}
+
 #[test]
 fn claude_desktop_sidecar_change_refreshes_without_audit_append() {
     let dir = tempfile::tempdir().unwrap();

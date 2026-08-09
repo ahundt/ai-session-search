@@ -155,6 +155,7 @@ impl ClaudeAdapter {
         };
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
+        let mut valid_record_count: usize = 0;
         let mut provider_session_id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -208,12 +209,11 @@ impl ClaudeAdapter {
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => {
-                    if !line.contains(char::REPLACEMENT_CHARACTER) {
-                        malformed_line_count += 1;
-                    }
+                    malformed_line_count += 1;
                     continue;
                 }
             };
+            valid_record_count += 1;
             if !session_id_bound {
                 // `session_id` keeps precedence over `sessionId` within one record, as before.
                 if let Some(session_id) = value
@@ -469,6 +469,7 @@ impl ClaudeAdapter {
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let mut raw_metadata = json!({
             "line_count": line_count,
+            "valid_record_count": valid_record_count,
             "session_path": normalize_path(path),
         });
         if malformed_line_count > 0 {

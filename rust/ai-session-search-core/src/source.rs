@@ -4,8 +4,10 @@
 //! Canonical provider discovery and public source inventory.
 
 use std::collections::HashSet;
+use std::io::{BufReader, Read};
 use std::sync::OnceLock;
 
+use anyhow::{bail, Result};
 use serde::Serialize;
 
 use crate::config::Config;
@@ -128,16 +130,52 @@ impl ProviderSet {
     /// diagnosis of why a file produced no session parses it exactly as indexing would. A
     /// second copy of this match would let the two disagree, which is precisely the failure a
     /// reconciliation diagnostic exists to rule out.
-    pub(crate) fn parse(&self, source: &SourceFile) -> crate::models::ParsedSession {
-        match source.provider {
-            Provider::Claude | Provider::ClaudeDesktop => self.claude.parse(source),
-            Provider::Codex => self.codex.parse(source),
-            Provider::Cursor => self.cursor.parse(source),
-            Provider::Antigravity => self.antigravity.parse(source),
-            Provider::Pi => self.pi.parse(source),
-            Provider::AiStudio => self.aistudio.parse(source),
-            Provider::GeminiCli => self.gemini_cli.parse(source),
+    pub(crate) fn parse(&self, source: &SourceFile) -> Result<crate::models::ParsedSession> {
+        self.parse_until(source, &|| false)?
+            .ok_or_else(|| anyhow::anyhow!("provider parse cancelled with a non-cancelling token"))
+    }
+
+    pub(crate) fn parse_until(
+        &self,
+        source: &SourceFile,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<crate::models::ParsedSession>> {
+        if should_cancel() {
+            return Ok(None);
         }
+        let parsed = match source.provider {
+            Provider::Claude | Provider::ClaudeDesktop => {
+                parse_jsonl_until(source, should_cancel, |reader| {
+                    self.claude.parse_reader(reader, &source.path)
+                })
+            }
+            Provider::Codex => parse_jsonl_until(source, should_cancel, |reader| {
+                self.codex.parse_reader(reader, &source.path)
+            }),
+            Provider::Cursor => parse_jsonl_until(source, should_cancel, |reader| {
+                self.cursor.parse_reader(reader, &source.path)
+            }),
+            Provider::Antigravity => parse_jsonl_until(source, should_cancel, |reader| {
+                self.antigravity.parse_reader(reader, &source.path)
+            }),
+            Provider::Pi => parse_jsonl_until(source, should_cancel, |reader| {
+                self.pi.parse_reader(reader, &source.path)
+            }),
+            Provider::AiStudio => read_snapshot_until(source, should_cancel, |raw| {
+                self.aistudio.parse_raw(&source.path, raw)
+            }),
+            Provider::GeminiCli => read_snapshot_until(source, should_cancel, |raw| {
+                self.gemini_cli.parse_raw(&source.path, raw)
+            }),
+        };
+        if should_cancel() {
+            return Ok(None);
+        }
+        let parsed = parsed?;
+        if let Some(reason) = total_parse_failure_reason(&parsed) {
+            bail!("{reason}");
+        }
+        Ok(Some(parsed))
     }
 
     pub(crate) fn discover_enabled(&self, config: &Config) -> DiscoveryResult {
@@ -178,6 +216,78 @@ impl ProviderSet {
         deduplicate_warnings(&mut discovered.warnings);
         discovered
     }
+}
+
+struct CancellationReader<'a, R> {
+    inner: R,
+    should_cancel: &'a dyn Fn() -> bool,
+}
+
+impl<R: Read> Read for CancellationReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if (self.should_cancel)() {
+            return Err(std::io::Error::other("session parse cancelled"));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+fn parse_jsonl_until(
+    source: &SourceFile,
+    should_cancel: &dyn Fn() -> bool,
+    parse: impl FnOnce(
+        BufReader<CancellationReader<'_, std::fs::File>>,
+    ) -> Result<crate::models::ParsedSession>,
+) -> Result<crate::models::ParsedSession> {
+    let file = std::fs::File::open(&source.path)?;
+    parse(BufReader::new(CancellationReader {
+        inner: file,
+        should_cancel,
+    }))
+}
+
+fn read_snapshot_until(
+    source: &SourceFile,
+    should_cancel: &dyn Fn() -> bool,
+    parse: impl FnOnce(String) -> Result<crate::models::ParsedSession>,
+) -> Result<crate::models::ParsedSession> {
+    let file = std::fs::File::open(&source.path)?;
+    let mut reader = CancellationReader {
+        inner: file,
+        should_cancel,
+    };
+    let mut raw = String::new();
+    reader.read_to_string(&mut raw)?;
+    parse(raw)
+}
+
+fn total_parse_failure_reason(parsed: &crate::models::ParsedSession) -> Option<String> {
+    if parsed.session.preview_text == "(parse failed)" {
+        return Some(
+            parsed
+                .session
+                .parse_warning
+                .clone()
+                .unwrap_or_else(|| "provider parser failed without a reason".to_string()),
+        );
+    }
+    let metadata = parsed.session.raw_metadata_json.as_deref()?;
+    let metadata: serde_json::Value = serde_json::from_str(metadata).ok()?;
+    let malformed = metadata
+        .get("malformed_line_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let valid_records = metadata
+        .get("valid_record_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    (malformed > 0 && valid_records == 0).then(|| {
+        parsed
+            .session
+            .parse_warning
+            .clone()
+            .unwrap_or_else(|| "session contained no parseable JSONL records".to_string())
+    })
 }
 
 impl DiscoveryResult {
@@ -317,6 +427,87 @@ fn canonical_unique_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_parse_stops_inside_a_large_source_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.jsonl");
+        let content = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"cancel\",\"message\":{{\"role\":\"user\",\"content\":{}}}}}\n",
+            serde_json::to_string(&"x".repeat(128 * 1024)).unwrap()
+        );
+        std::fs::write(&path, content).unwrap();
+        let source = SourceFile {
+            provider: Provider::Claude,
+            path: path.clone(),
+            mtime_ns: 0,
+            size_bytes: std::fs::metadata(&path).unwrap().len() as i64,
+        };
+        let config = Config::default();
+        let providers = ProviderSet::new(&config);
+        let checks = std::cell::Cell::new(0usize);
+
+        let parsed = providers
+            .parse_until(&source, &|| {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 4
+            })
+            .unwrap();
+
+        assert!(
+            parsed.is_none(),
+            "cancellation must not publish a partial parse"
+        );
+        assert!(checks.get() >= 4, "the token was checked during file reads");
+    }
+
+    #[test]
+    fn snapshot_parse_stops_inside_a_large_source_read_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.md");
+        std::fs::write(&path, "x".repeat(128 * 1024)).unwrap();
+        let source = SourceFile {
+            provider: Provider::AiStudio,
+            path: path.clone(),
+            mtime_ns: 0,
+            size_bytes: std::fs::metadata(&path).unwrap().len() as i64,
+        };
+        let providers = ProviderSet::new(&Config::default());
+        let checks = std::cell::Cell::new(0usize);
+
+        let parsed = providers
+            .parse_until(&source, &|| {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 4
+            })
+            .unwrap();
+
+        assert!(parsed.is_none());
+        assert!(checks.get() >= 4);
+    }
+
+    #[test]
+    fn valid_metadata_record_is_not_a_total_failure_when_another_line_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-only.jsonl");
+        std::fs::write(&path, "{\"type\":\"metadata\"}\n{partial\n").unwrap();
+        let source = SourceFile {
+            provider: Provider::Claude,
+            path: path.clone(),
+            mtime_ns: 0,
+            size_bytes: std::fs::metadata(&path).unwrap().len() as i64,
+        };
+
+        let parsed = ProviderSet::new(&Config::default()).parse(&source).unwrap();
+
+        assert!(parsed.messages.is_empty());
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
+        );
+    }
 
     fn disable_all(config: &mut Config) {
         config.providers.claude.enabled = false;

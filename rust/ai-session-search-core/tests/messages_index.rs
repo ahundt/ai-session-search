@@ -232,7 +232,7 @@ fn malformed_session_handled_gracefully_without_panicking() {
     std::fs::create_dir_all(projects.join("proj1")).unwrap();
     std::fs::write(projects.join("proj1/test-sess-1.jsonl"), CLAUDE_FIXTURE).unwrap();
     // Non-UTF-8 bytes decode to U+FFFD; this 5-byte file is not valid JSON even then, so it
-    // contributes 0 messages — handled like any non-JSON content (no crash, no spurious warning).
+    // contributes 0 messages and a diagnostic warning without crashing the reindex.
     std::fs::write(
         projects.join("proj1/corrupt.jsonl"),
         [0xff, 0xfe, 0x00, 0x80, 0x9f],
@@ -255,8 +255,8 @@ fn malformed_session_handled_gracefully_without_panicking() {
     );
     assert_eq!(
         db.count_parse_warnings().unwrap(),
-        0,
-        "malformed-but-recoverable content yields 0 messages, not a parse error/warning"
+        1,
+        "a wholly malformed new source is retained only as a diagnostic warning row"
     );
 }
 

@@ -102,6 +102,7 @@ impl AntigravityAdapter {
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
+        let mut valid_record_count: usize = 0;
 
         // Extract session ID from path. The path structure is:
         // .../brain/<conversation-id>/.system_generated/logs/transcript.jsonl
@@ -134,12 +135,11 @@ impl AntigravityAdapter {
             let value: Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(_) => {
-                    if !line.contains(char::REPLACEMENT_CHARACTER) {
-                        malformed_line_count += 1;
-                    }
+                    malformed_line_count += 1;
                     continue;
                 }
             };
+            valid_record_count += 1;
 
             let timestamp = value
                 .get("created_at")
@@ -239,6 +239,7 @@ impl AntigravityAdapter {
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let mut raw_metadata = json!({
             "line_count": line_count,
+            "valid_record_count": valid_record_count,
             "session_path": normalize_path(path),
         });
         if malformed_line_count > 0 {
@@ -743,7 +744,7 @@ mod tests {
     /// This input is not valid JSON even after lossy decoding, so it yields no messages, but
     /// parsing completes WITHOUT error (lossy recovery is not treated as a parse failure).
     #[test]
-    fn non_utf8_garbage_parses_gracefully_without_error() {
+    fn non_utf8_garbage_is_diagnosed_without_aborting_the_parse() {
         let dir = tempdir().unwrap();
         let session_dir = dir
             .path()
@@ -755,9 +756,9 @@ mod tests {
         let adapter = AntigravityAdapter::new(vec![dir.path().to_path_buf()]);
         let parsed = adapter.parse(&adapter.discover()[0]);
         assert!(parsed.messages.is_empty());
-        assert!(
-            parsed.session.parse_warning.is_none(),
-            "lossy recovery is not an error, so no parse warning is set"
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
         );
         assert_eq!(parsed.session.message_count, Some(0));
     }

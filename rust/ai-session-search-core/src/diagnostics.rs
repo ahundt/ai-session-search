@@ -163,7 +163,9 @@ pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>>
         if indexed.contains(&key) {
             continue;
         }
-        let parsed = providers.parse(&source);
+        let parsed = providers.parse(&source).unwrap_or_else(|error| {
+            crate::util::minimal_record(source.provider, &source.path, format!("{error:#}"))
+        });
         let resolves_to = parsed.session.provider_session_id.clone();
         let holder = holders
             .get(&(

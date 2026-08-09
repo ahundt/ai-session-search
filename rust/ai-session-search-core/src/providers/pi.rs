@@ -100,6 +100,7 @@ impl PiAdapter {
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
+        let mut valid_record_count: usize = 0;
         // Pi gives a spawned run a session id from the same space as a top-level one, so the
         // `session` record below binds it either way and no parent qualification is needed —
         // unlike claude, whose subagent records carry only the PARENT's id. The origin is used
@@ -130,12 +131,11 @@ impl PiAdapter {
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => {
-                    if !line.contains(char::REPLACEMENT_CHARACTER) {
-                        malformed_line_count += 1;
-                    }
+                    malformed_line_count += 1;
                     continue;
                 }
             };
+            valid_record_count += 1;
 
             let timestamp = value
                 .get("timestamp")
@@ -273,6 +273,7 @@ impl PiAdapter {
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let mut raw_metadata = json!({
             "line_count": line_count,
+            "valid_record_count": valid_record_count,
             "session_path": normalize_path(path),
         });
         if malformed_line_count > 0 {
@@ -954,7 +955,7 @@ mod tests {
     /// This input is not valid JSON even after lossy decoding, so it yields no messages, but
     /// parsing completes WITHOUT error (lossy recovery is not treated as a parse failure).
     #[test]
-    fn non_utf8_garbage_parses_gracefully_without_error() {
+    fn non_utf8_garbage_is_diagnosed_without_aborting_the_parse() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("--Users-x-src-demo--");
         fs::create_dir_all(&root).unwrap();
@@ -967,9 +968,9 @@ mod tests {
         assert_eq!(sources.len(), 1);
         let parsed = adapter.parse(&sources[0]);
         assert!(parsed.messages.is_empty());
-        assert!(
-            parsed.session.parse_warning.is_none(),
-            "lossy recovery is not an error, so no parse warning is set"
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some("skipped 1 malformed JSONL record")
         );
         assert_eq!(parsed.session.message_count, Some(0));
     }

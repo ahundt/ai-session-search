@@ -56,6 +56,10 @@ impl AiStudioAdapter {
     fn parse_path(&self, path: &Path) -> Result<ParsedSession> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read AI Studio session {}", path.display()))?;
+        self.parse_raw(path, raw)
+    }
+
+    pub(crate) fn parse_raw(&self, path: &Path, raw: String) -> Result<ParsedSession> {
         let mut turns: Vec<Turn> = Vec::new();
         let discovery_source = if path
             .extension()
