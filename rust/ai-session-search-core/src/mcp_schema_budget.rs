@@ -1411,7 +1411,7 @@ pub fn declared_limit_names() -> Vec<&'static str> {
 ///
 /// [`evaluate`] alone covers seven of the ten declared rows, because a catalogue cannot observe a
 /// response. The three it skips are not unobservable in general, only unobservable from that one
-/// artifact: [`crate::mcp_server::measure_representative_response`] builds a synthetic corpus and
+/// artifact: `crate::mcp_server::measure_representative_response` builds a synthetic corpus and
 /// runs a real search through the production dispatcher, and that result is exactly what the
 /// response rows are declared against. Passing it here is what makes the shipped checker measure
 /// its own table rather than most of it.

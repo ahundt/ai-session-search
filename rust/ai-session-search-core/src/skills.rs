@@ -1030,7 +1030,7 @@ pub struct SkillScaffoldReceipt {
 ///
 /// Same three phases as [`crate::export::ExportPublicationPlan`] and
 /// [`crate::analysis_publication::AnalysisPublicationPlan`]: preflight refuses an existing
-/// destination, [`crate::durable_fs::StagedDirectory`] stages a sibling, publish renames it into
+/// destination, `crate::durable_fs::StagedDirectory` stages a sibling, publish renames it into
 /// place. Reused rather than reimplemented so a half-written skill directory cannot exist: either
 /// the whole tree appears or nothing does.
 #[derive(Debug)]

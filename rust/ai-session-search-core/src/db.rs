@@ -1519,7 +1519,7 @@ impl Db {
     ///
     /// A database already at v4 owns the released FTS layout, so reparsing can safely promote it
     /// to schema 5. A pre-v4 database stops at parser generation 3; the caller must then run
-    /// [`Self::migrate_message_search_schema_exclusive`], which atomically builds the derived FTS
+    /// `Self::migrate_message_search_schema_exclusive`, which atomically builds the derived FTS
     /// objects and stamps schema 5. This two-stage rule prevents a current stamp over missing
     /// trigram objects.
     pub fn mark_schema_current(&self) -> Result<()> {

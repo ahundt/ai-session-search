@@ -295,7 +295,7 @@ impl MessageKind {
     /// panic; a proven case is `cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages`
     /// against rows storing `kind = 'message'`.
     ///
-    /// What this still fixes is the duplication: delegating to [`FromStr`] removes the second,
+    /// What this still fixes is the duplication: delegating to [`std::str::FromStr`] removes the second,
     /// hand-maintained match list where a newly added variant could silently fall through to
     /// `Unknown` forever. The round-trip test over every variant is what guards that.
     pub fn from_db_str(value: &str) -> Self {
@@ -1120,7 +1120,7 @@ pub struct MessageFilters {
     /// nothing, exactly as it already does on `search`.
     ///
     /// `corrections` is the one operation that narrows this by default -- see
-    /// [`crate::db::Db::find_corrections`], which forces `User` for the same reason it forces
+    /// `crate::db::Db::find_corrections`, which forces `User` for the same reason it forces
     /// `Role::User`.
     pub session_kinds: Option<Vec<SessionKind>>,
     pub limit: usize,
