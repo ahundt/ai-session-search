@@ -1031,11 +1031,6 @@ class _MessageSearchMessageMetadata(TypedDict):
     role: str
     kind: _MessageKind
 
-class _MessageSearchFieldViewExtent(TypedDict):
-    additional_field_text: Literal["none", "before", "after", "before_and_after"]
-    field_total_chars: int | None
-    coordinate_unit: Literal["unicode_scalar"]
-
 class _MessageSearchViewMarker(TypedDict):
     view_start_char: int
     view_end_char_exclusive: int
@@ -1045,7 +1040,8 @@ class _MessageSearchFieldView(TypedDict):
     field_start_char: int
     field_end_char_exclusive: int
     markers: NotRequired[list[_MessageSearchViewMarker]]
-    extent: _MessageSearchFieldViewExtent
+    additional_field_text: Literal["none", "before", "after", "before_and_after"]
+    field_total_chars: int | None
 
 class _MessageSearchPresentation(TypedDict):
     field_view: _MessageSearchFieldView
@@ -1055,7 +1051,6 @@ class _MessageSearchLiteralOccurrence(TypedDict):
     text: str
     field_start_char: int
     field_end_char_exclusive: int
-    coordinate_unit: Literal["unicode_scalar"]
 
 class _MessageSearchMatch(TypedDict):
     field: _SearchField
@@ -1112,6 +1107,7 @@ class MessageSearchResponse:
     """Canonical version-1 response; ``results`` is the ordinary materialized Python list."""
 
     response_schema_version: int
+    coordinate_unit: Literal["unicode_scalar"]
     effective_request: _MessageSearchEffectiveRequest
     results: list[_MessageSearchResult]
     page: _MessageSearchPage
@@ -1146,6 +1142,7 @@ class MessageSearchCompletion:
 class MessageSearchBatches:
     """Advanced context-managed exhaustive batches; prefer ``search_messages`` for a normal list."""
 
+    coordinate_unit: Literal["unicode_scalar"]
     runtime_diagnostics: MessageSearchRuntimeDiagnostics | None
     def __iter__(self) -> Self: ...
     def __next__(self) -> MessageSearchBatch: ...

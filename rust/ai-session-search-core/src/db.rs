@@ -2481,7 +2481,7 @@ impl Db {
                 (_, MessageSearchMode::Fuzzy) => unreachable!("fuzzy query rejected above"),
                 (SearchField::Content, _) => unreachable!("content handled above"),
             }
-            if field == SearchField::ToolArgument && filters.kinds.is_none() {
+            if field == SearchField::ToolArgument {
                 sql.push_str(" and m.kind = 'tool_call'");
             }
             if include_explain {
@@ -2834,7 +2834,7 @@ impl Db {
             }
             _ => false,
         };
-        if field == SearchField::ToolArgument && filters.kinds.is_none() {
+        if field == SearchField::ToolArgument {
             sql.push_str(" and m.kind = 'tool_call'");
         }
         sql.push_str(if order == MessageOrder::NewestFirst {
@@ -3418,10 +3418,7 @@ impl Db {
                 .chain(std::iter::once(content.len()))
                 .enumerate()
             {
-                loop {
-                    let Some(&(start_char, end_char)) = ranges.get(range_index) else {
-                        break;
-                    };
+                while let Some(&(start_char, end_char)) = ranges.get(range_index) {
                     if start_byte.is_none() && char_index == start_char {
                         start_byte = Some(byte_index);
                     }
@@ -6348,6 +6345,7 @@ mod tests {
         insert(8, 7, "compile C++ today");
         insert(9, 8, "flag --path passed");
         insert(10, 9, "CAFÉ diagnostic");
+        insert(11, 10, "İstanbul diagnostic");
 
         let seqs = |query: &str| -> Vec<i64> {
             let mut v: Vec<i64> = db
@@ -6369,8 +6367,14 @@ mod tests {
         assert_eq!(seqs("C++"), vec![7]);
         assert_eq!(seqs("--path"), vec![8]);
         assert_eq!(seqs("café"), vec![9]);
+        assert_eq!(seqs("İS"), vec![10]);
+        assert_eq!(
+            seqs("İST"),
+            vec![10],
+            "the trigram candidate gate must remain a superset of Unicode lowercase matching"
+        );
         // Empty query lists everything (structured filters only).
-        assert_eq!(seqs("").len(), 10);
+        assert_eq!(seqs("").len(), 11);
         // --regex still matches arbitrary patterns over the rows (scan path).
         let re = db
             .search_messages(
@@ -8757,6 +8761,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(nested.len(), 1);
+
+        db.conn
+            .execute(
+                "insert into messages (
+                     session_id, provider, seq, role, kind, content
+                 ) values (
+                     'claude:s1', 'claude', 2, 'user', 'conversation',
+                     '{\"args\":{\"cmd\":\"cargo test\"}}'
+                 )",
+                [],
+            )
+            .unwrap();
+        for (query, match_mode) in [
+            ("", MessageSearchMode::Literal),
+            ("cargo test", MessageSearchMode::Literal),
+            (r"cargo t.st", MessageSearchMode::Regex),
+            ("crgo tst", MessageSearchMode::Fuzzy),
+        ] {
+            let hits = db
+                .search_messages(
+                    query,
+                    &MessageFilters {
+                        kinds: Some(vec![
+                            crate::models::MessageKind::Conversation,
+                            crate::models::MessageKind::ToolCall,
+                        ]),
+                        field: Some(SearchField::ToolArgument),
+                        argument_path: Some("/cmd".to_string()),
+                        match_mode,
+                        limit: 10,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+                vec![0],
+                "tool-argument {match_mode:?} search must intersect an explicit kind union with tool_call"
+            );
+        }
 
         db.conn
             .execute_batch(

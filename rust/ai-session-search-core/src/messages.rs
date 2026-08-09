@@ -1104,6 +1104,9 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         (CliMessageQueryMode::Fuzzy, false) => MessageQuery::fuzzy(query_text)?,
         (mode, true) => bail!("--query-mode {mode:?} requires QUERY or --query <QUERY>"),
     };
+    if args.argument_path.is_some() && args.field != SearchField::ToolArgument {
+        bail!("argument_path requires field='tool_argument'");
+    }
     let target = match args.field {
         SearchField::Content => MessageTarget::content(),
         SearchField::ToolName => MessageTarget::tool_name(),
@@ -1339,9 +1342,22 @@ fn write_message_search_jsonl_batches<W: Write>(
         #[serde(rename = "type")]
         record_type: &'static str,
         response_schema_version: u32,
+        coordinate_unit: crate::message_search::CoordinateUnit,
         effective_request: &'a crate::message_search::ResolvedMessageSearchRequest,
         #[serde(skip_serializing_if = "Option::is_none")]
-        runtime_diagnostics: Option<&'a crate::message_search::MessageSearchRuntimeDiagnostics>,
+        included: Option<SearchMetadataIncluded<'a>>,
+    }
+
+    #[derive(Serialize)]
+    struct SearchMetadataIncluded<'a> {
+        runtime_diagnostics: &'a crate::message_search::MessageSearchRuntimeDiagnostics,
+    }
+
+    #[derive(Serialize)]
+    struct SearchIncludedRecord<'a> {
+        #[serde(rename = "type")]
+        record_type: &'static str,
+        included: &'a crate::message_search::MessageSearchIncludedData,
     }
 
     #[derive(Serialize)]
@@ -1368,14 +1384,29 @@ fn write_message_search_jsonl_batches<W: Write>(
         &SearchMetadata {
             record_type: "search_metadata",
             response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+            coordinate_unit: crate::message_search::CoordinateUnit::UnicodeScalar,
             effective_request: &request,
-            runtime_diagnostics: batches.runtime_diagnostics(),
+            included: batches.runtime_diagnostics().map(|runtime_diagnostics| {
+                SearchMetadataIncluded {
+                    runtime_diagnostics,
+                }
+            }),
         },
     )?;
     writeln!(out)?;
 
     let mut index = 0_usize;
     while let Some(batch) = batches.next_batch()? {
+        if !batch.included().is_empty() {
+            serde_json::to_writer(
+                &mut *out,
+                &SearchIncludedRecord {
+                    record_type: "search_included",
+                    included: batch.included(),
+                },
+            )?;
+            writeln!(out)?;
+        }
         for batch_index in 0..batch.results().len() {
             let result = batch
                 .result_document(&request, batch_index)
@@ -1584,6 +1615,7 @@ fn emit_message_search_machine_response(
                 #[serde(rename = "type")]
                 record_type: &'static str,
                 response_schema_version: u32,
+                coordinate_unit: crate::message_search::CoordinateUnit,
                 effective_request: &'a crate::message_search::ResolvedMessageSearchRequest,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 included: Option<&'a crate::message_search::MessageSearchIncludedData>,
@@ -1610,6 +1642,7 @@ fn emit_message_search_machine_response(
             let metadata = SearchMetadata {
                 record_type: "search_metadata",
                 response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+                coordinate_unit: crate::message_search::CoordinateUnit::UnicodeScalar,
                 effective_request: response.request(),
                 included: response.has_included_data().then(|| response.included()),
             };

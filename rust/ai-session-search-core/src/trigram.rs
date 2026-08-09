@@ -15,6 +15,7 @@
 
 use regex_syntax::hir::literal::{ExtractKind, Extractor, Seq};
 use regex_syntax::hir::{Hir, HirKind};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// FTS5's trigram tokenizer only indexes runs of at least three characters, so a shorter
 /// required literal cannot constrain the candidate set.
@@ -175,7 +176,19 @@ where
 /// Lower-cased because both indexes fold case, so a lower-cased trigram set is a superset of the
 /// regex's any-case matches.
 fn literal_to_trigrams(text: &str) -> Option<Vec<String>> {
-    let chars: Vec<char> = text.to_lowercase().chars().collect();
+    let lowercase = text.to_lowercase();
+    // FTS5's trigram tokenizer applies one-scalar Unicode folding, while Rust lowercase can
+    // expand one scalar into a multi-scalar grapheme (notably U+0130 -> `i` + U+0307). The
+    // authoritative verifier uses Rust lowercase, so indexing an expanded or already-decomposed
+    // grapheme could remove a real match before verification. Fall back to the scan path whenever
+    // a lowercase grapheme spans multiple scalars; the candidate set must remain a superset.
+    if lowercase
+        .graphemes(true)
+        .any(|grapheme| grapheme.chars().count() > 1)
+    {
+        return None;
+    }
+    let chars: Vec<char> = lowercase.chars().collect();
     if chars.len() < MIN_TRIGRAM_CHARS {
         return None;
     }

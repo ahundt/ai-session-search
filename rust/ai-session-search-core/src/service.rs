@@ -2294,24 +2294,29 @@ impl<'db> MessageService<'db> {
     ) -> Result<MessageSearchPlan> {
         let purpose = request
             .purpose()
-            .map(|selection| {
+            .map(|selection| -> Result<_> {
                 let definition = config
                     .search
                     .purposes
                     .get(selection.name())
-                    .ok_or_else(|| {
-                        anyhow!("unknown message-search purpose {:?}", selection.name())
+                    .ok_or_else(|| MessageSearchError::InvalidParameter {
+                        parameter: "purpose",
+                        reason: format!("unknown message-search purpose {:?}", selection.name()),
                     })?;
                 if selection
                     .version()
                     .is_some_and(|version| version != definition.version)
                 {
-                    bail!(
-                        "purpose {:?} version {} is unavailable; configured version is {}",
-                        selection.name(),
-                        selection.version().unwrap(),
-                        definition.version
-                    );
+                    return Err(MessageSearchError::InvalidParameter {
+                        parameter: "purpose_version",
+                        reason: format!(
+                            "purpose {:?} version {} is unavailable; configured version is {}",
+                            selection.name(),
+                            selection.version().unwrap(),
+                            definition.version
+                        ),
+                    }
+                    .into());
                 }
                 Ok((selection.name().to_string(), definition))
             })
@@ -2358,11 +2363,14 @@ impl<'db> MessageService<'db> {
         };
         if let (Some(current), Some(maximum)) = (limit, config.search.budgets.max_hits_per_page) {
             if current > maximum {
-                bail!(
-                    "resolved message-search limit {} exceeds search.budgets.max_hits_per_page {}; lower the request, purpose, operation default, or MCP default",
-                    current,
-                    maximum
-                );
+                return Err(MessageSearchError::InvalidParameter {
+                    parameter: "limit",
+                    reason: format!(
+                        "resolved message-search limit {} exceeds search.budgets.max_hits_per_page {}; lower the request, purpose, operation default, or MCP default",
+                        current, maximum
+                    ),
+                }
+                .into());
             }
         }
         let extent = if explicit_all {
@@ -2416,13 +2424,19 @@ impl<'db> MessageService<'db> {
             let total = context
                 .messages_before()
                 .checked_add(context.messages_after())
-                .ok_or_else(|| anyhow!("resolved message-search context total overflows"))?;
+                .ok_or_else(|| MessageSearchError::InvalidParameter {
+                    parameter: "context",
+                    reason: "resolved message-search context total overflows".to_string(),
+                })?;
             if total > maximum.get() {
-                bail!(
-                    "resolved message-search context total {} exceeds search.budgets.max_context_neighbors_per_hit {}; lower context_before or context_after",
-                    total,
-                    maximum
-                );
+                return Err(MessageSearchError::InvalidParameter {
+                    parameter: "context",
+                    reason: format!(
+                        "resolved message-search context total {} exceeds search.budgets.max_context_neighbors_per_hit {}; lower context_before or context_after",
+                        total, maximum
+                    ),
+                }
+                .into());
             }
         }
 
@@ -2576,14 +2590,15 @@ impl<'db> MessageService<'db> {
                     .map(|provider| provider.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                bail!(
+                return Err(MessageSearchError::Conflict(format!(
                     "session_id {:?} resolves to provider {}, outside providers=[{}]; include {} \
                      in providers or remove session_id",
                     predicates.session().unwrap_or_default(),
                     session.provider,
                     selected,
                     session.provider
-                );
+                ))
+                .into());
             }
         }
         let session_id = resolved_session.map(|session| session.id);

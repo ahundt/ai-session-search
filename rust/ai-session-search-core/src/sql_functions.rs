@@ -8,10 +8,16 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::Connection;
 use std::sync::Mutex;
 
+use crate::util::UnicodeLowerNeedle;
+
 struct FuzzyState {
     pattern: Pattern,
     matcher: NucleoMatcher,
     utf32_buf: Vec<char>,
+}
+
+fn unicode_lower_contains_value(needle: &UnicodeLowerNeedle, value: &str) -> bool {
+    needle.contains(value)
 }
 
 /// Register the deterministic scalar functions shared by every query connection.
@@ -22,17 +28,18 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
         FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
         |context| {
             type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
-            // The query is constant across a statement; cache it once instead of
-            // re-materializing a String for every scanned row.
+            // The query is constant across a statement; cache its streaming matcher once. This
+            // preserves `to_lowercase().contains(...)` expansion semantics without allocating a
+            // lowercased copy of every candidate row.
             let lowercase_query = context.get_or_create_aux(1, |value| -> Result<_, BoxError> {
-                Ok(String::from(value.as_str()?))
+                Ok(UnicodeLowerNeedle::from_lowered(value.as_str()?))
             })?;
             match context.get_raw(0) {
                 rusqlite::types::ValueRef::Null => Ok(false),
-                value => Ok(value
-                    .as_str()?
-                    .to_lowercase()
-                    .contains(lowercase_query.as_str())),
+                value => Ok(unicode_lower_contains_value(
+                    &lowercase_query,
+                    value.as_str()?,
+                )),
             }
         },
     )?;
@@ -123,6 +130,14 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_lower_contains_streams_lowercase_expansions_without_a_haystack_copy() {
+        let needle = crate::util::UnicodeLowerNeedle::from_lowered("i\u{307}st");
+
+        assert!(unicode_lower_contains_value(&needle, "İstanbul"));
+        assert!(!unicode_lower_contains_value(&needle, "unrelated"));
+    }
 
     #[test]
     fn unicode_lower_contains_preserves_null_empty_and_unicode_behavior() {

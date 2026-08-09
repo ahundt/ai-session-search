@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -718,6 +719,7 @@ fn execute_official_tool_call(
                         &tool_name,
                         ceiling,
                         recovery,
+                        Some(cancellation.flag()),
                     ),
                     Err(error) => rmcp_tool_error(error),
                 },
@@ -763,6 +765,7 @@ fn execute_official_tool_call(
             &tool_name,
             app.config().mcp.max_tool_result_chars,
             ToolRecovery::for_call(&tool_name, &args, &advertised_tools(app.config())),
+            Some(cancellation.flag()),
         ),
         Err(error) => rmcp_tool_error(error),
     };
@@ -1033,19 +1036,87 @@ impl ReducingArguments {
 /// to omit: a caller who does not know the page was already selected may re-scope the query
 /// instead of just lowering `limit`, and `REQ007-preserve-page-identity` is what makes the
 /// promise that a retry returns the same page true.
+struct CancellableJsonCharCounter<'a> {
+    chars: usize,
+    cancellation: Option<&'a AtomicBool>,
+}
+
+impl Write for CancellableJsonCharCounter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self
+            .cancellation
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            // `Write::write_all` retries `Interrupted` forever, which would turn a cancelled
+            // measurement into a busy loop. A non-retryable error terminates serialization.
+            return Err(io::Error::other("MCP tool call was cancelled"));
+        }
+        // JSON is UTF-8. Counting every byte that is not a continuation byte counts Unicode
+        // scalar values even when a serializer write happens to split a multibyte scalar.
+        self.chars += bytes
+            .iter()
+            .filter(|byte| (**byte & 0b1100_0000) != 0b1000_0000)
+            .count();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_char_count_cancellable<T: serde::Serialize + ?Sized>(
+    value: &T,
+    cancellation: Option<&AtomicBool>,
+) -> Result<usize, serde_json::Error> {
+    let mut counter = CancellableJsonCharCounter {
+        chars: 0,
+        cancellation,
+    };
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.chars)
+}
+
+fn serialized_char_count_or_zero<T: serde::Serialize + ?Sized>(
+    value: &T,
+    cancellation: Option<&AtomicBool>,
+) -> Result<usize, String> {
+    match serialized_char_count_cancellable(value, cancellation) {
+        Ok(chars) => Ok(chars),
+        Err(error) if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) => {
+            Err(error.to_string())
+        }
+        Err(_) => Ok(0),
+    }
+}
+
+#[cfg(test)]
 fn enforce_tool_result_ceiling(
     result: rmcp::model::CallToolResult,
     tool_name: &str,
     ceiling: usize,
     recovery: ToolRecovery,
 ) -> Result<rmcp::model::CallToolResult, String> {
+    enforce_tool_result_ceiling_cancellable(result, tool_name, ceiling, recovery, None)
+}
+
+fn enforce_tool_result_ceiling_cancellable(
+    result: rmcp::model::CallToolResult,
+    tool_name: &str,
+    ceiling: usize,
+    recovery: ToolRecovery,
+    cancellation: Option<&AtomicBool>,
+) -> Result<rmcp::model::CallToolResult, String> {
     // An error result is already the small path, and refusing to deliver an error because the
     // error is large would leave the caller with nothing at all to act on.
     if result.is_error.unwrap_or(false) {
         return Ok(result);
     }
-    let measured = match serde_json::to_string(&result) {
-        Ok(serialized) => serialized.chars().count(),
+    let measured = match serialized_char_count_cancellable(&result, cancellation) {
+        Ok(chars) => chars,
+        Err(error) if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) => {
+            return Err(error.to_string());
+        }
         // Measuring is not the operation; a result that cannot be measured is still a result,
         // and failing the call over the size check would turn a diagnostic into an outage.
         Err(_) => return Ok(result),
@@ -1076,38 +1147,32 @@ fn enforce_tool_result_ceiling(
     // structured content, which on a measured 20-result response was 4,200 of its 31,483
     // characters -- counting that as fixed put the envelope over the ceiling and produced advice
     // saying no page could ever fit, on a response whose 2-result page measured 4,930.
-    let shape = result.structured_content.as_ref().map(|structured| {
-        let rendered = serde_json::to_string(&result.content)
-            .map(|serialized| serialized.chars().count())
-            .unwrap_or_default();
+    let shape = if let Some(structured) = result.structured_content.as_ref() {
+        let rendered = serialized_char_count_or_zero(&result.content, cancellation)?;
         // Each result's own size, in order, so a shorter page is priced by the results it would
         // actually keep rather than by the page mean, which is computed partly from results it
         // would drop.
-        let items = returned_items(structured, returned);
-        let result_sizes: Vec<usize> = items
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|hit| {
-                        serde_json::to_string(hit)
-                            .map(|serialized| serialized.chars().count())
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let items = returned_items(structured, returned, cancellation)?;
+        let mut result_sizes = Vec::with_capacity(items.map_or(0, Vec::len));
+        if let Some(items) = items {
+            for hit in items {
+                result_sizes.push(serialized_char_count_or_zero(hit, cancellation)?);
+            }
+        }
         // `included` is deliberately not counted as scaling. It carries one entry per distinct
         // session, not per result, and a shorter page usually spans the same sessions: a measured
         // 20-result page and its 3-result prefix both covered exactly two. Treating it as
         // shrinking made the estimate 26% optimistic, which is the difference between advice that
         // works and advice that fails on the caller's next call.
         let scaling = result_sizes.iter().sum::<usize>() + rendered;
-        ResponseShape {
+        Some(ResponseShape {
             scaling_chars: scaling,
             envelope_chars: measured.saturating_sub(scaling),
             result_sizes,
-        }
-    });
+        })
+    } else {
+        None
+    };
 
     // The preamble says what did not happen, and says it in terms every tool has. An earlier
     // wording enumerated "results, context neighbours, match evidence, include groups or
@@ -1183,18 +1248,31 @@ fn returned_count(structured: &Value) -> Option<usize> {
 /// already says how many items it returned, so the array that *is* those items is the top-level
 /// array of that length -- and where more than one matches, the largest, since a page shrinks the
 /// payload rather than a same-length index beside it.
-fn returned_items(structured: &Value, returned: Option<usize>) -> Option<&Vec<Value>> {
-    let returned = returned?;
-    structured
-        .as_object()?
+fn returned_items<'a>(
+    structured: &'a Value,
+    returned: Option<usize>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Option<&'a Vec<Value>>, String> {
+    let Some(returned) = returned else {
+        return Ok(None);
+    };
+    let Some(object) = structured.as_object() else {
+        return Ok(None);
+    };
+    let mut largest = None;
+    let mut largest_chars = 0;
+    for items in object
         .values()
         .filter_map(Value::as_array)
         .filter(|items| items.len() == returned)
-        .max_by_key(|items| {
-            serde_json::to_string(items)
-                .map(|serialized| serialized.len())
-                .unwrap_or_default()
-        })
+    {
+        let chars = serialized_char_count_or_zero(items, cancellation)?;
+        if largest.is_none() || chars > largest_chars {
+            largest = Some(items);
+            largest_chars = chars;
+        }
+    }
+    Ok(largest)
 }
 
 /// What one over-ceiling response is made of, measured rather than assumed.
@@ -1390,8 +1468,15 @@ fn delivered_within_ceiling(
     tool_name: &str,
     ceiling: usize,
     recovery: ToolRecovery,
+    cancellation: Option<&AtomicBool>,
 ) -> rmcp::model::CallToolResult {
-    match enforce_tool_result_ceiling(result, tool_name, ceiling, recovery) {
+    match enforce_tool_result_ceiling_cancellable(
+        result,
+        tool_name,
+        ceiling,
+        recovery,
+        cancellation,
+    ) {
         Ok(delivered) => delivered,
         Err(error) => rmcp_tool_error(error),
     }
@@ -5961,6 +6046,9 @@ fn tool_search_messages_cancellable(
     .map_err(|error| error.to_string())?;
     let field = parse_opt_enum::<crate::models::SearchField>(args, "field")?
         .unwrap_or(crate::models::SearchField::Content);
+    if args.get("argument_path").is_some() && field != crate::models::SearchField::ToolArgument {
+        return Err("argument_path requires field='tool_argument'".to_string());
+    }
     let target = match field {
         crate::models::SearchField::Content => MessageTarget::content(),
         crate::models::SearchField::ToolName => MessageTarget::tool_name(),
@@ -6166,7 +6254,7 @@ fn message_search_text_summary(
         || "no more results".to_string(),
         |next_offset| {
             format!(
-                "more results: repeat the same request with offset={next_offset}; preserve every field in structuredContent.effective_request"
+                "more results: repeat the same request with offset={next_offset}; preserve every original tool argument except offset"
             )
         },
     );
@@ -7774,6 +7862,21 @@ mod tests {
         assert!(response["result"]["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("RFC 6901")));
+
+        let error = tool_search_messages(
+            &json!({
+                "query": "cargo",
+                "field": "content",
+                "argument_path": "/cmd"
+            }),
+            &config,
+            &db,
+        )
+        .expect_err("an argument pointer for content must not be accepted and ignored");
+        assert!(
+            error.contains("argument_path requires field='tool_argument'"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -13473,6 +13576,7 @@ mod tests {
                 "query": "hello",
                 "limit": 1,
                 "provider": "claude",
+                "role": "user",
                 "lines_per_message": 1,
             }),
             &config,
@@ -13490,8 +13594,13 @@ mod tests {
         assert!(
             response
                 .text
-                .contains("structuredContent.effective_request"),
-            "continuation must point at the typed request owner: {}",
+                .contains("preserve every original tool argument"),
+            "continuation must identify the original call as the complete replay owner: {}",
+            response.text
+        );
+        assert!(
+            !response.text.contains("structuredContent.effective_request"),
+            "effective_request intentionally summarizes resolved semantics and omits retrieval predicates: {}",
             response.text
         );
         assert!(
@@ -13759,6 +13868,18 @@ mod tests {
     /// forbids by name, and what Codex already does to us: it middle-truncates with no marker,
     /// keeping a plausible head and tail, so a caller cannot tell a complete answer from a
     /// mutilated one. Erroring is worse ergonomics and strictly better behaviour.
+    #[test]
+    fn ceiling_measurement_stops_when_the_request_is_cancelled() {
+        let cancelled = AtomicBool::new(true);
+        let error = serialized_char_count_cancellable(
+            &json!({ "payload": "x".repeat(4_000) }),
+            Some(&cancelled),
+        )
+        .expect_err("a cancelled measurement must stop before traversing the response");
+
+        assert_eq!(error.to_string(), "MCP tool call was cancelled");
+    }
+
     #[test]
     fn an_oversized_result_errors_rather_than_arriving_partially() {
         let mut full = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(

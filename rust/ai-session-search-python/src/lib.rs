@@ -3591,6 +3591,8 @@ struct NativeMessageSearchResponse {
     #[pyo3(get)]
     response_schema_version: u32,
     #[pyo3(get)]
+    coordinate_unit: &'static str,
+    #[pyo3(get)]
     effective_request: Py<PyAny>,
     #[pyo3(get)]
     results: Vec<Py<PyAny>>,
@@ -3631,6 +3633,7 @@ impl NativeMessageSearchResponse {
         Ok(Self {
             response_schema_version:
                 ai_session_search::message_search::MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+            coordinate_unit: "unicode_scalar",
             effective_request,
             results,
             page,
@@ -3756,6 +3759,8 @@ impl NativeMessageSearchCompletion {
 struct NativeMessageSearchBatches {
     inner: Mutex<CoreMessageSearchBatches>,
     request: ai_session_search::message_search::ResolvedMessageSearchRequest,
+    #[pyo3(get)]
+    coordinate_unit: &'static str,
     #[pyo3(get)]
     runtime_diagnostics: Option<Py<NativeMessageSearchRuntimeDiagnostics>>,
 }
@@ -4375,6 +4380,7 @@ impl SessionSearch {
         Ok(NativeMessageSearchBatches {
             inner: Mutex::new(batches),
             request,
+            coordinate_unit: "unicode_scalar",
             runtime_diagnostics,
         })
     }

@@ -1348,6 +1348,29 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(invalid.stdout.is_empty());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid regex"));
 
+    let ignored_argument_path = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "cargo",
+            "--field",
+            "content",
+            "--argument-path",
+            "/cmd",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!ignored_argument_path.status.success());
+    assert!(ignored_argument_path.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&ignored_argument_path.stderr)
+        .contains("argument_path requires field='tool_argument'"));
+
     let jsonl = Command::new(executable)
         .args([
             "--config",
@@ -1360,6 +1383,8 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             "--all-results",
             "--receipt-level",
             "full",
+            "--include",
+            "normalized_session_metadata,raw_provider_metadata,runtime_diagnostics",
             "--format",
             "jsonl",
         ])
@@ -1378,15 +1403,20 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             .collect::<Vec<_>>(),
         [
             Some("search_metadata"),
+            Some("search_included"),
             Some("hit"),
             Some("hit"),
             Some("search_end")
         ]
     );
     assert!(records[0]["effective_request"].is_object());
-    assert!(records[1]["result"]["message_ref"].is_object());
-    assert_eq!(records[3]["page"]["returned"], 2);
-    assert!(records[3]["receipt"]["ordered_digest"]
+    assert_eq!(records[0]["coordinate_unit"], "unicode_scalar");
+    assert!(records[0]["included"]["runtime_diagnostics"].is_object());
+    assert!(records[1]["included"]["normalized_session_metadata"].is_object());
+    assert!(records[1]["included"]["raw_provider_metadata"].is_object());
+    assert!(records[2]["result"]["message_ref"].is_object());
+    assert_eq!(records[4]["page"]["returned"], 2);
+    assert!(records[4]["receipt"]["ordered_digest"]
         .as_str()
         .is_some_and(|digest| digest.starts_with("sha256:")));
     assert!(records.iter().all(|record| {

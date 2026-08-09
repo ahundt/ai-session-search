@@ -2247,7 +2247,7 @@ impl MessageSearchIncludedData {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.normalized_session_metadata.is_none()
             && self.raw_provider_metadata.is_none()
             && self.runtime_diagnostics.is_none()

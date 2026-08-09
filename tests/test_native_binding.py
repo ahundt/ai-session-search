@@ -1421,6 +1421,7 @@ def test_native_message_search_response_exposes_only_the_canonical_version_one_d
     )
 
     assert response.response_schema_version == 1
+    assert response.coordinate_unit == "unicode_scalar"
     assert response.effective_request["query"] == "exact needle"
     assert isinstance(response.results, list)
     result = response.results[0]
@@ -1429,8 +1430,11 @@ def test_native_message_search_response_exposes_only_the_canonical_version_one_d
         "message_seq": 0,
     }
     assert result["presentation"]["field_view"]["additional_field_text"] != "none"
+    assert "extent" not in result["presentation"]["field_view"]
+    assert "coordinate_unit" not in result["presentation"]["field_view"]
     assert result["presentation"]["match_view"]["text"] == "exact needle"
     assert result["match"]["literal_occurrence"]["text"] == "exact needle"
+    assert "coordinate_unit" not in result["match"]["literal_occurrence"]
     assert result["included"]["parsed_references"][0]["host"] == "example.com"
     assert result["context"] == {
         "messages_before": [],
@@ -2139,6 +2143,11 @@ def test_message_search_planner_rejects_caller_input_as_value_error(tmp_path: Pa
     search = native.SessionSearch(tmp_path / "index.db")
     with pytest.raises(ValueError, match="fuzzy search requires a positive page size"):
         search.search_messages("fuzzy", query_mode="fuzzy")
+    with pytest.raises(ValueError, match="unknown message-search purpose"):
+        search.search_messages(
+            "needle",
+            native.MessageSearchRequest(purpose="missing-purpose", limit=1),
+        )
 
 
 def test_message_search_request_rejects_kind_and_kinds_together() -> None:
