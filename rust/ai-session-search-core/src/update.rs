@@ -449,7 +449,7 @@ fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableU
                     receipt.target
                 ),
                 ExecutableUpdateAction::Guidance {
-                    message: "Download the applicable native archive from the GitHub prerelease, verify its SHA256SUMS and build-provenance attestation, then rerun its installer with --replace and an explicit --backup path. Native archives are never downloaded or overwritten automatically; refresh integrations after replacement."
+                    message: "Download the applicable native archive from the GitHub prerelease, verify its SHA256SUMS and build-provenance attestation, then rerun its installer with --replace and an explicit --backup path. Native archives are never downloaded or overwritten automatically; run `aise skills update` after replacement."
                         .into(),
                 },
             )
@@ -526,7 +526,7 @@ pub(crate) fn run_package_update(config: &Config, skip_confirmation: bool) -> Re
         return Ok(());
     }
     let replacement_executable = background_child_executable()
-        .context("could not identify the aise executable that must refresh integrations")?;
+        .context("could not identify the aise executable that must refresh owned skills")?;
     execute_update_command(argv, environment, &replacement_executable)
 }
 
@@ -847,27 +847,27 @@ fn execute_update_command(
         );
     }
     let refresh_status = Command::new(replacement_executable)
-        .args(["integrations", "install"])
+        .args(["skills", "update"])
         .status()
         .with_context(|| {
             format!(
                 "update command `{rendered}` completed, but the updated executable {} could not \
-                 start `integrations install`; the package is updated, so run `{} integrations \
-                 install` after repairing that executable",
+                 start `skills update`; the package is updated, so run `{} skills update` after \
+                 repairing that executable",
                 replacement_executable.display(),
                 replacement_executable.display()
             )
         })?;
     if !refresh_status.success() {
         bail!(
-            "update command `{rendered}` completed, but `{} integrations install` exited with \
-             {refresh_status}; the package is updated and user-owned integration files were \
-             preserved, so resolve the reported integration error and rerun that exact command",
+            "update command `{rendered}` completed, but `{} skills update` exited with \
+             {refresh_status}; the package is updated and user-owned skill files were preserved, \
+             so resolve the reported skill error and rerun that exact command",
             replacement_executable.display()
         );
     }
     println!(
-        "Update command completed and integrations were refreshed. Run `aise --version` to verify the active executable."
+        "Update command completed and owned skills were refreshed. Run `aise --version` to verify the active executable."
     );
     Ok(())
 }
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn successful_manager_update_refreshes_integrations_with_the_replacement_executable() {
+    fn successful_manager_update_refreshes_only_owned_skills_with_the_replacement_executable() {
         let temp = TempDir::new().unwrap();
         let manager = temp.path().join("manager");
         let replacement = temp.path().join("aise");
@@ -1513,8 +1513,8 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(refresh_log).unwrap(),
-            "integrations\ninstall\n",
-            "the newly installed executable must refresh its owned MCP, instruction, skill, and alias state"
+            "skills\nupdate\n",
+            "the newly installed executable must refresh recorded skill roots without discovering new integration targets"
         );
     }
 

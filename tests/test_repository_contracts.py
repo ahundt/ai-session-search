@@ -443,6 +443,20 @@ def test_release_uses_trusted_publishing_for_both_package_registries() -> None:
     assert workflow.count("timeout-minutes:") >= 9
 
 
+def test_release_checksums_validate_beside_downloaded_assets() -> None:
+    workflow = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
+
+    assert "(cd dist && sha256sum -- * > SHA256SUMS)" in workflow
+    assert "sha256sum dist/* > dist/SHA256SUMS" not in workflow
+
+
+def test_msrv_job_compiles_library_tests() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    msrv_job = workflow.split("  rust-msrv:\n", 1)[1].split("\n  rust-portability:", 1)[0]
+
+    assert "cargo test -p ai-session-search --lib --locked --no-run" in msrv_job
+
+
 # These three scripts import `scripts.release_versions`, so the repository root must be on
 # sys.path. `python -m scripts.<name>` puts the working directory there; `python scripts/<name>.py`
 # puts `scripts/` there instead and raises ModuleNotFoundError. The file-path spelling only appears

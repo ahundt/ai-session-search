@@ -10,6 +10,7 @@ Usage: install.sh [--bin-dir DIR] [--replace --backup PATH]
 
 Install the archive-local aise executable. Existing files and symbolic links are
 never replaced unless --replace is paired with an absent rollback --backup path.
+When an ownership receipt exists, its rollback copy is BACKUP.aise-native-install.json.
 EOF
 }
 
@@ -70,6 +71,7 @@ source_receipt=$script_dir/aise-native-install.json
 mkdir -p -- "$bin_dir"
 destination=$bin_dir/aise
 receipt_destination=$bin_dir/aise-native-install.json
+backup_receipt=$backup.aise-native-install.json
 if [ -e "$destination" ] && [ ! -f "$destination" ] && [ ! -L "$destination" ]; then
     echo "error: destination is not a regular file: $destination" >&2
     exit 1
@@ -91,13 +93,32 @@ if [ "$replace" = false ] && [ -e "$receipt_destination" ]; then
     echo "error: native install receipt already exists: $receipt_destination" >&2
     exit 1
 fi
+if [ "$replace" = true ] && [ -e "$receipt_destination" ] &&
+   { [ -e "$backup_receipt" ] || [ -L "$backup_receipt" ]; }; then
+    echo "error: rollback receipt backup already exists: $backup_receipt" >&2
+    exit 1
+fi
 
 stage=$(mktemp "$bin_dir/.aise.install.XXXXXX")
 receipt_stage=$(mktemp "$bin_dir/.aise.receipt.XXXXXX")
 rollback_symlink=false
 published_binary=false
+published_receipt=false
 had_destination=false
+had_receipt=false
+receipt_backup_created=false
 cleanup() {
+    if [ "$published_receipt" = true ]; then
+        if [ -e "$receipt_destination" ] || [ -L "$receipt_destination" ]; then
+            rm -f -- "$receipt_destination"
+        fi
+        if [ "$had_receipt" = true ] && [ -e "$backup_receipt" ]; then
+            mv -- "$backup_receipt" "$receipt_destination" ||
+                echo "error: failed to restore rollback receipt: $backup_receipt" >&2
+        fi
+    elif [ "$receipt_backup_created" = true ] && [ -e "$backup_receipt" ]; then
+        rm -f -- "$backup_receipt"
+    fi
     if [ "$published_binary" = true ]; then
         if [ -e "$destination" ] || [ -L "$destination" ]; then
             rm -f -- "$destination"
@@ -138,17 +159,22 @@ if [ -e "$destination" ] || [ -L "$destination" ]; then
     else
         ln -- "$destination" "$backup"
     fi
-    mv -f -- "$stage" "$destination"
     published_binary=true
+    mv -f -- "$stage" "$destination"
     rollback_symlink=false
 else
+    published_binary=true
     ln -- "$stage" "$destination"
     rm -f -- "$stage"
-    published_binary=true
 fi
 stage=
+if [ -e "$receipt_destination" ]; then
+    had_receipt=true
+    ln -- "$receipt_destination" "$backup_receipt"
+    receipt_backup_created=true
+fi
+published_receipt=true
 mv -f -- "$receipt_stage" "$receipt_destination"
 receipt_stage=
-published_binary=false
 trap - EXIT HUP INT TERM
 printf 'installed aise: %s\n' "$destination"

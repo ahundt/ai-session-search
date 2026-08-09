@@ -48,13 +48,16 @@ easier to classify:
 ## Supply chain
 
 Every third-party GitHub Action is pinned to a full-length commit SHA. Release
-artifacts are built once, verified byte-for-byte, and published with GitHub
-build-provenance attestations and PyPI attestations. Publication to crates.io,
-PyPI, and GitHub Releases uses OpenID Connect trusted publishing through
-protected environments that require maintainer approval; no long-lived registry
-token exists. Publication is triggered by a `v*` tag, and the `release-tags`
-ruleset restricts creating, moving, and deleting those tags to the repository
-admin role.
+artifacts are verified byte-for-byte before publication and carry GitHub
+build-provenance attestations; Python distributions also carry PyPI
+attestations. The crates.io package is reproduced deterministically before the
+protected publish job asks Cargo to package it again. crates.io and PyPI use
+OpenID Connect trusted publishing, while GitHub Release creation uses the
+workflow's repository-scoped `GITHUB_TOKEN`. All publication jobs use protected
+environments that require maintainer approval, and no long-lived registry token
+exists. Publication is triggered by a `v*` tag, and the `release-tags` ruleset
+restricts creating, moving, and deleting those tags to the repository admin
+role.
 
 CI runs `cargo deny check advisories licenses sources bans` against the locked
 Rust dependency graph. Exceptions live in `deny.toml`, are recorded one

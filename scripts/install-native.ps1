@@ -54,6 +54,16 @@ function Copy-NewFile {
     }
 }
 
+function Move-FileCompatible {
+    param([string]$Source, [string]$Destination)
+
+    if ([System.IO.File]::Exists($Destination)) {
+        [System.IO.File]::Replace($Source, $Destination, $null)
+    } else {
+        [System.IO.File]::Move($Source, $Destination)
+    }
+}
+
 $sourceBinary = Join-Path $PSScriptRoot 'aise.exe'
 $sourceReceipt = Join-Path $PSScriptRoot 'aise-native-install.json'
 if (-not [System.IO.File]::Exists($sourceBinary)) {
@@ -65,6 +75,7 @@ if (-not [System.IO.File]::Exists($sourceReceipt)) {
 [System.IO.Directory]::CreateDirectory($BinDir) | Out-Null
 $destination = Join-Path $BinDir 'aise.exe'
 $receiptDestination = Join-Path $BinDir 'aise-native-install.json'
+$backupReceipt = $Backup + '.aise-native-install.json'
 
 $destinationItem = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
 if ($null -ne $destinationItem) {
@@ -89,12 +100,17 @@ if ($null -ne $receiptItem) {
     if (-not $Replace) {
         throw "Native install receipt already exists: $receiptDestination"
     }
+    if ($null -ne (Get-Item -LiteralPath $backupReceipt -Force -ErrorAction SilentlyContinue)) {
+        throw "Rollback receipt backup already exists: $backupReceipt"
+    }
 }
 
 $stage = Join-Path $BinDir ('.aise.install.' + [System.IO.Path]::GetRandomFileName())
 $receiptStage = Join-Path $BinDir ('.aise.receipt.' + [System.IO.Path]::GetRandomFileName())
 $rollbackLink = $null -ne $destinationItem -and $destinationIsLink
 $publishedBinary = $false
+$publishedReceipt = $false
+$receiptBackupCreated = $false
 $completed = $false
 try {
     Copy-NewFile $sourceBinary $stage
@@ -107,17 +123,33 @@ try {
         } else {
             Copy-NewFile $destination $Backup
         }
-        [System.IO.File]::Move($stage, $destination, $true)
         $publishedBinary = $true
+        Move-FileCompatible $stage $destination
         $rollbackLink = $false
     } else {
-        [System.IO.File]::Move($stage, $destination)
         $publishedBinary = $true
+        Move-FileCompatible $stage $destination
     }
-    [System.IO.File]::Move($receiptStage, $receiptDestination, $true)
+    if ($null -ne $receiptItem) {
+        Copy-NewFile $receiptDestination $backupReceipt
+        $receiptBackupCreated = $true
+    }
+    $publishedReceipt = $true
+    Move-FileCompatible $receiptStage $receiptDestination
     $completed = $true
 } finally {
     $rollback = Get-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+    $receiptRollback = Get-Item -LiteralPath $backupReceipt -Force -ErrorAction SilentlyContinue
+    if (-not $completed -and $publishedReceipt) {
+        if ([System.IO.File]::Exists($receiptDestination)) {
+            [System.IO.File]::Delete($receiptDestination)
+        }
+        if ($null -ne $receiptItem -and $null -ne $receiptRollback) {
+            Move-FileCompatible $backupReceipt $receiptDestination
+        }
+    } elseif (-not $completed -and $receiptBackupCreated -and $null -ne $receiptRollback) {
+        [System.IO.File]::Delete($backupReceipt)
+    }
     if (-not $completed -and $publishedBinary) {
         $published = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
         if ($null -ne $published) { Remove-Item -LiteralPath $destination -Force }

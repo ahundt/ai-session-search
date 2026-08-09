@@ -179,9 +179,10 @@ cargo uninstall ai-session-search
 
 `aise package update --yes` skips the confirmation prompt but still requires
 authoritative ownership evidence. The command delegates to uv, pip, pipx,
-Cargo, or Homebrew, then runs the replacement executable's
-`integrations install` after the manager succeeds. It never overwrites the
-executable itself. It refuses
+Cargo, or Homebrew, then runs the replacement executable's conservative
+`skills update` after the manager succeeds. That command visits only roots in
+the install manifest, including custom roots, and never discovers or configures
+new clients. It never overwrites the executable itself. It refuses
 automatic apply for a direct URL or source checkout, including a maintainer
 checkout installed into a uv tool environment or with `cargo install --path`
 or `cargo install --git`, and for unknown executables. Update the recorded
@@ -273,12 +274,15 @@ python -m pip install --upgrade ai-session-search && aise integrations install
 ```
 
 For a verified native archive, run its rollback-preserving installer and then
-`aise integrations install`. The installer publishes
+`aise skills update`. The installer publishes
 `aise-native-install.json` beside the executable; its archive identity and
 SHA-256 digest let `aise package status` distinguish this owner from an unknown
 standalone binary. Replacement still requires a newly downloaded archive whose
 checksums and provenance were verified, `--replace`, and an explicit rollback
-backup. Do not mix uv-, Cargo-, pip-, and native-owned executables on one
+backup. If an older ownership receipt exists, its rollback copy is written at
+`BACKUP.aise-native-install.json`; restore it together with `BACKUP` so
+`aise package status` continues to recognize the prior archive. Do not mix
+uv-, Cargo-, pip-, and native-owned executables on one
 `PATH`; `aise package status` reports the active executable and every matching
 candidate when ownership is unclear.
 

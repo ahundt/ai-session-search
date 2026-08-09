@@ -463,8 +463,10 @@ direct source, or unknown ownership and delegates only to a verified owning mana
 confirmation.
 
 Source checkout, direct URL, Cargo path/Git, and unknown installations receive guidance instead of
-silent registry replacement. Refresh integrations after a manager update. Uninstall integrations
-before removing the global executable.
+silent registry replacement. After a manager update, refresh only manifest-recorded owned skill
+roots; stable executable paths, aliases, MCP registrations, and managed instructions do not need
+rewriting, and an update must not discover new clients. Uninstall integrations before removing the
+global executable.
 
 ### REQ025-justify-timeouts
 

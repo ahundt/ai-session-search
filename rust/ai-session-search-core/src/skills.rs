@@ -907,7 +907,7 @@ fn validate(path: &Path) -> Result<SkillValidation> {
         })
         .collect::<Vec<_>>();
     match &descriptor.capability {
-        CapabilityFileState::Available { path } if descriptor.diagnostics.is_empty() => {
+        CapabilityFileState::Available { path: _ } if descriptor.diagnostics.is_empty() => {
             if let Err(problem) = load_policy(&descriptor) {
                 diagnostics.push(SkillDiagnostic {
                     file: crate::skill_catalog::CAPABILITY_FILE.to_string(),

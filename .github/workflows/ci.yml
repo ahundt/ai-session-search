@@ -86,7 +86,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           shared-key: msrv-1.88.0
-      - run: cargo check -p ai-session-search --lib --locked
+      - run: cargo test -p ai-session-search --lib --locked --no-run
       - run: cargo check -p ai-session-search-api-consumer --lib --locked
 
   rust-portability:

@@ -314,7 +314,7 @@ jobs:
         run: >-
           python -m scripts.verify_release_artifacts
           --release-set --version "${GITHUB_REF_NAME#v}" dist/*
-      - run: sha256sum dist/* > dist/SHA256SUMS
+      - run: (cd dist && sha256sum -- * > SHA256SUMS)
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
           subject-path: dist/*

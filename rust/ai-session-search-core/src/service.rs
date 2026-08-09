@@ -4417,7 +4417,10 @@ mod tests {
             .is_empty());
 
         let diagnostics = app.maintenance().diagnostics().unwrap();
-        assert_eq!(diagnostics.db_path, app.config().db_path());
+        assert_eq!(
+            std::path::Path::new(&diagnostics.db_path),
+            app.config().db_path()
+        );
         let compacted = app.maintenance().compact().unwrap();
         assert!(compacted.after_bytes > 0);
         assert_eq!(

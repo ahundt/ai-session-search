@@ -2763,6 +2763,12 @@ pub(crate) fn write_owned_skills(
     dry_run: bool,
     overwrite_changed: bool,
 ) -> Result<Vec<SkillWriteOutcome>> {
+    let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
+    let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
+    // A write command must not silently succeed, rewrite package bytes, or replace a damaged
+    // ownership record. Status and conservative removal planning may still inspect this state.
+    let _ = manifest.writable_manifest(&manifest_path)?;
+
     // Client discovery runs ONLY when no root was named. Naming roots is the precise request, so
     // resolving a home directory to answer it would make the command fail on a machine where HOME
     // is unset for a reason unrelated to what was asked.
@@ -2777,15 +2783,21 @@ pub(crate) fn write_owned_skills(
     } else {
         Vec::new()
     };
-    targets.extend(custom_skill_targets(explicit_roots)?);
+    if explicit_roots.is_empty() {
+        let discovered_roots = targets
+            .iter()
+            .map(|target| target.root.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let recorded_roots = manifest_recorded_skill_roots(&manifest)?
+            .into_iter()
+            .filter(|root| !discovered_roots.contains(root))
+            .collect::<Vec<_>>();
+        targets.extend(custom_skill_targets(&recorded_roots)?);
+    } else {
+        targets.extend(custom_skill_targets(explicit_roots)?);
+    }
     rebase_automatic_skill_roots(&mut targets, receipt_path);
     dedupe_skill_targets(&mut targets)?;
-
-    let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
-    let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
-    // A write command must not silently succeed, rewrite package bytes, or replace a damaged
-    // ownership record. Status and conservative removal planning may still inspect this state.
-    let _ = manifest.writable_manifest(&manifest_path)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     let mut mutations = Vec::new();
@@ -2894,6 +2906,27 @@ pub(crate) fn write_owned_skills(
         });
     }
     Ok(outcomes)
+}
+
+fn manifest_recorded_skill_roots(
+    manifest: &crate::skill_manifest::ManifestState,
+) -> Result<Vec<PathBuf>> {
+    match manifest {
+        crate::skill_manifest::ManifestState::Absent => Ok(Vec::new()),
+        crate::skill_manifest::ManifestState::Unreadable(problem) => {
+            bail!("cannot enumerate recorded skill roots: {problem}")
+        }
+        crate::skill_manifest::ManifestState::Loaded(manifest) => manifest
+            .installations
+            .iter()
+            .map(|installation| {
+                installation
+                    .root
+                    .to_path_buf()
+                    .context("decode a skill root from the install manifest")
+            })
+            .collect(),
+    }
 }
 
 /// What removing one skill directory would do, and what it refuses to touch.
@@ -5652,6 +5685,34 @@ mod tests {
             "mine",
             "a file aise did not write is never rewritten, even by restore"
         );
+    }
+
+    #[test]
+    fn routine_skill_update_includes_every_manifest_recorded_custom_root() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("state/transaction.json");
+        let root = dir.path().join("custom/ai-session-search");
+        fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        for file in AI_SESSION_SEARCH_SKILL_PACKAGE.files {
+            let path = root.join(file.relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.content).unwrap();
+        }
+        let manifest_path = crate::skill_manifest::manifest_path(&receipt);
+        let mut manifest = crate::skill_manifest::SkillInstallManifest::default();
+        manifest.record(
+            &root,
+            &AI_SESSION_SEARCH_SKILL_PACKAGE
+                .files
+                .iter()
+                .map(|file| (file.relative_path.to_string(), file.content))
+                .collect::<Vec<_>>(),
+        );
+        fs::write(&manifest_path, manifest.to_json().unwrap()).unwrap();
+
+        let loaded = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert_eq!(manifest_recorded_skill_roots(&loaded).unwrap(), vec![root]);
     }
 
     /// A directory aise never wrote is diagnosed per root, not written and not fatal.
