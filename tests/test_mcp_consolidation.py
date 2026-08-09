@@ -15,6 +15,7 @@ from ai_session_search import native
 from ai_session_search._native import _run_cli_command
 
 MCP_PROCESS_TIMEOUT_SECONDS = 10
+BACKGROUND_REFRESH_TIMEOUT_SECONDS = 30
 
 
 def test_python_api_exposes_rust_mcp_server() -> None:
@@ -143,7 +144,7 @@ def test_python_console_install_starts_the_canonical_refresh_child(tmp_path: Pat
     assert "started session index preparation in the background" in result.stdout
 
     recorded_words = 0
-    deadline = time.monotonic() + MCP_PROCESS_TIMEOUT_SECONDS
+    deadline = time.monotonic() + BACKGROUND_REFRESH_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if database.is_file():
             try:
@@ -165,9 +166,11 @@ def test_python_console_install_starts_the_canonical_refresh_child(tmp_path: Pat
             if recorded_words == 4:
                 break
         time.sleep(0.025)
+    report_path = cache / "background-refresh-status.json"
+    report = report_path.read_text(encoding="utf-8") if report_path.is_file() else "missing"
     assert recorded_words == 4, (
         f"the background refresh recorded {recorded_words} parser-contract keys within "
-        f"{MCP_PROCESS_TIMEOUT_SECONDS}s, expected 4"
+        f"{BACKGROUND_REFRESH_TIMEOUT_SECONDS}s, expected 4; status report: {report}"
     )
 
 

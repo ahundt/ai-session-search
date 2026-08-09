@@ -132,7 +132,11 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
     """
 
     def tree(root: Path) -> dict[str, bytes]:
-        return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+        return {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
 
     package = "ai-session-search"
     repository_files = tree(ROOT / "skills" / package)
@@ -534,12 +538,15 @@ LICENSE_COPIES = ("LICENSE", "rust/ai-session-search-core/LICENSE")
 
 
 def test_every_shipped_license_copy_is_the_verbatim_apache_2_0_text() -> None:
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
     for relative in LICENSE_COPIES:
         digest = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
         assert digest == APACHE_2_0_SHA256, (
             f"{relative} is not the verbatim Apache-2.0 text; every manifest declares the "
             "Apache-2.0 SPDX expression, so altered wording would misdeclare the published license"
         )
+        rule = f"{relative} text eol=lf"
+        assert rule in attributes, f"missing .gitattributes rule: {rule}"
 
 
 def test_manifests_and_notice_declare_one_consistent_license_and_copyright_holder() -> None:

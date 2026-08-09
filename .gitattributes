@@ -3,3 +3,7 @@
 # the embedded policy is digested byte-for-byte, so CRLF would change its reported SHA-256.
 skills/** text eol=lf
 rust/ai-session-search-core/skills/** text eol=lf
+
+# License bytes are hashed by release verification and shipped in every package format.
+LICENSE text eol=lf
+rust/ai-session-search-core/LICENSE text eol=lf

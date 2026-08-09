@@ -6414,8 +6414,9 @@ mod tests {
         .to_string();
 
         assert!(error.contains("inspect skill discovery entry"), "{error}");
+        let normalized_error = error.replace('\\', "/");
         assert!(
-            error.contains(".gemini/skills/ai-session-search"),
+            normalized_error.contains(".gemini/skills/ai-session-search"),
             "{error}"
         );
     }

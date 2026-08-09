@@ -421,4 +421,4 @@ def test_tracked_docs_contain_no_personal_install_paths() -> None:
         ROOT / "docs/development/maintainer-requirements-and-design-decisions.md",
         ROOT / "docs/migration/ai-session-search-major-migration.md",
     ):
-        assert personal_home not in path.read_text(), path
+        assert personal_home not in path.read_text(encoding="utf-8"), path
