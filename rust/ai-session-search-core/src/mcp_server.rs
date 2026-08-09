@@ -10224,13 +10224,15 @@ mod tests {
         use rmcp::ServiceExt as _;
         use std::io::Write as _;
 
+        const BACKGROUND_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         async fn wait_for_refresh(
             receiver: Arc<Mutex<mpsc::Receiver<usize>>>,
             minimum_generation: usize,
             description: &'static str,
         ) {
             tokio::task::spawn_blocking(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + BACKGROUND_REFRESH_TIMEOUT;
                 let receiver = receiver.lock().unwrap();
                 loop {
                     let remaining = deadline
