@@ -104,6 +104,21 @@ pub use skill_run::{
     SkillCapabilityOutput, SkillRunQuery, SkillRunReport,
 };
 
+/// Execute the canonical CLI after recording that this process entered through the Python binding.
+///
+/// This is an embedding boundary rather than a second dispatcher: command parsing and execution
+/// remain in [`run_cli_from`], while detached children can re-enter through the installed Python
+/// console script without guessing from platform-specific interpreter paths.
+#[doc(hidden)]
+pub fn run_cli_from_python<I, T>(args: I) -> anyhow::Result<i32>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    update::mark_python_binding_process();
+    cli::run_from(args)
+}
+
 /// Return whether an application error means an ordinary downstream reader closed its pipe.
 ///
 /// Inspecting the short error chain is `O(chain depth)` time and `O(1)` memory. Native and

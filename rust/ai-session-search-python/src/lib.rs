@@ -222,7 +222,7 @@ fn _run_cli_command(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
     argv.push(OsString::from("aise"));
     argv.extend(args.into_iter().map(OsString::from));
     py.detach(move || {
-        ai_session_search::run_cli_from(argv).map_err(|error| {
+        ai_session_search::run_cli_from_python(argv).map_err(|error| {
             if ai_session_search::is_broken_pipe_error(&error) {
                 PyBrokenPipeError::new_err(format!("{error:#}"))
             } else {

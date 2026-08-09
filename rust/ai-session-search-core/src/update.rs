@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -47,6 +48,14 @@ const ENV_PIPX_METADATA: &str = "AI_SESSION_SEARCH_PIPX_METADATA";
 const ENV_DIRECT_URL: &str = "AI_SESSION_SEARCH_DIRECT_URL";
 const ENV_SKIP_RELEASE_NOTIFICATION: &str = "AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION";
 
+static PYTHON_BINDING_PROCESS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliProcessOrigin {
+    Native,
+    PythonBinding,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallEvidence {
     pub executable: PathBuf,
@@ -77,24 +86,41 @@ impl InstallEvidence {
     }
 }
 
+/// Record that the canonical CLI entered through the in-process Python binding.
+pub(crate) fn mark_python_binding_process() {
+    PYTHON_BINDING_PROCESS.store(true, Ordering::Release);
+}
+
+fn cli_process_origin() -> CliProcessOrigin {
+    if PYTHON_BINDING_PROCESS.load(Ordering::Acquire) {
+        CliProcessOrigin::PythonBinding
+    } else {
+        CliProcessOrigin::Native
+    }
+}
+
 /// Resolve the same command surface for a detached child across native and Python installations.
 ///
 /// A native `aise` process can re-execute `current_exe()`. Under a PyO3 console script,
-/// `current_exe()` is the Python interpreter, so the entrypoint publishes both that runtime and the
-/// exact invoked `aise` script. We trust the override only when the published Python path identifies
-/// this process and the invoked path is an absolute executable file; otherwise native execution
-/// retains its zero-discovery path. Time and retained memory are `O(1)`.
+/// `current_exe()` is a host-specific Python interpreter path, so the binding explicitly records
+/// the process origin and the entrypoint publishes the exact invoked `aise` script. Native execution
+/// never trusts Python environment evidence. A Python binding process requires an absolute,
+/// executable console-script path. Time and retained memory are `O(1)`.
 pub(crate) fn background_child_executable() -> Result<PathBuf> {
-    background_child_executable_from_evidence(&InstallEvidence::capture()?)
+    background_child_executable_from_evidence(&InstallEvidence::capture()?, cli_process_origin())
 }
 
-fn background_child_executable_from_evidence(evidence: &InstallEvidence) -> Result<PathBuf> {
-    let Some(python_runtime) = evidence.python_executable.as_deref() else {
-        return Ok(evidence.executable.clone());
-    };
-    if !python_runtime_identifies_process(evidence) {
+fn background_child_executable_from_evidence(
+    evidence: &InstallEvidence,
+    origin: CliProcessOrigin,
+) -> Result<PathBuf> {
+    if origin == CliProcessOrigin::Native {
         return Ok(evidence.executable.clone());
     }
+    let python_runtime = evidence.python_executable.as_deref().context(
+        "the Python CLI binding did not publish its interpreter path; run the installed `aise` \
+         console script instead of calling the native binding directly",
+    )?;
     let invoked = evidence.invoked_executable.as_ref().with_context(|| {
         format!(
             "Python runtime {} did not identify the invoked aise console script; run the installed \
@@ -1543,7 +1569,19 @@ mod tests {
         let evidence = evidence(PathBuf::from("/opt/aise/bin/aise"));
 
         assert_eq!(
-            background_child_executable_from_evidence(&evidence).unwrap(),
+            background_child_executable_from_evidence(&evidence, CliProcessOrigin::Native).unwrap(),
+            evidence.executable
+        );
+    }
+
+    #[test]
+    fn native_background_child_ignores_inherited_python_console_evidence() {
+        let mut evidence = evidence(PathBuf::from("/opt/aise/bin/aise"));
+        evidence.python_executable = Some(PathBuf::from("/tmp/tool/bin/python"));
+        evidence.invoked_executable = Some(PathBuf::from("/tmp/tool/bin/aise"));
+
+        assert_eq!(
+            background_child_executable_from_evidence(&evidence, CliProcessOrigin::Native).unwrap(),
             evidence.executable
         );
     }
@@ -1560,31 +1598,36 @@ mod tests {
         evidence.invoked_executable = Some(invoked.clone());
 
         assert_eq!(
-            background_child_executable_from_evidence(&evidence).unwrap(),
+            background_child_executable_from_evidence(&evidence, CliProcessOrigin::PythonBinding,)
+                .unwrap(),
             invoked
         );
     }
 
     #[test]
-    fn python_background_child_accepts_a_distinct_venv_redirector_for_the_same_base_process() {
+    fn python_binding_background_child_does_not_infer_origin_from_interpreter_paths() {
         let temp = TempDir::new().unwrap();
+        let host_python = temp.path().join("host/python");
         let base_python = temp.path().join("base/python");
         let prefix = temp.path().join("venv");
         let venv_python = prefix.join("Scripts/python.exe");
         let invoked = prefix.join("Scripts/aise.exe");
+        fs::create_dir_all(host_python.parent().unwrap()).unwrap();
         fs::create_dir_all(base_python.parent().unwrap()).unwrap();
         fs::create_dir_all(venv_python.parent().unwrap()).unwrap();
+        write_executable(&host_python);
         write_executable(&base_python);
         write_executable(&venv_python);
         write_executable(&invoked);
-        let mut evidence = evidence(base_python.clone());
+        let mut evidence = evidence(host_python);
         evidence.python_base_executable = Some(base_python);
         evidence.python_executable = Some(venv_python);
         evidence.python_prefix = Some(prefix);
         evidence.invoked_executable = Some(invoked.clone());
 
         assert_eq!(
-            background_child_executable_from_evidence(&evidence).unwrap(),
+            background_child_executable_from_evidence(&evidence, CliProcessOrigin::PythonBinding,)
+                .unwrap(),
             invoked
         );
     }
@@ -1597,15 +1640,17 @@ mod tests {
         let mut evidence = evidence(python.clone());
         evidence.python_executable = Some(python);
 
-        let missing = background_child_executable_from_evidence(&evidence)
-            .unwrap_err()
-            .to_string();
+        let missing =
+            background_child_executable_from_evidence(&evidence, CliProcessOrigin::PythonBinding)
+                .unwrap_err()
+                .to_string();
         assert!(missing.contains("did not identify the invoked aise console script"));
 
         evidence.invoked_executable = Some(PathBuf::from("relative/aise"));
-        let invalid = background_child_executable_from_evidence(&evidence)
-            .unwrap_err()
-            .to_string();
+        let invalid =
+            background_child_executable_from_evidence(&evidence, CliProcessOrigin::PythonBinding)
+                .unwrap_err()
+                .to_string();
         assert!(invalid.contains("reported an invalid invoked aise executable"));
     }
 
