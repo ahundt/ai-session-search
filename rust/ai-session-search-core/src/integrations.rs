@@ -859,7 +859,6 @@ pub(crate) fn install_with_receipt(
     args: IntegrationInstallArgs,
     default_receipt: &Path,
 ) -> Result<IntegrationInstallOutcome> {
-    let binary = resolve_mcp_binary(args.binary.as_deref())?;
     let (mut targets, instruction_targets, mut skill_targets) =
         args.targets.resolve(args.no_instructions, args.no_skill)?;
     rebase_automatic_skill_roots(&mut skill_targets, default_receipt);
@@ -885,6 +884,11 @@ pub(crate) fn install_with_receipt(
         );
         return Ok(IntegrationInstallOutcome::NoTargets);
     }
+    let binary = if has_mcp_targets {
+        resolve_mcp_binary(args.binary.as_deref())?
+    } else {
+        PathBuf::new()
+    };
     // The manifest lives beside the resolved config, which `default_receipt` already sits next
     // to, so both durable records land in one place rather than two.
     let manifest = crate::skill_manifest::manifest_path(default_receipt);
@@ -1532,7 +1536,13 @@ fn another_owned_discovery_link(
     {
         let metadata = match fs::symlink_metadata(&link) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if missing_discovery_entry_is_benign(&link)? {
+                    continue;
+                }
+                return Err(error)
+                    .with_context(|| format!("inspect skill discovery entry {}", link.display()));
+            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("inspect skill discovery entry {}", link.display()))
@@ -1548,6 +1558,26 @@ fn another_owned_discovery_link(
         }
     }
     Ok(false)
+}
+
+/// Distinguish an absent discovery entry from a descendant hidden behind a non-directory parent.
+/// Windows reports both cases as `NotFound`, while Unix reports the latter as `NotADirectory`.
+fn missing_discovery_entry_is_benign(path: &Path) -> Result<bool> {
+    for ancestor in path.ancestors().skip(1) {
+        match fs::metadata(ancestor) {
+            Ok(metadata) => return Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect parent of skill discovery entry {}",
+                        ancestor.display()
+                    )
+                })
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn all_standard_discovery_links(

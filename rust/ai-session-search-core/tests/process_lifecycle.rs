@@ -291,6 +291,7 @@ fn integration_install_with_no_selected_components_does_not_start_indexing() {
     let output = Command::new(env!("CARGO_BIN_EXE_aise"))
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("PATH", "")
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1637,6 +1638,17 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
     let executable = env!("CARGO_BIN_EXE_aise");
+    let provider_bin = root.path().join("provider-bin");
+    fs::create_dir_all(&provider_bin).unwrap();
+    let codex = provider_bin.join("codex");
+    fs::write(&codex, "").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let provider_path = std::env::join_paths(
+        std::iter::once(provider_bin).chain(std::env::split_paths(&inherited_path)),
+    )
+    .unwrap();
     let create = Command::new(executable)
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
@@ -1655,6 +1667,7 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     drop(conn);
 
     let mut child = Command::new(executable)
+        .env("PATH", provider_path)
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1671,7 +1684,12 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     child.stdin.take().unwrap().write_all(b"n\n").unwrap();
     let output = child.wait_with_output().unwrap();
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("codex resume resume-test"), "{stdout}");
     assert!(stdout.contains("resume cancelled"), "{stdout}");

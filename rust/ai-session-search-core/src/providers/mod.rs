@@ -61,7 +61,8 @@ pub(crate) fn walk_roots(roots: &[PathBuf], max_depth: Option<usize>) -> WalkDis
             .ignore(false)
             .git_ignore(false)
             .git_exclude(false)
-            .parents(false);
+            .parents(false)
+            .sort_by_file_path(|left, right| left.cmp(right));
         if let Some(depth) = max_depth {
             builder.max_depth(Some(depth));
         }

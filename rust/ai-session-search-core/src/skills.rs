@@ -197,7 +197,7 @@ pub(crate) fn parse_skill_selector(value: OsString) -> Result<crate::skill_catal
         || rendered.starts_with("./")
         || rendered.starts_with("../")
         || rendered.starts_with("~/")
-        || rendered.contains(std::path::MAIN_SEPARATOR)
+        || rendered.contains('/')
         || (cfg!(windows)
             && (rendered.contains('\\')
                 || rendered.starts_with(r"\\")

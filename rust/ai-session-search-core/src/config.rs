@@ -2235,7 +2235,10 @@ mod tests {
 
     #[test]
     fn message_search_panels_parse_typed_values_and_purpose_preferences() {
-        let cfg: Config = toml::from_str(
+        let roots = tempfile::tempdir().unwrap();
+        let root_a = roots.path().join("a");
+        let root_b = roots.path().join("b");
+        let source = format!(
             r#"
             [search.message-search]
             default_limit = 25
@@ -2251,7 +2254,7 @@ mod tests {
 
             [search.scope]
             mode = "allowed-roots"
-            roots = ["/workspace/a", "/workspace/b"]
+            roots = [{root_a:?}, {root_b:?}]
             include_invocation_directory = true
 
             [search.purposes.historical-audit]
@@ -2266,9 +2269,9 @@ mod tests {
             include_refs = true
             lines_per_message = -8
             match_evidence_max_chars = 90
-            "#,
-        )
-        .unwrap();
+            "#
+        );
+        let cfg: Config = toml::from_str(&source).unwrap();
         cfg.validate().unwrap();
         assert_eq!(
             cfg.search

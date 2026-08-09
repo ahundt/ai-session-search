@@ -435,7 +435,8 @@ mod analysis_service_tests {
         let message = error.to_string();
         assert!(
             message.contains("aggregate")
-                && message.contains("additional/aise-capability.toml")
+                && message.contains("additional")
+                && message.contains("aise-capability.toml")
                 && message.contains("bytes were consumed by earlier selections"),
             "{message}"
         );

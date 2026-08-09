@@ -10225,15 +10225,24 @@ mod tests {
         use std::io::Write as _;
 
         async fn wait_for_refresh(
-            receiver: Arc<Mutex<mpsc::Receiver<()>>>,
+            receiver: Arc<Mutex<mpsc::Receiver<usize>>>,
+            minimum_generation: usize,
             description: &'static str,
         ) {
             tokio::task::spawn_blocking(move || {
-                receiver
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap_or_else(|_| panic!("{description}"));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let receiver = receiver.lock().unwrap();
+                loop {
+                    let remaining = deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .unwrap_or_default();
+                    let generation = receiver
+                        .recv_timeout(remaining)
+                        .unwrap_or_else(|_| panic!("{description}"));
+                    if generation >= minimum_generation {
+                        break;
+                    }
+                }
             })
             .await
             .unwrap();
@@ -10275,9 +10284,12 @@ mod tests {
 
         let (refresh_finished, refresh_finished_rx) = mpsc::channel();
         let refresh_finished_rx = Arc::new(Mutex::new(refresh_finished_rx));
+        let refresh_runs = Arc::new(AtomicUsize::new(0));
+        let runner_runs = Arc::clone(&refresh_runs);
         let refresh_runner = Arc::new(move |config: &Config, cancel: &AtomicBool| {
             run_background_refresh(config, cancel);
-            refresh_finished.send(()).unwrap();
+            let generation = runner_runs.fetch_add(1, Ordering::AcqRel) + 1;
+            refresh_finished.send(generation).unwrap();
         });
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -10296,6 +10308,7 @@ mod tests {
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
             wait_for_refresh(
                 Arc::clone(&refresh_finished_rx),
+                1,
                 "initialization refresh did not finish",
             )
             .await;
@@ -10310,6 +10323,7 @@ mod tests {
             )
             .unwrap();
             file.flush().unwrap();
+            let append_refresh = refresh_runs.load(Ordering::Acquire) + 1;
             let first = client
                 .peer()
                 .call_tool(
@@ -10332,9 +10346,11 @@ mod tests {
 
             wait_for_refresh(
                 Arc::clone(&refresh_finished_rx),
+                append_refresh,
                 "append refresh did not finish",
             )
             .await;
+            let post_append_refresh = refresh_runs.load(Ordering::Acquire) + 1;
             let second = client
                 .peer()
                 .call_tool(
@@ -10355,6 +10371,7 @@ mod tests {
             );
             wait_for_refresh(
                 Arc::clone(&refresh_finished_rx),
+                post_append_refresh,
                 "post-append verification refresh did not finish",
             )
             .await;
@@ -10367,6 +10384,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            let new_session_refresh = refresh_runs.load(Ordering::Acquire) + 1;
             let before_new_session_refresh = client
                 .peer()
                 .call_tool(
@@ -10387,9 +10405,11 @@ mod tests {
             );
             wait_for_refresh(
                 Arc::clone(&refresh_finished_rx),
+                new_session_refresh,
                 "new-session refresh did not finish",
             )
             .await;
+            let post_new_session_refresh = refresh_runs.load(Ordering::Acquire) + 1;
             let after_new_session_refresh = client
                 .peer()
                 .call_tool(
@@ -10410,6 +10430,7 @@ mod tests {
             );
             wait_for_refresh(
                 Arc::clone(&refresh_finished_rx),
+                post_new_session_refresh,
                 "post-new-session verification refresh did not finish",
             )
             .await;
@@ -10422,6 +10443,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            let replacement_refresh = refresh_runs.load(Ordering::Acquire) + 1;
             let before_replacement_refresh = client
                 .peer()
                 .call_tool(
@@ -10442,6 +10464,7 @@ mod tests {
             );
             wait_for_refresh(
                 Arc::clone(&refresh_finished_rx),
+                replacement_refresh,
                 "replacement refresh did not finish",
             )
             .await;
