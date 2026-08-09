@@ -10323,6 +10323,10 @@ mod tests {
             )
             .unwrap();
             file.flush().unwrap();
+            // Publish both data and metadata before another thread rediscovers the source.
+            // Windows may retain stale directory metadata while the write handle remains open.
+            file.sync_all().unwrap();
+            drop(file);
             let append_refresh = refresh_runs.load(Ordering::Acquire) + 1;
             let first = client
                 .peer()
