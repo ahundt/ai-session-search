@@ -73,6 +73,7 @@ fn isolated_integration_install(
 ) -> std::process::Output {
     let home = root.join("home");
     fs::create_dir_all(&home).unwrap();
+    let codex_config = home.join(".codex").join("config.toml");
     let executable = env!("CARGO_BIN_EXE_aise");
     let mut command = Command::new(executable);
     command
@@ -88,6 +89,10 @@ fn isolated_integration_install(
             "install",
             "--client",
             "codex",
+            "--exclude-client",
+            "codex",
+            "--codex-config",
+            codex_config.to_str().unwrap(),
             "--binary",
             executable,
             "--no-aliases",
