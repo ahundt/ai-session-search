@@ -77,7 +77,10 @@ fn isolated_integration_install(
     let mut command = Command::new(executable);
     command
         .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1033,6 +1036,8 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
         .args([
             "--config",
             config.to_str().unwrap(),
+            "--index-refresh",
+            "before-query",
             "messages",
             "search",
             "selfhealneedle12345",
@@ -1091,7 +1096,7 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
             .unwrap();
     assert_eq!(
         (uv, has_trigram, has_vocab, obsolete_gone, messages_after),
-        (4, true, true, true, 1)
+        (ai_session_search::db::SCHEMA_VERSION, true, true, true, 1)
     );
 }
 
