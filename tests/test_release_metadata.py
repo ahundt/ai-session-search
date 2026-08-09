@@ -19,6 +19,7 @@ def _write_manifests(
     root: Path, python_version: str = "1.0.0", cargo_version: str | None = None
 ) -> None:
     cargo_version = cargo_version or python_version
+    (root / "skills/ai-session-search").mkdir(parents=True)
     (root / "rust/ai-session-search-core").mkdir(parents=True)
     (root / "rust/ai-session-search-core/skills/ai-session-search").mkdir(parents=True)
     (root / "rust/ai-session-search-python").mkdir(parents=True)
@@ -37,6 +38,10 @@ def _write_manifests(
         f'[package]\nname = "ai-session-search"\nversion = "{cargo_version}"\n', encoding="utf-8"
     )
     (root / "rust/ai-session-search-core/skills/ai-session-search/SKILL.md").write_text(
+        f"---\nname: ai-session-search\nmetadata:\n  version: {cargo_version}\n---\n",
+        encoding="utf-8",
+    )
+    (root / "skills/ai-session-search/SKILL.md").write_text(
         f"---\nname: ai-session-search\nmetadata:\n  version: {cargo_version}\n---\n",
         encoding="utf-8",
     )
@@ -102,6 +107,18 @@ def test_release_metadata_normalizes_python_rc_to_cargo_semver(tmp_path: Path) -
 def test_release_metadata_rejects_a_stale_packaged_skill_version(tmp_path: Path) -> None:
     _write_manifests(tmp_path, "1.0.0rc1", "1.0.0-rc.1")
     skill = tmp_path / "rust/ai-session-search-core/skills/ai-session-search/SKILL.md"
+    skill.write_text(
+        skill.read_text(encoding="utf-8").replace("version: 1.0.0-rc.1", "version: 1.0.0-rc.0"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseMetadataError, match=r"SKILL\.md declares"):
+        verify_release_metadata(tmp_path, "v1.0.0rc1")
+
+
+def test_release_metadata_rejects_a_stale_repository_skill_version(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc1", "1.0.0-rc.1")
+    skill = tmp_path / "skills/ai-session-search/SKILL.md"
     skill.write_text(
         skill.read_text(encoding="utf-8").replace("version: 1.0.0-rc.1", "version: 1.0.0-rc.0"),
         encoding="utf-8",

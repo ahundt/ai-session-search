@@ -14,7 +14,7 @@ Never rebuild between verification and publication.
 The release being prepared is `1.0.0rc1` for Python and `1.0.0-rc.1` for
 Cargo. Its tag is `v1.0.0rc1`.
 
-Keep all six declarations aligned. The consumer crate stays unpublished at
+Keep all seven declarations aligned. The consumer crate stays unpublished at
 `0.0.0`; only its requirement on the released core crate carries the release
 version:
 
@@ -25,6 +25,7 @@ version:
 | `rust/ai-session-search-python/Cargo.toml` | `package.version` | `1.0.0-rc.1` |
 | `rust/ai-session-search-python/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.1` |
 | `tests/rust-api-consumer/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.1` |
+| `skills/ai-session-search/SKILL.md` | `metadata.version` | `1.0.0-rc.1` |
 | `rust/ai-session-search-core/skills/ai-session-search/SKILL.md` | `metadata.version` | `1.0.0-rc.1` |
 
 Cargo resolves a stale `1.0.0-rc.1` requirement against a `1.0.0` core crate
@@ -114,7 +115,7 @@ crates.io requires the crate to exist before its trusted publisher can be
 registered. Do not manually publish RC1 because the tag workflow must publish
 that unused version.
 
-1. Create and review a dedicated bootstrap commit with all six declarations
+1. Create and review a dedicated bootstrap commit with all seven declarations
    set to `1.0.0rc0` or `1.0.0-rc.0` as appropriate. Refresh both lockfiles.
 2. Run `./run_ci_local.sh`, then package, inspect, and dry-run the exact crate:
 
@@ -136,7 +137,7 @@ that unused version.
 
 5. Register the crates.io trusted publisher, revoke the bootstrap token, and
    run `cargo logout`.
-6. Restore all six declarations to RC1, refresh the lockfiles, and rerun the
+6. Restore all seven declarations to RC1, refresh the lockfiles, and rerun the
    complete RC1 gate. Do not create `v1.0.0rc1` before this is green.
 
 ## RC1 local gate
