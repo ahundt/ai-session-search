@@ -22,6 +22,7 @@ CORE_DEPENDENT_MANIFESTS = (
     "rust/ai-session-search-python/Cargo.toml",
     "tests/rust-api-consumer/Cargo.toml",
 )
+PACKAGED_SKILL = "rust/ai-session-search-core/skills/ai-session-search/SKILL.md"
 
 
 class ReleaseMetadataError(ValueError):
@@ -42,6 +43,21 @@ def _core_dependency_version(manifest: Mapping[str, object], relative: str) -> s
     if not isinstance(version, str):
         raise ReleaseMetadataError(f"{relative} depends on {CORE_CRATE} without a version")
     return version
+
+
+def _packaged_skill_version(path: pathlib.Path) -> str:
+    in_metadata = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line == "metadata:":
+            in_metadata = True
+            continue
+        if in_metadata and line and not line[0].isspace():
+            break
+        if in_metadata:
+            key, separator, value = line.strip().partition(":")
+            if separator and key == "version" and value.strip():
+                return value.strip().strip("'\"")
+    raise ReleaseMetadataError(f"{PACKAGED_SKILL} has no metadata.version")
 
 
 def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
@@ -72,6 +88,12 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
                 f"{relative} requires {CORE_CRATE} {dependency_version!r} "
                 f"instead of the release version {cargo_version!r}"
             )
+    skill_version = _packaged_skill_version(root / PACKAGED_SKILL)
+    if skill_version != cargo_version:
+        raise ReleaseMetadataError(
+            f"{PACKAGED_SKILL} declares {skill_version!r} "
+            f"instead of the release version {cargo_version!r}"
+        )
     return version
 
 
