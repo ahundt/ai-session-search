@@ -20,6 +20,8 @@ def test_native_installer_requires_explicit_safe_replacement(tmp_path: Path) -> 
     source = bundle / "aise"
     source.write_text("#!/bin/sh\necho first\n", encoding="utf-8")
     source.chmod(0o755)
+    receipt = bundle / "aise-native-install.json"
+    receipt.write_text('{"schema_version":1}\n', encoding="utf-8")
     bin_dir = tmp_path / "bin"
 
     initial = subprocess.run(
@@ -30,6 +32,7 @@ def test_native_installer_requires_explicit_safe_replacement(tmp_path: Path) -> 
     )
     assert initial.returncode == 0, initial.stderr
     assert (bin_dir / "aise").read_bytes() == source.read_bytes()
+    assert (bin_dir / "aise-native-install.json").read_bytes() == receipt.read_bytes()
 
     duplicate = subprocess.run(
         ["sh", str(installer), "--bin-dir", str(bin_dir)],
@@ -82,6 +85,9 @@ def test_native_installer_migrates_symbolic_link_with_rollback_copy(tmp_path: Pa
     source = bundle / "aise"
     source.write_text("#!/bin/sh\necho source\n", encoding="utf-8")
     source.chmod(0o755)
+    (bundle / "aise-native-install.json").write_text(
+        '{"schema_version":1}\n', encoding="utf-8"
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     external = tmp_path / "external"
@@ -142,6 +148,9 @@ def test_native_installer_restores_symbolic_link_when_publish_fails(
     source = bundle / "aise"
     source.write_text("#!/bin/sh\necho source\n", encoding="utf-8")
     source.chmod(0o755)
+    (bundle / "aise-native-install.json").write_text(
+        '{"schema_version":1}\n', encoding="utf-8"
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     external = tmp_path / "external"

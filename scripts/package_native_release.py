@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import gzip
+import hashlib
 import io
+import json
 import os
 import pathlib
 import re
@@ -45,15 +47,33 @@ def _payloads(
     license_file: pathlib.Path,
     notice: pathlib.Path,
     installer: pathlib.Path,
+    version: str,
+    target: str,
 ) -> tuple[tuple[str, bytes, int], ...]:
     binary_name = "aise.exe" if binary.suffix.lower() == ".exe" else "aise"
     installer_name = "install.ps1" if binary_name.endswith(".exe") else "install.sh"
     if installer.suffix.lower() != pathlib.Path(installer_name).suffix:
         raise PackagingError(f"installer for {binary_name} must use the {installer_name} extension")
+    binary_bytes = binary.read_bytes()
+    receipt = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "package": "ai-session-search",
+                "archive_version": version,
+                "target": target,
+                "executable_sha256": hashlib.sha256(binary_bytes).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
     return (
         ("LICENSE", license_file.read_bytes(), 0o644),
         ("NOTICE", notice.read_bytes(), 0o644),
-        (binary_name, binary.read_bytes(), 0o755),
+        (binary_name, binary_bytes, 0o755),
+        ("aise-native-install.json", receipt, 0o644),
         (installer_name, installer.read_bytes(), 0o755 if installer_name.endswith(".sh") else 0o644),
     )
 
@@ -124,7 +144,7 @@ def package_native_release(
     root = f"ai-session-search-{version}-{target}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / f"{root}.{archive_format}"
-    payloads = _payloads(binary, license_file, notice, installer)
+    payloads = _payloads(binary, license_file, notice, installer, version, target)
     epoch = _source_date_epoch()
     staging_path: pathlib.Path | None = None
     try:

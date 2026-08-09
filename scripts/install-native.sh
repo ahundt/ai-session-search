@@ -57,13 +57,19 @@ fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 source_binary=$script_dir/aise
+source_receipt=$script_dir/aise-native-install.json
 [ -f "$source_binary" ] && [ -x "$source_binary" ] || {
     echo "error: archive-local executable is missing or not executable: $source_binary" >&2
+    exit 1
+}
+[ -f "$source_receipt" ] && [ ! -L "$source_receipt" ] || {
+    echo "error: archive-local install receipt is missing or not a regular file: $source_receipt" >&2
     exit 1
 }
 
 mkdir -p -- "$bin_dir"
 destination=$bin_dir/aise
+receipt_destination=$bin_dir/aise-native-install.json
 if [ -e "$destination" ] && [ ! -f "$destination" ] && [ ! -L "$destination" ]; then
     echo "error: destination is not a regular file: $destination" >&2
     exit 1
@@ -76,19 +82,39 @@ if [ "$replace" = true ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
     echo "error: rollback backup already exists: $backup" >&2
     exit 1
 fi
+if { [ -e "$receipt_destination" ] || [ -L "$receipt_destination" ]; } &&
+   { [ ! -f "$receipt_destination" ] || [ -L "$receipt_destination" ]; }; then
+    echo "error: native install receipt destination is not a regular file: $receipt_destination" >&2
+    exit 1
+fi
+if [ "$replace" = false ] && [ -e "$receipt_destination" ]; then
+    echo "error: native install receipt already exists: $receipt_destination" >&2
+    exit 1
+fi
 
 stage=$(mktemp "$bin_dir/.aise.install.XXXXXX")
+receipt_stage=$(mktemp "$bin_dir/.aise.receipt.XXXXXX")
 rollback_symlink=false
+published_binary=false
+had_destination=false
 cleanup() {
-    if [ "$rollback_symlink" = true ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
+    if [ "$published_binary" = true ]; then
         if [ -e "$destination" ] || [ -L "$destination" ]; then
             rm -f -- "$destination"
         fi
+        if [ "$had_destination" = true ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
+            mv -- "$backup" "$destination" ||
+                echo "error: failed to restore rollback backup: $backup" >&2
+        fi
+    elif [ "$rollback_symlink" = true ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
         mv -- "$backup" "$destination" ||
             echo "error: failed to restore rollback backup: $backup" >&2
     fi
     if [ -n "${stage:-}" ] && [ -e "$stage" ]; then
         rm -f -- "$stage"
+    fi
+    if [ -n "${receipt_stage:-}" ] && [ -e "$receipt_stage" ]; then
+        rm -f -- "$receipt_stage"
     fi
 }
 abort_install() {
@@ -100,8 +126,11 @@ trap cleanup EXIT
 trap abort_install HUP INT TERM
 cp -- "$source_binary" "$stage"
 chmod 755 "$stage"
+cp -- "$source_receipt" "$receipt_stage"
+chmod 644 "$receipt_stage"
 
 if [ -e "$destination" ] || [ -L "$destination" ]; then
+    had_destination=true
     mkdir -p -- "$(dirname -- "$backup")"
     if [ -L "$destination" ]; then
         rollback_symlink=true
@@ -110,11 +139,16 @@ if [ -e "$destination" ] || [ -L "$destination" ]; then
         ln -- "$destination" "$backup"
     fi
     mv -f -- "$stage" "$destination"
+    published_binary=true
     rollback_symlink=false
 else
     ln -- "$stage" "$destination"
     rm -f -- "$stage"
+    published_binary=true
 fi
 stage=
+mv -f -- "$receipt_stage" "$receipt_destination"
+receipt_stage=
+published_binary=false
 trap - EXIT HUP INT TERM
 printf 'installed aise: %s\n' "$destination"

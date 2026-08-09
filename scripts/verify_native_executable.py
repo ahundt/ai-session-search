@@ -47,6 +47,24 @@ def verify(executable: pathlib.Path, timeout_seconds: float) -> None:
             environment,
             timeout_seconds,
         )
+        receipt = executable.with_name("aise-native-install.json")
+        if receipt.is_file():
+            report = installed_verifier._run_json_command(
+                str(executable),
+                executable.name,
+                ("package", "status", "--format", "json"),
+                root,
+                environment,
+                timeout_seconds,
+            )
+            if not isinstance(report, dict) or report.get("installation_owner") != "native-archive":
+                raise installed_verifier.InstallVerificationError(
+                    "installed native archive did not report installation_owner=native-archive"
+                )
+            if receipt.name not in str(report.get("ownership_evidence", "")):
+                raise installed_verifier.InstallVerificationError(
+                    "installed native archive ownership evidence did not name its receipt"
+                )
 
 
 def main() -> int:

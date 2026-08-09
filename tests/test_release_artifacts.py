@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import stat
 import tarfile
 import zipfile
@@ -362,6 +364,23 @@ def test_native_archives_are_deterministic_and_verifiable(
 
     assert first.read_bytes() == second.read_bytes()
     verify(first)
+    root = f"ai-session-search-1.0.0-{target}"
+    receipt_name = f"{root}/aise-native-install.json"
+    if archive_format == "tar.gz":
+        with tarfile.open(first, "r:gz") as archive:
+            receipt_file = archive.extractfile(receipt_name)
+            assert receipt_file is not None
+            receipt = json.load(receipt_file)
+    else:
+        with zipfile.ZipFile(first) as archive:
+            receipt = json.loads(archive.read(receipt_name))
+    assert receipt == {
+        "schema_version": 1,
+        "package": "ai-session-search",
+        "archive_version": "1.0.0",
+        "target": target,
+        "executable_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    }
 
 
 def test_native_packaging_rejects_unsafe_identity_and_overwrite(tmp_path: Path) -> None:
@@ -417,6 +436,18 @@ def test_native_zip_rejects_symbolic_link_member(tmp_path: Path) -> None:
         archive.writestr(f"{root}/LICENSE", b"license")
         archive.writestr(f"{root}/NOTICE", b"notice")
         archive.writestr(f"{root}/install.ps1", b"installer")
+        archive.writestr(
+            f"{root}/aise-native-install.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "package": "ai-session-search",
+                    "archive_version": "1.0.0",
+                    "target": "x86_64-pc-windows-msvc",
+                    "executable_sha256": hashlib.sha256(b"target").hexdigest(),
+                }
+            ),
+        )
         link = zipfile.ZipInfo(f"{root}/aise.exe")
         link.create_system = 3
         link.external_attr = 0o120777 << 16

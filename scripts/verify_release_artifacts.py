@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import configparser
 import email.parser
+import hashlib
+import json
 import pathlib
 import re
 import stat
@@ -23,6 +25,7 @@ from scripts.release_versions import cargo_version_for_python
 EXPECTED_DISTRIBUTION = "ai-session-search"
 EXPECTED_LICENSE = "Apache-2.0"
 EXPECTED_CONSOLE_SCRIPTS = {"aise": "ai_session_search.entrypoint:cli_main"}
+NATIVE_RECEIPT_NAME = "aise-native-install.json"
 EXPECTED_WHEEL_ABI_PREFIX = "cp312-abi3-"
 FORBIDDEN_SUFFIXES = {".cast", ".gif", ".mp4", ".webm"}
 FORBIDDEN_PARTS = {"ai_session_tools", "sessiongrep"}
@@ -242,6 +245,7 @@ def _native_archive_contract(path: pathlib.Path, names: Iterable[str]) -> tuple[
         (root, "LICENSE"),
         (root, "NOTICE"),
         (root, binary_name),
+        (root, NATIVE_RECEIPT_NAME),
         (root, installer_name),
     }
     actual = set(parts)
@@ -254,6 +258,31 @@ def _native_archive_contract(path: pathlib.Path, names: Iterable[str]) -> tuple[
     return root, binary_name
 
 
+def _verify_native_receipt(root: str, binary: bytes, receipt: bytes) -> None:
+    target = next(
+        (candidate for candidate in EXPECTED_NATIVE_TARGETS if root.endswith(f"-{candidate}")),
+        None,
+    )
+    if target is None:
+        raise VerificationError(f"{root}: native target is not supported")
+    version = root[len("ai-session-search-") : -(len(target) + 1)]
+    try:
+        parsed = json.loads(receipt)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VerificationError(f"{root}: invalid native install receipt: {error}") from error
+    expected = {
+        "schema_version": 1,
+        "package": EXPECTED_DISTRIBUTION,
+        "archive_version": version,
+        "target": target,
+        "executable_sha256": hashlib.sha256(binary).hexdigest(),
+    }
+    if parsed != expected:
+        raise VerificationError(
+            f"{root}: native install receipt differs from the executable and archive identity"
+        )
+
+
 def verify_native_archive(path: pathlib.Path) -> None:
     if path.name.endswith(".tar.gz"):
         with tarfile.open(path, "r:gz") as archive:
@@ -262,11 +291,17 @@ def verify_native_archive(path: pathlib.Path) -> None:
                 raise VerificationError(f"{path.name}: native archive may contain only regular files")
             root, binary_name = _native_archive_contract(path, (member.name for member in members))
             tar_binary = next(member for member in members if member.name == f"{root}/{binary_name}")
+            receipt = next(
+                member for member in members if member.name == f"{root}/{NATIVE_RECEIPT_NAME}"
+            )
             installer = next(member for member in members if member.name == f"{root}/install.sh")
             if tar_binary.size == 0 or (tar_binary.mode & 0o111) == 0:
                 raise VerificationError(f"{path.name}: native executable is empty or not executable")
             if installer.size == 0 or (installer.mode & 0o111) == 0:
                 raise VerificationError(f"{path.name}: native installer is empty or not executable")
+            binary_bytes = archive.extractfile(tar_binary).read()
+            receipt_bytes = archive.extractfile(receipt).read()
+            _verify_native_receipt(root, binary_bytes, receipt_bytes)
         return
 
     with zipfile.ZipFile(path) as archive:
@@ -282,6 +317,11 @@ def verify_native_archive(path: pathlib.Path) -> None:
             raise VerificationError(f"{path.name}: native executable is empty")
         if archive.getinfo(f"{root}/install.ps1").file_size == 0:
             raise VerificationError(f"{path.name}: native installer is empty")
+        _verify_native_receipt(
+            root,
+            archive.read(f"{root}/{binary_name}"),
+            archive.read(f"{root}/{NATIVE_RECEIPT_NAME}"),
+        )
 
 
 def verify_crate(path: pathlib.Path) -> None:

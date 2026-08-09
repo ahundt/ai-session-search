@@ -192,7 +192,10 @@ not recommend simultaneous Cargo and uv global commands because PATH order can
 select different versions. Package installation must not mutate MCP configs,
 managed Markdown, hooks, indexes, configuration, or session data. MCP setup and
 removal remain explicit `aise integrations install`/`aise integrations uninstall`
-operations. See
+operations. Each native archive carries an `aise-native-install.json` sidecar
+whose executable SHA-256 and archive identity are verified before packaging;
+the installer publishes it beside `aise`, and exact-archive smoke tests require
+`aise package status` to report `native-archive`. See
 [uv tool ownership](https://docs.astral.sh/uv/concepts/tools/) and
 [`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
 

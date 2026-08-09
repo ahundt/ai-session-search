@@ -503,6 +503,7 @@ impl SkillTarget {
     }
 
     /// Every managed path under this root, in package declaration order.
+    #[cfg(test)]
     fn managed_paths(&self) -> impl Iterator<Item = (PathBuf, &'static str)> + '_ {
         self.package
             .files
@@ -899,11 +900,12 @@ pub(crate) fn install_with_receipt(
         &binary,
         Some(&manifest),
     )?;
+    let skill_manifest = crate::skill_manifest::load_manifest(&manifest)?;
     let skill_file_changes = skill_targets
         .iter()
         .map(|target| {
             let migration = plan_migrate_discovery_copies(target, Some(&manifest))?;
-            let package_changes = plan_upsert_skill_file(target)?
+            let package_changes = plan_refresh_skill_files(target, &skill_manifest, false)?
                 .iter()
                 .any(|mutation| !mutation.is_noop());
             Ok(package_changes || !migration.mutations.is_empty())
@@ -2140,6 +2142,10 @@ fn preflight_install(
     binary: &Path,
     manifest_path: Option<&Path>,
 ) -> Result<Vec<PlannedFileMutation>> {
+    let skill_manifest = match manifest_path {
+        Some(path) => crate::skill_manifest::load_manifest(path)?,
+        None => crate::skill_manifest::ManifestState::Absent,
+    };
     let mut mutations = Vec::new();
     let mut retired_skill_roots = Vec::new();
     for target in targets {
@@ -2152,11 +2158,13 @@ fn preflight_install(
         let migration = plan_migrate_discovery_copies(target, manifest_path)?;
         mutations.extend(migration.mutations);
         retired_skill_roots.extend(migration.retired_roots);
-        if let Some(path) = manifest_path {
-            let manifest = crate::skill_manifest::load_manifest(path)?;
-            mutations.extend(plan_retire_removed_managed_skill_files(target, &manifest)?);
+        if manifest_path.is_some() {
+            mutations.extend(plan_retire_removed_managed_skill_files(
+                target,
+                &skill_manifest,
+            )?);
         }
-        mutations.extend(plan_upsert_skill_file(target)?);
+        mutations.extend(plan_refresh_skill_files(target, &skill_manifest, false)?);
     }
     if let Some(path) = manifest_path {
         if !skill_targets.is_empty() {
@@ -2646,11 +2654,12 @@ fn preflight_uninstall(
     })
 }
 
-/// Plan the writes that bring one skill directory up to the embedded content.
+/// Test the transaction path independently of manifest-aware ownership classification.
 ///
-/// Ownership is checked ONCE, on `SKILL.md`, and it gates the whole directory. Checking each file
-/// separately would let a directory be half ours: `aise` would overwrite the two files it wrote
-/// and refuse the one a user edited, leaving a tree that matches neither version.
+/// Production install and update callers use [`plan_refresh_skill_files`], which consults the
+/// per-file manifest before planning any replacement. This lower-level helper intentionally
+/// models only the marker-based, manifest-absent fixture used by transaction tests.
+#[cfg(test)]
 fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {
     let anchor = target.anchor();
     if let Some(text) = read_optional_utf8_regular_file(&anchor)?.as_deref() {
@@ -4967,7 +4976,12 @@ mod tests {
 
         let error = preflight_install(&[], &[], &targets, Path::new("aise"), Some(&manifest_path))
             .expect_err("body text must not spoof the managed ownership anchor");
-        assert!(format!("{error:#}").contains("refusing to replace unmanaged"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("refusing to write unmanaged AI Session Search skill")
+                && message.contains("no managed marker and no install record"),
+            "the refusal must name both missing ownership proofs: {message}"
+        );
         assert!(!general_root.exists(), "preflight must publish nothing");
         assert_eq!(
             fs::read_to_string(corrections_root.join("SKILL.md")).unwrap(),
@@ -5017,6 +5031,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A routine integration reinstall must not act like the explicitly destructive
+    /// `skills restore` path when one managed side file changed after installation.
+    #[test]
+    fn integration_reinstall_refuses_a_changed_managed_side_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("skills/ai-session-search");
+        let target = skill_target_for_package(
+            CUSTOM_SKILL_TARGET_LABEL,
+            root.clone(),
+            &AI_SESSION_SEARCH_SKILL_PACKAGE,
+            vec![],
+            vec![],
+        );
+        let config_path = dir.path().join("state/config.toml");
+        let manifest_path = crate::skill_manifest::manifest_path(&config_path);
+        let receipt = dir.path().join("state/install-transaction.json");
+
+        let first = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&target),
+            Path::new("aise"),
+            Some(&manifest_path),
+        )
+        .unwrap();
+        execute_planned_transaction(&receipt, &first).unwrap();
+
+        let policy = root.join("aise-capability.toml");
+        fs::write(&policy, "my retained integration policy\n").unwrap();
+        let manifest_before = fs::read(&manifest_path).unwrap();
+
+        let error = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&target),
+            Path::new("aise"),
+            Some(&manifest_path),
+        )
+        .expect_err("integration reinstall must refuse a changed managed file");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could destroy an edit you meant to keep")
+                && message.contains("skills restore"),
+            "the refusal must explain the retained edit and explicit repair path: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&policy).unwrap(),
+            "my retained integration policy\n",
+            "planning a reinstall must leave the edit untouched"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).unwrap(),
+            manifest_before,
+            "a refused reinstall must not rewrite its ownership evidence"
+        );
+        assert!(
+            !receipt.exists(),
+            "a refused reinstall must not publish a transaction receipt"
+        );
     }
 
     #[test]

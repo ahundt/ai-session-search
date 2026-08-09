@@ -153,8 +153,13 @@ exact manager command, then asks before running it; `--yes` skips confirmation.
 Stable uv, pip, pipx, Cargo, and Homebrew installations update through their
 owning manager. Release-candidate constraints are exact where the manager can
 preserve them safely; other managed installations receive explicit guidance.
-Direct-source developer installations and unknown executables are never
-replaced automatically.
+After a manager update succeeds, the replacement executable refreshes managed
+integrations before the command reports success. Verified native installers
+publish an executable-hash-bound `aise-native-install.json` receipt beside
+`aise`; package status recognizes that owner but requires a separately
+downloaded, checksum-verified archive and an explicit rollback backup for
+replacement. Direct-source developer installations and unknown executables
+are never replaced automatically.
 
 Ordinary interactive CLI commands may print a cached release notice to
 stderr. Disable that notification with

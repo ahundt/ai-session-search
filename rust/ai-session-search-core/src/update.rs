@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::cli::ReportOutputFormat;
 use crate::config::Config;
@@ -28,6 +29,8 @@ const MAX_RELEASE_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const RELEASE_CACHE_FILE_NAME: &str = "release-check.json";
 const REQUESTED_RELEASE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CARGO_INSTALL_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_NATIVE_INSTALL_RECEIPT_BYTES: u64 = 16 * 1024;
+const NATIVE_INSTALL_RECEIPT_NAME: &str = "aise-native-install.json";
 const CRATES_IO_CARGO_SOURCE: &str = "(registry+https://github.com/rust-lang/crates.io-index)";
 const RELEASE_CACHE_SCHEMA_VERSION: u32 = 3;
 const SECONDS_PER_HOUR: u64 = 60 * 60;
@@ -117,6 +120,7 @@ enum ExecutableOwner {
     Pipx,
     Cargo,
     Homebrew,
+    NativeArchive,
     DirectSource,
     Unknown,
 }
@@ -130,6 +134,7 @@ impl ExecutableOwner {
             Self::Pipx => "pipx",
             Self::Cargo => "Cargo",
             Self::Homebrew => "Homebrew",
+            Self::NativeArchive => "native archive",
             Self::DirectSource => "direct source",
             Self::Unknown => "unknown",
         }
@@ -210,6 +215,16 @@ struct CargoInstallMetadata {
 #[derive(Debug, Deserialize)]
 struct CargoInstallRecord {
     bins: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeArchiveReceipt {
+    schema_version: u32,
+    package: String,
+    archive_version: String,
+    target: String,
+    executable_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +314,10 @@ fn detect_executable_owner(evidence: &InstallEvidence) -> ExecutableOwner {
         _ => {}
     }
 
+    if native_archive_receipt(&evidence.executable).is_some() {
+        return ExecutableOwner::NativeArchive;
+    }
+
     if is_homebrew_executable(&evidence.executable) {
         return ExecutableOwner::Homebrew;
     }
@@ -308,6 +327,32 @@ fn detect_executable_owner(evidence: &InstallEvidence) -> ExecutableOwner {
         None => {}
     }
     ExecutableOwner::Unknown
+}
+
+fn native_archive_receipt(executable: &Path) -> Option<(PathBuf, NativeArchiveReceipt)> {
+    let receipt_path = executable.parent()?.join(NATIVE_INSTALL_RECEIPT_NAME);
+    let bytes = read_bounded_regular_file(&receipt_path, MAX_NATIVE_INSTALL_RECEIPT_BYTES).ok()?;
+    let receipt: NativeArchiveReceipt = serde_json::from_slice(&bytes).ok()?;
+    if receipt.schema_version != 1
+        || receipt.package != PACKAGE_NAME
+        || receipt.archive_version.is_empty()
+        || receipt.target.is_empty()
+        || receipt.executable_sha256.len() != 64
+    {
+        return None;
+    }
+    let mut source = File::open(executable).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    (format!("{:x}", hasher.finalize()) == receipt.executable_sha256)
+        .then_some((receipt_path, receipt))
 }
 
 fn is_regular_file_without_symlink(path: &Path) -> bool {
@@ -393,6 +438,22 @@ fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableU
                 PACKAGE_NAME,
             ])),
         ),
+        ExecutableOwner::NativeArchive => {
+            let (receipt_path, receipt) = native_archive_receipt(&evidence.executable)
+                .context("native archive ownership requires an executable-bound install receipt")?;
+            (
+                format!(
+                    "{} binds native archive {} for {} to this executable's SHA-256 digest",
+                    receipt_path.display(),
+                    receipt.archive_version,
+                    receipt.target
+                ),
+                ExecutableUpdateAction::Guidance {
+                    message: "Download the applicable native archive from the GitHub prerelease, verify its SHA256SUMS and build-provenance attestation, then rerun its installer with --replace and an explicit --backup path. Native archives are never downloaded or overwritten automatically; refresh integrations after replacement."
+                        .into(),
+                },
+            )
+        }
         ExecutableOwner::DirectSource => (
             if evidence.direct_url.is_some() {
                 "Python installation metadata records a direct URL or local source".into()
@@ -464,7 +525,9 @@ pub(crate) fn run_package_update(config: &Config, skip_confirmation: bool) -> Re
         println!("update cancelled");
         return Ok(());
     }
-    execute_update_command(argv, environment)
+    let replacement_executable = background_child_executable()
+        .context("could not identify the aise executable that must refresh integrations")?;
+    execute_update_command(argv, environment, &replacement_executable)
 }
 
 fn package_check_report(config: &Config) -> Result<PackageCheckReport> {
@@ -764,7 +827,11 @@ fn confirmation_answer_applies(answer: Option<&str>) -> bool {
     answer.is_empty() || matches!(answer.as_str(), "y" | "yes")
 }
 
-fn execute_update_command(argv: &[String], environment: &BTreeMap<String, String>) -> Result<()> {
+fn execute_update_command(
+    argv: &[String],
+    environment: &BTreeMap<String, String>,
+    replacement_executable: &Path,
+) -> Result<()> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| anyhow!("update command must not be empty"))?;
@@ -779,7 +846,29 @@ fn execute_update_command(argv: &[String], environment: &BTreeMap<String, String
             "update command `{rendered}` exited with {status}; the detected package manager remains the owner, so fix its reported error and rerun the same command"
         );
     }
-    println!("Update command completed. Run `aise --version` to verify the active executable.");
+    let refresh_status = Command::new(replacement_executable)
+        .args(["integrations", "install"])
+        .status()
+        .with_context(|| {
+            format!(
+                "update command `{rendered}` completed, but the updated executable {} could not \
+                 start `integrations install`; the package is updated, so run `{} integrations \
+                 install` after repairing that executable",
+                replacement_executable.display(),
+                replacement_executable.display()
+            )
+        })?;
+    if !refresh_status.success() {
+        bail!(
+            "update command `{rendered}` completed, but `{} integrations install` exited with \
+             {refresh_status}; the package is updated and user-owned integration files were \
+             preserved, so resolve the reported integration error and rerun that exact command",
+            replacement_executable.display()
+        );
+    }
+    println!(
+        "Update command completed and integrations were refreshed. Run `aise --version` to verify the active executable."
+    );
     Ok(())
 }
 
@@ -1398,6 +1487,37 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn successful_manager_update_refreshes_integrations_with_the_replacement_executable() {
+        let temp = TempDir::new().unwrap();
+        let manager = temp.path().join("manager");
+        let replacement = temp.path().join("aise");
+        let refresh_log = temp.path().join("refresh.log");
+        fs::write(&manager, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &replacement,
+            "#!/bin/sh\nscript_dir=$(CDPATH='' cd -- \"$(dirname -- \"$0\")\" && pwd)\nprintf '%s\\n' \"$@\" > \"$script_dir/refresh.log\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+
+        execute_update_command(
+            &[manager.display().to_string()],
+            &BTreeMap::new(),
+            &replacement,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(refresh_log).unwrap(),
+            "integrations\ninstall\n",
+            "the newly installed executable must refresh its owned MCP, instruction, skill, and alias state"
+        );
+    }
+
     #[test]
     fn native_background_child_reexecutes_the_running_binary() {
         let evidence = evidence(PathBuf::from("/opt/aise/bin/aise"));
@@ -1459,6 +1579,30 @@ mod tests {
             plan.action,
             ExecutableUpdateAction::Guidance { .. }
         ));
+    }
+
+    #[test]
+    fn executable_bound_native_receipt_reports_native_archive_ownership() {
+        use sha2::{Digest as _, Sha256};
+
+        let temp = TempDir::new().unwrap();
+        let executable = temp.path().join("aise");
+        write_executable(&executable);
+        let digest = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        fs::write(
+            temp.path().join("aise-native-install.json"),
+            format!(
+                "{{\"schema_version\":1,\"package\":\"ai-session-search\",\"archive_version\":\"1.0.0rc1\",\"target\":\"aarch64-apple-darwin\",\"executable_sha256\":\"{digest}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let plan = plan_package_manager_update(&evidence(executable)).unwrap();
+        assert_eq!(plan.owner, ExecutableOwner::NativeArchive);
+        let ExecutableUpdateAction::Guidance { message } = plan.action else {
+            panic!("native archives must not be overwritten without a verified download")
+        };
+        assert!(message.contains("verify") && message.contains("--replace"));
     }
 
     #[test]
