@@ -393,7 +393,7 @@ jobs:
         with:
           name: verified-python-distributions
           path: dist
-      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           attestations: true
 
