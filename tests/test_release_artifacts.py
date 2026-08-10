@@ -25,8 +25,9 @@ def _wheel(
     entry_points: bytes = b"[console_scripts]\naise=ai_session_search.entrypoint:cli_main\n",
     extra: str | None = None,
     omit: str | None = None,
-    wheel_tag: str = "cp312-abi3-macosx_11_0_arm64",
+    wheel_tag: str | tuple[str, ...] = "cp312-abi3-macosx_11_0_arm64",
 ) -> Path:
+    wheel_tags = (wheel_tag,) if isinstance(wheel_tag, str) else wheel_tag
     files = {
         "ai_session_search/_native.cp312.so": b"native",
         "ai_session_search/__init__.py": b"",
@@ -35,8 +36,10 @@ def _wheel(
         "ai_session_search/py.typed": b"",
         "ai_session_search-1.0.0.dist-info/METADATA": METADATA,
         "ai_session_search-1.0.0.dist-info/WHEEL": (
-            f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {wheel_tag}\n\n".encode()
-        ),
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\n"
+            + "".join(f"Tag: {tag}\n" for tag in wheel_tags)
+            + "\n"
+        ).encode(),
         "ai_session_search-1.0.0.dist-info/entry_points.txt": entry_points,
         "ai_session_search-1.0.0.dist-info/licenses/LICENSE": b"license",
         "ai_session_search-1.0.0.dist-info/licenses/NOTICE": b"notice",
@@ -191,6 +194,17 @@ def test_rejects_wheel_filename_tag_mismatch(tmp_path: Path) -> None:
     )
     with pytest.raises(VerificationError, match="filename tag"):
         verify(wheel)
+
+
+def test_accepts_compressed_wheel_filename_tags(tmp_path: Path) -> None:
+    wheel = _wheel(
+        tmp_path / "ai_session_search-1.0.0-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        wheel_tag=(
+            "cp312-abi3-manylinux_2_17_aarch64",
+            "cp312-abi3-manylinux2014_aarch64",
+        ),
+    )
+    verify(wheel)
 
 
 def test_rejects_wheel_filename_metadata_version_mismatch(tmp_path: Path) -> None:

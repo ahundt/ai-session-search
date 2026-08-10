@@ -112,10 +112,17 @@ def _verify_wheel_tags(
         )
     filename_parts = path.name.removesuffix(".whl").split("-")
     if len(filename_parts) >= 5:
-        filename_tag = "-".join(filename_parts[-3:])
-        if any(tag != filename_tag for tag in tags):
+        python_tag, abi_tag, platform_tag = filename_parts[-3:]
+        filename_tags = {
+            f"{python}-{abi}-{platform}"
+            for python in python_tag.split(".")
+            for abi in abi_tag.split(".")
+            for platform in platform_tag.split(".")
+        }
+        if set(tags) != filename_tags:
             raise VerificationError(
-                f"{path.name}: filename tag {filename_tag!r} differs from WHEEL tags {tags!r}"
+                f"{path.name}: filename tags {sorted(filename_tags)!r} "
+                f"differ from WHEEL tags {tags!r}"
             )
 
 
