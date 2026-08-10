@@ -18,7 +18,22 @@ use sha2::{Digest, Sha256};
 /// Callers digest the **exact bytes they read or wrote**, not a re-serialized value, so that a
 /// whitespace- or comment-only edit still changes the digest.
 pub(crate) fn sha256(content: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(content))
+    lower_hex(Sha256::digest(content).as_ref())
+}
+
+/// Lowercase hex encoding for digest output.
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    push_lower_hex(&mut encoded, bytes);
+    encoded
+}
+
+fn push_lower_hex(encoded: &mut String, bytes: &[u8]) {
+    use std::fmt::Write as _;
+
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
 }
 
 /// Incremental SHA-256 over a domain-separated sequence of length-framed values.
@@ -80,10 +95,7 @@ impl FramedSha256 {
         let bytes = self.digest.finalize();
         let mut encoded = String::with_capacity("sha256:".len() + bytes.len() * 2);
         encoded.push_str("sha256:");
-        for byte in bytes {
-            use std::fmt::Write as _;
-            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
-        }
+        push_lower_hex(&mut encoded, bytes.as_ref());
         encoded
     }
 

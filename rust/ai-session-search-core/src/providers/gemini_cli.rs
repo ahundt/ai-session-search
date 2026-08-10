@@ -9,8 +9,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
+use crate::hashing::sha256;
 use crate::models::{MessageCorrelationAuthority, ParsedSession, Provider, SourceFile};
 use crate::providers::snapshot::{parsed_session_from_raw, source_file, SnapshotMetadata};
 use crate::providers::{walk_roots, ProviderDiscovery};
@@ -204,7 +204,7 @@ fn known_project_paths(gemini_dir: &Path) -> HashMap<String, String> {
     }
     paths
         .into_iter()
-        .map(|path| (format!("{:x}", Sha256::digest(path.as_bytes())), path))
+        .map(|path| (sha256(path.as_bytes()), path))
         .collect()
 }
 
@@ -221,7 +221,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gemini = dir.path().join(".gemini");
         let project = "/tmp/example-project";
-        let hash = format!("{:x}", Sha256::digest(project.as_bytes()));
+        let hash = sha256(project.as_bytes());
         let chats = gemini.join("tmp").join(&hash).join("chats");
         fs::create_dir_all(&chats).unwrap();
         fs::write(

@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 use crate::cli::ReportOutputFormat;
 use crate::config::Config;
 use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
+use crate::hashing::lower_hex;
 use crate::util::{executable_candidates, is_executable_file, render_posix_shell_command};
 
 const PACKAGE_NAME: &str = "ai-session-search";
@@ -379,7 +380,7 @@ fn native_archive_receipt(executable: &Path) -> Option<(PathBuf, NativeArchiveRe
         }
         hasher.update(&buffer[..read]);
     }
-    (format!("{:x}", hasher.finalize()) == receipt.executable_sha256)
+    (lower_hex(hasher.finalize().as_ref()) == receipt.executable_sha256)
         .then_some((receipt_path, receipt))
 }
 
@@ -1677,7 +1678,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let executable = temp.path().join("aise");
         write_executable(&executable);
-        let digest = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        let digest = lower_hex(Sha256::digest(fs::read(&executable).unwrap()).as_ref());
         fs::write(
             temp.path().join("aise-native-install.json"),
             format!(

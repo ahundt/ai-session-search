@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::durable_fs::{entry_exists, sync_file, sync_parent, StagedFile};
+use crate::hashing::lower_hex;
 use crate::indexer::{index_update_lock_path, open_index_update_lock};
 
 #[derive(Debug, Clone)]
@@ -732,7 +733,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(lower_hex(digest.finalize().as_ref()))
 }
 
 fn write_receipt(path: &Path, receipt: &DatabaseMigrationReceipt) -> Result<()> {

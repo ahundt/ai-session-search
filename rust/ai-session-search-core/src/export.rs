@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use sha2::{Digest, Sha256};
 
 use crate::durable_fs::{entry_exists, StagedDirectory};
+use crate::hashing::sha256;
 use crate::models::SessionWithTranscript;
 
 const EXPORT_NAME_PREFIX_CHARS: usize = 80;
@@ -181,7 +181,7 @@ fn export_file_name(session_id: &str, format: ExportFormat) -> PathBuf {
     if prefix.is_empty() || prefix == "." || prefix == ".." {
         prefix = "session".to_string();
     }
-    let hash = format!("{:x}", Sha256::digest(session_id.as_bytes()));
+    let hash = sha256(session_id.as_bytes());
     PathBuf::from(format!(
         "{prefix}-{}.{}",
         &hash[..EXPORT_ID_HASH_HEX_CHARS],

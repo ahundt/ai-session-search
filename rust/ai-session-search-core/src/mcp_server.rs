@@ -387,7 +387,7 @@ impl rmcp::ServerHandler for OfficialMcpServer {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> impl Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>> + Send + '_
+    ) -> impl Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>> + Send + '_
     {
         let inner = Arc::clone(&self.inner);
         let refresh_after_delivery = Arc::clone(&self.refresh_after_delivery);
@@ -464,7 +464,7 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                     .register(request_id, permit)
                     .map_err(|error| rmcp::ErrorData::internal_error(error, None))?;
             }
-            Ok(tool_result)
+            Ok(tool_result.into())
         }
     }
 
@@ -9028,11 +9028,12 @@ mod tests {
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
 
             let peer_info = client.peer_info().expect("server initialization metadata");
-            assert_eq!(peer_info.server_info.name, "ai-session-search");
-            assert_eq!(
-                peer_info.server_info.title.as_deref(),
-                Some("AI Session Search")
-            );
+            let server_info = peer_info
+                .server_info
+                .as_ref()
+                .expect("server initialization metadata includes implementation info");
+            assert_eq!(server_info.name, "ai-session-search");
+            assert_eq!(server_info.title.as_deref(), Some("AI Session Search"));
             assert_eq!(
                 peer_info.instructions.as_deref(),
                 Some(crate::integrations::agent_instructions())
