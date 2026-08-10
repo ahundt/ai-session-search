@@ -85,11 +85,11 @@ enum Commands {
     RefreshIndex,
     /// Rebuild the index from session files (incremental; `--full` reparses everything).
     ///
-    /// Use `aise status` to see what is already indexed, or `aise doctor` when indexing is failing.
+    /// Use `aise doctor` to see what is already indexed or diagnose indexing failures.
     Reindex(ReindexArgs),
     /// Reclaim disk space: merge FTS segments, `VACUUM`, then truncate the WAL.
     ///
-    /// Use `aise status` first to see whether the index is large enough to be worth compacting.
+    /// Use `aise doctor` first to see whether the index is large enough to be worth compacting.
     Compact,
     /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
@@ -170,7 +170,7 @@ enum Commands {
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
     ///
-    /// Use `aise status` for the healthy-path summary, and `aise config paths` to see where files are read from.
+    /// Pass `--format json` for the machine-readable summary, and use `aise config paths` to see where files are read from.
     Doctor(DoctorArgs),
     /// Launch the interactive terminal UI for browsing and resuming sessions.
     ///
@@ -323,7 +323,7 @@ pub(crate) enum ReportOutputFormat {
 enum PackageCmd {
     /// Inspect the running executable, PATH candidates, owner evidence, and manager command.
     ///
-    /// Use `aise package check` to look for a newer release, or `aise status` for index health.
+    /// Use `aise package check` to look for a newer release, or `aise doctor` for index health.
     Status(ReportArgs),
     /// Check GitHub for a newer release in this build's stable or prerelease channel.
     ///
@@ -2608,6 +2608,19 @@ mod tests {
         assert!(!help.contains("all agents"));
         assert!(!help.contains("__refresh-index"));
         assert!(help.contains("Overrides AI_SESSION_SEARCH_INDEX_REFRESH and config.toml"));
+    }
+
+    #[test]
+    fn help_never_recommends_removed_root_status_command() {
+        for args in [
+            &["aise", "reindex", "--help"][..],
+            &["aise", "compact", "--help"],
+            &["aise", "doctor", "--help"],
+            &["aise", "package", "status", "--help"],
+        ] {
+            let help = Cli::try_parse_from(args).unwrap_err().to_string();
+            assert!(!help.contains("`aise status`"), "{help}");
+        }
     }
 
     #[test]
