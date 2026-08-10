@@ -48,7 +48,7 @@ jobs:
           mkdir dist
           cp "$first" dist/
           python -m scripts.verify_release_artifacts dist/*.crate
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: crate
           path: dist/*.crate
@@ -101,7 +101,7 @@ jobs:
           uv run --isolated --no-project --with "$wheel" \
             python scripts/verify_installed_distribution.py \
               --source-root "$GITHUB_WORKSPACE"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
@@ -194,7 +194,7 @@ jobs:
           & (Join-Path $bundle.FullName 'install.ps1') -BinDir $bin
           uv run --isolated --no-project python scripts/verify_native_executable.py \
             --executable (Join-Path $bin 'aise.exe')
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: native-${{ matrix.target }}
           path: dist/*
@@ -225,7 +225,7 @@ jobs:
           uv run --isolated --no-project --with "$sdist" \
             python scripts/verify_installed_distribution.py \
               --source-root "$GITHUB_WORKSPACE"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -265,7 +265,7 @@ jobs:
             echo "machine-local path leaked into SBOM" >&2
             exit 1
           fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: dependency-sboms
           path: sbom/*.cdx.json
@@ -318,26 +318,26 @@ jobs:
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
           subject-path: dist/*
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: verified-python-distributions
           path: |
             dist/*.whl
             dist/ai_session_search-*.tar.gz
           if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: verified-native-distributions
           path: |
             dist/ai-session-search-*.tar.gz
             dist/ai-session-search-*.zip
           if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: verified-crate-distribution
           path: dist/*.crate
           if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: verified-release-metadata
           path: |

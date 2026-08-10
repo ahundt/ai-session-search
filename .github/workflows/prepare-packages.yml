@@ -40,7 +40,7 @@ jobs:
           enable-cache: false
       - run: cargo package --locked -p ai-session-search
       - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts target/package/*.crate
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: prepared-rust-package
           path: target/package/*.crate
@@ -77,7 +77,7 @@ jobs:
           args: --release --locked --out dist
       - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*.whl
         shell: bash
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: prepared-python-wheel-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
@@ -103,7 +103,7 @@ jobs:
         shell: bash
       - run: uv run --isolated --no-project --with ./dist/*.tar.gz python scripts/verify_installed_distribution.py --source-root "$GITHUB_WORKSPACE"
         shell: bash
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: prepared-python-sdist
           path: dist/*.tar.gz
