@@ -134,10 +134,20 @@ between the workflow parking at `crates-io` and approving that environment:
    what the workflow attested:
 
    ```bash
+   git checkout --detach v1.0.0rc1
    gh run download <run-id> --name verified-crate-distribution --dir attested
    cargo package --locked --no-verify -p ai-session-search
    cmp attested/*.crate target/package/ai-session-search-1.0.0-rc.1.crate
    ```
+
+   The detached checkout is load-bearing, not tidiness. `cargo package` writes
+   `.cargo_vcs_info.json` into the crate recording the commit it was built from,
+   so building from `main` after even a docs-only commit produces a different
+   sha256 while every packaged file is identical. Publishing that crate consumes
+   the version with bytes the attestation does not cover, `publish-crate` then
+   fails the checksum comparison on every retry, and because registry versions
+   are immutable and `cargo yank` does not free the number, the only exits are a
+   new version or shipping unattested bytes. `cmp` catches this; run it.
 
 2. Only if `cmp` is silent, explicitly authorize and run:
 
