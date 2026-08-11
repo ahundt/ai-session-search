@@ -412,6 +412,11 @@ else
     printf '  go install github.com/rhysd/actionlint/cmd/actionlint@latest\n'
 fi
 
+# actionlint hands run: bodies to shellcheck, which only understands POSIX shells,
+# so a `shell: pwsh` step is unparsed until a runner executes it. This reports its
+# own skip when PowerShell is absent.
+step "Workflow PowerShell syntax" uv run --script scripts/check_workflow_powershell.py
+
 printf '\n%b=== Summary ===%b\nPassed: %s\n' "$BOLD" "$NC" "$PASSED_COUNT"
 if [ "$FAILED_COUNT" -gt 0 ]; then
     printf '%bFailed: %s%b\n%b\n' "$RED" "$FAILED_COUNT" "$NC" "$FAILED_NAMES"

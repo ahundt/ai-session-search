@@ -42,6 +42,10 @@ jobs:
       # shellcheck is preinstalled on the runner, so actionlint also lints every `run:` body.
       - name: Check workflow syntax, expressions, and shell bodies
         run: actionlint
+      # shellcheck only understands POSIX shells, so actionlint never parses a
+      # `shell: pwsh` body. PowerShell is preinstalled on this runner.
+      - name: Parse the PowerShell run bodies actionlint cannot
+        run: uv run --script scripts/check_workflow_powershell.py
       - name: Audit workflow security without GitHub API access
         run: uv tool run --from 'zizmor==${{ env.ZIZMOR_VERSION }}' zizmor --offline .
 
