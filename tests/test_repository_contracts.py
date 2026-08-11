@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import re
 import subprocess
@@ -527,6 +528,60 @@ def test_gh_cli_calls_name_the_repository_when_the_job_has_no_checkout() -> None
     assert not offenders, (
         "gh runs without a checkout and without --repo, so it cannot resolve the "
         f"repository: {offenders}"
+    )
+
+
+_ARTIFACT_STEP = re.compile(r"^(\s*)- uses: actions/(upload|download)-artifact@")
+_ARTIFACT_KEY = re.compile(r"^\s*(name|pattern):\s*(\S.*?)\s*$")
+_CALLED_WORKFLOW = re.compile(r"^\s*uses:\s*\./(\.github/workflows/[A-Za-z0-9._-]+)\s*$", re.M)
+
+
+def _artifact_flows(text: str) -> tuple[set[str], set[str]]:
+    """Return the artifact names a workflow uploads and the ones it asks to download."""
+    uploaded: set[str] = set()
+    requested: set[str] = set()
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        step = _ARTIFACT_STEP.match(line)
+        if step is None:
+            continue
+        indent, direction = step.group(1), step.group(2)
+        for follower in lines[index + 1 :]:
+            # The next step starts at the same indent, which ends this step's `with:`.
+            if follower.strip() and len(follower) - len(follower.lstrip()) <= len(indent):
+                break
+            key = _ARTIFACT_KEY.match(follower)
+            if key is None:
+                continue
+            value = key.group(2).strip("'\"")
+            if direction == "upload":
+                if key.group(1) == "name":
+                    # A matrix name is one template standing for many real artifacts.
+                    uploaded.add(re.sub(r"\$\{\{[^}]*\}\}", "*", value))
+            else:
+                requested.add(value)
+    return uploaded, requested
+
+
+def test_every_downloaded_artifact_is_uploaded_by_the_same_run() -> None:
+    # download-artifact fails the job when no artifact carries the name, and the jobs that
+    # download are the last ones in the pipeline: `release` runs after crates.io and PyPI
+    # have both published, where a failure is unrecoverable for that version. Renaming an
+    # upload is a one-line edit whose only consequence appears at that point. The `test`
+    # job calls ci.yml as a reusable workflow, so its uploads are in the same run and
+    # count here; that is how `dependency-license-inventories` reaches `verify`.
+    offenders: list[str] = []
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        text = workflow.read_text(encoding="utf-8")
+        uploaded, requested = _artifact_flows(text)
+        for called in _CALLED_WORKFLOW.findall(text):
+            uploaded |= _artifact_flows((ROOT / called).read_text(encoding="utf-8"))[0]
+        for name in sorted(requested):
+            if not any(fnmatch.fnmatchcase(candidate, name) for candidate in uploaded):
+                offenders.append(f"{workflow.name}: downloads {name!r}, uploaded={sorted(uploaded)}")
+
+    assert not offenders, (
+        "a job downloads an artifact name that no job in the same run uploads: " f"{offenders}"
     )
 
 
