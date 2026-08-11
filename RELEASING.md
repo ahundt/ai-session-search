@@ -240,9 +240,17 @@ verification, and attestation pipeline and uploads to TestPyPI. Confirm it
 installs:
 
 ```bash
-uv run --isolated --with-index https://test.pypi.org/simple/ \
+uv run --isolated --no-project --default-index https://test.pypi.org/simple/ \
   --with ai-session-search==1.0.0rc1 aise --version
 ```
+
+`--default-index` replaces PyPI rather than adding to it, so the command fails
+if anything has to come from the production index. That is the stronger check
+and it holds here because every `Requires-Dist` entry in the wheel is gated
+behind `extra == 'dev'`, leaving no runtime dependency to resolve. A project
+with runtime dependencies absent from TestPyPI needs `--index` and
+`--index-strategy unsafe-best-match` instead. `--no-project` keeps this
+checkout's own `pyproject.toml` out of the resolution.
 
 `publish-crate`, `publish`, and `release` are gated on `github.event_name ==
 'push'` and `publish-testpypi` on `workflow_dispatch`, and those are the only
