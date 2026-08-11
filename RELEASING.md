@@ -115,6 +115,27 @@ crates.io requires the crate to exist before its trusted publisher can be
 registered. Do not manually publish RC1 because the tag workflow must publish
 that unused version.
 
+crates.io has no pending-publisher equivalent to PyPI's, so exactly one manual
+publish is unavoidable; see
+[RFC 3691](https://rust-lang.github.io/rfcs/3691-trusted-publishing-cratesio.html).
+That publish cannot carry the workflow's guarantees: every one of them needs
+`publish.yml` to run, its crate job needs trusted publishing, and trusted
+publishing needs the crate to exist. The bootstrap crate is therefore built
+locally with no attestation, no SBOM, no reproduction check, and no matching
+Python distribution.
+
+Do not yank it afterwards. The bootstrap carries the same source as the release
+that follows and is a working crate, so it meets none of the conditions Cargo
+names for yanking: "an accidental publish, unintentional SemVer breakages, or a
+significantly broken and unusable crate"
+([cargo yank](https://doc.rust-lang.org/cargo/commands/cargo-yank.html)).
+Yanking a sound version signals a defect that does not exist.
+
+Use a pre-release version such as `1.0.0-rc.0`, not a stable `0.0.1` or
+`0.1.0`. Cargo does not resolve pre-release versions by default, so between the
+bootstrap and the first real release `cargo add ai-session-search` reports no
+stable version instead of installing the placeholder.
+
 1. Create and review a dedicated bootstrap commit with all seven declarations
    set to `1.0.0rc0` or `1.0.0-rc.0` as appropriate. Refresh both lockfiles.
 2. Run `./run_ci_local.sh`, then package, inspect, and dry-run the exact crate:
@@ -136,7 +157,10 @@ that unused version.
    ```
 
 5. Register the crates.io trusted publisher, revoke the bootstrap token, and
-   run `cargo logout`.
+   run `cargo logout`. A token created for this bootstrap should not outlive
+   it; a pre-existing general-purpose token is the maintainer's to keep, but
+   while one with `publish-new` or `publish-update` survives, the crate can
+   still be published outside the workflow and outside its approvals.
 6. Restore all seven declarations to RC1, refresh the lockfiles, and rerun the
    complete RC1 gate. Do not create `v1.0.0rc1` before this is green.
 
