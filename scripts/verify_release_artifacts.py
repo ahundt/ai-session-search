@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import datetime as dt
 import email.parser
 import hashlib
 import json
@@ -34,6 +35,8 @@ NATIVE_ARCHIVE_PATTERN = re.compile(
     r"^(?P<root>ai-session-search-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*)\.(?:tar\.gz|zip)$"
 )
 CRATE_PATTERN = re.compile(r"^ai-session-search-(?P<version>[0-9][A-Za-z0-9.+-]*)\.crate$")
+# PEP 770 places SBOMs here. maturin writes one CycloneDX document per wheel.
+WHEEL_SBOM_PATTERN = re.compile(r"\.dist-info/sboms/[^/]+\.json$")
 EXPECTED_NATIVE_TARGETS = {
     "x86_64-unknown-linux-gnu": "tar.gz",
     "aarch64-unknown-linux-gnu": "tar.gz",
@@ -170,6 +173,61 @@ def verify_wheel(path: pathlib.Path) -> None:
     native_pattern = re.compile(r"^_native(?:\.[^.]+)*\.(?:so|pyd|dylib)$")
     if not any(item and native_pattern.match(item[-1]) for item in parts):
         raise VerificationError(f"{path.name}: missing native extension module")
+
+
+def verify_wheel_build_clock(path: pathlib.Path, source_date_epoch: int) -> None:
+    """Require every embedded SBOM to prove the build observed the pinned clock.
+
+    maturin stamps each PEP 770 SBOM with the wall clock and a fresh serialNumber unless
+    SOURCE_DATE_EPOCH reaches the build. The manylinux wheels build inside a container
+    that does not inherit the runner environment, so the workflow can export the variable
+    and the container can still never receive it. Nothing else in the pipeline notices:
+    the wheel installs, passes every other check, and simply cannot be rebuilt.
+
+    Measured with maturin 1.14.1 by building one commit both ways: with the variable
+    exported, metadata.timestamp is exactly that epoch and serialNumber is absent;
+    without it, the timestamp is the build clock and serialNumber is a fresh UUID. Those
+    two fields were the whole byte difference between the v1.0.0rc1 production and
+    TestPyPI wheels, whose 13 other zip entries matched.
+    """
+    expected = dt.datetime.fromtimestamp(source_date_epoch, tz=dt.UTC)
+    with zipfile.ZipFile(path) as archive:
+        names = sorted(name for name in archive.namelist() if WHEEL_SBOM_PATTERN.search(name))
+        if not names:
+            raise VerificationError(
+                f"{path.name}: no embedded SBOM, so nothing records whether the build "
+                f"observed SOURCE_DATE_EPOCH={source_date_epoch}"
+            )
+        for name in names:
+            try:
+                document = json.loads(archive.read(name))
+            except json.JSONDecodeError as error:
+                raise VerificationError(f"{path.name}: {name} is not valid JSON: {error}") from error
+            metadata = document.get("metadata") if isinstance(document, dict) else None
+            recorded = metadata.get("timestamp") if isinstance(metadata, dict) else None
+            if not isinstance(recorded, str):
+                raise VerificationError(f"{path.name}: {name} has no metadata.timestamp")
+            try:
+                observed = dt.datetime.fromisoformat(recorded)
+            except ValueError as error:
+                raise VerificationError(
+                    f"{path.name}: {name} has an unparseable metadata.timestamp {recorded!r}"
+                ) from error
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=dt.UTC)
+            if observed != expected:
+                raise VerificationError(
+                    f"{path.name}: {name} records build time {recorded!r} instead of "
+                    f"SOURCE_DATE_EPOCH={source_date_epoch} ({expected.isoformat()}). "
+                    "The build never received the pinned clock, so this wheel cannot be "
+                    "reproduced from its commit."
+                )
+            if "serialNumber" in document:
+                raise VerificationError(
+                    f"{path.name}: {name} carries serialNumber {document['serialNumber']!r}. "
+                    "maturin omits it when the build observes SOURCE_DATE_EPOCH, and a "
+                    "per-build UUID changes the wheel's bytes on its own."
+                )
 
 
 def _verify_sdist_identity(
@@ -441,6 +499,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("artifacts", nargs="+", type=pathlib.Path)
     parser.add_argument("--release-set", action="store_true")
     parser.add_argument("--version")
+    # Pass this in the job that builds the wheels, where SOURCE_DATE_EPOCH is set. The
+    # verify job checks downloaded artifacts and has no build clock to compare against.
+    parser.add_argument("--source-date-epoch", type=int)
     args = parser.parse_args(argv)
     try:
         if args.release_set:
@@ -454,6 +515,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             if is_distribution:
                 verify(artifact)
+                if args.source_date_epoch is not None and artifact.suffix == ".whl":
+                    verify_wheel_build_clock(artifact, args.source_date_epoch)
                 print(f"verified: {artifact}")
             elif not args.release_set:
                 raise VerificationError(f"unsupported artifact type: {artifact.name}")

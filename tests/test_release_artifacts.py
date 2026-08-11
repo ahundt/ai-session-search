@@ -14,9 +14,15 @@ from pathlib import Path
 import pytest
 
 from scripts.package_native_release import PackagingError, package_native_release
-from scripts.verify_release_artifacts import VerificationError, verify, verify_release_set
+from scripts.verify_release_artifacts import (
+    VerificationError,
+    verify,
+    verify_release_set,
+    verify_wheel_build_clock,
+)
 
 METADATA = b"Name: ai-session-search\nVersion: 1.0.0\nLicense-Expression: Apache-2.0\n\n"
+SBOM_MEMBER = "ai_session_search-1.0.0.dist-info/sboms/ai-session-search-python.cyclonedx.json"
 
 
 def _wheel(
@@ -25,6 +31,7 @@ def _wheel(
     entry_points: bytes = b"[console_scripts]\naise=ai_session_search.entrypoint:cli_main\n",
     extra: str | None = None,
     omit: str | None = None,
+    sbom: dict[str, object] | None = None,
     wheel_tag: str | tuple[str, ...] = "cp312-abi3-macosx_11_0_arm64",
 ) -> Path:
     wheel_tags = (wheel_tag,) if isinstance(wheel_tag, str) else wheel_tag
@@ -44,6 +51,8 @@ def _wheel(
         "ai_session_search-1.0.0.dist-info/licenses/LICENSE": b"license",
         "ai_session_search-1.0.0.dist-info/licenses/NOTICE": b"notice",
     }
+    if sbom is not None:
+        files[SBOM_MEMBER] = json.dumps(sbom).encode()
     if omit is not None:
         files.pop(omit, None)
     if extra:
@@ -136,6 +145,77 @@ def test_rejects_wheel_without_aise_entry_point(tmp_path: Path) -> None:
     )
     with pytest.raises(VerificationError, match="entry_points"):
         verify(wheel)
+
+
+# maturin stamps every embedded PEP 770 SBOM with the build clock and a fresh
+# serialNumber unless SOURCE_DATE_EPOCH reaches the build. The manylinux wheels build
+# inside a container that does not inherit the runner environment, so the workflow can
+# export the variable on the runner and the container can still never receive it. The
+# only consequence is a wheel nobody can rebuild, which no other check notices.
+#
+# Measured on this repository by building the same commit twice: with SOURCE_DATE_EPOCH
+# exported, metadata.timestamp is exactly that epoch and serialNumber is absent; without
+# it, the timestamp is the wall clock and serialNumber is a fresh UUID. Those two fields
+# were the entire byte difference between the v1.0.0rc1 production and TestPyPI wheels.
+PINNED_EPOCH = 1786486656
+PINNED_TIMESTAMP = "2026-08-11T22:17:36.000000000Z"
+
+
+def test_accepts_wheel_whose_sbom_carries_the_pinned_build_clock(tmp_path: Path) -> None:
+    wheel = _wheel(
+        tmp_path / "package.whl",
+        sbom={"bomFormat": "CycloneDX", "metadata": {"timestamp": PINNED_TIMESTAMP}},
+    )
+
+    verify_wheel_build_clock(wheel, PINNED_EPOCH)
+
+
+def test_rejects_wheel_whose_sbom_kept_the_build_clock(tmp_path: Path) -> None:
+    # The exact shape of a manylinux container that never received the variable.
+    wheel = _wheel(
+        tmp_path / "package.whl",
+        sbom={
+            "bomFormat": "CycloneDX",
+            "serialNumber": "urn:uuid:6addf838-e331-4d51-9009-bc594048d465",
+            "metadata": {"timestamp": "2026-08-11T05:01:43.751894000Z"},
+        },
+    )
+
+    with pytest.raises(VerificationError, match="SOURCE_DATE_EPOCH"):
+        verify_wheel_build_clock(wheel, PINNED_EPOCH)
+
+
+def test_rejects_wheel_whose_sbom_carries_a_fresh_serial_number(tmp_path: Path) -> None:
+    # A pinned timestamp alone is not reproducibility: a random serialNumber changes the
+    # wheel's bytes on its own, so it has to fail even when the clock looks right.
+    wheel = _wheel(
+        tmp_path / "package.whl",
+        sbom={
+            "bomFormat": "CycloneDX",
+            "serialNumber": "urn:uuid:d2204b43-cb2d-490c-9828-6e2ebac4cf49",
+            "metadata": {"timestamp": PINNED_TIMESTAMP},
+        },
+    )
+
+    with pytest.raises(VerificationError, match="serialNumber"):
+        verify_wheel_build_clock(wheel, PINNED_EPOCH)
+
+
+def test_rejects_wheel_with_no_sbom_to_check(tmp_path: Path) -> None:
+    # Skipping the check when no SBOM is found would turn maturin dropping PEP 770
+    # support into a silent loss of the only evidence the epoch arrived.
+    with pytest.raises(VerificationError, match="no embedded SBOM"):
+        verify_wheel_build_clock(_wheel(tmp_path / "package.whl"), PINNED_EPOCH)
+
+
+def test_rejects_wheel_whose_sbom_timestamp_is_unparseable(tmp_path: Path) -> None:
+    wheel = _wheel(
+        tmp_path / "package.whl",
+        sbom={"bomFormat": "CycloneDX", "metadata": {"timestamp": "not a timestamp"}},
+    )
+
+    with pytest.raises(VerificationError, match="timestamp"):
+        verify_wheel_build_clock(wheel, PINNED_EPOCH)
 
 
 @pytest.mark.parametrize(

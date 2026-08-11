@@ -107,8 +107,17 @@ jobs:
           # The manylinux targets build inside a container, which does not inherit the
           # runner environment, so the variable has to be forwarded explicitly.
           docker-options: -e SOURCE_DATE_EPOCH
-      - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*.whl
+      # Exporting the variable and forwarding it into the container are two separate
+      # claims, and only the wheel itself can settle the second. maturin writes the epoch
+      # into the embedded SBOM's metadata.timestamp and drops serialNumber when it sees
+      # it, so comparing that timestamp proves the build received the pin. Without this a
+      # container that never got the variable still produces a wheel that installs and
+      # passes every other check, and is simply not reproducible from its commit.
+      - name: Verify the wheel and that the build observed the pinned clock
         shell: bash
+        run: >-
+          uv run --isolated --no-project python -m scripts.verify_release_artifacts
+          --source-date-epoch "$SOURCE_DATE_EPOCH" dist/*.whl
       - name: Smoke-test the exact wheel on its matching native runner
         shell: bash
         run: |

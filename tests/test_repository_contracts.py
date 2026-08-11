@@ -472,6 +472,19 @@ def test_wheels_and_native_jobs_pin_the_build_timestamp_to_the_commit() -> None:
     assert "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" in jobs["native"]
 
 
+def test_wheels_job_proves_the_pinned_build_clock_reached_the_build() -> None:
+    # Exporting SOURCE_DATE_EPOCH and forwarding it with docker-options are two separate
+    # claims, and the second one crosses a container boundary that nothing observes. If
+    # the forwarding silently stopped working the wheels would still build, install, and
+    # pass every other check; they would just no longer be reproducible from the commit.
+    # Passing the epoch to the verifier turns that into a build failure: measured against
+    # the real v1.0.0rc1 production wheel, which was built before the pin existed, the
+    # check rejects it and names the recorded build time.
+    wheels = _workflow_jobs((ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8"))["wheels"]
+
+    assert '--source-date-epoch "$SOURCE_DATE_EPOCH"' in wheels
+
+
 def _workflow_jobs(text: str) -> dict[str, str]:
     """Split a workflow into job name -> job body, keyed on the two-space job indent."""
     body = text.split("\njobs:\n", 1)[1]

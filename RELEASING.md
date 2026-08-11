@@ -342,7 +342,10 @@ repointed at a different commit. The maintainer holds that role and is unaffecte
 `publish.yml` then:
 
 1. reruns the reusable CI and metadata gates;
-2. builds each wheel, native archive, sdist, and crate once;
+2. builds each wheel, native archive, sdist, and crate once, pinning the build
+   clock to the commit and then requiring each wheel's embedded SBOM to record
+   that exact clock, so a manylinux container that never received the pin fails
+   the job instead of shipping a wheel that cannot be rebuilt from its commit;
 3. installs and tests the exact artifacts on their target runners;
 4. verifies the complete artifact set, writes `SHA256SUMS`, and creates GitHub
    build-provenance attestations;
