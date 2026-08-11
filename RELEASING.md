@@ -11,14 +11,16 @@ Never rebuild between verification and publication.
 
 ## Current release identity
 
-The release being prepared is `1.0.0rc1` for Python and `1.0.0-rc.1` for
-Cargo. Its tag is `v1.0.0rc1`.
+`1.0.0rc1` / `1.0.0-rc.1` is **published** to crates.io, PyPI, and as GitHub
+release `v1.0.0rc1`. The working tree still declares it, which is correct until
+the next release bumps it.
 
-Keep all seven declarations aligned. The consumer crate stays unpublished at
+Preparing a release means setting all seven declarations to the new version in
+one commit, then tagging that commit. The consumer crate stays unpublished at
 `0.0.0`; only its requirement on the released core crate carries the release
 version:
 
-| Location | Field | Required RC1 value |
+| Location | Field | Value (currently `1.0.0rc1` / `1.0.0-rc.1`) |
 | --- | --- | --- |
 | `pyproject.toml` | `project.version` | `1.0.0rc1` |
 | `rust/ai-session-search-core/Cargo.toml` | `package.version` | `1.0.0-rc.1` |
@@ -51,32 +53,41 @@ Pinned release tools are uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
 
 ## Release blockers
 
-Do not create the RC1 tag until all of these are complete:
+Registration is done once and holds for every later release. These were
+completed for `v1.0.0rc1` and need only confirming, not redoing:
 
-- The crates.io account exists and its email is verified. The crate name itself
-  is claimed after the tag rather than before it, and its trusted publisher is
-  registered after that; see the name bootstrap below.
-- The pending PyPI trusted publisher matches project `ai-session-search`,
-  repository `ahundt/ai-session-search`, workflow `publish.yml`, and
-  environment `pypi`.
+- The crates.io crate exists and its trusted publisher is registered for
+  repository `ahundt/ai-session-search`, workflow `publish.yml`, environment
+  `crates-io`. Confirm at
+  `https://crates.io/crates/ai-session-search/settings`.
+- The PyPI trusted publisher is registered for the same repository, workflow,
+  and environment `pypi`. It was a pending publisher until the first upload
+  created the project, and is now an ordinary project publisher.
 - GitHub environments `crates-io`, `pypi`, and `release` have the intended
   maintainers and approval rules.
 - The `release-tags` ruleset is active over `refs/tags/v*`:
   `gh api repos/ahundt/ai-session-search/rulesets`.
-- The exact RC1 commit passes the local gate and package preparation below.
-- The message-search response shape is the one you intend to publish. Until this
-  tag exists, `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION` stays at 1 because an
-  increment signals a consumer that does not exist; afterwards, removing a field,
-  renaming one, changing a type, or changing what a value means requires an
-  increment across the serializer, the closed MCP `outputSchema`, the Python
-  stubs, and every fixture. See `REQ006-report-extent-honestly` in
-  `docs/development/maintainer-requirements-and-design-decisions.md`. Reshaping
-  is cheap before this line and expensive after it.
+
+Do not create a tag until these are also true of the specific release:
+
+- The exact release commit passes the local gate and package preparation below.
+- Every declaration in the identity table is the new version, and the metadata
+  gate passes against the tag you are about to create.
+- The message-search response shape is the one you intend to publish.
+  **`v1.0.0rc1` is published, so the cheap-reshaping window is closed.**
+  Removing a field, renaming one, changing a type, or changing what a value
+  means now requires incrementing `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION`
+  across the serializer, the closed MCP `outputSchema`, the Python stubs, and
+  every fixture. See `REQ006-report-extent-honestly` in
+  `docs/development/maintainer-requirements-and-design-decisions.md`.
 
 These are release blocking because the workflow publishes in the order
 crates.io, PyPI, then GitHub Release. Registry versions are immutable.
 
 ## One-time account and publisher setup
+
+Both registries are already set up; this section records how, for recovery and
+for anyone reproducing the project elsewhere.
 
 ### crates.io
 
@@ -84,7 +95,7 @@ crates.io, PyPI, then GitHub Release. Registry versions are immutable.
    and create a short-lived API token.
 2. Run `cargo login` and enter that token. Cargo stores it in
    `~/.cargo/credentials.toml`.
-3. Use the token only for the name bootstrap below.
+3. Use the token only for the manual publish that creates the crate.
 4. After the trusted publisher is registered, revoke the token and run
    `cargo logout`.
 
@@ -107,19 +118,28 @@ The existing `ai-session-tools` project and its history cannot be renamed or
 merged into `ai-session-search`. Publish a final deprecation pointer there
 only as a separate maintainer decision.
 
-## One-time crates.io name bootstrap
+## Manual crate publish: done for rc1, fallback only
 
-crates.io requires the crate to exist before its trusted publisher can be
-registered, and it has no pending-publisher equivalent to PyPI's, so exactly one
-manual publish is unavoidable; see
+**This is no longer part of the normal path.** crates.io requires the crate to
+exist before its trusted publisher can be registered, and it has no
+pending-publisher equivalent to PyPI's, so exactly one manual publish was
+unavoidable; see
 [RFC 3691](https://rust-lang.github.io/rfcs/3691-trusted-publishing-cratesio.html).
+That happened for `1.0.0-rc.1`, and the trusted publisher is registered, so
+`publish-crate` publishes through the workflow from now on.
 
-Publish the release version itself. A placeholder such as `1.0.0-rc.0` would
-consume a version number nobody installs and invite a yank that is not
-warranted, and it is unnecessary: the `crate` job builds the crate twice and
-requires `cmp` to pass, so `cargo package` output is deterministic, and a local
-`cargo package --locked --no-verify` at the tagged commit reproduces the
-workflow's attested crate byte for byte. Verify that rather than assume it.
+Caveat worth knowing: rc1 *skipped* `cargo publish` because the version was
+already on the registry when the job ran, so the trusted-publisher path is
+configured but has never actually executed. The next release is the first to
+exercise it. Keep the procedure below for that failure, and for any later
+situation where the workflow cannot obtain credentials.
+
+The version published by hand is the release version itself, never a placeholder
+such as `1.0.0-rc.0`: a placeholder consumes a version number nobody installs
+and invites a yank that is not warranted, and it is unnecessary because the
+`crate` job builds the crate twice and requires `cmp` to pass, so `cargo
+package` output is deterministic and reproduces the workflow's attested crate
+byte for byte. Verify that rather than assume it.
 
 The tag workflow still runs end to end afterwards. Its `publish-crate` job
 compares the registry's recorded sha256 against the attested crate: a matching
@@ -155,15 +175,21 @@ between the workflow parking at `crates-io` and approving that environment:
    cargo publish --locked -p ai-session-search
    ```
 
-3. Register the crates.io trusted publisher for repository
+3. Confirm the crates.io trusted publisher still matches repository
    `ahundt/ai-session-search`, workflow `publish.yml`, and environment
-   `crates-io`. This release no longer needs it, because `publish-crate` now
-   skips, but every later release publishes through it.
-4. Revoke the bootstrap token and run `cargo logout`. A token created for this
-   bootstrap should not outlive it; a pre-existing general-purpose token is the
-   maintainer's to keep, but while one with `publish-new` or `publish-update`
-   survives, the crate can still be published outside the workflow and outside
-   its approvals.
+   `crates-io`. It was registered after the rc1 bootstrap; this step is a check,
+   not a re-registration.
+4. Revoke any token created for this publish and run `cargo logout`. A token
+   minted for a one-off publish should not outlive it; a pre-existing
+   general-purpose token is the maintainer's to keep, but while one with
+   `publish-new` or `publish-update` survives, the crate can still be published
+   outside the workflow and outside its approvals.
+
+   crates.io can enforce this rather than leaving it to token hygiene. The crate
+   settings page offers "Require trusted publishing for all new versions", which
+   rejects token-authenticated publishes outright. It also blocks this manual
+   procedure, so enable it only once a workflow publish has actually succeeded —
+   which has not happened yet, because rc1's `publish-crate` skipped.
 5. Approve `crates-io`, and confirm the job logs the skip rather than
    publishing a second time.
 
@@ -206,7 +232,7 @@ hide it. If plain installs must not reach a pre-release before 1.0.0, the only
 real options are to not publish an RC to the public registries at all, or to say
 so in the README.
 
-## RC1 local gate
+## Local gate
 
 The authoritative local gate creates isolated config, cache, and database
 state. It quarantines and checksum-restores any source-tree native extension,
