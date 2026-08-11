@@ -3,6 +3,11 @@ name: Build and publish distributions
 on:
   push:
     tags: ['v*']
+  # Rehearse the Python half against TestPyPI. Dispatch this against the
+  # release tag itself, so the rehearsal builds the same commit the release
+  # will. It publishes only to TestPyPI: crates.io has no test registry, and
+  # the production publish and GitHub Release jobs stay bound to a tag push.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -349,6 +354,7 @@ jobs:
 
   publish-crate:
     needs: verify
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: crates-io
@@ -414,8 +420,27 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
+  publish-testpypi:
+    needs: verify
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: verified-python-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true
+
   publish:
     needs: [verify, publish-crate]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi
@@ -432,6 +457,7 @@ jobs:
 
   release:
     needs: [verify, publish-crate, publish]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
