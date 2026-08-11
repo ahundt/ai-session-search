@@ -454,6 +454,51 @@ def test_release_checksums_validate_beside_downloaded_assets() -> None:
     assert "sha256sum dist/* > dist/SHA256SUMS" not in workflow
 
 
+def _workflow_jobs(text: str) -> dict[str, str]:
+    """Split a workflow into job name -> job body, keyed on the two-space job indent."""
+    body = text.split("\njobs:\n", 1)[1]
+    jobs: dict[str, str] = {}
+    name: str | None = None
+    lines: list[str] = []
+    for line in body.splitlines():
+        header = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+        if header:
+            if name is not None:
+                jobs[name] = "\n".join(lines)
+            name = header.group(1)
+            lines = []
+        elif name is not None:
+            lines.append(line)
+    if name is not None:
+        jobs[name] = "\n".join(lines)
+    return jobs
+
+
+def test_gh_cli_calls_name_the_repository_when_the_job_has_no_checkout() -> None:
+    # `gh` resolves the target repository from the git remote. A job that only downloads
+    # artifacts has no working tree, so gh exits 1 with "fatal: not a git repository"
+    # before it does anything. That failed the `release` job of the v1.0.0rc1 run after
+    # crates.io and PyPI had both published, leaving the tag without a GitHub Release.
+    # Every gh operation used here is API-backed, so naming the repository is enough.
+    offenders: list[str] = []
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        for job_name, job in _workflow_jobs(workflow.read_text(encoding="utf-8")).items():
+            if "actions/checkout" in job:
+                continue
+            calls = [
+                line.strip()
+                for line in job.splitlines()
+                if re.match(r"\s*gh\s+[a-z-]+", line) and not line.lstrip().startswith("#")
+            ]
+            if calls and "--repo" not in job:
+                offenders.append(f"{workflow.name}:{job_name}: {calls[0]}")
+
+    assert not offenders, (
+        "gh runs without a checkout and without --repo, so it cannot resolve the "
+        f"repository: {offenders}"
+    )
+
+
 def test_msrv_job_compiles_library_tests() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     msrv_job = workflow.split("  rust-msrv:\n", 1)[1].split("\n  rust-portability:", 1)[0]
