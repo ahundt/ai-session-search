@@ -71,6 +71,8 @@ jobs:
           enable-cache: false
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
+          # Same maturin the release and the tests use; see publish.yml.
+          maturin-version: v1.14.1
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           command: build

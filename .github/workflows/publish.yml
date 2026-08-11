@@ -100,6 +100,11 @@ jobs:
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
+          # Without this the action installs `latest`, so the published wheels are built
+          # by whatever maturin shipped that day while every test runs the version
+          # pyproject pins. Pinning the build tool is what makes SOURCE_DATE_EPOCH mean
+          # anything: a fixed clock cannot make two different compilers agree.
+          maturin-version: v1.14.1
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           command: build
@@ -240,6 +245,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
+          maturin-version: v1.14.1
           command: sdist
           args: --out dist
       - name: Build and smoke-test the exact sdist in isolation

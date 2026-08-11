@@ -585,6 +585,38 @@ def test_every_downloaded_artifact_is_uploaded_by_the_same_run() -> None:
     )
 
 
+def test_maturin_action_pins_the_maturin_version_the_project_pins() -> None:
+    # maturin-action's `maturin-version` input defaults to `latest`, and none of the
+    # workflows set it, so the wheels a release publishes are built by whatever maturin
+    # was newest that day. ci.yml's `uv run maturin` and every local test use the version
+    # pyproject pins instead. That splits the pipeline two ways: the same commit stops
+    # rebuilding to the same bytes as soon as upstream releases, which is the property the
+    # SOURCE_DATE_EPOCH pin exists to provide, and the release path runs a build tool no
+    # test ever exercised. Deriving the expected pin from pyproject keeps one source of
+    # truth, so bumping the dependency without bumping the workflows fails here.
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    pins = [
+        requirement
+        for requirement in project["project"]["optional-dependencies"]["dev"]
+        if requirement.startswith("maturin==")
+    ]
+    assert len(pins) == 1, f"expected exactly one pinned maturin requirement, found {pins}"
+    expected = f"maturin-version: v{pins[0].removeprefix('maturin==')}"
+
+    offenders: list[str] = []
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        text = workflow.read_text(encoding="utf-8")
+        steps = text.count("uses: PyO3/maturin-action@")
+        pinned = text.count(expected)
+        if steps != pinned:
+            offenders.append(f"{workflow.name}: {steps} maturin-action steps, {pinned} pinned")
+
+    assert not offenders, (
+        f"every maturin-action step must set {expected!r}, or the release builds with a "
+        f"different maturin than the tests do: {offenders}"
+    )
+
+
 def test_msrv_job_compiles_library_tests() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     msrv_job = workflow.split("  rust-msrv:\n", 1)[1].split("\n  rust-portability:", 1)[0]
