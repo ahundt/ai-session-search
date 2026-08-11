@@ -493,5 +493,10 @@ jobs:
             *-*|*rc[0-9]*|*a[0-9]*|*b[0-9]*|*dev*) prerelease=--prerelease ;;
             *) prerelease= ;;
           esac
+          # This job never checks out the repository, so gh has no git remote to
+          # infer the target from and exits 1 with "not a git repository". Every
+          # operation here is API-backed, including --verify-tag, which checks the
+          # remote tag, so naming the repository is enough and a checkout is not.
           gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag --generate-notes $prerelease
