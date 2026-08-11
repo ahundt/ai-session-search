@@ -167,9 +167,44 @@ between the workflow parking at `crates-io` and approving that environment:
 5. Approve `crates-io`, and confirm the job logs the skip rather than
    publishing a second time.
 
-A release candidate is already a pre-release, so `cargo add ai-session-search`
-reports no stable version until 1.0.0 ships. That is the intended behavior, not
-a side effect of a placeholder.
+## Pre-release semantics
+
+Three surfaces express pre-release status, two of them implicitly. Verify all
+three rather than assuming the version string carried through.
+
+| Surface | How it is expressed | Verify |
+| --- | --- | --- |
+| GitHub Release | Explicit `--prerelease`, chosen by the `case` on the tag in the `release` job | `gh release view v1.0.0rc1 --json isPrerelease` |
+| PyPI | Implicit in the PEP 440 spelling `1.0.0rc1` | `curl -s https://pypi.org/pypi/ai-session-search/json` and read `info.version` |
+| crates.io | Implicit in the SemVer spelling `1.0.0-rc.1` | `curl -s https://crates.io/api/v1/crates/ai-session-search` and read `max_stable_version` |
+
+The GitHub flag is the only one a release can get wrong on its own; the other
+two follow from the version string the metadata gate already pins. crates.io
+reporting `"max_stable_version": null` is the positive signal that it classified
+the version as a pre-release.
+
+### While no stable version exists, plain installs resolve to the RC
+
+This surprises people, so do not "fix" it. Measured against `1.0.0rc1` when it
+was the only published version:
+
+```
+uv pip install ai-session-search              -> ai-session-search==1.0.0rc1
+cargo add ai-session-search --dry-run         -> Adding ai-session-search v1.0.0-rc.1
+```
+
+Neither warns. This is specified behavior, not a marking failure.
+[PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases) excludes
+pre-releases from version specifiers "unless they are already present on the
+system, explicitly requested by the user, or if the only available version that
+satisfies the version specifier is a pre-release." Cargo resolves the same way
+when a crate has no stable version. Once any stable version exists, both
+resolvers prefer it and the RC is reachable only by an explicit pin.
+
+Do not publish a stable version merely to change this, and do not yank the RC to
+hide it. If plain installs must not reach a pre-release before 1.0.0, the only
+real options are to not publish an RC to the public registries at all, or to say
+so in the README.
 
 ## RC1 local gate
 
