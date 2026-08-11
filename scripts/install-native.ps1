@@ -26,6 +26,17 @@ if (-not $Replace -and $Backup) {
     throw '-Backup is valid only with -Replace.'
 }
 
+function Get-ExistingItem {
+    # -Backup is empty on every install that does not pass -Replace, and binding
+    # an empty string to -LiteralPath is a parameter binding failure that
+    # -ErrorAction SilentlyContinue does not suppress, so $ErrorActionPreference
+    # turns it into a fatal error before anything is copied.
+    param([string]$Path)
+
+    if (-not $Path) { return $null }
+    return Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+
 function Copy-NewFile {
     param([string]$Source, [string]$Destination)
 
@@ -58,7 +69,11 @@ function Move-FileCompatible {
     param([string]$Source, [string]$Destination)
 
     if ([System.IO.File]::Exists($Destination)) {
-        [System.IO.File]::Replace($Source, $Destination, $null)
+        # [NullString]::Value, not $null: PowerShell converts $null to an empty
+        # string when binding a .NET string parameter, and File.Replace rejects
+        # an empty destinationBackupFileName with "The value cannot be an empty
+        # string. (Parameter 'path')".
+        [System.IO.File]::Replace($Source, $Destination, [NullString]::Value)
     } else {
         [System.IO.File]::Move($Source, $Destination)
     }
@@ -75,9 +90,9 @@ if (-not [System.IO.File]::Exists($sourceReceipt)) {
 [System.IO.Directory]::CreateDirectory($BinDir) | Out-Null
 $destination = Join-Path $BinDir 'aise.exe'
 $receiptDestination = Join-Path $BinDir 'aise-native-install.json'
-$backupReceipt = $Backup + '.aise-native-install.json'
+$backupReceipt = if ($Backup) { $Backup + '.aise-native-install.json' } else { '' }
 
-$destinationItem = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+$destinationItem = Get-ExistingItem $destination
 if ($null -ne $destinationItem) {
     $destinationIsLink = ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
     if ($destinationItem.PSIsContainer -and -not $destinationIsLink) {
@@ -87,11 +102,11 @@ if ($null -ne $destinationItem) {
         throw "Destination already exists: $destination"
     }
 }
-$backupItem = Get-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+$backupItem = Get-ExistingItem $Backup
 if ($Replace -and $null -ne $backupItem) {
     throw "Rollback backup already exists: $Backup"
 }
-$receiptItem = Get-Item -LiteralPath $receiptDestination -Force -ErrorAction SilentlyContinue
+$receiptItem = Get-ExistingItem $receiptDestination
 if ($null -ne $receiptItem) {
     $receiptIsLink = ($receiptItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
     if ($receiptItem.PSIsContainer -or $receiptIsLink) {
@@ -100,7 +115,7 @@ if ($null -ne $receiptItem) {
     if (-not $Replace) {
         throw "Native install receipt already exists: $receiptDestination"
     }
-    if ($null -ne (Get-Item -LiteralPath $backupReceipt -Force -ErrorAction SilentlyContinue)) {
+    if ($null -ne (Get-ExistingItem $backupReceipt)) {
         throw "Rollback receipt backup already exists: $backupReceipt"
     }
 }
@@ -138,8 +153,8 @@ try {
     Move-FileCompatible $receiptStage $receiptDestination
     $completed = $true
 } finally {
-    $rollback = Get-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
-    $receiptRollback = Get-Item -LiteralPath $backupReceipt -Force -ErrorAction SilentlyContinue
+    $rollback = Get-ExistingItem $Backup
+    $receiptRollback = Get-ExistingItem $backupReceipt
     if (-not $completed -and $publishedReceipt) {
         if ([System.IO.File]::Exists($receiptDestination)) {
             [System.IO.File]::Delete($receiptDestination)
@@ -151,13 +166,13 @@ try {
         [System.IO.File]::Delete($backupReceipt)
     }
     if (-not $completed -and $publishedBinary) {
-        $published = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+        $published = Get-ExistingItem $destination
         if ($null -ne $published) { Remove-Item -LiteralPath $destination -Force }
         if ($null -ne $destinationItem -and $null -ne $rollback) {
             Move-Item -LiteralPath $Backup -Destination $destination
         }
     } elseif ($rollbackLink -and $null -ne $rollback) {
-        $published = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+        $published = Get-ExistingItem $destination
         if ($null -ne $published) { Remove-Item -LiteralPath $destination -Force }
         Move-Item -LiteralPath $Backup -Destination $destination
     }

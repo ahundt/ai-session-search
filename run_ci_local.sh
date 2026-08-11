@@ -417,6 +417,18 @@ fi
 # own skip when PowerShell is absent.
 step "Workflow PowerShell syntax" uv run --script scripts/check_workflow_powershell.py
 
+# The shipped Windows installer is pure .NET file IO, so it runs anywhere
+# PowerShell does. Before this it was executed only by the publish workflow's
+# Windows native job, which a tag push is the first thing to reach.
+if command -v pwsh >/dev/null 2>&1; then
+    step "Native PowerShell installer" pwsh -NoProfile -NonInteractive -File scripts/test_install_native_ps1.ps1
+else
+    printf '\n%bSKIPPED: pwsh is not installed, so install-native.ps1 was not exercised%b\n' "$YELLOW" "$NC"
+    printf 'The rust-portability CI job runs it on macOS and Windows and blocks the merge.\n'
+    printf 'Install it to see failures here first:\n'
+    printf '  brew install powershell\n'
+fi
+
 printf '\n%b=== Summary ===%b\nPassed: %s\n' "$BOLD" "$NC" "$PASSED_COUNT"
 if [ "$FAILED_COUNT" -gt 0 ]; then
     printf '%bFailed: %s%b\n%b\n' "$RED" "$FAILED_COUNT" "$NC" "$FAILED_NAMES"
