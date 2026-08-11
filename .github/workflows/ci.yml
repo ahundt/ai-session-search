@@ -110,12 +110,6 @@ jobs:
           shared-key: rust-portability
       - name: Exercise native filesystem, process, installer, and path behavior
         run: cargo test -p ai-session-search --all-targets --locked
-      # The shipped PowerShell installer was previously executed only by the
-      # publish workflow's Windows native job, so a tag push was the first thing
-      # that ever ran it. PowerShell is preinstalled on both runners here.
-      - name: Exercise the native PowerShell installer
-        shell: pwsh
-        run: ./scripts/test_install_native_ps1.ps1
 
   rust-install:
     runs-on: ubuntu-latest

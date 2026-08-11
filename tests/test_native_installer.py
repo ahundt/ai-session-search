@@ -48,9 +48,7 @@ def test_native_installer_requires_explicit_safe_replacement(tmp_path: Path) -> 
     original_receipt = (bin_dir / "aise-native-install.json").read_bytes()
     source.write_text("#!/bin/sh\necho second\n", encoding="utf-8")
     source.chmod(0o755)
-    receipt.write_text(
-        '{"schema_version":1,"archive_version":"second"}\n', encoding="utf-8"
-    )
+    receipt.write_text('{"schema_version":1,"archive_version":"second"}\n', encoding="utf-8")
     missing_backup = subprocess.run(
         ["sh", str(installer), "--bin-dir", str(bin_dir), "--replace"],
         capture_output=True,
@@ -96,6 +94,124 @@ def test_windows_native_installer_uses_windows_powershell_51_file_moves() -> Non
     assert not re.search(r"\[System\.IO\.File\]::Move\([^\n]+,\s*\$true\)", installer)
 
 
+# This static check was for a long time the only coverage the Windows installer
+# had, and asserting on the shape of the source while never running it let two
+# defects ship: an empty -Backup bound to -LiteralPath aborted every install,
+# and File.Replace received an empty destinationBackupFileName on every
+# -Replace. The tests below execute the installer so the Windows contract is
+# checked the same way the POSIX one is.
+
+POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
+requires_powershell = pytest.mark.skipif(POWERSHELL is None, reason="PowerShell is required to execute install-native.ps1")
+
+
+def _windows_bundle(tmp_path: Path, marker: str) -> Path:
+    bundle = tmp_path / f"bundle-{marker}"
+    bundle.mkdir()
+    shutil.copyfile(Path("scripts/install-native.ps1"), bundle / "install.ps1")
+    (bundle / "aise.exe").write_text(marker, encoding="utf-8")
+    (bundle / "aise-native-install.json").write_text(f'{{"schema_version":1,"archive_version":"{marker}"}}', encoding="utf-8")
+    return bundle
+
+
+def _run_installer(bundle: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    assert POWERSHELL is not None
+    return subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(bundle / "install.ps1"),
+            *arguments,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@requires_powershell
+def test_windows_native_installer_requires_explicit_safe_replacement(
+    tmp_path: Path,
+) -> None:
+    bundle = _windows_bundle(tmp_path, "first")
+    bin_dir = tmp_path / "bin"
+
+    initial = _run_installer(bundle, "-BinDir", str(bin_dir))
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    assert (bin_dir / "aise.exe").read_text(encoding="utf-8") == "first"
+    assert (bin_dir / "aise-native-install.json").exists()
+
+    duplicate = _run_installer(bundle, "-BinDir", str(bin_dir))
+    assert duplicate.returncode != 0
+    assert "already exists" in duplicate.stdout + duplicate.stderr
+
+    upgrade = _windows_bundle(tmp_path, "second")
+    missing_backup = _run_installer(upgrade, "-BinDir", str(bin_dir), "-Replace")
+    assert missing_backup.returncode != 0
+    assert "requires an explicit -Backup" in missing_backup.stdout + missing_backup.stderr
+    assert (bin_dir / "aise.exe").read_text(encoding="utf-8") == "first"
+
+    backup = tmp_path / "rollback" / "aise.exe.bak"
+    replaced = _run_installer(upgrade, "-BinDir", str(bin_dir), "-Replace", "-Backup", str(backup))
+    assert replaced.returncode == 0, replaced.stdout + replaced.stderr
+    assert (bin_dir / "aise.exe").read_text(encoding="utf-8") == "second"
+    assert backup.read_text(encoding="utf-8") == "first"
+    assert Path(f"{backup}.aise-native-install.json").exists()
+
+
+@requires_powershell
+def test_windows_native_installer_rejects_backup_without_replace(tmp_path: Path) -> None:
+    bundle = _windows_bundle(tmp_path, "first")
+    bin_dir = tmp_path / "bin"
+
+    completed = _run_installer(bundle, "-BinDir", str(bin_dir), "-Backup", str(tmp_path / "unused.bak"))
+
+    assert completed.returncode != 0
+    assert "valid only with -Replace" in completed.stdout + completed.stderr
+    assert not (bin_dir / "aise.exe").exists()
+
+
+@requires_powershell
+@pytest.mark.skipif(os.name != "posix", reason="creating a symlink needs no privilege here")
+def test_windows_native_installer_migrates_symbolic_link_with_rollback_copy(
+    tmp_path: Path,
+) -> None:
+    bundle = _windows_bundle(tmp_path, "source")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    external = tmp_path / "external"
+    external.write_text("keep", encoding="utf-8")
+    (bin_dir / "aise.exe").symlink_to(external)
+
+    without_replacement = _run_installer(bundle, "-BinDir", str(bin_dir))
+    assert without_replacement.returncode != 0
+    assert (bin_dir / "aise.exe").is_symlink()
+    assert external.read_text(encoding="utf-8") == "keep"
+
+    backup = tmp_path / "backup"
+    completed = _run_installer(bundle, "-BinDir", str(bin_dir), "-Replace", "-Backup", str(backup))
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not (bin_dir / "aise.exe").is_symlink()
+    assert (bin_dir / "aise.exe").read_text(encoding="utf-8") == "source"
+    assert backup.is_symlink()
+    assert os.readlink(backup) == str(external)
+    assert external.read_text(encoding="utf-8") == "keep"
+
+
+@requires_powershell
+def test_windows_native_installer_leaves_no_staging_files_behind(tmp_path: Path) -> None:
+    bundle = _windows_bundle(tmp_path, "first")
+    bin_dir = tmp_path / "bin"
+
+    assert _run_installer(bundle, "-BinDir", str(bin_dir)).returncode == 0
+
+    leftovers = sorted(p.name for p in bin_dir.iterdir() if p.name.startswith(".aise."))
+    assert leftovers == []
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX installer contract")
 def test_native_installer_migrates_symbolic_link_with_rollback_copy(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
@@ -105,9 +221,7 @@ def test_native_installer_migrates_symbolic_link_with_rollback_copy(tmp_path: Pa
     source = bundle / "aise"
     source.write_text("#!/bin/sh\necho source\n", encoding="utf-8")
     source.chmod(0o755)
-    (bundle / "aise-native-install.json").write_text(
-        '{"schema_version":1}\n', encoding="utf-8"
-    )
+    (bundle / "aise-native-install.json").write_text('{"schema_version":1}\n', encoding="utf-8")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     external = tmp_path / "external"
@@ -168,9 +282,7 @@ def test_native_installer_restores_symbolic_link_when_publish_fails(
     source = bundle / "aise"
     source.write_text("#!/bin/sh\necho source\n", encoding="utf-8")
     source.chmod(0o755)
-    (bundle / "aise-native-install.json").write_text(
-        '{"schema_version":1}\n', encoding="utf-8"
-    )
+    (bundle / "aise-native-install.json").write_text('{"schema_version":1}\n', encoding="utf-8")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     external = tmp_path / "external"
