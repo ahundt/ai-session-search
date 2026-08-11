@@ -53,11 +53,9 @@ Pinned release tools are uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
 
 Do not create the RC1 tag until all of these are complete:
 
-- The crates.io account exists, its email is verified, and the
-  `ai-session-search` crate name has been bootstrapped with RC0.
-- The crates.io trusted publisher matches repository
-  `ahundt/ai-session-search`, workflow `publish.yml`, and environment
-  `crates-io`.
+- The crates.io account exists and its email is verified. The crate name itself
+  is claimed after the tag rather than before it, and its trusted publisher is
+  registered after that; see the name bootstrap below.
 - The pending PyPI trusted publisher matches project `ai-session-search`,
   repository `ahundt/ai-session-search`, workflow `publish.yml`, and
   environment `pypi`.
@@ -86,7 +84,7 @@ crates.io, PyPI, then GitHub Release. Registry versions are immutable.
    and create a short-lived API token.
 2. Run `cargo login` and enter that token. Cargo stores it in
    `~/.cargo/credentials.toml`.
-3. Use the token only for the RC0 bootstrap below.
+3. Use the token only for the name bootstrap below.
 4. After the trusted publisher is registered, revoke the token and run
    `cargo logout`.
 
@@ -109,60 +107,59 @@ The existing `ai-session-tools` project and its history cannot be renamed or
 merged into `ai-session-search`. Publish a final deprecation pointer there
 only as a separate maintainer decision.
 
-## One-time crates.io RC0 bootstrap
+## One-time crates.io name bootstrap
 
 crates.io requires the crate to exist before its trusted publisher can be
-registered. Do not manually publish RC1 because the tag workflow must publish
-that unused version.
-
-crates.io has no pending-publisher equivalent to PyPI's, so exactly one manual
-publish is unavoidable; see
+registered, and it has no pending-publisher equivalent to PyPI's, so exactly one
+manual publish is unavoidable; see
 [RFC 3691](https://rust-lang.github.io/rfcs/3691-trusted-publishing-cratesio.html).
-That publish cannot carry the workflow's guarantees: every one of them needs
-`publish.yml` to run, its crate job needs trusted publishing, and trusted
-publishing needs the crate to exist. The bootstrap crate is therefore built
-locally with no attestation, no SBOM, no reproduction check, and no matching
-Python distribution.
 
-Do not yank it afterwards. The bootstrap carries the same source as the release
-that follows and is a working crate, so it meets none of the conditions Cargo
-names for yanking: "an accidental publish, unintentional SemVer breakages, or a
-significantly broken and unusable crate"
-([cargo yank](https://doc.rust-lang.org/cargo/commands/cargo-yank.html)).
-Yanking a sound version signals a defect that does not exist.
+Publish the release version itself. A placeholder such as `1.0.0-rc.0` would
+consume a version number nobody installs and invite a yank that is not
+warranted, and it is unnecessary: the `crate` job builds the crate twice and
+requires `cmp` to pass, so `cargo package` output is deterministic, and a local
+`cargo package --locked --no-verify` at the tagged commit reproduces the
+workflow's attested crate byte for byte. Verify that rather than assume it.
 
-Use a pre-release version such as `1.0.0-rc.0`, not a stable `0.0.1` or
-`0.1.0`. Cargo does not resolve pre-release versions by default, so between the
-bootstrap and the first real release `cargo add ai-session-search` reports no
-stable version instead of installing the placeholder.
+The tag workflow still runs end to end afterwards. Its `publish-crate` job
+compares the registry's recorded sha256 against the attested crate: a matching
+checksum sets `published=true` and skips both the credential request and
+`cargo publish`, so `publish` and `release` still run. Differing bytes fail the
+job instead of replacing an immutable version.
 
-1. Create and review a dedicated bootstrap commit with all seven declarations
-   set to `1.0.0rc0` or `1.0.0-rc.0` as appropriate. Refresh both lockfiles.
-2. Run `./run_ci_local.sh`, then package, inspect, and dry-run the exact crate:
+Because the comparison needs the attested artifact, this happens after the tag,
+between the workflow parking at `crates-io` and approving that environment:
+
+1. From the clean tagged checkout, reproduce the crate and confirm it matches
+   what the workflow attested:
 
    ```bash
-   cargo package --locked -p ai-session-search
-   uv run python -m scripts.verify_release_artifacts \
-     target/package/ai-session-search-1.0.0-rc.0.crate
-   cargo publish --dry-run --locked -p ai-session-search
+   gh run download <run-id> --name verified-crate-distribution --dir attested
+   cargo package --locked --no-verify -p ai-session-search
+   cmp attested/*.crate target/package/ai-session-search-1.0.0-rc.1.crate
    ```
 
-3. Create the annotated provenance tag
-   `crate-bootstrap-v1.0.0-rc.0`. It intentionally does not match the
-   `publish.yml` `v*` trigger.
-4. From that unchanged clean checkout, explicitly authorize and run:
+2. Only if `cmp` is silent, explicitly authorize and run:
 
    ```bash
    cargo publish --locked -p ai-session-search
    ```
 
-5. Register the crates.io trusted publisher, revoke the bootstrap token, and
-   run `cargo logout`. A token created for this bootstrap should not outlive
-   it; a pre-existing general-purpose token is the maintainer's to keep, but
-   while one with `publish-new` or `publish-update` survives, the crate can
-   still be published outside the workflow and outside its approvals.
-6. Restore all seven declarations to RC1, refresh the lockfiles, and rerun the
-   complete RC1 gate. Do not create `v1.0.0rc1` before this is green.
+3. Register the crates.io trusted publisher for repository
+   `ahundt/ai-session-search`, workflow `publish.yml`, and environment
+   `crates-io`. This release no longer needs it, because `publish-crate` now
+   skips, but every later release publishes through it.
+4. Revoke the bootstrap token and run `cargo logout`. A token created for this
+   bootstrap should not outlive it; a pre-existing general-purpose token is the
+   maintainer's to keep, but while one with `publish-new` or `publish-update`
+   survives, the crate can still be published outside the workflow and outside
+   its approvals.
+5. Approve `crates-io`, and confirm the job logs the skip rather than
+   publishing a second time.
+
+A release candidate is already a pre-release, so `cargo add ai-session-search`
+reports no stable version until 1.0.0 ships. That is the intended behavior, not
+a side effect of a placeholder.
 
 ## RC1 local gate
 
