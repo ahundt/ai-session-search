@@ -225,6 +225,34 @@ Before tagging, confirm:
 - Archives contain no demo media, absolute or traversal paths, legacy Python
   package directories, symlinks, or hard links.
 
+## TestPyPI rehearsal
+
+crates.io has no test registry, so only the Python half can be rehearsed. Do it
+before approving `pypi`, because a rejected wheel tag or unrenderable metadata
+cannot be fixed in place once crates.io has published an immutable version.
+
+Register a pending publisher on TestPyPI, which is a separate account from
+PyPI, using the same project, owner, and workflow values as PyPI but
+environment `testpypi`. TestPyPI re-prompts for the account password before
+accepting publisher changes; a submission made after that window lapses is
+discarded without an error, so confirm the publisher appears under **Pending
+publishers** before continuing.
+
+`gh workflow run publish.yml --ref v1.0.0rc1` then reuses the same build,
+verification, and attestation pipeline and uploads to TestPyPI. Confirm it
+installs:
+
+```bash
+uv run --isolated --with-index https://test.pypi.org/simple/ \
+  --with ai-session-search==1.0.0rc1 aise --version
+```
+
+`publish-crate`, `publish`, and `release` are gated on `github.event_name ==
+'push'` and `publish-testpypi` on `workflow_dispatch`, and those are the only
+triggers, so a dispatch can never reach a production registry and a tag push
+can never reach TestPyPI. A rehearsal consumes the version on TestPyPI; a
+second attempt at the same version needs a new one.
+
 ## Tag workflow
 
 Create the annotated tag only after reviewing the exact commit. The tag must
@@ -242,8 +270,12 @@ repointed at a different commit. The maintainer holds that role and is unaffecte
 3. installs and tests the exact artifacts on their target runners;
 4. verifies the complete artifact set, writes `SHA256SUMS`, and creates GitHub
    build-provenance attestations;
-5. reproduces the attested crate before requesting short-lived crates.io
-   credentials;
+5. reproduces the attested crate, then compares the registry's recorded sha256
+   for this version before requesting short-lived crates.io credentials. An
+   absent version publishes; a version already carrying the attested checksum
+   is skipped so a retry reaches the remaining jobs; a version carrying
+   different bytes fails, because the tag would otherwise try to replace an
+   immutable release;
 6. pauses at `crates-io`, publishes through OIDC, then pauses at `pypi` and
    publishes the verified wheel/sdist set with PyPI attestations;
 7. pauses at `release` and creates the GitHub prerelease from the same verified
