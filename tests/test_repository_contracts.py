@@ -454,6 +454,24 @@ def test_release_checksums_validate_beside_downloaded_assets() -> None:
     assert "sha256sum dist/* > dist/SHA256SUMS" not in workflow
 
 
+def test_wheels_and_native_jobs_pin_the_build_timestamp_to_the_commit() -> None:
+    # maturin stamps the wheel's embedded PEP 770 SBOM with metadata.timestamp and a
+    # fresh serialNumber. Those two fields were the entire difference between the
+    # v1.0.0rc1 production wheels and the TestPyPI rehearsal wheels built from the same
+    # commit: 13 of 15 zip entries matched, including the compiled extension, and the
+    # RECORD differed only because it hashes the SBOM. Exporting SOURCE_DATE_EPOCH makes
+    # the whole wheel byte-identical across builds.
+    jobs = _workflow_jobs((ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8"))
+
+    wheels = jobs["wheels"]
+    assert 'SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)' in wheels
+    # The manylinux targets build inside a container that does not inherit the runner
+    # environment, so setting the variable alone would silently not apply to them.
+    assert "docker-options: -e SOURCE_DATE_EPOCH" in wheels
+
+    assert "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" in jobs["native"]
+
+
 def _workflow_jobs(text: str) -> dict[str, str]:
     """Split a workflow into job name -> job body, keyed on the two-space job indent."""
     body = text.split("\njobs:\n", 1)[1]
