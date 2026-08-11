@@ -197,8 +197,8 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath $extract
           $bundle = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
           & (Join-Path $bundle.FullName 'install.ps1') -BinDir $bin
-          uv run --isolated --no-project python scripts/verify_native_executable.py \
-            --executable (Join-Path $bin 'aise.exe')
+          $executable = Join-Path $bin 'aise.exe'
+          uv run --isolated --no-project python scripts/verify_native_executable.py --executable $executable
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: native-${{ matrix.target }}
