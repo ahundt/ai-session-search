@@ -1,3 +1,4 @@
+
 # AI Session Search (`aise`)
 
 Search every local AI coding session you already have, from one Rust binary that re-indexes only
@@ -12,6 +13,8 @@ Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
 <!-- Demo goes here: drag demo.gif into the GitHub web editor, which uploads it and
      inserts a user-attachments image link in place of this comment. The recording
      itself is untracked; regenerate it with uv run python tests/test_demo.py --record -->
+
+<img width="1561" height="1098" alt="demo" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
 
 ## Eight incompatible session formats
 
