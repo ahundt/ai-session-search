@@ -1,9 +1,7 @@
 
 # AI Session Search (`aise`)
 
-Search every local AI coding session you already have, from one Rust binary that re-indexes only
-what changed. Reads Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi,
-Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
+Ultra-fast rust-based search of every local AI coding session with on-the-fly reindexing. Reads Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
 
 [![PyPI](https://img.shields.io/pypi/v/ai-session-search)](https://pypi.org/project/ai-session-search/)
 [![crates.io](https://img.shields.io/crates/v/ai-session-search)](https://crates.io/crates/ai-session-search)
@@ -16,7 +14,7 @@ Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
 
 <img width="1561" height="1098" alt="demo" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
 
-## Eight incompatible session formats
+## Eight session formats now interact seamlessly
 
 Your AI coding history is already on disk. Claude Code writes JSONL files named by UUID. Codex
 keeps its own transcript format under `~/.codex`. Cursor, Gemini CLI, Antigravity, and AI Studio
@@ -31,7 +29,7 @@ That index reaches you four ways: the `aise` command line, an MCP server your co
 query mid-conversation, a Rust crate, and a Python package. One parser and one set of query
 types sit underneath all four, so the answer is the same whichever one you ask.
 
-## Common tasks
+## Common tasks and Example commands
 
 | Do this | Command |
 | --- | --- |
@@ -57,44 +55,18 @@ delegated work searchable once it finishes.
 
 ## Install
 
-Pick one owner for the global `aise` command.
+Install the global `aise` command, via `uv` (recommended):
 
 ```bash
 uv tool install ai-session-search && aise integrations install
 ```
 
+via rust's `cargo`:
+
 ```bash
 cargo install ai-session-search --locked && aise integrations install
 ```
 
-Other paths to the same build: `uvx --from ai-session-search aise --help` to run it once,
-`uv add ai-session-search` for a project dependency, `python -m pip install ai-session-search`
-for a standard install.
-
-Installing the package never touches your configuration. It does not create command aliases,
-edit MCP client configuration, write instruction files or skills, or scan a single transcript.
-`aise integrations install` is the explicit second step that does those things: it adds the
-`aisearch` and `ai_session_search` aliases, configures every AI client it detects, and starts
-building the index in the background. Run `aise doctor` afterward for readiness and recovery
-guidance.
-
-Wheels cover CPython 3.12 through 3.14 on manylinux2014 x86_64 and aarch64, macOS x86_64 and
-arm64, and Windows x86_64. Building from source needs Rust 1.88 or newer and a C linker.
-
-To remove it, take the integrations out before the executable, because the uninstaller is what
-knows which entries are its own:
-
-```bash
-aise integrations uninstall
-uv tool uninstall ai-session-search    # or: cargo uninstall ai-session-search
-```
-
-Uninstalling removes what `aise` installed and leaves your index, configuration, and session
-files alone. The [installation guide](docs/development/installation.md) covers source builds,
-per-component flags, custom destinations, updates through `aise package update`, and recovery.
-
-On PyPI, `ai-session-search` supersedes the retired `ai_session_tools` package, which was a
-single-user Python implementation last published as `0.3.1` and receives no further releases.
 
 ## Quick start
 
@@ -397,6 +369,38 @@ implementation. Indexed filtering covers provider, session, path, date, role, me
 sequence, and canonical tool-argument JSON pointer. One `--kinds` set selects message classes, so
 two options can never disagree about what comes back. File reconstruction streams, restores are
 collision-safe, and export and analysis bundles are immutable and checksummed.
+
+## Uninstalling and other install details
+
+
+Other paths to the same build: `uvx --from ai-session-search aise --help` to run it once,
+`uv add ai-session-search` for a project dependency, `python -m pip install ai-session-search`
+for a standard install.
+
+Installing the package never touches your configuration. It does not create command aliases,
+edit MCP client configuration, write instruction files or skills, or scan a single transcript.
+`aise integrations install` is the explicit second step that does those things: it adds the
+`aisearch` and `ai_session_search` aliases, configures every AI client it detects, and starts
+building the index in the background. Run `aise doctor` afterward for readiness and recovery
+guidance.
+
+Wheels cover CPython 3.12 through 3.14 on manylinux2014 x86_64 and aarch64, macOS x86_64 and
+arm64, and Windows x86_64. Building from source needs Rust 1.88 or newer and a C linker.
+
+To remove it, take the integrations out before the executable, because the uninstaller is what
+knows which entries are its own:
+
+```bash
+aise integrations uninstall
+uv tool uninstall ai-session-search    # or: cargo uninstall ai-session-search
+```
+
+Uninstalling removes what `aise` installed and leaves your index, configuration, and session
+files alone. The [installation guide](docs/development/installation.md) covers source builds,
+per-component flags, custom destinations, updates through `aise package update`, and recovery.
+
+On PyPI, `ai-session-search` supersedes the retired `ai_session_tools` package, which was a
+single-user Python implementation last published as `0.3.1` and receives no further releases.
 
 ## Development
 
