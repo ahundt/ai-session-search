@@ -874,6 +874,8 @@ def _build_banner() -> str:
         row(),
         cmd_row("aise list --session-kinds",   "what your subagents did, as sessions of their own"),
         row(),
+        cmd_row("aise integrations install",   "serve all of this to your agents over MCP"),
+        row(),
         crow(_SKILL_HINT, style=GRAY),
         bot(),
         "",
@@ -1090,11 +1092,18 @@ def _type(text: str, delay: float = 0.04) -> None:
         sys.stdout.flush()
 
 
-def _run(cmd: str, show_prompt: bool = True, shell: bool = False) -> subprocess.CompletedProcess:
+def _run(
+    cmd: str,
+    show_prompt: bool = True,
+    shell: bool = False,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """Print a shell prompt + command (with typing effect), then run it.
 
     shell=False (default): uses shlex.split() — safe for regex metacharacters.
     shell=True: needed only for commands with real shell pipes (|).
+    env=None (default): DEMO_ENV. The MCP act passes MCP_DEMO_ENV so that integration
+    commands read and print a throwaway HOME instead of the recording machine's real one.
     """
     if show_prompt:
         _type("\n\033[1;32m$\033[0m ", delay=0)
@@ -1102,12 +1111,60 @@ def _run(cmd: str, show_prompt: bool = True, shell: bool = False) -> subprocess.
         pause(0.3)
     result = subprocess.run(
         shlex.split(cmd) if not shell else cmd,
-        env=DEMO_ENV,
+        env=env or DEMO_ENV,
         shell=shell,
         capture_output=False,   # let output flow to terminal (captured by asciinema)
         text=True,
     )
     return result
+
+
+def _mcp_demo_environment() -> dict[str, str]:
+    """Sandbox for the MCP act so a plain `aise integrations install` reveals nothing.
+
+    The act shows the real command a user runs, with no --no-* flags trimming it down, so
+    every destination it prints has to be relocated rather than suppressed. Three separate
+    roots leak the recording machine otherwise:
+
+    1. Client registrations resolve from HOME, so HOME points at a short throwaway dir.
+       Short matters: the platform temp dir on macOS is ~60 characters and wraps every row.
+    2. Executable aliases are created *beside* `aise`, so a copy of the executable goes in
+       the sandbox and leads PATH. That also fixes the path stored in client configs,
+       which defaults to the first `aise` on PATH.
+    3. Managed skills install under the app directory, which derives from the config file's
+       location, so the act gets its own config inside the sandbox.
+
+    The config keeps the demo's provider settings, otherwise the background index
+    preparation that install kicks off would walk the recording machine's real sessions.
+    """
+    base = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
+    home = base / "aise-demo-home"
+    shutil.rmtree(home, ignore_errors=True)
+
+    binary_dir = home / "bin"
+    binary_dir.mkdir(parents=True, exist_ok=True)
+    resolved = shutil.which("aise", path=DEMO_ENV.get("PATH", os.defpath))
+    if resolved:
+        # Copy rather than symlink: aliases are created beside the resolved executable, and
+        # a symlink would resolve back to the real installation directory.
+        shutil.copy2(resolved, binary_dir / "aise")
+
+    app_dir = home / ".ai-session-search"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    sandbox_config = app_dir / "config.toml"
+    sandbox_config.write_text(
+        Path(DEMO_ENV["AI_SESSION_SEARCH_CONFIG"]).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    return {
+        **DEMO_ENV,
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "AI_SESSION_SEARCH_CONFIG": str(sandbox_config),
+        "AI_SESSION_SEARCH_CACHE_DIR": str(home / ".cache"),
+        "PATH": f"{binary_dir}{os.pathsep}{DEMO_ENV.get('PATH', os.defpath)}",
+    }
 
 
 def get_first_session_id() -> str:
@@ -1174,8 +1231,20 @@ def run_demo_acts() -> None:
     _run(f"aise list --session-kinds subagent {PROV}")
     pause(7.0)
 
-    # ── Act 8: consolidated CLI/MCP entry point ────────────────────────────────
-    section("One executable — discover the composable MCP integration surface")
+    # ── Act 8: MCP — wire the same executable into coding agents ──────────────
+    # Runs against a throwaway HOME so the printed client paths are a sandbox, never the
+    # recording machine's own. --no-aliases drops the only rows derived from the aise
+    # executable's location instead of HOME. See _mcp_demo_environment.
+    mcp_env = _mcp_demo_environment()
+    section("Let your coding agent search this history — one MCP server, every client")
+    pause(2.0)
+    _run("aise integrations install", env=mcp_env)
+    pause(5.0)
+    _run("aise integrations status", env=mcp_env)
+    pause(7.0)
+
+    # ── Act 9: consolidated CLI entry point ───────────────────────────────────
+    section("One executable — the whole command surface")
     pause(2.0)
     _run("aise --help")
     pause(7.0)
@@ -1587,6 +1656,63 @@ def convert_to_mp4(gif_file: Path = GIF_FILE, mp4_file: Path = MP4_FILE) -> None
 
 # ── Verification ───────────────────────────────────────────────────────────────
 
+# The demo's own synthetic identities. Everything else that looks like a home directory,
+# a login name, or an address is the recording machine leaking into a published GIF.
+_SYNTHETIC_HOME_OWNERS: Final[frozenset[str]] = frozenset({"demo"})
+
+
+def rendered_cast_text(cast_file: Path) -> str:
+    """Return what a viewer actually sees: cast output events with ANSI codes stripped.
+
+    Checking the raw cast JSON instead would both miss and over-match. Escape sequences
+    split words across events, and the file also carries an env block a viewer never sees.
+    """
+    text_parts: list[str] = []
+    for line in cast_file.read_text(encoding="utf-8").splitlines()[1:]:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if len(event) >= 3 and event[1] == "o":
+            text_parts.append(event[2])
+    rendered = "".join(text_parts)
+    rendered = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", rendered)
+    rendered = re.sub(r"\x1b\][^\x07]*\x07", "", rendered)
+    return rendered.replace("\r", "")
+
+
+def audit_rendered_text_for_pii(rendered: str) -> list[str]:
+    """Return every personally identifying string a viewer would see. Empty means clean.
+
+    A published demo is forever, so this fails closed on the categories that identify a
+    person or their machine: a home directory belonging to anyone but the synthetic `demo`
+    user, the recording account's login name, its hostname, and any email address. The
+    synthetic fixtures deliberately use /Users/demo, which is why the owner is checked
+    rather than the /Users prefix alone.
+    """
+    findings: list[str] = []
+
+    for match in re.finditer(r"/(?:Users|home)/([A-Za-z0-9._-]+)", rendered):
+        if match.group(1) not in _SYNTHETIC_HOME_OWNERS:
+            findings.append(f"home directory of {match.group(1)!r}: {match.group(0)}")
+
+    login = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if login and login not in _SYNTHETIC_HOME_OWNERS:
+        for match in re.finditer(rf"\b{re.escape(login)}\b", rendered):
+            findings.append(f"login name {login!r} at offset {match.start()}")
+
+    hostname = os.uname().nodename.split(".")[0] if hasattr(os, "uname") else ""
+    if len(hostname) > 3:
+        for match in re.finditer(rf"\b{re.escape(hostname)}\b", rendered):
+            findings.append(f"hostname {hostname!r} at offset {match.start()}")
+
+    for match in re.finditer(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", rendered):
+        findings.append(f"email address: {match.group(0)}")
+
+    # Deduplicate while preserving discovery order so the report reads as a checklist.
+    return list(dict.fromkeys(findings))
+
+
 # Checks for the default --record demo. Each entry: (fragment, description).
 # Fragment must appear in command OUTPUT (not in typed keystroke stream).
 _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
@@ -1597,7 +1723,8 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     ("regression",       "Act 5: corrections skill classifies correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
     ("Explore",          "Act 7: subagent listing shows the agent type from the sidecar"),
-    ("integrations",     "Act 8: one executable advertises integration management"),
+    ("configured",       "Act 8: MCP server registered into detected clients"),
+    ("integrations",     "Act 9: one executable advertises integration management"),
 )
 
 # Checks for the --post-a self-improvement loop demo.
@@ -1675,6 +1802,20 @@ def verify_recording(
         else:
             print(f"  ✗ {description} — '{fragment}' not found in cast")
     print(f"\nVerification: {passed}/{len(checks)} checks passed")
+
+    # A missing content check is a weak demo; a leaked home directory is permanent once
+    # the GIF is published, so this gate runs on every recording and fails the whole run.
+    leaks = audit_rendered_text_for_pii(rendered_cast_text(cast_file))
+    if leaks:
+        print(f"\nPII audit: FAILED — {len(leaks)} identifying string(s) visible in the recording")
+        for leak in leaks[:20]:
+            print(f"  ✗ {leak}")
+        if len(leaks) > 20:
+            print(f"  ... and {len(leaks) - 20} more")
+        print("Do not publish this recording. Re-record after isolating the leaking command.")
+        return False
+    print("PII audit: clean — no home directory, login name, hostname, or address visible")
+
     return passed == len(checks)
 
 
@@ -1698,6 +1839,39 @@ class TestDemoFree:
         assert "--overwrite" in v2 and "--output-format" not in v2
         assert v3[v3.index("--window-size") + 1] == "160x48"
         assert v3[v3.index("--output-format") + 1] == "asciicast-v2"
+
+    def test_pii_audit_flags_a_real_home_directory_and_allows_the_synthetic_one(self) -> None:
+        leaked = audit_rendered_text_for_pii(
+            "claude code modern /Users/jsmith/.claude.json: configured"
+        )
+        assert leaked and "jsmith" in leaked[0]
+
+        # The fixtures intentionally show /Users/demo as a project path; flagging it would
+        # make the gate unusable and train the next maintainer to skip it.
+        assert audit_rendered_text_for_pii("cwd=/Users/demo/datapipe  preview=run the tests") == []
+
+    def test_pii_audit_flags_login_name_hostname_and_email(self) -> None:
+        login = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        if login and login not in _SYNTHETIC_HOME_OWNERS:
+            assert audit_rendered_text_for_pii(f"building index for {login} now")
+        assert audit_rendered_text_for_pii("contact someone@example.com for access")
+        assert audit_rendered_text_for_pii("plain output with no identifying strings") == []
+
+    def test_rendered_cast_text_strips_ansi_and_ignores_the_env_header(
+        self, tmp_path: Path
+    ) -> None:
+        cast = tmp_path / "sample.cast"
+        cast.write_text(
+            json.dumps({"version": 2, "width": 80, "height": 24,
+                        "env": {"USER": "should-not-be-scanned"}}) + "\n"
+            + json.dumps([0.1, "o", "[1;32m$[0m aise list\r\n"]) + "\n"
+            + json.dumps([0.2, "i", "keystrokes are not what a viewer sees"]) + "\n",
+            encoding="utf-8",
+        )
+        rendered = rendered_cast_text(cast)
+        assert rendered == "$ aise list\n"
+        assert "should-not-be-scanned" not in rendered
+        assert "keystrokes" not in rendered
 
     def test_staged_output_is_atomic_and_cleans_failures(self, tmp_path: Path) -> None:
         destination = tmp_path / "demo.gif"
