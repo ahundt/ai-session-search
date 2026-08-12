@@ -108,6 +108,25 @@ The complete, numbered contract catalogue with its verification map is
 [docs/development/maintainer-requirements-and-design-decisions.md](docs/development/maintainer-requirements-and-design-decisions.md).
 Read the entries that touch your change before altering public behavior.
 
+## Naming
+
+Use dashes for product slugs, repositories, package-manager names, skills, and MCP
+server identities. Use underscores only where a programming language or an
+environment variable requires them.
+
+| Surface | Canonical name |
+| --- | --- |
+| Product name | AI Session Search |
+| GitHub repository, PyPI distribution, crates.io package | `ai-session-search` |
+| Python import and Rust crate path | `ai_session_search` |
+| MCP server key and protocol name | `ai-session-search` |
+| MCP protocol title | AI Session Search |
+| Primary executable | `aise` |
+| Descriptive executable aliases | `aisearch`, `ai_session_search` |
+
+Reinstalling migrates the historical `ai_session_search` and `aise` MCP keys to
+`ai-session-search` without leaving duplicate servers behind.
+
 ## Commits and pull requests
 
 Write commit subjects that name the files or components and the behavior, for
@@ -126,6 +145,7 @@ separate commits so a single concern can be reverted on its own.
 | Product capabilities and quick start | [README.md](README.md) |
 | Install, verify, update, uninstall | [docs/development/installation.md](docs/development/installation.md) |
 | Settings resolution across CLI, env, TOML, MCP | [docs/development/configuration.md](docs/development/configuration.md) |
+| Python and Rust library APIs | [docs/development/library-api.md](docs/development/library-api.md) |
 | Building and publishing artifacts | [docs/development/releasing.md](docs/development/releasing.md) |
 | Release operator checklist | [RELEASING.md](RELEASING.md) |
 | Cumulative product contracts | [docs/development/maintainer-requirements-and-design-decisions.md](docs/development/maintainer-requirements-and-design-decisions.md) |

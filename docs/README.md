@@ -9,6 +9,7 @@ start. The documents below separate user procedures from maintainer records.
 | --- | --- |
 | Install, verify, update, or uninstall `aise` and its MCP integrations | [Installation](development/installation.md) |
 | Resolve CLI, environment, TOML, Rust, Python, and MCP settings | [Configuration](development/configuration.md) |
+| Call AI Session Search from Python or Rust | [Library guide](development/library-api.md) |
 | Build, verify, and publish Cargo, PyPI, and GitHub artifacts | [Releasing packages](development/releasing.md) |
 | Preserve cumulative product contracts while changing the repository | [Maintainer requirements and design decisions](development/maintainer-requirements-and-design-decisions.md) |
 | Re-check client-imposed MCP limits when a harness or schema changes | [MCP client limits and measured evidence](development/mcp-client-limits-and-measured-evidence.md) |
