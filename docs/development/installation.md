@@ -108,18 +108,20 @@ The default stored command is the absolute path of the first `aise` on the
 installer's PATH. This prevents a desktop client or harness from selecting a
 shadowed installation through a different PATH order. Use `--binary PATH` to
 select another installation deliberately. Supported selectors are `claude`, `codex`,
-`gemini`, `antigravity`, `cursor`, `windsurf`, `vscode`, `zed`, `opencode`,
-`openclaw`, and `kilocode`; omission or `all` updates detected clients. Repeat
+`gemini`, `antigravity`, `pi`, `prime-agent`, `cursor`, `windsurf`, `vscode`, `zed`,
+`opencode`, `openclaw`, and `kilocode`; omission or `all` updates detected clients. Repeat
 `--client CLIENT` to include several explicit clients, or repeat
 `--exclude-client CLIENT` to remove clients from that set. Explicit custom
 paths are always included and are not client aliases, so exclusions do not
 discard them. The Kilo selector is
 explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
-`~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
-instruction guidance for Claude, Codex, OpenCode, Gemini, and Antigravity;
-Gemini and Antigravity share `~/.gemini/GEMINI.md`. It does not install hooks.
-It installs one `ai-session-search` skill package for detected or explicitly selected Claude,
-Codex, Gemini, and Antigravity harnesses. The app owns the canonical package under
+`~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed instruction guidance for Claude, Codex, OpenCode, Gemini,
+Antigravity, Pi, and Prime Agent; Gemini and Antigravity share `~/.gemini/GEMINI.md`, while Pi and
+Prime use `~/.pi/agent/AGENTS.md` and `~/.prime/agent/AGENTS.md`. It does not install hooks. Pi has
+no built-in MCP client, and Prime currently accepts remote HTTP MCP servers rather than a local
+stdio subprocess, so selecting either installs its skill and guidance without writing a false MCP
+registration. It installs one `ai-session-search` skill package for detected or explicitly
+selected Claude, Codex, Gemini, Antigravity, Pi, and Prime Agent harnesses. The app owns the canonical package under
 `~/.ai-session-search/skills/`, beside `~/.ai-session-search/config.toml`. This app directory is a
 sibling of `~/.claude`, not a child of it and not a harness-owned location. The
 `ai-session-search/` package contains general harness guidance in `SKILL.md`, adjacent
@@ -128,7 +130,11 @@ sibling of `~/.claude`, not a child of it and not a harness-owned location. The
 point to the canonical package from `~/.claude/skills/` (Claude Code CLI/Desktop),
 `~/.agents/skills/` (ChatGPT Codex desktop and Codex CLI/IDE),
 `~/.gemini/skills/` (Gemini), `~/.gemini/config/skills/` (Antigravity
-App/IDE), and `~/.gemini/antigravity-cli/skills/` (Antigravity CLI). Selecting several
+App/IDE), `~/.gemini/antigravity-cli/skills/` (Antigravity CLI),
+`~/.pi/agent/skills/` (Pi), and `~/.prime/agent/skills/` (Prime Agent). Pi and Prime also read
+`~/.agents/skills/`, but their native links make explicit installs and lifecycle status independent
+of Codex detection. Both accept repeatable `--skill PATH`; that explicit flag remains active with
+`--no-skills`, which only disables discovery. Selecting several
 harnesses keeps every selected discovery directory; shared destinations are deduplicated. Use
 repeatable `--skill-root DIR` for one or more exact additional package destinations. Each custom
 directory must end in `ai-session-search`; it names a package directory, not a file inside one.

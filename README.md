@@ -107,11 +107,13 @@ Eight tools are exposed: `search_sessions`, `search_messages`, `list_sessions`, 
 `get_resume_command`, `get_index_status`, `run_skill_capability`, and `query_session_index` for
 read-only SQL.
 
-The installer writes each client's native JSON or TOML shape for Claude Code and Claude Desktop,
-ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI, Antigravity App/IDE/CLI, Cursor, Windsurf,
-VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode VS Code extension. Claude receives
-`CLAUDE.md` guidance, Codex and OpenCode receive a managed `AGENTS.md` block, and Gemini and
-Antigravity share one managed block in `~/.gemini/GEMINI.md`. Every other client receives MCP
+The installer writes each MCP client's native JSON or TOML shape for Claude Code and Claude
+Desktop, ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI, Antigravity App/IDE/CLI, Cursor,
+Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode VS Code extension. Pi and Prime
+Agent instead receive the shared skill plus native `AGENTS.md` guidance: Pi has no MCP client, and
+Prime's kernel currently accepts remote HTTP MCP integrations rather than a local stdio server.
+Claude receives `CLAUDE.md` guidance, Codex and OpenCode receive a managed `AGENTS.md` block, and
+Gemini and Antigravity share one managed block in `~/.gemini/GEMINI.md`. Every other MCP client receives MCP
 configuration only. No client hooks are installed.
 
 Omit `--client` to update everything detected, or name clients explicitly. Generated

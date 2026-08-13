@@ -149,11 +149,13 @@ used by index refresh.
 absolute path of the first `aise` on the installer's PATH plus `mcp serve`; `--binary PATH`
 selects a different installation explicitly. The installer supports Claude
 Code/Desktop, ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI, Antigravity
-App/IDE/CLI, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode
-VS Code extension. Claude, Codex, OpenCode, Gemini, and Antigravity receive managed instruction-file
-guidance; Gemini and Antigravity share one sentinel-owned `~/.gemini/GEMINI.md` block. The repository
-does not install client hooks. It installs the owned `$ai-session-search` skill for detected
-Claude, Codex, and Gemini/Antigravity harnesses unless `--no-skill` is passed.
+App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy
+KiloCode VS Code extension. Claude, Codex, OpenCode, Gemini, Antigravity, Pi, and Prime receive
+managed instruction-file guidance. Pi has no native MCP client, and Prime accepts remote HTTP MCP
+integrations rather than the local stdio server, so those selectors install only supported
+components. The repository does not install client hooks. It installs the owned
+`$ai-session-search` skill for detected Claude, Codex, Gemini/Antigravity, Pi, and Prime harnesses
+unless `--no-skill` is passed.
 Antigravity App/IDE and CLI share `~/.gemini/config/mcp_config.json` but use
 `~/.gemini/config/skills/` and `~/.gemini/antigravity-cli/skills/`
 respectively. Install, status,

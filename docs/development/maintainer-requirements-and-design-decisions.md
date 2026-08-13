@@ -419,9 +419,15 @@ Do not claim end-to-end support from a configured JSON key or an MCP handshake a
 | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/skills` | `~/.gemini/GEMINI.md` |
 | Antigravity App/IDE/current CLI | `~/.gemini/config/mcp_config.json` | App/IDE: `~/.gemini/config/skills`; CLI: `~/.gemini/antigravity-cli/skills` | shared `~/.gemini/GEMINI.md` |
 | Antigravity compatibility | `~/.gemini/antigravity-cli/settings.json`; `~/.gemini/antigravity/mcp_config.json` | tested compatibility roots only | no duplicate instruction file |
+| Pi coding agent | none: Pi deliberately has no MCP client | `~/.pi/agent/skills` | `~/.pi/agent/AGENTS.md` |
+| Prime Agent | no local stdio MCP: Prime's kernel integration currently accepts remote HTTP servers only | `~/.prime/agent/skills` | `~/.prime/agent/AGENTS.md` |
 
-Other supported clients retain their documented native MCP shapes. Do not fabricate every
-instruction filename for every harness.
+Pi and Prime Agent also discover `~/.agents/skills`, but each explicit selector installs one link in
+its harness-native root. This avoids coupling their installation to Codex detection and keeps
+ownership/status output attributable to the selected harness. Their repeatable `--skill PATH` and
+`--no-skills` flags remain harness runtime controls: explicit paths are additive even when automatic
+skill discovery is disabled. Other supported clients retain their documented native MCP shapes. Do
+not fabricate every instruction filename or unsupported MCP transport for every harness.
 
 ### REQ020-normalize-provider-records
 

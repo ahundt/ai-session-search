@@ -2872,6 +2872,11 @@ mod tests {
             .to_string();
         assert!(install_help.contains("starts best-effort session index preparation"));
         assert!(install_help.contains("run `aise doctor` to check readiness and freshness"));
+        assert!(install_help.contains("pi, prime-agent"), "{install_help}");
+        assert!(
+            install_help.contains("Pi and Prime Agent instead receive their native skill"),
+            "{install_help}"
+        );
 
         let cli = Cli::try_parse_from([
             "aise",

@@ -151,6 +151,8 @@ pub enum McpClient {
     Codex,
     Gemini,
     Antigravity,
+    Pi,
+    PrimeAgent,
     Cursor,
     Windsurf,
     Vscode,
@@ -162,10 +164,10 @@ pub enum McpClient {
 
 #[derive(Debug, Default, Args)]
 pub struct IntegrationTargetsArgs {
-    /// Client config to include. Repeat for multiple clients; omit for all detected clients.
+    /// Harness/client to include. Repeat for multiple selections; omit for all detected harnesses.
     #[arg(long = "client", value_enum, default_value = "all")]
     pub clients: Vec<McpClient>,
-    /// Client config to exclude from the selected set. Repeat for multiple clients.
+    /// Harness/client to exclude from the selected set. Repeat for multiple selections.
     /// Omit to exclude none.
     #[arg(long = "exclude-client", value_enum)]
     pub excluded_clients: Vec<McpClient>,
@@ -239,7 +241,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures MCP, executable aliases, managed instructions, and the AI Session Search skills for every detected client in one step. Supported MCP clients: Claude Code/Desktop, ChatGPT Codex desktop, Codex CLI/IDE, Gemini, Antigravity App/IDE/CLI, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills (Claude Code/Desktop), ~/.agents/skills (ChatGPT Codex desktop and Codex CLI/IDE), ~/.gemini/skills (Gemini), ~/.gemini/config/skills (Antigravity App/IDE), and ~/.gemini/antigravity-cli/skills (Antigravity CLI). Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
+    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent instead receive their native skill and AGENTS.md guidance because Pi has no MCP client and Prime Agent accepts only remote HTTP MCP integrations. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -258,7 +260,7 @@ pub struct IntegrationInstallArgs {
     /// Do not add AI Session Search (`aise`) guidance to CLAUDE.md, AGENTS.md, or GEMINI.md.
     #[arg(long)]
     pub no_instructions: bool,
-    /// Do not install the AI Session Search skill for Claude, Codex, or Gemini/Antigravity.
+    /// Do not install the AI Session Search skill for any selected skill-capable harness.
     #[arg(long)]
     pub no_skill: bool,
     /// Do not create the `aisearch` and `ai_session_search` executable aliases beside `aise`.
@@ -717,11 +719,13 @@ fn assemble_selected_targets(
     Ok((targets, instruction_targets, skill_targets))
 }
 
-const CONCRETE_CLIENTS: [McpClient; 11] = [
+const CONCRETE_CLIENTS: [McpClient; 13] = [
     McpClient::Claude,
     McpClient::Codex,
     McpClient::Gemini,
     McpClient::Antigravity,
+    McpClient::Pi,
+    McpClient::PrimeAgent,
     McpClient::Cursor,
     McpClient::Windsurf,
     McpClient::Vscode,
@@ -1594,6 +1598,8 @@ fn all_standard_discovery_links(
             .join(".gemini")
             .join("antigravity-cli")
             .join("skills"),
+        layout.home.join(".pi").join("agent").join("skills"),
+        layout.home.join(".prime").join("agent").join("skills"),
     ]
     .into_iter()
     .map(|root| root.join(package.name))
@@ -1739,6 +1745,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
                 Vec::new(),
             ),
         ],
+        McpClient::Pi | McpClient::PrimeAgent => Vec::new(),
         McpClient::Cursor => vec![json_target(
             layout,
             "cursor",
@@ -1807,35 +1814,12 @@ fn instruction_targets_for_layout(
     client: McpClient,
     layout: &ClientLayout,
 ) -> Vec<InstructionTarget> {
-    let targets = match client {
-        McpClient::All => vec![
-            InstructionTarget {
-                label: "claude",
-                path: layout.home.join(".claude").join("CLAUDE.md"),
-                format: InstructionFormat::ClaudeImport,
-                detect_paths: vec![layout.home.join(".claude")],
-                detect_binaries: vec!["claude"],
-            },
-            InstructionTarget {
-                label: "codex",
-                path: layout.home.join(".codex").join("AGENTS.md"),
-                format: InstructionFormat::InlineBlock,
-                detect_paths: vec![layout.home.join(".codex")],
-                detect_binaries: vec!["codex"],
-            },
-            gemini_instruction_target(layout),
-            InstructionTarget {
-                label: "opencode",
-                path: layout
-                    .home
-                    .join(".config")
-                    .join("opencode")
-                    .join("AGENTS.md"),
-                format: InstructionFormat::InlineBlock,
-                detect_paths: vec![layout.home.join(".config").join("opencode")],
-                detect_binaries: vec!["opencode"],
-            },
-        ],
+    match client {
+        McpClient::All => CONCRETE_CLIENTS
+            .into_iter()
+            .flat_map(|client| instruction_targets_for_layout(client, layout))
+            .filter(instruction_detected)
+            .collect(),
         McpClient::Claude => vec![InstructionTarget {
             label: "claude",
             path: layout.home.join(".claude").join("CLAUDE.md"),
@@ -1853,6 +1837,18 @@ fn instruction_targets_for_layout(
         McpClient::Gemini | McpClient::Antigravity => {
             vec![gemini_instruction_target(layout)]
         }
+        McpClient::Pi => vec![pi_family_instruction_target(
+            layout,
+            "pi",
+            ".pi/agent",
+            "pi",
+        )],
+        McpClient::PrimeAgent => vec![pi_family_instruction_target(
+            layout,
+            "prime-agent",
+            ".prime/agent",
+            "prime-agent",
+        )],
         McpClient::Opencode => vec![InstructionTarget {
             label: "opencode",
             path: layout
@@ -1864,13 +1860,23 @@ fn instruction_targets_for_layout(
             detect_paths: vec![layout.home.join(".config").join("opencode")],
             detect_binaries: vec!["opencode"],
         }],
-        _ => return Vec::new(),
-    };
+        _ => Vec::new(),
+    }
+}
 
-    if client == McpClient::All {
-        targets.into_iter().filter(instruction_detected).collect()
-    } else {
-        targets
+fn pi_family_instruction_target(
+    layout: &ClientLayout,
+    label: &'static str,
+    agent_dir: &str,
+    binary: &'static str,
+) -> InstructionTarget {
+    let root = layout.home.join(agent_dir);
+    InstructionTarget {
+        label,
+        path: root.join("AGENTS.md"),
+        format: InstructionFormat::InlineBlock,
+        detect_paths: vec![root],
+        detect_binaries: vec![binary],
     }
 }
 
@@ -1932,6 +1938,8 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
             ],
             vec!["agy"],
         ),
+        McpClient::Pi => pi_family_skill_layout(layout, ".pi/agent", "pi"),
+        McpClient::PrimeAgent => pi_family_skill_layout(layout, ".prime/agent", "prime-agent"),
         _ => return Vec::new(),
     };
     let canonical_root = layout.home.join(".ai-session-search").join("skills");
@@ -1951,6 +1959,15 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
             target
         })
         .collect()
+}
+
+fn pi_family_skill_layout(
+    layout: &ClientLayout,
+    agent_dir: &str,
+    binary: &'static str,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<&'static str>) {
+    let root = layout.home.join(agent_dir);
+    (vec![root.join("skills")], vec![root], vec![binary])
 }
 
 fn skill_target_for_package(
@@ -4209,6 +4226,39 @@ mod tests {
     }
 
     #[test]
+    fn pi_family_paths_are_platform_independent_home_relative_contracts() {
+        for (platform, home, config) in [
+            (
+                ClientPlatform::Macos,
+                "/Users/alice",
+                "/Users/alice/Library/Application Support",
+            ),
+            (ClientPlatform::Linux, "/home/alice", "/home/alice/.config"),
+            (
+                ClientPlatform::Windows,
+                "C:/Users/Alice",
+                "C:/Users/Alice/AppData/Roaming",
+            ),
+        ] {
+            let layout = ClientLayout::new(PathBuf::from(home), PathBuf::from(config), platform);
+            for (client, agent_dir) in [
+                (McpClient::Pi, ".pi/agent"),
+                (McpClient::PrimeAgent, ".prime/agent"),
+            ] {
+                let expected_root = PathBuf::from(home).join(agent_dir);
+                assert_eq!(
+                    instruction_targets_for_layout(client, &layout)[0].path,
+                    expected_root.join("AGENTS.md")
+                );
+                assert_eq!(
+                    skill_targets_for_layout(client, &layout)[0].discovery_links,
+                    vec![expected_root.join("skills/ai-session-search")]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn injected_layout_rejects_missing_home_instead_of_using_cwd() {
         let error = ClientLayout::from_discovered_dirs(
             None,
@@ -4666,6 +4716,7 @@ mod tests {
             "Cursor",
             "Antigravity",
             "Pi coding agent",
+            "Prime Agent",
             "Google AI Studio",
             "Gemini CLI",
         ] {
@@ -6315,6 +6366,8 @@ mod tests {
         let codex = skill_targets_for_layout(McpClient::Codex, &layout);
         let gemini = skill_targets_for_layout(McpClient::Gemini, &layout);
         let antigravity = skill_targets_for_layout(McpClient::Antigravity, &layout);
+        let pi = skill_targets_for_layout(McpClient::Pi, &layout);
+        let prime_agent = skill_targets_for_layout(McpClient::PrimeAgent, &layout);
         let canonical = PathBuf::from("/home/test/.ai-session-search/skills/ai-session-search");
         assert_eq!(
             claude[0].root, canonical,
@@ -6323,6 +6376,8 @@ mod tests {
         assert_eq!(codex[0].root, canonical);
         assert_eq!(gemini[0].root, canonical);
         assert_eq!(antigravity[0].root, canonical);
+        assert_eq!(pi[0].root, canonical);
+        assert_eq!(prime_agent[0].root, canonical);
         assert_eq!(
             claude[0].discovery_links[0],
             PathBuf::from("/home/test/.claude/skills/ai-session-search")
@@ -6343,6 +6398,14 @@ mod tests {
             antigravity[0].discovery_links[1],
             PathBuf::from("/home/test/.gemini/antigravity-cli/skills/ai-session-search"),
             "Antigravity CLI has a distinct current global skill directory"
+        );
+        assert_eq!(
+            pi[0].discovery_links[0],
+            PathBuf::from("/home/test/.pi/agent/skills/ai-session-search")
+        );
+        assert_eq!(
+            prime_agent[0].discovery_links[0],
+            PathBuf::from("/home/test/.prime/agent/skills/ai-session-search")
         );
         assert!(skill_targets_for_layout(McpClient::Opencode, &layout).is_empty());
     }
@@ -6387,12 +6450,16 @@ mod tests {
         );
 
         let links = all_standard_discovery_links(&layout, &AI_SESSION_SEARCH_SKILL_PACKAGE);
-        assert!(
-            links.contains(&PathBuf::from(
-                "/home/test/.gemini/antigravity-cli/skills/ai-session-search"
-            )),
-            "a CLI-only surviving link must retain the canonical skill package: {links:?}"
-        );
+        for expected in [
+            "/home/test/.gemini/antigravity-cli/skills/ai-session-search",
+            "/home/test/.pi/agent/skills/ai-session-search",
+            "/home/test/.prime/agent/skills/ai-session-search",
+        ] {
+            assert!(
+                links.contains(&PathBuf::from(expected)),
+                "a surviving harness link must retain the canonical skill package: {links:?}"
+            );
+        }
     }
 
     #[test]
@@ -6433,6 +6500,8 @@ mod tests {
             McpClient::Codex,
             McpClient::Gemini,
             McpClient::Antigravity,
+            McpClient::Pi,
+            McpClient::PrimeAgent,
         ]
         .into_iter()
         .flat_map(|client| skill_targets_for_layout(client, &layout))
@@ -6443,7 +6512,7 @@ mod tests {
         for target in targets {
             assert_eq!(
                 target.discovery_links.len(),
-                5,
+                7,
                 "{} must remain discoverable from all selected harnesses",
                 target.package.name
             );
@@ -6743,7 +6812,52 @@ mod tests {
     }
 
     #[test]
-    fn instruction_targets_cover_claude_codex_gemini_antigravity_and_opencode() {
+    fn pi_family_targets_install_native_skills_and_instructions_without_stdio_mcp() {
+        use clap::ValueEnum;
+
+        assert_eq!(McpClient::from_str("pi", false), Ok(McpClient::Pi));
+        assert_eq!(
+            McpClient::from_str("prime-agent", false),
+            Ok(McpClient::PrimeAgent)
+        );
+        let layout = ClientLayout::new(
+            PathBuf::from("/home/test"),
+            PathBuf::from("/home/test/.config"),
+            ClientPlatform::Linux,
+        );
+        for (client, agent_dir, binary) in [
+            (McpClient::Pi, ".pi/agent", "pi"),
+            (McpClient::PrimeAgent, ".prime/agent", "prime-agent"),
+        ] {
+            assert!(
+                targets_for_layout(client, &layout).is_empty(),
+                "Pi-family harnesses cannot consume aise's local stdio MCP server natively"
+            );
+            let instructions = instruction_targets_for_layout(client, &layout);
+            assert_eq!(instructions.len(), 1);
+            assert_eq!(
+                instructions[0].path,
+                PathBuf::from(format!("/home/test/{agent_dir}/AGENTS.md"))
+            );
+            assert!(matches!(
+                instructions[0].format,
+                InstructionFormat::InlineBlock
+            ));
+            assert_eq!(instructions[0].detect_binaries, vec![binary]);
+
+            let skills = skill_targets_for_layout(client, &layout);
+            assert_eq!(skills.len(), 1);
+            assert_eq!(
+                skills[0].discovery_links,
+                vec![PathBuf::from(format!(
+                    "/home/test/{agent_dir}/skills/ai-session-search"
+                ))]
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_targets_cover_claude_codex_gemini_antigravity_pi_prime_and_opencode() {
         let targets = instruction_targets_for(McpClient::All).unwrap();
         let labels = targets
             .iter()
@@ -6763,6 +6877,15 @@ mod tests {
             let targets = instruction_targets_for(client).unwrap();
             assert_eq!(targets.len(), 1);
             assert!(targets[0].path.ends_with(".gemini/GEMINI.md"));
+            assert!(matches!(targets[0].format, InstructionFormat::InlineBlock));
+        }
+        for (client, suffix) in [
+            (McpClient::Pi, ".pi/agent/AGENTS.md"),
+            (McpClient::PrimeAgent, ".prime/agent/AGENTS.md"),
+        ] {
+            let targets = instruction_targets_for(client).unwrap();
+            assert_eq!(targets.len(), 1);
+            assert!(targets[0].path.ends_with(suffix));
             assert!(matches!(targets[0].format, InstructionFormat::InlineBlock));
         }
         assert!(instruction_targets_for(McpClient::Opencode)
