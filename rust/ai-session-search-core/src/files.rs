@@ -943,12 +943,36 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
     };
     let target = restore_reconstructed(&reconstructed, args.output_dir.as_deref())?;
     println!(
-        "restored '{}' v{version}/{} ({lines} lines) -> {}",
-        args.file,
-        edits.len(),
-        target.display()
+        "{}",
+        restored_file_receipt(
+            &args.file,
+            version,
+            edits.len(),
+            lines,
+            &target,
+            reconstructed.content.as_bytes(),
+        )
     );
     Ok(())
+}
+
+/// Render one successful recovery receipt with a digest of the exact published bytes.
+/// For `B` content bytes this adds O(B) SHA-256 work, O(1) hashing state, and one serial in-memory
+/// pass after reconstruction/publication; filesystem write complexity and collision safety do not
+/// change.
+fn restored_file_receipt(
+    requested_file: &str,
+    version: usize,
+    version_count: usize,
+    lines: i64,
+    destination: &Path,
+    content: &[u8],
+) -> String {
+    let digest = crate::hashing::sha256(content);
+    format!(
+        "restored '{requested_file}' v{version}/{version_count} ({lines} lines) -> {} (sha256:{digest})",
+        destination.display()
+    )
 }
 
 fn run_extract_all(db: &Db, args: &FilesExtractArgs) -> Result<()> {
@@ -1535,6 +1559,25 @@ mod tests {
         // Normal cases: absolute path to the user's own file, or a clean relative path.
         assert!(ensure_safe_restore_target(Path::new("/Users/me/proj/src/db.rs")).is_ok());
         assert!(ensure_safe_restore_target(Path::new("src/db.rs")).is_ok());
+    }
+
+    #[test]
+    fn restored_receipt_names_destination_and_content_checksum() {
+        let receipt = restored_file_receipt(
+            "src/lib.rs",
+            2,
+            4,
+            3,
+            Path::new("/repo/src/lib.recovered.rs"),
+            b"one\ntwo\nthree\n",
+        );
+        assert_eq!(
+            receipt,
+            format!(
+                "restored 'src/lib.rs' v2/4 (3 lines) -> /repo/src/lib.recovered.rs (sha256:{})",
+                crate::hashing::sha256(b"one\ntwo\nthree\n")
+            )
+        );
     }
 
     #[test]
