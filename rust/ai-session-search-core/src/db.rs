@@ -2956,6 +2956,27 @@ impl Db {
         Ok((hits, explain))
     }
 
+    /// Enumerate the global tool-name superset with one B-tree successor seek per distinct name.
+    /// Every structurally eligible name is necessarily present globally; scoring extras is safe and
+    /// row loading still applies all filters. For N named rows and V distinct names this performs
+    /// O(V log N) indexed seeks and retains O(V) short strings, instead of scanning O(N) index
+    /// entries through SELECT DISTINCT. SQLite rejects this recursive CTE on the public SQL surface,
+    /// but it is a fixed internal statement over the trusted schema.
+    fn global_tool_name_vocabulary(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "with recursive names(name) as (
+                 select min(tool_name) from messages where tool_name is not null
+                 union all
+                 select (select min(tool_name) from messages where tool_name > names.name)
+                   from names where name is not null
+             )
+             select name from names where name is not null",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     #[cfg(test)]
     fn search_tool_name_fuzzy_direct_for_test(
         &self,
@@ -3000,30 +3021,14 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         use rusqlite::types::Value;
 
-        // Tool-name score depends only on the name, not the row. Let N be structurally eligible
-        // named rows, V distinct names, and W=offset+limit. The old path read O(N + B_N) bytes and
-        // scored O(V) names. This path index-scans N names to build/score the same complete V, then
-        // materializes at most W ranked rows and O(B_W) content bytes. Explain adds one matching-row
-        // count. The vocabulary/score map retains O(V) short strings; result state is
-        // O(W + bytes(W)). SQLite traversal is serial and no schema/write cost is added. A JSON
-        // virtual table carries bounded score tiers between statements.
-        let mut vocabulary_sql = String::from(
-            "select distinct m.tool_name from messages m where m.tool_name is not null",
-        );
-        let mut vocabulary_args = Vec::new();
-        append_message_filters(
-            &mut vocabulary_sql,
-            &mut vocabulary_args,
-            filters,
-            &self.access_scope,
-        );
-        vocabulary_sql.push_str(" order by m.tool_name");
-        let mut vocabulary_stmt = self.conn.prepare(&vocabulary_sql)?;
-        let names = vocabulary_stmt
-            .query_map(rusqlite::params_from_iter(vocabulary_args.iter()), |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Tool-name score depends only on the name, not the row. Let N be globally named rows, V
+        // global distinct names, and W=offset+limit. The old path read O(N + B_N) bytes and scored
+        // O(V) names. This path discovers/scored the complete global vocabulary with O(V log N)
+        // index seeks, then applies structural filters while materializing at most W ranked rows
+        // and O(B_W) content bytes. Explain adds one matching-row count. The vocabulary/score map
+        // retains O(V) short strings; result state is O(W + bytes(W)). SQLite traversal is serial
+        // and no schema/write cost is added. A JSON virtual table carries bounded score tiers.
+        let names = self.global_tool_name_vocabulary()?;
 
         let pattern = Pattern::new(
             query,
@@ -8211,6 +8216,39 @@ mod tests {
             "tool_name_vocabulary_benchmark rows=250000 vocabulary=251 direct_median_us={} direct_p95_us={} optimized_median_us={} optimized_p95_us={} digest=sha256:{}",
             direct.0, direct.1, optimized.0, optimized.1, direct.2
         );
+    }
+
+    #[test]
+    fn global_tool_name_vocabulary_matches_distinct_index_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test');
+                 insert into messages (
+                     session_id, provider, seq, role, tool_name, content
+                 ) values
+                   ('s1', 'claude', 0, 'tool', 'ÄTool', ''),
+                   ('s1', 'claude', 1, 'tool', 'exec_command', ''),
+                   ('s1', 'claude', 2, 'tool', 'exec_command', ''),
+                   ('s1', 'claude', 3, 'user', null, '');",
+            )
+            .unwrap();
+        let expected = db
+            .conn
+            .prepare(
+                "select distinct tool_name from messages
+                  where tool_name is not null order by tool_name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(db.global_tool_name_vocabulary().unwrap(), expected);
     }
 
     #[test]
