@@ -50,6 +50,13 @@ def _write_manifests(
         f'''[dependencies]\nai-session-search = {{ version = "{cargo_version}", path = "../ai-session-search-core" }}\n''',
         encoding="utf-8",
     )
+    (root / "docs/development").mkdir(parents=True)
+    (root / "docs/development/library-api.md").write_text(
+        "### Features\n\n```toml\n[dependencies]\n"
+        f'ai-session-search = {{ version = "{cargo_version}", default-features = false }}\n'
+        "```\n",
+        encoding="utf-8",
+    )
 
 
 def test_release_metadata_requires_tag_manifests_and_dependency_to_match(tmp_path: Path) -> None:
@@ -126,6 +133,29 @@ def test_release_metadata_rejects_a_stale_repository_skill_version(tmp_path: Pat
 
     with pytest.raises(ReleaseMetadataError, match=r"SKILL\.md declares"):
         verify_release_metadata(tmp_path, "v1.0.0rc1")
+
+
+def test_release_metadata_rejects_a_stale_documented_core_requirement(tmp_path: Path) -> None:
+    # Cargo never reads a docs code block, so a copied install snippet keeps telling readers
+    # to pin a superseded candidate long after every manifest moved on.
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+    doc = tmp_path / "docs/development/library-api.md"
+    doc.write_text(
+        doc.read_text(encoding="utf-8").replace("1.0.0-rc.2", "1.0.0-rc.1"), encoding="utf-8"
+    )
+
+    with pytest.raises(ReleaseMetadataError, match=r"library-api\.md documents"):
+        verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
+def test_release_metadata_rejects_a_removed_documented_core_requirement(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+    (tmp_path / "docs/development/library-api.md").write_text(
+        "### Features\n\nNo snippet here.\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ReleaseMetadataError, match="documents no ai-session-search version"):
+        verify_release_metadata(tmp_path, "v1.0.0rc2")
 
 
 @pytest.mark.parametrize(

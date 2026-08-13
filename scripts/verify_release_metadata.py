@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import re
 import sys
 import tomllib
 from collections.abc import Mapping
@@ -25,6 +26,13 @@ CORE_DEPENDENT_MANIFESTS = (
 RELEASE_SKILLS = (
     "skills/ai-session-search/SKILL.md",
     "rust/ai-session-search-core/skills/ai-session-search/SKILL.md",
+)
+# Documents that publish a copy-and-paste Cargo requirement on the released crate. Cargo never
+# reads a code block, so a stale snippet keeps telling readers to pin a superseded candidate
+# after every manifest has moved on, and only this gate reports it.
+RELEASE_DOC_REQUIREMENTS = ("docs/development/library-api.md",)
+_DOCUMENTED_REQUIREMENT = re.compile(
+    re.escape(CORE_CRATE) + r'\s*=\s*\{[^}]*\bversion\s*=\s*"([^"]+)"'
 )
 
 
@@ -63,6 +71,20 @@ def _skill_version(path: pathlib.Path, relative: str) -> str:
     raise ReleaseMetadataError(f"{relative} has no metadata.version")
 
 
+def _verify_documented_requirements(root: pathlib.Path, cargo_version: str) -> None:
+    for relative in RELEASE_DOC_REQUIREMENTS:
+        text = (root / relative).read_text(encoding="utf-8")
+        documented = _DOCUMENTED_REQUIREMENT.findall(text)
+        if not documented:
+            raise ReleaseMetadataError(f"{relative} documents no {CORE_CRATE} version requirement")
+        stale = sorted({version for version in documented if version != cargo_version})
+        if stale:
+            raise ReleaseMetadataError(
+                f"{relative} documents {CORE_CRATE} {', '.join(repr(v) for v in stale)} "
+                f"instead of the release version {cargo_version!r}"
+            )
+
+
 def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
     project = _manifest(root / "pyproject.toml")
     core = _manifest(root / "rust/ai-session-search-core/Cargo.toml")
@@ -98,6 +120,7 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
                 f"{relative} declares {skill_version!r} "
                 f"instead of the release version {cargo_version!r}"
             )
+    _verify_documented_requirements(root, cargo_version)
     return version
 
 
