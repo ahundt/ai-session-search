@@ -275,8 +275,10 @@ aise repeats --path ~/source/project --when 30d
 aise analyze --provider codex --when 7d --limit 50 --output /absolute/new/analysis
 ```
 
-`aise skills corrections` scans only what a PERSON wrote, in user-started sessions; pass
-`--session-kinds user subagent` to include delegation prompts. `--format json` returns
+`aise skills corrections` and default/user-role `aise repeats` scan only source-attributable
+human text; generated, harness, unknown-authorship, and mirror rows do not count as recurrence.
+Corrections default to user-started sessions; pass `--session-kinds user subagent` to include
+attributable human text in both session classes. `--format json` returns
 a tagged skill-run receipt plus the classification report.
 
 Its deterministic categories live in this skill's adjacent `aise-capability.toml`. Categories

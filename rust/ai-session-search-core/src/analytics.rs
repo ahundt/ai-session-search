@@ -675,8 +675,8 @@ pub struct RepeatsArgs {
     /// Interpret QUERY as a Rust regex before repeat mining.
     #[arg(long)]
     pub regex: bool,
-    /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
-    /// slash (human-entered commands), or compaction. Omit for every role.
+    /// Filter by role: user (source-attributable human text only), assistant, tool
+    /// (calls/results), slash (human-entered commands), or compaction. Omit to mine human text.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict to one indexed session source. Omit to include all nine.
@@ -783,7 +783,14 @@ fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> 
     } else {
         args.query.as_deref().unwrap_or("")
     };
-    let hits = db.search_messages(query, &filters)?;
+    // Default/user repeat mining is evidence about what a person wrote, not every provider row
+    // stored with `role=user`. Explicit assistant/tool/slash/compaction analysis retains its
+    // role-based contract because those roles do not claim human authorship.
+    let hits = if args.role.is_none() || args.role == Some(Role::User) {
+        db.search_attributable_human_messages(query, &filters)?
+    } else {
+        db.search_messages(query, &filters)?
+    };
     let rows = repeat_phrase_groups(
         &hits,
         args.context,
@@ -1109,6 +1116,85 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid planning regex '[unclosed'"), "{err}");
+    }
+
+    #[test]
+    fn repeats_mine_only_original_attributable_human_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.execute_batch_for_test(
+            "insert into sessions (
+                     id, provider, provider_session_id, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values ('claude:repeat-authorship', 'claude', 'repeat-authorship', '',
+                           '/repeat-authorship', 'v1', 'test');
+                 insert into messages (
+                     id, session_id, provider, seq, role, kind, content, authorship, record_relation
+                 ) values
+                   (101, 'claude:repeat-authorship', 'claude', 0, 'user', 'conversation',
+                    'durable human phrase', 'human', 'original'),
+                   (102, 'claude:repeat-authorship', 'claude', 1, 'user', 'conversation',
+                    'durable human phrase', 'human', 'original'),
+                   (103, 'claude:repeat-authorship', 'claude', 2, 'user', 'conversation',
+                    'durable agent phrase', 'agent', 'original'),
+                   (104, 'claude:repeat-authorship', 'claude', 3, 'user', 'harness_notice',
+                    'durable harness phrase', 'harness', 'original'),
+                   (105, 'claude:repeat-authorship', 'claude', 4, 'user', 'conversation',
+                    'durable mirror phrase', 'human', 'mirror'),
+                   (106, 'claude:repeat-authorship', 'claude', 5, 'user', 'conversation',
+                    'durable unknown phrase', 'unknown', 'unknown'),
+                   (107, 'claude:repeat-authorship', 'claude', 6, 'user', 'conversation',
+                    'mixed human phrase generated repeated phrase', 'mixed', 'original'),
+                   (108, 'claude:repeat-authorship', 'claude', 7, 'user', 'conversation',
+                    'mixed human phrase generated repeated phrase', 'mixed', 'original');
+                 insert into message_content_parts (
+                     message_id, ordinal, start_char, end_char, authorship, origin
+                 ) values
+                   (107, 0, 0, 18, 'human', 'direct_input'),
+                   (107, 1, 18, 43, 'generated', 'tool_payload'),
+                   (108, 0, 0, 18, 'human', 'direct_input'),
+                   (108, 1, 18, 43, 'generated', 'tool_payload');",
+        )
+        .unwrap();
+        let args = RepeatsArgs {
+            query: None,
+            regex: false,
+            role: None,
+            provider: None,
+            session_id: None,
+            path: None,
+            dates: DateRange::default(),
+            context: 0,
+            limit: 0,
+            max_groups: Some(0),
+            max_examples_per_group: Some(0),
+            min_matches: Some(2),
+            phrase_min_words: Some(2),
+            phrase_max_words: Some(4),
+            format: OutputFormat::Json,
+        };
+        let filters = repeat_filters(&db, &args, Some(Role::User)).unwrap();
+        let hits = db.search_attributable_human_messages("", &filters).unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+            [0, 1, 6, 7]
+        );
+        assert_eq!(hits[2].content, "mixed human phrase");
+        assert_eq!(hits[3].content, "mixed human phrase");
+        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4, 0, 0);
+        assert!(groups
+            .iter()
+            .any(|group| group.repeat == "durable human phrase"));
+        assert!(groups
+            .iter()
+            .any(|group| group.repeat == "mixed human phrase"));
+        assert!(!groups.iter().any(|group| group.repeat.contains("agent")));
+        assert!(!groups.iter().any(|group| group.repeat.contains("harness")));
+        assert!(!groups.iter().any(|group| group.repeat.contains("mirror")));
+        assert!(!groups.iter().any(|group| group.repeat.contains("unknown")));
+        assert!(!groups
+            .iter()
+            .any(|group| group.repeat.contains("generated")));
     }
 
     #[test]

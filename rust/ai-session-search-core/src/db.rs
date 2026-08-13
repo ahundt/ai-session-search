@@ -1422,6 +1422,12 @@ impl Db {
     }
 
     #[cfg(test)]
+    pub(crate) fn execute_batch_for_test(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn wal_checkpoint_busy_for_test(&self) -> Result<i64> {
         self.conn
             .query_row("pragma wal_checkpoint(passive)", [], |row| row.get(0))
@@ -3375,6 +3381,94 @@ impl Db {
             map.insert(session_id, raw);
         }
         Ok(map)
+    }
+
+    /// Return only source-authoritative human text for prose analytics such as `repeats`.
+    ///
+    /// Whole human messages retain their original identity and content. Mixed messages concatenate
+    /// source-ordered human parts, so generated or harness regions cannot become repeat evidence.
+    /// Unknown authorship and mirror rows fail closed. Let `M` be structurally eligible messages,
+    /// `P_h` human parts, and `B_h` emitted human bytes: work is `O(M + P_h + B_h)` plus the
+    /// authoritative literal/regex predicate and output ordering; finite result memory is
+    /// `O(K + bytes(K))`, while an explicit unlimited request retains all matches. SQLite owns the
+    /// correlated part-scan state. This path deliberately does not use raw-content trigrams because
+    /// a match may cross two human fragments after an intervening generated fragment is removed.
+    pub(crate) fn search_attributable_human_messages(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+    ) -> Result<Vec<MessageHit>> {
+        use rusqlite::types::Value;
+
+        self.validate_access_scope()?;
+        if filters.match_mode == MessageSearchMode::Fuzzy {
+            bail!("attributable human-message analytics do not support fuzzy matching");
+        }
+        if filters.field.unwrap_or(SearchField::Content) != SearchField::Content {
+            bail!("attributable human-message analytics search message content only");
+        }
+        if filters.match_mode == MessageSearchMode::Regex {
+            regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
+        }
+
+        let mut inner = String::from(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind,
+                    m.tool_call_id,
+                    case
+                      when m.authorship = 'human' then m.content
+                      else (
+                        select group_concat(fragment, '')
+                        from (
+                          select substr(m.content, p.start_char + 1,
+                                        p.end_char - p.start_char) as fragment
+                          from message_content_parts p
+                          where p.message_id = m.id and p.authorship = 'human'
+                          order by p.ordinal
+                        )
+                      )
+                    end as content
+             from messages m
+             where m.record_relation = 'original'
+               and (
+                 m.authorship = 'human'
+                 or (
+                   m.authorship = 'mixed'
+                   and exists (
+                     select 1 from message_content_parts p
+                     where p.message_id = m.id and p.authorship = 'human'
+                   )
+                 )
+               )",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        append_message_filters(&mut inner, &mut args, filters, &self.access_scope);
+        let mut sql = format!("select * from ({inner}) attributable where 1 = 1");
+        if !query.is_empty() {
+            match filters.match_mode {
+                MessageSearchMode::Literal => {
+                    sql.push_str(" and unicode_lower_contains(attributable.content, ?)");
+                    args.push(Value::Text(query.to_lowercase()));
+                }
+                MessageSearchMode::Regex => {
+                    sql.push_str(" and rust_regexp(?, attributable.content)");
+                    args.push(Value::Text(query.to_string()));
+                }
+                MessageSearchMode::Fuzzy => unreachable!("fuzzy rejected above"),
+            }
+        }
+        sql.push_str(" order by attributable.session_id, attributable.seq");
+        if filters.limit > 0 {
+            sql.push_str(" limit ? offset ?");
+            args.push(Value::Integer(filters.limit as i64));
+            args.push(Value::Integer(filters.offset as i64));
+        } else if filters.offset > 0 {
+            sql.push_str(" limit -1 offset ?");
+            args.push(Value::Integer(filters.offset as i64));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Scan user messages and tag each against `policies` (policies in selection order,
