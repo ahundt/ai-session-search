@@ -2546,20 +2546,24 @@ impl Db {
                         MessageSearchMode::Fuzzy => unreachable!("fuzzy query rejected above"),
                     }
                     if include_explain {
-                        let mut tool_filters = filters.clone();
-                        tool_filters.kinds = Some(vec![crate::models::MessageKind::ToolCall]);
-                        let corpus = self.filtered_corpus_count(&tool_filters)?;
+                        // Preserve the published derived-field receipt: candidate/corpus counts are
+                        // authoritative projected matches, not the broader raw-JSON FTS superset.
+                        // Explain-only counting reruns this completed predicate without page/order;
+                        // ordinary retrieval pays no second query.
+                        let count_sql = format!("select count(*) from ({sql}) authoritative");
+                        let authoritative = self.conn.query_row(
+                            &count_sql,
+                            rusqlite::params_from_iter(args.iter()),
+                            |row| row.get::<_, i64>(0),
+                        )?;
                         derived_explain = Some(SearchExplain {
                             prefilter: prefilter.clone(),
-                            candidates: prefilter
-                                .as_deref()
-                                .map(|query| self.fts5_candidate_count(&tool_filters, query))
-                                .transpose()?,
+                            candidates: Some(authoritative),
                             prefilter_skipped: prefilter.is_none().then(|| {
                                 "no JSON-stable required literal of at least three characters"
                                     .to_string()
                             }),
-                            corpus,
+                            corpus: authoritative,
                         });
                     }
                 }
@@ -9541,9 +9545,15 @@ mod tests {
                 explain.prefilter.is_some(),
                 "tool-argument {match_mode:?} search should prefilter raw tool-call JSON: {explain:?}"
             );
-            assert!(
-                explain.candidates.unwrap() < explain.corpus,
-                "tool-argument {match_mode:?} prefilter should exclude unrelated tool calls: {explain:?}"
+            assert_eq!(
+                explain.candidates,
+                Some(hits.len() as i64),
+                "published derived-field candidates count authoritative projected matches: {explain:?}"
+            );
+            assert_eq!(
+                explain.corpus,
+                explain.candidates.unwrap(),
+                "raw-JSON prefilter selectivity is internal until the receipt names it separately"
             );
         }
 
