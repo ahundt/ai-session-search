@@ -118,8 +118,13 @@ delegation would add overhead without increasing recall.
 
 Run the relevant `--help` before adding options not shown below.
 
-Time periods and relative days are UTC. For an exact event boundary, pass an RFC 3339 timestamp
-with `Z` or an explicit offset; fractional seconds are preserved for same-second event ordering.
+Time periods and relative days are UTC. Session list/search/export/analysis date filters intersect
+the inclusive query period with each known indexed span from `created_at` through `updated_at`.
+`since` tests the span end, `until` tests the span start, and `when` tests both. An exact RFC 3339
+value is a zero-width period. A span can contain gaps and does not prove continuous activity.
+Message, file, and event-analytics dates still test each event timestamp. For an exact event
+boundary, pass a timestamp with `Z` or an explicit offset; fractional seconds are preserved for
+same-second event ordering.
 
 ## Commands by task
 
@@ -128,8 +133,12 @@ with `Z` or an explicit offset; fractional seconds are preserved for same-second
 ```sh
 aise search "database migration" --path ~/source/project --when 30d --limit 10
 aise list --provider codex --when 7d --limit 20
+# Newest session whose working directory is this path or a component-boundary descendant.
+aise list --path ~/source/project --limit 1
 ```
 
+`aise list` orders eligible sessions newest first before applying `--limit`. Path matching includes
+the exact directory and descendants, but excludes lexical siblings such as `project-other`.
 Use `aise search` when the topic, title, repository, or remembered phrase is enough. Provider names
 are:
 

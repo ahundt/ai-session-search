@@ -196,6 +196,9 @@ source's enabled state and effective roots.
 # Provider, path, and time scopes combine
 aise list --provider claude-desktop --path ~/source/project --since 7d
 
+# Get the newest session in this directory or a descendant directory
+aise list --path ~/source/project --limit 1
+
 # Search user turns while excluding compaction summaries
 aise messages search "regression" --role user --include-compaction false
 

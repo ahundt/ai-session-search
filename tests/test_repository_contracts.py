@@ -810,6 +810,23 @@ def test_temporal_complexity_contracts_are_kept_with_their_owners() -> None:
             assert contract in source, f"{path} lacks {contract!r}"
 
 
+def test_readme_and_packaged_skill_explain_temporal_and_recent_directory_retrieval() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    skill = (ROOT / "skills/ai-session-search/SKILL.md").read_text(encoding="utf-8")
+
+    for text in (readme, skill):
+        assert "aise list --path ~/source/project --limit 1" in text
+    for phrase in (
+        "known indexed span",
+        "`since` tests the span end",
+        "`until` tests the span start",
+        "span can contain gaps",
+        "component-boundary descendant",
+        "excludes lexical siblings",
+    ):
+        assert phrase in skill
+
+
 def test_documentation_has_conventional_names_and_task_navigation() -> None:
     docs = Path("docs")
     markdown_paths = sorted(path.relative_to(docs) for path in docs.rglob("*.md"))
