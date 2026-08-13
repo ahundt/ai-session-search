@@ -946,6 +946,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
         "{}",
         restored_file_receipt(
             &args.file,
+            &reconstructed.session_id,
             version,
             edits.len(),
             lines,
@@ -962,6 +963,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
 /// change.
 fn restored_file_receipt(
     requested_file: &str,
+    source_session_id: &str,
     version: usize,
     version_count: usize,
     lines: i64,
@@ -970,7 +972,7 @@ fn restored_file_receipt(
 ) -> String {
     let digest = crate::hashing::sha256(content);
     format!(
-        "restored '{requested_file}' v{version}/{version_count} ({lines} lines) -> {} (sha256:{digest})",
+        "restored '{requested_file}' from session {source_session_id} v{version}/{version_count} ({lines} lines) -> {} (sha256:{digest})",
         destination.display()
     )
 }
@@ -1565,6 +1567,7 @@ mod tests {
     fn restored_receipt_names_destination_and_content_checksum() {
         let receipt = restored_file_receipt(
             "src/lib.rs",
+            "claude:source-session",
             2,
             4,
             3,
@@ -1574,7 +1577,7 @@ mod tests {
         assert_eq!(
             receipt,
             format!(
-                "restored 'src/lib.rs' v2/4 (3 lines) -> /repo/src/lib.recovered.rs (sha256:{})",
+                "restored 'src/lib.rs' from session claude:source-session v2/4 (3 lines) -> /repo/src/lib.recovered.rs (sha256:{})",
                 crate::hashing::sha256(b"one\ntwo\nthree\n")
             )
         );
