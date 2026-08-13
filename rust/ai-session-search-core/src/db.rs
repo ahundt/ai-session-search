@@ -3001,12 +3001,12 @@ impl Db {
         use rusqlite::types::Value;
 
         // Tool-name score depends only on the name, not the row. Let N be structurally eligible
-        // named rows, V distinct names, C matching rows, and B_C their content bytes. The old path
-        // read O(N + B_N) bytes and scored O(V) names. This path scores the same complete V, then
-        // uses idx_messages_tool_name to materialize O(C + B_C) rows. Worst case remains O(N+B_N)
-        // when every name matches. The vocabulary and matching-name map retain O(V) short strings;
-        // top-K remains O(W + bytes(W)). SQLite traversal is serial and no schema/write cost is
-        // added. A JSON virtual table carries the bounded vocabulary between the two statements.
+        // named rows, V distinct names, and W=offset+limit. The old path read O(N + B_N) bytes and
+        // scored O(V) names. This path index-scans N names to build/score the same complete V, then
+        // materializes at most W ranked rows and O(B_W) content bytes. Explain adds one matching-row
+        // count. The vocabulary/score map retains O(V) short strings; result state is
+        // O(W + bytes(W)). SQLite traversal is serial and no schema/write cost is added. A JSON
+        // virtual table carries bounded score tiers between statements.
         let mut vocabulary_sql = String::from(
             "select distinct m.tool_name from messages m where m.tool_name is not null",
         );
@@ -3044,15 +3044,47 @@ impl Db {
             }
         }
 
-        let mut top = Vec::new();
+        let explained_matching_rows = if include_explain && !matching_names.is_empty() {
+            let selected_names = serde_json::to_string(&matching_names.keys().collect::<Vec<_>>())?;
+            let mut sql = String::from(
+                "select count(*) from json_each(?) selected
+                   join messages m on m.tool_name = selected.value
+                  where m.tool_name is not null",
+            );
+            let mut args = vec![Value::Text(selected_names)];
+            append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+            Some(
+                self.conn
+                    .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        // Names in one score/exactness tier can interleave only by session/seq, while every lower
+        // tier ranks after every row in this tier. Read at most the still-missing W rows from each
+        // tier and stop once W is full; this is equivalent to global row scoring without loading
+        // content that cannot reach the requested window.
+        let ranked_limit = fuzzy_ranked_limit(filters)?;
+        let mut scored_names = matching_names.into_iter().collect::<Vec<_>>();
+        scored_names.sort_by(|(left_name, left), (right_name, right)| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left_name.cmp(right_name))
+        });
+        let mut top = Vec::with_capacity(ranked_limit);
         let mut matched = 0_i64;
-        if !matching_names.is_empty() {
-            let selected_names = serde_json::to_string(
-                &matching_names
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-            )?;
+        for tier in scored_names.chunk_by(|left, right| left.1 == right.1) {
+            if top.len() == ranked_limit {
+                break;
+            }
+            let selected_names =
+                serde_json::to_string(&tier.iter().map(|(name, _)| name).collect::<Vec<_>>())?;
+            let remaining = ranked_limit - top.len();
             let mut sql = String::from(
                 "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
                         m.kind, m.tool_call_id, m.content
@@ -3062,30 +3094,23 @@ impl Db {
             );
             let mut args = vec![Value::Text(selected_names)];
             append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-            let ranked_limit = fuzzy_ranked_limit(filters)?;
+            sql.push_str(" order by m.session_id, m.seq limit ?");
+            args.push(Value::Integer(remaining as i64));
             let mut stmt = self.conn.prepare(&sql)?;
             let rows =
                 stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
             for row in rows {
                 let mut hit = row?;
-                let (score, exact_phrase) = matching_names
-                    .get(
-                        hit.tool_name
-                            .as_deref()
-                            .expect("SQL excludes null tool names"),
-                    )
-                    .copied()
-                    .expect("row joined through the scored vocabulary");
-                hit.fuzzy_score = Some(score);
+                hit.fuzzy_score = Some(tier[0].1 .0);
+                top.push((hit, tier[0].1 .1));
                 matched += 1;
-                top.push((hit, exact_phrase));
-                if top.len() >= top_k_compaction_threshold(ranked_limit) {
-                    retain_top_fuzzy_hits(&mut top, ranked_limit);
-                }
             }
         }
-        let ranked_limit = fuzzy_ranked_limit(filters)?;
-        let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
+        let hits = top
+            .into_iter()
+            .skip(filters.offset)
+            .map(|(hit, _)| hit)
+            .collect();
         let explain = include_explain
             .then(|| {
                 let mut corpus_sql =
@@ -3104,7 +3129,7 @@ impl Db {
                 )?;
                 Ok::<_, anyhow::Error>(SearchExplain {
                     prefilter: None,
-                    candidates: Some(matched),
+                    candidates: Some(explained_matching_rows.unwrap_or(matched)),
                     prefilter_skipped: Some(
                         "complete filtered tool-name vocabulary scored before matching rows are loaded"
                             .to_string(),
@@ -8206,6 +8231,7 @@ mod tests {
                    ('s1', 'claude', 0, 'tool', 'exec_command', 'large ignored payload a'),
                    ('s1', 'claude', 1, 'tool', 'Edit', 'large ignored payload b'),
                    ('s1', 'claude', 2, 'tool', 'mcp:memory:execute', 'large ignored payload c'),
+                   ('s1', 'claude', 3, 'tool', 'ExecCommand', 'equal-score spelling payload'),
                    ('s2', 'codex', 0, 'tool', 'exec_command', 'large ignored payload d'),
                    ('s2', 'codex', 1, 'tool', 'write_stdin', 'large ignored payload e');",
             )
