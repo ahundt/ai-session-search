@@ -682,11 +682,40 @@ where
         index += 1;
     }
 
-    Cli::try_parse_from(
-        std::iter::once(program)
-            .chain(global_tokens)
-            .chain(command_tokens),
-    )
+    let normalized = std::iter::once(program)
+        .chain(global_tokens)
+        .chain(command_tokens)
+        .collect::<Vec<_>>();
+    Cli::try_parse_from(&normalized)
+        .map_err(|error| clarify_stale_message_argument(error, &normalized))
+}
+
+/// Replace Clap's edit-distance guess only for removed message-search arguments whose meaning is
+/// known. The stale names remain rejected: accepting aliases would silently preserve old scope
+/// semantics. Parsing and lookup are O(A) over the argument vector with O(1) extra state.
+fn clarify_stale_message_argument(mut error: clap::Error, args: &[OsString]) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    if error.kind() != ErrorKind::UnknownArgument
+        || args.get(1).and_then(|value| value.to_str()) != Some("messages")
+        || args.get(2).and_then(|value| value.to_str()) != Some("search")
+    {
+        return error;
+    }
+    let replacement = if args.iter().any(|value| value == "--project") {
+        Some("--workspace-path")
+    } else if args.iter().any(|value| value == "--type") {
+        Some("--role")
+    } else {
+        None
+    };
+    if let Some(replacement) = replacement {
+        error.insert(
+            ContextKind::SuggestedArg,
+            ContextValue::String(replacement.to_string()),
+        );
+    }
+    error
 }
 
 fn execute(cli: Cli) -> Result<()> {
@@ -3157,6 +3186,30 @@ mod tests {
         ]);
         assert_parses(["aise", "repeats", "--regex", "--", "magic|config"]);
         assert_parses(["aise", "search", "--limit", "1", "--", "--path"]);
+    }
+
+    #[test]
+    fn stale_message_scope_aliases_name_the_canonical_replacements() {
+        let project = parse_cli_from([
+            "aise",
+            "messages",
+            "search",
+            "--project",
+            "/tmp/project",
+            "workflow",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(project.contains("--workspace-path"), "{project}");
+        assert!(
+            !project.contains("similar argument exists: '--role'"),
+            "{project}"
+        );
+
+        let kind = parse_cli_from(["aise", "messages", "search", "workflow", "--type", "user"])
+            .unwrap_err()
+            .to_string();
+        assert!(kind.contains("--role"), "{kind}");
     }
 
     #[test]
