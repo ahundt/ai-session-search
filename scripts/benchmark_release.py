@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime
 import hashlib
 import json
 import os
@@ -143,14 +144,12 @@ def artifact_privacy(fixture: str) -> dict[str, Any]:
     """Classify whether benchmark evidence is portable and publishable."""
     generated = fixture == "generated"
     return {
-        "classification": (
-            "portable_generated" if generated else "private_local_fixture"
-        ),
+        "classification": ("portable_generated" if generated else "private_local_fixture"),
         "publishable": generated,
     }
 
 
-def generated_fixture_config() -> str:
+def generated_fixture_config(*, include_prime_agent: bool = True) -> str:
     """Return a portable config whose app-owned paths stay relative to the fixture directory."""
     provider_names = (
         "claude",
@@ -159,19 +158,31 @@ def generated_fixture_config() -> str:
         "cursor",
         "antigravity",
         "pi",
+        "prime-agent",
         "aistudio",
         "gemini-cli",
     )
+    if not include_prime_agent:
+        provider_names = tuple(name for name in provider_names if name != "prime-agent")
     disabled = "\n".join(f"[providers.{name}]\nenabled = false\npaths = []" for name in provider_names)
     return f'[index]\ndb_path = "generated.db"\ncache_dir = "cache"\n{disabled}\n'
 
 
-def generate_fixture(artifact_dir: Path, binary: Path, seed: int, sessions: int, messages_per_session: int) -> Path:
+def generate_fixture(
+    artifact_dir: Path,
+    binary: Path,
+    seed: int,
+    sessions: int,
+    messages_per_session: int,
+    *,
+    include_prime_agent: bool = True,
+) -> Path:
+    """Generate deterministic point and multi-day-span sessions in O(sessions * messages)."""
     fixture_dir = artifact_dir / "fixture"
     fixture_dir.mkdir(parents=True, exist_ok=True)
     database = fixture_dir / "generated.db"
     config = fixture_dir / "config.toml"
-    config.write_text(generated_fixture_config())
+    config.write_text(generated_fixture_config(include_prime_agent=include_prime_agent))
     subprocess.run(
         [str(binary), "--config", str(config), "reindex"],
         cwd=fixture_dir,
@@ -185,6 +196,14 @@ def generate_fixture(artifact_dir: Path, binary: Path, seed: int, sessions: int,
             month = 1 + (session_number // 28) % 12
             day = 1 + session_number % 28
             timestamp = f"{year:04d}-{month:02d}-{day:02d}T12:00:00.000000Z"
+            # Even-numbered sessions are point spans; odd-numbered sessions cross 35 days so
+            # temporal benchmarks exercise overlap that terminal-timestamp filtering misses.
+            if session_number % 2 == 0:
+                created_at = timestamp
+            else:
+                created_at = (
+                    (datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")) - datetime.timedelta(days=35)).isoformat().replace("+00:00", "Z")
+                )
             connection.execute(
                 "insert into sessions (id, provider, provider_session_id, title, cwd, repo_root, "
                 "created_at, updated_at, last_message_at, preview_text, source_path, message_count, "
@@ -194,7 +213,7 @@ def generate_fixture(artifact_dir: Path, binary: Path, seed: int, sessions: int,
                     session_id,
                     session_id.removeprefix("codex:"),
                     f"SQLite benchmark {session_number}",
-                    timestamp,
+                    created_at,
                     timestamp,
                     timestamp,
                     "deterministic database search fixture",
@@ -366,7 +385,12 @@ def process_tree_resources(root_pid: int) -> tuple[int, int, float, int]:
     return ps_process_tree_resources(root_pid)
 
 
-def sample_process(argv: list[str], normalizations: dict[bytes, bytes] | None = None) -> dict[str, Any]:
+def sample_process(
+    argv: list[str],
+    normalizations: dict[bytes, bytes] | None = None,
+    *,
+    extract_session_ids: bool = False,
+) -> dict[str, Any]:
     started = time.perf_counter_ns()
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     peak_rss_kib = 0
@@ -390,6 +414,12 @@ def sample_process(argv: list[str], normalizations: dict[bytes, bytes] | None = 
         normalized_stdout = normalized_stdout.replace(source, replacement)
         normalized_stderr = normalized_stderr.replace(source, replacement)
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+    session_ids = None
+    if extract_session_ids and child.returncode == 0:
+        decoded = json.loads(normalized_stdout)
+        if not isinstance(decoded, list):
+            raise ValueError("temporal benchmark output must be a JSON array")
+        session_ids = sorted(item if isinstance(item, str) else str(item["id"]) for item in decoded)
     return {
         "exit_code": child.returncode,
         "wall_ms": elapsed_ms,
@@ -402,13 +432,42 @@ def sample_process(argv: list[str], normalizations: dict[bytes, bytes] | None = 
         "result_sha256": hashlib.sha256(normalized_stdout).hexdigest(),
         "normalized_stdout_bytes": len(normalized_stdout),
         "stderr": normalized_stderr.decode("utf-8", "replace")[-4000:],
+        **({"session_ids": session_ids} if session_ids is not None else {}),
     }
+
+
+def temporal_overlap_oracle(database: Path, case: dict[str, Any]) -> dict[str, Any] | None:
+    """Return canonical overlap IDs/digest for a declared closed temporal case in O(S)."""
+    if case.get("expected_relation") != "intentional_change_with_oracle":
+        return None
+    start = case.get("oracle_start")
+    end = case.get("oracle_end")
+    if not isinstance(start, str) or not isinstance(end, str):
+        raise ValueError(f"temporal case {case.get('id')!r} requires oracle_start/oracle_end")
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        rows = connection.execute(
+            "select id from sessions where coalesce(updated_at, created_at) >= ? and coalesce(created_at, updated_at) <= ? order by id",
+            (start, end),
+        ).fetchall()
+    finally:
+        connection.close()
+    ids = [str(row[0]) for row in rows]
+    encoded = json.dumps(ids, separators=(",", ":")).encode()
+    return {"eligible_ids": ids, "eligible_ids_sha256": hashlib.sha256(encoded).hexdigest()}
 
 
 def case_measurement_metadata(case: dict[str, Any]) -> dict[str, Any]:
     """Return declared work units and workload dimensions needed to interpret a sample."""
     metadata = {"operations": int(case.get("operations", 1))}
-    for key in ("reader_bound", "workload"):
+    for key in (
+        "reader_bound",
+        "workload",
+        "temporal_mode",
+        "expected_relation",
+        "oracle_start",
+        "oracle_end",
+    ):
         if key in case:
             metadata[key] = case[key]
     return metadata
@@ -423,13 +482,9 @@ def validate_fixture_policy(
     if fixture == "generated":
         return
     if tier == "release":
-        raise SystemExit(
-            "release benchmarks require --fixture generated; local databases may contain private session data"
-        )
+        raise SystemExit("release benchmarks require --fixture generated; local databases may contain private session data")
     if not allow_private_fixture:
-        raise SystemExit(
-            "local benchmark fixtures require --allow-private-fixture; resulting artifacts are private and not release evidence"
-        )
+        raise SystemExit("local benchmark fixtures require --allow-private-fixture; resulting artifacts are private and not release evidence")
 
 
 def parse_args() -> argparse.Namespace:
@@ -513,15 +568,10 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                 manifest["seed"],
                 args.fixture_sessions * args.fixture_scale,
                 args.fixture_messages,
+                include_prime_agent=(build["label"] == "candidate"),
             )
-            required_version = (
-                manifest["fixture"]["required_schema_version"]
-                if build["label"] == "candidate"
-                else None
-            )
-            fixtures[str(build["label"])] = validate_fixture(
-                source, fixture_root, required_version, build["binary"]
-            )
+            required_version = manifest["fixture"]["required_schema_version"] if build["label"] == "candidate" else None
+            fixtures[str(build["label"])] = validate_fixture(source, fixture_root, required_version, build["binary"])
     else:
         fixture = validate_fixture(
             Path(args.fixture),
@@ -582,11 +632,25 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                         str(ROOT).encode(): b"{repository}",
                         str(Path.home()).encode(): b"{home}",
                     }
-                    sample = sample_process(argv, path_normalizations)
+                    sample = sample_process(
+                        argv,
+                        path_normalizations,
+                        extract_session_ids=(case.get("expected_relation") == "intentional_change_with_oracle"),
+                    )
                     after_fixture_state = sqlite_file_state(sample_fixture)
                     durable_before = durable_sqlite_state(before_fixture_state)
                     durable_after = durable_sqlite_state(after_fixture_state)
                     sample.update(case_measurement_metadata(case))
+                    oracle = temporal_overlap_oracle(sample_fixture, case)
+                    if oracle is not None:
+                        sample["temporal_oracle"] = oracle
+                        sample["temporal_oracle_match"] = sample.get("session_ids") == oracle["eligible_ids"]
+                        if label == "candidate" and not sample["temporal_oracle_match"]:
+                            raise SystemExit(
+                                f"{label}/{case['id']} differs from temporal overlap oracle: "
+                                f"observed={sample.get('session_ids')!r}, "
+                                f"expected={oracle['eligible_ids']!r}"
+                            )
                     sample.update(
                         kind="sample",
                         build=label,

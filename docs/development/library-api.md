@@ -29,7 +29,11 @@ scope = aise.QueryScope(
 )
 
 sessions = search.list_sessions(
-    aise.SessionQuery(provider="codex", limit=20),
+    aise.SessionQuery(
+        provider="codex",
+        dates=aise.DateRange(when="2026-01"),
+        limit=20,
+    ),
 )
 messages = search.search_messages(
     "authentication",
@@ -58,6 +62,17 @@ if sessions:
 
 status = search.index_status()
 ```
+
+`SessionQuery.dates` intersects the inclusive query period with each known indexed session span
+from `created_at` through `updated_at`. An exact RFC 3339 value is a zero-width period and matches a
+span containing that instant. The span can contain gaps and is not evidence of continuous process
+activity. `QueryScope.dates` on messages, files, and event analytics instead compares each event's
+own timestamp.
+
+A finite session list limit bounds returned records, not necessarily SQLite rows considered; a
+zero limit intentionally returns all eligible sessions. Ranked session search also scores all
+eligible session/transcript bytes before retaining its top page. See `REQ010-protect-complexity-bounds`
+in the maintainer requirements for current runtime, memory, I/O, and output-growth bounds.
 
 ### Concurrency and resource ownership
 

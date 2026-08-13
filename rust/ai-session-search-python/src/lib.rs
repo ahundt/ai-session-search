@@ -4523,6 +4523,10 @@ impl SessionSearch {
         NativeSessionInspection::from_inspection(py, inspection)
     }
 
+    /// List sessions through the shared catalog query.
+    ///
+    /// Complexity is owned by `CatalogService::list_sessions`; conversion performs one
+    /// allocation/conversion per returned record, `O(K + D_K)` time and retained output bytes.
     #[pyo3(signature = (request=None))]
     fn list_sessions(
         &self,
@@ -4544,6 +4548,10 @@ impl SessionSearch {
         })
     }
 
+    /// Rank sessions through the shared catalog query.
+    ///
+    /// Scanning/scoring bounds are owned by `CatalogService::search_sessions`; this adapter adds
+    /// `O(K + D_K)` conversion and retained output work, with no second database query.
     #[pyo3(signature = (query, request=None))]
     fn search_sessions(
         &self,

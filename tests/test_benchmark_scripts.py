@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -28,7 +29,7 @@ def load_script(name: str) -> ModuleType:
 
 def test_release_manifest_clients_use_only_canonical_query_modes() -> None:
     manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
-    client_cases = [case for case in manifest["cases"] if case["surface"] in {"python", "mcp"}]
+    client_cases = [case for case in manifest["cases"] if case["surface"] in {"python", "mcp"} and "--mode" in case["argv"]]
     assert client_cases
     for case in client_cases:
         mode_index = case["argv"].index("--mode") + 1
@@ -37,7 +38,7 @@ def test_release_manifest_clients_use_only_canonical_query_modes() -> None:
 
 def test_release_manifest_rust_driver_uses_only_canonical_query_modes() -> None:
     manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
-    rust_cases = [case for case in manifest["cases"] if case["surface"] == "rust"]
+    rust_cases = [case for case in manifest["cases"] if case["surface"] == "rust" and "--operation" not in case["argv"]]
 
     assert rust_cases
     for case in rust_cases:
@@ -79,6 +80,83 @@ def test_release_manifest_has_complete_four_surface_search_matrix() -> None:
         benchmark.validate_manifest(broken)
 
 
+def test_temporal_benchmarks_reuse_clients_and_require_oracle_semantics() -> None:
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    temporal = [case for case in manifest["cases"] if case.get("temporal_mode")]
+
+    assert {(case["surface"], "search" in case["id"]) for case in temporal} == {
+        ("cli", False),
+        ("cli", True),
+        ("python", False),
+        ("python", True),
+        ("mcp", False),
+        ("mcp", True),
+    }
+    assert all(case["expected_relation"] == "intentional_change_with_oracle" for case in temporal)
+    assert all(case["require_equal"] is False for case in temporal)
+    assert all("--when" in case["argv"] for case in temporal)
+    assert all(case["oracle_start"] <= case["oracle_end"] for case in temporal)
+
+
+def test_temporal_overlap_oracle_uses_closed_session_spans(tmp_path: Path) -> None:
+    benchmark = load_script("benchmark_release.py")
+    database = tmp_path / "fixture.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("create table sessions (id text, created_at text, updated_at text)")
+        connection.executemany(
+            "insert into sessions values (?, ?, ?)",
+            [
+                ("long", "2026-01-10T00:00:00+00:00", "2026-03-10T00:00:00+00:00"),
+                ("late", "2026-03-11T00:00:00+00:00", "2026-03-12T00:00:00+00:00"),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    oracle = benchmark.temporal_overlap_oracle(
+        database,
+        {
+            "id": "test",
+            "expected_relation": "intentional_change_with_oracle",
+            "oracle_start": "2026-02-15T00:00:00+00:00",
+            "oracle_end": "2026-02-15T00:00:00+00:00",
+        },
+    )
+    assert oracle is not None
+    assert oracle["eligible_ids"] == ["long"]
+    assert len(oracle["eligible_ids_sha256"]) == 64
+
+
+def test_temporal_oracle_is_release_blocking_for_candidate_not_historical_baseline() -> None:
+    source = (ROOT / "scripts/benchmark_release.py").read_text()
+
+    assert 'label == "candidate" and not sample["temporal_oracle_match"]' in source
+    assert 'sample["temporal_oracle_match"]' in source
+
+
+def test_generated_fixture_has_point_spans_multi_day_spans_and_all_provider_isolation() -> None:
+    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    config = load_script("benchmark_release.py").generated_fixture_config()
+
+    assert "session_number % 2 == 0" in source
+    assert "datetime.timedelta(days=35)" in source
+    for provider in (
+        "claude",
+        "claude-desktop",
+        "codex",
+        "cursor",
+        "antigravity",
+        "pi",
+        "prime-agent",
+        "aistudio",
+        "gemini-cli",
+    ):
+        assert f"[providers.{provider}]" in config
+    assert "[providers.prime-agent]" not in load_script("benchmark_release.py").generated_fixture_config(include_prime_agent=False)
+
+
 def test_release_manifest_has_same_server_mcp_reader_bound_matrix() -> None:
     manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
     cases = {case["reader_bound"]: case for case in manifest["cases"] if case.get("workload") == "same-server-mcp-fuzzy-readers"}
@@ -106,6 +184,16 @@ def test_benchmark_samples_retain_declared_work_units_and_reader_bound() -> None
         "workload": "same-server-mcp-fuzzy-readers",
     }
     assert benchmark.case_measurement_metadata({}) == {"operations": 1}
+    assert benchmark.case_measurement_metadata(
+        {
+            "temporal_mode": "when",
+            "expected_relation": "intentional_change_with_oracle",
+        }
+    ) == {
+        "operations": 1,
+        "temporal_mode": "when",
+        "expected_relation": "intentional_change_with_oracle",
+    }
 
 
 @pytest.mark.parametrize("tier", ["smoke", "subsystem", "release"])
@@ -232,7 +320,9 @@ def test_mcp_benchmark_client_uses_only_canonical_search_contract() -> None:
 
     assert '"response_format"' not in source
     assert '["structuredContent"]["hits"]' not in source
-    assert '["structuredContent"]["results"]' in source
+    assert '["structuredContent"][result_field]' in source
+    assert 'result_field = "results"' in source
+    assert 'result_field = "sessions"' in source
 
 
 def test_python_benchmark_client_uses_only_canonical_search_contract() -> None:

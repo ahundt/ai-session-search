@@ -91,9 +91,15 @@ enum Commands {
     ///
     /// Use `aise doctor` first to see whether the index is large enough to be worth compacting.
     Compact,
-    /// List recent sessions (newest first), with optional provider/path/date filters.
+    /// List recent sessions, optionally intersecting their known spans with a date period.
+    ///
+    /// Date bounds intersect the known indexed session span from created_at through updated_at.
+    /// The span can contain gaps and is not continuous runtime.
     List(QueryArgs),
-    /// Search indexed sessions by keyword, ranked by relevance; filter with `--provider`.
+    /// Search indexed sessions by keyword and date-span/metadata filters, ranked by relevance.
+    ///
+    /// Date bounds intersect the known indexed session span from created_at through updated_at.
+    /// The span can contain gaps and is not continuous runtime.
     #[command(
         after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY` or select `--query-mode regex|fuzzy`."
     )]
@@ -3251,6 +3257,32 @@ mod tests {
                 help.contains(provider.as_str()),
                 "missing {provider} in {help}"
             );
+        }
+    }
+
+    #[test]
+    fn session_help_defines_span_overlap_without_redefining_event_dates() {
+        let mut cli = Cli::command();
+        for name in ["list", "search"] {
+            let mut help = Vec::new();
+            cli.find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("{name} subcommand"))
+                .write_long_help(&mut help)
+                .unwrap();
+            let help = String::from_utf8(help).unwrap();
+            for required in [
+                "known indexed session span",
+                "created_at through updated_at",
+                "can contain gaps",
+                "not continuous runtime",
+                "Inclusive lower bound of the query period",
+                "Inclusive upper bound of the query period",
+            ] {
+                assert!(
+                    help.contains(required),
+                    "{name} help omits {required}: {help}"
+                );
+            }
         }
     }
 

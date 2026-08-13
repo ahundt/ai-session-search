@@ -797,6 +797,19 @@ def test_release_guide_records_standard_tool_adoption_decisions() -> None:
         assert tool in guide
 
 
+def test_temporal_complexity_contracts_are_kept_with_their_owners() -> None:
+    owners: dict[str, tuple[str, ...]] = {
+        "rust/ai-session-search-core/src/db.rs": ("fn push_session_time_window", "O(S)", "O(1)` application memory"),
+        "rust/ai-session-search-core/src/service.rs": ("pub fn list_sessions", "O(S log S + O + K)", "pub fn search_sessions"),
+        "rust/ai-session-search-python/src/lib.rs": ("fn list_sessions", "O(K + D_K)", "fn search_sessions"),
+        "scripts/benchmark_release.py": ("def temporal_overlap_oracle", "in O(S)"),
+    }
+    for path, contracts in owners.items():
+        source = (ROOT / path).read_text(encoding="utf-8")
+        for contract in contracts:
+            assert contract in source, f"{path} lacks {contract!r}"
+
+
 def test_documentation_has_conventional_names_and_task_navigation() -> None:
     docs = Path("docs")
     markdown_paths = sorted(path.relative_to(docs) for path in docs.rglob("*.md"))

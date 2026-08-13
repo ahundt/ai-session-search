@@ -29,7 +29,74 @@
       "id": "cli-list",
       "tier": "smoke",
       "surface": "cli",
+      "expected_relation": "equal",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "list", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-session-overlap-list",
+      "tier": "subsystem",
+      "surface": "cli",
+      "require_equal": false,
+      "expected_relation": "intentional_change_with_oracle",
+      "temporal_mode": "when",
+      "oracle_start": "2025-12-01T00:00:00+00:00",
+      "oracle_end": "2025-12-31T23:59:59.999999999+00:00",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "list", "--when", "2025-12", "--limit", "0", "--format", "json"]
+    },
+    {
+      "id": "cli-session-overlap-search",
+      "tier": "subsystem",
+      "surface": "cli",
+      "require_equal": false,
+      "expected_relation": "intentional_change_with_oracle",
+      "temporal_mode": "when",
+      "oracle_start": "2025-12-01T00:00:00+00:00",
+      "oracle_end": "2025-12-31T23:59:59.999999999+00:00",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "search", "benchmark", "--when", "2025-12", "--limit", "0", "--format", "json"]
+    },
+    {
+      "id": "python-session-overlap-list",
+      "tier": "subsystem",
+      "surface": "python",
+      "require_equal": false,
+      "expected_relation": "intentional_change_with_oracle",
+      "temporal_mode": "when",
+      "oracle_start": "2025-12-01T00:00:00+00:00",
+      "oracle_end": "2025-12-31T23:59:59.999999999+00:00",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--operation", "session-list", "--when", "2025-12", "--limit", "0"]
+    },
+    {
+      "id": "python-session-overlap-search",
+      "tier": "subsystem",
+      "surface": "python",
+      "require_equal": false,
+      "expected_relation": "intentional_change_with_oracle",
+      "temporal_mode": "when",
+      "oracle_start": "2025-12-01T00:00:00+00:00",
+      "oracle_end": "2025-12-31T23:59:59.999999999+00:00",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--operation", "session-search", "--query", "benchmark", "--when", "2025-12", "--limit", "0"]
+    },
+    {
+      "id": "mcp-session-overlap-list",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "require_equal": false,
+      "expected_relation": "intentional_change_with_oracle",
+      "temporal_mode": "when",
+      "oracle_start": "2025-12-01T00:00:00+00:00",
+      "oracle_end": "2025-12-31T23:59:59.999999999+00:00",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--operation", "session-list", "--when", "2025-12", "--limit", "0"]
+    },
+    {
+      "id": "mcp-session-overlap-search",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "require_equal": false,
+      "expected_relation": "intentional_change_with_oracle",
+      "temporal_mode": "when",
+      "oracle_start": "2025-12-01T00:00:00+00:00",
+      "oracle_end": "2025-12-31T23:59:59.999999999+00:00",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--operation", "session-search", "--query", "benchmark", "--when", "2025-12", "--limit", "0"]
     },
     {
       "id": "cli-schema",

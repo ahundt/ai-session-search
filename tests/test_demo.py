@@ -2050,14 +2050,14 @@ class TestDemoFree:
                 f"Real home directory {real_home} found in synthetic data: {jsonl_file}"
 
     def test_aise_list_path_filter(self) -> None:
-        """aise list --path scopes sessions to the synthetic webauth project."""
+        """CLI path scope orders eligible sessions newest first before applying limit."""
         result = subprocess.run(
-            ["aise", "list", "--path", _WEB_CWD, "--provider", "claude"],
+            ["aise", "list", "--path", _WEB_CWD, "--provider", "claude",
+             "--limit", "1", "--format", "json"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
         assert result.returncode == 0, f"aise list --path failed: {result.stderr}"
-        assert _S1[:8] in result.stdout or _S2[:8] in result.stdout, \
-            f"Expected webauth session IDs in output; got:\n{result.stdout}"
+        assert [row["id"] for row in json.loads(result.stdout)] == [f"claude:{_S2}"]
 
     def test_find_not_in_aise_help(self) -> None:
         """aise --help must not list 'find' as an explicit command (hidden alias)."""

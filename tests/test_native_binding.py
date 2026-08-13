@@ -352,6 +352,35 @@ def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:
         native.DateRange(when="7d").resolve_bounds(reference_time="2026-06-15")
 
 
+def test_native_recent_directory_listing_and_session_span_filtering(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executemany(
+            "insert into sessions (id, provider, provider_session_id, title, cwd, created_at, updated_at, preview_text, source_path, parse_version, discovery_source) values (?, 'claude', ?, 'shared needle', ?, ?, ?, 'shared needle', ?, 'test', 'fixture')",
+            [
+                ("claude:long", "long", "/work/project", "2026-01-10T00:00:00+00:00", "2026-03-10T00:00:00+00:00", "/long.jsonl"),
+                ("claude:february", "february", "/work/project/sub", "2026-02-05T00:00:00+00:00", "2026-02-06T00:00:00+00:00", "/february.jsonl"),
+                ("claude:sibling", "sibling", "/work/project-other", "2026-04-01T00:00:00+00:00", "2026-04-01T00:00:00+00:00", "/sibling.jsonl"),
+            ],
+        )
+        connection.executemany(
+            "insert into transcripts (session_id, transcript_text) values (?, 'shared needle')",
+            [("claude:long",), ("claude:february",), ("claude:sibling",)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    for dates in (native.DateRange(when="2026-01"), native.DateRange(when="2026-02-15T00:00:00Z")):
+        request = native.SessionQuery(dates=dates, limit=0)
+        assert [session.id for session in search.list_sessions(request)] == ["claude:long"]
+        assert [hit.session.id for hit in search.search_sessions("needle", request)] == ["claude:long"]
+    assert [session.id for session in search.list_sessions(native.SessionQuery(path_prefix="/work/project", limit=1))] == ["claude:long"]
+    assert [session.id for session in search.list_sessions(native.SessionQuery(path_prefix="/work/project", limit=0))] == ["claude:long", "claude:february"]
+
+
 def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
     search = native.SessionSearch(tmp_path / "index.db")
     session_query = native.SessionQuery(limit=3)

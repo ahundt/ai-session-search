@@ -2129,17 +2129,20 @@ impl<'db> CatalogService<'db> {
     ///
     /// # Complexity
     ///
-    /// Current list paging uses SQL `OFFSET`: with `N` eligible rows, offset `O`, and positive
-    /// limit `K`, favorable indexed work is `O(log N + O + K)`, not keyset `O(log N + K)`.
-    /// Returned memory is proportional to the selected rows and their text bytes. A zero limit
-    /// intentionally returns the complete filtered corpus.
+    /// Current list paging uses SQL `OFFSET`: with `S` rows considered, `N` eligible rows,
+    /// offset `O`, and positive limit `K`, favorable indexed work is `O(log S + O + K)`; a
+    /// planner-selected temporary sort is conservatively `O(S log S + O + K)`. Session-span
+    /// overlap adds `O(S)` constant-time comparisons and no message scan. Returned memory is
+    /// `O(K + D_K)` for selected row/text bytes. A zero limit intentionally returns the complete
+    /// filtered corpus, so `K=N`; SQLite page-cache or temporary-sort memory is additional.
     pub fn list_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
         filters.validate()?;
         self.db.list_recent(filters)
     }
 
     /// List a numeric-offset page in the same `(updated_at DESC, id ASC)` order as
-    /// [`CatalogService::list_sessions`]. Intended for bounded protocol adapters.
+    /// [`CatalogService::list_sessions`]. Intended for bounded protocol adapters and has the same
+    /// time/I/O bounds; application-retained output is `O(K + D_K)` for this page.
     pub fn list_sessions_page(
         &self,
         filters: &SearchFilters,
@@ -2153,12 +2156,14 @@ impl<'db> CatalogService<'db> {
     ///
     /// # Complexity
     ///
-    /// Let `B` be total eligible field/transcript bytes, `N` eligible sessions, `K` a positive
-    /// result limit, `D_K` bytes retained in the top-K records, and `D_max` the largest current
+    /// Let `S` be session rows considered, `B` total eligible field/transcript bytes, `N`
+    /// eligible sessions, `K` a positive result limit, `D_K` bytes retained in the top-K records,
+    /// and `D_max` the largest current
     /// record plus transcript, `A` query tokens, and `P` configured workers. Batched scoring plus
     /// amortized linear top-K compaction does `O(B*(A+1) + N + K log K)` aggregate work; the final
     /// term is the retained-page sort. Peak processing memory is
-    /// `O(K + D_K + batch_budget + D_max)`. Ideal scoring latency is `O(B*(A+1)/P + N/P)` plus
+    /// `O(K + D_K + batch_budget + D_max)`. Session filtering adds an `O(S)` scan bound but
+    /// rejects non-overlapping rows before transcript scoring/materialization. Ideal scoring latency is `O(B*(A+1)/P + N/P)` plus
     /// serial SQLite traversal, batch joins, retained-set compaction, and final `O(K log K)` sort.
     /// A zero limit intentionally retains every match, increasing memory to `O(N + B)` and final
     /// sorting to `O(N log N)`; parallel scoring does not change result membership or rank.

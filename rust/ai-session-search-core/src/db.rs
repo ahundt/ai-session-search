@@ -5479,6 +5479,12 @@ fn push_message_session_kinds(
     );
 }
 
+/// Append closed-interval overlap predicates for a session's known indexed span.
+///
+/// Let `S` be session rows considered by SQLite. This adds at most two constant-time text
+/// comparisons per considered row: `O(S)` worst-case SQL work and `O(1)` application memory.
+/// It performs no message join, allocation proportional to `S`, output growth, or database write;
+/// ordering, paging, and result retention remain owned by the calling query.
 fn push_session_time_window(
     sql: &mut String,
     args: &mut Vec<String>,
@@ -5490,7 +5496,7 @@ fn push_session_time_window(
         args.push(since.to_rfc3339());
     }
     if let Some(until) = until {
-        sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
+        sql.push_str(" and coalesce(s.created_at, s.updated_at) <= ? ");
         args.push(until_bound_text(until));
     }
 }
@@ -6183,13 +6189,13 @@ mod tests {
         );
     }
 
-    /// `--since` on a session query bounds when a session was last active, not when it began.
-    /// A recovery audit read `since: "12h"` as "sessions created in the last 12 hours" and was
-    /// surprised by a session started on July 14 and continued on August 1; that session is
-    /// correctly recent. `created_at` is the fallback for a row with no update time, never the
-    /// primary bound, so a long-lived session never falls out of a recent window while active.
+    /// Session date bounds intersect the closed known session span.
+    ///
+    /// A session spanning January through March matches periods and exact instants inside that
+    /// span even when its terminal update lies outside the query. Missing endpoints retain the
+    /// existing defensive fallback to the endpoint that is present.
     #[test]
-    fn session_date_window_bounds_last_activity_and_falls_back_to_creation() {
+    fn session_date_window_intersects_known_span_and_falls_back_for_null_endpoints() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -6198,19 +6204,22 @@ mod tests {
                      id, provider, provider_session_id, created_at, updated_at, preview_text,
                      source_path, parse_version, discovery_source
                  ) values
-                   ('claude:long-running', 'claude', 'long-running', '2026-01-01T00:00:00+00:00',
+                   ('claude:long-running', 'claude', 'long-running', '2026-01-10T00:00:00+00:00',
                     '2026-03-10T00:00:00+00:00', '', '/long', 'v1', 'test'),
-                   ('claude:short-lived', 'claude', 'short-lived', '2026-03-09T00:00:00+00:00',
-                    '2026-01-05T00:00:00+00:00', '', '/short', 'v1', 'test'),
+                   ('claude:february', 'claude', 'february', '2026-02-05T00:00:00+00:00',
+                    '2026-02-06T00:00:00+00:00', '', '/february', 'v1', 'test'),
                    ('claude:never-updated', 'claude', 'never-updated', '2026-03-11T00:00:00+00:00',
-                    null, '', '/never', 'v1', 'test');",
+                    null, '', '/never', 'v1', 'test'),
+                   ('claude:creation-missing', 'claude', 'creation-missing', null,
+                    '2026-01-20T00:00:00+00:00', '', '/creation-missing', 'v1', 'test');",
             )
             .unwrap();
 
-        let ids = |since: &str| {
+        let ids = |since: Option<&str>, until: Option<&str>| {
             let mut ids: Vec<String> = db
                 .list_recent(&SearchFilters {
-                    since: crate::util::parse_datetime(since),
+                    since: since.and_then(crate::util::parse_datetime),
+                    until: until.and_then(crate::util::parse_datetime),
                     ..SearchFilters::default()
                 })
                 .unwrap()
@@ -6221,19 +6230,33 @@ mod tests {
             ids
         };
 
-        // `long-running` began before the bound and is still returned; `short-lived` began after
-        // it and is not. Creation time decides neither.
         assert_eq!(
-            ids("2026-03-01T00:00:00+00:00"),
+            ids(
+                Some("2026-01-01T00:00:00+00:00"),
+                Some("2026-01-31T23:59:59+00:00")
+            ),
+            vec!["claude:creation-missing", "claude:long-running"],
+            "January intersects the long-running span and both point fallbacks"
+        );
+        assert_eq!(
+            ids(
+                Some("2026-02-15T00:00:00+00:00"),
+                Some("2026-02-15T00:00:00+00:00")
+            ),
+            vec!["claude:long-running"],
+            "an exact instant inside the known span is included"
+        );
+        assert_eq!(
+            ids(None, Some("2026-01-31T23:59:59+00:00")),
+            vec!["claude:creation-missing", "claude:long-running"],
+            "until compares the session start, not terminal activity"
+        );
+        assert_eq!(
+            ids(Some("2026-03-01T00:00:00+00:00"), None),
             vec!["claude:long-running", "claude:never-updated"],
+            "since compares the session end"
         );
-        // With no update time the row is bounded by when it was created, so it is neither
-        // silently dropped from every window nor allowed to match every one.
-        assert_eq!(
-            ids("2026-03-10T12:00:00+00:00"),
-            vec!["claude:never-updated"]
-        );
-        assert!(ids("2026-03-12T00:00:00+00:00").is_empty());
+        assert!(ids(Some("2026-03-12T00:00:00+00:00"), None).is_empty());
     }
 
     /// Subagent runs outnumber the sessions that spawned them — 4,051 against 858 user-started
@@ -7622,6 +7645,49 @@ mod tests {
     }
 
     #[test]
+    fn list_recent_returns_newest_sessions_in_exact_directory_or_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, cwd, updated_at, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values
+                   ('claude:root-old', 'claude', 'root-old', '/work/project',
+                    '2026-01-01T00:00:00+00:00', '', '/root-old', 'v1', 'test'),
+                   ('claude:child-new', 'claude', 'child-new', '/work/project/sub/dir',
+                    '2026-03-01T00:00:00+00:00', '', '/child-new', 'v1', 'test'),
+                   ('claude:sibling-newer', 'claude', 'sibling-newer', '/work/project-other',
+                    '2026-04-01T00:00:00+00:00', '', '/sibling-newer', 'v1', 'test');",
+            )
+            .unwrap();
+
+        let query = |limit| SearchFilters {
+            path_prefix: Some("/work/project".to_string()),
+            limit,
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            db.list_recent(&query(1))
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ["claude:child-new"],
+            "limit applies after exact-directory/descendant filtering and newest-first ordering"
+        );
+        assert_eq!(
+            db.list_recent(&query(0))
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ["claude:child-new", "claude:root-old"]
+        );
+    }
+
+    #[test]
     fn restricted_fuzzy_search_scores_only_authorized_messages() {
         use crate::config::{SearchScopeConfig, SearchScopeMode};
         use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
@@ -8825,6 +8891,85 @@ mod tests {
             four.0,
             four.1,
             one.2
+        );
+    }
+
+    /// Opt-in direct attribution of terminal-timestamp versus closed-span predicates. Correctness
+    /// stays in ordinary tests; this records median/p95 and verifies both plans avoid message or
+    /// transcript scans without making scheduler-sensitive timing a unit-test gate.
+    #[test]
+    #[ignore = "deterministic release-mode temporal predicate measurement"]
+    fn session_temporal_overlap_predicate_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "insert into sessions (id, provider, provider_session_id, created_at, updated_at, preview_text, source_path, parse_version, discovery_source) values (?1, 'claude', ?1, ?2, ?3, '', ?4, '1', 'test')",
+                )
+                .unwrap();
+            for index in 0..100_000 {
+                let created = if index % 2 == 0 {
+                    "2026-01-01T00:00:00+00:00"
+                } else {
+                    "2025-12-01T00:00:00+00:00"
+                };
+                insert
+                    .execute(params![
+                        format!("s{index:06}"),
+                        created,
+                        "2026-01-15T00:00:00+00:00",
+                        format!("/{index}.jsonl")
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let measure = |predicate: &str| {
+            let sql = format!("select count(*) from sessions s where {predicate}");
+            let expected: i64 = db.conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+            let mut elapsed = Vec::new();
+            for _ in 0..9 {
+                let started = Instant::now();
+                assert_eq!(
+                    db.conn
+                        .query_row::<i64, _, _>(&sql, [], |row| row.get(0))
+                        .unwrap(),
+                    expected
+                );
+                elapsed.push(started.elapsed().as_micros());
+            }
+            elapsed.sort_unstable();
+            let plan = db
+                .conn
+                .prepare(&format!("explain query plan {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ");
+            assert!(
+                !plan.contains("messages") && !plan.contains("transcripts"),
+                "{plan}"
+            );
+            (
+                elapsed[elapsed.len() / 2],
+                elapsed[elapsed.len() - 1],
+                expected,
+                plan,
+            )
+        };
+        let terminal = measure(
+            "coalesce(s.updated_at, s.created_at) >= '2025-12-15T00:00:00+00:00' and coalesce(s.updated_at, s.created_at) <= '2025-12-31T23:59:59+00:00'",
+        );
+        let overlap = measure(
+            "coalesce(s.updated_at, s.created_at) >= '2025-12-01T00:00:00+00:00' and coalesce(s.created_at, s.updated_at) <= '2025-12-31T23:59:59+00:00'",
+        );
+        eprintln!(
+            "session_temporal_predicate_benchmark sessions=100000 terminal_median_us={} terminal_p95_us={} terminal_matches={} overlap_median_us={} overlap_p95_us={} overlap_matches={} terminal_plan={:?} overlap_plan={:?}",
+            terminal.0, terminal.1, terminal.2, overlap.0, overlap.1, overlap.2, terminal.3, overlap.3
         );
     }
 

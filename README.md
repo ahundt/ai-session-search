@@ -154,9 +154,13 @@ reparsed only the 6 sessions whose bytes had changed, so steady-state cost follo
 Refresh runs on access by default, including when an MCP client asks a question, and
 `--index-refresh existing-only` skips it when you want the query cost alone.
 
-Scope flags cut the corpus a query considers. `--since`, `--provider`, and `--path` matter most
-for the modes that rank the whole eligible set before paging. Your index is probably smaller
-than this one, so treat these timings as a ceiling.
+Scope flags cut the corpus a query considers. For session list/search/export/analysis, date bounds
+intersect the known indexed span from `created_at` through `updated_at`: `--since` requires the span
+to end on or after the bound, `--until` requires it to start on or before the bound, and `--when`
+requires overlap with the resolved period. That span can contain gaps; it is not a claim of
+continuous process activity. Message, file, and event analytics continue to compare each event's
+own timestamp. `--provider` and `--path` compose with either interpretation. Your index is probably
+smaller than this one, so treat these timings as a ceiling.
 
 ## Session sources
 

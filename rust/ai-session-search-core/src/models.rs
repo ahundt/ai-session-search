@@ -950,7 +950,11 @@ pub struct SearchFilters {
     /// [`SessionRecord::parent_session_id`] stores is typed precisely so "every subagent of
     /// this session" is an equality match rather than a JSON scan.
     pub parent_session_id: Option<String>,
+    /// Inclusive query start. Session retrieval keeps rows whose known indexed end
+    /// (`updated_at`, falling back to `created_at`) is on or after this instant.
     pub since: Option<DateTime<Utc>>,
+    /// Inclusive query end. Session retrieval keeps rows whose known indexed start
+    /// (`created_at`, falling back to `updated_at`) is on or before this instant.
     pub until: Option<DateTime<Utc>>,
     pub limit: usize,
     pub warnings_only: bool,

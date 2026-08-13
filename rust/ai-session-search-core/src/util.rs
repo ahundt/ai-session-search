@@ -1220,11 +1220,11 @@ pub fn datetime_from_mtime_ns(mtime_ns: i64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(secs, nanos)
 }
 
-/// Guarantee a session has dates: fall back to the file mtime for any of
-/// `created_at`/`updated_at`/`last_message_at` the parser left unset. The session file's
-/// modification time is always available and is a faithful "last activity" timestamp, so
-/// no session is ever left "undated" — date filters (`--since`/`--until`) and recency
-/// sorting then always have a real value to compare. Parser-provided dates win.
+/// Guarantee a session has dates: fall back to the observed file mtime for any of
+/// `created_at`/`updated_at`/`last_message_at` the parser left unset. This keeps session-span
+/// filters and recency sorting defined for providers without native timestamps; it does not prove
+/// continuous activity or reorder two parser-provided endpoints. Parser-provided dates win.
+/// Runs in `O(1)` time and memory and performs no I/O because the caller supplies `mtime_ns`.
 pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
     let mtime = datetime_from_mtime_ns(mtime_ns);
     if session.updated_at.is_none() {
@@ -1235,6 +1235,27 @@ pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
     }
     if session.last_message_at.is_none() {
         session.last_message_at = session.updated_at;
+    }
+}
+
+/// Reject a malformed known session span after provider parsing and fallback.
+///
+/// This is `O(1)` time/memory with no I/O. Keeping validation after fallback lets providers with
+/// one or no native endpoint use the canonical mtime point span, while two contradictory native
+/// endpoints fail before persistence instead of being silently reordered at query time.
+pub fn validate_session_date_order(session: &SessionRecord) -> anyhow::Result<()> {
+    match (session.created_at, session.updated_at) {
+        (Some(created_at), Some(updated_at)) if created_at <= updated_at => Ok(()),
+        (Some(created_at), Some(updated_at)) => anyhow::bail!(
+            "session '{}' has created_at {} after updated_at {}; provider timestamp normalization must produce an ordered known span",
+            session.id,
+            created_at.to_rfc3339(),
+            updated_at.to_rfc3339()
+        ),
+        _ => anyhow::bail!(
+            "session '{}' has no complete date span after mtime fallback; verify the source file timestamp and provider parser",
+            session.id
+        ),
     }
 }
 
@@ -1742,6 +1763,29 @@ mod tests {
         rec.updated_at = Some(parsed);
         backfill_session_dates(&mut rec, mtime_ns);
         assert_eq!(rec.updated_at, Some(parsed));
+    }
+
+    #[test]
+    fn session_date_order_validation_accepts_fallback_and_rejects_reversal() {
+        let mtime_ns = 1_700_000_000_000_000_000;
+        let mut fallback = minimal_record(
+            Provider::Claude,
+            Path::new("/tmp/fallback.jsonl"),
+            String::new(),
+        );
+        backfill_session_dates(&mut fallback.session, mtime_ns);
+        validate_session_date_order(&fallback.session).unwrap();
+
+        fallback.session.created_at = datetime_from_mtime_ns(mtime_ns + 2_000_000_000);
+        let error = validate_session_date_order(&fallback.session)
+            .expect_err("reversed native endpoints must fail before persistence")
+            .to_string();
+        assert!(error.contains("created_at"), "{error}");
+        assert!(error.contains("after updated_at"), "{error}");
+        assert!(
+            error.contains("provider timestamp normalization"),
+            "{error}"
+        );
     }
 
     #[test]

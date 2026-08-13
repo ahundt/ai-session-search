@@ -726,9 +726,11 @@ class QueryScope:
 class SessionQuery:
     """Session list/search filters; limit=0 explicitly selects every match.
 
-    ``current_repo`` overrides repository-aware ranking. When omitted, ``search_sessions`` honors
-    configured ``prefer_current_repo`` behavior and derives the repository from the working
-    directory.
+    ``dates`` intersects an inclusive query period with each known indexed session span from
+    ``created_at`` through ``updated_at``. The span can contain gaps and does not assert continuous
+    process activity. ``current_repo`` overrides repository-aware ranking. When omitted,
+    ``search_sessions`` honors configured ``prefer_current_repo`` behavior and derives the
+    repository from the working directory.
     """
 
     provider: _ProviderId | None
@@ -1372,12 +1374,24 @@ class SessionSearch:
     def list_sessions(
         self,
         request: SessionQuery | None = None,
-    ) -> list[SessionRecord]: ...
+    ) -> list[SessionRecord]:
+        """List matching sessions in database order.
+
+        Work follows the Rust catalog query: worst-case session scan/sort plus output proportional
+        to returned row and text bytes. ``request.limit=0`` can return the complete eligible set.
+        """
+        ...
     def search_sessions(
         self,
         query: str,
         request: SessionQuery | None = None,
-    ) -> list[SearchHit]: ...
+    ) -> list[SearchHit]:
+        """Rank matching sessions after metadata and session-span filtering.
+
+        A finite limit bounds retained top-K results, not eligible transcript bytes scored;
+        ``request.limit=0`` can retain and return every match.
+        """
+        ...
     def search_files(
         self,
         pattern: str | None = None,

@@ -20,6 +20,13 @@ Library-only consumers may set `default-features = false` to omit the CLI
 release-check network client. The search, index, export, and recovery APIs do
 not require the `release-check` feature.
 
+Session list, ranked search, bundle export, and analysis intersect each resolved inclusive date
+period with the known indexed session span `[created_at, updated_at]`. `since` requires the span end
+to be on or after the query start; `until` requires the span start to be on or before the query end;
+`when` applies both. Exact RFC 3339 values remain zero-width instants. A known span can contain gaps
+and does not imply continuous process activity. Message, file, and event-analytics filters retain
+scalar event-timestamp semantics.
+
 `SessionSearch` owns configuration, the SQLite connection, and service lifetimes.
 Keep one instance for a related unit of work, then compose the immutable filter and
 publication types re-exported beside it. Existing module paths remain supported; storage,

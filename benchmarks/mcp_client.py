@@ -25,20 +25,30 @@ def parse_reader_bound(value: str) -> str | int:
     return parsed
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901 - one benchmark entry point selects three public operations.
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--fixture", required=True)
-    parser.add_argument("--query", required=True)
+    parser.add_argument(
+        "--operation",
+        choices=("message-search", "session-list", "session-search"),
+        default="message-search",
+    )
+    parser.add_argument("--query")
     parser.add_argument("--mode", choices=("literal", "regex", "fuzzy"), default="literal")
     parser.add_argument("--field", choices=("content", "tool_name", "tool_argument"), default="content")
     parser.add_argument("--argument-path")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--requests", type=int, default=1)
     parser.add_argument("--max-concurrent-reads", type=parse_reader_bound)
+    parser.add_argument("--since")
+    parser.add_argument("--until")
+    parser.add_argument("--when")
     args = parser.parse_args()
     if args.requests < 1:
         parser.error("--requests must be a positive integer")
+    if args.operation != "session-list" and args.query is None:
+        parser.error(f"--query is required for {args.operation}")
 
     with tempfile.TemporaryDirectory(prefix="aise-mcp-benchmark-") as temporary_dir:
         command = [
@@ -78,20 +88,33 @@ def main() -> int:
             },
             {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
         ]
-        search_arguments = {
-            "query": args.query,
-            "query_mode": args.mode,
-            "field": args.field,
-            **({"argument_path": args.argument_path} if args.argument_path else {}),
-            "limit": args.limit,
-            "detail": "full",
-        }
+        if args.operation == "message-search":
+            tool_name = "search_messages"
+            search_arguments = {
+                "query": args.query,
+                "query_mode": args.mode,
+                "field": args.field,
+                **({"argument_path": args.argument_path} if args.argument_path else {}),
+                "limit": args.limit,
+                "detail": "full",
+            }
+            result_field = "results"
+        else:
+            tool_name = "list_sessions" if args.operation == "session-list" else "search_sessions"
+            search_arguments = {
+                **({"query": args.query} if args.query is not None else {}),
+                **({"since": args.since} if args.since is not None else {}),
+                **({"until": args.until} if args.until is not None else {}),
+                **({"when": args.when} if args.when is not None else {}),
+                "limit": args.limit,
+            }
+            result_field = "sessions"
         requests.extend(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "tools/call",
-                "params": {"name": "search_messages", "arguments": search_arguments},
+                "params": {"name": tool_name, "arguments": search_arguments},
             }
             for request_id in range(2, args.requests + 2)
         )
@@ -112,7 +135,7 @@ def main() -> int:
         response = search_responses[request_id]
         if "structuredContent" not in response.get("result", {}):
             raise SystemExit(f"MCP search failed: {json.dumps(response, sort_keys=True)}")
-        structured_results.append(response["result"]["structuredContent"]["results"])
+        structured_results.append(response["result"]["structuredContent"][result_field])
     if any(result != structured_results[0] for result in structured_results[1:]):
         raise SystemExit("concurrent MCP searches returned different structured hits")
     print(json.dumps(structured_results[0], sort_keys=True, separators=(",", ":")))

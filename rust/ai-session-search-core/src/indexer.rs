@@ -902,6 +902,12 @@ pub(crate) fn reindex_until(
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
         crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
+        crate::util::validate_session_date_order(&parsed.session).with_context(|| {
+            format!(
+                "refusing malformed session timestamps from {}",
+                source.path.display()
+            )
+        })?;
         // Do not oscillate between two live files that claim one provider ID. The existing holder
         // remains canonical until it leaves the configured discovery set.
         if current_without_session
@@ -1160,6 +1166,12 @@ where
                 return Ok(TailOutcome::FullParse);
             }
             crate::util::backfill_session_dates(&mut tail.session, source.mtime_ns);
+            crate::util::validate_session_date_order(&tail.session).with_context(|| {
+                format!(
+                    "refusing malformed tail session timestamps from {}",
+                    source.path.display()
+                )
+            })?;
             crate::util::backfill_event_dates(
                 &tail.session,
                 &mut tail.new_messages,

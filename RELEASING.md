@@ -48,6 +48,11 @@ The distribution exposes one executable, `aise`, and MCP clients run
 This is the first public compatibility baseline at 1.0.0. The former private,
 single-user package does not define the public compatibility contract.
 
+`1.0.0rc2` intentionally changes bounded session-date membership from terminal activity to closed
+known-span overlap: `[created_at, updated_at]` intersects the resolved inclusive query period.
+Request/response shapes are unchanged. Message, file, and event-analytics date filters retain their
+per-event timestamp semantics. A known span can contain gaps and does not claim continuous runtime.
+
 Pinned release tools are uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
 0.20.2. Change them only in a separate reviewed toolchain change.
 

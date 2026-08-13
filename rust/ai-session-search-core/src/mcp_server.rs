@@ -4114,9 +4114,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "exclude_session_ids": session_exclude_ids_schema(),
                             "session_kinds": session_kinds_schema(),
                             "parent_session_id": parent_session_id_schema(),
-                            "since": session_activity_since_schema(),
-                            "until": session_activity_until_schema(),
-                            "when": session_activity_when_schema(),
+                            "since": session_span_since_schema(),
+                            "until": session_span_until_schema(),
+                            "when": session_span_when_schema(),
                             "limit": {
                                 "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
@@ -4215,9 +4215,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "exclude_session_ids": session_exclude_ids_schema(),
                             "session_kinds": session_kinds_schema(),
                             "parent_session_id": parent_session_id_schema(),
-                            "since": session_activity_since_schema(),
-                            "until": session_activity_until_schema(),
-                            "when": session_activity_when_schema(),
+                            "since": session_span_since_schema(),
+                            "until": session_span_until_schema(),
+                            "when": session_span_when_schema(),
                             "limit": {
                                 "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit),
@@ -5767,32 +5767,31 @@ fn apply_session_preview_chars(value: &mut Value, preview_chars: Option<usize>) 
     }
 }
 
-/// Schema for `since` on the session-listing tools, the lower session-activity bound.
+/// Schema for `since` on session tools: the inclusive start of an overlap query.
 ///
 /// One helper per field `search_sessions` and `list_sessions` share, so the two copies cannot
-/// drift apart: when these descriptions were inline literals, the `list_sessions` copy of this
-/// one was missing the whole-month example the `search_sessions` copy carried, and nothing
-/// noticed until the emitted catalogues were diffed.
-fn session_activity_since_schema() -> Value {
+/// drift apart. Schema construction is constant work and delegates parsing/filter cost to
+/// `DateRange` and `push_session_time_window()`.
+fn session_span_since_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Lower bound on session activity: last updated at or after this, or created at or after it when a session has no update time. Not a creation filter — a session started months ago and continued today is inside '7d'. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
+        "description": "Inclusive query start. Match when the known indexed session end is at or after it. Calendar/relative periods use UTC; exact RFC 3339 honors its offset and fractional seconds. Examples: '2026-01', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
     })
 }
 
-/// Schema for `until` on the session-listing tools, the inclusive upper session-activity bound.
-fn session_activity_until_schema() -> Value {
+/// Schema for `until` on session tools: the inclusive end of an overlap query.
+fn session_span_until_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Upper bound on the same session-activity timestamp, inclusive. Same precision and timezone rules as since. Default: no upper bound."
+        "description": "Inclusive query end. Match when the known indexed session start is at or before it, even if the session continued later. Same precision/timezone rules as since. Default: no upper bound."
     })
 }
 
-/// Schema for `when` on the session-listing tools, one period setting both activity bounds.
-fn session_activity_when_schema() -> Value {
+/// Schema for `when` on session tools: one period intersected with the known session span.
+fn session_span_when_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Single UTC period bounding session activity at both ends, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
+        "description": "Single UTC period intersected with each known indexed session span, e.g. '2026-01', '7d', or 'yesterday'. Exact RFC 3339 selects spans containing that instant. Spans can contain gaps; this is not continuous process activity. Do not combine with since/until."
     })
 }
 
@@ -8131,6 +8130,37 @@ mod tests {
     /// advertised value parses. A schema that offers a spelling the parser rejects is the
     /// drift this guards: the enum list is derived from `SessionKind` for exactly that reason,
     /// so this asserts the derivation holds end to end rather than trusting it.
+    #[test]
+    fn session_tools_advertise_closed_span_overlap() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        for tool_name in ["search_sessions", "list_sessions"] {
+            let tool = tool_input_schema(&config, tool_name);
+            let properties = &tool["inputSchema"]["properties"];
+            let since = properties["since"]["description"].as_str().unwrap();
+            let until = properties["until"]["description"].as_str().unwrap();
+            let when = properties["when"]["description"].as_str().unwrap();
+            assert!(
+                since.contains("known indexed session end"),
+                "{tool_name}: {since}"
+            );
+            assert!(
+                until.contains("known indexed session start"),
+                "{tool_name}: {until}"
+            );
+            assert!(
+                when.contains("spans containing that instant"),
+                "{tool_name}: {when}"
+            );
+            assert!(when.contains("can contain gaps"), "{tool_name}: {when}");
+            assert!(
+                when.contains("not continuous process activity"),
+                "{tool_name}: {when}"
+            );
+        }
+    }
+
     #[test]
     fn session_tools_advertise_the_session_classes_their_parser_accepts() {
         let (dir, _db) = fixture();
@@ -11299,6 +11329,103 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_gets_most_recent_sessions_in_directory_and_subdirectories() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        rusqlite::Connection::open(config.db_path())
+            .unwrap()
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, cwd, updated_at, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values
+                   ('claude:root-old', 'claude', 'root-old', '/work/project',
+                    '2026-01-01T00:00:00+00:00', '', '/root-old', 'v1', 'test'),
+                   ('claude:child-new', 'claude', 'child-new', '/work/project/sub/dir',
+                    '2026-03-01T00:00:00+00:00', '', '/child-new', 'v1', 'test'),
+                   ('claude:sibling-newer', 'claude', 'sibling-newer', '/work/project-other',
+                    '2026-04-01T00:00:00+00:00', '', '/sibling-newer', 'v1', 'test');",
+            )
+            .unwrap();
+
+        let ids = |limit| {
+            let response = tool_list_sessions(
+                &json!({"path_prefix": "/work/project", "limit": limit}),
+                &config,
+                &db,
+            )
+            .unwrap()
+            .structured_content
+            .unwrap();
+            response["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| session["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(1), ["claude:child-new"]);
+        assert_eq!(ids(0), ["claude:child-new", "claude:root-old"]);
+    }
+
+    #[test]
+    fn session_span_filters_compose_across_mcp_list_and_search() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        rusqlite::Connection::open(config.db_path())
+            .unwrap()
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, title, created_at, updated_at,
+                     preview_text, source_path, parse_version, discovery_source
+                 ) values
+                   ('claude:long-span', 'claude', 'long-span', 'span needle',
+                    '2026-01-10T00:00:00+00:00', '2026-03-10T00:00:00+00:00',
+                    'span needle', '/long-span.jsonl', 'test', 'fixture'),
+                   ('claude:february-only', 'claude', 'february-only', 'span needle',
+                    '2026-02-05T00:00:00+00:00', '2026-02-06T00:00:00+00:00',
+                    'span needle', '/february-only.jsonl', 'test', 'fixture');
+                 insert into transcripts (session_id, transcript_text) values
+                   ('claude:long-span', 'span needle'),
+                   ('claude:february-only', 'span needle');",
+            )
+            .unwrap();
+
+        for temporal in [
+            json!({"when": "2026-01"}),
+            json!({"when": "2026-02-15T00:00:00Z"}),
+            json!({"until": "2026-01"}),
+            json!({"since": "2026-03"}),
+        ] {
+            let mut list_args = temporal.clone();
+            list_args["limit"] = json!(0);
+            let listed = tool_list_sessions(&list_args, &config, &db).unwrap();
+            let listed = listed.structured_content.unwrap();
+            let listed_ids = listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| session["id"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(listed_ids, ["claude:long-span"]);
+
+            let mut search_args = temporal;
+            search_args["query"] = json!("needle");
+            search_args["limit"] = json!(0);
+            let searched = tool_search_sessions(&search_args, &config, &db).unwrap();
+            let searched = searched.structured_content.unwrap();
+            let searched_ids = searched["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                // SearchHit serializes the session fields flat, matching CLI JSON.
+                .map(|hit| hit["id"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(searched_ids, ["claude:long-span"]);
+        }
+    }
+
+    #[test]
     fn search_sessions_returns_structured_hits_mirroring_cli_json() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -13700,8 +13827,8 @@ mod tests {
     /// The two meanings of `since` stay apart on the wire, and every copy of each is identical.
     ///
     /// Four advertised tools spell a parameter `since` with two different meanings: it bounds
-    /// when a *session* was last active on `list_sessions` and `search_sessions`, and one
-    /// *message's* own timestamp on `search_messages` and `run_skill_capability`. A
+    /// the start of a closed session-span overlap query on `list_sessions` and `search_sessions`,
+    /// and one *message's* own timestamp on `search_messages` and `run_skill_capability`. A
     /// deduplication pass keyed on the spelling once published one sentence across tools whose
     /// semantics differ, and a deduplication test can only prove the copies agree, never that
     /// the surviving copy is right — so this reads the emitted catalogue and pins the semantic
@@ -13725,8 +13852,8 @@ mod tests {
             schema["description"].as_str().map(str::to_owned)
         };
 
-        // The session-activity tools describe session activity, in identical words — the two
-        // copies come from one shared builder, and this holds them to it.
+        // The session tools describe known-span overlap in identical words — the two copies come
+        // from one shared builder, and this holds them to it.
         for field in ["since", "until", "when"] {
             let search = described("search_sessions", field)
                 .unwrap_or_else(|| panic!("search_sessions.{field} has a description"));
@@ -13735,19 +13862,21 @@ mod tests {
             assert_eq!(
                 search, list,
                 "{field} diverged between the two session tools; both must come from the shared \
-                 session_activity_*_schema builder"
-            );
-            assert!(
-                search.contains("session activity") || search.contains("session-activity"),
-                "search_sessions.{field} must say it bounds session activity: {search}"
+                 session_span_*_schema builder"
             );
         }
-        // `since` is not a creation filter, and the description pre-empts that misreading.
         let session_since = described("search_sessions", "since").expect("described above");
+        let session_until = described("search_sessions", "until").expect("described above");
+        let session_when = described("search_sessions", "when").expect("described above");
         assert!(
-            session_since.contains("Not a creation filter"),
-            "the session `since` must pre-empt the creation-filter misreading: {session_since}"
+            session_since.contains("indexed session end"),
+            "{session_since}"
         );
+        assert!(
+            session_until.contains("indexed session start"),
+            "{session_until}"
+        );
+        assert!(session_when.contains("span"), "{session_when}");
 
         // The message tools describe the message's own timestamp, not session activity.
         let capability_since = described("run_skill_capability", "since")
