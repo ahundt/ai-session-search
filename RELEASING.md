@@ -12,23 +12,23 @@ Never rebuild between verification and publication.
 ## Current release identity
 
 `1.0.0rc1` / `1.0.0-rc.1` is **published** to crates.io, PyPI, and as GitHub
-release `v1.0.0rc1`. The working tree still declares it, which is correct until
-the next release bumps it.
+release `v1.0.0rc1`. The working tree declares the local `1.0.0rc2` / `1.0.0-rc.2`
+candidate; it has not been tagged, pushed, or published.
 
 Preparing a release means setting all seven declarations to the new version in
 one commit, then tagging that commit. The consumer crate stays unpublished at
 `0.0.0`; only its requirement on the released core crate carries the release
 version:
 
-| Location | Field | Value (currently `1.0.0rc1` / `1.0.0-rc.1`) |
+| Location | Field | Value (candidate `1.0.0rc2` / `1.0.0-rc.2`) |
 | --- | --- | --- |
-| `pyproject.toml` | `project.version` | `1.0.0rc1` |
-| `rust/ai-session-search-core/Cargo.toml` | `package.version` | `1.0.0-rc.1` |
-| `rust/ai-session-search-python/Cargo.toml` | `package.version` | `1.0.0-rc.1` |
-| `rust/ai-session-search-python/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.1` |
-| `tests/rust-api-consumer/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.1` |
-| `skills/ai-session-search/SKILL.md` | `metadata.version` | `1.0.0-rc.1` |
-| `rust/ai-session-search-core/skills/ai-session-search/SKILL.md` | `metadata.version` | `1.0.0-rc.1` |
+| `pyproject.toml` | `project.version` | `1.0.0rc2` |
+| `rust/ai-session-search-core/Cargo.toml` | `package.version` | `1.0.0-rc.2` |
+| `rust/ai-session-search-python/Cargo.toml` | `package.version` | `1.0.0-rc.2` |
+| `rust/ai-session-search-python/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.2` |
+| `tests/rust-api-consumer/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.2` |
+| `skills/ai-session-search/SKILL.md` | `metadata.version` | `1.0.0-rc.2` |
+| `rust/ai-session-search-core/skills/ai-session-search/SKILL.md` | `metadata.version` | `1.0.0-rc.2` |
 
 Cargo resolves a stale `1.0.0-rc.1` requirement against a `1.0.0` core crate
 without complaint, so `cargo check --locked` cannot report either dependency
@@ -37,7 +37,7 @@ drifting. The metadata gate is the only check that does.
 Run the metadata gate before creating a tag:
 
 ```bash
-uv run python -m scripts.verify_release_metadata --tag v1.0.0rc1
+uv run python -m scripts.verify_release_metadata --tag v1.0.0rc2
 ```
 
 The release requires Rust 1.88 or newer and CPython 3.12 through 3.14 with
@@ -154,10 +154,10 @@ between the workflow parking at `crates-io` and approving that environment:
    what the workflow attested:
 
    ```bash
-   git checkout --detach v1.0.0rc1
+   git checkout --detach v1.0.0rc2
    gh run download <run-id> --name verified-crate-distribution --dir attested
    cargo package --locked --no-verify -p ai-session-search
-   cmp attested/*.crate target/package/ai-session-search-1.0.0-rc.1.crate
+   cmp attested/*.crate target/package/ai-session-search-1.0.0-rc.2.crate
    ```
 
    The detached checkout is load-bearing, not tidiness. `cargo package` writes
@@ -200,9 +200,9 @@ three rather than assuming the version string carried through.
 
 | Surface | How it is expressed | Verify |
 | --- | --- | --- |
-| GitHub Release | Explicit `--prerelease`, chosen by the `case` on the tag in the `release` job | `gh release view v1.0.0rc1 --json isPrerelease` |
-| PyPI | Implicit in the PEP 440 spelling `1.0.0rc1` | `curl -s https://pypi.org/pypi/ai-session-search/json` and read `info.version` |
-| crates.io | Implicit in the SemVer spelling `1.0.0-rc.1` | `curl -s https://crates.io/api/v1/crates/ai-session-search` and read `max_stable_version` |
+| GitHub Release | Explicit `--prerelease`, chosen by the `case` on the tag in the `release` job | `gh release view v1.0.0rc2 --json isPrerelease` |
+| PyPI | Implicit in the PEP 440 spelling `1.0.0rc2` | `curl -s https://pypi.org/pypi/ai-session-search/json` and read `info.version` |
+| crates.io | Implicit in the SemVer spelling `1.0.0-rc.2` | `curl -s https://crates.io/api/v1/crates/ai-session-search` and read `max_stable_version` |
 
 The GitHub flag is the only one a release can get wrong on its own; the other
 two follow from the version string the metadata gate already pins. crates.io
@@ -286,7 +286,7 @@ Before tagging, confirm:
   force-push.
 - `git status --short` is clean.
 - The staged release diff was inspected before its version commit.
-- `python -m scripts.verify_release_metadata --tag v1.0.0rc1` passes.
+- `python -m scripts.verify_release_metadata --tag v1.0.0rc2` passes.
 - The local wheel, sdist, and crate prepared above pass artifact verification.
 - The wheel contains the extension, typed stubs, `py.typed`, `LICENSE`, and
   `NOTICE`; sdists contain both lockfiles and build manifests.
@@ -306,13 +306,13 @@ accepting publisher changes; a submission made after that window lapses is
 discarded without an error, so confirm the publisher appears under **Pending
 publishers** before continuing.
 
-`gh workflow run publish.yml --ref v1.0.0rc1` then reuses the same build,
+`gh workflow run publish.yml --ref v1.0.0rc2` then reuses the same build,
 verification, and attestation pipeline and uploads to TestPyPI. Confirm it
 installs:
 
 ```bash
 uv run --isolated --no-project --default-index https://test.pypi.org/simple/ \
-  --with ai-session-search==1.0.0rc1 aise --version
+  --with ai-session-search==1.0.0rc2 aise --version
 ```
 
 `--default-index` replaces PyPI rather than adding to it, so the command fails

@@ -2,7 +2,7 @@
 name: ai-session-search
 description: Search, recover, inspect, export, and analyze local AI session history with AI Session Search (`aise`) across Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI. Use when asked to "find prior AI work", "recover context after compaction", "inspect tool calls or corrections", "reconstruct a file", "export a session", "analyze repeated mistakes", or turn session evidence into durable agent guidance.
 metadata:
-  version: 1.0.0-rc.1
+  version: 1.0.0-rc.2
 ---
 <!-- ai-session-search-managed-skill v1 -->
 

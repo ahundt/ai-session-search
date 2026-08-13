@@ -7,4 +7,4 @@ license.workspace = true
 publish = false
 
 [dependencies]
-ai-session-search = { path = "../../rust/ai-session-search-core", version = "1.0.0-rc.1", default-features = false }
+ai-session-search = { path = "../../rust/ai-session-search-core", version = "1.0.0-rc.2", default-features = false }
