@@ -59,6 +59,7 @@ Reproduce with the smallest failing test at the shared typed layer, then cover
 every adapter reached: Rust, PyO3, Python, CLI, MCP, schemas, docs, examples,
 provider fixtures, packaging. State what you measured and the command that
 measured it. Mark inferences as inferences and name the evidence they rest on.
+Benchmarks: use `scripts/benchmark_release.py` with `--fixture generated` and a `smoke`, `subsystem`, or `release` tier, then compare baseline/candidate JSONL with `scripts/render_benchmark_report.py`.
 
 Before altering public behavior, read the entries that touch your change in the
 [maintainer requirements](docs/development/maintainer-requirements-and-design-decisions.md).
