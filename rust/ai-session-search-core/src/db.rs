@@ -2956,12 +2956,12 @@ impl Db {
         Ok((hits, explain))
     }
 
-    fn search_tool_name_fuzzy_indexed(
+    #[cfg(test)]
+    fn search_tool_name_fuzzy_direct_for_test(
         &self,
         query: &str,
         filters: &MessageFilters,
-        include_explain: bool,
-    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+    ) -> Result<Vec<MessageHit>> {
         let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
                     m.kind, m.tool_call_id, m.content
@@ -2970,9 +2970,61 @@ impl Db {
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        sql.push_str(" order by m.tool_name, m.session_id, m.seq");
+        sql.push_str(" order by m.session_id, m.seq");
+        let rows = self.query_message_hits(&sql, &args)?;
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        let scored = score_fuzzy_derived_hits(
+            &pattern,
+            &query.to_lowercase(),
+            SearchField::ToolName,
+            None,
+            rows,
+        );
+        Ok(finish_fuzzy_hits(
+            scored,
+            fuzzy_ranked_limit(filters)?,
+            filters.offset,
+        ))
+    }
 
-        let ranked_limit = fuzzy_ranked_limit(filters)?;
+    fn search_tool_name_fuzzy_indexed(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        use rusqlite::types::Value;
+
+        // Tool-name score depends only on the name, not the row. Let N be structurally eligible
+        // named rows, V distinct names, C matching rows, and B_C their content bytes. The old path
+        // read O(N + B_N) bytes and scored O(V) names. This path scores the same complete V, then
+        // uses idx_messages_tool_name to materialize O(C + B_C) rows. Worst case remains O(N+B_N)
+        // when every name matches. The vocabulary and matching-name map retain O(V) short strings;
+        // top-K remains O(W + bytes(W)). SQLite traversal is serial and no schema/write cost is
+        // added. A JSON virtual table carries the bounded vocabulary between the two statements.
+        let mut vocabulary_sql = String::from(
+            "select distinct m.tool_name from messages m where m.tool_name is not null",
+        );
+        let mut vocabulary_args = Vec::new();
+        append_message_filters(
+            &mut vocabulary_sql,
+            &mut vocabulary_args,
+            filters,
+            &self.access_scope,
+        );
+        vocabulary_sql.push_str(" order by m.tool_name");
+        let mut vocabulary_stmt = self.conn.prepare(&vocabulary_sql)?;
+        let names = vocabulary_stmt
+            .query_map(rusqlite::params_from_iter(vocabulary_args.iter()), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
         let pattern = Pattern::new(
             query,
             CaseMatching::Ignore,
@@ -2980,47 +3032,87 @@ impl Db {
             AtomKind::Fuzzy,
         );
         let query_lower = query.to_lowercase();
+        let query_needle = UnicodeLowerNeedle::from_lowered(&query_lower);
         let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
         let mut utf32_buf = Vec::new();
-        let mut cached_name = None;
-        let mut cached_match = None;
-        let mut top = Vec::new();
-        let mut corpus = 0_i64;
-        let mut matched = 0_i64;
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
-        for row in rows {
-            let mut hit = row?;
-            corpus += 1;
-            let name = hit
-                .tool_name
-                .as_deref()
-                .expect("SQL excludes messages without tool names");
-            if cached_name.as_deref() != Some(name) {
-                utf32_buf.clear();
-                cached_match = pattern
-                    .score(Utf32Str::new(name, &mut utf32_buf), &mut matcher)
-                    .map(|score| (score, name.to_lowercase().contains(&query_lower)));
-                cached_name = Some(name.to_string());
+        let mut matching_names = HashMap::new();
+        for name in names {
+            utf32_buf.clear();
+            if let Some(score) = pattern.score(Utf32Str::new(&name, &mut utf32_buf), &mut matcher) {
+                let exact_phrase = query_needle.contains(&name);
+                matching_names.insert(name, (score, exact_phrase));
             }
-            if let Some((score, exact_phrase)) = cached_match {
-                matched += 1;
+        }
+
+        let mut top = Vec::new();
+        let mut matched = 0_i64;
+        if !matching_names.is_empty() {
+            let selected_names = serde_json::to_string(
+                &matching_names
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut sql = String::from(
+                "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
+                        m.kind, m.tool_call_id, m.content
+                   from json_each(?) selected
+                   join messages m on m.tool_name = selected.value
+                  where m.tool_name is not null",
+            );
+            let mut args = vec![Value::Text(selected_names)];
+            append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+            let ranked_limit = fuzzy_ranked_limit(filters)?;
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows =
+                stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+            for row in rows {
+                let mut hit = row?;
+                let (score, exact_phrase) = matching_names
+                    .get(
+                        hit.tool_name
+                            .as_deref()
+                            .expect("SQL excludes null tool names"),
+                    )
+                    .copied()
+                    .expect("row joined through the scored vocabulary");
                 hit.fuzzy_score = Some(score);
+                matched += 1;
                 top.push((hit, exact_phrase));
                 if top.len() >= top_k_compaction_threshold(ranked_limit) {
                     retain_top_fuzzy_hits(&mut top, ranked_limit);
                 }
             }
         }
+        let ranked_limit = fuzzy_ranked_limit(filters)?;
         let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
-        let explain = include_explain.then(|| SearchExplain {
-            prefilter: None,
-            candidates: Some(matched),
-            prefilter_skipped: Some(
-                "complete filtered corpus scored with bounded top-K retention".to_string(),
-            ),
-            corpus,
-        });
+        let explain = include_explain
+            .then(|| {
+                let mut corpus_sql =
+                    String::from("select count(*) from messages m where m.tool_name is not null");
+                let mut corpus_args = Vec::new();
+                append_message_filters(
+                    &mut corpus_sql,
+                    &mut corpus_args,
+                    filters,
+                    &self.access_scope,
+                );
+                let corpus = self.conn.query_row(
+                    &corpus_sql,
+                    rusqlite::params_from_iter(corpus_args.iter()),
+                    |row| row.get(0),
+                )?;
+                Ok::<_, anyhow::Error>(SearchExplain {
+                    prefilter: None,
+                    candidates: Some(matched),
+                    prefilter_skipped: Some(
+                        "complete filtered tool-name vocabulary scored before matching rows are loaded"
+                            .to_string(),
+                    ),
+                    corpus,
+                })
+            })
+            .transpose()?;
         Ok((hits, explain))
     }
 
@@ -7989,7 +8081,7 @@ mod tests {
         assert_eq!(explain.candidates, Some(1));
         assert_eq!(
             explain.prefilter_skipped.as_deref(),
-            Some("complete filtered corpus scored with bounded top-K retention")
+            Some("complete filtered tool-name vocabulary scored before matching rows are loaded")
         );
         assert!(explain.candidates.unwrap() < explain.corpus);
         let vocabulary_plan = db
@@ -8020,6 +8112,125 @@ mod tests {
         assert!(
             none.is_empty(),
             "unknown tool matches nothing (incl. NULL-tool rows)"
+        );
+    }
+
+    #[test]
+    #[ignore = "deterministic release-mode tool-name vocabulary performance measurement"]
+    fn fuzzy_tool_name_vocabulary_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test')",
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "insert into messages (
+                         session_id, provider, seq, role, tool_name, content
+                     ) values ('s1', 'claude', ?1, 'tool', ?2, ?3)",
+                )
+                .unwrap();
+            for seq in 0..250_000_i64 {
+                let name = if seq % 25_000 == 0 {
+                    "exec_command".to_string()
+                } else {
+                    format!("unrelated_tool_{:03}", seq % 250)
+                };
+                insert
+                    .execute(params![seq, name, "x".repeat(2_048)])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let filters = MessageFilters {
+            field: Some(SearchField::ToolName),
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: 20,
+            ..Default::default()
+        };
+        let measure = |optimized: bool| {
+            let search = || {
+                if optimized {
+                    db.search_messages("exec", &filters).unwrap()
+                } else {
+                    db.search_tool_name_fuzzy_direct_for_test("exec", &filters)
+                        .unwrap()
+                }
+            };
+            let expected = serde_json::to_vec(&search()).unwrap();
+            let digest = crate::hashing::sha256(&expected);
+            let mut elapsed = Vec::new();
+            for _ in 0..7 {
+                let started = Instant::now();
+                assert_eq!(serde_json::to_vec(&search()).unwrap(), expected);
+                elapsed.push(started.elapsed().as_micros());
+            }
+            elapsed.sort_unstable();
+            (
+                elapsed[elapsed.len() / 2],
+                elapsed[elapsed.len() - 1],
+                digest,
+            )
+        };
+        let direct = measure(false);
+        let optimized = measure(true);
+        assert_eq!(direct.2, optimized.2);
+        eprintln!(
+            "tool_name_vocabulary_benchmark rows=250000 vocabulary=251 direct_median_us={} direct_p95_us={} optimized_median_us={} optimized_p95_us={} digest=sha256:{}",
+            direct.0, direct.1, optimized.0, optimized.1, direct.2
+        );
+    }
+
+    #[test]
+    fn fuzzy_tool_name_vocabulary_path_matches_direct_row_scoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values
+                   ('s1','claude','s1','','/p','1','test'),
+                   ('s2','codex','s2','','/q','1','test');
+                 insert into messages (
+                     session_id, provider, seq, role, tool_name, content
+                 ) values
+                   ('s1', 'claude', 0, 'tool', 'exec_command', 'large ignored payload a'),
+                   ('s1', 'claude', 1, 'tool', 'Edit', 'large ignored payload b'),
+                   ('s1', 'claude', 2, 'tool', 'mcp:memory:execute', 'large ignored payload c'),
+                   ('s2', 'codex', 0, 'tool', 'exec_command', 'large ignored payload d'),
+                   ('s2', 'codex', 1, 'tool', 'write_stdin', 'large ignored payload e');",
+            )
+            .unwrap();
+        let filters = MessageFilters {
+            field: Some(SearchField::ToolName),
+            match_mode: MessageSearchMode::Fuzzy,
+            providers: Some(vec![Provider::Claude]),
+            limit: 2,
+            offset: 1,
+            ..Default::default()
+        };
+        let optimized = db.search_messages("exec", &filters).unwrap();
+        let direct = db
+            .search_tool_name_fuzzy_direct_for_test("exec", &filters)
+            .unwrap();
+        assert_eq!(
+            optimized
+                .iter()
+                .map(|hit| (&hit.session_id, hit.seq, hit.fuzzy_score))
+                .collect::<Vec<_>>(),
+            direct
+                .iter()
+                .map(|hit| (&hit.session_id, hit.seq, hit.fuzzy_score))
+                .collect::<Vec<_>>()
         );
     }
 
