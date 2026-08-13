@@ -184,6 +184,8 @@ const FUZZY_SCORE_BATCH_SIZE: usize = 512;
 /// this byte budget beyond the largest record rather than multiplying that record by the row cap.
 const SESSION_SCORE_BATCH_SIZE: usize = 128;
 const SESSION_SCORE_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Bound raw message JSON retained while projected fuzzy fields score in parallel.
+const DERIVED_FUZZY_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default SQLite busy timeout for normal CLI/MCP use. This is intentionally a short wait, not
 /// an indefinite block: concurrent agent sessions should ride out brief write bursts, while real
@@ -2892,34 +2894,49 @@ impl Db {
             AtomKind::Fuzzy,
         );
         let query_lower = query.to_lowercase();
-        let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
-        let mut utf32_buf = Vec::new();
         let ranked_limit = fuzzy_ranked_limit(filters)?;
         let mut top = Vec::new();
         let mut corpus = 0_i64;
         let mut matched = 0_i64;
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+        let mut batch = Vec::with_capacity(FUZZY_SCORE_BATCH_SIZE);
+        let mut batch_bytes = 0_usize;
         for row in rows {
-            let mut hit = row?;
+            let hit = row?;
             corpus += 1;
-            let Some(value) =
-                selected_message_field_parts(&hit, field, filters.argument_path.as_deref())
-            else {
-                continue;
-            };
-            let value = value.into_owned();
-            utf32_buf.clear();
-            if let Some(score) = pattern.score(Utf32Str::new(&value, &mut utf32_buf), &mut matcher)
-            {
-                matched += 1;
-                hit.fuzzy_score = Some(score);
-                let exact_phrase = value.to_lowercase().contains(&query_lower);
-                top.push((hit, exact_phrase));
+            batch_bytes = batch_bytes.saturating_add(hit.content.len());
+            batch.push(hit);
+            if batch.len() == FUZZY_SCORE_BATCH_SIZE || batch_bytes >= DERIVED_FUZZY_BATCH_BYTES {
+                let scored = self.runtime.install(|| {
+                    score_fuzzy_derived_hits(
+                        &pattern,
+                        &query_lower,
+                        field,
+                        filters.argument_path.as_deref(),
+                        std::mem::take(&mut batch),
+                    )
+                })?;
+                batch_bytes = 0;
+                matched += scored.len() as i64;
+                top.extend(scored);
                 if top.len() >= top_k_compaction_threshold(ranked_limit) {
                     retain_top_fuzzy_hits(&mut top, ranked_limit);
                 }
             }
+        }
+        if !batch.is_empty() {
+            let scored = self.runtime.install(|| {
+                score_fuzzy_derived_hits(
+                    &pattern,
+                    &query_lower,
+                    field,
+                    filters.argument_path.as_deref(),
+                    batch,
+                )
+            })?;
+            matched += scored.len() as i64;
+            top.extend(scored);
         }
         let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
         let explain = include_explain.then(|| SearchExplain {
@@ -5343,6 +5360,37 @@ fn json_projection_prefilter_groups(pattern: &str) -> Option<Vec<Vec<String>>> {
         })
         .collect::<Vec<_>>();
     (!groups.is_empty() && groups.iter().all(|group| !group.is_empty())).then_some(groups)
+}
+
+/// Project and score one derived-field batch in parallel. For raw bytes `B_b`, rows `N_b`, and
+/// workers `P`, tool-argument projection plus fuzzy scoring does O(B_b + score(B_b)) aggregate
+/// work and ideal O((B_b + score(B_b))/P) scoring latency, excluding serial SQLite traversal and
+/// scheduling. Worker-local matcher/buffer state is O(P*Q); output retains only matching rows.
+fn score_fuzzy_derived_hits(
+    pattern: &Pattern,
+    query_lower: &str,
+    field: SearchField,
+    argument_path: Option<&str>,
+    hits: Vec<MessageHit>,
+) -> Vec<(MessageHit, bool)> {
+    let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
+    hits.into_par_iter()
+        .map_init(
+            || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
+            |(matcher, utf32_buf), mut hit| {
+                let value = selected_message_field_parts(&hit, field, argument_path)?.into_owned();
+                utf32_buf.clear();
+                pattern
+                    .score(Utf32Str::new(&value, utf32_buf), matcher)
+                    .map(|score| {
+                        hit.fuzzy_score = Some(score);
+                        let exact_phrase = exact_phrase_needle.contains(&value);
+                        (hit, exact_phrase)
+                    })
+            },
+        )
+        .filter_map(std::convert::identity)
+        .collect()
 }
 
 fn score_fuzzy_message_hits(
@@ -9460,6 +9508,153 @@ mod tests {
             direct_us[direct_us.len() / 2],
             direct_us[direct_us.len() - 1],
             digest
+        );
+    }
+
+    #[test]
+    fn fuzzy_tool_argument_search_uses_workers_without_changing_scores_or_order() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = |db: &Db| {
+            seed_messages(db, &[("tool", "placeholder")]);
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare(
+                        "insert into messages (
+                             session_id, provider, seq, role, tool_name, kind, content
+                         ) values ('claude:s1', 'claude', ?1, 'tool', 'exec_command',
+                                   'tool_call', ?2)",
+                    )
+                    .unwrap();
+                for seq in 1..=1_100_i64 {
+                    let cmd = if seq % 137 == 0 {
+                        format!("cargo test workspace target {seq}")
+                    } else {
+                        format!("ordinary tool argument payload {seq}")
+                    };
+                    insert
+                        .execute(params![
+                            seq,
+                            crate::util::tool_call_message_content(
+                                "exec_command",
+                                serde_json::json!({"cmd": cmd})
+                            )
+                        ])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        };
+        let one = Db::open_with_threads(
+            &root.path().join("one.db"),
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let four = Db::open_with_threads(
+            &root.path().join("four.db"),
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .unwrap();
+        seed(&one);
+        seed(&four);
+        let filters = MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some("/cmd".to_string()),
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: 20,
+            ..Default::default()
+        };
+        let identity = |hits: Vec<MessageHit>| {
+            hits.into_iter()
+                .map(|hit| (hit.session_id, hit.seq, hit.fuzzy_score))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(one.worker_pool_build_count(), 0);
+        assert_eq!(four.worker_pool_build_count(), 0);
+        let expected = identity(one.search_messages("crgo tst wrkspce", &filters).unwrap());
+        let actual = identity(four.search_messages("crgo tst wrkspce", &filters).unwrap());
+        assert_eq!(actual, expected);
+        assert_eq!(one.worker_pool_build_count(), 1);
+        assert_eq!(four.worker_pool_build_count(), 1);
+    }
+
+    #[test]
+    #[ignore = "deterministic release-mode derived fuzzy performance measurement"]
+    fn fuzzy_tool_argument_parallel_scoring_benchmark() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index.db");
+        {
+            let db =
+                Db::open_with_threads(&path, TEST_BUSY_TIMEOUT_MS, NonZeroUsize::new(1).unwrap())
+                    .unwrap();
+            seed_messages(&db, &[("tool", "placeholder")]);
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare(
+                        "insert into messages (
+                             session_id, provider, seq, role, tool_name, kind, content
+                         ) values ('claude:s1', 'claude', ?1, 'tool', 'exec_command',
+                                   'tool_call', ?2)",
+                    )
+                    .unwrap();
+                for seq in 1..=30_000_i64 {
+                    let cmd = if seq % 3_000 == 0 {
+                        format!("cargo test workspace target {seq}")
+                    } else {
+                        format!("ordinary deterministic tool argument payload {seq}")
+                    };
+                    insert
+                        .execute(params![
+                            seq,
+                            crate::util::tool_call_message_content(
+                                "exec_command",
+                                serde_json::json!({"cmd": cmd})
+                            )
+                        ])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let filters = MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some("/cmd".to_string()),
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: 50,
+            ..Default::default()
+        };
+        let measure = |threads| {
+            let db = Db::open_with_threads(
+                &path,
+                TEST_BUSY_TIMEOUT_MS,
+                NonZeroUsize::new(threads).unwrap(),
+            )
+            .unwrap();
+            let search = || db.search_messages("crgo tst wrkspce", &filters).unwrap();
+            let expected = serde_json::to_vec(&search()).unwrap();
+            let digest = crate::hashing::sha256(&expected);
+            let mut elapsed = Vec::new();
+            for _ in 0..7 {
+                let started = Instant::now();
+                assert_eq!(serde_json::to_vec(&search()).unwrap(), expected);
+                elapsed.push(started.elapsed().as_micros());
+            }
+            elapsed.sort_unstable();
+            (
+                elapsed[elapsed.len() / 2],
+                elapsed[elapsed.len() - 1],
+                digest,
+            )
+        };
+        let one = measure(1);
+        let four = measure(4);
+        assert_eq!(one.2, four.2);
+        eprintln!(
+            "tool_argument_fuzzy_parallel_benchmark rows=30000 one_worker_median_us={} one_worker_p95_us={} four_worker_median_us={} four_worker_p95_us={} digest=sha256:{}",
+            one.0, one.1, four.0, four.1, one.2
         );
     }
 

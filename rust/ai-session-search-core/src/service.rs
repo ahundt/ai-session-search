@@ -2288,8 +2288,10 @@ impl<'db> MessageService<'db> {
     /// Fuzzy search scores every filtered row with parallel batches, does
     /// `O(B_F + F + W log W)` aggregate work for retained window `W=offset+limit`, and has ideal
     /// scoring latency `O(B_F/P + W log W)` over `P` workers plus serial SQLite traversal and
-    /// scheduling overhead. Its peak Rust memory is `O(W + bytes(W) + batch_bytes)`; validation
-    /// rejects an unbounded fuzzy page.
+    /// scheduling overhead. Content and derived-field fuzzy paths both use bounded parallel
+    /// batches; tool-argument fuzzy projection remains exhaustive but parallelizes JSON parsing
+    /// and scoring. Peak Rust memory is `O(W + bytes(W) + batch_budget + largest_row + P*Q)`;
+    /// validation rejects an unbounded fuzzy page.
     pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
     }
