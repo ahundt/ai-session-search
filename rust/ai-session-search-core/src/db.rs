@@ -2453,6 +2453,7 @@ impl Db {
             };
             PreparedMessageExplain::Ready(explain)
         } else {
+            let mut derived_explain = None;
             match (field, filters.match_mode) {
                 (SearchField::ToolName, MessageSearchMode::Literal) => {
                     sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
@@ -2463,29 +2464,94 @@ impl Db {
                     sql.push_str(" and rust_regexp(?, m.tool_name)");
                     args.push(Value::Text(query.to_string()));
                 }
-                (SearchField::ToolArgument, MessageSearchMode::Literal) => {
-                    sql.push_str(" and unicode_lower_contains(rust_json_pointer(?, m.content), ?)");
-                    args.push(Value::Text(
-                        filters.argument_path.clone().unwrap_or_default(),
-                    ));
-                    args.push(Value::Text(query.to_lowercase()));
-                }
-                (SearchField::ToolArgument, MessageSearchMode::Regex) => {
-                    regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
-                    sql.push_str(" and rust_regexp(?, rust_json_pointer(?, m.content))");
-                    args.push(Value::Text(query.to_string()));
-                    args.push(Value::Text(
-                        filters.argument_path.clone().unwrap_or_default(),
-                    ));
+                (SearchField::ToolArgument, mode) => {
+                    // Let F be structurally eligible tool-call rows, C the raw-JSON trigram
+                    // candidates (C <= F), B_C their total JSON bytes, Q the query length, P_Q the
+                    // postings entries read for its required grams, and H the returned page. The
+                    // previous path parsed/projected every row: O(F + B_F + H) application work.
+                    // This path does O(Q + P_Q + C + B_C + H), including authoritative projection
+                    // and matching. Worst case remains O(F + B_F + H) when every row is candidate;
+                    // selective anchors reduce JSON parsing from B_F to B_C. Peak owned Rust
+                    // result memory remains O(H + bytes(H)); SQLite's execution/postings state is
+                    // implementation-owned and conservatively bounded by O(P_Q + C). No second
+                    // candidate Vec is materialized here. Query latency is
+                    // the same serial critical path as the work above—this branch does not claim
+                    // a /worker_threads speedup. The existing incrementally maintained raw-content
+                    // index adds no new storage or write-maintenance asymptotic cost.
+                    if mode == MessageSearchMode::Regex {
+                        regex::Regex::new(query)
+                            .map_err(|error| anyhow!("invalid regex: {error}"))?;
+                    }
+                    let prefilter_pattern = match mode {
+                        MessageSearchMode::Literal if !query.is_empty() => {
+                            Some(regex::escape(query))
+                        }
+                        MessageSearchMode::Regex => Some(query.to_string()),
+                        MessageSearchMode::Literal => None,
+                        MessageSearchMode::Fuzzy => unreachable!("fuzzy query rejected above"),
+                    };
+                    let prefilter = (self.schema_version()? >= 4)
+                        .then(|| {
+                            prefilter_pattern
+                                .as_deref()
+                                .and_then(json_projection_prefilter_groups)
+                                .map(|groups| crate::trigram::render_prefilter_groups(&groups))
+                        })
+                        .flatten();
+                    if let Some(fts_query) = &prefilter {
+                        sql.push_str(
+                            " and m.id in (
+                                 select rowid from messages_trigram
+                                  where messages_trigram match ?
+                             )",
+                        );
+                        args.push(Value::Text(fts_query.clone()));
+                    }
+                    sql.push_str(" and m.kind = 'tool_call'");
+                    match mode {
+                        MessageSearchMode::Literal => {
+                            sql.push_str(
+                                " and unicode_lower_contains(rust_json_pointer(?, m.content), ?)",
+                            );
+                            args.push(Value::Text(
+                                filters.argument_path.clone().unwrap_or_default(),
+                            ));
+                            args.push(Value::Text(query.to_lowercase()));
+                        }
+                        MessageSearchMode::Regex => {
+                            sql.push_str(" and rust_regexp(?, rust_json_pointer(?, m.content))");
+                            args.push(Value::Text(query.to_string()));
+                            args.push(Value::Text(
+                                filters.argument_path.clone().unwrap_or_default(),
+                            ));
+                        }
+                        MessageSearchMode::Fuzzy => unreachable!("fuzzy query rejected above"),
+                    }
+                    if include_explain {
+                        let mut tool_filters = filters.clone();
+                        tool_filters.kinds = Some(vec![crate::models::MessageKind::ToolCall]);
+                        let corpus = self.filtered_corpus_count(&tool_filters)?;
+                        derived_explain = Some(SearchExplain {
+                            prefilter: prefilter.clone(),
+                            candidates: prefilter
+                                .as_deref()
+                                .map(|query| self.fts5_candidate_count(&tool_filters, query))
+                                .transpose()?,
+                            prefilter_skipped: prefilter.is_none().then(|| {
+                                "no JSON-stable required literal of at least three characters"
+                                    .to_string()
+                            }),
+                            corpus,
+                        });
+                    }
                 }
                 (_, MessageSearchMode::Fuzzy) => unreachable!("fuzzy query rejected above"),
                 (SearchField::Content, _) => unreachable!("content handled above"),
             }
-            if field == SearchField::ToolArgument {
-                sql.push_str(" and m.kind = 'tool_call'");
-            }
             if include_explain {
-                PreparedMessageExplain::DerivedFieldRows
+                derived_explain.map_or(PreparedMessageExplain::DerivedFieldRows, |explain| {
+                    PreparedMessageExplain::Ready(Some(explain))
+                })
             } else {
                 PreparedMessageExplain::Ready(None)
             }
@@ -2798,42 +2864,9 @@ impl Db {
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        let sql_filters_projection = match (field, filters.match_mode) {
-            (SearchField::ToolName, MessageSearchMode::Literal) => {
-                sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
-                args.push(rusqlite::types::Value::Text(query.to_lowercase()));
-                true
-            }
-            (SearchField::ToolName, MessageSearchMode::Regex) => {
-                regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
-                sql.push_str(" and rust_regexp(?, m.tool_name)");
-                args.push(rusqlite::types::Value::Text(query.to_string()));
-                true
-            }
-            // TODO(perf): exact/regex tool-argument search parses every filtered tool_call
-            // row's JSON (O(rows x JSON bytes)); an exact literal of >= 3 chars could be
-            // routed through the messages_trigram prefilter first (the literal must appear
-            // in raw content for the pointer projection to contain it), like fuzzy already
-            // does. Deferred past rc.1: correctness-sensitive to prefilter supersets.
-            (SearchField::ToolArgument, MessageSearchMode::Literal) => {
-                sql.push_str(" and unicode_lower_contains(rust_json_pointer(?, m.content), ?)");
-                args.push(rusqlite::types::Value::Text(
-                    filters.argument_path.clone().unwrap_or_default(),
-                ));
-                args.push(rusqlite::types::Value::Text(query.to_lowercase()));
-                true
-            }
-            (SearchField::ToolArgument, MessageSearchMode::Regex) => {
-                regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
-                sql.push_str(" and rust_regexp(?, rust_json_pointer(?, m.content))");
-                args.push(rusqlite::types::Value::Text(query.to_string()));
-                args.push(rusqlite::types::Value::Text(
-                    filters.argument_path.clone().unwrap_or_default(),
-                ));
-                true
-            }
-            _ => false,
-        };
+        // The dispatcher sends only fuzzy derived-field searches here. Literal and regex have one
+        // owner in prepare_non_fuzzy_message_query(), including tool-argument trigram planning.
+        debug_assert_eq!(filters.match_mode, MessageSearchMode::Fuzzy);
         if field == SearchField::ToolArgument {
             sql.push_str(" and m.kind = 'tool_call'");
         }
@@ -2842,28 +2875,6 @@ impl Db {
         } else {
             " order by m.session_id, m.seq"
         });
-        if sql_filters_projection && filters.limit > 0 {
-            sql.push_str(" limit ? offset ?");
-            args.push(rusqlite::types::Value::Integer(filters.limit as i64));
-            args.push(rusqlite::types::Value::Integer(filters.offset as i64));
-        } else if sql_filters_projection && filters.offset > 0 {
-            sql.push_str(" limit -1 offset ?");
-            args.push(rusqlite::types::Value::Integer(filters.offset as i64));
-        }
-        if sql_filters_projection {
-            let candidates = self.query_message_hits(&sql, &args)?;
-            let corpus = candidates.len() as i64;
-            let explain = include_explain.then(|| SearchExplain {
-                prefilter: None,
-                candidates: Some(corpus),
-                prefilter_skipped: Some(
-                    "derived field verified and paginated in SQLite".to_string(),
-                ),
-                corpus,
-            });
-            return Ok((candidates, explain));
-        }
-        debug_assert_eq!(filters.match_mode, MessageSearchMode::Fuzzy);
         let pattern = Pattern::new(
             query,
             CaseMatching::Ignore,
@@ -5352,6 +5363,37 @@ fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Re
         fuzzy_score: None,
         content: row.get(offset + 8)?,
     })
+}
+
+/// Convert regex required literals into raw-JSON-safe trigram groups for a projected tool
+/// argument.
+///
+/// A JSON string may escape quotes, backslashes, and control characters, so a trigram spanning
+/// any such character is not necessarily present in the stored envelope. Removing those grams
+/// preserves the candidate-superset contract; if any regex alternative loses every usable gram,
+/// this returns `None` and the caller scans every eligible tool call. Provider-normalized tool
+/// envelopes and non-string projections both use `serde_json`'s compact serialization, while
+/// string projections remove their surrounding quotes and decode escapes; this is why only the
+/// latter representation boundary needs filtering. The projected-value matcher remains final.
+///
+/// For Q query scalar values and G extracted trigrams, runtime is O(Q + G), peak memory is O(G),
+/// and latency is one serial extraction pass. In practice G <= O(Q); no corpus data is read here.
+fn json_projection_prefilter_groups(pattern: &str) -> Option<Vec<Vec<String>>> {
+    let groups = crate::trigram::trigram_prefilter_groups(pattern)?;
+    let groups = groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .filter(|trigram| {
+                    trigram.chars().all(|character| {
+                        !character.is_control() && !matches!(character, '"' | '\\')
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    (!groups.is_empty() && groups.iter().all(|group| !group.is_empty())).then_some(groups)
 }
 
 fn score_fuzzy_message_hits(
@@ -8807,6 +8849,118 @@ mod tests {
                      from n;"#,
             )
             .unwrap();
+        for (query, match_mode) in [
+            ("cargo test", MessageSearchMode::Literal),
+            (r"cargo t.st", MessageSearchMode::Regex),
+        ] {
+            let filters = MessageFilters {
+                field: Some(SearchField::ToolArgument),
+                argument_path: Some("/cmd".to_string()),
+                match_mode,
+                ..Default::default()
+            };
+            let (hits, explain) = db
+                .search_messages_with_explain(query, &filters, true)
+                .unwrap();
+            assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), vec![0]);
+            let explain = explain.unwrap();
+            assert!(
+                explain.prefilter.is_some(),
+                "tool-argument {match_mode:?} search should prefilter raw tool-call JSON: {explain:?}"
+            );
+            assert!(
+                explain.candidates.unwrap() < explain.corpus,
+                "tool-argument {match_mode:?} prefilter should exclude unrelated tool calls: {explain:?}"
+            );
+        }
+
+        db.conn
+            .execute(
+                "update messages set content = ?1 where seq = 0",
+                [crate::util::tool_call_message_content(
+                    "exec_command",
+                    serde_json::json!({"cmd": "quoted \"target\" and slash \\ value"}),
+                )],
+            )
+            .unwrap();
+        for (query, expected, expect_prefilter) in [
+            ("quoted \"target\"", vec![0], true),
+            (r#"quoted \"target\""#, Vec::new(), true),
+            ("slash \\ value", vec![0], true),
+            ("d\\ ", Vec::new(), false),
+        ] {
+            let filters = MessageFilters {
+                field: Some(SearchField::ToolArgument),
+                argument_path: Some("/cmd".to_string()),
+                ..Default::default()
+            };
+            let (hits, explain) = db
+                .search_messages_with_explain(query, &filters, true)
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+                expected,
+                "JSON escaping must not create a trigram false negative for {query:?}"
+            );
+            assert_eq!(
+                explain.unwrap().prefilter.is_some(),
+                expect_prefilter,
+                "only JSON-stable required trigrams may prefilter {query:?}"
+            );
+        }
+
+        db.conn
+            .execute(
+                "update messages set content = ?1 where seq = 0",
+                [crate::util::tool_call_message_content(
+                    "exec_command",
+                    serde_json::json!({"cmd": "cargo test"}),
+                )],
+            )
+            .unwrap();
+
+        // Incremental insert/update/delete triggers must keep derived-field prefilter membership
+        // in sync just as they do for ordinary content search.
+        db.conn
+            .execute(
+                "insert into messages (
+                     session_id, provider, seq, role, tool_name, kind, content
+                 ) values ('claude:s1', 'claude', 500, 'tool', 'exec_command', 'tool_call', ?1)",
+                [crate::util::tool_call_message_content(
+                    "exec_command",
+                    serde_json::json!({"cmd": "incremental trigram target"}),
+                )],
+            )
+            .unwrap();
+        let incremental_filters = MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some("/cmd".to_string()),
+            ..Default::default()
+        };
+        let find_incremental = |query: &str| {
+            db.search_messages(query, &incremental_filters)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.seq)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find_incremental("incremental trigram target"), vec![500]);
+        db.conn
+            .execute(
+                "update messages set content = ?1 where seq = 500",
+                [crate::util::tool_call_message_content(
+                    "exec_command",
+                    serde_json::json!({"cmd": "replacement trigram target"}),
+                )],
+            )
+            .unwrap();
+        assert!(find_incremental("incremental trigram target").is_empty());
+        assert_eq!(find_incremental("replacement trigram target"), vec![500]);
+        db.conn
+            .execute("delete from messages where seq = 500", [])
+            .unwrap();
+        assert!(find_incremental("replacement trigram target").is_empty());
+
         let fuzzy_filters = MessageFilters {
             field: Some(SearchField::ToolArgument),
             argument_path: Some("/cmd".to_string()),
@@ -8855,6 +9009,202 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("RFC 6901"));
+    }
+
+    #[test]
+    fn tool_argument_trigram_prefilter_preserves_direct_scan_order_and_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("tool", "placeholder")]);
+        db.conn
+            .execute_batch(
+                r#"update messages set kind = 'tool_call', tool_name = 'exec_command',
+                       content = '{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}'
+                   where seq = 0;
+                   with recursive n(value) as (
+                       values(1) union all select value + 1 from n where value < 250
+                   )
+                   insert into messages (
+                       session_id, provider, seq, role, tool_name, kind, content
+                   )
+                   select 'claude:s1', 'claude', value, 'tool', 'exec_command', 'tool_call',
+                          case when value in (70, 140, 210)
+                               then printf('{"args":{"cmd":"cargo test target %d"},"kind":"tool_call","tool_name":"exec_command"}', value)
+                               else printf('{"args":{"cmd":"unrelated payload %d"},"kind":"tool_call","tool_name":"exec_command"}', value)
+                          end
+                     from n;"#,
+            )
+            .unwrap();
+
+        for (query, mode) in [
+            ("cargo test", MessageSearchMode::Literal),
+            (r"cargo t.st", MessageSearchMode::Regex),
+        ] {
+            for (limit, offset) in [(0, 0), (2, 0), (2, 1), (1, 3)] {
+                let filters = MessageFilters {
+                    field: Some(SearchField::ToolArgument),
+                    argument_path: Some("/cmd".to_string()),
+                    match_mode: mode,
+                    limit,
+                    offset,
+                    ..Default::default()
+                };
+                let accelerated = db.search_messages(query, &filters).unwrap();
+                let predicate = match mode {
+                    MessageSearchMode::Literal => {
+                        "unicode_lower_contains(rust_json_pointer('/cmd', m.content), ?1)"
+                    }
+                    MessageSearchMode::Regex => {
+                        "rust_regexp(?1, rust_json_pointer('/cmd', m.content))"
+                    }
+                    MessageSearchMode::Fuzzy => unreachable!(),
+                };
+                let mut sql = format!(
+                    "select m.session_id, m.seq from messages m \
+                     where m.kind = 'tool_call' and {predicate} \
+                     order by m.session_id, m.seq"
+                );
+                if limit > 0 {
+                    sql.push_str(" limit ?2 offset ?3");
+                } else if offset > 0 {
+                    sql.push_str(" limit -1 offset ?3");
+                }
+                let query_arg = if mode == MessageSearchMode::Literal {
+                    query.to_lowercase()
+                } else {
+                    query.to_string()
+                };
+                let mut statement = db.conn.prepare(&sql).unwrap();
+                let direct = if limit > 0 {
+                    statement
+                        .query_map(params![query_arg, limit as i64, offset as i64], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                } else if offset > 0 {
+                    statement
+                        .query_map(params![query_arg, limit as i64, offset as i64], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                } else {
+                    statement
+                        .query_map([query_arg], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                };
+                assert_eq!(
+                    hit_keys(accelerated),
+                    direct,
+                    "accelerated {mode:?} page limit={limit} offset={offset} must equal the independent direct projection scan"
+                );
+            }
+        }
+    }
+
+    /// Deterministic, opt-in latency measurement for the raw-JSON candidate prefilter. The
+    /// ordinary test above owns correctness; this reports median warm latency and digest parity
+    /// without making a scheduler-sensitive timing assertion.
+    ///
+    /// Complexity model: N rows of J JSON bytes each and C candidates. Direct scan is O(N*J);
+    /// accelerated verification is postings lookup plus O(C*J), with O(H) returned-result memory
+    /// in both cases. Run with `cargo test -p ai-session-search --release
+    /// tool_argument_trigram_prefilter_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "deterministic release-mode performance measurement"]
+    fn tool_argument_trigram_prefilter_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("tool", "placeholder")]);
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "insert into messages (session_id, provider, seq, role, tool_name, kind, content) \
+                     values ('claude:s1', 'claude', ?1, 'tool', 'exec_command', 'tool_call', ?2)",
+                )
+                .unwrap();
+            for seq in 1..=25_000_i64 {
+                let cmd = if seq % 5_000 == 0 {
+                    format!("selective trigram benchmark target {seq}")
+                } else {
+                    format!("ordinary deterministic payload {seq} with JSON parsing padding")
+                };
+                insert
+                    .execute(params![
+                        seq,
+                        crate::util::tool_call_message_content(
+                            "exec_command",
+                            serde_json::json!({"cmd": cmd})
+                        )
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let filters = MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some("/cmd".to_string()),
+            ..Default::default()
+        };
+        let query = "selective trigram benchmark target";
+        let accelerated = || db.search_messages(query, &filters).unwrap();
+        let direct = || {
+            let mut statement = db
+                .conn
+                .prepare(
+                    "select m.session_id, m.seq from messages m \
+                     where m.kind = 'tool_call' and \
+                           unicode_lower_contains(rust_json_pointer('/cmd', m.content), ?1) \
+                     order by m.session_id, m.seq",
+                )
+                .unwrap();
+            statement
+                .query_map([query], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let accelerated_keys = hit_keys(accelerated());
+        let direct_keys = direct();
+        assert_eq!(accelerated_keys, direct_keys);
+        let digest = crate::hashing::sha256(&serde_json::to_vec(&direct_keys).unwrap());
+        let mut accelerated_us = Vec::new();
+        let mut direct_us = Vec::new();
+        for _ in 0..7 {
+            let started = Instant::now();
+            assert_eq!(hit_keys(accelerated()), direct_keys);
+            accelerated_us.push(started.elapsed().as_micros());
+            let started = Instant::now();
+            assert_eq!(direct(), direct_keys);
+            direct_us.push(started.elapsed().as_micros());
+        }
+        accelerated_us.sort_unstable();
+        direct_us.sort_unstable();
+        let (_, explain) = db
+            .search_messages_with_explain(query, &filters, true)
+            .unwrap();
+        let explain = explain.unwrap();
+        eprintln!(
+            "tool_argument_prefilter_benchmark rows={} candidates={} hits={} accelerated_median_us={} accelerated_p95_us={} direct_median_us={} direct_p95_us={} digest=sha256:{}",
+            explain.corpus,
+            explain.candidates.unwrap(),
+            direct_keys.len(),
+            accelerated_us[accelerated_us.len() / 2],
+            accelerated_us[accelerated_us.len() - 1],
+            direct_us[direct_us.len() / 2],
+            direct_us[direct_us.len() - 1],
+            digest
+        );
     }
 
     #[test]

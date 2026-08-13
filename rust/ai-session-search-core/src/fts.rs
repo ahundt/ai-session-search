@@ -28,6 +28,14 @@ pub(crate) fn install_released_message_word_index(conn: &Connection) -> Result<(
     Ok(())
 }
 
+/// Install and incrementally maintain the schema-v4 word and trigram indexes.
+///
+/// For one inserted/deleted/changed message of `J` Unicode scalar values, FTS tokenization and
+/// postings maintenance are O(J) work with implementation-owned bounded streaming state; the index
+/// stores O(T) postings for the corpus's emitted trigrams (`T <= O(total content scalars)`, before
+/// compression). This is synchronous writer latency—triggers complete before the row mutation
+/// commits—so query acceleration does not trade correctness for asynchronous index lag. Reusing
+/// this existing index for another search field adds no new asymptotic storage or write cost.
 pub(crate) fn install_target_message_search_indexes(conn: &Connection) -> Result<()> {
     install_released_message_word_index(conn)?;
     conn.execute_batch(

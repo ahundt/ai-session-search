@@ -2153,11 +2153,13 @@ impl<'db> CatalogService<'db> {
     ///
     /// # Complexity
     ///
-    /// Let `B` be the total eligible field and transcript bytes, `N` the eligible sessions, `K` a
-    /// positive result limit, `D_K` the text bytes retained in those result records, and `D_max`
-    /// the largest current candidate's fields/transcript. Work is `O(B + N log K)` and peak result
-    /// processing memory is `O(K + D_K + D_max)` because each streamed transcript is also
-    /// lowercased transiently. A zero limit intentionally retains every matching session.
+    /// Let `B` be total eligible field/transcript bytes, `N` eligible sessions, `K` a positive
+    /// result limit, `D_K` bytes retained in the top-K records, and `D_max` the largest current
+    /// record plus transcript. Streaming scoring and amortized linear top-K compaction do
+    /// `O(B + N + K log K)` work; the final term is the one retained-page sort. Peak processing
+    /// memory is `O(K + D_K + D_max)`. The path is serial, so latency has the same critical-path
+    /// bound; configured message-scoring workers do not accelerate it. A zero limit intentionally
+    /// retains every match, increasing memory to `O(N + B)` and final sorting to `O(N log N)`.
     pub fn search_sessions(
         &self,
         query: &str,
@@ -2272,11 +2274,20 @@ impl<'db> MessageService<'db> {
     ///
     /// # Complexity
     ///
-    /// Schema-v4 exact/regex uses SQLite trigram candidates when a safe literal exists, then
-    /// authoritative verification. Fuzzy search scores the complete structurally filtered corpus
-    /// and retains only the requested top-K page window. Regex without a safe literal may scan the
-    /// filtered corpus. Literal/regex output is unbounded only when `filters.limit == 0`; fuzzy
-    /// validation rejects an unbounded page.
+    /// Let `F` be structurally filtered rows, `C <= F` safe-trigram candidates, `B_F`/`B_C`
+    /// their selected-field bytes, `Q` query length, `P_Q` total postings entries read for the
+    /// required grams, and `K` the requested page window. Schema-v4 content and tool-argument
+    /// literal/regex searches do `O(Q + P_Q + C + B_C)` work including authoritative
+    /// verification; worst case remains `O(F + B_F)` when no safe/selective anchor exists.
+    /// Tool-argument candidates come from raw JSON, then RFC 6901 projection remains authoritative.
+    /// Peak Rust result memory is `O(K + bytes(K))` for finite non-fuzzy pages and `O(F + B_F)`
+    /// when `limit == 0`; SQLite's implementation-owned statement/postings state is conservatively
+    /// `O(P_Q + C)`. These paths are serial, so latency has the same critical-path bound as work.
+    /// Fuzzy search scores every filtered row with parallel batches, does
+    /// `O(B_F + F + W log W)` aggregate work for retained window `W=offset+limit`, and has ideal
+    /// scoring latency `O(B_F/P + W log W)` over `P` workers plus serial SQLite traversal and
+    /// scheduling overhead. Its peak Rust memory is `O(W + bytes(W) + batch_bytes)`; validation
+    /// rejects an unbounded fuzzy page.
     pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
     }
