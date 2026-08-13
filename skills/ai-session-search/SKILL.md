@@ -54,15 +54,15 @@ The MCP server key and protocol identity are `ai-session-search`, with display t
 2. Use `search_messages` for exact, regex, or fuzzy search over message content, canonical tool
    names, or one tool-argument JSON pointer. Start with the shortest discriminating fragment; add
    words only when results are ambiguous.
-   *(Exact/regex can use selective indexes. For `N` eligible rows with `T` total selected-field
-   characters and page window `W`, fuzzy uses `O(T + N + W log W)` time. Peak memory includes the
-   full text bytes in one 512-row scoring batch, the retained `W` rows, and per-worker
-   UTF-32/lowercase scratch for the largest row. Literals under 3 characters and exact/regex
-   tool-argument fields scan the filtered corpus.)*
+   *(Exact/regex can use selective indexes, including JSON-safe tool-argument anchors. For `N`
+   eligible rows with `T` total selected-field characters and page window `W`, fuzzy uses
+   `O(T + N + W log W)` aggregate work in bounded parallel batches. Peak memory includes one
+   bounded batch plus its largest row, retained `W` text, and per-worker matcher/query scratch.
+   Short or unsafe anchors fall back to the filtered corpus; fuzzy tool arguments remain exhaustive.)*
 3. Use `search_sessions` for broad topics, titles, repositories, or remembered phrases.
-   *(For `N` eligible sessions with `T` total field/transcript characters and positive result limit
-   `K`, scoring uses `O(T + N + K log K)` time. Peak memory is the retained `K` records and their
-   text plus the largest streamed transcript and its transient lowercase copy.)*
+   *(For `N` eligible sessions, `T` total field/transcript characters, `A` query tokens, and positive
+   result limit `K`, scoring uses `O(T*(A+1) + N + K log K)` aggregate work in bounded parallel
+   batches. Peak memory is retained `K` records/text plus the batch budget and largest session.)*
 4. Pass a returned session ID and optional sequence to `get_session` for bounded evidence.
    *(~0.01 s focused; `O(log M + C)` message lookup and context after an `O(S)` id resolve.)*
 
