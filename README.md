@@ -98,7 +98,7 @@ refactor, and it queries this index and answers inline without you leaving the c
 The server is a subcommand of the same executable, so there is nothing else to install.
 
 ```bash
-aise integrations install    # configures every detected client
+aise integrations install    # configures supported components for every detected harness
 aise integrations status
 aise mcp serve               # direct stdio use by a client
 ```
@@ -386,7 +386,8 @@ for a standard install.
 Installing the package never touches your configuration. It does not create command aliases,
 edit MCP client configuration, write instruction files or skills, or scan a single transcript.
 `aise integrations install` is the explicit second step that does those things: it adds the
-`aisearch` and `ai_session_search` aliases, configures every AI client it detects, and starts
+`aisearch` and `ai_session_search` aliases, configures supported components for every detected
+harness, and starts
 building the index in the background. Run `aise doctor` afterward for readiness and recovery
 guidance.
 

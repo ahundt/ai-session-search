@@ -334,9 +334,11 @@ Zed, OpenCode, Codex TOML, Claude Markdown, Gemini/Antigravity Markdown,
 integrations, not package ownership.
 
 The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desktop and Codex
-CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, Cursor,
+CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, **Pi**, **Prime Agent**, Cursor,
 Windsurf, VS Code, Zed, **OpenCode**, OpenClaw, and the legacy KiloCode
-adapter. Antigravity App/IDE and CLI share the current
+adapter. Pi and Prime Agent acceptance covers native skill discovery, managed `AGENTS.md`, explicit
+selection, status, idempotent reinstall, dry-run, and ownership-safe uninstall; it intentionally
+expects no local stdio MCP target. Antigravity App/IDE and CLI share the current
 `~/.gemini/config/mcp_config.json`; the installer also maintains the two
 legacy Antigravity MCP locations for older harness versions. App/IDE and CLI
 use distinct current skill roots while sharing managed `~/.gemini/GEMINI.md`

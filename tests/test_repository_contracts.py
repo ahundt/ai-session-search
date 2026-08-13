@@ -308,10 +308,23 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "ChatGPT Codex desktop" in installation
     assert "~/.gemini/config/mcp_config.json" in installation
     assert "~/.gemini/antigravity-cli/skills/" in installation
+    for native_root in (
+        "~/.pi/agent/skills/",
+        "~/.prime/agent/skills/",
+        "~/.pi/agent/AGENTS.md",
+        "~/.prime/agent/AGENTS.md",
+    ):
+        assert native_root in installation
+    assert "Pi has" in installation and "MCP client" in installation
+    assert "Prime currently accepts remote HTTP MCP servers" in installation
+    acceptance = installation.split("The integration acceptance matrix", 1)[1]
+    assert "Pi" in acceptance and "Prime Agent" in acceptance
     assert "toml_edit::DocumentMut" in configuration
     assert "ChatGPT Codex desktop" in configuration
     assert "~/.gemini/config/mcp_config.json" in configuration
     assert "~/.gemini/antigravity-cli/skills/" in configuration
+    assert "Pi has no native MCP client" in configuration
+    assert "Prime accepts remote HTTP MCP" in configuration
     assert "shared RAII lock" in readme
     assert "CPython 3.12 through 3.14" in releasing
     assert "cp312-abi3" in releasing
