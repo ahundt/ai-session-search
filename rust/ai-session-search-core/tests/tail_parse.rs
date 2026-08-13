@@ -196,6 +196,27 @@ fn pi_tail_matches_full() {
     assert_tail_matches_full(initial, appended, file, |c, p| adapter.parse_reader(c, p));
 }
 
+#[test]
+fn prime_agent_tail_matches_full() {
+    let adapter = ai_session_search::providers::pi::PiAdapter::prime_agent(vec![]);
+    let initial = concat!(
+        r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/p"}"#,
+        "\n",
+        r#"{"type":"message","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"inspect the project"}]}}"#,
+        "\n",
+    );
+    let appended = concat!(
+        r#"{"type":"message","timestamp":"2026-06-18T17:31:36.595Z","message":{"role":"assistant","content":[{"type":"text","text":"inspection complete"}]}}"#,
+        "\n",
+    );
+    assert_tail_matches_full(
+        initial,
+        appended,
+        "019edbc9-83df-72a0-a95b-64e6d810ad75.jsonl",
+        |c, p| adapter.parse_reader(c, p),
+    );
+}
+
 /// All sessions, no filtering (for `list_recent`).
 fn all_sessions() -> SearchFilters {
     SearchFilters {
@@ -238,6 +259,7 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
     cfg.providers.cursor.enabled = false;
     cfg.providers.antigravity.enabled = false;
     cfg.providers.pi.enabled = false;
+    cfg.providers.prime_agent.enabled = false;
     cfg.providers.aistudio.enabled = false;
     cfg.providers.gemini_cli.enabled = false;
     cfg.index.db_path = Some(root.join("index.db").to_string_lossy().to_string());
@@ -424,6 +446,7 @@ fn codex_only_config(root: &Path, codex_root: &Path) -> Config {
     cfg.providers.cursor.enabled = false;
     cfg.providers.antigravity.enabled = false;
     cfg.providers.pi.enabled = false;
+    cfg.providers.prime_agent.enabled = false;
     cfg.providers.aistudio.enabled = false;
     cfg.providers.gemini_cli.enabled = false;
     cfg.index.db_path = Some(root.join("index.db").to_string_lossy().to_string());

@@ -232,7 +232,7 @@ pub struct CorrectionsArgs {
     /// Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to one indexed session source. Omit to include all eight.
+    /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
@@ -281,7 +281,7 @@ pub struct CorrectionsArgs {
 
 #[derive(Debug, Args)]
 pub struct PlanningArgs {
-    /// Restrict to one indexed session source. Omit to include all eight.
+    /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
@@ -309,7 +309,7 @@ pub struct PlanningArgs {
 
 #[derive(Debug, Args)]
 pub struct StatsArgs {
-    /// Restrict to one indexed session source. Omit to include all eight.
+    /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
@@ -679,7 +679,7 @@ pub struct RepeatsArgs {
     /// slash (human-entered commands), or compaction. Omit for every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
-    /// Restrict to one indexed session source. Omit to include all eight.
+    /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.

@@ -4351,38 +4351,29 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let providers = [
-            Provider::Claude,
-            Provider::ClaudeDesktop,
-            Provider::Codex,
-            Provider::Cursor,
-            Provider::Antigravity,
-            Provider::Pi,
-            Provider::AiStudio,
-            Provider::GeminiCli,
-        ]
-        .into_iter()
-        .map(|provider| {
-            let expected = crate::util::provider_parse_version(provider);
-            let mut indexed_sessions = 0;
-            let mut current_sessions = 0;
-            for (stored_provider, parse_version, count) in &grouped {
-                if stored_provider == provider.as_str() {
-                    indexed_sessions += count;
-                    if parse_version == expected {
-                        current_sessions += count;
+        let providers = crate::source::PROVIDERS
+            .into_iter()
+            .map(|provider| {
+                let expected = crate::util::provider_parse_version(provider);
+                let mut indexed_sessions = 0;
+                let mut current_sessions = 0;
+                for (stored_provider, parse_version, count) in &grouped {
+                    if stored_provider == provider.as_str() {
+                        indexed_sessions += count;
+                        if parse_version == expected {
+                            current_sessions += count;
+                        }
                     }
                 }
-            }
-            ProviderParserHealth {
-                provider,
-                expected_parse_version: expected.to_string(),
-                indexed_sessions,
-                current_sessions,
-                stale_sessions: indexed_sessions - current_sessions,
-            }
-        })
-        .collect::<Vec<_>>();
+                ProviderParserHealth {
+                    provider,
+                    expected_parse_version: expected.to_string(),
+                    indexed_sessions,
+                    current_sessions,
+                    stale_sessions: indexed_sessions - current_sessions,
+                }
+            })
+            .collect::<Vec<_>>();
         let indexed_sessions = providers.iter().map(|item| item.indexed_sessions).sum();
         let current_sessions = providers.iter().map(|item| item.current_sessions).sum();
 

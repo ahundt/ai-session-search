@@ -1,6 +1,6 @@
 ---
 name: ai-session-search
-description: Search, recover, inspect, export, and analyze local AI session history with AI Session Search (`aise`) across Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI. Use when asked to "find prior AI work", "recover context after compaction", "inspect tool calls or corrections", "reconstruct a file", "export a session", "analyze repeated mistakes", or turn session evidence into durable agent guidance.
+description: Search, recover, inspect, export, and analyze local AI session history with AI Session Search (`aise`) across Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI. Use when asked to "find prior AI work", "recover context after compaction", "inspect tool calls or corrections", "reconstruct a file", "export a session", "analyze repeated mistakes", or turn session evidence into durable agent guidance.
 metadata:
   version: 1.0.0-rc.1
 ---
@@ -8,7 +8,7 @@ metadata:
 
 # AI Session Search (`aise`)
 
-Use `aise` instead of scanning raw provider files. It normalizes eight providers into one index.
+Use `aise` instead of scanning raw provider files. It normalizes nine providers into one index.
 The local Codex provider covers ChatGPT Codex desktop plus Codex CLI/IDE through
 their shared `~/.codex` host. Claude Code CLI/Desktop share the Claude Code
 provider, while Claude Desktop local-agent sessions use `claude-desktop`.
@@ -134,7 +134,7 @@ Use `aise search` when the topic, title, repository, or remembered phrase is eno
 are:
 
 ```text
-claude, claude-desktop, codex, cursor, antigravity, pi, aistudio, gemini-cli
+claude, claude-desktop, codex, cursor, antigravity, pi, prime-agent, aistudio, gemini-cli
 ```
 
 ### Find what a subagent did

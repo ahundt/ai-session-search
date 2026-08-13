@@ -51,6 +51,9 @@ paths = []
 [providers.pi]
 enabled = false
 paths = []
+[providers.prime-agent]
+enabled = false
+paths = []
 [providers.aistudio]
 enabled = false
 paths = []
@@ -805,7 +808,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
     let config_report: serde_json::Value =
         serde_json::from_slice(&config_json_output.stdout).unwrap();
     let provider_roots = config_report["provider_roots"].as_array().unwrap();
-    assert_eq!(provider_roots.len(), 8, "{config_report}");
+    assert_eq!(provider_roots.len(), 9, "{config_report}");
     let providers = provider_roots
         .iter()
         .map(|entry| entry["provider"].as_str().unwrap())
@@ -819,6 +822,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
             "cursor",
             "antigravity",
             "pi",
+            "prime-agent",
             "aistudio",
             "gemini-cli",
         ])

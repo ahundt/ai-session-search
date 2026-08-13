@@ -75,7 +75,7 @@ retained as a fallback after its replacement gate passes.
 
 | Legacy Python method family | Canonical Rust composition | Disposition |
 |---|---|---|
-| `SessionRecoveryEngine._iter_all_jsonl`, `_scan_jsonl`, `_process_message_line`; `AiStudioSource`; `GeminiCliSource`; `ClaudeSource`; `MultiSourceEngine`; `_discover_sources` | provider adapters + `SourceService::inventory` + `IndexService::refresh/reindex` | Deleted. Rust supports eight providers, normalized tool events, incremental parsing, one writer lock, parser health, and durable archives |
+| `SessionRecoveryEngine._iter_all_jsonl`, `_scan_jsonl`, `_process_message_line`; `AiStudioSource`; `GeminiCliSource`; `ClaudeSource`; `MultiSourceEngine`; `_discover_sources` | provider adapters + `SourceService::inventory` + `IndexService::refresh/reindex` | Deleted. Rust supports nine providers, normalized tool events, incremental parsing, one writer lock, parser health, and durable archives |
 | `parse_date_input`, `_passes_date_filter`, partial-date `FilterSpec` builders | `DateRange`, typed query bounds, `DateRange` | Deleted. Rust owns ISO, EDTF, duration, and natural-language parsing; no second Python calendar remains |
 | `search`, `get_versions`, `extract_final`, `extract_all`, `reconstruct_from_edits`, `get_original_path` | `FileService::{search,history,cross_reference,reconstruct,reconstruct_versions,restore,publish_versions}` | Deleted after bulk selection/publication and native facade gates passed; no second naming, replay, or write policy remains |
 | `get_messages`, `search_messages`, `search_messages_with_context`, `timeline_session` | `MessageService::{search,context}` + typed role/kind/tool/argument/sequence selectors | Deleted. Timeline is ordered message search, not a second model |

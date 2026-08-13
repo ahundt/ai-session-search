@@ -17,6 +17,9 @@ pub enum Provider {
     Cursor,
     Antigravity,
     Pi,
+    #[serde(rename = "prime-agent")]
+    #[clap(name = "prime-agent", alias = "prime_agent")]
+    PrimeAgent,
     #[serde(rename = "aistudio")]
     #[clap(name = "aistudio", alias = "ai-studio")]
     AiStudio,
@@ -34,6 +37,7 @@ impl Provider {
             Self::Cursor => "cursor",
             Self::Antigravity => "antigravity",
             Self::Pi => "pi",
+            Self::PrimeAgent => "prime-agent",
             Self::AiStudio => "aistudio",
             Self::GeminiCli => "gemini-cli",
         }
@@ -48,6 +52,7 @@ impl Provider {
             Self::Cursor => "Cursor",
             Self::Antigravity => "Antigravity",
             Self::Pi => "Pi coding agent",
+            Self::PrimeAgent => "Prime Agent",
             Self::AiStudio => "Google AI Studio",
             Self::GeminiCli => "Gemini CLI",
         }
@@ -55,7 +60,10 @@ impl Provider {
 
     /// Whether this source has a native CLI command that reopens a recorded session.
     pub const fn supports_native_resume(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex | Self::Pi)
+        matches!(
+            self,
+            Self::Claude | Self::Codex | Self::Pi | Self::PrimeAgent
+        )
     }
 
     /// Parse a `provider` value read back from the index. These columns are written from
@@ -85,12 +93,13 @@ impl std::str::FromStr for Provider {
             "cursor" => Ok(Self::Cursor),
             "antigravity" => Ok(Self::Antigravity),
             "pi" => Ok(Self::Pi),
+            "prime-agent" | "prime_agent" | "primeagent" => Ok(Self::PrimeAgent),
             "aistudio" | "ai-studio" | "ai_studio" => Ok(Self::AiStudio),
             "gemini-cli" | "gemini_cli" | "geminicli" => Ok(Self::GeminiCli),
             // Canonical spellings only: the hyphen/underscore aliases accepted above are
             // conveniences, so listing them here would imply four names for one provider.
             other => Err(format!(
-                "unsupported provider: {other} — must be one of \"claude\", \"claude-desktop\", \"codex\", \"cursor\", \"antigravity\", \"pi\", \"aistudio\", \"gemini-cli\""
+                "unsupported provider: {other} — must be one of \"claude\", \"claude-desktop\", \"codex\", \"cursor\", \"antigravity\", \"pi\", \"prime-agent\", \"aistudio\", \"gemini-cli\""
             )),
         }
     }
@@ -503,6 +512,7 @@ pub enum MessageCorrelationAuthority {
     Cursor,
     Google,
     Pi,
+    PrimeAgent,
 }
 
 impl MessageCorrelationAuthority {
@@ -513,6 +523,7 @@ impl MessageCorrelationAuthority {
             Self::Cursor => "cursor",
             Self::Google => "google",
             Self::Pi => "pi",
+            Self::PrimeAgent => "prime_agent",
         }
     }
 
@@ -531,8 +542,9 @@ impl std::str::FromStr for MessageCorrelationAuthority {
             "cursor" => Ok(Self::Cursor),
             "google" => Ok(Self::Google),
             "pi" => Ok(Self::Pi),
+            "prime_agent" | "primeagent" => Ok(Self::PrimeAgent),
             other => Err(format!(
-                "unknown message correlation authority: {other} — must be one of \"anthropic\", \"open_ai\", \"cursor\", \"google\", \"pi\""
+                "unknown message correlation authority: {other} — must be one of \"anthropic\", \"open_ai\", \"cursor\", \"google\", \"pi\", \"prime_agent\""
             )),
         }
     }
@@ -2241,7 +2253,7 @@ mod tests {
                 .filter(|provider| provider.supports_native_resume())
                 .map(Provider::as_str)
                 .collect::<Vec<_>>(),
-            ["claude", "codex", "pi"]
+            ["claude", "codex", "pi", "prime-agent"]
         );
     }
 

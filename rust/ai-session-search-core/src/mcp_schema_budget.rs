@@ -581,7 +581,9 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    ("search_messages", 4_631, 10),
+    // 4_631 -> 4_645: the canonical `prime-agent` provider enum value adds 14 bytes. The
+    // schema remains 355 bytes below Codex's 5,000-byte description-deletion cliff.
+    ("search_messages", 4_645, 10),
     // 4_742 -> 4_747: naming the capability file `aise-capability.toml` rather than the generic
     // `capability.toml` costs five bytes across the two descriptions that name it. 253 bytes of
     // headroom remain before Codex's 5,000-byte cliff, past which it deletes every parameter

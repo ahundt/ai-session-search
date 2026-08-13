@@ -220,6 +220,8 @@ struct ProvidersFile {
     cursor: Option<ProviderFile>,
     antigravity: Option<ProviderFile>,
     pi: Option<ProviderFile>,
+    #[serde(rename = "prime-agent")]
+    prime_agent: Option<ProviderFile>,
     aistudio: Option<ProviderFile>,
     #[serde(rename = "gemini-cli")]
     gemini_cli: Option<ProviderFile>,
@@ -264,6 +266,9 @@ impl ConfigFile {
             }
             if let Some(value) = providers.pi {
                 value.apply(&mut config.providers.pi);
+            }
+            if let Some(value) = providers.prime_agent {
+                value.apply(&mut config.providers.prime_agent);
             }
             if let Some(value) = providers.aistudio {
                 value.apply(&mut config.providers.aistudio);
@@ -336,6 +341,8 @@ pub struct ProvidersConfig {
     pub antigravity: ProviderConfig,
     #[serde(default)]
     pub pi: ProviderConfig,
+    #[serde(default, rename = "prime-agent")]
+    pub prime_agent: ProviderConfig,
     #[serde(default)]
     pub aistudio: ProviderConfig,
     #[serde(default, rename = "gemini-cli")]
@@ -1092,6 +1099,17 @@ impl Default for Config {
                         .to_string_lossy()
                         .to_string()],
                 },
+                prime_agent: ProviderConfig {
+                    enabled: true,
+                    paths: vec![
+                        home.join(".prime/agent/sessions")
+                            .to_string_lossy()
+                            .to_string(),
+                        home.join(".prime/agent/session-artifacts")
+                            .to_string_lossy()
+                            .to_string(),
+                    ],
+                },
                 aistudio: ProviderConfig {
                     enabled: true,
                     paths: Vec::new(),
@@ -1593,6 +1611,15 @@ impl Config {
             .collect()
     }
 
+    pub fn prime_agent_paths(&self) -> Vec<PathBuf> {
+        self.providers
+            .prime_agent
+            .paths
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect()
+    }
+
     pub fn aistudio_paths(&self) -> Vec<PathBuf> {
         self.providers
             .aistudio
@@ -2025,6 +2052,7 @@ fn anchor_toml_paths(
         ("cursor", &mut config.providers.cursor),
         ("antigravity", &mut config.providers.antigravity),
         ("pi", &mut config.providers.pi),
+        ("prime-agent", &mut config.providers.prime_agent),
         ("aistudio", &mut config.providers.aistudio),
         ("gemini-cli", &mut config.providers.gemini_cli),
     ] {
@@ -3296,6 +3324,7 @@ mod tests {
                 crate::models::Provider::Cursor => &config.providers.cursor,
                 crate::models::Provider::Antigravity => &config.providers.antigravity,
                 crate::models::Provider::Pi => &config.providers.pi,
+                crate::models::Provider::PrimeAgent => &config.providers.prime_agent,
                 crate::models::Provider::AiStudio => &config.providers.aistudio,
                 crate::models::Provider::GeminiCli => &config.providers.gemini_cli,
             }
@@ -3445,6 +3474,8 @@ paths = ["sessions/cursor"]
 paths = ["sessions/antigravity"]
 [providers.pi]
 paths = ["sessions/pi"]
+[providers.prime-agent]
+paths = ["sessions/prime-agent"]
 [providers.aistudio]
 paths = ["sessions/ai-studio"]
 [providers.gemini-cli]
@@ -3474,6 +3505,7 @@ paths = ["sessions/gemini-cli"]
             (resolved.config.cursor_paths(), "sessions/cursor"),
             (resolved.config.antigravity_paths(), "sessions/antigravity"),
             (resolved.config.pi_paths(), "sessions/pi"),
+            (resolved.config.prime_agent_paths(), "sessions/prime-agent"),
             (resolved.config.aistudio_paths(), "sessions/ai-studio"),
             (resolved.config.gemini_cli_paths(), "sessions/gemini-cli"),
         ] {

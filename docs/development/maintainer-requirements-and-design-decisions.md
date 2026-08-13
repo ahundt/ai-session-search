@@ -426,7 +426,7 @@ instruction filename for every harness.
 ### REQ020-normalize-provider-records
 
 Claude Code, Claude Desktop local agent, ChatGPT Codex desktop and Codex CLI/IDE, Cursor, Antigravity App/IDE/CLI, Pi,
-Google AI Studio, and Gemini CLI local transcripts normalize into the shared session/message model.
+Prime Agent, Google AI Studio, and Gemini CLI local transcripts normalize into the shared session/message model.
 List, show, search, message reads, export, analysis, Python, Rust, CLI, and MCP must operate on those
 canonical records rather than adapter-specific response models.
 

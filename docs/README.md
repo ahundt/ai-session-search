@@ -42,7 +42,7 @@ Search indexed AI-session messages while separating result selection, context, p
 | `field` | `content`, `tool_name`, `tool_argument` | `typed_default` |
 | `role` | `user`, `assistant`, `tool`, `slash`, `compaction` | `all_eligible` |
 | `kinds` | `conversation`, `compaction`, `tool_call`, `tool_result`, `harness_notice`, `unknown` | `typed_default` |
-| `providers` | `claude`, `claude-desktop`, `codex`, `cursor`, `antigravity`, `pi`, `aistudio`, `gemini-cli` | `all_eligible` |
+| `providers` | `claude`, `claude-desktop`, `codex`, `cursor`, `antigravity`, `pi`, `prime-agent`, `aistudio`, `gemini-cli` | `all_eligible` |
 | `match_window` | `earliest`, `latest` | `typed_default` |
 | `detail` | `compact`, `full` | `surface_policy` |
 | `field_view` | `no_char_limit`, `max_chars {max_chars: positive_character_count}` | `surface_policy` |

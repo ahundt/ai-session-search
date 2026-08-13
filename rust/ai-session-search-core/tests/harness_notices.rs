@@ -200,6 +200,7 @@ fn unindexed_files_are_explained_by_naming_the_file_that_took_their_id() {
         &mut config.providers.cursor,
         &mut config.providers.antigravity,
         &mut config.providers.pi,
+        &mut config.providers.prime_agent,
         &mut config.providers.aistudio,
         &mut config.providers.gemini_cli,
     ] {

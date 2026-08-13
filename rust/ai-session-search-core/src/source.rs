@@ -21,13 +21,14 @@ use crate::providers::{
 use crate::util::normalize_path;
 
 /// Providers supported by discovery, in stable presentation order.
-pub const PROVIDERS: [Provider; 8] = [
+pub const PROVIDERS: [Provider; 9] = [
     Provider::Claude,
     Provider::ClaudeDesktop,
     Provider::Codex,
     Provider::Cursor,
     Provider::Antigravity,
     Provider::Pi,
+    Provider::PrimeAgent,
     Provider::AiStudio,
     Provider::GeminiCli,
 ];
@@ -36,7 +37,7 @@ pub const PROVIDERS: [Provider; 8] = [
 ///
 /// The provider registry owns membership/order and `provider_parse_version` owns each version;
 /// hashing those two canonical definitions avoids a second manually bumped generation. The first
-/// call is `O(P + V)` for `P = 8` providers and `V` version bytes; `OnceLock` makes later calls
+/// call is `O(P + V)` for `P = 9` providers and `V` version bytes; `OnceLock` makes later calls
 /// `O(1)`. Retained memory is one 32-byte value.
 pub(crate) fn provider_parse_contract_fingerprint() -> [i64; 4] {
     static FINGERPRINT: OnceLock<[i64; 4]> = OnceLock::new();
@@ -106,6 +107,7 @@ pub(crate) struct ProviderSet {
     pub(crate) cursor: CursorAdapter,
     pub(crate) antigravity: AntigravityAdapter,
     pub(crate) pi: PiAdapter,
+    pub(crate) prime_agent: PiAdapter,
     pub(crate) aistudio: AiStudioAdapter,
     pub(crate) gemini_cli: GeminiCliAdapter,
 }
@@ -119,6 +121,7 @@ impl ProviderSet {
             cursor: CursorAdapter::new(provider_roots(config, Provider::Cursor)),
             antigravity: AntigravityAdapter::new(provider_roots(config, Provider::Antigravity)),
             pi: PiAdapter::new(provider_roots(config, Provider::Pi)),
+            prime_agent: PiAdapter::prime_agent(provider_roots(config, Provider::PrimeAgent)),
             aistudio: AiStudioAdapter::new(provider_roots(config, Provider::AiStudio)),
             gemini_cli: GeminiCliAdapter::new(provider_roots(config, Provider::GeminiCli)),
         }
@@ -160,6 +163,9 @@ impl ProviderSet {
             }),
             Provider::Pi => parse_jsonl_until(source, should_cancel, |reader| {
                 self.pi.parse_reader(reader, &source.path)
+            }),
+            Provider::PrimeAgent => parse_jsonl_until(source, should_cancel, |reader| {
+                self.prime_agent.parse_reader(reader, &source.path)
             }),
             Provider::AiStudio => read_snapshot_until(source, should_cancel, |raw| {
                 self.aistudio.parse_raw(&source.path, raw)
@@ -203,6 +209,12 @@ impl ProviderSet {
         }
         if config.providers.pi.enabled {
             discovered.extend_provider(Provider::Pi, self.pi.discover_with_warnings());
+        }
+        if config.providers.prime_agent.enabled {
+            discovered.extend_provider(
+                Provider::PrimeAgent,
+                self.prime_agent.discover_with_warnings(),
+            );
         }
         if config.providers.aistudio.enabled {
             discovered.extend_provider(Provider::AiStudio, self.aistudio.discover_with_warnings());
@@ -394,6 +406,7 @@ pub(crate) fn provider_enabled(config: &Config, provider: Provider) -> bool {
         Provider::Cursor => config.providers.cursor.enabled,
         Provider::Antigravity => config.providers.antigravity.enabled,
         Provider::Pi => config.providers.pi.enabled,
+        Provider::PrimeAgent => config.providers.prime_agent.enabled,
         Provider::AiStudio => config.providers.aistudio.enabled,
         Provider::GeminiCli => config.providers.gemini_cli.enabled,
     }
@@ -407,6 +420,7 @@ pub(crate) fn provider_roots(config: &Config, provider: Provider) -> Vec<std::pa
         Provider::Cursor => config.cursor_paths(),
         Provider::Antigravity => config.antigravity_paths(),
         Provider::Pi => config.pi_paths(),
+        Provider::PrimeAgent => config.prime_agent_paths(),
         Provider::AiStudio => config.aistudio_paths(),
         Provider::GeminiCli => config.gemini_cli_paths(),
     };
@@ -516,6 +530,7 @@ mod tests {
         config.providers.cursor.enabled = false;
         config.providers.antigravity.enabled = false;
         config.providers.pi.enabled = false;
+        config.providers.prime_agent.enabled = false;
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
     }
@@ -711,6 +726,10 @@ mod tests {
                 .join(label)
                 .join(".system_generated/logs/transcript.jsonl"),
             Provider::Pi => root.join(label).join(format!("{label}.jsonl")),
+            Provider::PrimeAgent => root.join(format!(
+                "019fea39-38c2-710e-8100-3624dfc0ac0{}.jsonl",
+                if label == "first" { "7" } else { "8" }
+            )),
             Provider::AiStudio => root.join(format!("{label}.json")),
             Provider::GeminiCli => root
                 .join(label)
@@ -751,6 +770,7 @@ mod tests {
                 Provider::Cursor => &mut config.providers.cursor,
                 Provider::Antigravity => &mut config.providers.antigravity,
                 Provider::Pi => &mut config.providers.pi,
+                Provider::PrimeAgent => &mut config.providers.prime_agent,
                 Provider::AiStudio => &mut config.providers.aistudio,
                 Provider::GeminiCli => &mut config.providers.gemini_cli,
             };

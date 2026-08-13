@@ -50,6 +50,10 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                 ),
                 Provider::Codex => (which("codex").is_some(), Some("codex resume <session-id>")),
                 Provider::Pi => (which("pi").is_some(), Some("pi --session <session-id>")),
+                Provider::PrimeAgent => (
+                    which("prime-agent").is_some(),
+                    Some("prime-agent --resume <session-id>"),
+                ),
                 Provider::Cursor => (which("cursor").is_some(), None),
                 Provider::Antigravity => (
                     which("agy").is_some() || which("antigravity").is_some(),

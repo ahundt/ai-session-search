@@ -3669,7 +3669,7 @@ fn message_search_tool_description(config: &Config) -> String {
          page.next_offset is the next offset argument when more results exist. Expand one hit \
          with get_session(session_id, message_seq).\n",
     );
-    // Only what `enum` cannot say. The six message classes and eight provider slugs already
+    // Only what `enum` cannot say. The six message classes and nine provider slugs already
     // travel as accepted values on their own parameters, and restating them here would be a
     // second copy of a list the model already has, free to drift from it.
     text.push_str(
@@ -4065,7 +4065,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     // the tool description and the enum in front of them whenever they have the parameter. That
     // copy cost 274 bytes of the schema budget on `run_skill_capability`, which is measured
     // against 5,000 and was over it.
-    let provider_filter_description = "One session source; omit for all eight.";
+    let provider_filter_description = "Source; omit for all.";
     let native_resume_summary = crate::source::PROVIDERS
         .into_iter()
         .filter(|provider| provider.supports_native_resume())
@@ -6939,6 +6939,7 @@ mod tests {
             &mut config.providers.cursor,
             &mut config.providers.antigravity,
             &mut config.providers.pi,
+            &mut config.providers.prime_agent,
             &mut config.providers.aistudio,
             &mut config.providers.gemini_cli,
         ] {
@@ -10275,6 +10276,7 @@ mod tests {
             &mut config.providers.cursor,
             &mut config.providers.antigravity,
             &mut config.providers.pi,
+            &mut config.providers.prime_agent,
             &mut config.providers.aistudio,
             &mut config.providers.gemini_cli,
         ] {

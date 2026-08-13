@@ -63,6 +63,7 @@ def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp
             "cursor",
             "antigravity",
             "pi",
+            "prime-agent",
             "aistudio",
             "gemini-cli",
         ],
@@ -576,7 +577,7 @@ def test_native_source_inventory_uses_configured_provider_policy(tmp_path: Path,
     config_dir = tmp_path / "config"
     cache_dir = tmp_path / "cache"
     config_dir.mkdir()
-    providers = ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
+    providers = ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "prime-agent", "aistudio", "gemini-cli"]
     (config_dir / "config.toml").write_text(
         "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
         encoding="utf-8",
@@ -621,7 +622,7 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
 ) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    providers = ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
+    providers = ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "prime-agent", "aistudio", "gemini-cli"]
     (config_dir / "config.toml").write_text(
         "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
         encoding="utf-8",
@@ -667,6 +668,7 @@ def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
         "cursor",
         "antigravity",
         "pi",
+        "prime-agent",
         "aistudio",
         "gemini-cli",
     ]

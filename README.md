@@ -23,7 +23,7 @@ each store sessions somewhere else again, in shapes that share nothing with each
 So the fix an agent made last month is in there, along with the version of a file it overwrote
 and the reason it stopped halfway through a task, and you have no way to go get any of it.
 
-`aise` parses all eight formats into one index and searches it.
+`aise` parses all nine formats into one index and searches it.
 
 That index reaches you four ways: the `aise` command line, an MCP server your coding agent can
 query mid-conversation, a Rust crate, and a Python package. One parser and one set of query
@@ -170,10 +170,14 @@ claim they are searchable.
 | Cursor | `cursor` | no; use show/export |
 | Antigravity App/IDE/CLI | `antigravity` | no; use show/export |
 | Pi coding agent | `pi` | yes |
+| Prime Agent | `prime-agent` | yes |
 | Google AI Studio | `aistudio` | no; use show/export |
 | Gemini CLI | `gemini-cli` | no; use show/export |
 
-Codex desktop and Codex CLI/IDE share one local host under `~/.codex`, so they index together.
+Prime Agent is Pi-derived but stores its own root and RLM-child transcripts under
+`~/.prime/agent`; it remains a separate provider so filters, IDs, diagnostics, and resume commands
+never conflate the two harnesses. Codex desktop and Codex CLI/IDE share one local host under
+`~/.codex`, so they index together.
 The `codex` provider reads that local transcript format only; it does not parse Chat/Work
 browser state or sync cloud history, which OpenAI documents as
 [separate histories](https://help.openai.com/en/articles/20001276) in the merged desktop app.

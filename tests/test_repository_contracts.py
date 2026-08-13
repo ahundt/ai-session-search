@@ -342,6 +342,7 @@ def test_message_query_docs_distinguish_query_field_from_tool_filter() -> None:
         "cursor",
         "antigravity",
         "pi",
+        "prime-agent",
         "aistudio",
         "gemini-cli",
     ):

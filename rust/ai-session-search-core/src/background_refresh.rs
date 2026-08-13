@@ -859,6 +859,7 @@ mod tests {
         config.providers.cursor.enabled = false;
         config.providers.antigravity.enabled = false;
         config.providers.pi.enabled = false;
+        config.providers.prime_agent.enabled = false;
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
 

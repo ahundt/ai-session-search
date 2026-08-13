@@ -277,6 +277,7 @@ impl<'a> AppState<'a> {
                     Provider::Cursor => ("CURSOR", Color::Magenta),
                     Provider::Antigravity => ("GEMINI", Color::Yellow),
                     Provider::Pi => ("PI", Color::Green),
+                    Provider::PrimeAgent => ("PRIME", Color::LightGreen),
                     Provider::AiStudio => ("AI Studio", Color::Cyan),
                     Provider::GeminiCli => ("Gemini", Color::Blue),
                 };

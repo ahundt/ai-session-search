@@ -51,7 +51,7 @@ const GLOBAL_OPTIONS_HEADING: &str =
 #[command(
     name = "aise",
     version,
-    about = "AI Session Search (aise): search local sessions from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI"
+    about = "AI Session Search (aise): search local sessions from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI"
 )]
 struct Cli {
     /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
@@ -397,7 +397,7 @@ enum SessionInclude {
 
 #[derive(Debug, Args, Clone)]
 struct SessionFilterArgs {
-    /// Restrict to one indexed session source; omit to include all eight.
+    /// Restrict to one indexed session source; omit to include all nine.
     #[arg(long)]
     provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.

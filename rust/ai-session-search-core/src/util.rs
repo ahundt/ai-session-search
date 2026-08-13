@@ -1207,6 +1207,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
         Provider::Cursor => "cursor-v4",
         Provider::Antigravity => "antigravity-v3",
         Provider::Pi => "pi-v3",
+        Provider::PrimeAgent => "prime-agent-v1",
         Provider::AiStudio => "aistudio-v2",
         Provider::GeminiCli => "gemini-cli-v3",
     }
@@ -1313,6 +1314,7 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Claude => "claude",
         Provider::Codex => "codex",
         Provider::Pi => "pi",
+        Provider::PrimeAgent => "prime-agent",
         Provider::ClaudeDesktop
         | Provider::Cursor
         | Provider::Antigravity
@@ -1352,6 +1354,11 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Pi => vec![
             "pi".to_string(),
             "--session".to_string(),
+            session.provider_session_id.clone(),
+        ],
+        Provider::PrimeAgent => vec![
+            "prime-agent".to_string(),
+            "--resume".to_string(),
             session.provider_session_id.clone(),
         ],
         Provider::ClaudeDesktop
@@ -1584,6 +1591,27 @@ mod tests {
         assert!(lines(b"").is_empty());
         // Invalid UTF-8 (0xFF) becomes U+FFFD; the rest of the line is preserved, not dropped.
         assert_eq!(lines(&[b'h', b'i', 0xFF, b'!', b'\n']), vec!["hi\u{FFFD}!"]);
+    }
+
+    #[test]
+    fn prime_agent_resume_plan_uses_native_session_id() {
+        let parsed = minimal_record(
+            Provider::PrimeAgent,
+            std::path::Path::new("/tmp/019fea39-38c2-710e-8100-3624dfc0ac07.jsonl"),
+            String::new(),
+        );
+        let session_id = parsed.session.provider_session_id.clone();
+        assert_eq!(
+            resume_plan(&parsed.session).unwrap(),
+            (
+                vec![
+                    "prime-agent".to_string(),
+                    "--resume".to_string(),
+                    session_id,
+                ],
+                None,
+            )
+        );
     }
 
     #[test]

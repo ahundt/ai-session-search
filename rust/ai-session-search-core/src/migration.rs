@@ -566,6 +566,7 @@ fn canonical_provider_name(name: &str) -> &str {
         "aistudio" | "ai_studio" | "ai-studio" => "ai-studio",
         "gemini" | "gemini_cli" | "gemini-cli" => "gemini-cli",
         "claude_desktop" | "claude-desktop" => "claude-desktop",
+        "prime_agent" | "prime-agent" => "prime-agent",
         other => other,
     }
 }
@@ -578,6 +579,7 @@ fn set_provider_paths(config: &mut Config, name: &str, paths: Vec<String>) -> bo
         "cursor" => &mut config.providers.cursor,
         "antigravity" => &mut config.providers.antigravity,
         "pi" => &mut config.providers.pi,
+        "prime-agent" => &mut config.providers.prime_agent,
         "ai-studio" => &mut config.providers.aistudio,
         "gemini-cli" => &mut config.providers.gemini_cli,
         _ => return false,

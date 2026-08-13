@@ -670,7 +670,7 @@ pub enum FilesCmd {
 
 #[derive(Debug, Args, Clone, Default)]
 pub struct FileScopeArgs {
-    /// Restrict to one indexed session source. Omit to include all eight.
+    /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from session/message output.

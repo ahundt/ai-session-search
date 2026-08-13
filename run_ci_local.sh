@@ -182,6 +182,8 @@ enabled = false
 enabled = false
 [providers.pi]
 enabled = false
+[providers.prime-agent]
+enabled = false
 [providers.aistudio]
 enabled = false
 [providers.gemini-cli]

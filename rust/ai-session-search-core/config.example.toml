@@ -263,6 +263,10 @@ repeat_phrase_max_words = 5
 # enabled = true
 # paths = ["~/.pi/agent/sessions"]
 #
+# [providers.prime-agent]
+# enabled = true
+# paths = ["~/.prime/agent/sessions", "~/.prime/agent/session-artifacts"]
+#
 # [providers.aistudio]
 # enabled = true
 # paths = []

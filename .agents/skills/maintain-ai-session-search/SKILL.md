@@ -102,8 +102,9 @@ identity and does not determine priority.
   files, directories, aliases, and user-modified managed trees.
 - `REQ019-verify-each-harness` — Validate configuration, skill discovery, MCP startup, permission,
   and tool invocation separately for every supported app, IDE, and CLI.
-- `REQ020-normalize-provider-records` — Parse supported local provider formats into one canonical
-  session/message model and exercise every public read surface against it.
+- `REQ020-normalize-provider-records` — Parse supported local provider formats, including Prime
+  Agent through the shared Pi-family parser, into one canonical session/message model and exercise
+  every public read surface against it.
 - `REQ021-state-local-data-boundary` — Never imply that cloud-only history without a local
   transcript is searchable.
 - `REQ022-separate-guidance-capabilities` — Let harnesses interpret `SKILL.md`; let aise execute only

@@ -3,7 +3,7 @@ from typing import Literal, NotRequired, Self, TypedDict, final
 
 from .types import FieldView, MatchView, MessageClassificationDefinition
 
-_ProviderId = Literal["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
+_ProviderId = Literal["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "prime-agent", "aistudio", "gemini-cli"]
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
 _MessageKind = Literal["conversation", "compaction", "tool_call", "tool_result", "harness_notice", "unknown"]
 _SessionKind = Literal["user", "subagent"]

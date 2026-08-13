@@ -846,6 +846,14 @@ pub(crate) fn reindex_until(
                     should_cancel,
                     |r, p| adapters.pi.parse_reader(r, p),
                 )?,
+                Provider::PrimeAgent => try_tail(
+                    source,
+                    &source_path,
+                    expected_session_id,
+                    db,
+                    should_cancel,
+                    |r, p| adapters.prime_agent.parse_reader(r, p),
+                )?,
                 Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
             };
             match outcome {
@@ -1224,6 +1232,7 @@ mod tests {
         config.providers.cursor.enabled = false;
         config.providers.antigravity.enabled = false;
         config.providers.pi.enabled = false;
+        config.providers.prime_agent.enabled = false;
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
         config
@@ -1239,6 +1248,7 @@ mod tests {
         config.providers.cursor.enabled = false;
         config.providers.antigravity.enabled = false;
         config.providers.pi.enabled = false;
+        config.providers.prime_agent.enabled = false;
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
         config

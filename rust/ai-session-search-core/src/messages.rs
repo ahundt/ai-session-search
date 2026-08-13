@@ -660,7 +660,7 @@ pub struct MessageSearchArgs {
     #[arg(long)]
     pub argument_path: Option<String>,
     /// Restrict to these indexed session sources. Repeat --provider or pass a comma-separated
-    /// list; omit it to include all eight.
+    /// list; omit it to include all nine.
     #[arg(long = "provider", value_enum, value_delimiter = ',', action = clap::ArgAction::Append)]
     pub providers: Vec<Provider>,
     /// Interpret QUERY as a literal substring, Rust regex, or bounded fuzzy pattern.

@@ -21,17 +21,43 @@ use crate::util::{
     truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiSessionLayout {
+    ProjectDirectories,
+    PrimeAgent,
+}
+
 pub struct PiAdapter {
     roots: Vec<PathBuf>,
     id_re: Regex,
+    provider: Provider,
+    layout: PiSessionLayout,
 }
 
 impl PiAdapter {
     pub fn new(roots: Vec<PathBuf>) -> Self {
+        Self::with_layout(roots, Provider::Pi, PiSessionLayout::ProjectDirectories)
+    }
+
+    pub fn prime_agent(roots: Vec<PathBuf>) -> Self {
+        Self::with_layout(roots, Provider::PrimeAgent, PiSessionLayout::PrimeAgent)
+    }
+
+    fn with_layout(roots: Vec<PathBuf>, provider: Provider, layout: PiSessionLayout) -> Self {
         Self {
             roots,
             id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
                 .expect("valid regex"),
+            provider,
+            layout,
+        }
+    }
+
+    fn correlation_authority(&self) -> MessageCorrelationAuthority {
+        match self.provider {
+            Provider::Pi => MessageCorrelationAuthority::Pi,
+            Provider::PrimeAgent => MessageCorrelationAuthority::PrimeAgent,
+            _ => unreachable!("PiAdapter supports only Pi-family providers"),
         }
     }
 
@@ -53,7 +79,20 @@ impl PiAdapter {
             // session.jsonl) and are sessions of their own. Anything nested that names no
             // parent session directory is neither, so it stays out rather than becoming a
             // session with an invented identity.
-            if !is_top_level_session(root, path) && self.spawn_origin(root, path).is_none() {
+            let is_session = match self.layout {
+                PiSessionLayout::ProjectDirectories => {
+                    is_top_level_session(root, path) || self.spawn_origin(root, path).is_some()
+                }
+                // Prime root and RLM-child transcripts are UUID-named. Its sibling
+                // `rlm-subagents.jsonl` is a registry, not a transcript, so reject every
+                // non-UUID filename before parsing.
+                PiSessionLayout::PrimeAgent => {
+                    self.has_uuid_filename(path)
+                        && (is_top_level_session(root, path)
+                            || self.spawn_origin(root, path).is_some())
+                }
+            };
+            if !is_session {
                 continue;
             }
             let mtime_ns = entry
@@ -64,7 +103,7 @@ impl PiAdapter {
                 .map(|value| value.as_nanos() as i64)
                 .unwrap_or_default();
             files.push(SourceFile {
-                provider: Provider::Pi,
+                provider: self.provider,
                 path: entry.path,
                 mtime_ns,
                 size_bytes: entry.metadata.len() as i64,
@@ -79,7 +118,7 @@ impl PiAdapter {
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
         match self.parse_inner(&source.path) {
             Ok(parsed) => parsed,
-            Err(err) => minimal_record(Provider::Pi, &source.path, format!("{err:#}")),
+            Err(err) => minimal_record(self.provider, &source.path, format!("{err:#}")),
         }
     }
 
@@ -204,7 +243,7 @@ impl PiAdapter {
                                 .filter(|id| !id.trim().is_empty())
                             {
                                 raw_message = raw_message.with_native_event_identity(
-                                    MessageCorrelationAuthority::Pi,
+                                    self.correlation_authority(),
                                     event_id,
                                 );
                             }
@@ -236,7 +275,7 @@ impl PiAdapter {
                                 .filter(|id| !id.trim().is_empty())
                             {
                                 raw_message = raw_message.with_native_event_identity(
-                                    MessageCorrelationAuthority::Pi,
+                                    self.correlation_authority(),
                                     event_id,
                                 );
                             }
@@ -282,8 +321,8 @@ impl PiAdapter {
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let session = SessionRecord {
-            id: format!("pi:{provider_session_id}"),
-            provider: Provider::Pi,
+            id: format!("{}:{provider_session_id}", self.provider.as_str()),
+            provider: self.provider,
             provider_session_id,
             title,
             summary,
@@ -295,13 +334,13 @@ impl PiAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: crate::util::provider_parse_version(Provider::Pi).to_string(),
+            parse_version: crate::util::provider_parse_version(self.provider).to_string(),
             raw_metadata_json,
             parse_warning: super::malformed_jsonl_warning(malformed_line_count),
             discovery_source: "jsonl".to_string(),
             parent_session_id: spawned
                 .as_ref()
-                .map(|origin| origin.parent_link(Provider::Pi)),
+                .map(|origin| origin.parent_link(self.provider)),
             // Pi names the run's directory after the agent and nests each attempt below it
             // (`<agent>/run-N/`), so the leading segment is the agent and the rest is which
             // attempt. Same slot as claude's `agentType` and codex's `agent_nickname`.
@@ -329,6 +368,13 @@ impl PiAdapter {
 
     fn extract_id(&self, path: &Path) -> Option<String> {
         self.id_in(path.file_stem().and_then(|stem| stem.to_str())?)
+    }
+
+    fn has_uuid_filename(&self, path: &Path) -> bool {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return false;
+        };
+        self.id_in(stem).as_deref() == Some(stem)
     }
 
     /// The session id embedded in a file or directory name. Pi names both after the session
@@ -949,6 +995,76 @@ mod tests {
             parsed.session.parse_warning.as_deref(),
             Some("skipped 1 malformed JSONL record")
         );
+    }
+
+    #[test]
+    fn prime_agent_discovers_root_and_child_transcripts_but_not_rlm_registry() {
+        let temp = tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let artifacts = temp.path().join("session-artifacts");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let root_id = "019fea39-38c2-710e-8100-3624dfc0ac07";
+        fs::write(
+            sessions.join(format!("{root_id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{root_id}\",\"timestamp\":\"2026-08-10T05:50:46.466Z\",\"cwd\":\"/Users/example/project\"}}\n\
+                 {{\"type\":\"message\",\"id\":\"root-user\",\"timestamp\":\"2026-08-10T06:01:17.784Z\",\"message\":{{\"role\":\"user\",\"content\":\"Run the project\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let child_id = "019feb40-49d3-721f-9211-4735efd1bd18";
+        let child_dir = artifacts.join(root_id).join("sub-a1b2c3d4");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join(format!("{child_id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{child_id}\",\"timestamp\":\"2026-08-10T06:02:00.000Z\",\"cwd\":\"/Users/example/project\"}}\n\
+                 {{\"type\":\"message\",\"id\":\"child-user\",\"timestamp\":\"2026-08-10T06:02:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"Inspect the tests\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            artifacts.join(root_id).join("rlm-subagents.jsonl"),
+            "{\"child_id\":\"registry-only\",\"status\":\"completed\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            child_dir.join(format!("registry-{child_id}.jsonl")),
+            "{\"child_id\":\"registry-only\",\"status\":\"completed\"}\n",
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::prime_agent(vec![sessions, artifacts]);
+        let mut sources = adapter.discover();
+        sources.sort_by(|left, right| left.path.cmp(&right.path));
+        assert_eq!(sources.len(), 2, "the RLM registry is not a transcript");
+
+        let parsed = sources
+            .iter()
+            .map(|source| adapter.parse(source))
+            .collect::<Vec<_>>();
+        let root = parsed
+            .iter()
+            .find(|session| session.session.provider_session_id == root_id)
+            .unwrap();
+        assert_eq!(root.session.provider, Provider::PrimeAgent);
+        assert_eq!(root.session.id, format!("prime-agent:{root_id}"));
+        assert_eq!(root.session.parent_session_id, None);
+        assert_eq!(root.messages[0].provenance.authorship.as_str(), "human");
+
+        let child = parsed
+            .iter()
+            .find(|session| session.session.provider_session_id == child_id)
+            .unwrap();
+        assert_eq!(child.session.provider, Provider::PrimeAgent);
+        let expected_parent = format!("prime-agent:{root_id}");
+        assert_eq!(
+            child.session.parent_session_id.as_deref(),
+            Some(expected_parent.as_str())
+        );
+        assert_eq!(child.messages[0].provenance.authorship.as_str(), "agent");
     }
 
     /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).
