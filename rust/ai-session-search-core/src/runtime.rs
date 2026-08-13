@@ -70,7 +70,7 @@ impl ExecutionRuntime {
     }
 
     #[cfg(test)]
-    fn pool_build_count(&self) -> usize {
+    pub(crate) fn pool_build_count(&self) -> usize {
         self.pool_builds.load(Ordering::Relaxed)
     }
 }

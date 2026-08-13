@@ -179,6 +179,11 @@ const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
 /// size. Byte memory still includes full content for the current batch and top window plus each
 /// worker's UTF-32/lowercase scratch for its largest processed row.
 const FUZZY_SCORE_BATCH_SIZE: usize = 512;
+/// Bound rows and ordinary transcript bytes retained between serial SQLite traversal and parallel
+/// session scoring. One individually oversized record is processed alone, so batching adds at most
+/// this byte budget beyond the largest record rather than multiplying that record by the row cap.
+const SESSION_SCORE_BATCH_SIZE: usize = 128;
+const SESSION_SCORE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default SQLite busy timeout for normal CLI/MCP use. This is intentionally a short wait, not
 /// an indefinite block: concurrent agent sessions should ride out brief write bursts, while real
@@ -607,6 +612,11 @@ impl Db {
     /// Number of data-parallel workers owned by this database lifecycle.
     pub fn worker_threads(&self) -> usize {
         self.runtime.worker_threads()
+    }
+
+    #[cfg(test)]
+    fn worker_pool_build_count(&self) -> usize {
+        self.runtime.pool_build_count()
     }
 
     pub(crate) fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
@@ -4147,7 +4157,6 @@ impl Db {
         scoring: &crate::config::ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
         self.validate_access_scope()?;
-        let matcher = SkimMatcherV2::default().smart_case();
         let query_lower = query.to_lowercase();
         let tokens: Vec<&str> = query_lower.split_whitespace().collect();
         let query_needle = UnicodeLowerNeedle::from_lowered(&query_lower);
@@ -4155,7 +4164,17 @@ impl Db {
             .iter()
             .map(|token| UnicodeLowerNeedle::from_lowered(token))
             .collect::<Vec<_>>();
+        let context = SessionScoreContext {
+            query,
+            query_needle: &query_needle,
+            tokens: &tokens,
+            token_needles: &token_needles,
+            current_repo,
+            scoring,
+            now: Utc::now(),
+        };
         let mut hits = Vec::new();
+        let ranked_limit = filters.limit;
         let mut sql = format!(
             "select {}, coalesce(t.transcript_text, '') as transcript_text
                from sessions s
@@ -4172,102 +4191,32 @@ impl Db {
             row_to_session_with_transcript,
         )?;
 
+        let mut batch = Vec::with_capacity(SESSION_SCORE_BATCH_SIZE);
+        let mut batch_bytes = 0_usize;
         for record in candidates {
             let record = record?;
-            let title = record.session.title.as_deref().unwrap_or_default();
-            let summary = record.session.summary.as_deref().unwrap_or_default();
-            let cwd = record.session.cwd.as_deref().unwrap_or_default();
-            let repo_root = record.session.repo_root.as_deref().unwrap_or_default();
-            let preview = record.session.preview_text.as_str();
-            let transcript = record.transcript_text.as_str();
-            let haystacks = [
-                ("title", title),
-                ("summary", summary),
-                ("cwd", cwd),
-                ("repo", repo_root),
-                ("preview", preview),
-                ("transcript", transcript),
-            ];
-
-            let mut score = 0i64;
-            let mut best_source = "fuzzy".to_string();
-            let mut best_source_score = i64::MIN;
-            let mut best_snippet = snippet_from_match(preview, query, 160);
-
-            let mut term_coverage = vec![false; tokens.len()];
-            let mut matched = false;
-            for (source, value) in haystacks {
-                let mut source_score = 0i64;
-                if query_needle.contains(value) {
-                    matched = true;
-                    source_score += match source {
-                        "title" => scoring.title_score,
-                        "summary" => scoring.summary_score,
-                        "cwd" | "repo" => scoring.path_score,
-                        "preview" => scoring.preview_score,
-                        _ => scoring.other_score,
-                    };
+            batch_bytes = batch_bytes.saturating_add(session_search_record_bytes(&record));
+            batch.push(record);
+            if batch.len() == SESSION_SCORE_BATCH_SIZE || batch_bytes >= SESSION_SCORE_BATCH_BYTES {
+                let scored = self
+                    .runtime
+                    .install(|| score_session_records(std::mem::take(&mut batch), &context))?;
+                batch_bytes = 0;
+                hits.extend(scored);
+                if ranked_limit > 0 && hits.len() >= top_k_compaction_threshold(ranked_limit) {
+                    retain_top_session_hits(&mut hits, ranked_limit);
                 }
-                for (index, token) in tokens.iter().enumerate() {
-                    if !token.is_empty() && token_needles[index].contains(value) {
-                        matched = true;
-                        source_score += scoring.token_bonus;
-                        term_coverage[index] = true;
-                    }
-                }
-                if matches!(source, "title" | "cwd" | "repo" | "preview") {
-                    if let Some(fuzzy_score) = matcher.fuzzy_match(value, query) {
-                        matched = true;
-                        source_score += fuzzy_score;
-                    }
-                }
-
-                score += source_score;
-                if source_score > best_source_score {
-                    best_source_score = source_score;
-                    best_source = source.to_string();
-                    best_snippet = snippet_from_match(value, query, 160);
-                }
-            }
-            // Bonus when every whitespace-delimited query term matched at least one field in this
-            // session. Coverage never crosses session boundaries.
-            if !matched {
-                continue;
-            }
-            if tokens.len() > 1 && term_coverage.iter().all(|matched| *matched) {
-                score += scoring.all_tokens_bonus;
-            }
-
-            if let Some(updated_at) = record.session.updated_at {
-                let age_days = (Utc::now() - updated_at)
-                    .num_days()
-                    .clamp(0, scoring.recency_max_days);
-                score += (scoring.recency_max_days - age_days) * scoring.recency_weight;
-            }
-            if let (Some(current_repo), Some(repo_root)) =
-                (current_repo, record.session.repo_root.as_deref())
-            {
-                if current_repo == repo_root {
-                    score += scoring.current_repo_bonus;
-                    if best_source == "fuzzy" {
-                        best_source = "repo".to_string();
-                        best_snippet = snippet_from_match(repo_root, query, 160);
-                    }
-                }
-            }
-            hits.push(SearchHit {
-                session: record.session,
-                score,
-                match_source: best_source,
-                match_snippet: best_snippet,
-            });
-            if filters.limit > 0 && hits.len() >= top_k_compaction_threshold(filters.limit) {
-                retain_top_session_hits(&mut hits, filters.limit);
             }
         }
+        if !batch.is_empty() {
+            hits.extend(
+                self.runtime
+                    .install(|| score_session_records(batch, &context))?,
+            );
+        }
 
-        if filters.limit > 0 {
-            retain_top_session_hits(&mut hits, filters.limit);
+        if ranked_limit > 0 {
+            retain_top_session_hits(&mut hits, ranked_limit);
         }
         hits.sort_by(compare_session_hits);
         Ok(hits)
@@ -5464,6 +5413,133 @@ fn finish_fuzzy_hits(
         .into_iter()
         .skip(offset)
         .map(|(hit, _)| hit)
+        .collect()
+}
+
+fn session_search_record_bytes(record: &SessionWithTranscript) -> usize {
+    record.transcript_text.len()
+        + record.session.preview_text.len()
+        + record.session.title.as_ref().map_or(0, String::len)
+        + record.session.summary.as_ref().map_or(0, String::len)
+        + record.session.cwd.as_ref().map_or(0, String::len)
+        + record.session.repo_root.as_ref().map_or(0, String::len)
+}
+
+struct SessionScoreContext<'a> {
+    query: &'a str,
+    query_needle: &'a UnicodeLowerNeedle,
+    tokens: &'a [&'a str],
+    token_needles: &'a [UnicodeLowerNeedle],
+    current_repo: Option<&'a str>,
+    scoring: &'a crate::config::ScoringConfig,
+    now: DateTime<Utc>,
+}
+
+/// Score one bounded batch independently. For batch bytes `B_b`, rows `N_b`, query tokens `A`,
+/// and workers `P`, aggregate work is O(B_b * (A + 1) + N_b); ideal scoring latency is
+/// O(B_b * (A + 1) / P + N_b / P), excluding Rayon scheduling. Output memory is O(N_b + D_b)
+/// for matching record bytes `D_b`; the caller compacts globally retained top-K results between
+/// batches. A single `now` value preserves recency scores across worker counts and batch timing.
+fn score_session_records(
+    records: Vec<SessionWithTranscript>,
+    context: &SessionScoreContext<'_>,
+) -> Vec<SearchHit> {
+    let SessionScoreContext {
+        query,
+        query_needle,
+        tokens,
+        token_needles,
+        current_repo,
+        scoring,
+        now,
+    } = context;
+    records
+        .into_par_iter()
+        .filter_map(|record| {
+            let matcher = SkimMatcherV2::default().smart_case();
+            let title = record.session.title.as_deref().unwrap_or_default();
+            let summary = record.session.summary.as_deref().unwrap_or_default();
+            let cwd = record.session.cwd.as_deref().unwrap_or_default();
+            let repo_root = record.session.repo_root.as_deref().unwrap_or_default();
+            let preview = record.session.preview_text.as_str();
+            let transcript = record.transcript_text.as_str();
+            let haystacks = [
+                ("title", title),
+                ("summary", summary),
+                ("cwd", cwd),
+                ("repo", repo_root),
+                ("preview", preview),
+                ("transcript", transcript),
+            ];
+
+            let mut score = 0_i64;
+            let mut best_source = "fuzzy".to_string();
+            let mut best_source_score = i64::MIN;
+            let mut best_snippet = snippet_from_match(preview, query, 160);
+            let mut term_coverage = vec![false; tokens.len()];
+            let mut matched = false;
+            for (source, value) in haystacks {
+                let mut source_score = 0_i64;
+                if query_needle.contains(value) {
+                    matched = true;
+                    source_score += match source {
+                        "title" => scoring.title_score,
+                        "summary" => scoring.summary_score,
+                        "cwd" | "repo" => scoring.path_score,
+                        "preview" => scoring.preview_score,
+                        _ => scoring.other_score,
+                    };
+                }
+                for (index, token) in tokens.iter().enumerate() {
+                    if !token.is_empty() && token_needles[index].contains(value) {
+                        matched = true;
+                        source_score += scoring.token_bonus;
+                        term_coverage[index] = true;
+                    }
+                }
+                if matches!(source, "title" | "cwd" | "repo" | "preview") {
+                    if let Some(fuzzy_score) = matcher.fuzzy_match(value, query) {
+                        matched = true;
+                        source_score += fuzzy_score;
+                    }
+                }
+                score += source_score;
+                if source_score > best_source_score {
+                    best_source_score = source_score;
+                    best_source = source.to_string();
+                    best_snippet = snippet_from_match(value, query, 160);
+                }
+            }
+            if !matched {
+                return None;
+            }
+            if tokens.len() > 1 && term_coverage.iter().all(|matched| *matched) {
+                score += scoring.all_tokens_bonus;
+            }
+            if let Some(updated_at) = record.session.updated_at {
+                let age_days = (*now - updated_at)
+                    .num_days()
+                    .clamp(0, scoring.recency_max_days);
+                score += (scoring.recency_max_days - age_days) * scoring.recency_weight;
+            }
+            if let (Some(current_repo), Some(repo_root)) =
+                (current_repo, record.session.repo_root.as_deref())
+            {
+                if *current_repo == repo_root {
+                    score += scoring.current_repo_bonus;
+                    if best_source == "fuzzy" {
+                        best_source = "repo".to_string();
+                        best_snippet = snippet_from_match(repo_root, query, 160);
+                    }
+                }
+            }
+            Some(SearchHit {
+                session: record.session,
+                score,
+                match_source: best_source,
+                match_snippet: best_snippet,
+            })
+        })
         .collect()
 }
 
@@ -8149,6 +8225,186 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].session.id, all[0].session.id);
         assert_eq!(one[0].session.id, "s2");
+    }
+
+    #[test]
+    fn session_search_uses_the_application_worker_runtime_without_changing_ranking() {
+        let root = tempfile::tempdir().unwrap();
+        let one = Db::open_with_threads(
+            &root.path().join("one.db"),
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let four = Db::open_with_threads(
+            &root.path().join("four.db"),
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .unwrap();
+        for db in [&one, &four] {
+            for index in 0..1_100 {
+                let id = format!("s{index:04}");
+                db.conn
+                    .execute(
+                        "insert into sessions (
+                             id, provider, provider_session_id, title, summary, cwd, repo_root,
+                             preview_text, source_path, updated_at, parse_version, discovery_source
+                         ) values (?1, 'claude', ?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, '1', 'test')",
+                        params![
+                            id,
+                            (index % 7 == 0).then_some("database migration"),
+                            format!("summary {index}"),
+                            format!("/repo/{index}"),
+                            format!("preview database work item {index}"),
+                            format!("/{index}.jsonl"),
+                            format!("2026-01-{:02}T00:00:00Z", index % 28 + 1),
+                        ],
+                    )
+                    .unwrap();
+                db.conn
+                    .execute(
+                        "insert into transcripts(session_id, transcript_text) values (?1, ?2)",
+                        params![
+                            format!("s{index:04}"),
+                            format!(
+                                "transcript {index} discusses database schema migration planning"
+                            )
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        let filters = SearchFilters {
+            limit: 40,
+            ..Default::default()
+        };
+        let scoring = crate::config::ScoringConfig {
+            recency_weight: 0,
+            ..Default::default()
+        };
+        let identities = |hits: Vec<SearchHit>| {
+            hits.into_iter()
+                .map(|hit| {
+                    (
+                        hit.session.id,
+                        hit.score,
+                        hit.match_source,
+                        hit.match_snippet,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(one.worker_pool_build_count(), 0);
+        assert_eq!(four.worker_pool_build_count(), 0);
+        let expected = identities(
+            one.search("databse migraton", &filters, Some("/repo/7"), &scoring)
+                .unwrap(),
+        );
+        let actual = identities(
+            four.search("databse migraton", &filters, Some("/repo/7"), &scoring)
+                .unwrap(),
+        );
+        assert_eq!(
+            actual, expected,
+            "worker count must not change session ranking"
+        );
+        assert_eq!(one.worker_pool_build_count(), 1);
+        assert_eq!(four.worker_pool_build_count(), 1);
+    }
+
+    /// Opt-in deterministic comparison of one-worker and multi-worker session scoring. Correctness
+    /// belongs to the non-ignored parity test above; this prints p50/p95 and digest evidence without
+    /// imposing a scheduler-sensitive speedup threshold.
+    #[test]
+    #[ignore = "deterministic release-mode session-search performance measurement"]
+    fn session_search_parallel_scoring_benchmark() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index.db");
+        {
+            let db =
+                Db::open_with_threads(&path, TEST_BUSY_TIMEOUT_MS, NonZeroUsize::new(1).unwrap())
+                    .unwrap();
+            let transcript_padding = "database schema migration planning ".repeat(250);
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut session = tx
+                    .prepare(
+                        "insert into sessions (
+                             id, provider, provider_session_id, title, preview_text, source_path,
+                             parse_version, discovery_source
+                         ) values (?1, 'claude', ?1, ?2, ?3, ?4, '1', 'test')",
+                    )
+                    .unwrap();
+                let mut transcript = tx
+                    .prepare("insert into transcripts(session_id, transcript_text) values (?1, ?2)")
+                    .unwrap();
+                for index in 0..4_000 {
+                    let id = format!("s{index:04}");
+                    session
+                        .execute(params![
+                            id,
+                            (index % 11 == 0).then_some("database migration"),
+                            format!("preview {index}"),
+                            format!("/{index}.jsonl"),
+                        ])
+                        .unwrap();
+                    transcript
+                        .execute(params![
+                            format!("s{index:04}"),
+                            format!("{transcript_padding}{index}")
+                        ])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let filters = SearchFilters {
+            limit: 50,
+            ..Default::default()
+        };
+        let scoring = crate::config::ScoringConfig {
+            recency_weight: 0,
+            ..Default::default()
+        };
+        let measure = |threads| {
+            let db = Db::open_with_threads(
+                &path,
+                TEST_BUSY_TIMEOUT_MS,
+                NonZeroUsize::new(threads).unwrap(),
+            )
+            .unwrap();
+            let search = || {
+                db.search("databse migraton", &filters, None, &scoring)
+                    .unwrap()
+            };
+            let expected = serde_json::to_vec(&search()).unwrap();
+            let digest = crate::hashing::sha256(&expected);
+            let mut elapsed = Vec::new();
+            for _ in 0..7 {
+                let started = Instant::now();
+                assert_eq!(serde_json::to_vec(&search()).unwrap(), expected);
+                elapsed.push(started.elapsed().as_micros());
+            }
+            elapsed.sort_unstable();
+            (
+                elapsed[elapsed.len() / 2],
+                elapsed[elapsed.len() - 1],
+                digest,
+            )
+        };
+        let one = measure(1);
+        let four = measure(4);
+        assert_eq!(one.2, four.2);
+        eprintln!(
+            "session_parallel_benchmark sessions=4000 transcript_bytes_per_session={} one_worker_median_us={} one_worker_p95_us={} four_worker_median_us={} four_worker_p95_us={} digest=sha256:{}",
+            "database schema migration planning ".len() * 250,
+            one.0,
+            one.1,
+            four.0,
+            four.1,
+            one.2
+        );
     }
 
     #[test]

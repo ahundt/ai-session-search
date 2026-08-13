@@ -2155,11 +2155,13 @@ impl<'db> CatalogService<'db> {
     ///
     /// Let `B` be total eligible field/transcript bytes, `N` eligible sessions, `K` a positive
     /// result limit, `D_K` bytes retained in the top-K records, and `D_max` the largest current
-    /// record plus transcript. Streaming scoring and amortized linear top-K compaction do
-    /// `O(B + N + K log K)` work; the final term is the one retained-page sort. Peak processing
-    /// memory is `O(K + D_K + D_max)`. The path is serial, so latency has the same critical-path
-    /// bound; configured message-scoring workers do not accelerate it. A zero limit intentionally
-    /// retains every match, increasing memory to `O(N + B)` and final sorting to `O(N log N)`.
+    /// record plus transcript, `A` query tokens, and `P` configured workers. Batched scoring plus
+    /// amortized linear top-K compaction does `O(B*(A+1) + N + K log K)` aggregate work; the final
+    /// term is the retained-page sort. Peak processing memory is
+    /// `O(K + D_K + batch_budget + D_max)`. Ideal scoring latency is `O(B*(A+1)/P + N/P)` plus
+    /// serial SQLite traversal, batch joins, retained-set compaction, and final `O(K log K)` sort.
+    /// A zero limit intentionally retains every match, increasing memory to `O(N + B)` and final
+    /// sorting to `O(N log N)`; parallel scoring does not change result membership or rank.
     pub fn search_sessions(
         &self,
         query: &str,
