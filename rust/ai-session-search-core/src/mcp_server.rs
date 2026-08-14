@@ -14418,7 +14418,7 @@ mod tests {
                 json!({
                     "id": format!("claude:{index:032}"),
                     "title": "x".repeat(400),
-                    "repo_root": "/Users/athundt/source/rtk",
+                    "repo_root": "/Users/example/source/widget",
                 })
             })
             .collect();

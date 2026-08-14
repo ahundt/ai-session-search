@@ -2080,7 +2080,7 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
                 unstated.push(format!("aise {} {}", leaf.join(" "), trimmed));
             }
             // A filter that matches by prefix has to say so. `--workspace-path
-            // /Users/athundt/source/rtk` also matches `/Users/athundt/source/rtk-other`, and a
+            // /Users/example/source/widget` also matches `/Users/example/source/widget-other`, and a
             // reader who thinks it is an exact match reads a wider result set as a narrower one.
             // `aise search --path` already says "starts with this path prefix" and
             // `--exclude-workspace-path` says "prefix", so the two that do not are inconsistent
