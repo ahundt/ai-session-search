@@ -1475,9 +1475,62 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Serializes tests that mutate the process `PATH` so they never race the same env var
+    /// across `cargo test`'s parallel test threads. Every test in this crate that touches the
+    /// real `PATH` goes through [`with_stub_binary_on_path`], so this mutex is the only
+    /// coordination required.
+    static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Prepends a directory containing one fake, always-findable `name` executable to `PATH`,
+    /// runs `f`, then restores the original `PATH` even if `f` panics. Lets a test exercise the
+    /// real [`resume_plan`]/[`which`] resolution without depending on `claude`, `codex`, `pi`,
+    /// or `prime-agent` actually being installed on the host or CI runner.
+    pub(crate) fn with_stub_binary_on_path<T>(name: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = PATH_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = stub_dir.path().join(name);
+        std::fs::write(&stub, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let original_path = std::env::var_os("PATH");
+        let mut search_dirs = vec![stub_dir.path().to_path_buf()];
+        if let Some(existing) = &original_path {
+            search_dirs.extend(std::env::split_paths(existing));
+        }
+        let new_path = std::env::join_paths(search_dirs).unwrap();
+        // SAFETY: serialized by PATH_MUTEX above, and no other test in this crate reads or
+        // writes the real PATH env var, so no concurrent access races this mutation.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                // SAFETY: see above; runs on unwind too, so a panic in `f` never leaves PATH
+                // mutated for later tests.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("PATH", value),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+        let _restore = RestorePath(original_path);
+
+        f()
+    }
 
     #[test]
     fn unicode_lower_contains_matches_eager_lowercase_for_unicode_cases() {
@@ -1622,8 +1675,12 @@ mod tests {
             String::new(),
         );
         let session_id = parsed.session.provider_session_id.clone();
+        // Stubbed rather than assumed: `resume_plan` refuses when the native CLI is absent, so
+        // asserting the success path against the live PATH only passes on a machine that happens
+        // to have `prime-agent` installed.
+        let plan = with_stub_binary_on_path("prime-agent", || resume_plan(&parsed.session));
         assert_eq!(
-            resume_plan(&parsed.session).unwrap(),
+            plan.unwrap(),
             (
                 vec![
                     "prime-agent".to_string(),
