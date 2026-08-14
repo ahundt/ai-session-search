@@ -1,7 +1,7 @@
 
 # AI Session Search (`aise`)
 
-Ultra-fast rust-based search of every local AI coding session with on-the-fly reindexing. Reads Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
+Ultra-fast rust-based search of every local AI coding session with on-the-fly reindexing. Reads Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Prime Agent, Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
 
 [![PyPI](https://img.shields.io/pypi/v/ai-session-search)](https://pypi.org/project/ai-session-search/)
 [![crates.io](https://img.shields.io/crates/v/ai-session-search)](https://crates.io/crates/ai-session-search)
@@ -14,7 +14,7 @@ Ultra-fast rust-based search of every local AI coding session with on-the-fly re
 
 <img width="1561" height="1098" alt="demo" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
 
-## Eight session formats now interact seamlessly
+## Nine session formats now interact seamlessly
 
 Your AI coding history is already on disk. Claude Code writes JSONL files named by UUID. Codex
 keeps its own transcript format under `~/.codex`. Cursor, Gemini CLI, Antigravity, and AI Studio

@@ -13,6 +13,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# The provider set every public surface has to agree on. PROVIDER_COUNT_WORD is the spelling the
+# README uses in prose; adding a provider changes it, which is what forces the README edit.
+PROVIDER_IDS = (
+    "claude",
+    "claude-desktop",
+    "codex",
+    "cursor",
+    "antigravity",
+    "pi",
+    "prime-agent",
+    "aistudio",
+    "gemini-cli",
+)
+PROVIDER_COUNT_WORD = "nine"
+# Reader-facing names, which are friendlier than Provider::display_name; "Codex" alone so the
+# README stays free to write "ChatGPT Codex" or "Codex CLI".
+README_PROVIDER_NAMES = (
+    "Claude Code",
+    "Claude Desktop",
+    "Codex",
+    "Cursor",
+    "Antigravity",
+    "Pi",
+    "Prime Agent",
+    "Google AI Studio",
+    "Gemini CLI",
+)
+
 
 def test_python_metadata_and_maturin_require_cp312_abi3_through_314() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -338,6 +366,21 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "peak growth is `O(B_session)`" in requirements
 
 
+def test_readme_opening_and_format_count_cover_every_provider() -> None:
+    # Prime Agent landed as a distinct provider: the session-source table gained a row and the
+    # body said "all nine formats", while the heading above it and the one-line summary still
+    # said eight and never named Prime Agent. Tie the summary, the count, and the table to one
+    # provider set so the next provider cannot land in the table alone.
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    summary = readme.split("\n## ", 1)[0]
+    for name in README_PROVIDER_NAMES:
+        assert name in summary, f"README summary above the first heading omits {name}"
+    assert f"{PROVIDER_COUNT_WORD.capitalize()} session formats" in readme
+    assert f"parses all {PROVIDER_COUNT_WORD} formats" in readme
+    for provider_id in PROVIDER_IDS:
+        assert f"`{provider_id}`" in readme, f"README has no session-source row for {provider_id}"
+
+
 def test_message_query_docs_distinguish_query_field_from_tool_filter() -> None:
     models = (ROOT / "rust/ai-session-search-core/src/models.rs").read_text(encoding="utf-8")
     cli = (ROOT / "rust/ai-session-search-core/src/messages.rs").read_text(encoding="utf-8")
@@ -348,17 +391,7 @@ def test_message_query_docs_distinguish_query_field_from_tool_filter() -> None:
     normalized_binding = " ".join(binding.replace("///", "").split())
     normalized_stub = " ".join(stub.split())
 
-    for provider_id in (
-        "claude",
-        "claude-desktop",
-        "codex",
-        "cursor",
-        "antigravity",
-        "pi",
-        "prime-agent",
-        "aistudio",
-        "gemini-cli",
-    ):
+    for provider_id in PROVIDER_IDS:
         assert provider_id in models
     assert "The query searches only `field`" in normalized_models
     assert "independent of `field`" in normalized_models
