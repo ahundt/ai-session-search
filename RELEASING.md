@@ -294,7 +294,10 @@ Before tagging, confirm:
 - `python -m scripts.verify_release_metadata --tag v1.0.0rc2` passes.
 - The local wheel, sdist, and crate prepared above pass artifact verification.
 - The wheel contains the extension, typed stubs, `py.typed`, `LICENSE`, and
-  `NOTICE`; sdists contain both lockfiles and build manifests.
+  `NOTICE`; the sdist carries `Cargo.lock` and both build manifests. `uv.lock`
+  is deliberately absent, because it locks the development extras and no
+  install path from the sdist reads it. `python -m
+  scripts.verify_release_artifacts` holds the enforced list.
 - Archives contain no demo media, absolute or traversal paths, legacy Python
   package directories, symlinks, or hard links.
 
