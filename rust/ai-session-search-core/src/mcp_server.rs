@@ -647,7 +647,7 @@ fn execute_official_tool_call(
         Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
     }
 
-    let args = Value::Object(request.arguments.unwrap_or_default());
+    let mut args = Value::Object(request.arguments.unwrap_or_default());
     let params = json!({ "name": request.name, "arguments": args });
     let prepared = (|| -> Result<Preparation, String> {
         if cancellation.is_cancelled() {
@@ -657,6 +657,11 @@ fn execute_official_tool_call(
             .lock()
             .map_err(|_| "MCP state lock is poisoned".to_string())?;
         validate_tool_call(&params, server.advertised_tools())?;
+        args = without_advertised_defaults(
+            &request.name,
+            std::mem::take(&mut args),
+            server.advertised_tools(),
+        );
         let recovery = ToolRecovery::for_call(
             params["name"].as_str().unwrap_or_default(),
             &args,
@@ -1542,6 +1547,37 @@ fn tool_requests_existing_only(params: &Value) -> bool {
         .and_then(|arguments| arguments.get("index_refresh"))
         .and_then(Value::as_str)
         == Some("existing-only")
+}
+
+/// Drop every top-level argument whose value equals the `default` its advertised schema declares.
+///
+/// A JSON-schema `default` promises "absent resolves to this value", and Claude Code takes the
+/// promise literally: it materializes every declared default before it calls the tool, so the
+/// server sees `limit`, `lines_per_message`, `field_view`, and `match_view` on every call whether
+/// or not the model wrote them. Because the advertised default is exactly what an absent value
+/// resolves to, removing an equal value changes nothing a caller can observe except the two
+/// things it must change: a rule that rejects one parameter beside another (`all_results` beside
+/// `limit`, `detail` beside the presentation budgets, `match_view` without a query) no longer
+/// fires on values the caller never wrote, and a `purpose` bundle keeps precedence over a default
+/// the client injected. A value that differs from the default is the caller's own and is kept.
+///
+/// `O(P)` for the tool's `P` advertised properties; the catalogue is the per-connection cached
+/// one, so nothing is rebuilt per call.
+fn without_advertised_defaults(tool_name: &str, args: Value, tools: &Value) -> Value {
+    let Value::Object(mut fields) = args else {
+        return args;
+    };
+    let Some(properties) = tools
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
+        .and_then(|tool| tool["inputSchema"]["properties"].as_object())
+    else {
+        return Value::Object(fields);
+    };
+    fields.retain(|key, value| {
+        properties.get(key).and_then(|schema| schema.get("default")) != Some(value)
+    });
+    Value::Object(fields)
 }
 
 fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
@@ -6899,7 +6935,12 @@ mod tests {
         assert!(error.contains("-2"), "{error}");
     }
 
+    /// Mirrors the serve path: validate against the advertised catalogue, drop arguments equal
+    /// to their advertised defaults, then dispatch. Tests that bypass this and call
+    /// `dispatch_tool_cancellable` directly see the raw arguments a client sent.
     fn call_tool(name: &str, arguments: Value, config: &Config, db: &Db) -> Value {
+        let tools = advertised_tools(config);
+        let arguments = without_advertised_defaults(name, arguments, &tools);
         match dispatch_tool_cancellable(name, &arguments, config, db, None) {
             Ok(content) => {
                 let mut result = json!({
@@ -7377,6 +7418,95 @@ mod tests {
             violations.is_empty(),
             "response contradicts the published outputSchema: {violations:?}"
         );
+    }
+
+    /// Claude Code materializes every JSON-schema `default` before it calls a tool, so the
+    /// server sees `limit`, `lines_per_message`, `field_view`, and `match_view` on every call
+    /// whether or not the model wrote them. A value equal to the advertised default resolves to
+    /// exactly what its absence resolves to, so it must not count as "present" for a rule that
+    /// rejects one parameter beside another. Dogfooded 2026-08-15 from Claude Code: `all_results`
+    /// ("conflicts with limit"), `detail` ("conflicts with lines_per_message, field_view, and
+    /// match_view"), and a query-less filter search ("match_view requires a query") were all
+    /// unreachable, and a `purpose` bundle's page size was silently overridden by the
+    /// materialized default.
+    #[test]
+    fn client_materialized_schema_defaults_never_trip_exclusivity_rules() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = advertised_tools(&config);
+        let properties = tools
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .expect("search_messages is served")["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties")
+            .clone();
+        let materialize = |explicit: Value| {
+            let mut args = serde_json::Map::new();
+            for (name, schema) in &properties {
+                if let Some(default) = schema.get("default") {
+                    args.insert(name.clone(), default.clone());
+                }
+            }
+            for (name, value) in explicit.as_object().expect("explicit args are an object") {
+                args.insert(name.clone(), value.clone());
+            }
+            Value::Object(args)
+        };
+        assert!(
+            properties["limit"].get("default").is_some()
+                && properties["match_view"].get("default").is_some(),
+            "the premise of this test is that rule participants advertise defaults: {properties:?}"
+        );
+
+        let every = call_tool(
+            "search_messages",
+            materialize(json!({ "query": "hello", "all_results": true })),
+            &config,
+            &db,
+        );
+        assert!(
+            every["result"]["isError"].is_null(),
+            "all_results beside the materialized default limit: {every}"
+        );
+        assert_eq!(
+            every["result"]["structuredContent"]["page"]["result_set_extent"],
+            json!("all"),
+            "{every}"
+        );
+
+        let compact = call_tool(
+            "search_messages",
+            materialize(json!({ "query": "hello", "detail": "compact" })),
+            &config,
+            &db,
+        );
+        assert!(
+            compact["result"]["isError"].is_null(),
+            "detail beside materialized presentation defaults: {compact}"
+        );
+
+        let filter_only = call_tool(
+            "search_messages",
+            materialize(json!({ "role": "user" })),
+            &config,
+            &db,
+        );
+        assert!(
+            filter_only["result"]["isError"].is_null(),
+            "query-less filter search beside the materialized match_view default: {filter_only}"
+        );
+
+        // A value that differs from the advertised default is the caller's own and still conflicts.
+        let explicit = call_tool(
+            "search_messages",
+            materialize(json!({ "query": "hello", "all_results": true, "limit": 7 })),
+            &config,
+            &db,
+        );
+        assert_eq!(explicit["result"]["isError"], json!(true), "{explicit}");
     }
 
     #[test]
