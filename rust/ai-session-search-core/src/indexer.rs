@@ -739,6 +739,10 @@ pub(crate) fn reindex_until(
             discovery_warnings: Vec::new(),
         });
     }
+    // Derived query indexes an older aise did not create are built here, first, because this is
+    // the one place that already holds the cross-process writer election and expects long
+    // writes; every query process's `open` deliberately skips the build on a populated index.
+    db.ensure_message_kind_index()?;
     let adapters = ProviderSet::new(config);
     let discovery = adapters.discover_enabled(config);
     let sources = deduplicate_sources(discovery.sources);
@@ -1677,6 +1681,39 @@ mod tests {
             "temporary opportunistic timeout must be restored"
         );
         writer.execute_batch("rollback").unwrap();
+    }
+
+    /// An index written before the message-class index existed gains it on the next refresh:
+    /// `open` skips the build on a populated table (it runs in every query process), the elected
+    /// refresh writer builds it once, and it stays put afterwards.
+    #[test]
+    fn refresh_builds_the_message_kind_index_an_older_aise_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Db::open(&path).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "insert into sessions(id, provider, provider_session_id, preview_text, source_path, \
+                   parse_version, discovery_source) \
+                 values('claude:s1', 'claude', 's1', '', '/x', 'v1', 'jsonl');
+                 insert into messages(session_id, provider, seq, role, content) \
+                 values('claude:s1', 'claude', 0, 'user', 'hello');
+                 drop index {};",
+                crate::db::MESSAGE_KIND_INDEX
+            ))
+            .unwrap();
+        let reopened = Db::open(&path).unwrap();
+        assert!(
+            !reopened.message_kind_index_exists().unwrap(),
+            "open leaves the build to the refresh writer on a populated index"
+        );
+        let config = config_with_no_providers(&path);
+        auto_reindex(&config, &reopened, None).unwrap();
+        assert!(
+            reopened.message_kind_index_exists().unwrap(),
+            "the elected refresh writer builds the missing class index"
+        );
     }
 
     #[test]

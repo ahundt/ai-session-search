@@ -304,6 +304,14 @@ impl MessageKind {
             .collect()
     }
 
+    /// Every class [`MessageFilters::kind_predicate`] can leave out when the caller names no
+    /// set: `HarnessNotice` always, `Compaction` under `no_compaction`. Together a small share of
+    /// any real index (2 % of 2.69 M rows measured), which is what lets a count over the default
+    /// predicate be written as `count(everything) - count(these)`; the storage layer keeps a
+    /// partial index over exactly this set for the second term. Kept in ascending name order so
+    /// the SQL rendered from it is stable.
+    pub const EXCLUDABLE_BY_DEFAULT: &'static [Self] = &[Self::Compaction, Self::HarnessNotice];
+
     /// Parse a `kind` value read back from the index, mapping anything unrecognized to
     /// [`MessageKind::Unknown`].
     ///
@@ -1485,7 +1493,8 @@ pub struct SessionTimeProfile {
     pub tool_results: i64,
 }
 
-/// Cost breakdown for `messages search --explain`. For literal/regex search, `candidates` is the
+/// Cost breakdown for `messages search --receipt-level summary|full` (MCP `receipt_level`,
+/// serialized as `search_explanation`). For literal/regex search, `candidates` is the
 /// prefilter output that requires verification. For fuzzy search, it is every row that matched
 /// during complete-corpus scoring, independent of the requested result page.
 #[derive(Debug, Clone, Serialize)]
@@ -1504,10 +1513,12 @@ pub struct SearchExplain {
 }
 
 impl SearchExplain {
-    /// One-line (two for content search) human-readable selectivity summary for
-    /// `messages search --explain`, written to stderr so it never pollutes the
-    /// parseable stdout. `has_content_query` distinguishes a query with no usable
-    /// >=3-char anchor from an empty search (structural filters only).
+    /// One-line (two for content search) human-readable selectivity summary the CLI writes to
+    /// stderr for `messages search --receipt-level summary|full`, so it never pollutes the
+    /// parseable stdout. It is a presentation of the four structured fields, which are what
+    /// `--format json`, Python, and MCP carry (the MCP output schema deliberately has no
+    /// `summary`). `has_content_query` distinguishes a query with no usable >=3-char anchor from
+    /// an empty search (structural filters only).
     pub fn summary(&self, has_content_query: bool) -> String {
         match (&self.prefilter, self.candidates) {
             (None, Some(candidates)) if has_content_query && self.prefilter_skipped.is_some() => {
@@ -1864,6 +1875,35 @@ mod tests {
             KindPredicate::AllExcept(vec![MessageKind::HarnessNotice, MessageKind::Compaction]),
             "no_compaction narrows the same exclusion rather than switching to an inclusion"
         );
+    }
+
+    /// The storage layer keeps a partial index over exactly `EXCLUDABLE_BY_DEFAULT` so a count
+    /// over the default class predicate never reads message rows. Every class an exclusion
+    /// predicate can name must be in that set, or the count silently returns to a table scan.
+    #[test]
+    fn every_default_exclusion_is_covered_by_the_excludable_set() {
+        for no_compaction in [false, true] {
+            let filters = MessageFilters {
+                no_compaction,
+                ..Default::default()
+            };
+            let KindPredicate::AllExcept(excluded) = filters.kind_predicate() else {
+                panic!("naming no set must produce an exclusion");
+            };
+            for kind in excluded {
+                assert!(
+                    MessageKind::EXCLUDABLE_BY_DEFAULT.contains(&kind),
+                    "{kind:?} is excluded by default but missing from EXCLUDABLE_BY_DEFAULT"
+                );
+            }
+        }
+        let mut names: Vec<&str> = MessageKind::EXCLUDABLE_BY_DEFAULT
+            .iter()
+            .map(MessageKind::as_str)
+            .collect();
+        let rendered = names.clone();
+        names.sort_unstable();
+        assert_eq!(rendered, names, "kept sorted so rendered SQL is stable");
     }
 
     /// The session-class spellings are the providers' own, not invented here, and the

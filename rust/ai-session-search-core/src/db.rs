@@ -251,6 +251,42 @@ const SQLITE_PAGE_CACHE_KIB: i64 = 64 * 1_024;
 /// not eagerly allocated resident memory, and SQLite/OS may choose a lower platform-safe value.
 const SQLITE_MMAP_BYTES: i64 = 256 * 1_024 * 1_024;
 
+/// Partial covering index over the classes the default search predicate can exclude
+/// ([`crate::models::MessageKind::EXCLUDABLE_BY_DEFAULT`]). It exists for one statement: the
+/// receipt's corpus denominator, `count(rows the structural filters admit)`, whose class clause
+/// is `kind != 'harness_notice'`. No index answers a `!=` without visiting rows, and the message
+/// rows carry the bodies, so that count read every page of a 22.6 GB table (117 s). Written as
+/// `count(every class) - count(only the excluded classes)`, the first term is served by the
+/// index that leads with the selected filter column and the second by this one: it leads with
+/// `kind` and carries every column a structural filter tests, so both terms are index-only.
+///
+/// Partial, not whole-table, on purpose: an index leading with `kind` over every row is
+/// attractive to the planner for `kind = 'tool_call'` and `--kind` selections, and on the real
+/// schema and statistics it displaced the ordered `idx_messages_tool_calls`/`session_seq`
+/// walks with a seek plus a temp B-tree sort (checked with `explain query plan` against a
+/// replica of the production schema and `sqlite_stat1`). A partial index is usable only when the
+/// query text implies its `where` clause, so no other statement can pick it, and it holds
+/// 2 % of the rows. That implication is textual: [`excluded_kinds_predicate`] renders the one
+/// clause both the DDL and the count use.
+///
+/// Built by [`Db::ensure_message_kind_index`]: at open only while the table is empty,
+/// otherwise once by the elected refresh writer.
+pub(crate) const MESSAGE_KIND_INDEX: &str = "idx_messages_excluded_kinds";
+const MESSAGE_KIND_INDEX_COLUMNS: &str = "(kind, role, provider, session_id, ts, tool_name)";
+
+/// `kind in ('compaction', 'harness_notice')`, the exact text of [`MESSAGE_KIND_INDEX`]'s partial
+/// clause. SQLite proves partial-index usability by comparing expressions, and bound parameters
+/// never qualify, so the count statement inlines this literal (enum spellings, no user input)
+/// and narrows with a bound `kind in (?)` after it.
+fn excluded_kinds_predicate() -> String {
+    let classes = crate::models::MessageKind::EXCLUDABLE_BY_DEFAULT
+        .iter()
+        .map(|kind| format!("'{}'", kind.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("kind in ({classes})")
+}
+
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
 type ProgressReporter = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -1153,6 +1189,12 @@ impl Db {
                 .query_row("select exists(select 1 from messages)", [], |row| {
                     row.get(0)
                 })?;
+        // The class index is free while the table is empty. On a populated index that lacks it
+        // (written by an older aise) the build is one full scan under the write lock, so it is
+        // left to the elected refresh writer rather than paid inside every query process's open.
+        if !messages_exist {
+            self.ensure_message_kind_index()?;
+        }
         // A brand-new empty database has no incompatible data to migrate. Install the current
         // layout immediately so its first indexing pass maintains both FTS indexes atomically.
         // Existing schema-0 databases with messages still take the parser-backfill/v3 path first.
@@ -2426,7 +2468,7 @@ impl Db {
     }
 
     /// Like [`Db::search_messages`], optionally returning the exact planner diagnostics used by
-    /// this search. This keeps MCP `explain`, CLI `--explain`, and the search path on one shared
+    /// this search. This keeps the MCP `receipt_level`, CLI `--receipt-level`, and the search path on one shared
     /// FTS/trigram decision instead of running the planner twice. Candidate counts are interpreted
     /// with the named strategy: message IDs for content/tool-argument FTS, distinct names for the
     /// bounded tool-name vocabulary, or retained top-K rows for pre-v4 compatibility streaming.
@@ -3176,20 +3218,7 @@ impl Db {
             .collect();
         let explain = include_explain
             .then(|| {
-                let mut corpus_sql =
-                    String::from("select count(*) from messages m where m.tool_name is not null");
-                let mut corpus_args = Vec::new();
-                append_message_filters(
-                    &mut corpus_sql,
-                    &mut corpus_args,
-                    filters,
-                    &self.access_scope,
-                );
-                let corpus = self.conn.query_row(
-                    &corpus_sql,
-                    rusqlite::params_from_iter(corpus_args.iter()),
-                    |row| row.get(0),
-                )?;
+                let corpus = self.corpus_count_with_base("m.tool_name is not null", filters)?;
                 Ok::<_, anyhow::Error>(SearchExplain {
                     prefilter: None,
                     candidates: Some(explained_matching_rows.unwrap_or(matched)),
@@ -3216,19 +3245,141 @@ impl Db {
     }
 
     /// Count the messages matching the structural filters (role / provider / session / path / time /
-    /// tool / no-compaction) — the corpus that literal or regex content matching then
-    /// scans. Shared by [`Db::search_messages`]'s prefilter gate and [`Db::explain_message_search`]
-    /// so both see the exact same denominator (predicates via [`append_message_filters`]).
+    /// tool / class) — the corpus that literal or regex content matching then scans, and the
+    /// denominator every receipt reports. Only receipts and the fuzzy tool-name planner call
+    /// this; the search hot path probes [`Db::filtered_corpus_reaches`] instead.
+    ///
+    /// Cost: index-only. The class predicate defaults to `kind != 'harness_notice'`, and no
+    /// index answers a `!=` without visiting rows, so this is computed as
+    /// `count(every class) - count(only the excluded classes)`. The first term is served by the
+    /// index that leads with the selected filter column (`role`, `provider`, `session_id`, `ts`,
+    /// or SQLite's smallest index for `count(*)`); the second by [`MESSAGE_KIND_INDEX`], which
+    /// leads with `kind` and carries every column a structural filter tests. Time is
+    /// `O(F + E)` index entries for `F` rows matching the structural filters and `E` rows of the
+    /// excluded classes (2 % of a real index), never `O(N)` message-row page reads. Measured on
+    /// a 22.6 GB / 2.69 M-row index: the previous single `!=` statement scanned every row in
+    /// 117 s; the decomposition reads ~80 MB of index pages in ≈5 s cold and well under a
+    /// second warm. When [`MESSAGE_KIND_INDEX`] is absent (an index an older aise wrote, before
+    /// its elected writer's next refresh builds it), the second term falls back to the row scan
+    /// with the same result. See [`Db::corpus_count_statements`] for the exact statements.
     fn filtered_corpus_count(&self, filters: &MessageFilters) -> Result<i64> {
-        use rusqlite::types::Value;
-        let mut sql = String::from("select count(*) from messages m where 1 = 1");
-        let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        Ok(self
-            .conn
-            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
-                row.get(0)
-            })?)
+        self.corpus_count_with_base("1 = 1", filters)
+    }
+
+    /// [`Db::filtered_corpus_count`] over the rows that also satisfy `base_predicate`, an SQL
+    /// fragment over alias `m` (`"m.tool_name is not null"` for the fuzzy tool-name planner).
+    fn corpus_count_with_base(
+        &self,
+        base_predicate: &str,
+        filters: &MessageFilters,
+    ) -> Result<i64> {
+        let mut corpus = 0_i64;
+        for (sql, args, sign) in self.corpus_count_statements(base_predicate, filters) {
+            let count: i64 =
+                self.conn
+                    .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                        row.get(0)
+                    })?;
+            corpus += sign * count;
+        }
+        Ok(corpus)
+    }
+
+    /// The signed count statements whose sum is the filtered corpus (see
+    /// [`Db::filtered_corpus_count`]). Public to tests, which assert every statement plans as
+    /// an index-only read.
+    fn corpus_count_statements(
+        &self,
+        base_predicate: &str,
+        filters: &MessageFilters,
+    ) -> Vec<(String, Vec<rusqlite::types::Value>, i64)> {
+        let build = |class: ClassSelection<'_>| {
+            let mut sql = format!("select count(*) from messages m where {base_predicate}");
+            if matches!(class, ClassSelection::Only(_)) {
+                // The literal clause that lets SQLite use the partial index; the bound
+                // `m.kind in (?)` the class selection appends narrows to the excluded set.
+                sql.push_str(&format!(" and m.{}", excluded_kinds_predicate()));
+            }
+            let mut args = Vec::new();
+            append_message_filters_with_class(
+                &mut sql,
+                &mut args,
+                filters,
+                &self.access_scope,
+                class,
+            );
+            if filters.tool.is_some() {
+                // `unicode_lower_contains(m.tool_name, ?)` is already false on NULL, so this adds
+                // no rows; it states the partial index's condition so `idx_messages_tool_name`
+                // (covering) can answer the count instead of a row scan.
+                sql.push_str(" and m.tool_name is not null");
+            }
+            (sql, args)
+        };
+        let excludable = crate::models::MessageKind::EXCLUDABLE_BY_DEFAULT;
+        match filters.kind_predicate() {
+            crate::models::KindPredicate::AllExcept(excluded) => {
+                debug_assert!(excluded.iter().all(|kind| excludable.contains(kind)));
+                let (total_sql, total_args) = build(ClassSelection::Unrestricted);
+                let (excluded_sql, excluded_args) = build(ClassSelection::Only(&excluded));
+                vec![
+                    (total_sql, total_args, 1),
+                    (excluded_sql, excluded_args, -1),
+                ]
+            }
+            // An explicit selection inside the excludable set (`--kinds harness-notice`) is the
+            // partial index's own population. Any other explicit set names classes no index
+            // carries, so it counts by reading rows: `O(N)` row pages, the bound the receipt
+            // description states for explicit class selections.
+            crate::models::KindPredicate::Only(kinds)
+                if !kinds.is_empty() && kinds.iter().all(|kind| excludable.contains(kind)) =>
+            {
+                let (sql, args) = build(ClassSelection::Only(&kinds));
+                vec![(sql, args, 1)]
+            }
+            crate::models::KindPredicate::Only(_) => {
+                let (sql, args) = build(ClassSelection::FromFilters);
+                vec![(sql, args, 1)]
+            }
+        }
+    }
+
+    /// Whether [`MESSAGE_KIND_INDEX`] exists.
+    pub(crate) fn message_kind_index_exists(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "select exists(select 1 from sqlite_schema where type = 'index' and name = ?1)",
+            params![MESSAGE_KIND_INDEX],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Build [`MESSAGE_KIND_INDEX`] if it is missing; returns whether it was built.
+    ///
+    /// The build is one full scan of `messages` (minutes on a multi-gigabyte index) inside one
+    /// write transaction, so it runs only where a long write is already expected: [`Db::init`]
+    /// calls it while the table is still empty (free), and the elected writer calls it at the
+    /// start of every refresh ([`crate::indexer::reindex_until`]) so an index written by an
+    /// older aise gains it once, under the cross-process writer election, while WAL readers keep
+    /// serving. Until then every count that needs it degrades to the row scan, never to an error.
+    pub(crate) fn ensure_message_kind_index(&self) -> Result<bool> {
+        if self.message_kind_index_exists()? {
+            return Ok(false);
+        }
+        self.report_progress(
+            "building the message-class index once (one scan of every indexed message) so \
+             receipts and class-filtered counts read the index instead of every message row",
+        );
+        let started = std::time::Instant::now();
+        self.conn.execute_batch(&format!(
+            "create index if not exists {MESSAGE_KIND_INDEX} on messages{MESSAGE_KIND_INDEX_COLUMNS} \
+             where {}",
+            excluded_kinds_predicate()
+        ))?;
+        self.report_progress(&format!(
+            "built the message-class index in {:.1?}",
+            started.elapsed()
+        ));
+        Ok(true)
     }
 
     /// Determine whether the structurally filtered corpus reaches `threshold` without counting
@@ -5123,11 +5274,35 @@ fn push_exclude_path_prefixes(
 /// `m` table alias. Centralizing this guarantees the `explain` candidate count is
 /// computed over exactly the rows `search_messages` scans (no filter drift between
 /// the two as filters are added).
+/// Which message-class clause [`append_message_filters_with_class`] emits. Every search and
+/// count uses [`Self::FromFilters`]; the two other selections exist only so the receipt's corpus
+/// count can be written as `count(unrestricted) - count(only the excluded classes)`, both halves
+/// of which existing indexes answer without reading message rows.
+#[derive(Debug, Clone, Copy)]
+enum ClassSelection<'a> {
+    /// The class predicate the filters resolve to ([`MessageFilters::kind_predicate`]).
+    FromFilters,
+    /// No class clause at all: every stored `kind`, known to this build or not.
+    Unrestricted,
+    /// Exactly these classes (`kind in (...)`).
+    Only(&'a [crate::models::MessageKind]),
+}
+
 fn append_message_filters(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
     filters: &MessageFilters,
     access: &crate::search_scope::EffectiveAccessScope,
+) {
+    append_message_filters_with_class(sql, args, filters, access, ClassSelection::FromFilters);
+}
+
+fn append_message_filters_with_class(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    filters: &MessageFilters,
+    access: &crate::search_scope::EffectiveAccessScope,
+    class: ClassSelection<'_>,
 ) {
     use rusqlite::types::Value;
     if let Some(role) = filters.role {
@@ -5142,18 +5317,24 @@ fn append_message_filters(
     // produced an always-empty result that reads as "no such messages exist". The removed
     // `is_compaction = 0` clause was the same redundancy, since role Compaction always infers
     // kind Compaction. Class selection changes belong in `MessageFilters::effective_kinds`.
-    match filters.kind_predicate() {
-        crate::models::KindPredicate::AllExcept(excluded) => {
+    let predicate = match class {
+        ClassSelection::FromFilters => Some(filters.kind_predicate()),
+        ClassSelection::Unrestricted => None,
+        ClassSelection::Only(kinds) => Some(crate::models::KindPredicate::Only(kinds.to_vec())),
+    };
+    match predicate {
+        None => {}
+        Some(crate::models::KindPredicate::AllExcept(excluded)) => {
             for kind in excluded {
                 sql.push_str(" and m.kind != ?");
                 args.push(Value::Text(kind.as_str().to_string()));
             }
         }
-        crate::models::KindPredicate::Only(kinds) if kinds.is_empty() => {
+        Some(crate::models::KindPredicate::Only(kinds)) if kinds.is_empty() => {
             // Every named class was removed. Match nothing rather than silently matching all.
             sql.push_str(" and 0");
         }
-        crate::models::KindPredicate::Only(kinds) => {
+        Some(crate::models::KindPredicate::Only(kinds)) => {
             sql.push_str(" and m.kind in (");
             for (i, kind) in kinds.iter().enumerate() {
                 if i > 0 {
@@ -14366,5 +14547,227 @@ mod tests {
         assert!(db.filtered_corpus_reaches(&filters, 4).unwrap());
         assert!(!db.filtered_corpus_reaches(&filters, 5).unwrap());
         assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 4);
+    }
+
+    /// Seed one session with rows of every class the receipt count must handle: the classes
+    /// excluded by default (harness notice, compaction), the ones returned by default, one tool
+    /// row with a name, and one legacy `kind` this build does not know, which the default class
+    /// predicate must still count (an inclusion list would silently drop it).
+    fn seed_every_message_class(db: &Db) {
+        seed_messages(db, &[("user", "one"), ("assistant", "two")]);
+        db.conn
+            .execute_batch(
+                "update messages set kind = 'conversation', ts = '2026-08-01T00:00:00Z';
+                 insert into messages(session_id, provider, seq, role, kind, ts, tool_name, content) values
+                   ('claude:s1', 'claude', 10, 'user', 'harness_notice', '2026-08-02T00:00:00Z', null, 'notice'),
+                   ('claude:s1', 'claude', 11, 'user', 'compaction', '2026-08-02T00:00:00Z', null, 'summary'),
+                   ('claude:s1', 'claude', 12, 'assistant', 'message', '2026-08-03T00:00:00Z', null, 'legacy kind'),
+                   ('claude:s1', 'claude', 13, 'assistant', 'tool_call', '2026-08-03T00:00:00Z', 'Bash', 'ls'),
+                   ('claude:s1', 'claude', 14, 'tool', 'tool_result', '2026-08-03T00:00:00Z', 'Bash', 'ok');",
+            )
+            .unwrap();
+    }
+
+    fn corpus_count_filter_cases() -> Vec<(&'static str, MessageFilters)> {
+        vec![
+            ("default", MessageFilters::default()),
+            (
+                "role",
+                MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                },
+            ),
+            (
+                "provider",
+                MessageFilters {
+                    providers: Some(vec![Provider::Claude]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "since",
+                MessageFilters {
+                    since: Some(utc("2026-08-02T12:00:00Z")),
+                    ..Default::default()
+                },
+            ),
+            (
+                "session",
+                MessageFilters {
+                    session_id: Some("claude:s1".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "workspace_path",
+                MessageFilters {
+                    workspace_path_prefix: Some("/x".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "tool",
+                MessageFilters {
+                    tool: Some("bash".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "no_compaction",
+                MessageFilters {
+                    no_compaction: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "explicit_excludable_kind",
+                MessageFilters {
+                    kinds: Some(vec![crate::models::MessageKind::HarnessNotice]),
+                    ..Default::default()
+                },
+            ),
+        ]
+    }
+
+    /// Explicit selections outside the excludable set count by reading rows (no index carries
+    /// those classes); they must still be exact.
+    fn explicit_row_scanning_kind_filters() -> MessageFilters {
+        MessageFilters {
+            kinds: Some(vec![
+                crate::models::MessageKind::Conversation,
+                crate::models::MessageKind::ToolCall,
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// The single-statement count every corpus figure used to be: correct, and a full scan of
+    /// the messages table because no index carried `kind`. Kept here as the oracle.
+    fn naive_corpus_count(db: &Db, filters: &MessageFilters) -> i64 {
+        let mut sql = String::from("select count(*) from messages m where 1 = 1");
+        let mut args = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters, &db.access_scope);
+        db.conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn query_plan(db: &Db, sql: &str, args: &[rusqlite::types::Value]) -> String {
+        let mut stmt = db
+            .conn
+            .prepare(&format!("explain query plan {sql}"))
+            .unwrap();
+        stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>()
+        .join(" | ")
+    }
+
+    #[test]
+    fn corpus_count_equals_the_naive_count_for_every_class_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_every_message_class(&db);
+        for (name, filters) in corpus_count_filter_cases() {
+            assert_eq!(
+                db.filtered_corpus_count(&filters).unwrap(),
+                naive_corpus_count(&db, &filters),
+                "{name}: the decomposed count must equal the single-statement count"
+            );
+        }
+        let explicit = explicit_row_scanning_kind_filters();
+        assert_eq!(
+            db.filtered_corpus_count(&explicit).unwrap(),
+            naive_corpus_count(&db, &explicit),
+            "explicit non-excludable classes"
+        );
+        // Sanity: the default predicate keeps the legacy `message` row and drops only the notice.
+        assert_eq!(
+            db.filtered_corpus_count(&MessageFilters::default())
+                .unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn corpus_count_statements_are_served_from_covering_indexes() {
+        // A receipt (`receipt_level=summary|full`) must never cost a scan of the messages table:
+        // on a 22.6 GB index that turned a 0.5 s search into 117 s (each row's page is read to
+        // test `kind`). Every statement behind the corpus figure must be answered from an index
+        // that carries every column it tests, for every single-family structural filter.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_every_message_class(&db);
+        for (name, filters) in corpus_count_filter_cases() {
+            let statements = db.corpus_count_statements("1 = 1", &filters);
+            assert!(!statements.is_empty(), "{name}: no count statements");
+            for (sql, args, _sign) in &statements {
+                let plan = query_plan(&db, sql, args);
+                // Every step that touches the messages alias `m` (a subquery over sessions may
+                // appear too) must be a covering-index step: `SCAN m USING COVERING INDEX` is
+                // SQLite's count(*) optimization, `SEARCH m USING COVERING INDEX ...` a seek.
+                // A bare `SCAN m` or `SEARCH m USING INDEX` (non-covering) reads message rows.
+                for step in plan.split(" | ") {
+                    if step.contains("SCAN m") || step.contains("SEARCH m") {
+                        assert!(
+                            step.contains("USING COVERING INDEX"),
+                            "{name}: corpus count must not read message rows\nsql: {sql}\nplan: {plan}"
+                        );
+                    }
+                }
+                assert!(
+                    plan.contains("COVERING INDEX"),
+                    "{name}: corpus count must be index-only\nsql: {sql}\nplan: {plan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn message_kind_index_is_created_free_on_an_empty_database_and_deferred_on_a_populated_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        assert!(
+            db.message_kind_index_exists().unwrap(),
+            "an empty database gets the class index at open, where building it is free"
+        );
+        seed_every_message_class(&db);
+        db.conn
+            .execute_batch(&format!("drop index {MESSAGE_KIND_INDEX}"))
+            .unwrap();
+        drop(db);
+        // A populated database that lacks the index (one written by an older aise) must not pay
+        // for the build inside `open`: `open` runs in every query process, the build holds the
+        // write lock for one full scan of `messages`, and peers opening meanwhile would fail on
+        // busy timeout. The elected writer builds it during the next refresh instead.
+        let reopened = Db::open(&path).unwrap();
+        assert!(
+            !reopened.message_kind_index_exists().unwrap(),
+            "open must defer the class index build on a populated database"
+        );
+        assert!(
+            reopened.ensure_message_kind_index().unwrap(),
+            "the maintenance path reports that it built the index"
+        );
+        assert!(reopened.message_kind_index_exists().unwrap());
+        assert!(
+            !reopened.ensure_message_kind_index().unwrap(),
+            "a second call is a no-op"
+        );
+        // Correctness is identical with or without the index; only the plan changes.
+        for (name, filters) in corpus_count_filter_cases() {
+            assert_eq!(
+                reopened.filtered_corpus_count(&filters).unwrap(),
+                naive_corpus_count(&reopened, &filters),
+                "{name}"
+            );
+        }
     }
 }

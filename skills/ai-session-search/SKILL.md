@@ -211,12 +211,14 @@ requested predicate after indexed candidate retrieval. Fuzzy mode scores the com
 structurally eligible corpus and retains bounded top-K state for the requested page. In the
 receipt, `prefilter_skipped` explains why an exact or regex index prefilter was not used, and
 `candidates` over `corpus` is the selectivity to improve by anchoring the query on a rarer
-literal. The receipt's `corpus` count reads every message row the structural filters admit, and
-no index covers that predicate, so on a multi-gigabyte index the receipt costs seconds to
-minutes more than the search itself: measured 0.5 s without and 117 s with the receipt on a
-23 GB, 2.6-million-message index. Do not add it to a search that is already slow; narrow with
-`--workspace-path`, `--session-id`, `--role`, or `--when` first. The CLI prints the receipt with
-`--format json`; MCP returns it as `receipt` in the structured output.
+literal. The receipt's `corpus` count is answered from indexes, never from message rows: it
+costs one pass over the smallest index of the message table when no structural filter is set
+(a few seconds cold on a 23 GB, 2.7-million-message index, well under a second warm) and only
+the filtered rows' index entries with `--role`, `--session-id`, `--workspace-path`, `--when`, or
+`--tool`. The exception is an explicit `--kinds` set outside `harness-notice`/`compaction`,
+which counts by reading rows. An index written by an aise before 1.0.0rc2 gains the supporting
+index at its next refresh; until then the default receipt reads rows once more. The CLI prints
+the receipt with `--format json`; MCP returns it as `receipt` in the structured output.
 
 Search canonical tool fields without scanning rendered output conventions:
 
