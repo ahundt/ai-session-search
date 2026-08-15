@@ -2464,6 +2464,11 @@ fn session_meta_output_schema() -> Value {
     })
 }
 
+/// Mirrors `models::SearchExplain`, the one planner receipt every surface serializes: CLI
+/// `--format json`, Python, and MCP all emit these four fields and nothing else. The
+/// human-readable line `SearchExplain::summary` renders is CLI stderr only, so it is not promised
+/// here; a validating client (Claude Code) rejects the whole response when a required key is
+/// absent, with no server-side symptom.
 fn search_explanation_output_schema() -> Value {
     json!({
         "type": ["object", "null"],
@@ -2471,10 +2476,9 @@ fn search_explanation_output_schema() -> Value {
             "corpus": { "type": "integer", "minimum": 0 },
             "prefilter": { "type": ["string", "null"] },
             "candidates": { "type": ["integer", "null"], "minimum": 0 },
-            "prefilter_skipped": { "type": ["string", "null"] },
-            "summary": { "type": "string" }
+            "prefilter_skipped": { "type": ["string", "null"] }
         },
-        "required": ["corpus", "prefilter", "candidates", "prefilter_skipped", "summary"],
+        "required": ["corpus", "prefilter", "candidates", "prefilter_skipped"],
         "additionalProperties": false
     })
 }
@@ -7215,6 +7219,21 @@ mod tests {
             Value::Object(fields) => {
                 let declared = schema.get("properties");
                 let closed = schema.get("additionalProperties") == Some(&Value::Bool(false));
+                // `required` is the promise a validating client enforces first: a key the schema
+                // requires and the runtime omits fails the whole response at the caller. This
+                // validator once skipped it, which is how a required `summary` nobody emitted
+                // survived until Claude Code rejected every receipt.
+                for key in schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    if !fields.contains_key(key) {
+                        out.push(format!("{path}: missing required property {key}"));
+                    }
+                }
                 for (key, child) in fields {
                     let child_path = format!("{path}.{key}");
                     if let Some(child_schema) = declared.and_then(|properties| properties.get(key))
@@ -7418,6 +7437,47 @@ mod tests {
             violations.is_empty(),
             "response contradicts the published outputSchema: {violations:?}"
         );
+    }
+
+    /// The receipt is the one payload group the default call never emits, so the test above
+    /// cannot see it. Claude Code validates `structuredContent` against `outputSchema` and
+    /// rejected every `receipt_level=summary|full` call with "receipt/search_explanation must
+    /// have required property 'summary'" (dogfooded 2026-08-15): the schema still promised the
+    /// human summary the runtime stopped emitting when the receipt moved to the shared
+    /// serializer. Every receipt level, literal and regex, must validate.
+    #[test]
+    fn search_messages_output_schema_holds_for_every_receipt_level() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let schema = advertised_tools(&config)
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .expect("search_messages is served")["outputSchema"]
+            .clone();
+
+        for receipt_level in ["none", "summary", "full"] {
+            for query_mode in ["literal", "regex"] {
+                let out = search_messages_value(
+                    &json!({
+                        "query": "hello",
+                        "query_mode": query_mode,
+                        "receipt_level": receipt_level,
+                        "limit": 1
+                    }),
+                    &config,
+                    &db,
+                );
+                let mut violations = Vec::new();
+                output_schema_violations(&out, &schema, "structuredContent", &mut violations);
+                assert!(
+                    violations.is_empty(),
+                    "receipt_level={receipt_level} query_mode={query_mode} contradicts the \
+                     published outputSchema: {violations:?}"
+                );
+            }
+        }
     }
 
     /// Claude Code materializes every JSON-schema `default` before it calls a tool, so the
