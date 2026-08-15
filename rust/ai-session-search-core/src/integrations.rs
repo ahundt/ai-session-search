@@ -30,6 +30,10 @@ const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
 const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`): call the `ai-session-search` MCP `search_sessions` tool to find relevant sessions or `search_messages` for message-level matches, then pass a returned session ID to `get_session`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. If MCP is unavailable, run `aise messages search --help`.";
+/// The block for a harness that has no MCP registration for aise (Pi, Prime Agent). It leads with
+/// the three CLI commands that cover the common path and names the installed skill, because the
+/// MCP-first sentence above sends such an agent to a tool it cannot call.
+const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; this harness has no `ai-session-search` MCP registration, so do not look for MCP tools. Find sessions with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; run `aise <command> --help` before adding a flag it does not show.";
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
@@ -648,7 +652,24 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstructionFormat {
     ClaudeImport,
+    /// One managed inline block whose text leads with the MCP tools, for a harness that also
+    /// receives an MCP registration from `aise integrations install`.
     InlineBlock,
+    /// The same managed inline block, but its text leads with the CLI, for a harness that gets no
+    /// MCP registration (Pi and Prime Agent: `mcp_targets_for_layout` returns nothing for them).
+    /// Telling such an agent to call `search_sessions` sends it to a tool it does not have; the
+    /// observed cost was repeated `aise ... --help` probes before any search ran.
+    InlineCliBlock,
+}
+
+impl InstructionFormat {
+    /// The sentence this target's managed block carries.
+    fn line(self) -> &'static str {
+        match self {
+            Self::ClaudeImport | Self::InlineBlock => INSTRUCTIONS_LINE,
+            Self::InlineCliBlock => CLI_INSTRUCTIONS_LINE,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1874,7 +1895,9 @@ fn pi_family_instruction_target(
     InstructionTarget {
         label,
         path: root.join("AGENTS.md"),
-        format: InstructionFormat::InlineBlock,
+        // Pi-family harnesses receive no MCP registration (`mcp_targets_for_layout`), so their
+        // block must lead with the CLI.
+        format: InstructionFormat::InlineCliBlock,
         detect_paths: vec![root],
         detect_binaries: vec![binary],
     }
@@ -3745,21 +3768,27 @@ fn remove_instruction_file(target: &InstructionTarget) -> Result<bool> {
 fn plan_upsert_instruction_file(target: &InstructionTarget) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
         InstructionFormat::ClaudeImport => plan_upsert_claude_instruction_file(&target.path),
-        InstructionFormat::InlineBlock => plan_upsert_inline_instruction_file(&target.path),
+        InstructionFormat::InlineBlock | InstructionFormat::InlineCliBlock => {
+            plan_upsert_inline_instruction_file(&target.path, target.format)
+        }
     }
 }
 
 fn plan_remove_instruction_file(target: &InstructionTarget) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
         InstructionFormat::ClaudeImport => plan_remove_claude_instruction_file(&target.path),
-        InstructionFormat::InlineBlock => plan_remove_inline_instruction_file(&target.path),
+        InstructionFormat::InlineBlock | InstructionFormat::InlineCliBlock => {
+            plan_remove_inline_instruction_file(&target.path)
+        }
     }
 }
 
 fn status_instruction_file(target: &InstructionTarget) -> Result<&'static str> {
     match target.format {
         InstructionFormat::ClaudeImport => status_claude_instruction_file(&target.path),
-        InstructionFormat::InlineBlock => status_inline_instruction_file(&target.path),
+        InstructionFormat::InlineBlock | InstructionFormat::InlineCliBlock => {
+            status_inline_instruction_file(&target.path, target.format)
+        }
     }
 }
 
@@ -3833,9 +3862,12 @@ fn remove_claude_instruction_text(text: &str) -> Result<Option<String>> {
     Ok(without_legacy.or(without_reference))
 }
 
-fn plan_upsert_inline_instruction_file(path: &Path) -> Result<Vec<PlannedFileMutation>> {
+fn plan_upsert_inline_instruction_file(
+    path: &Path,
+    format: InstructionFormat,
+) -> Result<Vec<PlannedFileMutation>> {
     let original = read_optional_utf8_regular_file(path)?;
-    let next = upsert_inline_instruction_text(original.as_deref().unwrap_or_default())?;
+    let next = upsert_inline_instruction_text(original.as_deref().unwrap_or_default(), format)?;
     let mut mutations = vec![planned_write(path, &original, next)];
     if let Some(removal) = plan_remove_aise_instruction_file(path)? {
         mutations.push(removal);
@@ -3861,7 +3893,7 @@ fn plan_remove_inline_instruction_file(path: &Path) -> Result<Vec<PlannedFileMut
     Ok(mutations)
 }
 
-fn status_inline_instruction_file(path: &Path) -> Result<&'static str> {
+fn status_inline_instruction_file(path: &Path, format: InstructionFormat) -> Result<&'static str> {
     let text = read_optional_utf8_regular_file(path)?;
     let Some(text) = text else {
         return Ok("missing");
@@ -3881,7 +3913,9 @@ fn status_inline_instruction_file(path: &Path) -> Result<&'static str> {
             .expect("validated managed block has an end marker")
         + INSTRUCTIONS_END.len();
     Ok(
-        if starts == 1 && ends == 1 && text[start..end].trim_end() == instruction_block().trim_end()
+        if starts == 1
+            && ends == 1
+            && text[start..end].trim_end() == instruction_block(format).trim_end()
         {
             "configured"
         } else {
@@ -3890,14 +3924,14 @@ fn status_inline_instruction_file(path: &Path) -> Result<&'static str> {
     )
 }
 
-fn upsert_inline_instruction_text(text: &str) -> Result<String> {
+fn upsert_inline_instruction_text(text: &str, format: InstructionFormat) -> Result<String> {
     let without_inline = remove_inline_instruction_block(text)?.unwrap_or_else(|| text.to_string());
     let removed = remove_instruction_reference(&without_inline)?.unwrap_or(without_inline);
     let mut next = removed.trim_end().to_string();
     if !next.is_empty() {
         next.push_str("\n\n");
     }
-    next.push_str(&instruction_block());
+    next.push_str(&instruction_block(format));
     Ok(next)
 }
 
@@ -4051,8 +4085,11 @@ fn is_managed_instruction_file(text: &str) -> bool {
     managed.starts_with(INSTRUCTIONS_FILE_START) && managed.ends_with(INSTRUCTIONS_FILE_END)
 }
 
-fn instruction_block() -> String {
-    format!("<!-- aise-instructions v1 -->\n{INSTRUCTIONS_LINE}\n{INSTRUCTIONS_END}\n")
+fn instruction_block(format: InstructionFormat) -> String {
+    format!(
+        "<!-- aise-instructions v1 -->\n{}\n{INSTRUCTIONS_END}\n",
+        format.line()
+    )
 }
 
 fn resolve_mcp_binary(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -4623,12 +4660,14 @@ mod tests {
     #[test]
     fn inline_instruction_upsert_adds_replaces_and_stays_single() {
         let original = "# Team rules\n";
-        let first = upsert_inline_instruction_text(original).unwrap();
-        assert!(first.contains(instruction_block().trim_end()));
+        let first =
+            upsert_inline_instruction_text(original, InstructionFormat::InlineBlock).unwrap();
+        assert!(first.contains(instruction_block(InstructionFormat::InlineBlock).trim_end()));
         assert!(first.contains("# Team rules"));
 
         let stale = first.replace(INSTRUCTIONS_LINE, "old wording");
-        let updated = upsert_inline_instruction_text(&stale).unwrap();
+        let updated =
+            upsert_inline_instruction_text(&stale, InstructionFormat::InlineBlock).unwrap();
         assert!(updated.contains(INSTRUCTIONS_LINE));
         assert!(!updated.contains("old wording"));
         assert_eq!(updated.matches(INSTRUCTIONS_START).count(), 1);
@@ -4638,11 +4677,12 @@ mod tests {
     fn inline_instruction_upsert_collapses_duplicates_and_uninstall_removes_every_block() {
         let duplicated = format!(
             "# Team rules\n\n{}Keep this.\n\n{}",
-            instruction_block(),
-            instruction_block()
+            instruction_block(InstructionFormat::InlineBlock),
+            instruction_block(InstructionFormat::InlineBlock)
         );
 
-        let updated = upsert_inline_instruction_text(&duplicated).unwrap();
+        let updated =
+            upsert_inline_instruction_text(&duplicated, InstructionFormat::InlineBlock).unwrap();
         assert_eq!(updated.matches(INSTRUCTIONS_START).count(), 1);
         assert_eq!(updated.matches(INSTRUCTIONS_END).count(), 1);
         assert!(updated.contains("# Team rules"));
@@ -4659,7 +4699,10 @@ mod tests {
 
     #[test]
     fn inline_instruction_remove_only_deletes_managed_block() {
-        let input = format!("# Team rules\n\n{}Keep this.\n", instruction_block());
+        let input = format!(
+            "# Team rules\n\n{}Keep this.\n",
+            instruction_block(InstructionFormat::InlineBlock)
+        );
         let output = remove_inline_instruction_block(&input).unwrap().unwrap();
         assert!(output.contains("# Team rules"));
         assert!(output.contains("Keep this."));
@@ -4730,7 +4773,10 @@ mod tests {
         let claude_md = dir.path().join("CLAUDE.md");
         fs::write(
             &claude_md,
-            format!("# Team rules\n\n{}Keep this.\n", instruction_block()),
+            format!(
+                "# Team rules\n\n{}Keep this.\n",
+                instruction_block(InstructionFormat::InlineBlock)
+            ),
         )
         .unwrap();
         let target = InstructionTarget {
@@ -4806,11 +4852,16 @@ mod tests {
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
         };
-        fs::write(&agents_md, instruction_block()).unwrap();
+        fs::write(
+            &agents_md,
+            instruction_block(InstructionFormat::InlineBlock),
+        )
+        .unwrap();
         assert_eq!(status_instruction_file(&target).unwrap(), "configured");
         fs::write(
             &agents_md,
-            instruction_block().replace(INSTRUCTIONS_LINE, LEGACY_INSTRUCTIONS_LINE),
+            instruction_block(InstructionFormat::InlineBlock)
+                .replace(INSTRUCTIONS_LINE, LEGACY_INSTRUCTIONS_LINE),
         )
         .unwrap();
         assert_eq!(status_instruction_file(&target).unwrap(), "outdated");
@@ -6839,10 +6890,30 @@ mod tests {
                 instructions[0].path,
                 PathBuf::from(format!("/home/test/{agent_dir}/AGENTS.md"))
             );
+            // No MCP registration means the block must not send the agent to MCP tools. The
+            // MCP-first sentence did exactly that on Pi and Prime Agent, and the recorded fallout
+            // was agents probing `aise ... --help` repeatedly before any search ran.
             assert!(matches!(
                 instructions[0].format,
-                InstructionFormat::InlineBlock
+                InstructionFormat::InlineCliBlock
             ));
+            let block = instruction_block(instructions[0].format);
+            assert!(block.contains("<!-- aise-instructions v1 -->"), "{block}");
+            assert!(
+                block.contains("no `ai-session-search` MCP registration"),
+                "{block}"
+            );
+            assert!(block.contains("aise search \""), "{block}");
+            assert!(block.contains("aise messages search \""), "{block}");
+            assert!(
+                block.contains("aise messages get <session-id> --seq"),
+                "{block}"
+            );
+            assert!(block.contains("`ai-session-search` skill"), "{block}");
+            assert!(
+                !block.contains("call the `ai-session-search` MCP"),
+                "pi-family block must not lead with the MCP tools: {block}"
+            );
             assert_eq!(instructions[0].detect_binaries, vec![binary]);
 
             let skills = skill_targets_for_layout(client, &layout);
@@ -6886,7 +6957,10 @@ mod tests {
             let targets = instruction_targets_for(client).unwrap();
             assert_eq!(targets.len(), 1);
             assert!(targets[0].path.ends_with(suffix));
-            assert!(matches!(targets[0].format, InstructionFormat::InlineBlock));
+            assert!(matches!(
+                targets[0].format,
+                InstructionFormat::InlineCliBlock
+            ));
         }
         assert!(instruction_targets_for(McpClient::Opencode)
             .unwrap()
