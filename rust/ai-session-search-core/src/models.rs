@@ -67,12 +67,20 @@ impl Provider {
     }
 
     /// Parse a `provider` value read back from the index. These columns are written from
-    /// [`Provider::as_str`], so a parse failure means index corruption or a variant added without a
-    /// migration. Callers must surface that failure rather than silently changing row ownership.
+    /// [`Provider::as_str`], so a value this build cannot parse was written by a newer aise whose
+    /// provider set is larger (a variant ships without a schema-generation bump). The message
+    /// carries the recovery because only this decoder knows it: upgrading, never a reindex, which
+    /// enumerates the same rows and fails identically. Callers must surface the failure rather
+    /// than silently changing row ownership; the open path normally refuses such an index first
+    /// (`SchemaState::UnknownProviders`).
     pub fn from_db_str(value: &str) -> Result<Self, String> {
-        value
-            .parse()
-            .map_err(|_| format!("unrecognized provider in index: {value:?}"))
+        value.parse().map_err(|_| {
+            format!(
+                "unrecognized provider in index: {value:?}; this aise {} does not recognize it, \
+                 so a newer aise wrote the index: upgrade aise (`aise package update`) and retry",
+                env!("CARGO_PKG_VERSION")
+            )
+        })
     }
 }
 
@@ -129,12 +137,16 @@ impl Role {
     }
 
     /// Parse a `role` value read back from the index. Written from [`Role::as_str`], so a failure
-    /// means index corruption or a variant added without a migration. Callers must surface that
-    /// failure rather than silently changing message authorship.
+    /// means index corruption or a variant added without a migration; the recovery is a full
+    /// reparse, and the message carries it because only this decoder knows that. Callers must
+    /// surface the failure rather than silently changing message authorship.
     pub fn from_db_str(value: &str) -> Result<Self, String> {
-        value
-            .parse()
-            .map_err(|_| format!("unrecognized role in index: {value:?}"))
+        value.parse().map_err(|_| {
+            format!(
+                "unrecognized role in index: {value:?}; stop AISE processes, then run \
+                 `aise reindex --full` and retry"
+            )
+        })
     }
 }
 

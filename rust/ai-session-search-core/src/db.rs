@@ -78,6 +78,15 @@ pub(crate) enum SchemaState {
         current: i64,
         supported: i64,
     },
+    /// Current version stamp, but `sessions.provider` holds a value this build cannot decode. A
+    /// provider variant can ship without a schema-generation bump (Prime Agent did, at generation
+    /// 5), so this is how an index a newer aise wrote looks to an older aise. It is treated like
+    /// [`SchemaState::Newer`]: refused once at open with the upgrade advice, instead of failing
+    /// deep inside whichever query first reads such a row with advice to run the very reindex
+    /// that fails the same way.
+    UnknownProviders {
+        providers: Vec<String>,
+    },
     /// Current version stamp, but the derived message-search layout is hybrid/incomplete while every
     /// base table (including `messages`) is intact. The derived FTS5 objects can be rebuilt online
     /// from the intact base rows — no transcript re-read, no data loss — so a writable command can
@@ -104,6 +113,40 @@ impl SchemaState {
             },
         }
     }
+
+    /// The single sentence every open path prints for [`SchemaState::UnknownProviders`]: the
+    /// provider values, this build's version so the reader can compare, and the one fix.
+    pub(crate) fn unknown_providers_message(path: &Path, providers: &[String]) -> String {
+        format!(
+            "index {} contains sessions from provider(s) {} that this aise {} does not recognize, \
+             so a newer aise wrote it; upgrade aise (`aise package update`) before opening it",
+            path.display(),
+            providers.join(", "),
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+}
+
+/// Distinct `sessions.provider` values this build cannot decode, in index order. Empty when every
+/// provider is known or when the `sessions` table does not exist yet. `O(S)` sessions once per
+/// open; the column is short and the table is small next to `messages`.
+pub(crate) fn unknown_index_providers(conn: &Connection) -> Result<Vec<String>> {
+    let table_exists: bool = conn.query_row(
+        "select exists(select 1 from sqlite_schema where type = 'table' and name = 'sessions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn.prepare("select distinct provider from sessions order by provider")?;
+    let providers = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(providers
+        .into_iter()
+        .filter(|provider| Provider::from_db_str(provider).is_err())
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1479,13 +1522,24 @@ impl Db {
             SchemaState::Older { current, .. } => current >= MIN_READABLE_SCHEMA_VERSION,
             SchemaState::Missing
             | SchemaState::Newer { .. }
+            | SchemaState::UnknownProviders { .. }
             | SchemaState::RepairableLayout { .. }
             | SchemaState::RecoveryRequired { .. } => false,
         })
     }
 
     pub(crate) fn schema_state(&self) -> Result<SchemaState> {
-        Ok(SchemaState::from_version(self.schema_version()?))
+        match SchemaState::from_version(self.schema_version()?) {
+            SchemaState::Current => {
+                let providers = unknown_index_providers(&self.conn)?;
+                Ok(if providers.is_empty() {
+                    SchemaState::Current
+                } else {
+                    SchemaState::UnknownProviders { providers }
+                })
+            }
+            other => Ok(other),
+        }
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -5511,16 +5565,18 @@ fn decode_db_enum<T>(
     context: &'static str,
     decode: impl FnOnce(&str) -> std::result::Result<T, String>,
 ) -> rusqlite::Result<T> {
+    // The recovery advice travels with the decoder's reason: an unknown provider means a newer
+    // aise wrote the row and the fix is to upgrade, while an unknown role means corruption and
+    // the fix is a full reparse. This wrapper only adds where the value was read. It must not
+    // append its own `aise reindex --full` advice: for a provider that is the command that fails
+    // the same way, the circular advice a Pi session hit on 2026-08-13.
     decode(&value).map_err(|reason| {
         rusqlite::Error::FromSqlConversionFailure(
             column_index,
             rusqlite::types::Type::Text,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "{reason} while reading {context}; stop AISE processes, then run \
-                     `aise reindex --full` and retry"
-                ),
+                format!("{reason} (while reading {context})"),
             )
             .into(),
         )
@@ -5990,14 +6046,26 @@ mod tests {
     #[test]
     fn message_row_rejects_corrupt_provider_and_role_with_recovery_context() {
         let connection = Connection::open_in_memory().unwrap();
-        for (provider, role, bad_value, column) in [
+        // The recovery differs by column: an unknown provider was written by a newer aise and a
+        // reindex from this build fails on the same rows, so it must say upgrade; an unknown role
+        // is corruption, so it must say reindex.
+        for (provider, role, bad_value, column, advice, forbidden) in [
             (
                 "not-a-provider",
                 "user",
                 "not-a-provider",
                 "messages.provider",
+                "upgrade aise",
+                "reindex --full",
             ),
-            ("claude", "not-a-role", "not-a-role", "messages.role"),
+            (
+                "claude",
+                "not-a-role",
+                "not-a-role",
+                "messages.role",
+                "aise reindex --full",
+                "upgrade aise",
+            ),
         ] {
             let error = connection
                 .query_row(
@@ -6009,7 +6077,8 @@ mod tests {
             let error = error.to_string();
             assert!(error.contains(bad_value), "{error}");
             assert!(error.contains(column), "{error}");
-            assert!(error.contains("aise reindex --full"), "{error}");
+            assert!(error.contains(advice), "{error}");
+            assert!(!error.contains(forbidden), "{error}");
         }
     }
 

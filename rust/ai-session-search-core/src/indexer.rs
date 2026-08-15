@@ -130,7 +130,14 @@ impl<'a> IndexCoordinator<'a> {
                             Ok(SchemaState::RecoveryRequired { reason: detail })
                         }
                     }
-                    None => Ok(SchemaState::Current),
+                    None => {
+                        let providers = crate::db::unknown_index_providers(&conn)?;
+                        Ok(if providers.is_empty() {
+                            SchemaState::Current
+                        } else {
+                            SchemaState::UnknownProviders { providers }
+                        })
+                    }
                 }
             }
             Ok(version) => Ok(SchemaState::from_version(version)),
@@ -1086,6 +1093,12 @@ pub fn ensure_schema_backfilled(
     if !db.needs_backfill()? {
         if db.schema_is_readable()? {
             return Ok(false);
+        }
+        if let SchemaState::UnknownProviders { providers } = db.schema_state()? {
+            anyhow::bail!(
+                "{}",
+                SchemaState::unknown_providers_message(&config.db_path(), &providers)
+            );
         }
         anyhow::bail!(
             "index schema generation {} is newer than this aise build supports (maximum {}); upgrade aise before opening {}",

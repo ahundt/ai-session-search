@@ -441,6 +441,20 @@ canonical records rather than adapter-specific response models.
 Do not add a second parser for an opaque or duplicative database without evidence that it contains
 unique supported data.
 
+Adding a provider variant is an index-compatibility event even when the schema generation does not
+move: Prime Agent shipped at generation 5, so a `1.0.0rc1` executable opening an index that a later
+build has written cannot decode `sessions.provider` for those rows. Two aise executables on one
+machine is the ordinary case (one per package manager, or a harness registration pinned to an
+absolute path), and it produced exactly this on 2026-08-13 in a Pi session: every command of the
+older build failed while reading a Prime Agent row with advice to run `aise reindex --full`, which
+enumerates the same rows and failed identically. The open path therefore inspects
+`select distinct provider from sessions` (covered by `idx_sessions_provider`, about 1.4 ms on a
+6,946-session index) and refuses once with `SchemaState::UnknownProviders`, naming the provider,
+this build's version, and the fix — upgrade aise — the same way `SchemaState::Newer` refuses a newer
+generation. The per-row decode failure keeps the same upgrade advice for a row written after the
+open. Bumping the schema generation for a provider addition was rejected because it forces every
+user through a full reparse for a change that touches no existing row.
+
 ### REQ021-state-local-data-boundary
 
 The product searches locally discoverable transcripts. Cloud-only account history with no local

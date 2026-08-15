@@ -999,6 +999,10 @@ impl SessionSearch {
                 "index {} uses schema generation {current}, newer than this aise build supports ({supported}); upgrade aise before opening it",
                 config.db_path().display()
             ),
+            SchemaState::UnknownProviders { providers } => anyhow::bail!(
+                "{}",
+                SchemaState::unknown_providers_message(&config.db_path(), &providers)
+            ),
             SchemaState::RepairableLayout { reason }
                 if config.index.refresh == IndexRefresh::ExistingOnly =>
             {
@@ -1246,6 +1250,56 @@ mod execution_runtime_tests {
             )
             .unwrap();
         assert_eq!(schema_after, schema_before);
+    }
+
+    /// A provider variant can be added without a schema-generation bump (Prime Agent was, at
+    /// generation 5), so an index a newer aise wrote can carry a `sessions.provider` value this
+    /// build cannot decode. Before this guard the older build failed deep inside whichever query
+    /// touched such a row with "unrecognized provider ... run `aise reindex --full`", and that
+    /// command failed the same way while enumerating retained sessions -- circular advice that
+    /// locked the older build out of every command (observed from a Pi session on 2026-08-13).
+    /// The open must refuse once, name the provider, and say the fix: upgrade aise.
+    #[test]
+    fn ordinary_open_refuses_an_index_carrying_a_provider_this_build_does_not_know() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("index.db");
+        {
+            let db = Db::open(&db_path).unwrap();
+            let parsed = minimal_record(
+                Provider::Codex,
+                std::path::Path::new("/tmp/known-session.jsonl"),
+                String::new(),
+            );
+            db.replace_session(&parsed, 0, 0).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "update sessions set provider = 'future-provider' where id = 'codex:known-session'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        for refresh in [IndexRefresh::Auto, IndexRefresh::ExistingOnly] {
+            let mut config = config.clone();
+            config.index.refresh = refresh;
+            let error = SessionSearch::open(config)
+                .err()
+                .unwrap_or_else(|| panic!("{refresh:?}: unknown provider must be rejected"))
+                .to_string();
+            assert!(error.contains("future-provider"), "{refresh:?}: {error}");
+            assert!(error.contains("upgrade aise"), "{refresh:?}: {error}");
+            assert!(
+                error.contains(env!("CARGO_PKG_VERSION")),
+                "{refresh:?}: names this build so the reader can compare: {error}"
+            );
+            assert!(
+                !error.contains("reindex --full"),
+                "{refresh:?}: reindex is the command that fails; advising it is circular: {error}"
+            );
+        }
     }
 
     #[test]
