@@ -3718,7 +3718,8 @@ fn message_search_tool_description(config: &Config) -> String {
          omitted. query_mode=regex is Rust regex syntax and query_mode=fuzzy is a bounded fuzzy \
          match. Times accept an RFC 3339 instant or a relative form; see `aise dates`. \
          receipt_level=summary explains how the search was planned and full adds each value's \
-         origin. \
+         origin; both count every row the filters admit, which can add seconds to minutes on a \
+         large index, so narrow first. \
          lines_per_message applies its line window first, then field_view and match_view apply \
          their character budgets in Unicode scalars; all three change presentation only and \
          never change matching, ordering, result count, context membership, or includes.\n",
