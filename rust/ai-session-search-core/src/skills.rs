@@ -113,6 +113,10 @@ pub(crate) struct SkillExecution {
 
 #[derive(Debug, Parser)]
 #[command(
+    // The usage line must name an invocation a reader can run. These arguments are parsed
+    // after `aise skills <SKILL>` (or `aise skills run <SKILL>`), and clap would otherwise print
+    // the internal argv[0] placeholder, which is no executable at all.
+    bin_name = "aise skills <SKILL>",
     disable_help_subcommand = true,
     after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
                   parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
@@ -1450,6 +1454,25 @@ fn report_write_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `aise skills corrections -- --help` once printed `Usage: aise-skill-capability [OPTIONS]`,
+    /// the internal argv[0] placeholder, which names no executable; a Pi session hit exactly that
+    /// on 2026-08-14. The usage line must show the invocation a reader can actually run.
+    #[test]
+    fn capability_help_names_the_real_invocation_not_the_internal_placeholder() {
+        use clap::CommandFactory;
+        let rendered = MessageClassificationCommand::command()
+            .render_help()
+            .to_string();
+        assert!(
+            rendered.contains("Usage: aise skills <SKILL>"),
+            "usage line does not name the runnable invocation:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("aise-skill-capability"),
+            "internal placeholder leaked into help:\n{rendered}"
+        );
+    }
 
     #[test]
     fn inferred_and_explicit_run_keep_the_first_capability_option() {

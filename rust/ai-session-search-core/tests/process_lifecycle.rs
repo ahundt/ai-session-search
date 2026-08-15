@@ -2142,7 +2142,9 @@ fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Usage: aise-skill-capability"));
+    // The usage line names the runnable invocation, not the internal argv[0] placeholder.
+    assert!(stdout.contains("Usage: aise skills <SKILL>"), "{stdout}");
+    assert!(!stdout.contains("aise-skill-capability"), "{stdout}");
     assert!(stdout.contains("--session-id"));
     assert!(
         !stdout.contains("Flattened into each command"),
