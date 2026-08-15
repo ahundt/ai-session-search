@@ -2257,6 +2257,107 @@ mod tests {
         assert!(error.contains("does not apply"), "{error}");
     }
 
+    /// Every `aise …` example line inside a shell code block, with the sample values a reader
+    /// would substitute. A line ends at the first unquoted `|`, `;`, `&&`, or redirection, so an
+    /// example that pipes into another program still contributes its `aise` part.
+    fn documented_aise_invocations(document: &str) -> Vec<(usize, Vec<String>)> {
+        let mut invocations = Vec::new();
+        let mut in_shell_block = false;
+        for (index, raw) in document.lines().enumerate() {
+            let line = raw.trim();
+            if let Some(fence) = line.strip_prefix("```") {
+                in_shell_block = !in_shell_block
+                    && matches!(fence.trim(), "sh" | "bash" | "shell" | "zsh" | "console");
+                continue;
+            }
+            if !in_shell_block || line.starts_with('#') {
+                continue;
+            }
+            let Some(command) = line.strip_prefix("$ ").or(Some(line)) else {
+                continue;
+            };
+            let Some(rest) = command.strip_prefix("aise ") else {
+                continue;
+            };
+            let words = shlex::split(&format!("aise {rest}"))
+                .unwrap_or_else(|| panic!("line {}: unbalanced quoting: {raw}", index + 1));
+            let mut invocation = Vec::new();
+            for word in words {
+                if matches!(word.as_str(), "|" | ";" | "&&" | "||" | ">" | ">>" | "2>&1") {
+                    break;
+                }
+                invocation.push(match word.as_str() {
+                    "SESSION_ID" => "claude:00000000-0000-4000-8000-000000000000".to_owned(),
+                    other => other.replace("SESSION_ID", "00000000-0000-4000-8000-000000000000"),
+                });
+            }
+            invocations.push((index + 1, invocation));
+        }
+        invocations
+    }
+
+    /// The shipped skill and README are what an agent reads instead of `--help`, so an example
+    /// that names a flag this build no longer accepts teaches the wrong command with authority.
+    /// That happened: `messages search --regex/--fuzzy/--explain` were renamed to `--query-mode`
+    /// and `--receipt-level` on 2026-07-22 and the skill kept the old spellings through rc1;
+    /// session history shows agents on Pi and Claude Code paying for it with `--help` probes and
+    /// failed calls. Every documented invocation must parse against the current CLI, including
+    /// the capability arguments after `skills <name>`, which the root parser passes through.
+    #[test]
+    fn every_documented_aise_example_parses_against_the_current_cli() {
+        let documents = [
+            (
+                "skills/ai-session-search/SKILL.md",
+                include_str!("../skills/ai-session-search/SKILL.md"),
+            ),
+            ("README.md", include_str!("../../../README.md")),
+        ];
+        let mut failures = Vec::new();
+        let mut checked = 0usize;
+        for (name, document) in documents {
+            for (line, invocation) in documented_aise_invocations(document) {
+                checked += 1;
+                let rendered = invocation.join(" ");
+                let cli = match Cli::try_parse_from(&invocation) {
+                    Ok(cli) => cli,
+                    // `--help` and `--version` are successful parses that clap reports as errors.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            clap::error::ErrorKind::DisplayHelp
+                                | clap::error::ErrorKind::DisplayVersion
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        let first_line = error.to_string();
+                        let first_line = first_line.lines().next().unwrap_or_default().to_owned();
+                        failures.push(format!("{name}:{line}: {rendered}\n    {first_line}"));
+                        continue;
+                    }
+                };
+                if let Commands::Skills(command) = cli.command {
+                    if !command.is_management() {
+                        if let Err(error) = command.into_execution() {
+                            failures.push(format!("{name}:{line}: {rendered}\n    {error}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 40,
+            "expected the documents to carry examples; found {checked}"
+        );
+        assert!(
+            failures.is_empty(),
+            "{} documented aise invocation(s) do not parse against this build:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
     /// Read-only deterministic capabilities live under the skill that defines them.
     ///
     /// The inferred form is the normal human path. `run` is only the collision escape for a

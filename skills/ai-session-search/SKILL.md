@@ -77,9 +77,11 @@ transport and result size add overhead.
 Choose the first MCP call by what is known, then narrow:
 
 - Unknown session, remembered topic: `search_sessions(query, path_prefix, when, limit)`.
-- Exact phrase, identifier, correction, or tool activity: `search_messages(query, path_prefix,
-  role/kind/tool, context, limit, lines_per_message)`; skip session discovery when the string is
-  already distinctive.
+- Exact phrase, identifier, correction, or tool activity: `search_messages(query,
+  workspace_path_prefix, role/kinds/tool_name_contains, context, limit, lines_per_message)`; skip
+  session discovery when the string is already distinctive. Omit `query` to list every message
+  the filters select; pass `all_results=true` instead of `limit` for every match of a literal or
+  regex query, and expect a bounded-ceiling refusal with retry guidance when that is too large.
 - Returned hit: pass its `session_id` and `seq` as `get_session(session_id, message_seq, context)`.
 - Aggregate or relationship question: inspect the schema, read each column's `note`, then use
   bounded `query_session_index(sql, limit, timeout_ms, max_cell_chars)`; do not use raw SQL for
@@ -168,8 +170,8 @@ distinction as `thread_source: user | subagent`.
 
 ```sh
 aise messages search "foreign key" --workspace-path ~/source/project --limit 20 --context 2
-aise messages search 'timeout|lock|busy' --regex --limit 20 --lines-per-message 4
-aise messages search "approximate remembered wording" --fuzzy --limit 20
+aise messages search 'timeout|lock|busy' --query-mode regex --limit 20 --lines-per-message 4
+aise messages search "approximate remembered wording" --query-mode fuzzy --limit 20
 aise messages search misunderstood --role user --when 14d --limit 20 --context 2
 aise messages search "CANNOT STOP" --kinds harness-notice --when 2d --limit 20
 ```
@@ -180,11 +182,11 @@ the harness told the agent rather than what the user wrote. They are indexed but
 ordinary results, so they never skew `corrections`, `repeats`, or a user-role search. `--kinds`
 is the single class filter and accepts several values; `--kind` selects one.
 
-Literal matching is the default. Use `--regex` for Rust regex syntax and `--fuzzy` for
-sequence-based approximate wording. Fuzzy is not edit distance: use at least 3 characters and a
-positive `--limit`. Every structurally eligible row is scored before the deterministic offset and
-limit slice is selected. A hit is identified by
-`(session_id, seq)`.
+Literal matching is the default. `--query-mode regex` (MCP: `query_mode=regex`) uses Rust regex
+syntax, which has no look-around; `--query-mode fuzzy` matches sequence-based approximate
+wording. Fuzzy is not edit distance: use at least 3 characters and a positive `--limit`. Every
+structurally eligible row is scored before the deterministic offset and limit slice is selected.
+A hit is identified by `(session_id, seq)`.
 
 ### Read one session: newest/oldest N, and page without re-reading
 
@@ -199,20 +201,29 @@ aise messages get SESSION_ID --seq-from 500 --seq-to 999
 `--limit` selects oldest-first unless `--order newest`; order picks WHICH N, so newest is the last
 N, not the first N shown backwards. To read further, continue from the next seq range
 (`seq_from = last seq + 1`) rather than re-requesting a larger `--limit`/`transcript_lines`, which
-re-sends what you already read. MCP mirrors this: `search_messages(order=…)` (newest requires
-`session_id`) and `get_session(seq_from, seq_to)`.
+re-sends what you already read. MCP mirrors this with `get_session(seq_from, seq_to)`;
+`search_messages` pages newest-first with `offset`, and `match_window=latest` (one `session_id`)
+selects the last occurrence inside each hit rather than the first.
 
-Add `--explain` when a search is unexpectedly broad or slow. Exact and regex modes still verify the
-requested predicate after indexed candidate retrieval. Fuzzy mode scores the complete structurally
-eligible corpus and retains bounded top-K state for the requested page. `prefilter_skipped` explains
-why an exact or regex index prefilter was not used. CLI explanations use stderr; MCP returns the
-receipt as structured output.
+To learn how a search was planned, add `--receipt-level summary` (MCP: `receipt_level=summary`);
+`full` adds the origin of every resolved parameter. Exact and regex modes still verify the
+requested predicate after indexed candidate retrieval. Fuzzy mode scores the complete
+structurally eligible corpus and retains bounded top-K state for the requested page. In the
+receipt, `prefilter_skipped` explains why an exact or regex index prefilter was not used, and
+`candidates` over `corpus` is the selectivity to improve by anchoring the query on a rarer
+literal. The receipt's `corpus` count reads every message row the structural filters admit, and
+no index covers that predicate, so on a multi-gigabyte index the receipt costs seconds to
+minutes more than the search itself: measured 0.5 s without and 117 s with the receipt on a
+23 GB, 2.6-million-message index. Do not add it to a search that is already slow; narrow with
+`--workspace-path`, `--session-id`, `--role`, or `--when` first. The CLI prints the receipt with
+`--format json`; MCP returns it as `receipt` in the structured output.
 
 Search canonical tool fields without scanning rendered output conventions:
 
 ```sh
-aise messages search exec --field tool-name --fuzzy --limit 20
+aise messages search exec --field tool-name --query-mode fuzzy --limit 20
 aise messages search "cargo test" --field tool-argument --argument-path /cmd --limit 20
+aise messages search "cargo test" --field tool-argument --argument-path /command --tool-name-contains Bash --limit 20
 ```
 
 Prefer a short fragment such as `foreign key` or `wrong repo` over a remembered sentence. Short
@@ -220,10 +231,13 @@ queries tolerate wording differences and expose more candidate turns; use `--wor
 `--role`, `--when`, and `--context` to narrow message results before lengthening the text query.
 
 Literal mode has no Boolean `OR`: a query such as `stdout OR printf` searches those exact words.
-Use `--regex 'stdout|printf'` for alternatives. Put boundaries around short identifiers
-(`--regex '\baise\b'`) so `aise` does not also match `raise`. Recent sessions contained stale
-`--project` and `--type` calls; use `--workspace-path` and `--role` for message search, and check
-`--help` before reusing an old command.
+Use `--query-mode regex 'stdout|printf'` for alternatives. Put boundaries around short
+identifiers (`--query-mode regex '\baise\b'`) so `aise` does not also match `raise`. Recent
+sessions contained stale `--project`, `--type`, `--regex`, `--fuzzy`, and `--explain` calls; use
+`--workspace-path`, `--role`, `--query-mode`, and `--receipt-level` for message search, and check
+`--help` before reusing an old command. Output formats are `table`, `json`, `jsonl`, `csv`, and
+`plain`; `--include` accepts `normalized_session_metadata`, `parsed_references`,
+`raw_provider_metadata`, `runtime_diagnostics`, or `none`.
 
 Searching for a string that starts with `-` (a flag name, a diff line, `--path`) needs an escape,
 because a bare positional query is parsed as a flag. Put every other flag first, then `--`, then
@@ -281,7 +295,7 @@ aise skills corrections --path ~/source/project --when 30d --limit 50
 aise planning --path ~/source/project --when 30d --limit 50
 aise stats --path ~/source/project --when 30d
 aise repeats --path ~/source/project --when 30d
-aise analyze --provider codex --when 7d --limit 50 --output /absolute/new/analysis
+aise analyze --provider codex --when 7d --output /absolute/new/analysis
 ```
 
 `aise skills corrections` and default/user-role `aise repeats` scan only source-attributable

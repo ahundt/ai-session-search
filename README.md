@@ -203,7 +203,7 @@ aise list --path ~/source/project --limit 1
 aise messages search "regression" --role user --include-compaction false
 
 # Search normalized tool calls and one canonical argument field
-aise messages search "Cargo.toml" --field tool-argument --argument-path /path --tool Edit
+aise messages search "Cargo.toml" --field tool-argument --argument-path /path --tool-name-contains Edit
 
 # Cap each returned message at its first 5 lines; negative keeps the tail instead
 aise messages get SESSION_ID --role user --lines-per-message 5
