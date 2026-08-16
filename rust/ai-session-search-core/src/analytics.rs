@@ -929,12 +929,17 @@ fn extract_user_request_body(content: &str) -> Option<&str> {
     Some(content[start..end].trim())
 }
 
+/// Split `content` into caseless alphanumeric word tokens.
+///
+/// Tokens taken from stored text are compared against tokens a user typed, so both sides fold case
+/// the way search does ([`crate::util::fold_caseless_char`]) rather than merely lowercasing: Greek
+/// writes one letter as `Σ`, `σ`, or `ς` by position, and lowercasing keeps the last two apart.
 pub(crate) fn normalized_tokens(content: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in content.chars() {
         if ch.is_alphanumeric() {
-            current.extend(ch.to_lowercase());
+            current.extend(crate::util::fold_caseless_char(ch));
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
         }
@@ -1036,6 +1041,25 @@ mod tests {
 
     fn patterns() -> Vec<(String, Regex)> {
         compile_patterns(&Config::default()).unwrap()
+    }
+
+    /// One Greek word is one token however its sigma is written.
+    ///
+    /// Repeat mining and phrase analysis compare a token a user typed against tokens taken from
+    /// stored text, so the two sides have to agree on what the same word is — the same requirement
+    /// search has, and the same rule answers it ([`crate::util::fold_caseless_char`]). Lowercasing
+    /// alone leaves `ς` and `σ` apart, which counted one repeated word as two and let an excluded
+    /// phrase token pass through unexcluded.
+    #[test]
+    fn a_greek_word_normalizes_to_one_token_whichever_sigma_it_is_written_with() {
+        let expected = vec!["οδοσσ".to_string()];
+        for spelling in ["ΟΔΟΣΣ", "οδοσς", "οδοσσ", "Οδοσς"] {
+            assert_eq!(
+                normalized_tokens(spelling),
+                expected,
+                "{spelling:?} is the same token"
+            );
+        }
     }
 
     fn categorize(text: &str) -> Option<String> {
