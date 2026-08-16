@@ -72,7 +72,7 @@ impl PiAdapter {
         for entry in walked.entries {
             let root = &entry.root;
             let path = &entry.path;
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            if !is_jsonl(path) {
                 continue;
             }
             // Top-level project sessions live directly under <root>/<encoded-cwd>/<file>.jsonl.
@@ -447,15 +447,45 @@ impl PiAdapter {
 /// entirely, with no rule about what a transcript may be called.
 ///
 /// Only a direct child counts. Matching the name anywhere below the root promoted any file two
-/// levels under an unrelated `sessions` directory to a top-level session. A root pointed straight
-/// at one project directory has no such child and is used as given.
+/// levels under an unrelated `sessions` directory to a top-level session.
+///
+/// The child has to hold transcripts, not merely carry the name. A project root configured
+/// directly is free to have a `sessions` subdirectory of its own, and descending into it on the
+/// strength of the name dropped every transcript sitting in that project — silently, because
+/// discovery warns only about I/O. What tells the two layouts apart is whether the child holds
+/// `.jsonl` files where pi keeps them.
 fn sessions_root(root: &Path) -> PathBuf {
     let nested = root.join("sessions");
-    if nested.is_dir() {
+    if holds_transcripts(&nested) {
         nested
     } else {
         root.to_path_buf()
     }
+}
+
+/// Whether `directory` holds a `.jsonl` file at a depth [`is_top_level_session`] accepts.
+///
+/// Answers from the first one found. An agent home keeps a transcript in its first project
+/// directory, so the usual answer costs two directory reads; a directory that is unreadable or
+/// absent holds nothing, which is the same answer discovery would reach by walking it.
+fn holds_transcripts(directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if is_jsonl(&path) {
+            return true;
+        }
+        path.is_dir()
+            && std::fs::read_dir(&path)
+                .is_ok_and(|children| children.flatten().any(|child| is_jsonl(&child.path())))
+    })
+}
+
+/// Whether `path` names a JSON Lines file, the only extension pi writes a transcript to.
+fn is_jsonl(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
 }
 
 /// A session file is "top level" when it sits at most one directory below the sessions root.
@@ -1063,6 +1093,40 @@ mod tests {
         let mut expected = vec![transcript_path, run_path];
         expected.sort();
         assert_eq!(found, expected);
+    }
+
+    /// An explicit project root keeps its meaning when it happens to contain a `sessions` child.
+    ///
+    /// Descending into `<root>/sessions` on the strength of that directory existing reads one
+    /// ordinary subdirectory name as proof the root is a pi agent home. A project configured
+    /// directly, with its transcripts sitting in it, then had every one of them dropped — no error,
+    /// no warning, just an empty provider. The child is the sessions directory when it holds
+    /// transcripts, which is a question about what is there rather than what it is called.
+    #[test]
+    fn an_explicit_project_root_keeps_its_transcripts_when_it_holds_an_unrelated_sessions_directory(
+    ) {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("demo");
+        fs::create_dir_all(&root).unwrap();
+
+        let transcript_path = root.join("2026-06-18T17-31-17-343Z.jsonl");
+        fs::write(
+            &transcript_path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"019edbc9-83df-72a0-a95b-64e6d810ad75\",\"timestamp\":\"2026-06-18T17:31:17.343Z\",\"cwd\":\"/Users/example/src/demo\"}\n",
+        )
+        .unwrap();
+
+        // The project's own `sessions/` directory, holding no transcript of pi's.
+        fs::create_dir_all(root.join("sessions").join("fixtures")).unwrap();
+        fs::write(root.join("sessions").join("fixtures").join("notes.md"), "x").unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let found: Vec<_> = adapter
+            .discover()
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(found, vec![transcript_path]);
     }
 
     /// A transcript keeps being discovered whatever its file is called, and a `sessions`
