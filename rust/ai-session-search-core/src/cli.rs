@@ -2536,7 +2536,7 @@ mod tests {
             "Filters (which messages):",
             "Time window (formats: `aise dates`):",
             "Result window and context (how many, from where):",
-            "Presentation and output (never changes which messages match):",
+            "Presentation and output (how matches are shown; matching stays the same):",
             "Advanced (purpose bundles, receipts, self-description):",
         ];
         let mut last = 0;

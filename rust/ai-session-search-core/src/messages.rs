@@ -582,11 +582,13 @@ impl std::str::FromStr for CliMessageSearchInclude {
 /// Help sections for `aise messages search`: thirty-nine options in one alphabetical block hid the
 /// six a caller needs first. Sections separate what to find, which messages, when, how many, how
 /// they are shown, and the diagnostics only scripts and maintainers reach for. Presentation
-/// options never change which messages match (REQ004); the heading says so.
+/// options change how matches are shown and leave matching itself unchanged (REQ004); the heading
+/// says so.
 const QUERY_HEADING: &str = "Query (what to find)";
 const FILTER_HEADING: &str = "Filters (which messages)";
 const RESULTS_HEADING: &str = "Result window and context (how many, from where)";
-const PRESENTATION_HEADING: &str = "Presentation and output (never changes which messages match)";
+const PRESENTATION_HEADING: &str =
+    "Presentation and output (how matches are shown; matching stays the same)";
 const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-description)";
 
 #[derive(Debug, Args)]

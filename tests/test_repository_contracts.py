@@ -853,9 +853,9 @@ def test_readme_and_packaged_skill_explain_temporal_and_recent_directory_retriev
         "known indexed span",
         "`since` tests the span end",
         "`until` tests the span start",
-        "span can contain gaps",
+        "may contain gaps",
         "component-boundary descendant",
-        "excludes lexical siblings",
+        "leaves lexical siblings",
     ):
         assert phrase in skill
 

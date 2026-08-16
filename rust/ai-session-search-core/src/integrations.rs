@@ -33,7 +33,7 @@ const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Ses
 /// The block for a harness that has no MCP registration for aise (Pi, Prime Agent). It leads with
 /// the three CLI commands that cover the common path and names the installed skill, because the
 /// MCP-first sentence above sends such an agent to a tool it cannot call.
-const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; this harness has no `ai-session-search` MCP registration, so do not look for MCP tools. Find sessions with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; run `aise <command> --help` before adding a flag it does not show.";
+const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; on this harness the `aise` command and the installed skill are the whole integration. List recent sessions with `aise list --path <dir> --when 7d --limit 10`, find sessions by topic with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; `aise <command> --help` lists every current flag.";
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
@@ -5082,7 +5082,9 @@ mod tests {
         assert!(skill_content.contains("aise messages search"));
         assert!(skill_content.contains("query_session_index"));
         assert!(skill_content.contains("short distinctive fragment"));
-        assert!(skill_content.contains("Literal mode has no Boolean `OR`"));
+        assert!(skill_content.contains("Literal mode matches the query text as typed"));
+        assert!(skill_content.contains("List recent sessions by metadata, then read them"));
+        assert!(skill_content.contains("aise list --path ~/source/project --when 7d --limit 10"));
         assert!(skill_content.contains("one-significant-figure warm-cache measurements"));
         assert!(skill_content.contains("Lower-priority file recovery"));
         assert!(skill_content
@@ -6900,7 +6902,13 @@ mod tests {
             let block = instruction_block(instructions[0].format);
             assert!(block.contains("<!-- aise-instructions v1 -->"), "{block}");
             assert!(
-                block.contains("no `ai-session-search` MCP registration"),
+                block.contains(
+                    "the `aise` command and the installed skill are the whole integration"
+                ),
+                "{block}"
+            );
+            assert!(
+                block.contains("aise list --path <dir> --when 7d --limit 10"),
                 "{block}"
             );
             assert!(block.contains("aise search \""), "{block}");
