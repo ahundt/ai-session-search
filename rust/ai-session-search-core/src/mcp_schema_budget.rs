@@ -581,14 +581,18 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    // 4_631 -> 4_645: the canonical `prime-agent` provider enum value adds 14 bytes. The
-    // schema remains 355 bytes below Codex's 5,000-byte description-deletion cliff.
-    ("search_messages", 4_645, 10),
-    // 4_742 -> 4_747: naming the capability file `aise-capability.toml` rather than the generic
-    // `capability.toml` costs five bytes across the two descriptions that name it. 253 bytes of
-    // headroom remain before Codex's 5,000-byte cliff, past which it deletes every parameter
-    // description with no marker to the model.
-    ("run_skill_capability", 4_747, 9),
+    // 4_645 -> 4_706: `field_view`/`match_view` now state their omission value as the JSON a
+    // caller sends (`{kind:max_chars,max_chars:220}`) because Claude Code drops `oneOf` from the
+    // schema it shows the model, and `query`'s omission reads "without it every message the
+    // filters allow is eligible". 294 bytes remain below Codex's 5,000-byte description-deletion
+    // cliff.
+    ("search_messages", 4_706, 10),
+    // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
+    // and `all_results` say "omit for" like every other property so the tool description's
+    // omitted-values sentence can read them back. 279 bytes of headroom remain before Codex's
+    // 5,000-byte cliff, past which it deletes every parameter description with no marker to the
+    // model.
+    ("run_skill_capability", 4_721, 9),
     ("get_session", 4_064, 10),
     // 4_250 -> 4_306: `query` now states its matching model (case-insensitive substring of the
     // whole query and of each word, fuzzy on title and paths, every-word bonus, no quote or

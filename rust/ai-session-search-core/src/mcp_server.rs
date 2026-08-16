@@ -1636,8 +1636,15 @@ fn validate_schema_value(
             .filter(|branch| validate_schema_value(value, branch, root, tool_name, path).is_ok())
             .count();
         if matching != 1 {
+            // Name every accepted shape: a client that dropped `oneOf` from the schema it showed
+            // the model (observed in Claude Code 2.1.233) leaves the model nothing else to read.
+            let accepted: Vec<String> = branches
+                .iter()
+                .map(|branch| schema_alternative_shape(branch, root))
+                .collect();
             return Err(invalid(format!(
-                "must match exactly one schema alternative, matched {matching}"
+                "must match exactly one schema alternative, matched {matching}; accepted: {}",
+                accepted.join(" | ")
             )));
         }
     }
@@ -1762,6 +1769,59 @@ fn validate_schema_value(
         }
     }
     Ok(())
+}
+
+/// One `oneOf` branch rendered as the value a caller would write: `{kind:max_chars,max_chars:<integer>}`
+/// for a tagged object (its `kind` enum first, then each other required property with its type),
+/// otherwise the branch's `type` or `enum`. `$ref` branches resolve against `root` first.
+fn schema_alternative_shape(branch: &Value, root: &Value) -> String {
+    let resolved = branch
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix('#'))
+        .and_then(|pointer| root.pointer(pointer))
+        .unwrap_or(branch);
+    if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
+        let mut parts = Vec::new();
+        if let Some(kind) = properties
+            .get("kind")
+            .and_then(|kind| kind.get("enum"))
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+        {
+            parts.push(format!("kind:{kind}"));
+        }
+        let required = resolved
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for key in required.iter().filter_map(Value::as_str) {
+            if key == "kind" {
+                continue;
+            }
+            let type_name = properties
+                .get(key)
+                .and_then(|schema| schema.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("value");
+            parts.push(format!("{key}:<{type_name}>"));
+        }
+        return format!("{{{}}}", parts.join(","));
+    }
+    if let Some(values) = resolved.get("enum").and_then(Value::as_array) {
+        return values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    resolved
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("value")
+        .to_owned()
 }
 
 /// Format a type mismatch. `null` gets a corrective hint because several MCP clients
@@ -3644,17 +3704,19 @@ fn render_message_search_field_description(
                     "positive keeps first N, negative last N, 0 none; omit for {}.",
                     configured.presentation().lines_per_message()
                 ),
+                // Written as the value a caller would send, because a client that drops `oneOf`
+                // (observed in Claude Code 2.1.233) shows the model no other shape for these two.
                 ("field_view", _) => match configured.presentation().field_view() {
                     FieldViewBudget::MaxChars { max_chars } => {
-                        format!("omit for max_chars {max_chars}.")
+                        format!("omit for {{kind:max_chars,max_chars:{max_chars}}}.")
                     }
-                    FieldViewBudget::NoCharLimit => "omit for no character cap.".to_owned(),
+                    FieldViewBudget::NoCharLimit => "omit for {kind:no_char_limit}.".to_owned(),
                 },
                 ("match_view", _) => match configured.presentation().match_view() {
                     MatchViewBudget::MaxChars { max_chars } => {
-                        format!("omit for max_chars {max_chars}.")
+                        format!("omit for {{kind:max_chars,max_chars:{max_chars}}}.")
                     }
-                    MatchViewBudget::MinimalSpan => "omit for the smallest match span.".to_owned(),
+                    MatchViewBudget::MinimalSpan => "omit for {kind:minimal_span}.".to_owned(),
                 },
                 // The two omissions that mean "this filter is not applied" say so once in
                 // `tool.description` instead of twelve times here. Both variants describe one
@@ -3671,8 +3733,10 @@ fn render_message_search_field_description(
                     _,
                     MessageSearchOmission::AllEligible | MessageSearchOmission::NoAdditionalFilter,
                 ) => String::new(),
+                // A mode rather than a value, so it is worded without "omit for" and stays out
+                // of the tool description's omitted-values sentence, which lists values.
                 (_, MessageSearchOmission::QuerylessSearch) => {
-                    "omit for a queryless search.".to_owned()
+                    "without it every message the filters allow is eligible.".to_owned()
                 }
                 // A defaulted parameter must name its default value in the text, not just in the
                 // keyword. `default` is one of the six keywords both Codex and VS Code delete
@@ -3698,40 +3762,50 @@ fn render_message_search_field_description(
     }
 }
 
-/// Compose `tool.description` from the registry: the lead, the vocabulary `enum` cannot carry,
-/// and the nine conflict rules verbatim.
+/// Compose `tool.description` from the registry and the emitted schema: the lead, the
+/// vocabulary `enum` cannot carry, the omission values and view shapes read back from the
+/// schema's own properties, and the nine conflict rules verbatim.
 ///
 /// The rules are `rule_descriptors()[i].message()` with a bullet, never a paraphrase. The moment
 /// the published text is authored separately from the validator's it drifts, and the published
 /// rules stop describing behaviour;
 /// `search_messages_description_publishes_every_conflict_rule_verbatim` asserts substring
 /// containment so generation makes that drift unrepresentable rather than merely caught.
-fn message_search_tool_description(config: &Config) -> String {
+///
+/// The omission values are restated here because this is the channel that reaches the model
+/// when the properties do not. Observed 2026-08-15 from Claude Code 2.1.233: the schema it
+/// handed the model kept descriptions only on `required` properties and dropped `oneOf` and
+/// `minimum`, so `search_messages`, which requires nothing, arrived with no property prose at
+/// all and `field_view` as an empty object, while `tool.description` arrived intact. The
+/// sentence is read from the emitted property descriptions (`omitted_values_sentence`), so it
+/// cannot disagree with them, and the shapes from the emitted `oneOf`/`$defs`.
+fn message_search_tool_description(config: &Config, input_schema: &Value) -> String {
     let specification = MessageService::message_search_spec_for_config(config, SearchSurface::Mcp)
         .expect("validated MCP configuration resolves a queryless message-search request");
     let registry = specification.registry();
     let mut text = String::from(
         "Find exact message evidence across local AI session history. structuredContent is \
-         authoritative: effective_request states the resolved interpretation and budgets, results \
-         carry message_ref plus field and match views with exact literal coordinates, and \
-         page.next_offset is the next offset argument when more results exist. Expand one hit \
-         with get_session(session_id, message_seq).\n",
+         authoritative: effective_request states the resolved request and budgets, results carry \
+         message_ref plus field and match views with exact literal coordinates, and \
+         page.next_offset is the next offset when more results exist. Expand one hit with \
+         get_session(session_id, message_seq).\n",
     );
     // Only what `enum` cannot say. The six message classes and nine provider slugs already
     // travel as accepted values on their own parameters, and restating them here would be a
-    // second copy of a list the model already has, free to drift from it.
+    // second copy of a list the model already has, free to drift from it. Literal-mode semantics
+    // and the time examples are here because the CLI states them in its own help and a model
+    // may have no shell to run `aise dates`.
     text.push_str(
-        "Omitting a filter leaves it unapplied. harness_notice is what the harness told the agent \
-         rather than what a person wrote, and it is the one message class omitted when kinds is \
-         omitted. query_mode=regex is Rust regex syntax and query_mode=fuzzy is a bounded fuzzy \
-         match. Times accept an RFC 3339 instant or a relative form; see `aise dates`. \
-         receipt_level=summary explains how the search was planned and full adds each value's \
-         origin; the receipt's corpus count reads index entries, not message rows, except for an \
-         explicit kinds set beyond harness_notice/compaction. \
-         lines_per_message applies its line window first, then field_view and match_view apply \
-         their character budgets in Unicode scalars; all three change presentation only and \
-         never change matching, ordering, result count, context membership, or includes.\n",
+        "Omitting a filter leaves it unapplied. harness_notice (the harness's own text, not a \
+         person's) is the one class omitted when kinds is omitted. query_mode literal is a \
+         case-insensitive substring (punctuation significant), regex is Rust regex, fuzzy is a \
+         bounded fuzzy match. since/until/when take an RFC 3339 instant or a relative form such \
+         as 7d, yesterday, or 2026-01. receipt_level summary explains how the search was \
+         planned; full adds each value's origin. lines_per_message (line window first) and \
+         field_view/match_view (character budgets in Unicode scalars) change presentation only, \
+         never matching, order, count, context, or includes.\n",
     );
+    text.push_str(&omitted_values_sentence(input_schema));
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {
         text.push_str("  ");
@@ -3739,6 +3813,47 @@ fn message_search_tool_description(config: &Config) -> String {
         text.push('\n');
     }
     text
+}
+
+/// "Omitted values: ..." read back from the emitted property descriptions.
+///
+/// Every property whose description says "omit for X" contributes `name X`; properties that
+/// share the same X are joined with `/` so the sentence stays inside the description budget
+/// (`claude-code-tool-description-chars`). Reading the emitted prose rather than the resolver
+/// keeps one owner: the per-property renderer decides the value and the words, and this only
+/// repeats them where the properties may not arrive.
+fn omitted_values_sentence(input_schema: &Value) -> String {
+    let Some(properties) = input_schema.get("properties").and_then(Value::as_object) else {
+        return String::new();
+    };
+    // (value text, property names) in first-seen order.
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for (name, schema) in properties {
+        let Some(description) = schema.get("description").and_then(Value::as_str) else {
+            continue;
+        };
+        let lower = description.to_ascii_lowercase();
+        let Some(start) = lower.find("omit for ") else {
+            continue;
+        };
+        let rest = &description[start + "omit for ".len()..];
+        let value = rest.split('.').next().unwrap_or(rest).trim();
+        if value.is_empty() {
+            continue;
+        }
+        match groups.iter_mut().find(|(existing, _)| existing == value) {
+            Some((_, names)) => names.push(name.as_str()),
+            None => groups.push((value.to_owned(), vec![name.as_str()])),
+        }
+    }
+    if groups.is_empty() {
+        return String::new();
+    }
+    let clauses: Vec<String> = groups
+        .iter()
+        .map(|(value, names)| format!("{} {value}", names.join("/")))
+        .collect();
+    format!("Omitted: {}.\n", clauses.join("; "))
 }
 
 /// The `$defs` name for the one variant `field_view` and `match_view` genuinely share.
@@ -4152,6 +4267,187 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let query_session_index_description = format!(
         "Expert read-only SQL over the SQLite index for {provider_summary}. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Column values are provider spellings, so messages.tool_name is namespaced in Claude (mcp__server__tool) and a leaf name in Codex: match it with search_messages tool_name_contains, because one spelling drops the other provider silently. For how many messages contain a term, query messages_vocab(term, doc, cnt), which the listing omits as index machinery: doc counts messages and cnt occurrences, terms are case-folded, and `where term >= 'x' and term < 'y'` reads the index order instead of scanning. search_messages pages and reports no total. Omit sql to list schema objects; use schema_table for one table's columns and the note on each column that reads this way; pass sql only for one row-returning SELECT/WITH statement."
     );
+    // Built before the catalogue so the tool description can restate, from the emitted
+    // schema itself, the omission values and view shapes a client may strip from the
+    // properties (see `message_search_tool_description`).
+    let search_messages_input_schema = project_message_search_spec(
+        config,
+        json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "default": "literal" },
+                        "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
+                        "kind": { "type": "string", "enum": message_kind_values() },
+                        "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
+                        "argument_path": { "type": "string" },
+                        "providers": provider_set_schema(&provider_values),
+                        "tool_name_contains": { "type": "string" },
+                        "session_id": { "type": "string" },
+                        "workspace_path_prefix": { "type": "string" },
+                        "transcript_path_prefix": { "type": "string" },
+                        "exclude_workspace_path_prefixes": { "type": "array", "items": { "type": "string" } },
+                        "exclude_transcript_path_prefixes": { "type": "array", "items": { "type": "string" } },
+                        "exclude_session_ids": { "type": "array", "items": { "type": "string" } },
+                        "seq_from": { "type": "integer", "minimum": 0 },
+                        "seq_to": { "type": "integer", "minimum": 0 },
+                        "since": { "type": "string" },
+                        "until": { "type": "string" },
+                        "when": { "type": "string" },
+                        "include_compaction": { "type": "boolean", "default": true },
+                        "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() } },
+                        "match_window": { "type": "string", "enum": ["earliest", "latest"] },
+                        "context": { "type": "integer", "minimum": 0, "default": 0 },
+                        "context_before": { "type": "integer", "minimum": 0 },
+                        "context_after": { "type": "integer", "minimum": 0 },
+                        "lines_per_message": { "type": "integer", "default": config.mcp.lines_per_message },
+                        "detail": { "type": "string", "enum": ["compact", "full"] },
+                        "field_view": {
+                            "default": {
+                                "kind": "max_chars",
+                                "max_chars": config.mcp.preview_chars.max(1)
+                            },
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": { "kind": { "enum": ["no_char_limit"] } },
+                                    "required": ["kind"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "enum": ["max_chars"] },
+                                        "max_chars": { "type": "integer", "minimum": 1 }
+                                    },
+                                    "required": ["kind", "max_chars"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "match_view": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": { "kind": { "enum": ["minimal_span"] } },
+                                    "required": ["kind"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "enum": ["max_chars"] },
+                                        "max_chars": { "type": "integer", "minimum": 1 }
+                                    },
+                                    "required": ["kind", "max_chars"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "include": {
+                            "type": "array",
+                            "uniqueItems": true,
+                            "items": { "type": "string", "enum": ["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"] },
+                            "description": "Optional payload groups: normalized_session_metadata adds deduplicated normalized session fields; parsed_references adds per-result parsed references; raw_provider_metadata adds verbatim provider metadata; runtime_diagnostics adds package/config/schema identity. Omit to use the MCP default; an explicit empty array requests only the semantic core. A supplied set replaces defaults."
+                        },
+                        "purpose": purpose_input_schema(config),
+                        "purpose_version": { "type": "integer", "minimum": 1 },
+                        "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] },
+                        "limit": { "type": "integer", "minimum": 1, "default": config.mcp.search_messages_limit.max(1) },
+                        "all_results": { "type": "boolean", "default": false },
+                        "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    },
+                    "additionalProperties": false
+        }),
+    );
+    // Hoisted for the same reason as search_messages: the description restates the
+    // omission values from the emitted properties.
+    let run_skill_capability_input_schema = json!({
+                "type": "object",
+                "properties": {
+                    "skill": skill_selector_input_schema(),
+                    "definition": {
+                        "type": "object",
+                        "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent aise-capability.toml rules.",
+                        "properties": {
+                            "categories": {
+                                "type": "array",
+                                "description": "Typed classification categories for this call, replacing the package's own.",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string", "minLength": 1 },
+                                        "patterns": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "items": { "type": "string", "minLength": 1 }
+                                        }
+                                    },
+                                    "required": ["name", "patterns"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["categories"],
+                        "additionalProperties": false
+                    },
+                    "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset: compact returns bounded views; full returns the complete message in field_view plus a bounded match view. Conflicts with field_view and match_view." },
+                    "field_view": {
+                        "description": format!("View budget for the returned message: no_char_limit returns the complete message; max_chars retains at most that many Unicode scalar characters. Omit for {{kind:max_chars,max_chars:{}}}.", config.mcp.preview_chars.max(1)),
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": { "kind": { "enum": ["no_char_limit"] } },
+                                "required": ["kind"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "enum": ["max_chars"] },
+                                    "max_chars": { "type": "integer", "minimum": 1 }
+                                },
+                                "required": ["kind", "max_chars"],
+                                "additionalProperties": false
+                            }
+                        ]
+                    },
+                    "match_view": {
+                        "description": "Independent match-centered view: minimal_span returns the complete regex match; max_chars adds surrounding text without changing the match coordinates.",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": { "kind": { "enum": ["minimal_span"] } },
+                                "required": ["kind"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "enum": ["max_chars"] },
+                                    "max_chars": { "type": "integer", "minimum": 1 }
+                                },
+                                "required": ["kind", "max_chars"],
+                                "additionalProperties": false
+                            }
+                        ]
+                    },
+                    "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Extra packages evaluated after the primary one; all must declare the same capability type." },
+                    "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan; omit for user-started sessions only." },
+                    "provider": provider_filter_schema(&provider_values, provider_filter_description),
+                    "session_id": { "type": "string", "description": "Exact session ID or unique prefix; scopes the run to one session found by search_sessions." },
+                    "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path; scopes the run to one project." },
+                    "since": { "type": "string", "description": "Lower bound on the message's own timestamp; omit for no bound." },
+                    "until": { "type": "string", "description": "Upper bound on the message's own timestamp, inclusive; omit for no bound." },
+                    "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
+                    "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size; omit for the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit) },
+                    "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide. Omit for false." },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." }
+                },
+                "required": ["skill"],
+                "additionalProperties": false
+    });
     let mut response = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -4305,95 +4601,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "search_messages",
                     "annotations": read_only_tool_annotations(),
-                    "description": message_search_tool_description(config),
+                    "description": message_search_tool_description(config, &search_messages_input_schema),
                     "outputSchema": search_messages_output_schema(),
-                    "inputSchema": project_message_search_spec(config, json!({
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string" },
-                            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "default": "literal" },
-                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
-                            "kind": { "type": "string", "enum": message_kind_values() },
-                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
-                            "argument_path": { "type": "string" },
-                            "providers": provider_set_schema(&provider_values),
-                            "tool_name_contains": { "type": "string" },
-                            "session_id": { "type": "string" },
-                            "workspace_path_prefix": { "type": "string" },
-                            "transcript_path_prefix": { "type": "string" },
-                            "exclude_workspace_path_prefixes": { "type": "array", "items": { "type": "string" } },
-                            "exclude_transcript_path_prefixes": { "type": "array", "items": { "type": "string" } },
-                            "exclude_session_ids": { "type": "array", "items": { "type": "string" } },
-                            "seq_from": { "type": "integer", "minimum": 0 },
-                            "seq_to": { "type": "integer", "minimum": 0 },
-                            "since": { "type": "string" },
-                            "until": { "type": "string" },
-                            "when": { "type": "string" },
-                            "include_compaction": { "type": "boolean", "default": true },
-                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() } },
-                            "match_window": { "type": "string", "enum": ["earliest", "latest"] },
-                            "context": { "type": "integer", "minimum": 0, "default": 0 },
-                            "context_before": { "type": "integer", "minimum": 0 },
-                            "context_after": { "type": "integer", "minimum": 0 },
-                            "lines_per_message": { "type": "integer", "default": config.mcp.lines_per_message },
-                            "detail": { "type": "string", "enum": ["compact", "full"] },
-                            "field_view": {
-                                "default": {
-                                    "kind": "max_chars",
-                                    "max_chars": config.mcp.preview_chars.max(1)
-                                },
-                                "oneOf": [
-                                    {
-                                        "type": "object",
-                                        "properties": { "kind": { "enum": ["no_char_limit"] } },
-                                        "required": ["kind"],
-                                        "additionalProperties": false
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "enum": ["max_chars"] },
-                                            "max_chars": { "type": "integer", "minimum": 1 }
-                                        },
-                                        "required": ["kind", "max_chars"],
-                                        "additionalProperties": false
-                                    }
-                                ]
-                            },
-                            "match_view": {
-                                "oneOf": [
-                                    {
-                                        "type": "object",
-                                        "properties": { "kind": { "enum": ["minimal_span"] } },
-                                        "required": ["kind"],
-                                        "additionalProperties": false
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "enum": ["max_chars"] },
-                                            "max_chars": { "type": "integer", "minimum": 1 }
-                                        },
-                                        "required": ["kind", "max_chars"],
-                                        "additionalProperties": false
-                                    }
-                                ]
-                            },
-                            "include": {
-                                "type": "array",
-                                "uniqueItems": true,
-                                "items": { "type": "string", "enum": ["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"] },
-                                "description": "Optional payload groups: normalized_session_metadata adds deduplicated normalized session fields; parsed_references adds per-result parsed references; raw_provider_metadata adds verbatim provider metadata; runtime_diagnostics adds package/config/schema identity. Omit to use the MCP default; an explicit empty array requests only the semantic core. A supplied set replaces defaults."
-                            },
-                            "purpose": purpose_input_schema(config),
-                            "purpose_version": { "type": "integer", "minimum": 1 },
-                            "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] },
-                            "limit": { "type": "integer", "minimum": 1, "default": config.mcp.search_messages_limit.max(1) },
-                            "all_results": { "type": "boolean", "default": false },
-                            "offset": { "type": "integer", "minimum": 0, "default": 0 }
-                        },
-                        "additionalProperties": false
-                    }))
+                    "inputSchema": search_messages_input_schema
                 },
                 {
                     "name": "run_skill_capability",
@@ -4404,94 +4614,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     // `tool.description` is a separate field with its own 2,048-character cap that
                     // no measured client charges to the schema. A fact many parameters share also
                     // reads better stated once here than transcribed onto each of them.
-                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. since and until bound the message's own timestamp rather than session activity, and accept an RFC 3339 instant or a relative form; see `aise dates`. session_kinds defaults to user-started sessions only, unlike search_messages and list_sessions which return both classes: in a spawned subagent run, 'user' rows hold the calling agent's delegation prompt rather than text a person entered. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
+                    "description": format!("{} {}", format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Packaged and direct definitions share a 1 MiB parsing ceiling; exceeding it returns byte counts and guidance rather than truncated rules. since/until/when bound the message's own timestamp, not session activity: an RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01. session_kinds omits subagent runs, unlike search_messages and list_sessions: in a spawned run, 'user' rows hold the calling agent's delegation prompt, not a person's text. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."), omitted_values_sentence(&run_skill_capability_input_schema).trim_end()),
                     "outputSchema": run_skill_capability_output_schema(),
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "skill": skill_selector_input_schema(),
-                            "definition": {
-                                "type": "object",
-                                "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent aise-capability.toml rules.",
-                                "properties": {
-                                    "categories": {
-                                        "type": "array",
-                                        "description": "Typed classification categories for this call, replacing the package's own.",
-                                        "minItems": 1,
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "name": { "type": "string", "minLength": 1 },
-                                                "patterns": {
-                                                    "type": "array",
-                                                    "minItems": 1,
-                                                    "items": { "type": "string", "minLength": 1 }
-                                                }
-                                            },
-                                            "required": ["name", "patterns"],
-                                            "additionalProperties": false
-                                        }
-                                    }
-                                },
-                                "required": ["categories"],
-                                "additionalProperties": false
-                            },
-                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset: compact returns bounded views; full returns the complete message in field_view plus a bounded match view. Conflicts with field_view and match_view." },
-                            "field_view": {
-                                "description": format!("View budget for the returned message: no_char_limit returns the complete message; max_chars retains at most that many Unicode scalar characters. The configured MCP default is max_chars={}.", config.mcp.preview_chars.max(1)),
-                                "oneOf": [
-                                    {
-                                        "type": "object",
-                                        "properties": { "kind": { "enum": ["no_char_limit"] } },
-                                        "required": ["kind"],
-                                        "additionalProperties": false
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "enum": ["max_chars"] },
-                                            "max_chars": { "type": "integer", "minimum": 1 }
-                                        },
-                                        "required": ["kind", "max_chars"],
-                                        "additionalProperties": false
-                                    }
-                                ]
-                            },
-                            "match_view": {
-                                "description": "Independent match-centered view: minimal_span returns the complete regex match; max_chars adds surrounding text without changing the match coordinates.",
-                                "oneOf": [
-                                    {
-                                        "type": "object",
-                                        "properties": { "kind": { "enum": ["minimal_span"] } },
-                                        "required": ["kind"],
-                                        "additionalProperties": false
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "enum": ["max_chars"] },
-                                            "max_chars": { "type": "integer", "minimum": 1 }
-                                        },
-                                        "required": ["kind", "max_chars"],
-                                        "additionalProperties": false
-                                    }
-                                ]
-                            },
-                            "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Extra packages evaluated after the primary one; all must declare the same capability type." },
-                            "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan; omit for user-started sessions only." },
-                            "provider": provider_filter_schema(&provider_values, provider_filter_description),
-                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix; scopes the run to one session found by search_sessions." },
-                            "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path; scopes the run to one project." },
-                            "since": { "type": "string", "description": "Lower bound on the message's own timestamp; omit for no bound." },
-                            "until": { "type": "string", "description": "Upper bound on the message's own timestamp, inclusive; omit for no bound." },
-                            "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
-                            "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit) },
-                            "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide. Omit for one page." },
-                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." }
-                        },
-                        "required": ["skill"],
-                        "additionalProperties": false
-                    }
+                    "inputSchema": run_skill_capability_input_schema
                 },
                 {
                     "name": "get_index_status",
@@ -7437,6 +7562,106 @@ mod tests {
         }
     }
 
+    /// Observed 2026-08-15 from Claude Code 2.1.233: the schema it showed the model kept
+    /// property descriptions only on `required` properties and dropped `oneOf`, so on
+    /// `search_messages` (which requires nothing) every "omit for N" and both view shapes were
+    /// invisible while `tool.description` arrived whole. The two message-search tool
+    /// descriptions therefore restate every omission value, read back from the emitted property
+    /// prose so the two channels cannot disagree, and the view budgets are worded as the JSON a
+    /// caller sends.
+    #[test]
+    fn message_search_tool_descriptions_restate_every_omission_value_from_the_emitted_prose() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = advertised_tools(&config);
+        for tool_name in ["search_messages", "run_skill_capability"] {
+            let tool = tools
+                .as_array()
+                .expect("tools list")
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} is served"));
+            let description = tool["description"].as_str().expect("description");
+            let start = description
+                .find("Omitted: ")
+                .unwrap_or_else(|| panic!("{tool_name} description has no Omitted: sentence"));
+            let sentence = description[start..].split('\n').next().expect("one line");
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .expect("properties");
+            let mut stated = 0;
+            for (name, schema) in properties {
+                if name == ADAPTER_CONTROL_FIELD {
+                    // Injected on every tool after the catalogue is built, so it is outside the
+                    // tool's own omission sentence; its "Omit for auto" travels on the property.
+                    continue;
+                }
+                let prose = schema["description"].as_str().unwrap_or_default();
+                let lower = prose.to_ascii_lowercase();
+                let Some(start) = lower.find("omit for ") else {
+                    continue;
+                };
+                let value = prose[start + "omit for ".len()..]
+                    .split('.')
+                    .next()
+                    .unwrap()
+                    .trim();
+                stated += 1;
+                assert!(
+                    sentence.contains(name.as_str()) && sentence.contains(value),
+                    "{tool_name}: {name} says \"omit for {value}\" but the Omitted: line does not carry it: {sentence}"
+                );
+            }
+            assert!(
+                stated >= 8,
+                "{tool_name} states only {stated} omission values"
+            );
+            // Identical values are grouped, so the sentence stays inside the description cap.
+            assert!(
+                sentence
+                    .contains("context/context_after/context_before/lines_per_message/offset 0")
+                    || sentence.contains("offset 0"),
+                "{sentence}"
+            );
+            assert!(
+                sentence.contains("{kind:max_chars,max_chars:"),
+                "the view budget is written as the value a caller sends: {sentence}"
+            );
+        }
+        // `query`'s omission is a mode, not a value, so it is worded without "omit for" and
+        // stays out of the sentence.
+        let query = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .unwrap()["inputSchema"]["properties"]["query"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(query.contains("without it every message"), "{query}");
+    }
+
+    /// A `oneOf` failure names every accepted shape, because a client that dropped `oneOf`
+    /// from the schema it showed the model leaves the model nothing else to read.
+    #[test]
+    fn a_rejected_view_budget_names_the_accepted_shapes() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = advertised_tools(&config);
+        let error = validate_tool_call(
+            &json!({
+                "name": "search_messages",
+                "arguments": { "query": "hello", "field_view": { "kind": "none" } }
+            }),
+            &tools,
+        )
+        .expect_err("an unknown view kind is rejected");
+        assert!(
+            error.contains("accepted: {kind:no_char_limit} | {kind:max_chars,max_chars:<integer>}"),
+            "{error}"
+        );
+    }
+
     /// The rule the message-search family adopted holds for every tool: no property advertises
     /// a `default` keyword, and every property that resolves to something when omitted says so
     /// in prose. Dogfooded 2026-08-15 from Claude Code 2.1.233 against `get_session`:
@@ -8305,7 +8530,7 @@ mod tests {
         // Page continuation uses the response's explicit next offset, while focused message
         // expansion uses the separate session/message identity.
         assert!(
-            tool_doc.contains("page.next_offset") && tool_doc.contains("next offset argument"),
+            tool_doc.contains("page.next_offset is the next offset"),
             "search_messages description advertises offset continuation: {tool_doc}"
         );
         assert!(
@@ -8333,7 +8558,7 @@ mod tests {
         }
         // What `enum` cannot say about them is said once, in the channel every client forwards.
         assert!(
-            tool_doc.contains("harness_notice is what the harness told the agent"),
+            tool_doc.contains("harness_notice (the harness's own text, not a person's)"),
             "the one class whose meaning a token cannot carry is glossed: {tool_doc}"
         );
     }
@@ -12525,7 +12750,7 @@ mod tests {
         // that a caller is told, not which of the two fields tells them, so both are read.
         let advertised = format!("{description}{}", tool["inputSchema"]);
         assert!(
-            advertised.contains("session_kinds defaults to user-started sessions only")
+            advertised.contains("session_kinds omits subagent runs")
                 && advertised.contains("search_messages")
                 && advertised.contains("list_sessions"),
             "a default that differs from the sibling tools must name them and say so, or it is a \
@@ -12622,22 +12847,22 @@ mod tests {
             (
                 "run_skill_capability",
                 "why session_kinds excludes subagent runs by default",
-                "delegation prompt rather than text a person entered",
+                "delegation prompt, not a person's text",
             ),
             (
                 "run_skill_capability",
                 "that default differs from the sibling tools",
-                "unlike search_messages and list_sessions which return both classes",
+                "unlike search_messages and list_sessions",
             ),
             (
                 "run_skill_capability",
                 "since and until bound the message, not session activity",
-                "rather than session activity",
+                "the message's own timestamp, not session activity",
             ),
             (
                 "run_skill_capability",
                 "the accepted time formats",
-                "RFC 3339 instant or a relative form; see `aise dates`",
+                "RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01",
             ),
             // Twelve filters dropped "omit for none" or "omit for all" for one convention.
             (
@@ -12664,17 +12889,17 @@ mod tests {
             (
                 "search_messages",
                 "which message class kinds omits",
-                "the one message class omitted when kinds is omitted",
+                "the one class omitted when kinds is omitted",
             ),
             (
                 "search_messages",
                 "which argument continues a page",
-                "page.next_offset is the next offset argument",
+                "page.next_offset is the next offset",
             ),
             (
                 "search_messages",
                 "what receipt_level=summary buys",
-                "receipt_level=summary explains how the search was planned",
+                "receipt_level summary explains how the search was planned",
             ),
             (
                 "search_messages",
@@ -13308,8 +13533,8 @@ mod tests {
         // what keeps three copies from drifting apart.
         let tool_doc = search_messages["description"].as_str().unwrap();
         for required in [
-            "lines_per_message applies its line window first",
-            "never change matching, ordering, result count, context membership, or includes",
+            "lines_per_message (line window first)",
+            "never matching, order, count, context, or includes",
             "detail conflicts with lines_per_message, field_view, and match_view",
         ] {
             assert!(
@@ -13336,10 +13561,7 @@ mod tests {
         );
         // Which regex dialect and how bounded the fuzzy match is are facts an enum token cannot
         // carry, so they are stated once in the channel every client forwards whole.
-        for required in [
-            "query_mode=regex is Rust regex syntax",
-            "bounded fuzzy match",
-        ] {
+        for required in ["regex is Rust regex", "bounded fuzzy match"] {
             assert!(
                 tool_doc.contains(required),
                 "missing {required:?} from tool.description: {tool_doc}"
@@ -13379,7 +13601,7 @@ mod tests {
             .unwrap();
         let advertised = format!("{}{receipt_description}", search_messages["description"]);
         assert!(
-            advertised.contains("receipt_level=summary explains how the search was planned"),
+            advertised.contains("receipt_level summary explains how the search was planned"),
             "the advertised text must say what summary buys: {advertised}"
         );
         assert!(
@@ -13762,7 +13984,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            field_view_prose.contains("omit for max_chars 10"),
+            field_view_prose.contains("omit for {kind:max_chars,max_chars:10}"),
             "{field_view_prose}"
         );
         assert!(get_session["description"]
