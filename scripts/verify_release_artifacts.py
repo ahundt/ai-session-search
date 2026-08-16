@@ -129,6 +129,22 @@ def _verify_wheel_tags(
             )
 
 
+def _verify_wheel_sboms_name_no_checkout(
+    path: pathlib.Path, archive: zipfile.ZipFile, names: list[str]
+) -> None:
+    # maturin records workspace crates in the embedded SBOM as path+file://<checkout>/...,
+    # so an unrewritten wheel names the runner's or maintainer's directory. The wheels job
+    # and prepare_packages rewrite it to workspace:<relative> with scripts/sanitize_sboms.py;
+    # a wheel that reaches verification unrewritten fails here rather than shipping the
+    # path, as the first published release did.
+    for name in names:
+        if WHEEL_SBOM_PATTERN.search(name) and b"path+file://" in archive.read(name):
+            raise VerificationError(
+                f"{path.name}: {name} names the build machine's checkout with path+file://; "
+                "run scripts/sanitize_sboms.py --root <checkout> on the wheel first"
+            )
+
+
 def verify_wheel(path: pathlib.Path) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -158,6 +174,7 @@ def verify_wheel(path: pathlib.Path) -> None:
                 f"{path.name}: expected only {EXPECTED_CONSOLE_SCRIPTS!r}, got {console_scripts!r}"
             )
         _verify_wheel_tags(path, archive, names)
+        _verify_wheel_sboms_name_no_checkout(path, archive, names)
 
     required = {
         "LICENSE",

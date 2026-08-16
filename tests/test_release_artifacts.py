@@ -208,6 +208,33 @@ def test_rejects_wheel_with_no_sbom_to_check(tmp_path: Path) -> None:
         verify_wheel_build_clock(_wheel(tmp_path / "package.whl"), PINNED_EPOCH)
 
 
+def test_rejects_wheel_whose_sbom_names_the_build_machine_path(tmp_path: Path) -> None:
+    # maturin records workspace crates as path+file://<checkout>/rust/<crate>, which is the
+    # runner's or maintainer's directory. The wheels job rewrites it to workspace:<relative>
+    # before this runs; a wheel that reaches verification unrewritten must fail rather than
+    # ship the path, which is exactly what the first published release did.
+    wheel = _wheel(
+        tmp_path / "package.whl",
+        sbom={
+            "bomFormat": "CycloneDX",
+            "metadata": {
+                "timestamp": PINNED_TIMESTAMP,
+                "component": {"bom-ref": "path+file:///Users/runner/work/repo/repo/rust/core#core@1.0.0"},
+            },
+        },
+    )
+
+    with pytest.raises(VerificationError, match=r"path\+file://"):
+        verify(wheel)
+
+    verify(
+        _wheel(
+            tmp_path / "clean.whl",
+            sbom={"bomFormat": "CycloneDX", "metadata": {"component": {"bom-ref": "workspace:rust/core#core@1.0.0"}}},
+        )
+    )
+
+
 def test_rejects_wheel_whose_sbom_timestamp_is_unparseable(tmp_path: Path) -> None:
     wheel = _wheel(
         tmp_path / "package.whl",

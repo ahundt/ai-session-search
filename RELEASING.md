@@ -275,7 +275,8 @@ Before tagging, confirm:
   `path+file://<checkout>/...`, so an unrewritten wheel carries the directory it was built in
   (the runner's checkout in the first published release, the maintainer's home locally).
   `scripts/sanitize_sboms.py` rewrites the wheel in place, both from `scripts.prepare_packages`
-  and in the `wheels` job of `publish.yml`, and refuses a path outside the checkout.
+  and in the `wheels` job of `publish.yml`, and refuses a path outside the checkout;
+  `scripts.verify_release_artifacts` then rejects any wheel that still holds `path+file://`.
 
 ## TestPyPI rehearsal
 
@@ -324,8 +325,9 @@ holds that role and is unaffected.
 1. reruns the reusable CI and metadata gates;
 2. builds each wheel, native archive, sdist, and crate once, pinning the build clock to the
    commit, rewriting each wheel's embedded SBOM to `workspace:` references, and then requiring
-   that SBOM to record the exact pinned clock, so a manylinux container that never received
-   the pin fails the job instead of shipping a wheel that cannot be rebuilt from its commit;
+   that SBOM to record the exact pinned clock and no `path+file://` path, so a manylinux
+   container that never received the pin, or a wheel that skipped the rewrite, fails the job
+   instead of shipping;
 3. installs and tests the exact artifacts on their target runners;
 4. verifies the complete artifact set, writes `SHA256SUMS`, and creates GitHub build-provenance
    attestations;
