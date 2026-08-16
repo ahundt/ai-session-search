@@ -1744,6 +1744,38 @@ struct NativeReconstructedFileVersions {
     inner: ai_session_search::files::ReconstructedFileVersions,
 }
 
+/// One published file version, with the session and version it came from and its content digest.
+// `Clone` exists so the receipt can expose a `Vec` of these by value; the type is only ever
+// returned, never accepted as an argument, so no `FromPyObject` derive is wanted.
+#[pyclass(
+    name = "PublishedFileVersion",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+struct NativePublishedFileVersion {
+    #[pyo3(get)]
+    source_session_id: String,
+    #[pyo3(get)]
+    version: usize,
+    #[pyo3(get)]
+    path: PathBuf,
+    #[pyo3(get)]
+    sha256: String,
+}
+
+impl From<ai_session_search::files::PublishedFileVersion> for NativePublishedFileVersion {
+    fn from(published: ai_session_search::files::PublishedFileVersion) -> Self {
+        Self {
+            source_session_id: published.source_session_id,
+            version: published.version,
+            path: published.path,
+            sha256: published.sha256,
+        }
+    }
+}
+
 /// Receipt for an atomically published directory of recovered file versions.
 #[pyclass(
     name = "RecoveryPublicationReceipt",
@@ -1754,7 +1786,7 @@ struct NativeRecoveryPublicationReceipt {
     #[pyo3(get)]
     destination: PathBuf,
     #[pyo3(get)]
-    files: Vec<PathBuf>,
+    files: Vec<NativePublishedFileVersion>,
 }
 
 impl From<ai_session_search::files::RecoveryPublicationReceipt>
@@ -1763,7 +1795,11 @@ impl From<ai_session_search::files::RecoveryPublicationReceipt>
     fn from(receipt: ai_session_search::files::RecoveryPublicationReceipt) -> Self {
         Self {
             destination: receipt.destination,
-            files: receipt.files,
+            files: receipt
+                .files
+                .into_iter()
+                .map(NativePublishedFileVersion::from)
+                .collect(),
         }
     }
 }
@@ -4953,6 +4989,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeFileCrossRef>()?;
     module.add_class::<NativeReconstructedFile>()?;
     module.add_class::<NativeReconstructedFileVersions>()?;
+    module.add_class::<NativePublishedFileVersion>()?;
     module.add_class::<NativeRecoveryPublicationReceipt>()?;
     module.add_class::<NativeExportDocument>()?;
     module.add_class::<NativeExportPublicationReceipt>()?;

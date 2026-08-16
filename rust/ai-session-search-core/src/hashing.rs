@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 ///
 /// Callers digest the **exact bytes they read or wrote**, not a re-serialized value, so that a
 /// whitespace- or comment-only edit still changes the digest.
-pub(crate) fn sha256(content: &[u8]) -> String {
+pub fn sha256(content: &[u8]) -> String {
     lower_hex(Sha256::digest(content).as_ref())
 }
 

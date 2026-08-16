@@ -18,7 +18,7 @@ mod executable_alias;
 pub mod export;
 pub mod files;
 mod fts;
-mod hashing;
+pub mod hashing;
 pub mod indexer;
 pub mod inspect;
 pub(crate) mod integrations;

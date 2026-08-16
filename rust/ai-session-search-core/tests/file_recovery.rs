@@ -499,13 +499,33 @@ fn all_versions_publish_as_one_complete_directory_without_overwrite() {
         receipt
             .files
             .iter()
-            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|published| {
+                (
+                    published
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    published.version,
+                )
+            })
             .collect::<Vec<_>>(),
-        ["app_v1.py", "app_v2.py", "app_v3.py"]
+        [
+            ("app_v1.py".to_string(), 1),
+            ("app_v2.py".to_string(), 2),
+            ("app_v3.py".to_string(), 3),
+        ]
     );
+    let published_v3 = std::fs::read_to_string(destination.join("app_v3.py")).unwrap();
+    assert_eq!(published_v3, "L1\nLINE2\nL3");
+    // Every published version names the session it was recovered from and digests the exact bytes
+    // written, so the directory is self-describing without querying the index again.
+    let third = &receipt.files[2];
+    assert_eq!(third.source_session_id, "claude:sess-fr-1");
     assert_eq!(
-        std::fs::read_to_string(destination.join("app_v3.py")).unwrap(),
-        "L1\nLINE2\nL3"
+        third.sha256,
+        ai_session_search::hashing::sha256(published_v3.as_bytes())
     );
 
     let error = service

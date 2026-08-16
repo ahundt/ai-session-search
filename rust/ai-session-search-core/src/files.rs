@@ -372,11 +372,26 @@ pub struct ReconstructedFile {
     pub content: String,
 }
 
+/// One published version: which session and version it was reconstructed from, where it landed,
+/// and the SHA-256 of the exact bytes written there.
+///
+/// A recovered file is evidence about a session, so the receipt has to say which session and which
+/// version of the file it came from. Reporting only the destination path left a directory of
+/// `name_vN` files whose provenance could be re-derived only by searching the index again, while
+/// the single-version restore beside it had always printed all four facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedFileVersion {
+    pub source_session_id: String,
+    pub version: usize,
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 /// Receipt for an atomically published, non-replacing directory of reconstructed versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveryPublicationReceipt {
     pub destination: PathBuf,
-    pub files: Vec<PathBuf>,
+    pub files: Vec<PublishedFileVersion>,
 }
 
 fn versioned_output_name(reconstructed: &ReconstructedFile) -> PathBuf {
@@ -450,8 +465,14 @@ where
     let mut files = Vec::new();
     for reconstructed in std::iter::once(first).chain(versions) {
         let name = versioned_output_name(&reconstructed);
-        staging.write(&name, reconstructed.content.as_bytes())?;
-        files.push(destination.join(name));
+        let content = reconstructed.content.as_bytes();
+        staging.write(&name, content)?;
+        files.push(PublishedFileVersion {
+            source_session_id: reconstructed.session_id,
+            version: reconstructed.version,
+            path: destination.join(name),
+            sha256: crate::hashing::sha256(content),
+        });
     }
     staging.publish(destination)?;
     Ok(RecoveryPublicationReceipt {
@@ -1007,6 +1028,17 @@ fn run_extract_all(db: &Db, args: &FilesExtractArgs) -> Result<()> {
             args.file,
             receipt.destination.display()
         );
+        // One line per version, carrying the same evidence a single-version restore prints, so a
+        // published directory can be audited without querying the index again.
+        for published in &receipt.files {
+            println!(
+                "  v{} from session {} -> {} (sha256:{})",
+                published.version,
+                published.source_session_id,
+                published.path.display(),
+                published.sha256
+            );
+        }
         return Ok(());
     }
 

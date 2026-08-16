@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 import sqlite3
@@ -1053,8 +1054,16 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         (4, "reset"),
     ]
     assert publication.destination == tmp_path / "published-versions"
-    assert [path.name for path in publication.files] == ["jan_v1.py", "jan_v2.py", "jan_v4.py"]
+    assert [(published.path.name, published.version) for published in publication.files] == [
+        ("jan_v1.py", 1),
+        ("jan_v2.py", 2),
+        ("jan_v4.py", 4),
+    ]
     assert (publication.destination / "jan_v4.py").read_text(encoding="utf-8") == "reset"
+    # Every published version names its source session and digests the bytes actually written, so
+    # a recovered directory can be audited without querying the index again.
+    assert {published.source_session_id for published in publication.files} == {"claude:analysis"}
+    assert publication.files[2].sha256 == hashlib.sha256(b"reset").hexdigest()
     with pytest.raises(RuntimeError, match="already exists"):
         search.publish_file_versions(
             "jan.py",

@@ -55,6 +55,7 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "FileCrossRef",
     "ReconstructedFile",
     "ReconstructedFileVersions",
+    "PublishedFileVersion",
     "RecoveryPublicationReceipt",
     "ExportDocument",
     "ExportPublicationReceipt",
@@ -518,11 +519,20 @@ class ReconstructedFileVersions:
     def __next__(self) -> ReconstructedFile: ...
 
 @final
+class PublishedFileVersion:
+    """One published file version, with its source session, version, path, and content digest."""
+
+    source_session_id: str
+    version: int
+    path: Path
+    sha256: str
+
+@final
 class RecoveryPublicationReceipt:
     """Receipt for an atomically published directory of recovered file versions."""
 
     destination: Path
-    files: list[Path]
+    files: list[PublishedFileVersion]
 
 @final
 class ExportDocument:
