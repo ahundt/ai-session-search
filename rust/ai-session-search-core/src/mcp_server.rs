@@ -643,7 +643,15 @@ fn execute_official_tool_call(
         /// The result, the configured delivery ceiling, and what a retry could ask for, all read
         /// under the same lock that produced the result, so the policy applied and the advice
         /// given both describe the call this actually was.
+        ///
+        /// This variant carries a result that cost no database work, so producing it under the
+        /// lock costs no other request anything.
         Direct(Result<ToolResponse, String>, usize, ToolRecovery),
+        /// Everything the schema-only `query_session_index` branch needs, read under the lock so
+        /// that its own SQLite read can run after the guard is dropped. That read opens a
+        /// connection and scans the catalogue, which is blocking database work; the type-level
+        /// contract above says a tool call does that with the mutex released.
+        SchemaOnly(Config, usize, ToolRecovery),
         Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
     }
 
@@ -674,8 +682,8 @@ fn execute_official_tool_call(
         }
         if is_schema_only_index_call(&params) {
             let ceiling = server.config.mcp.max_tool_result_chars;
-            return Ok(Preparation::Direct(
-                tool_query_session_index_cancellable(&args, &server.config, Some(&cancellation)),
+            return Ok(Preparation::SchemaOnly(
+                server.config.clone(),
                 ceiling,
                 recovery,
             ));
@@ -717,21 +725,27 @@ fn execute_official_tool_call(
     })();
 
     let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
+    let deliver = |result: Result<ToolResponse, String>, ceiling, recovery| match result {
+        Ok(response) => delivered_within_ceiling(
+            tool_response_to_rmcp(response),
+            &tool_name,
+            ceiling,
+            recovery,
+            Some(cancellation.flag()),
+        ),
+        Err(error) => rmcp_tool_error(error),
+    };
     let (config, inputs, refresh_after_call) = match prepared {
         Ok(Preparation::Direct(result, ceiling, recovery)) => {
-            return (
-                match result {
-                    Ok(response) => delivered_within_ceiling(
-                        tool_response_to_rmcp(response),
-                        &tool_name,
-                        ceiling,
-                        recovery,
-                        Some(cancellation.flag()),
-                    ),
-                    Err(error) => rmcp_tool_error(error),
-                },
-                false,
-            );
+            return (deliver(result, ceiling, recovery), false);
+        }
+        Ok(Preparation::SchemaOnly(config, ceiling, recovery)) => {
+            // The guard is gone by now, so the catalogue read below waits on SQLite alone rather
+            // than on every other MCP request for this connection.
+            #[cfg(test)]
+            let _schema_activity = reader_probe.as_ref().map(|probe| probe.enter());
+            let result = tool_query_session_index_cancellable(&args, &config, Some(&cancellation));
+            return (deliver(result, ceiling, recovery), false);
         }
         Ok(Preparation::Reader(config, inputs, refresh_after_call)) => {
             (config, inputs, refresh_after_call)
@@ -11259,6 +11273,80 @@ mod tests {
             assert_eq!(first.unwrap().is_error, Some(false));
             assert_eq!(second.unwrap().is_error, Some(false));
             assert_eq!(probe.max_active.load(Ordering::Acquire), 2);
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    /// The schema-only `query_session_index` branch is the one tool path that answers without a
+    /// prepared reader, so it is the one that could read SQLite while still holding the state
+    /// mutex. Every other MCP request for the connection — `tools/list` included — waits on that
+    /// mutex, so holding it across a catalogue read would put them behind SQLite's own busy
+    /// timeout. The probe parks the call at the moment of the read and the mutex is sampled there.
+    #[test]
+    fn official_rmcp_schema_only_index_call_reads_without_holding_the_state_mutex() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let probe = Arc::new(TestReaderProbe::block_first_until_test());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(1).unwrap())
+                    .unwrap()
+                    .with_reader_probe(Arc::clone(&probe));
+            let inner = Arc::clone(&server.inner);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let peer = client.peer().clone();
+            // No `sql` argument, which is what makes this the schema-only branch.
+            let call = tokio::spawn(async move {
+                peer.call_tool(rmcp::model::CallToolRequestParams::new(
+                    "query_session_index",
+                ))
+                .await
+            });
+
+            for _ in 0..500 {
+                if probe.entries.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                probe.entries.load(Ordering::Acquire),
+                1,
+                "the schema-only call must reach its database read"
+            );
+            // Sampled here and asserted after the barrier is released: a failed assertion would
+            // otherwise leave the parked call waiting forever and turn this into a hang.
+            let mutex_was_free = inner.try_lock().is_ok();
+            probe.release_first();
+            assert!(
+                mutex_was_free,
+                "the state mutex is free while the schema-only call reads the catalogue"
+            );
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+                .await
+                .expect("the schema-only call completes")
+                .unwrap()
+                .expect("query_session_index returns a tool result");
+            assert_eq!(result.is_error, Some(false));
+            let text = &result.content[0].as_text().unwrap().text;
+            assert!(text.contains("sessions"), "{text}");
 
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");
