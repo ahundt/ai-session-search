@@ -7,6 +7,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
@@ -240,27 +241,67 @@ impl UnicodeLowerNeedle {
     }
 
     pub(crate) fn contains(&self, haystack: &str) -> bool {
+        self.find_in(haystack).is_some()
+    }
+
+    /// The byte range of `haystack` holding its first Unicode-caseless occurrence of the needle.
+    ///
+    /// The range names characters of the original `haystack`, so slicing it is safe and shows the
+    /// text as written. It cannot be read off the folded sequence directly, because folding
+    /// changes how many characters there are: `İ` lowercases to two. The scan therefore tracks
+    /// only where the current source character ends, and once a match completes it walks back
+    /// over source characters, folding each, until it has accounted for the needle's length. A
+    /// match that begins or ends part-way through one character's expansion widens to that whole
+    /// character, which is the only range that can be sliced.
+    ///
+    /// Time is O(haystack) folded characters plus O(needle) for the one backward walk, and no
+    /// allocation happens on the scan, which is what keeps [`Self::contains`] cheap enough for
+    /// the per-record ranking loop that calls it for every haystack of every session.
+    pub(crate) fn find_in(&self, haystack: &str) -> Option<Range<usize>> {
         if self.pattern.is_empty() {
-            return true;
+            return Some(0..0);
         }
 
         let mut matched = 0_usize;
-        for lowered in haystack
-            .chars()
-            .flat_map(|character| character.to_lowercase())
-        {
-            while matched > 0 && lowered != self.pattern[matched] {
-                matched = self.prefix[matched - 1];
-            }
-            if lowered == self.pattern[matched] {
-                matched += 1;
-                if matched == self.pattern.len() {
-                    return true;
+        for (offset, character) in haystack.char_indices() {
+            let character_end = offset + character.len_utf8();
+            for lowered in character.to_lowercase() {
+                while matched > 0 && lowered != self.pattern[matched] {
+                    matched = self.prefix[matched - 1];
+                }
+                if lowered == self.pattern[matched] {
+                    matched += 1;
+                    if matched == self.pattern.len() {
+                        let start = source_start_of_folded_match(
+                            haystack,
+                            character_end,
+                            self.pattern.len(),
+                        );
+                        return Some(start..character_end);
+                    }
                 }
             }
         }
-        false
+        None
     }
+}
+
+/// Where in `haystack` a match of `folded_len` folded characters ending at byte `end` begins.
+///
+/// Source characters are walked backwards from `end`, subtracting how many folded characters each
+/// produces, and the one that exhausts the count is the one the match starts inside. Returning
+/// that character's own start offset widens the range to a character boundary.
+fn source_start_of_folded_match(haystack: &str, end: usize, folded_len: usize) -> usize {
+    let mut remaining = folded_len;
+    let mut start = end;
+    for (offset, character) in haystack[..end].char_indices().rev() {
+        start = offset;
+        remaining = remaining.saturating_sub(character.to_lowercase().count());
+        if remaining == 0 {
+            break;
+        }
+    }
+    start
 }
 
 /// The compact display string plus whether non-whitespace content was omitted at the end.
@@ -574,57 +615,47 @@ pub fn snippet_from_match(value: &str, query: &str, max_len: usize) -> String {
         return "(no snippet available)".to_string();
     }
 
-    let compact_lower = compact.to_ascii_lowercase();
-    let query_lower = query.to_ascii_lowercase();
-    if let Some(index) = compact_lower.find(&query_lower) {
-        let half = max_len / 2;
-        let mut start = index.saturating_sub(half);
-        let mut end = (index + query.len() + half).min(compact.len());
-
-        while start > 0 && !compact.is_char_boundary(start) {
-            start -= 1;
-        }
-        while end < compact.len() && !compact.is_char_boundary(end) {
-            end += 1;
-        }
-
-        let mut snippet = compact[start..end].to_string();
-        if start > 0 {
-            snippet = format!("...{snippet}");
-        }
-        if end < compact.len() {
-            snippet.push_str("...");
-        }
-        return snippet;
+    // The same Unicode-caseless locate the session matcher ranks with, so a hit it found on
+    // `CAFÉ` for `café` is a hit this can center on. Folding only ASCII here would agree with it
+    // on ASCII queries and quietly disagree on every other one, returning the head of the field
+    // as the evidence for a match that is elsewhere in the text.
+    let query_lower = query.to_lowercase();
+    if let Some(found) = UnicodeLowerNeedle::from_lowered(&query_lower).find_in(&compact) {
+        return window_around_match(&compact, found, max_len);
     }
 
     for token in query_lower.split_whitespace() {
-        if token.is_empty() {
-            continue;
-        }
-        if let Some(index) = compact_lower.find(token) {
-            let half = max_len / 2;
-            let mut start = index.saturating_sub(half);
-            let mut end = (index + token.len() + half).min(compact.len());
-            while start > 0 && !compact.is_char_boundary(start) {
-                start -= 1;
-            }
-            while end < compact.len() && !compact.is_char_boundary(end) {
-                end += 1;
-            }
-
-            let mut snippet = compact[start..end].to_string();
-            if start > 0 {
-                snippet = format!("...{snippet}");
-            }
-            if end < compact.len() {
-                snippet.push_str("...");
-            }
-            return snippet;
+        if let Some(found) = UnicodeLowerNeedle::from_lowered(token).find_in(&compact) {
+            return window_around_match(&compact, found, max_len);
         }
     }
 
     truncate_for_display(&compact, max_len)
+}
+
+/// A window of `compact` around `found`, extended by half of `max_len` on each side, with `...`
+/// marking each end that was cut. Bounds move outward to character boundaries so the slice is
+/// valid and no character is shown in half.
+fn window_around_match(compact: &str, found: Range<usize>, max_len: usize) -> String {
+    let half = max_len / 2;
+    let mut start = found.start.saturating_sub(half);
+    let mut end = (found.end + half).min(compact.len());
+
+    while start > 0 && !compact.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < compact.len() && !compact.is_char_boundary(end) {
+        end += 1;
+    }
+
+    let mut snippet = compact[start..end].to_string();
+    if start > 0 {
+        snippet = format!("...{snippet}");
+    }
+    if end < compact.len() {
+        snippet.push_str("...");
+    }
+    snippet
 }
 
 pub fn highlight_matches(value: &str, query: &str) -> String {
@@ -2292,6 +2323,92 @@ pub(crate) mod tests {
         let text = "alpha beta gamma delta epsilon zeta eta theta";
         let snippet = snippet_from_match(text, "delta", 20);
         assert!(snippet.contains("delta"));
+    }
+
+    /// The snippet has to locate a match the same way the matcher that produced the hit did.
+    ///
+    /// Session ranking asks `UnicodeLowerNeedle`, which folds case for the whole of Unicode. A
+    /// snippet that folds only ASCII disagrees with it on every non-ASCII query: the session is
+    /// returned and ranked on a real match, and the evidence shown beside it is the head of the
+    /// field, with the match nowhere in view.
+    #[test]
+    fn snippet_locates_the_same_match_the_session_matcher_ranked_on() {
+        // These are cases where `to_lowercase` differs from `to_ascii_lowercase`. Full case
+        // folding is a different operation and is deliberately not the contract here: `ß` and
+        // `ss` are distinct under `to_lowercase`, so the matcher does not equate them either.
+        let cases = [
+            ("café", "CAFÉ", "ordinary accented text"),
+            ("МОСКВА", "москва", "Cyrillic"),
+            ("ΣΊΣΥΦΟΣ", "σίσυφος", "Greek final sigma"),
+            (
+                "i\u{307}stanbul",
+                "İSTANBUL",
+                "İ lowercases into two characters",
+            ),
+        ];
+        for (query, occurrence, why) in cases {
+            let lowered = query.to_lowercase();
+            let value = format!(
+                "{}{occurrence}{}",
+                "padding ".repeat(30),
+                " tail".repeat(30)
+            );
+            assert!(
+                UnicodeLowerNeedle::from_lowered(&lowered).contains(&value),
+                "the matcher itself has to match for the snippet to be at fault: {why}"
+            );
+
+            let snippet = snippet_from_match(&value, query, 40);
+            assert!(
+                snippet.contains(occurrence),
+                "{why}: query={query:?} occurrence={occurrence:?} snippet={snippet:?}"
+            );
+        }
+    }
+
+    /// Token fallback, used when the whole query is absent but one of its words is present.
+    #[test]
+    fn snippet_falls_back_to_a_matching_query_word_case_insensitively() {
+        let value = format!("{}RÉSUMÉ here{}", "padding ".repeat(30), " tail".repeat(30));
+        let snippet = snippet_from_match(&value, "missing résumé", 40);
+        assert!(snippet.contains("RÉSUMÉ"), "{snippet}");
+    }
+
+    /// A query with no occurrence still gets the head window it always got.
+    #[test]
+    fn snippet_without_a_match_shows_the_head_of_the_value() {
+        let value = "alpha beta gamma delta";
+        assert_eq!(
+            snippet_from_match(value, "nothing-here", 12),
+            "alpha bet..."
+        );
+        assert_eq!(
+            snippet_from_match("   \n ", "anything", 12),
+            "(no snippet available)"
+        );
+    }
+
+    /// The located range names characters of the original text, so slicing it is safe and shows
+    /// the text as written even where folding changed how many characters there are.
+    #[test]
+    fn unicode_needle_reports_the_original_byte_range_of_its_match() {
+        let needle = UnicodeLowerNeedle::from_lowered("i\u{307}st");
+        let haystack = "xxİSTANBUL";
+        let found = needle
+            .find_in(haystack)
+            .expect("İ folds to i + combining dot");
+        // `İ` occupies bytes 2..4, so the three source characters the four folded ones came from
+        // span 2..6. The range widens to whole characters, which is what makes the slice valid.
+        assert_eq!(&haystack[found.clone()], "İST");
+        assert_eq!(found, 2..6);
+
+        assert_eq!(
+            UnicodeLowerNeedle::from_lowered("").find_in("abc"),
+            Some(0..0)
+        );
+        assert_eq!(UnicodeLowerNeedle::from_lowered("zz").find_in("abc"), None);
+        let ascii = UnicodeLowerNeedle::from_lowered("beta");
+        assert_eq!(ascii.find_in("alpha beta gamma"), Some(6..10));
     }
 
     #[test]
