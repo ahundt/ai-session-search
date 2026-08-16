@@ -578,6 +578,21 @@ criteria, UX consequences, error behavior, ownership states, complexity bounds, 
 verification plan, and unresolved external actions. New summaries must retain verified mechanisms
 instead of erasing useful prior analysis.
 
+Open design decision, recorded 2026-08-16 for the maintainer: **where the resume command lives.**
+Today `util::resume_plan` is called directly by `aise resume` (cli.rs) and by the MCP
+`get_resume_command` tool (mcp_server.rs); it is not exposed through the shared service, so
+Python has no session-level resume (only the provider-status `resume_command`), and neither
+`get_session` nor `aise show` carries the command. The candidate design: compute `resume`
+(`{command, cwd}` or an unavailable reason with the `aise show`/`aise export` fallbacks) once at
+the shared typed layer as session metadata; return it always on `get_session` (structured
+`session.resume` plus one text line) and `aise show`; make it opt-in on `list_sessions` /
+`search_sessions` / `aise list|search` through the existing `include` group so paged output stays
+short (roughly 80 bytes per row otherwise); expose it on the Python `SessionRecord` with stubs.
+`get_resume_command` and `aise resume` then remain only as the cheapest id-to-command hop, and
+whether to retire them is the maintainer's call because it removes a public tool. Costs are one
+`resume_plan` string formatting per returned session; no index read. Deferred until decided; the
+`REQ002-share-typed-contract` gap (Python has no resume) is part of the same change.
+
 ### REQ033-commit-coherent-progress
 
 Commit coherent, recoverable progress points. Commit messages name exact files or components,
