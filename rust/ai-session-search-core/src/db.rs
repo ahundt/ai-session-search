@@ -3181,7 +3181,9 @@ impl Db {
                 .then_with(|| right.1.cmp(&left.1))
                 .then_with(|| left_name.cmp(right_name))
         });
-        let mut top = Vec::with_capacity(ranked_limit);
+        // Sized by rows found, never by the request: `ranked_limit` is `offset + limit` from the
+        // caller, and reserving it up front asked for ~150 GB at offset 1e9 and overflowed at 1e17.
+        let mut top = Vec::new();
         let mut matched = 0_i64;
         for tier in scored_names.chunk_by(|left, right| left.1 == right.1) {
             if top.len() == ranked_limit {
@@ -8674,6 +8676,42 @@ mod tests {
         let explain = explain.unwrap();
         assert_eq!(explain.corpus, 10_002);
         assert_eq!(explain.candidates, Some(10_002));
+    }
+
+    /// `offset` is caller input on every surface and no schema caps it. The ranked page
+    /// (`offset + limit` rows) must be retained memory proportional to rows actually found, never
+    /// a reservation sized by the request: `Vec::with_capacity(offset + limit)` panicked with
+    /// "capacity overflow" at `--offset 100000000000000000` (CLI, and inside the MCP worker) and
+    /// asked the allocator for ~150 GB at `--offset 1000000000` before that.
+    #[test]
+    fn fuzzy_tool_name_offset_beyond_the_corpus_returns_empty_without_reserving_the_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test');
+                 insert into messages (session_id, provider, seq, role, tool_name, content)
+                 values ('s1', 'claude', 0, 'tool', 'exec_command', '');",
+            )
+            .unwrap();
+        for offset in [100_000_000_000_000_000_usize, 1_000_000_000] {
+            let hits = db
+                .search_messages(
+                    "exec",
+                    &MessageFilters {
+                        field: Some(SearchField::ToolName),
+                        match_mode: MessageSearchMode::Fuzzy,
+                        limit: 1,
+                        offset,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert!(hits.is_empty(), "offset {offset} lies past the only row");
+        }
     }
 
     #[test]
