@@ -361,6 +361,21 @@ General configuration location and runtime overrides follow explicit option, app
 `AI_SESSION_SEARCH_*` environment variable, platform config, then embedded default. Full receipts
 must expose the selected origin rather than only the final value.
 
+MCP argument presence is the caller's own. The `search_messages` and `run_skill_capability`
+schemas state every omission value in the property description ("Omit for 20") and advertise no
+`default` keyword: Claude Code materializes each JSON-schema `default` into the call before
+dispatch, which made an absent value and a typed one indistinguishable to the server (a
+materialized `limit` beside `all_results` tripped the exclusivity rule; a materialized page size
+outranked a purpose bundle). Stripping values equal to the advertised default at dispatch was
+tried for one day (2026-08-15) and inverted the defect: a typed value equal to the default then
+lost to a purpose bundle on MCP while winning on the CLI and in Python, and full receipts reported
+it as a configured default rather than the call. Withholding the keyword removes the ambiguity at
+its source; the retry advice reads the resolved page from the same configured request that
+rendered the prose (`configured_omitted_page`), and
+`message_search_family_states_defaults_in_prose_and_advertises_no_default_keyword` pins both.
+The session tools keep their `default` keywords because for them an omitted and a typed default
+value resolve identically.
+
 ### REQ014-use-platform-app-paths
 
 Config, database, cache, transaction receipts, update state, and canonical app-owned skills must

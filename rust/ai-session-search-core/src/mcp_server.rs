@@ -647,7 +647,7 @@ fn execute_official_tool_call(
         Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
     }
 
-    let mut args = Value::Object(request.arguments.unwrap_or_default());
+    let args = Value::Object(request.arguments.unwrap_or_default());
     let params = json!({ "name": request.name, "arguments": args });
     let prepared = (|| -> Result<Preparation, String> {
         if cancellation.is_cancelled() {
@@ -657,15 +657,17 @@ fn execute_official_tool_call(
             .lock()
             .map_err(|_| "MCP state lock is poisoned".to_string())?;
         validate_tool_call(&params, server.advertised_tools())?;
-        args = without_advertised_defaults(
-            &request.name,
-            std::mem::take(&mut args),
-            server.advertised_tools(),
-        );
+        // `advertised_tools()` populates the per-connection cache under `&mut`; once it has, the
+        // catalogue and the configuration are read side by side without cloning either.
+        server.advertised_tools();
         let recovery = ToolRecovery::for_call(
             params["name"].as_str().unwrap_or_default(),
             &args,
-            server.advertised_tools(),
+            server
+                .advertised_tools
+                .as_ref()
+                .expect("advertised_tools() just populated the cache"),
+            &server.config,
         );
         if let Some(error) = &server.roots_error {
             return Err(format!("invalid MCP roots authority: {error}"));
@@ -769,7 +771,12 @@ fn execute_official_tool_call(
             tool_response_to_rmcp(response),
             &tool_name,
             app.config().mcp.max_tool_result_chars,
-            ToolRecovery::for_call(&tool_name, &args, &advertised_tools(app.config())),
+            ToolRecovery::for_call(
+                &tool_name,
+                &args,
+                &advertised_tools(app.config()),
+                app.config(),
+            ),
             Some(cancellation.flag()),
         ),
         Err(error) => rmcp_tool_error(error),
@@ -908,7 +915,7 @@ impl ToolRecovery {
     /// property, put there so the model can see it (the generated message-search schema descriptions).
     /// Deriving from it keeps one owner: a tool that gains or loses pagination changes its schema
     /// and this follows, where a hand-listed table would keep answering for the old surface.
-    fn for_call(tool_name: &str, args: &Value, advertised: &Value) -> Self {
+    fn for_call(tool_name: &str, args: &Value, advertised: &Value, config: &Config) -> Self {
         let properties = advertised
             .as_array()
             .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
@@ -928,18 +935,41 @@ impl ToolRecovery {
                 reducers,
             };
         };
-        // An explicit argument wins, then the default the schema advertises. `limit=0` means
-        // "every match" on the session tools: unbounded, so there is no requested page to halve,
-        // but the tool still pages and a finite retry is still available.
+        // An explicit argument wins, then the default the schema advertises, then the page the
+        // configuration resolves for the tools that state their omission value in prose rather
+        // than a `default` keyword (see `strip_default_keywords`). `limit=0` means "every match"
+        // on the session tools: unbounded, so there is no requested page to halve, but the tool
+        // still pages and a finite retry is still available.
         let explicit = args.get("limit").and_then(Value::as_u64);
-        let paging =
-            match explicit.or_else(|| limit_property.get("default").and_then(Value::as_u64)) {
-                Some(0) | None => ToolPaging::EveryMatch,
-                Some(page) => usize::try_from(page)
-                    .map(ToolPaging::Page)
-                    .unwrap_or(ToolPaging::EveryMatch),
-            };
+        let paging = match explicit
+            .or_else(|| limit_property.get("default").and_then(Value::as_u64))
+            .or_else(|| configured_omitted_page(tool_name, config))
+        {
+            Some(0) | None => ToolPaging::EveryMatch,
+            Some(page) => usize::try_from(page)
+                .map(ToolPaging::Page)
+                .unwrap_or(ToolPaging::EveryMatch),
+        };
         Self { paging, reducers }
+    }
+}
+
+/// The page an omitted `limit` resolves to on the tools whose schemas carry no `default` keyword:
+/// the same configured request that rendered "Omit for N" into their descriptions, so the model's
+/// text and the retry advice come from one owner. Tools that still advertise the keyword do not
+/// reach this.
+fn configured_omitted_page(tool_name: &str, config: &Config) -> Option<u64> {
+    match tool_name {
+        "search_messages" => {
+            let specification =
+                MessageService::message_search_spec_for_config(config, SearchSurface::Mcp).ok()?;
+            match specification.configured_default().extent() {
+                ResolvedRequestExtent::Page { limit, .. } => Some(limit.get() as u64),
+                ResolvedRequestExtent::AllResults { .. } => Some(0),
+            }
+        }
+        "run_skill_capability" => Some(config.mcp.run_message_classification_limit as u64),
+        _ => None,
     }
 }
 
@@ -1547,37 +1577,6 @@ fn tool_requests_existing_only(params: &Value) -> bool {
         .and_then(|arguments| arguments.get("index_refresh"))
         .and_then(Value::as_str)
         == Some("existing-only")
-}
-
-/// Drop every top-level argument whose value equals the `default` its advertised schema declares.
-///
-/// A JSON-schema `default` promises "absent resolves to this value", and Claude Code takes the
-/// promise literally: it materializes every declared default before it calls the tool, so the
-/// server sees `limit`, `lines_per_message`, `field_view`, and `match_view` on every call whether
-/// or not the model wrote them. Because the advertised default is exactly what an absent value
-/// resolves to, removing an equal value changes nothing a caller can observe except the two
-/// things it must change: a rule that rejects one parameter beside another (`all_results` beside
-/// `limit`, `detail` beside the presentation budgets, `match_view` without a query) no longer
-/// fires on values the caller never wrote, and a `purpose` bundle keeps precedence over a default
-/// the client injected. A value that differs from the default is the caller's own and is kept.
-///
-/// `O(P)` for the tool's `P` advertised properties; the catalogue is the per-connection cached
-/// one, so nothing is rebuilt per call.
-fn without_advertised_defaults(tool_name: &str, args: Value, tools: &Value) -> Value {
-    let Value::Object(mut fields) = args else {
-        return args;
-    };
-    let Some(properties) = tools
-        .as_array()
-        .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
-        .and_then(|tool| tool["inputSchema"]["properties"].as_object())
-    else {
-        return Value::Object(fields);
-    };
-    fields.retain(|key, value| {
-        properties.get(key).and_then(|schema| schema.get("default")) != Some(value)
-    });
-    Value::Object(fields)
 }
 
 fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
@@ -3300,6 +3299,18 @@ fn message_search_mcp_fields(parameter: MessageSearchParameter) -> &'static [&'s
     }
 }
 
+/// Remove the `default` keyword from every property; the omission value each one resolves to is
+/// stated in its description (`render_message_search_field_description` appends "Omit for ..."
+/// for every declared default before this runs). See the call site for why the keyword itself
+/// must not travel to the client.
+fn strip_default_keywords(properties: &mut serde_json::Map<String, Value>) {
+    for schema in properties.values_mut() {
+        if let Some(object) = schema.as_object_mut() {
+            object.remove("default");
+        }
+    }
+}
+
 fn set_schema_default(properties: &mut serde_json::Map<String, Value>, field: &str, value: Value) {
     properties
         .get_mut(field)
@@ -3938,6 +3949,18 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         }
         set_schema_description(properties, field, rendered);
     }
+    // Every default is now stated in prose, so the keyword itself goes. Claude Code materializes
+    // each JSON-schema `default` into the call before dispatch, which made an absent value and a
+    // typed one indistinguishable here: `all_results` arrived beside a `limit` the model never
+    // wrote and was rejected by the rule against the pair, `detail` beside the presentation
+    // budgets likewise, a query-less filter search failed `match_view requires a query`, and a
+    // `purpose` bundle's page size lost to the injected default. Stripping values equal to the
+    // default at dispatch (2026-08-15, one day) fixed those but broke the other direction: an
+    // explicit value equal to the default lost to a purpose bundle here and won on the CLI and in
+    // Python, and full receipts reported it as a configured default rather than the call. With
+    // no keyword to materialize, a value is present exactly when the caller wrote it, and Codex
+    // and VS Code, which delete the keyword before the model sees it, lose nothing.
+    strip_default_keywords(properties);
 
     extract_shared_char_budget_variant(&mut schema);
 
@@ -4475,9 +4498,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "since": { "type": "string", "description": "Lower bound on the message's own timestamp; omit for no bound." },
                             "until": { "type": "string", "description": "Upper bound on the message's own timestamp, inclusive; omit for no bound." },
                             "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
-                            "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit), "default": config.mcp.run_message_classification_limit },
-                            "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide.", "default": false },
-                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
+                            "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit) },
+                            "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide. Omit for one page." },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." }
                         },
                         "required": ["skill"],
                         "additionalProperties": false
@@ -6940,12 +6963,8 @@ mod tests {
         assert!(error.contains("-2"), "{error}");
     }
 
-    /// Mirrors the serve path: validate against the advertised catalogue, drop arguments equal
-    /// to their advertised defaults, then dispatch. Tests that bypass this and call
-    /// `dispatch_tool_cancellable` directly see the raw arguments a client sent.
+    /// Mirrors the serve path: dispatch the arguments exactly as a client sent them.
     fn call_tool(name: &str, arguments: Value, config: &Config, db: &Db) -> Value {
-        let tools = advertised_tools(config);
-        let arguments = without_advertised_defaults(name, arguments, &tools);
         match dispatch_tool_cancellable(name, &arguments, config, db, None) {
             Ok(content) => {
                 let mut result = json!({
@@ -7481,93 +7500,125 @@ mod tests {
         }
     }
 
-    /// Claude Code materializes every JSON-schema `default` before it calls a tool, so the
-    /// server sees `limit`, `lines_per_message`, `field_view`, and `match_view` on every call
-    /// whether or not the model wrote them. A value equal to the advertised default resolves to
-    /// exactly what its absence resolves to, so it must not count as "present" for a rule that
-    /// rejects one parameter beside another. Dogfooded 2026-08-15 from Claude Code: `all_results`
-    /// ("conflicts with limit"), `detail` ("conflicts with lines_per_message, field_view, and
-    /// match_view"), and a query-less filter search ("match_view requires a query") were all
-    /// unreachable, and a `purpose` bundle's page size was silently overridden by the
-    /// materialized default.
+    /// Claude Code materializes every JSON-schema `default` before it calls a tool, so a
+    /// declared default makes an absent value and a typed one indistinguishable to the server.
+    /// Dogfooded 2026-08-15 from Claude Code: `all_results` ("conflicts with limit"), `detail`
+    /// ("conflicts with lines_per_message, field_view, and match_view"), and a query-less filter
+    /// search ("match_view requires a query") were all unreachable, and a `purpose` bundle's page
+    /// size was silently overridden by the materialized default. The message-search family
+    /// therefore states every omission value in prose and advertises no `default` keyword, so a
+    /// present value is always the caller's own: the rules fire only on what was written, and a
+    /// typed value equal to the omission value keeps its `explicit` origin and its precedence
+    /// over purpose bundles, as on the CLI and in Python.
     #[test]
-    fn client_materialized_schema_defaults_never_trip_exclusivity_rules() {
+    fn message_search_family_states_defaults_in_prose_and_advertises_no_default_keyword() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
         let tools = advertised_tools(&config);
-        let properties = tools
-            .as_array()
-            .expect("tools list")
-            .iter()
-            .find(|tool| tool["name"] == "search_messages")
-            .expect("search_messages is served")["inputSchema"]["properties"]
-            .as_object()
-            .expect("properties")
-            .clone();
-        let materialize = |explicit: Value| {
-            let mut args = serde_json::Map::new();
+        // The properties that used to advertise a `default` keyword; each must now say in prose
+        // what omission resolves to.
+        let stated_in_prose: HashMap<&str, &[&str]> = HashMap::from([
+            (
+                "search_messages",
+                &[
+                    "limit",
+                    "all_results",
+                    "offset",
+                    "context",
+                    "context_before",
+                    "context_after",
+                    "lines_per_message",
+                    "field_view",
+                    "match_view",
+                    "include",
+                    "receipt_level",
+                    "match_window",
+                    "query_mode",
+                    "field",
+                    "include_compaction",
+                ][..],
+            ),
+            (
+                "run_skill_capability",
+                &["limit", "all_results", "offset"][..],
+            ),
+        ]);
+        for tool_name in ["search_messages", "run_skill_capability"] {
+            let properties = tools
+                .as_array()
+                .expect("tools list")
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} is served"))["inputSchema"]["properties"]
+                .as_object()
+                .expect("properties")
+                .clone();
             for (name, schema) in &properties {
-                if let Some(default) = schema.get("default") {
-                    args.insert(name.clone(), default.clone());
+                if name == "index_refresh" {
+                    // Injected on every tool by the adapter; omitted and `auto` resolve alike.
+                    continue;
+                }
+                assert!(
+                    schema.get("default").is_none(),
+                    "{tool_name}.{name} advertises a `default` a client would materialize: {schema}"
+                );
+                if stated_in_prose[tool_name].contains(&name.as_str()) {
+                    let description = schema["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    assert!(
+                        description.contains("omit"),
+                        "{tool_name}.{name} must state what omission resolves to: {schema}"
+                    );
                 }
             }
-            for (name, value) in explicit.as_object().expect("explicit args are an object") {
-                args.insert(name.clone(), value.clone());
-            }
-            Value::Object(args)
-        };
-        assert!(
-            properties["limit"].get("default").is_some()
-                && properties["match_view"].get("default").is_some(),
-            "the premise of this test is that rule participants advertise defaults: {properties:?}"
-        );
+        }
 
+        // The rule participants work when the model writes only what it means.
         let every = call_tool(
             "search_messages",
-            materialize(json!({ "query": "hello", "all_results": true })),
+            json!({ "query": "hello", "all_results": true }),
             &config,
             &db,
         );
-        assert!(
-            every["result"]["isError"].is_null(),
-            "all_results beside the materialized default limit: {every}"
-        );
+        assert!(every["result"]["isError"].is_null(), "{every}");
         assert_eq!(
             every["result"]["structuredContent"]["page"]["result_set_extent"],
             json!("all"),
             "{every}"
         );
-
         let compact = call_tool(
             "search_messages",
-            materialize(json!({ "query": "hello", "detail": "compact" })),
+            json!({ "query": "hello", "detail": "compact" }),
             &config,
             &db,
         );
-        assert!(
-            compact["result"]["isError"].is_null(),
-            "detail beside materialized presentation defaults: {compact}"
-        );
+        assert!(compact["result"]["isError"].is_null(), "{compact}");
+        let filter_only = call_tool("search_messages", json!({ "role": "user" }), &config, &db);
+        assert!(filter_only["result"]["isError"].is_null(), "{filter_only}");
 
-        let filter_only = call_tool(
+        // A typed value is the caller's own even when it equals the omission value: it still
+        // participates in the rules and keeps its explicit origin in a full receipt.
+        let typed_pair = call_tool(
             "search_messages",
-            materialize(json!({ "role": "user" })),
+            json!({ "query": "hello", "all_results": true, "limit": 20 }),
             &config,
             &db,
         );
-        assert!(
-            filter_only["result"]["isError"].is_null(),
-            "query-less filter search beside the materialized match_view default: {filter_only}"
-        );
-
-        // A value that differs from the advertised default is the caller's own and still conflicts.
-        let explicit = call_tool(
+        assert_eq!(typed_pair["result"]["isError"], json!(true), "{typed_pair}");
+        let typed_receipt = call_tool(
             "search_messages",
-            materialize(json!({ "query": "hello", "all_results": true, "limit": 7 })),
+            json!({ "query": "hello", "limit": 20, "receipt_level": "full" }),
             &config,
             &db,
         );
-        assert_eq!(explicit["result"]["isError"], json!(true), "{explicit}");
+        assert_eq!(
+            typed_receipt["result"]["structuredContent"]["receipt"]["parameter_origins"]
+                ["result_extent"]["source"],
+            json!("explicit"),
+            "{typed_receipt}"
+        );
     }
 
     #[test]
@@ -12368,10 +12419,20 @@ mod tests {
             properties["definition"]["properties"]["categories"]["minItems"], 1,
             "a direct definition must advertise its nonempty category invariant"
         );
-        assert_eq!(
-            properties["limit"]["default"],
-            json!(config.mcp.run_message_classification_limit),
-            "the advertised default must be the configured one"
+        assert!(
+            properties["limit"]["description"]
+                .as_str()
+                .unwrap()
+                .contains(&format!(
+                    "configured MCP default of {}",
+                    config.mcp.run_message_classification_limit
+                )),
+            "the stated default must be the configured one: {}",
+            properties["limit"]
+        );
+        assert!(
+            properties["limit"]["default"].is_null(),
+            "no `default` keyword for a client to materialize"
         );
         let skill = properties["skill"]["description"].as_str().unwrap();
         assert!(
@@ -13136,17 +13197,20 @@ mod tests {
             get_session["inputSchema"]["properties"]["transcript_lines"]["default"], -40,
             "bare get_session is bounded by default"
         );
-        assert_eq!(
-            search_messages["inputSchema"]["properties"]["context"]["default"], 0,
+        assert!(
+            search_messages["inputSchema"]["properties"]["context"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("omit for 0"),
             "search hit expansion is opt-in"
         );
         let message_window = search_messages["inputSchema"]["properties"]["lines_per_message"]
             ["description"]
             .as_str()
             .unwrap();
-        assert_eq!(
-            search_messages["inputSchema"]["properties"]["lines_per_message"]["default"], 0,
-            "per-message presentation remains uncapped until callers opt in"
+        assert!(
+            message_window.contains("omit for 0"),
+            "per-message presentation remains uncapped until callers opt in: {message_window}"
         );
         // A signed count states all four cases on the parameter itself, because the sign
         // convention is what a caller cannot guess from the type.
@@ -13177,10 +13241,11 @@ mod tests {
             .is_some_and(|d| d.contains("message_seq") && !d.contains("session_id, seq")));
         let match_mode = &search_messages["inputSchema"]["properties"]["query_mode"];
         assert_eq!(match_mode["enum"], json!(["literal", "regex", "fuzzy"]));
-        assert_eq!(match_mode["default"], "literal");
-        // The default has to be in the text as well as the keyword: Codex and VS Code both
-        // delete `default` before a model sees the schema, and JSON Schema 2020-12 section 9.2
-        // makes it an annotation with no validation force even where it survives.
+        assert!(match_mode["default"].is_null());
+        // The default lives in the text, not the keyword: Codex and VS Code both delete
+        // `default` before a model sees the schema, JSON Schema 2020-12 section 9.2 makes it an
+        // annotation with no validation force even where it survives, and Claude Code
+        // materializes it into the call (see `strip_default_keywords`).
         assert!(
             match_mode["description"]
                 .as_str()
@@ -13606,13 +13671,23 @@ mod tests {
             get_session["inputSchema"]["properties"]["preview_chars"]["default"],
             10
         );
-        assert_eq!(
-            search_messages["inputSchema"]["properties"]["limit"]["default"],
-            1
+        // The message-search family states its omission values in prose (no `default` keyword,
+        // see `strip_default_keywords`), rendered from the same configured request.
+        let limit_prose = search_messages["inputSchema"]["properties"]["limit"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            limit_prose.contains("omit for the configured page of 1"),
+            "{limit_prose}"
         );
-        assert_eq!(
-            search_messages["inputSchema"]["properties"]["field_view"]["default"],
-            json!({"kind": "max_chars", "max_chars": 10})
+        assert!(search_messages["inputSchema"]["properties"]["limit"]["default"].is_null());
+        let field_view_prose = search_messages["inputSchema"]["properties"]["field_view"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            field_view_prose.contains("omit for max_chars 10"),
+            "{field_view_prose}"
         );
         assert!(get_session["description"]
             .as_str()
@@ -13670,43 +13745,51 @@ mod tests {
             .as_object()
             .expect("search_messages properties");
 
-        assert_eq!(
-            properties["limit"]["default"],
-            configured["extent"]["limit"]
-        );
-        assert_eq!(
-            properties["offset"]["default"],
-            configured["extent"]["offset"]
-        );
-        assert_eq!(
-            properties["context_before"]["default"],
-            configured["context"]["messages_before"]
-        );
-        assert_eq!(
-            properties["context_after"]["default"],
-            configured["context"]["messages_after"]
-        );
+        // Every omission value is rendered into the property's prose from the configured request
+        // and the `default` keyword is withheld (see `strip_default_keywords`), so what the model
+        // reads is the configured value and nothing is materialized into the call.
+        let states = |property: &str, configured_value: &Value| {
+            let description = properties[property]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{property} has a description"));
+            // Scalars render verbatim; an object (a view budget) renders as its kind and number,
+            // so every scalar leaf must appear.
+            let mut leaves = Vec::new();
+            fn collect(value: &Value, leaves: &mut Vec<String>) {
+                match value {
+                    Value::Object(map) => map.values().for_each(|v| collect(v, leaves)),
+                    Value::Array(items) => items.iter().for_each(|v| collect(v, leaves)),
+                    other => leaves.push(render_default_value(other)),
+                }
+            }
+            collect(configured_value, &mut leaves);
+            for leaf in &leaves {
+                assert!(
+                    description.contains(leaf.as_str()),
+                    "{property} must state its configured omission value {leaf:?}: {description}"
+                );
+            }
+            assert!(
+                properties[property].get("default").is_none(),
+                "{property} must not advertise a `default` keyword"
+            );
+        };
+        states("limit", &configured["extent"]["limit"]);
+        states("offset", &configured["extent"]["offset"]);
+        states("context_before", &configured["context"]["messages_before"]);
+        states("context_after", &configured["context"]["messages_after"]);
         assert!(
             properties["context"].get("default").is_none(),
             "an asymmetric configured context cannot be represented as one radius"
         );
-        assert_eq!(
-            properties["lines_per_message"]["default"],
-            configured["presentation"]["lines_per_message"]
+        states(
+            "lines_per_message",
+            &configured["presentation"]["lines_per_message"],
         );
-        assert_eq!(
-            properties["field_view"]["default"],
-            configured["presentation"]["field_view"]
-        );
-        assert_eq!(
-            properties["match_view"]["default"],
-            configured["presentation"]["match_view"]
-        );
-        assert_eq!(properties["include"]["default"], configured["include"]);
-        assert_eq!(
-            properties["receipt_level"]["default"],
-            configured["receipt_level"]
-        );
+        states("field_view", &configured["presentation"]["field_view"]);
+        states("match_view", &configured["presentation"]["match_view"]);
+        states("include", &configured["include"]);
+        states("receipt_level", &configured["receipt_level"]);
     }
 
     #[test]
@@ -14408,7 +14491,7 @@ mod tests {
             )]);
 
         for pageless in ["get_session", "get_resume_command", "get_index_status"] {
-            let recovery = ToolRecovery::for_call(pageless, &json!({}), &advertised);
+            let recovery = ToolRecovery::for_call(pageless, &json!({}), &advertised, &config);
             assert_eq!(
                 recovery.paging,
                 ToolPaging::Unpaged,
@@ -14435,7 +14518,8 @@ mod tests {
             "query_session_index",
             "run_skill_capability",
         ] {
-            let recovery = ToolRecovery::for_call(pageable, &json!({ "limit": 20 }), &advertised);
+            let recovery =
+                ToolRecovery::for_call(pageable, &json!({ "limit": 20 }), &advertised, &config);
             assert_eq!(recovery.paging, ToolPaging::Page(20));
             let error =
                 enforce_tool_result_ceiling(oversized.clone(), pageable, 10, recovery).unwrap_err();
@@ -14460,7 +14544,7 @@ mod tests {
                         .collect::<std::collections::BTreeSet<_>>()
                 })
                 .unwrap_or_default();
-            let recovery = ToolRecovery::for_call(name, &json!({}), &advertised);
+            let recovery = ToolRecovery::for_call(name, &json!({}), &advertised, &config);
             let error =
                 enforce_tool_result_ceiling(oversized.clone(), name, 10, recovery).unwrap_err();
             for argument in [
@@ -14518,17 +14602,29 @@ mod tests {
         let advertised = advertised_tools(&config);
 
         assert_eq!(
-            ToolRecovery::for_call("search_messages", &json!({}), &advertised).paging,
+            ToolRecovery::for_call("search_messages", &json!({}), &advertised, &config).paging,
             ToolPaging::Page(9),
             "an omitted limit resolves to the configured page, which is what a retry must beat"
         );
         assert_eq!(
-            ToolRecovery::for_call("search_messages", &json!({ "limit": 3 }), &advertised).paging,
+            ToolRecovery::for_call(
+                "search_messages",
+                &json!({ "limit": 3 }),
+                &advertised,
+                &config
+            )
+            .paging,
             ToolPaging::Page(3),
             "an explicit limit is the page that overflowed"
         );
         assert_eq!(
-            ToolRecovery::for_call("search_sessions", &json!({ "limit": 0 }), &advertised).paging,
+            ToolRecovery::for_call(
+                "search_sessions",
+                &json!({ "limit": 0 }),
+                &advertised,
+                &config
+            )
+            .paging,
             ToolPaging::EveryMatch,
             "limit=0 asks the session tools for every match, which is unbounded rather than absent"
         );
@@ -14578,8 +14674,12 @@ mod tests {
         let measured = serde_json::to_string(&oversized).unwrap().chars().count();
         let ceiling = measured / 4;
 
-        let recovery =
-            ToolRecovery::for_call("search_sessions", &json!({ "limit": 0 }), &advertised);
+        let recovery = ToolRecovery::for_call(
+            "search_sessions",
+            &json!({ "limit": 0 }),
+            &advertised,
+            &config,
+        );
         let error = enforce_tool_result_ceiling(oversized, "search_sessions", ceiling, recovery)
             .expect_err("a result over the ceiling must not be delivered");
 
@@ -14633,7 +14733,7 @@ mod tests {
         // the smallest possible overflow is where an optimistic guess most easily lands back
         // over the line.
         let ceiling = measured - 1;
-        let recovery = ToolRecovery::for_call("search_messages", &arguments, &advertised);
+        let recovery = ToolRecovery::for_call("search_messages", &arguments, &advertised, &config);
         let error = enforce_tool_result_ceiling(full, "search_messages", ceiling, recovery)
             .expect_err("the result is over the ceiling");
 
@@ -14697,7 +14797,12 @@ mod tests {
                 result,
                 "search_messages",
                 ceiling,
-                ToolRecovery::for_call("search_messages", &json!({}), &advertised_tools(&config)),
+                ToolRecovery::for_call(
+                    "search_messages",
+                    &json!({}),
+                    &advertised_tools(&config),
+                    &config
+                ),
             )
             .is_ok(),
             "an ordinary default call must never take the error path"
