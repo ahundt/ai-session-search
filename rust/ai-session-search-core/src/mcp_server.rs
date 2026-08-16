@@ -8201,7 +8201,9 @@ mod tests {
         assert!(out["receipt"]["search_explanation"]["prefilter_skipped"]
             .as_str()
             .unwrap()
-            .contains("complete filtered corpus scored with bounded top-K retention"));
+            .contains(
+                "complete filtered corpus scored, retaining at most min(offset + limit, corpus) ranked rows"
+            ));
     }
 
     #[test]

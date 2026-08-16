@@ -2700,7 +2700,15 @@ impl Db {
         } else {
             " order by m.session_id, m.seq"
         });
-        let ranked_limit = fuzzy_ranked_limit(filters)?;
+        let ranked_limit = match self.fuzzy_ranking_window("1 = 1", filters)? {
+            FuzzyRankingWindow::Rank { limit, .. } => limit,
+            FuzzyRankingWindow::PastCorpus { corpus } => {
+                return Ok((
+                    Vec::new(),
+                    include_explain.then(|| empty_past_corpus(corpus)),
+                ))
+            }
+        };
         let pattern = Pattern::new(
             query,
             CaseMatching::Ignore,
@@ -2740,14 +2748,7 @@ impl Db {
             top.extend(scored);
         }
         let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
-        let explain = include_explain.then(|| SearchExplain {
-            prefilter: None,
-            candidates: Some(matched),
-            prefilter_skipped: Some(
-                "complete filtered corpus scored with bounded top-K retention".to_string(),
-            ),
-            corpus,
-        });
+        let explain = include_explain.then(|| scored_whole_corpus(matched, corpus));
         Ok((hits, explain))
     }
 
@@ -2984,7 +2985,15 @@ impl Db {
             AtomKind::Fuzzy,
         );
         let query_lower = query.to_lowercase();
-        let ranked_limit = fuzzy_ranked_limit(filters)?;
+        let ranked_limit = match self.fuzzy_ranking_window("1 = 1", filters)? {
+            FuzzyRankingWindow::Rank { limit, .. } => limit,
+            FuzzyRankingWindow::PastCorpus { corpus } => {
+                return Ok((
+                    Vec::new(),
+                    include_explain.then(|| empty_past_corpus(corpus)),
+                ))
+            }
+        };
         let mut top = Vec::new();
         let mut corpus = 0_i64;
         let mut matched = 0_i64;
@@ -3029,14 +3038,7 @@ impl Db {
             top.extend(scored);
         }
         let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
-        let explain = include_explain.then(|| SearchExplain {
-            prefilter: None,
-            candidates: Some(matched),
-            prefilter_skipped: Some(
-                "complete filtered corpus scored with bounded top-K retention".to_string(),
-            ),
-            corpus,
-        });
+        let explain = include_explain.then(|| scored_whole_corpus(matched, corpus));
         Ok((hits, explain))
     }
 
@@ -3120,6 +3122,16 @@ impl Db {
             !self.conn.is_autocommit(),
             "the fuzzy tool-name statements must share one read snapshot"
         );
+        let (ranked_limit, counted_corpus) =
+            match self.fuzzy_ranking_window("m.tool_name is not null", filters)? {
+                FuzzyRankingWindow::Rank { limit, corpus } => (limit, corpus),
+                FuzzyRankingWindow::PastCorpus { corpus } => {
+                    return Ok((
+                        Vec::new(),
+                        include_explain.then(|| empty_past_corpus(corpus)),
+                    ))
+                }
+            };
         let names = self.global_tool_name_vocabulary()?;
 
         let pattern = Pattern::new(
@@ -3164,7 +3176,6 @@ impl Db {
         // tier ranks after every row in this tier. Read at most the still-missing W rows from each
         // tier and stop once W is full; this is equivalent to global row scoring without loading
         // content that cannot reach the requested window.
-        let ranked_limit = fuzzy_ranked_limit(filters)?;
         let mut scored_names = matching_names.into_iter().collect::<Vec<_>>();
         scored_names.sort_by(|(left_name, left), (right_name, right)| {
             right
@@ -3173,8 +3184,9 @@ impl Db {
                 .then_with(|| right.1.cmp(&left.1))
                 .then_with(|| left_name.cmp(right_name))
         });
-        // Sized by rows found, never by the request: `ranked_limit` is `offset + limit` from the
-        // caller, and reserving it up front asked for ~150 GB at offset 1e9 and overflowed at 1e17.
+        // Sized by rows found, never by the request: reserving `ranked_limit` up front asked for
+        // ~150 GB at offset 1e9 and overflowed at 1e17. `ranked_limit` is itself bounded by the
+        // eligible corpus (see `Db::fuzzy_ranking_window`), so growth stops at the rows that exist.
         let mut top = Vec::new();
         let mut matched = 0_i64;
         for tier in scored_names.chunk_by(|left, right| left.1 == right.1) {
@@ -3212,7 +3224,11 @@ impl Db {
             .collect();
         let explain = include_explain
             .then(|| {
-                let corpus = self.corpus_count_with_base("m.tool_name is not null", filters)?;
+                // Reuse the count the ranking window already took, when it took one.
+                let corpus = match counted_corpus {
+                    Some(corpus) => corpus,
+                    None => self.corpus_count_with_base("m.tool_name is not null", filters)?,
+                };
                 Ok::<_, anyhow::Error>(SearchExplain {
                     prefilter: None,
                     candidates: Some(explained_matching_rows.unwrap_or(matched)),
@@ -3258,6 +3274,46 @@ impl Db {
     /// with the same result. See [`Db::corpus_count_statements`] for the exact statements.
     fn filtered_corpus_count(&self, filters: &MessageFilters) -> Result<i64> {
         self.corpus_count_with_base("1 = 1", filters)
+    }
+
+    /// How many scored candidates a fuzzy page has to retain, bounded by the eligible corpus.
+    ///
+    /// `offset + limit` is what the caller asked to rank, and both are theirs to choose: paging
+    /// deep into a large result set is legitimate, which is why there is no arbitrary window cap.
+    /// Ranking further than there are rows to rank never is. Left unbounded, that retention target
+    /// was unreachable for a large offset — [`retain_top_fuzzy_hits`] truncates only above the
+    /// target — so the vector of scored rows, each carrying its message content, grew to every
+    /// matching row and `skip(offset)` then discarded all of it. Bounding the target by the corpus
+    /// makes peak retention `min(matching rows, offset + limit, corpus)` for every request.
+    ///
+    /// The count reads covering indexes rather than message rows (see
+    /// [`Db::filtered_corpus_count`]) and is taken only when the requested window exceeds one
+    /// scoring batch, so an ordinary page pays nothing for the bound and is told `None` back so it
+    /// counts on its own terms if a receipt needs one. `base_predicate` is the same fragment
+    /// [`Db::corpus_count_with_base`] takes, so each caller bounds against the rows it actually
+    /// scans; an over-estimate would only leave the window wider than needed, never truncate a
+    /// real page.
+    fn fuzzy_ranking_window(
+        &self,
+        base_predicate: &str,
+        filters: &MessageFilters,
+    ) -> Result<FuzzyRankingWindow> {
+        let requested = fuzzy_ranked_limit(filters)?;
+        if requested <= FUZZY_SCORE_BATCH_SIZE {
+            return Ok(FuzzyRankingWindow::Rank {
+                limit: requested,
+                corpus: None,
+            });
+        }
+        let corpus = self.corpus_count_with_base(base_predicate, filters)?;
+        let corpus_rows = usize::try_from(corpus).unwrap_or(usize::MAX);
+        if filters.offset >= corpus_rows {
+            return Ok(FuzzyRankingWindow::PastCorpus { corpus });
+        }
+        Ok(FuzzyRankingWindow::Rank {
+            limit: requested.min(corpus_rows),
+            corpus: Some(corpus),
+        })
     }
 
     /// [`Db::filtered_corpus_count`] over the rows that also satisfy `base_predicate`, an SQL
@@ -5886,6 +5942,53 @@ fn compare_fuzzy_hits(left: &(MessageHit, bool), right: &(MessageHit, bool)) -> 
         .then_with(|| left.0.seq.cmp(&right.0.seq))
 }
 
+/// The receipt for a fuzzy page that scored every eligible row.
+///
+/// `matched` is how many of them the pattern matched and `corpus` how many were eligible. The
+/// message names the retention bound [`Db::fuzzy_ranking_window`] enforces, so a reader can tell
+/// that a deep page costs scoring time without costing proportional memory.
+fn scored_whole_corpus(matched: i64, corpus: i64) -> SearchExplain {
+    SearchExplain {
+        prefilter: None,
+        candidates: Some(matched),
+        prefilter_skipped: Some(
+            "complete filtered corpus scored, retaining at most min(offset + limit, corpus) ranked rows"
+                .to_string(),
+        ),
+        corpus,
+    }
+}
+
+/// The receipt for a fuzzy page whose window starts at or past the last eligible row.
+///
+/// `candidates` counts rows that scored, and none did, so it stays absent rather than reporting a
+/// zero that would read as "the corpus was scored and nothing matched". `corpus` is exact: it is
+/// the index-only count that decided the page is empty.
+fn empty_past_corpus(corpus: i64) -> SearchExplain {
+    SearchExplain {
+        prefilter: None,
+        candidates: None,
+        prefilter_skipped: Some(
+            "offset starts at or past the last eligible row, so no row was scored".to_string(),
+        ),
+        corpus,
+    }
+}
+
+/// The outcome of sizing a fuzzy page's ranking window against the eligible corpus.
+///
+/// See [`Db::fuzzy_ranking_window`], which explains why the window is bounded at all.
+enum FuzzyRankingWindow {
+    /// Score the corpus while retaining at most `limit` ranked candidates. `corpus` carries the
+    /// eligible count when sizing the window had to measure it, so a receipt can reuse it instead
+    /// of repeating the query.
+    Rank { limit: usize, corpus: Option<i64> },
+    /// The window starts at or past the last eligible row, so the page is empty whatever the
+    /// scores are. `corpus` is the exact eligible count, which the receipt reports in place of a
+    /// scored-candidate count that was never measured.
+    PastCorpus { corpus: i64 },
+}
+
 fn fuzzy_ranked_limit(filters: &MessageFilters) -> Result<usize> {
     filters
         .offset
@@ -7150,7 +7253,7 @@ mod tests {
         assert_eq!(explain.prefilter.as_deref(), None);
         assert_eq!(
             explain.prefilter_skipped.as_deref(),
-            Some("complete filtered corpus scored with bounded top-K retention")
+            Some("complete filtered corpus scored, retaining at most min(offset + limit, corpus) ranked rows")
         );
         assert_eq!(explain.corpus, 1);
     }
@@ -8765,6 +8868,75 @@ mod tests {
         }
     }
 
+    /// A fuzzy window past the eligible corpus is answered from the index, without scoring a row.
+    ///
+    /// `offset + limit` is the retention target for fuzzy ranking, and `retain_top_fuzzy_hits`
+    /// truncates only above it. An offset larger than any corpus therefore made the target
+    /// unreachable: every matching row stayed in memory with its content until `skip(offset)`
+    /// threw all of it away. The receipt is the observable proof that no scoring happened —
+    /// `candidates` counts rows that scored, and it is absent rather than a zero that would read
+    /// as "the corpus was scored and nothing matched".
+    #[test]
+    fn a_fuzzy_window_past_the_corpus_is_answered_without_scoring_any_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test');",
+            )
+            .unwrap();
+        for seq in 0..4 {
+            db.conn
+                .execute(
+                    "insert into messages (session_id, provider, seq, role, tool_name, content) \
+                     values ('s1', 'claude', ?, 'tool', 'exec_command', 'exec command output')",
+                    [seq],
+                )
+                .unwrap();
+        }
+
+        for field in [
+            None,
+            Some(SearchField::ToolName),
+            Some(SearchField::Content),
+        ] {
+            let filters = |offset: usize| MessageFilters {
+                field,
+                match_mode: MessageSearchMode::Fuzzy,
+                limit: 2,
+                offset,
+                ..Default::default()
+            };
+
+            // Past the corpus: empty page, exact corpus, and nothing scored. The offset is above
+            // FUZZY_SCORE_BATCH_SIZE, which is what makes the window worth bounding.
+            let (hits, explain) = db
+                .search_messages_with_explain("exec", &filters(1_000_000_000), true)
+                .unwrap();
+            assert!(hits.is_empty(), "{field:?}");
+            let explain = explain.expect("an explained request returns a receipt");
+            assert_eq!(explain.corpus, 4, "{field:?}");
+            assert_eq!(
+                explain.candidates, None,
+                "{field:?}: no row scored, so no candidate count was measured"
+            );
+
+            // Inside the corpus the page and its receipt are unchanged by the bound.
+            let (hits, explain) = db
+                .search_messages_with_explain("exec", &filters(0), true)
+                .unwrap();
+            assert_eq!(hits.len(), 2, "{field:?}");
+            assert_eq!(
+                explain.expect("receipt").candidates,
+                Some(4),
+                "{field:?}: every row scored"
+            );
+        }
+    }
+
     #[test]
     fn date_filter_until_covers_sub_second_tail_of_final_second() {
         let dir = tempfile::tempdir().unwrap();
@@ -10126,7 +10298,7 @@ mod tests {
         let explain = explain.unwrap();
         assert_eq!(
             explain.prefilter_skipped.as_deref(),
-            Some("complete filtered corpus scored with bounded top-K retention")
+            Some("complete filtered corpus scored, retaining at most min(offset + limit, corpus) ranked rows")
         );
         assert!(
             explain.candidates.unwrap() < explain.corpus,
@@ -11104,7 +11276,7 @@ mod tests {
         let explain = explain.unwrap();
         assert_eq!(
             explain.prefilter_skipped.as_deref(),
-            Some("complete filtered corpus scored with bounded top-K retention")
+            Some("complete filtered corpus scored, retaining at most min(offset + limit, corpus) ranked rows")
         );
         assert_eq!(explain.candidates, Some(1_205));
         assert_eq!(explain.corpus, 1_205);

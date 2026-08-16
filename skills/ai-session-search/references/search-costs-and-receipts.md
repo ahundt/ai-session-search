@@ -51,8 +51,9 @@ config, surface config, or typed default). Fields:
   fuzzy search). `candidates / corpus` is the selectivity; improve it by anchoring the query on a
   rarer literal.
 - Exact and regex modes verify the requested predicate after candidate retrieval, so a prefilter
-  changes cost, never membership. Fuzzy scores the complete eligible corpus and retains bounded
-  top-K state for the requested page.
+  changes cost, never membership. Fuzzy scores the complete eligible corpus and retains at most
+  `min(offset + limit, corpus)` ranked rows, so a huge `offset` costs no extra memory; an `offset`
+  at or past the last eligible row returns an empty page without scoring any row.
 
 The CLI prints the receipt with `--format json` (and a one-line `[explain]` summary on stderr);
 MCP returns it as `receipt` in the structured output.
