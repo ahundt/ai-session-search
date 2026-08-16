@@ -249,10 +249,11 @@ impl UnicodeLowerNeedle {
     /// The range names characters of the original `haystack`, so slicing it is safe and shows the
     /// text as written. It cannot be read off the folded sequence directly, because folding
     /// changes how many characters there are: `İ` lowercases to two. The scan therefore tracks
-    /// only where the current source character ends, and once a match completes it walks back
-    /// over source characters, folding each, until it has accounted for the needle's length. A
-    /// match that begins or ends part-way through one character's expansion widens to that whole
-    /// character, which is the only range that can be sliced.
+    /// where the current source character starts and ends and how far into its expansion the
+    /// match completed; it then walks back over the characters before it, folding each, until it
+    /// has accounted for the rest of the needle. A match that begins or ends part-way through one
+    /// character's expansion widens to that whole character, which is the only range that can be
+    /// sliced.
     ///
     /// Time is O(haystack) folded characters plus O(needle) for the one backward walk, and no
     /// allocation happens on the scan, which is what keeps [`Self::contains`] cheap enough for
@@ -265,17 +266,20 @@ impl UnicodeLowerNeedle {
         let mut matched = 0_usize;
         for (offset, character) in haystack.char_indices() {
             let character_end = offset + character.len_utf8();
-            for lowered in character.to_lowercase() {
+            for (folded_index, lowered) in character.to_lowercase().enumerate() {
                 while matched > 0 && lowered != self.pattern[matched] {
                     matched = self.prefix[matched - 1];
                 }
                 if lowered == self.pattern[matched] {
                     matched += 1;
                     if matched == self.pattern.len() {
+                        // This character supplied `folded_index + 1` of the needle's characters,
+                        // which can be fewer than its whole expansion when the match ends inside
+                        // one. Only the rest were supplied by the characters before it.
                         let start = source_start_of_folded_match(
                             haystack,
-                            character_end,
-                            self.pattern.len(),
+                            offset,
+                            self.pattern.len() - (folded_index + 1),
                         );
                         return Some(start..character_end);
                     }
@@ -286,20 +290,22 @@ impl UnicodeLowerNeedle {
     }
 }
 
-/// Where in `haystack` a match of `folded_len` folded characters ending at byte `end` begins.
+/// Where in `haystack` the `folded_len` folded characters ending at byte `end` begin.
 ///
 /// Source characters are walked backwards from `end`, subtracting how many folded characters each
-/// produces, and the one that exhausts the count is the one the match starts inside. Returning
-/// that character's own start offset widens the range to a character boundary.
+/// produces, and the one that exhausts the count is the one the run starts inside. Returning that
+/// character's own start offset widens the range to a character boundary. `end` is the start of
+/// the character the caller already accounted for, so a `folded_len` of zero means that character
+/// supplied the whole match and the walk has nothing to do.
 fn source_start_of_folded_match(haystack: &str, end: usize, folded_len: usize) -> usize {
     let mut remaining = folded_len;
     let mut start = end;
     for (offset, character) in haystack[..end].char_indices().rev() {
-        start = offset;
-        remaining = remaining.saturating_sub(character.to_lowercase().count());
         if remaining == 0 {
             break;
         }
+        start = offset;
+        remaining = remaining.saturating_sub(character.to_lowercase().count());
     }
     start
 }
@@ -2472,6 +2478,34 @@ pub(crate) mod tests {
         assert_eq!(UnicodeLowerNeedle::from_lowered("zz").find_in("abc"), None);
         let ascii = UnicodeLowerNeedle::from_lowered("beta");
         assert_eq!(ascii.find_in("alpha beta gamma"), Some(6..10));
+    }
+
+    /// A match ending part-way through one character's expansion still starts where it started.
+    ///
+    /// `İ` folds to two characters, so a needle ending in `i` matches after consuming only the
+    /// first of them. Accounting for that character's whole expansion instead of the part the
+    /// match used spent one folded character too many walking back, and the range lost a leading
+    /// source character: the caller sliced `bİ` out of `abİ` and highlighted the wrong span.
+    #[test]
+    fn a_match_ending_inside_a_folded_expansion_keeps_its_leading_characters() {
+        let range = UnicodeLowerNeedle::from_lowered("abi")
+            .find_in("abİ")
+            .expect("İ folds to i + combining dot, so the needle's trailing i matches");
+        assert_eq!(&"abİ"[range.clone()], "abİ");
+        assert_eq!(range, 0..4);
+
+        let haystack = "wwxyzİq";
+        let range = UnicodeLowerNeedle::from_lowered("xyzi")
+            .find_in(haystack)
+            .expect("the needle's trailing i matches the first half of İ");
+        assert_eq!(&haystack[range.clone()], "xyzİ");
+        assert_eq!(range, 2..7);
+
+        // A one-character needle satisfied by the head of an expansion widens to that character.
+        let range = UnicodeLowerNeedle::from_lowered("i")
+            .find_in("İ")
+            .expect("the expansion starts with i");
+        assert_eq!(range, 0..2);
     }
 
     #[test]
