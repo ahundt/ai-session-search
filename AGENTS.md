@@ -19,12 +19,18 @@ uv run maturin develop --uv    # abi3 extension into the venv; pytest fails with
 ## Build
 
 ```bash
-./run_ci_local.sh                                       # full gate, before proposing a commit
+./run_ci_local.sh                                       # host-platform gate, before proposing a commit
 cargo test -p ai-session-search <test name>             # focused Rust
 uv run pytest tests/<file>.py -k <test name>            # focused Python
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 uv run ruff check . && uv run mypy ai_session_search tests
 ```
+
+The gate runs on one machine, so a green run proves the platform you ran it on. macOS, Windows,
+and Linux, on x86_64 and arm64 across CPython 3.12 to 3.14, are exercised only by the required CI
+matrix, which has caught what a green local gate did not: a test building a `file://` URL by
+string interpolation passed everywhere paths start with a separator and failed on all three
+Windows jobs, where the drive letter parses as the URL host instead.
 
 Run the gate with no environment prefix. Never prefix
 `AI_SESSION_SEARCH_RUSTC_WRAPPER=`: it exports an empty `RUSTC_WRAPPER` and

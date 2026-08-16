@@ -241,6 +241,11 @@ schema, exact wheel and sdist install pathways, and workflow syntax when `action
 installed. CI runs `actionlint` in the required `workflow-security` job, so a workflow syntax
 error blocks the merge whether or not it was caught locally.
 
+That division holds for platforms too: the gate runs on one machine and proves that machine.
+macOS, Windows, and Linux, on x86_64 and arm64 across CPython 3.12 to 3.14, are exercised only by
+the required CI matrix. A green local gate is the precondition for pushing; the green CI run on
+the exact commit being released is the precondition for tagging.
+
 Run the release policy check with the pinned cargo-deny version, the same four checks CI runs:
 
 ```bash
