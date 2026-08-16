@@ -7782,12 +7782,56 @@ mod tests {
             );
         }
 
-        for (tool_name, defaults) in &materialized {
+        // The behavioural half above can only inject top-level arguments, so it reads top-level
+        // property schemas. The keyword itself is legal at any depth, and this catalogue nests
+        // schemas several levels down — `skill_selector_input_schema` appears under both `skill`
+        // and `additional_skills.items`, and the view budgets are `oneOf` branches. Checking only
+        // the depth the injection reaches would let a nested one through, so the contract is
+        // asserted over the whole input schema.
+        for tool in tools {
+            let tool_name = tool["name"].as_str().expect("tool name");
+            let mut found = Vec::new();
+            default_keywords(&tool["inputSchema"], "inputSchema", false, &mut found);
             assert!(
-                defaults.is_empty(),
-                "{tool_name} advertises `default` on {:?}; state the omission value in prose instead",
-                defaults.keys().collect::<Vec<_>>()
+                found.is_empty(),
+                "{tool_name} advertises `default` at {:?}; state the omission value in prose instead",
+                found.iter().map(|(path, _)| path).collect::<Vec<_>>()
             );
+        }
+    }
+
+    /// Every `default` keyword anywhere in `schema`, as `(JSON pointer, value)`.
+    ///
+    /// A client materializes this keyword wherever it appears, so finding it means walking `oneOf`
+    /// branches, nested `properties`, and array `items` rather than the top level alone. A key
+    /// named `default` directly inside a `properties` or `$defs` map is a member's name instead of
+    /// the keyword, so those two maps are searched for nested schemas but not for the keyword.
+    fn default_keywords(
+        schema: &Value,
+        path: &str,
+        names_members: bool,
+        found: &mut Vec<(String, Value)>,
+    ) {
+        match schema {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "default" && !names_members {
+                        found.push((format!("{path}/default"), value.clone()));
+                    }
+                    default_keywords(
+                        value,
+                        &format!("{path}/{key}"),
+                        matches!(key.as_str(), "properties" | "$defs"),
+                        found,
+                    );
+                }
+            }
+            Value::Array(items) => {
+                for (index, value) in items.iter().enumerate() {
+                    default_keywords(value, &format!("{path}/{index}"), false, found);
+                }
+            }
+            _ => {}
         }
     }
 
