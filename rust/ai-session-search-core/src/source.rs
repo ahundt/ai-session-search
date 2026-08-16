@@ -725,8 +725,8 @@ mod tests {
             Provider::Antigravity => root
                 .join(label)
                 .join(".system_generated/logs/transcript.jsonl"),
-            // Pi names a transcript for the session it holds, which is what tells it apart from
-            // the bookkeeping files that sit beside the sessions directory.
+            // Named the way pi names a transcript, after the session it holds. Discovery does not
+            // require that, but a fixture that matches the real layout is the one worth testing.
             Provider::Pi => root.join(label).join(format!(
                 "2026-06-18T17-31-17-343Z_019edbc9-83df-72a0-a95b-64e6d810ad7{}.jsonl",
                 if label == "first" { "5" } else { "6" }
