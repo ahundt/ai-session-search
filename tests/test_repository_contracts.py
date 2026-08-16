@@ -183,6 +183,7 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
         "aise-capability.toml",
         "references/message-classification.md",
         "references/recover-prior-work-with-evidence.md",
+        "references/search-costs-and-receipts.md",
     }, f"unexpected shipped skill files: {sorted(repository_files)}"
 
     # One shipped package. A second directory here becomes a second top-level skill in every

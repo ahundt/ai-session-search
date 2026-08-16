@@ -113,6 +113,12 @@ const AI_SESSION_SEARCH_SKILL_FILES: &[ManagedSkillFile] = &[
         relative_path: "references/message-classification.md",
         content: include_str!("../skills/ai-session-search/references/message-classification.md"),
     },
+    ManagedSkillFile {
+        relative_path: "references/search-costs-and-receipts.md",
+        content: include_str!(
+            "../skills/ai-session-search/references/search-costs-and-receipts.md"
+        ),
+    },
 ];
 pub(crate) const AI_SESSION_SEARCH_SKILL_NAME: &str = "ai-session-search";
 
@@ -5082,16 +5088,23 @@ mod tests {
         assert!(skill_content.contains("aise messages search"));
         assert!(skill_content.contains("query_session_index"));
         assert!(skill_content.contains("short distinctive fragment"));
-        assert!(skill_content.contains("Literal mode matches the query text as typed"));
+        assert!(skill_content.contains("Literal is the default: the query text as typed"));
         assert!(skill_content.contains("List recent sessions by metadata, then read them"));
         assert!(skill_content.contains("aise list --path ~/source/project --when 7d --limit 10"));
-        assert!(skill_content.contains("one-significant-figure warm-cache measurements"));
-        assert!(skill_content.contains("Lower-priority file recovery"));
+        assert!(skill_content.contains("one-significant-figure measurements"));
+        assert!(skill_content.contains("Recover an edited file"));
         assert!(skill_content
             .contains("aise messages search \"foreign key\" --workspace-path ~/source/project"));
         assert!(skill_content.contains(
-            "message search uses `--workspace-path`; broad search and analytics use `--path`"
+            "`--workspace-path` on\n   message search, `--path` on session commands and analytics"
         ));
+        let costs = AI_SESSION_SEARCH_SKILL_FILES
+            .iter()
+            .find(|file| file.relative_path == "references/search-costs-and-receipts.md")
+            .expect("the managed skill includes its cost and receipt reference")
+            .content;
+        assert!(costs.contains("O(T + N + W log W)"));
+        assert!(costs.contains("`corpus`"));
         assert!(
             !skill_content.contains("aise messages search \"foreign key\" --path ~/source/project"),
             "the installed skill must use the command-specific message-search scope flag"
