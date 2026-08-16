@@ -725,7 +725,12 @@ mod tests {
             Provider::Antigravity => root
                 .join(label)
                 .join(".system_generated/logs/transcript.jsonl"),
-            Provider::Pi => root.join(label).join(format!("{label}.jsonl")),
+            // Pi names a transcript for the session it holds, which is what tells it apart from
+            // the bookkeeping files that sit beside the sessions directory.
+            Provider::Pi => root.join(label).join(format!(
+                "2026-06-18T17-31-17-343Z_019edbc9-83df-72a0-a95b-64e6d810ad7{}.jsonl",
+                if label == "first" { "5" } else { "6" }
+            )),
             Provider::PrimeAgent => root.join(format!(
                 "019fea39-38c2-710e-8100-3624dfc0ac0{}.jsonl",
                 if label == "first" { "7" } else { "8" }

@@ -81,8 +81,13 @@ impl PiAdapter {
             // parent session directory is neither, so it stays out rather than becoming a
             // session with an invented identity.
             let is_session = match self.layout {
+                // A top-level transcript is named for the session it holds, which is what tells
+                // it apart from the bookkeeping files pi keeps beside `sessions/` — a root of
+                // `~/.pi/agent` reaches `run-history.jsonl` and `extensions/*.jsonl`, and
+                // indexing those as sessions gave every one of them the same invented id.
                 PiSessionLayout::ProjectDirectories => {
-                    is_top_level_session(root, path) || self.spawn_origin(root, path).is_some()
+                    (is_top_level_session(root, path) && self.extract_id(path).is_some())
+                        || self.spawn_origin(root, path).is_some()
                 }
                 // Prime root and RLM-child transcripts are UUID-named. Its sibling
                 // `rlm-subagents.jsonl` is a registry, not a transcript, so reject every
@@ -437,17 +442,32 @@ impl PiAdapter {
     }
 }
 
-/// A session file is "top level" when it sits at most one directory below the
-/// configured root. With the default root (`~/.pi/agent/sessions`) that's
-/// `<root>/<encoded-cwd>/<file>.jsonl` (depth 2); if a user points a root at a
-/// specific project directory the session files sit directly in it (depth 1).
-/// Subagent transcripts live further down the tree (`<session>/<agent>/run-N/
-/// session.jsonl`) and are excluded so they don't duplicate the parent session.
+/// A session file is "top level" when it sits at most one directory below the sessions directory.
+///
+/// Depth is measured from the innermost `sessions` directory under the configured root, or from
+/// the root itself when there is none. Pi keeps transcripts at `<agent home>/sessions/
+/// <encoded-cwd>/<file>.jsonl`, so a root of `~/.pi/agent` now discovers exactly what the narrower
+/// `~/.pi/agent/sessions` discovers; measuring from the root alone put every transcript one level
+/// past the deepest accepted depth and dropped all of them. With either root a transcript is at
+/// depth 2 from the sessions directory, and pointing a root straight at one project directory puts
+/// it at depth 1.
+///
+/// Subagent transcripts live further down (`<session>/<agent>/run-N/session.jsonl`) and are
+/// excluded here so they do not duplicate the parent session. [`PiAdapter::spawn_origin`]
+/// recognizes those by the session id in an ancestor directory's name, at whatever depth they sit.
 fn is_top_level_session(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    matches!(relative.components().count(), 1 | 2)
+    let components: Vec<Component<'_>> = relative.components().collect();
+    let Some((_, directories)) = components.split_last() else {
+        return false;
+    };
+    let depth = directories
+        .iter()
+        .rposition(|component| component.as_os_str() == "sessions")
+        .map_or(components.len(), |index| components.len() - index - 1);
+    matches!(depth, 1 | 2)
 }
 
 /// Scan a pi assistant `message.content` array for `toolCall` blocks that mutate a file
@@ -991,6 +1011,53 @@ mod tests {
         let sources = adapter.discover();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].path, transcript_path);
+    }
+
+    /// A root one level above the sessions directory finds the transcripts and rejects the rest.
+    ///
+    /// `~/.pi/agent` is the natural thing to configure when the layout is `~/.pi/agent/sessions/
+    /// <encoded-cwd>/<file>.jsonl`, and it is one level too high. Accepting a fixed depth turned
+    /// that into the worst of both: every transcript sat one level below the deepest accepted
+    /// depth and was dropped, while `run-history.jsonl` — a log pi keeps beside `sessions`, not a
+    /// transcript — sat at an accepted depth and was indexed as a session.
+    #[test]
+    fn discovers_sessions_when_the_root_sits_above_the_sessions_directory() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("agent");
+        let project = root.join("sessions").join("--Users-example-src-demo--");
+        fs::create_dir_all(&project).unwrap();
+
+        let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        let transcript_path = project.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
+        fs::write(
+            &transcript_path,
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
+{"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"Add pi support"}]}}
+"#,
+        )
+        .unwrap();
+
+        // A spawned run below the same project directory stays a session of its own.
+        let run = project.join(session_id).join("agent01").join("run-0");
+        fs::create_dir_all(&run).unwrap();
+        let run_path = run.join("session.jsonl");
+        fs::write(&run_path, "{}\n").unwrap();
+
+        // Pi's own bookkeeping beside `sessions/` is not a transcript.
+        fs::write(root.join("run-history.jsonl"), "{}\n").unwrap();
+        fs::create_dir_all(root.join("extensions")).unwrap();
+        fs::write(root.join("extensions").join("cache.jsonl"), "{}\n").unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let mut found: Vec<_> = adapter
+            .discover()
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        found.sort();
+        let mut expected = vec![transcript_path, run_path];
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     /// Differential guard for the streaming-parse refactor (task #241): identical output
