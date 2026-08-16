@@ -208,8 +208,15 @@ const FUZZY_SCORE_BATCH_SIZE: usize = 512;
 /// this byte budget beyond the largest record rather than multiplying that record by the row cap.
 const SESSION_SCORE_BATCH_SIZE: usize = 128;
 const SESSION_SCORE_BATCH_BYTES: usize = 8 * 1024 * 1024;
-/// Bound raw message JSON retained while projected fuzzy fields score in parallel.
-const DERIVED_FUZZY_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Bound the message bytes retained by one fuzzy scoring batch. Rows alone do not bound memory:
+/// 512 tool results of a megabyte each are half a gigabyte held before the batch scores.
+const FUZZY_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// One rule for every fuzzy batch: score when the row cap or the byte cap is reached, so peak
+/// retained input is `min(FUZZY_SCORE_BATCH_SIZE rows, FUZZY_BATCH_BYTES + one row)`.
+const fn fuzzy_batch_is_full(rows: usize, bytes: usize) -> bool {
+    rows >= FUZZY_SCORE_BATCH_SIZE || bytes >= FUZZY_BATCH_BYTES
+}
 
 /// Default SQLite busy timeout for normal CLI/MCP use. This is intentionally a short wait, not
 /// an indefinite block: concurrent agent sessions should ride out brief write bursts, while real
@@ -2746,13 +2753,17 @@ impl Db {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         let mut batch = Vec::with_capacity(FUZZY_SCORE_BATCH_SIZE);
+        let mut batch_bytes = 0_usize;
         let mut top = Vec::new();
         let mut corpus = 0_i64;
         let mut matched = 0_i64;
         for row in rows {
-            batch.push(row?);
+            let hit = row?;
             corpus += 1;
-            if batch.len() == FUZZY_SCORE_BATCH_SIZE {
+            batch_bytes = batch_bytes.saturating_add(hit.content.len());
+            batch.push(hit);
+            if fuzzy_batch_is_full(batch.len(), batch_bytes) {
+                batch_bytes = 0;
                 let scored = self.runtime.install(|| {
                     score_fuzzy_message_hits(&pattern, &query_lower, std::mem::take(&mut batch))
                 })?;
@@ -2984,7 +2995,12 @@ impl Db {
             && filters.match_mode == MessageSearchMode::Fuzzy
             && self.schema_version()? >= 4
         {
-            return self.search_tool_name_fuzzy_indexed(query, filters, include_explain);
+            // Vocabulary, per-tier rows, and the explain counts are separate statements; one
+            // read snapshot keeps them on the same data whichever surface called (MessageService
+            // already holds one, and `with_read_snapshot` then runs inline).
+            return self.with_read_snapshot(|| {
+                self.search_tool_name_fuzzy_indexed(query, filters, include_explain)
+            });
         }
         let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
@@ -3023,7 +3039,7 @@ impl Db {
             corpus += 1;
             batch_bytes = batch_bytes.saturating_add(hit.content.len());
             batch.push(hit);
-            if batch.len() == FUZZY_SCORE_BATCH_SIZE || batch_bytes >= DERIVED_FUZZY_BATCH_BYTES {
+            if fuzzy_batch_is_full(batch.len(), batch_bytes) {
                 let scored = self.runtime.install(|| {
                     score_fuzzy_derived_hits(
                         &pattern,
@@ -3138,6 +3154,14 @@ impl Db {
         // and O(B_W) content bytes. Explain adds one matching-row count. The vocabulary/score map
         // retains O(V) short strings; result state is O(W + bytes(W)). SQLite traversal is serial
         // and no schema/write cost is added. A JSON virtual table carries bounded score tiers.
+        // Inside SQLite each processed tier is still visited in full: `idx_messages_tool_name`
+        // seeks the tier's names, every matching row's sort key is read, and `order by session_id,
+        // seq limit ?` keeps W of them (O(R_tier log W)); the W bound above is what crosses into
+        // Rust, not what the engine touches.
+        debug_assert!(
+            !self.conn.is_autocommit(),
+            "the fuzzy tool-name statements must share one read snapshot"
+        );
         let names = self.global_tool_name_vocabulary()?;
 
         let pattern = Pattern::new(
@@ -8731,6 +8755,20 @@ mod tests {
             assert_eq!(explain.candidates, None, "nothing was prefiltered");
             assert!(explain.prefilter_skipped.is_some());
         }
+    }
+
+    /// Every fuzzy scoring batch is bounded by rows and by bytes; the content path used to be
+    /// bounded by rows alone, so 512 megabyte-sized tool results were held before scoring.
+    #[test]
+    fn fuzzy_batches_score_at_the_row_cap_or_the_byte_cap_whichever_comes_first() {
+        assert!(fuzzy_batch_is_full(FUZZY_SCORE_BATCH_SIZE, 0));
+        assert!(fuzzy_batch_is_full(3, FUZZY_BATCH_BYTES));
+        assert!(fuzzy_batch_is_full(3, FUZZY_BATCH_BYTES + 1));
+        assert!(!fuzzy_batch_is_full(
+            FUZZY_SCORE_BATCH_SIZE - 1,
+            FUZZY_BATCH_BYTES - 1
+        ));
+        assert!(!fuzzy_batch_is_full(1, 1));
     }
 
     /// `offset` is caller input on every surface and no schema caps it. The ranked page
