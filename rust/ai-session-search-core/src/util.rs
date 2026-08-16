@@ -1225,16 +1225,44 @@ pub fn datetime_from_mtime_ns(mtime_ns: i64) -> Option<DateTime<Utc>> {
 /// filters and recency sorting defined for providers without native timestamps; it does not prove
 /// continuous activity or reorder two parser-provided endpoints. Parser-provided dates win.
 /// Runs in `O(1)` time and memory and performs no I/O because the caller supplies `mtime_ns`.
+/// Fill the session's known span from what the parser found, then the file's mtime, and leave it
+/// ordered. `O(1)`, no I/O.
+///
+/// The span is `[created_at, updated_at]`. A missing end takes the file mtime; a missing start
+/// takes the end, a point span, because the only fact known is that the session was active then.
+/// It must never take the mtime: a Codex tail slice past the 1 MiB overlap carries no
+/// `session_meta`, a Pi or Prime tail of tool results advances only `updated_at`, and the mtime
+/// follows the last write, so filling the start from it produced `created_at > updated_at` and
+/// the reversed span aborted every refresh (and every read command that refreshes first) for as
+/// long as the file kept growing. Two contradictory native endpoints are stored ordered with the
+/// reversal named in `parse_warning`, where `aise doctor` and `--warnings-only` surface it, rather
+/// than stopping the reindex for every later source.
 pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
     let mtime = datetime_from_mtime_ns(mtime_ns);
     if session.updated_at.is_none() {
         session.updated_at = mtime;
     }
     if session.created_at.is_none() {
-        session.created_at = mtime;
+        session.created_at = session.updated_at;
     }
     if session.last_message_at.is_none() {
         session.last_message_at = session.updated_at;
+    }
+    if let (Some(created_at), Some(updated_at)) = (session.created_at, session.updated_at) {
+        if created_at > updated_at {
+            let reversal = format!(
+                "session '{}' has created_at {} after updated_at {}; the span was stored in order",
+                session.id,
+                created_at.to_rfc3339(),
+                updated_at.to_rfc3339()
+            );
+            session.created_at = Some(updated_at);
+            session.updated_at = Some(created_at);
+            session.parse_warning = Some(match session.parse_warning.take() {
+                Some(existing) => format!("{existing}; {reversal}"),
+                None => reversal,
+            });
+        }
     }
 }
 
@@ -1816,10 +1844,80 @@ pub(crate) mod tests {
         assert_eq!(rec.created_at, mtime);
         assert_eq!(rec.last_message_at, mtime);
         // A parser-provided date is preserved (not overwritten by mtime).
-        let parsed = datetime_from_mtime_ns(1).unwrap();
+        let parsed = datetime_from_mtime_ns(mtime_ns + 1_000_000_000).unwrap();
         rec.updated_at = Some(parsed);
         backfill_session_dates(&mut rec, mtime_ns);
         assert_eq!(rec.updated_at, Some(parsed));
+        assert_eq!(rec.created_at, mtime, "the earlier start stays");
+    }
+
+    /// A parser that reports the last activity but not the start (a Codex tail slice past the
+    /// 1 MiB overlap has no `session_meta`; a Pi/Prime tail of tool results advances only
+    /// `updated_at`) must get a point span at that end. Filling the start from the file's mtime
+    /// put it after the native end, and the reversed span aborted the whole reindex.
+    #[test]
+    fn backfill_session_dates_uses_the_known_end_when_only_the_end_is_native() {
+        let mtime_ns = 1_700_000_000_000_000_000;
+        let native_end = datetime_from_mtime_ns(mtime_ns - 3_600_000_000_000).unwrap();
+        let mut record =
+            minimal_record(Provider::Codex, Path::new("/tmp/tail.jsonl"), String::new());
+        record.session.updated_at = Some(native_end);
+        backfill_session_dates(&mut record.session, mtime_ns);
+        assert_eq!(record.session.created_at, Some(native_end));
+        assert_eq!(record.session.updated_at, Some(native_end));
+        assert_eq!(record.session.last_message_at, Some(native_end));
+        assert!(
+            record
+                .session
+                .parse_warning
+                .as_deref()
+                .unwrap_or("")
+                .is_empty(),
+            "a point span is not a reorder"
+        );
+        validate_session_date_order(&record.session).unwrap();
+    }
+
+    /// Two contradictory native endpoints are a provider bug, not a reason to stop indexing every
+    /// later source: the span is stored ordered and the row says so.
+    #[test]
+    fn backfill_session_dates_orders_a_reversed_native_span_and_records_a_warning() {
+        let mtime_ns = 1_700_000_000_000_000_000;
+        let earlier = datetime_from_mtime_ns(mtime_ns - 2_000_000_000).unwrap();
+        let later = datetime_from_mtime_ns(mtime_ns - 1_000_000_000).unwrap();
+        let mut record = minimal_record(
+            Provider::Claude,
+            Path::new("/tmp/reversed.jsonl"),
+            String::new(),
+        );
+        record.session.created_at = Some(later);
+        record.session.updated_at = Some(earlier);
+        backfill_session_dates(&mut record.session, mtime_ns);
+        assert_eq!(record.session.created_at, Some(earlier));
+        assert_eq!(record.session.updated_at, Some(later));
+        let warning = record
+            .session
+            .parse_warning
+            .clone()
+            .expect("the reorder is recorded");
+        assert!(warning.contains("created_at"), "{warning}");
+        assert!(warning.contains("after updated_at"), "{warning}");
+        validate_session_date_order(&record.session).unwrap();
+
+        // An existing warning is kept, not replaced.
+        let mut twice = minimal_record(
+            Provider::Claude,
+            Path::new("/tmp/reversed.jsonl"),
+            "earlier".into(),
+        );
+        twice.session.created_at = Some(later);
+        twice.session.updated_at = Some(earlier);
+        backfill_session_dates(&mut twice.session, mtime_ns);
+        let warning = twice.session.parse_warning.clone().unwrap();
+        assert!(
+            warning.contains("earlier") && warning.contains("created_at"),
+            "{warning}"
+        );
     }
 
     #[test]

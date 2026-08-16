@@ -955,3 +955,51 @@ fn tail_parse_invalid_utf8_recovered_in_tail_consistent_with_full() {
         "lossy-recovered tail-append index == full reindex of the same final file"
     );
 }
+
+/// A Codex rollout without a `session_meta` line (an old-format file, a copy from another
+/// machine, or the tail slice past the 1 MiB overlap of any grown rollout) yields the last
+/// activity but no start. That must index as a point span at the last activity and must never
+/// stop the reindex: it did, because the missing start was filled from the file mtime, which
+/// follows the native end, and the reversed span was refused with `?` for every source after it.
+#[test]
+fn codex_rollout_without_session_meta_indexes_as_a_point_span_and_the_reindex_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_root = dir.path().join("codex");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    const META_LESS: &str =
+        "rollout-2026-06-24T01-00-00-019efd00-0000-7000-8000-000000000001.jsonl";
+    std::fs::write(
+        codex_root.join(META_LESS),
+        concat!(
+            r#"{"timestamp":"2026-06-24T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"start without meta"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-24T01:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    // A healthy sibling that sorts after the meta-less file and must still be indexed.
+    std::fs::write(codex_root.join(CODEX_FILE), CODEX_INITIAL).unwrap();
+
+    let cfg = codex_only_config(dir.path(), &codex_root);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    let (files_seen, sessions_updated) = indexer::reindex(&cfg, &db, true, None)
+        .expect("one span-less file must not stop the reindex");
+    assert_eq!(files_seen, 2);
+    assert_eq!(sessions_updated, 2, "the healthy sibling is indexed too");
+
+    let meta_less = db
+        .resolve_session_record("019efd00-0000-7000-8000-000000000001")
+        .unwrap();
+    let end = meta_less.updated_at.expect("the last activity is known");
+    assert_eq!(
+        meta_less.created_at,
+        Some(end),
+        "an unknown start becomes a point span at the known end, never the file mtime"
+    );
+    assert!(
+        meta_less.parse_warning.as_deref().unwrap_or("").is_empty(),
+        "a point span is ordinary, not a warning: {:?}",
+        meta_less.parse_warning
+    );
+}

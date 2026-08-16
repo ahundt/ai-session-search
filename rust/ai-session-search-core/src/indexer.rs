@@ -913,12 +913,18 @@ pub(crate) fn reindex_until(
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
         crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
-        crate::util::validate_session_date_order(&parsed.session).with_context(|| {
-            format!(
-                "refusing malformed session timestamps from {}",
-                source.path.display()
-            )
-        })?;
+        // `backfill_parsed_dates` leaves the span ordered; the only way to arrive here without a
+        // complete span is a source whose mtime does not convert. That is this file's problem:
+        // index it as a warned stub, like any other parse failure, so the sources after it are
+        // still indexed and every read command that refreshes first still answers.
+        if let Err(error) = crate::util::validate_session_date_order(&parsed.session) {
+            parsed = crate::util::minimal_record(
+                source.provider,
+                &source.path,
+                format!("malformed session timestamps: {error:#}"),
+            );
+            crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
+        }
         // Do not oscillate between two live files that claim one provider ID. The existing holder
         // remains canonical until it leaves the configured discovery set.
         if current_without_session
@@ -1182,13 +1188,10 @@ where
             if expected_session_id != Some(tail.session.id.as_str()) {
                 return Ok(TailOutcome::FullParse);
             }
+            // Fills the tail's volatile end for `append_tail`; the tail's `created_at` is never
+            // persisted (`append_tail` advances `updated_at`/`last_message_at` only), so nothing
+            // here validates it.
             crate::util::backfill_session_dates(&mut tail.session, source.mtime_ns);
-            crate::util::validate_session_date_order(&tail.session).with_context(|| {
-                format!(
-                    "refusing malformed tail session timestamps from {}",
-                    source.path.display()
-                )
-            })?;
             crate::util::backfill_event_dates(
                 &tail.session,
                 &mut tail.new_messages,
