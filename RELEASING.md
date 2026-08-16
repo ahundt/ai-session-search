@@ -290,8 +290,8 @@ the account password before accepting publisher changes; a submission made after
 lapses is discarded without an error, so confirm the publisher appears under **Pending
 publishers** before continuing.
 
-`gh workflow run publish.yml --ref vX.Y.ZrcN` then reuses the same build, verification, and
-attestation pipeline and uploads to TestPyPI. Confirm it installs:
+`gh workflow run publish.yml --ref vX.Y.ZrcN` then reuses the same build and verification
+pipeline and uploads to TestPyPI. Confirm it installs:
 
 ```bash
 uv run --isolated --no-project --default-index https://test.pypi.org/simple/ \
@@ -309,6 +309,21 @@ and `--index-strategy unsafe-best-match` instead. `--no-project` keeps this chec
 `publish-testpypi` on `workflow_dispatch`, and those are the only triggers, so a dispatch can
 never reach a production registry and a tag push can never reach TestPyPI. A rehearsal consumes
 the version on TestPyPI; a second attempt at the same version needs a new one.
+
+The GitHub provenance attestation in the `verify` job is gated on `push` for the same reason.
+`actions/attest-build-provenance` has no dry-run — `push-to-registry` only controls registry
+push and `create-storage-record` only controls artifact metadata — so every invocation signs an
+attestation into the repository's list, and there is no API to remove one. A rehearsal would
+leave a permanent entry for a release that never happened, and because `SOURCE_DATE_EPOCH` pins
+the build clock, it would name the same subject digests the real release attests later.
+
+The rehearsal still covers what that step depends on. `verify_release_artifacts --release-set`
+runs on every trigger against the same `dist/*` the attestation would take as its subject, so a
+missing or unexpected artifact fails the dispatch. The TestPyPI publish keeps `attestations:
+true`, so PEP 740 attestations are signed through the same OIDC identity and land on the
+disposable test registry. A repository-contract test asserts the `verify` job still declares
+`id-token: write` and `attestations: write`, which is the one precondition the gate would
+otherwise hide until a real tag push.
 
 ## Tag workflow
 

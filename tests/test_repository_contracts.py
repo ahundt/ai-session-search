@@ -534,6 +534,42 @@ def test_wheels_job_proves_the_pinned_build_clock_reached_the_build() -> None:
     assert '--source-date-epoch "$SOURCE_DATE_EPOCH"' in wheels
 
 
+def test_build_provenance_is_attested_only_for_a_real_tag_push() -> None:
+    # `actions/attest-build-provenance` has no dry-run: `push-to-registry` only controls
+    # registry push, `create-storage-record` only controls artifact metadata, and every
+    # invocation signs and persists an attestation in the repository's list with no delete
+    # API. Running it on the TestPyPI rehearsal therefore leaves a permanent entry for a
+    # release that never happened. Because SOURCE_DATE_EPOCH pins the build clock the
+    # rehearsal wheels are byte-identical to the release wheels, so those entries duplicate
+    # subject digests the real release attests again.
+    #
+    # Gating on `push` costs no rehearsal coverage that anything else provides: the step
+    # right before it verifies the exact release set at the same `subject-path` on every
+    # run, and the TestPyPI publish signs PEP 740 attestations through the same OIDC
+    # identity onto the disposable test registry. What the gate does hide is a regression in
+    # the permissions the attest step needs, which would then first appear during a real
+    # release, so this asserts them here instead.
+    verify = _workflow_jobs((ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8"))["verify"]
+
+    assert "id-token: write" in verify
+    assert "attestations: write" in verify
+
+    attest = verify.index("uses: actions/attest-build-provenance@")
+    release_set = verify.index("--release-set")
+    assert release_set < attest, (
+        "the release-set verification must run before the attestation, so a rehearsal still "
+        "proves the subject-path resolves to exactly the expected artifacts"
+    )
+    gate = "if: github.event_name == 'push'"
+    assert gate in verify[:attest], (
+        f"the attestation step must carry {gate!r}: it persists an entry that cannot be "
+        "deleted, so a workflow_dispatch rehearsal must not create one"
+    )
+    assert verify[:attest].rindex(gate) > release_set, (
+        "the gate must sit on the attestation step itself, not on an earlier step"
+    )
+
+
 def _workflow_jobs(text: str) -> dict[str, str]:
     """Split a workflow into job name -> job body, keyed on the two-space job indent."""
     body = text.split("\njobs:\n", 1)[1]
@@ -716,8 +752,13 @@ def test_manual_package_preparation_defaults_to_all_without_publish_credentials(
     assert "default: all" in workflow
     assert "options: [all, rust, python]" in workflow
     assert "cargo package --locked -p ai-session-search" in workflow
-    assert "uv build --no-sources --sdist" in workflow
-    assert workflow.count("maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b") == 1
+    # Both prepared Python artifacts come from the maturin the release uses, one
+    # maturin-action step each. `uv build --sdist` calls maturin as the PEP 517 backend but
+    # resolves it from the `maturin>=1.14.1,<2.0` range in pyproject.toml, so a rehearsal
+    # could package its sdist with a different maturin than the release packages the real
+    # one — which is the property this rehearsal exists to check.
+    assert "run: uv build" not in workflow
+    assert workflow.count("maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b") == 2
     assert "id-token: write" not in workflow
     assert "cargo publish" not in workflow
     assert "gh-action-pypi-publish" not in workflow
