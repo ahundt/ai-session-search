@@ -309,6 +309,31 @@ def test_generated_fixture_config_contains_only_portable_app_paths() -> None:
     assert "\\\\" not in config
 
 
+def test_generated_fixture_reindex_cannot_reach_the_running_user_s_transcripts() -> None:
+    # The generated fixture disables every provider by name, which only works for the provider
+    # names the config text happens to list. `generate_fixture` deliberately omits the
+    # `prime-agent` stanza for the baseline build, so that provider kept its default
+    # `~/.prime/agent/sessions` root: measured here, the baseline config indexed 119 real
+    # transcripts while the all-disabled config indexed none. That put real session content into
+    # an artifact the classifier calls `portable_generated` and `publishable`, and it made the
+    # two builds measure different corpora — 22,546 messages against 512 — so every before/after
+    # comparison and the `require_equal` digest check compared unlike things.
+    #
+    # Naming providers cannot fix that, because the omission exists precisely for binaries that
+    # do not know a name. Pointing HOME at the fixture directory makes the default roots resolve
+    # inside it, so the reindex is hermetic whatever the config says and whatever the binary
+    # knows.
+    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    reindex = source.split("def generate_fixture(", 1)[1].split("connection = sqlite3.connect", 1)[0]
+
+    assert "env=" in reindex, (
+        "the fixture reindex must run with an explicit environment; inheriting the caller's HOME "
+        "lets any provider the config does not disable read the running user's transcripts"
+    )
+    assert '"HOME"' in reindex
+    assert "fixture_dir" in reindex
+
+
 def test_benchmark_help_does_not_claim_an_obsolete_fixture_schema() -> None:
     source = (ROOT / "scripts/benchmark_release.py").read_text()
 

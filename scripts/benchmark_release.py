@@ -183,10 +183,17 @@ def generate_fixture(
     database = fixture_dir / "generated.db"
     config = fixture_dir / "config.toml"
     config.write_text(generated_fixture_config(include_prime_agent=include_prime_agent))
+    # HOME points at the fixture so every provider's default root resolves inside it and finds
+    # nothing. The config disables providers by name, which only covers the names it lists, and
+    # `include_prime_agent` deliberately omits one for baselines that predate the key — that
+    # omission left `~/.prime/agent/sessions` live and indexed 119 real transcripts into a
+    # fixture the classifier calls publishable, while the candidate indexed none. Isolating the
+    # home directory is what makes the fixture hermetic whatever a given binary knows about.
     subprocess.run(
         [str(binary), "--config", str(config), "reindex"],
         cwd=fixture_dir,
         check=True,
+        env={**os.environ, "HOME": str(fixture_dir), "USERPROFILE": str(fixture_dir)},
     )
     connection = sqlite3.connect(database)
     try:
