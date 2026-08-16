@@ -148,9 +148,13 @@ normal uninstall retire the earlier sibling `corrections` package and its discov
 when the ownership manifest, file digests, and exact link targets still match; dry-run reports each
 planned removal without changing the installation.
 Generated guidance introduces the product as **AI Session Search (`aise`)** and
-names the initial MCP tools (`search_sessions`, `search_messages`, and
-`get_session`) rather than assuming that a new user or agent knows what `aise`
-means. Claude's imported `AI_SESSION_SEARCH.md` has an explicit whole-file
+walks the four-step workflow with the MCP tool for each (`list_sessions` for
+recent sessions by directory or period, `search_sessions` for a topic,
+`search_messages` for the exact turn, `get_session` to read it), names the
+installed skill and the CLI fallback, and the same sentence is the MCP server's
+`initialize` instructions; Pi and Prime Agent, which get no MCP registration,
+receive the same four steps as `aise` commands. Claude's imported
+`AI_SESSION_SEARCH.md` has an explicit whole-file
 ownership sentinel so upgrades can replace older aise-owned wording while
 refusing to overwrite user-owned content.
 

@@ -29,7 +29,10 @@ const LEGACY_SERVER_NAMES: [&str; 2] = ["ai_session_search", "aise"];
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
-const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`): call the `ai-session-search` MCP `search_sessions` tool to find relevant sessions or `search_messages` for message-level matches, then pass a returned session ID to `get_session`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. If MCP is unavailable, run `aise messages search --help`.";
+/// The block for a harness that registers the MCP server (and the server's own `initialize`
+/// instructions). It names the same four steps as `CLI_INSTRUCTIONS_LINE` in the same order,
+/// with the MCP tool for each, so an agent reads one workflow whichever surface it holds.
+const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) through the `ai-session-search` MCP server: list recent sessions by directory or period with `list_sessions(path_prefix, when, limit)`, find sessions by topic with `search_sessions(query, path_prefix, when, limit)`, find the exact turn with `search_messages(query, context, limit)`, then read it with `get_session(session_id, message_seq)`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; if MCP is unavailable, the `aise` command covers everything and `aise <command> --help` lists every current flag.";
 /// The block for a harness that has no MCP registration for aise (Pi, Prime Agent). It leads with
 /// the three CLI commands that cover the common path and names the installed skill, because the
 /// MCP-first sentence above sends such an agent to a tool it cannot call.
@@ -4755,8 +4758,43 @@ mod tests {
     fn instruction_content_names_product_and_gives_an_exact_mcp_workflow() {
         let content = instruction_file_content();
         assert!(content.contains("AI Session Search (`aise`)"));
-        for tool in ["`search_sessions`", "`search_messages`", "`get_session`"] {
+        for tool in [
+            "`list_sessions(",
+            "`search_sessions(",
+            "`search_messages(",
+            "`get_session(",
+        ] {
             assert!(content.contains(tool), "missing {tool}: {content}");
+        }
+        assert!(
+            content.contains("installed `ai-session-search` skill"),
+            "the block names the skill that holds the full workflow: {content}"
+        );
+        assert!(
+            content.contains("`aise <command> --help`"),
+            "the block names the CLI fallback: {content}"
+        );
+        // Both blocks walk the same four steps in the same order, so an agent that reads the
+        // MCP block on one harness and the CLI block on another meets one workflow.
+        for line in [INSTRUCTIONS_LINE, CLI_INSTRUCTIONS_LINE] {
+            let lower = line.to_ascii_lowercase();
+            let positions: Vec<usize> = [
+                "recent sessions",
+                "by topic",
+                "the exact turn",
+                "then read it",
+            ]
+            .iter()
+            .map(|phrase| {
+                lower
+                    .find(phrase)
+                    .unwrap_or_else(|| panic!("missing {phrase:?}: {line}"))
+            })
+            .collect();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "steps out of order: {line}"
+            );
         }
         for provider in [
             "Claude Code",
