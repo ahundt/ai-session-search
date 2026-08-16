@@ -23,8 +23,9 @@ use crate::providers::{
 };
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, parse_datetime, preview_from_text, substantive_text,
-    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    minimal_record, normalize_path, observe_session_end, observe_session_start, parse_datetime,
+    preview_from_text, substantive_text, truncate_for_display, RawMessage,
+    UserRoleAuthorshipEvidence,
 };
 
 /// The workflow engine's own log, written beside the agent transcripts it spawned. It records
@@ -336,12 +337,8 @@ impl ClaudeAdapter {
             match role.as_deref() {
                 Some("user") | Some("assistant") => {
                     if let Some(mixed) = mixed_user_content {
-                        if created_at.is_none() {
-                            created_at = timestamp;
-                        }
-                        if timestamp.is_some() {
-                            updated_at = timestamp;
-                        }
+                        observe_session_start(&mut created_at, timestamp);
+                        observe_session_end(&mut updated_at, timestamp);
                         let mut raw_message =
                             RawMessage::message("user", mixed.content, timestamp, None);
                         if let Some(parts) = mixed.parts {
@@ -399,12 +396,8 @@ impl ClaudeAdapter {
                         messages.push(raw_message);
                         continue;
                     }
-                    if created_at.is_none() {
-                        created_at = timestamp;
-                    }
-                    if timestamp.is_some() {
-                        updated_at = timestamp;
-                    }
+                    observe_session_start(&mut created_at, timestamp);
+                    observe_session_end(&mut updated_at, timestamp);
                     let mut raw_message = RawMessage::message(
                         role.unwrap_or_default(),
                         text.clone(),

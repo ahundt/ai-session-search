@@ -18,8 +18,8 @@ use crate::models::{
 use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, parse_datetime, parse_unix_seconds, preview_from_text,
-    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    minimal_record, normalize_path, observe_session_end, parse_datetime, parse_unix_seconds,
+    preview_from_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -246,7 +246,7 @@ impl CodexAdapter {
                             }
                             last_user = Some(text.clone());
                         }
-                        updated_at = timestamp.or(updated_at);
+                        observe_session_end(&mut updated_at, timestamp);
                         let mut raw_message = RawMessage::message(
                             role.unwrap_or("message"),
                             text.clone(),
@@ -318,7 +318,7 @@ impl CodexAdapter {
                             &mut file_edits,
                         );
                         if !output.trim().is_empty() {
-                            updated_at = timestamp.or(updated_at);
+                            observe_session_end(&mut updated_at, timestamp);
                             let tool_name = payload
                                 .get("call_id")
                                 .and_then(Value::as_str)

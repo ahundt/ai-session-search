@@ -17,8 +17,9 @@ use crate::models::{
 use crate::providers::{spawn::SpawnOrigin, walk_roots, ProviderDiscovery};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, parse_datetime, preview_from_text, substantive_text,
-    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    minimal_record, normalize_path, observe_session_end, observe_session_start, parse_datetime,
+    preview_from_text, substantive_text, truncate_for_display, RawMessage,
+    UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,7 +200,7 @@ impl PiAdapter {
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned);
                     }
-                    created_at = created_at.or(timestamp);
+                    observe_session_start(&mut created_at, timestamp);
                 }
                 Some("message") => {
                     let Some(message) = value.get("message") else {
@@ -227,10 +228,8 @@ impl PiAdapter {
                     }
                     match role {
                         Some("user") | Some("assistant") => {
-                            if created_at.is_none() {
-                                created_at = timestamp;
-                            }
-                            updated_at = timestamp.or(updated_at);
+                            observe_session_start(&mut created_at, timestamp);
+                            observe_session_end(&mut updated_at, timestamp);
                             let mut raw_message = RawMessage::message(
                                 role.unwrap_or("message"),
                                 text.to_string(),
@@ -258,7 +257,7 @@ impl PiAdapter {
                         // `messages search --role tool`), tagged with the tool's name, but
                         // kept out of the conversation transcript/title/preview.
                         Some("toolResult") => {
-                            updated_at = timestamp.or(updated_at);
+                            observe_session_end(&mut updated_at, timestamp);
                             let tool_name = message
                                 .get("toolName")
                                 .and_then(Value::as_str)
@@ -549,6 +548,56 @@ mod tests {
     use crate::models::Provider;
     use std::fs;
     use tempfile::tempdir;
+
+    /// A transcript whose records are not in time order still reports the span it covers.
+    ///
+    /// Records normally arrive in order, so the last one is the latest. A repaired file, a
+    /// re-parsed tail, or a late flush breaks that, and taking the last record's timestamp then
+    /// moved the session's end backwards: it sorts as less recent than it is, and a `--since`
+    /// window containing its real latest activity misses it. The tool result here is the newest
+    /// event and arrives before an older assistant turn.
+    #[test]
+    fn an_out_of_order_pi_transcript_reports_its_widest_span() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let project = root.join("--Users-example-src-demo--");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        fs::write(
+            project.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl")),
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T12:00:00.000Z","cwd":"/Users/example/src/demo"}
+{"type":"message","id":"m1","timestamp":"2026-06-18T12:05:00.000Z","message":{"role":"user","content":[{"type":"text","text":"trace the caller"}]}}
+{"type":"message","id":"m2","timestamp":"2026-06-18T12:30:00.000Z","message":{"role":"toolResult","toolCallId":"t1","toolName":"ls","content":[{"type":"text","text":"Cargo.toml"}]}}
+{"type":"message","id":"m3","timestamp":"2026-06-18T12:10:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"here is the caller"}]}}
+{"type":"message","id":"m0","timestamp":"2026-06-18T11:50:00.000Z","message":{"role":"user","content":[{"type":"text","text":"an earlier turn flushed late"}]}}
+"#,
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        let source = sources
+            .iter()
+            .find(|source| source.path.to_string_lossy().contains(session_id))
+            .expect("the top-level transcript is discovered");
+        let record = adapter.parse(source);
+
+        assert_eq!(
+            record.session.created_at.map(|at| at.to_rfc3339()),
+            Some("2026-06-18T11:50:00+00:00".to_string()),
+            "the earliest event starts the span even though it arrived last"
+        );
+        assert_eq!(
+            record.session.updated_at.map(|at| at.to_rfc3339()),
+            Some("2026-06-18T12:30:00+00:00".to_string()),
+            "the latest event ends the span even though an older record followed it"
+        );
+        assert!(
+            record.session.parse_warning.is_none(),
+            "an ordered span needs no reversal warning: {:?}",
+            record.session.parse_warning
+        );
+    }
 
     #[test]
     fn discovers_and_parses_pi_sessions() {

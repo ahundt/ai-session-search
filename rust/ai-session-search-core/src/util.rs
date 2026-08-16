@@ -1287,6 +1287,38 @@ pub fn datetime_from_mtime_ns(mtime_ns: i64) -> Option<DateTime<Utc>> {
 /// long as the file kept growing. Two contradictory native endpoints are stored ordered with the
 /// reversal named in `parse_warning`, where `aise doctor` and `--warnings-only` surface it, rather
 /// than stopping the reindex for every later source.
+/// Widen a session's observed start to include `timestamp`, keeping the earliest seen.
+///
+/// Transcripts are append-only, so their records are normally in time order and "the first record
+/// with a timestamp" and "the earliest timestamp" name the same instant. They stop agreeing when a
+/// file is repaired, when a tail slice is re-parsed, or when a harness flushes a record late.
+/// Folding rather than taking the first record keeps the stored span a superset of what was
+/// observed, and pairing this with [`observe_session_end`] makes `created_at <= updated_at` hold by
+/// construction instead of relying on [`backfill_session_dates`] to reorder it afterwards.
+pub(crate) fn observe_session_start(
+    created_at: &mut Option<DateTime<Utc>>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    if let Some(timestamp) = timestamp {
+        *created_at = Some(created_at.map_or(timestamp, |current| current.min(timestamp)));
+    }
+}
+
+/// Widen a session's observed end to include `timestamp`, keeping the latest seen.
+///
+/// See [`observe_session_start`] for why the fold matters. Taking the last record instead moved a
+/// session's end backwards whenever a later record carried an older timestamp, which sorts the
+/// session as less recent than it is and drops it out of a `--since` window that its real latest
+/// activity falls inside.
+pub(crate) fn observe_session_end(
+    updated_at: &mut Option<DateTime<Utc>>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    if let Some(timestamp) = timestamp {
+        *updated_at = Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
+    }
+}
+
 pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
     let mtime = datetime_from_mtime_ns(mtime_ns);
     if session.updated_at.is_none() {
@@ -1954,6 +1986,37 @@ pub(crate) mod tests {
         assert_eq!(normalize_path_prefix(&abs), canon);
         assert_eq!(normalize_path_prefix(&format!("{abs}/")), canon);
         assert_eq!(normalize_path_prefix(&format!("{abs}/.")), canon);
+    }
+
+    /// A record carrying an older timestamp than one already seen widens the span rather than
+    /// replacing an endpoint with it.
+    #[test]
+    fn observing_out_of_order_timestamps_keeps_the_widest_span() {
+        let at = |seconds: i64| {
+            datetime_from_mtime_ns(1_700_000_000_000_000_000 + seconds * 1_000_000_000)
+        };
+        let (early, middle, late) = (at(0), at(60), at(120));
+
+        let mut created_at = None;
+        let mut updated_at = None;
+        // Arrival order: middle, late, early. Taking the first and last record would store
+        // middle..early, a reversed span whose end is 60 seconds before the real one.
+        for timestamp in [middle, late, early] {
+            observe_session_start(&mut created_at, timestamp);
+            observe_session_end(&mut updated_at, timestamp);
+        }
+        assert_eq!(created_at, early);
+        assert_eq!(updated_at, late);
+
+        // `None` carries no information, so it neither widens nor clears an endpoint.
+        observe_session_start(&mut created_at, None);
+        observe_session_end(&mut updated_at, None);
+        assert_eq!(created_at, early);
+        assert_eq!(updated_at, late);
+
+        let mut unset = None;
+        observe_session_end(&mut unset, None);
+        assert_eq!(unset, None, "no timestamp seen leaves the endpoint unknown");
     }
 
     #[test]

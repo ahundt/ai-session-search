@@ -15,8 +15,9 @@ use crate::models::{
 };
 use crate::providers::{walk_roots, ProviderDiscovery};
 use crate::util::{
-    find_repo_root, format_transcript_line, minimal_record, normalize_path, parse_datetime,
-    preview_from_text, substantive_text, truncate_for_display, RawMessage,
+    find_repo_root, format_transcript_line, minimal_record, normalize_path, observe_session_end,
+    observe_session_start, parse_datetime, preview_from_text, substantive_text,
+    truncate_for_display, RawMessage,
 };
 
 pub struct AntigravityAdapter {
@@ -146,12 +147,8 @@ impl AntigravityAdapter {
                 .and_then(Value::as_str)
                 .and_then(parse_datetime);
 
-            if created_at.is_none() && timestamp.is_some() {
-                created_at = timestamp;
-            }
-            if timestamp.is_some() {
-                updated_at = timestamp;
-            }
+            observe_session_start(&mut created_at, timestamp);
+            observe_session_end(&mut updated_at, timestamp);
 
             // Extract cwd from tool_calls args
             if cwd.is_none() {
