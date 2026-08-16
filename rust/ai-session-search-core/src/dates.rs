@@ -59,6 +59,10 @@ pub enum Bound {
 /// Resolved `(since, until)` filter bounds; either side `None` means "unbounded".
 pub type Bounds = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
+/// Help section every command that takes `--since/--until/--when` files them under, so the three
+/// stay together and apart from that command's own filters.
+pub const TIME_WINDOW_HEADING: &str = "Time window (formats: `aise dates`)";
+
 // Shared `--since/--until/--when` flags. Flattened into each command's args so syntax and
 // inclusive bound resolution are defined once (DRY). The resolved bounds are relation-neutral:
 // session queries intersect them with a known session span, while message/file/analytics queries
@@ -70,16 +74,16 @@ pub struct DateRange {
     /// language. Calendar and relative periods use UTC; exact RFC 3339 timestamps honor `Z` or
     /// their explicit offset. Examples: `2026-01-15`, `2026-01`, `202X`, `7d`, `yesterday`.
     /// See `aise dates`. Omit for no lower bound.
-    #[arg(long)]
+    #[arg(long, help_heading = TIME_WINDOW_HEADING)]
     pub since: Option<String>,
     /// Inclusive upper bound of the query period. Same formats as `--since`; periods resolve to
     /// their last instant, while an RFC 3339 timestamp preserves its fractional-second precision.
     /// Omit for no upper bound.
-    #[arg(long)]
+    #[arg(long, help_heading = TIME_WINDOW_HEADING)]
     pub until: Option<String>,
     /// A single period used as BOTH bounds (e.g. `2026-01`, `202X`, `2026-01/2026-03`).
     /// Omit for no time filter; conflicts with `--since` and `--until`.
-    #[arg(long, conflicts_with_all = ["since", "until"])]
+    #[arg(long, help_heading = TIME_WINDOW_HEADING, conflicts_with_all = ["since", "until"])]
     pub when: Option<String>,
 }
 

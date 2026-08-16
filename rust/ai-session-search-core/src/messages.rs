@@ -579,6 +579,16 @@ impl std::str::FromStr for CliMessageSearchInclude {
     }
 }
 
+/// Help sections for `aise messages search`: thirty-nine options in one alphabetical block hid the
+/// six a caller needs first. Sections separate what to find, which messages, when, how many, how
+/// they are shown, and the diagnostics only scripts and maintainers reach for. Presentation
+/// options never change which messages match (REQ004); the heading says so.
+const QUERY_HEADING: &str = "Query (what to find)";
+const FILTER_HEADING: &str = "Filters (which messages)";
+const RESULTS_HEADING: &str = "Result window and context (how many, from where)";
+const PRESENTATION_HEADING: &str = "Presentation and output (never changes which messages match)";
+const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-description)";
+
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("search_request")
@@ -632,6 +642,7 @@ pub struct MessageSearchArgs {
     /// Text to find. Use this for leading-dash strings, e.g. `-e --path`. Omit both this and the
     /// positional query to list every message the other filters select.
     #[arg(
+        help_heading = QUERY_HEADING,
         short = 'e',
         long = "query",
         value_name = "QUERY",
@@ -640,150 +651,150 @@ pub struct MessageSearchArgs {
     pub query_arg: Option<String>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
     /// slash (human-entered commands), or compaction. Omit for every role.
-    #[arg(long = "role", value_enum)]
+    #[arg(help_heading = FILTER_HEADING, long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict by semantic message kind; tool calls and results are distinct. One-value alias
     /// for --kinds.
-    #[arg(long, value_enum)]
+    #[arg(help_heading = FILTER_HEADING, long, value_enum)]
     pub kind: Option<MessageKind>,
     /// Message classes to return. Omit for every class except harness-notice, which is what the
     /// harness told the agent (Stop-hook feedback, PreToolUse blocks, local-command caveats,
     /// task notifications) rather than what the user wrote. Pass harness-notice to answer why an
     /// agent stopped, looped, or was blocked. This is the single class filter; --kind selects one.
-    #[arg(long, value_enum, num_args = 1.., value_delimiter = ',', conflicts_with = "kind")]
+    #[arg(help_heading = FILTER_HEADING, long, value_enum, num_args = 1.., value_delimiter = ',', conflicts_with = "kind")]
     pub kinds: Vec<MessageKind>,
     /// QUERY searches only this field: content, canonical tool name, or one tool-argument path.
-    #[arg(long, value_enum, default_value_t = SearchField::Content)]
+    #[arg(help_heading = QUERY_HEADING, long, value_enum, default_value_t = SearchField::Content)]
     pub field: SearchField,
     /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path. Required with
     /// `--field tool-argument`; omit it for any other field, where it selects nothing.
-    #[arg(long)]
+    #[arg(help_heading = QUERY_HEADING, long)]
     pub argument_path: Option<String>,
     /// Restrict to these indexed session sources. Repeat --provider or pass a comma-separated
     /// list; omit it to include all nine.
-    #[arg(long = "provider", value_enum, value_delimiter = ',', action = clap::ArgAction::Append)]
+    #[arg(help_heading = FILTER_HEADING, long = "provider", value_enum, value_delimiter = ',', action = clap::ArgAction::Append)]
     pub providers: Vec<Provider>,
     /// Interpret QUERY as a literal substring, Rust regex, or bounded fuzzy pattern.
-    #[arg(long, value_enum, default_value_t = CliMessageQueryMode::Literal)]
+    #[arg(help_heading = QUERY_HEADING, long, value_enum, default_value_t = CliMessageQueryMode::Literal)]
     pub query_mode: CliMessageQueryMode,
     /// Scope to one exact session id or unique prefix. Omit to search every session.
-    #[arg(long)]
+    #[arg(help_heading = FILTER_HEADING, long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose working directory or repository root starts with this path
     /// prefix, so a sibling sharing the leading path matches too. Omit to search every root.
-    #[arg(long)]
+    #[arg(help_heading = FILTER_HEADING, long)]
     pub workspace_path: Option<String>,
     /// Restrict to sessions whose transcript storage path starts with this path prefix. Omit to
     /// search every transcript path.
-    #[arg(long)]
+    #[arg(help_heading = FILTER_HEADING, long)]
     pub transcript_path: Option<String>,
     /// Exclude a session working-directory or repository-root prefix. Repeatable; omit to exclude
     /// no root.
-    #[arg(long = "exclude-workspace-path")]
+    #[arg(help_heading = FILTER_HEADING, long = "exclude-workspace-path")]
     pub exclude_workspace_paths: Vec<String>,
     /// Exclude a transcript storage prefix. Repeatable; omit to exclude no path.
-    #[arg(long = "exclude-transcript-path")]
+    #[arg(help_heading = FILTER_HEADING, long = "exclude-transcript-path")]
     pub exclude_transcript_paths: Vec<String>,
     /// Exclude one exact session id. Repeat to exclude multiple sessions; omit to exclude none.
-    #[arg(long = "exclude-session")]
+    #[arg(help_heading = FILTER_HEADING, long = "exclude-session")]
     pub exclude_sessions: Vec<String>,
     /// Also require canonical tool_name to contain this case-insensitive substring, independent
     /// of --field (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude `Edit`). Omit
     /// to place no requirement on the tool name.
-    #[arg(long)]
+    #[arg(help_heading = QUERY_HEADING, long)]
     pub tool_name_contains: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Lower inclusive message sequence bound. Only valid with --session-id because
     /// seq numbers are local to each session. Omit to start at the first message.
-    #[arg(long)]
+    #[arg(help_heading = FILTER_HEADING, long)]
     pub seq_from: Option<i64>,
     /// Upper inclusive message sequence bound. Only valid with --session-id because
     /// seq numbers are local to each session. Omit to run to the last message.
-    #[arg(long)]
+    #[arg(help_heading = FILTER_HEADING, long)]
     pub seq_to: Option<i64>,
-    /// Optional payload groups. Repeat or comma-delimit names; --include none requests only the
-    /// semantic core and cannot be combined with another name. Omit for no optional group on this
-    /// surface, which is where the CLI differs from MCP: MCP adds normalized session metadata by
-    /// default because it answers across arbitrary sessions, while a CLI caller can see the paths
-    /// they searched.
-    #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
-    pub include: Option<Vec<CliMessageSearchInclude>>,
     /// Include context-compaction messages. Pass an explicit boolean.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(help_heading = FILTER_HEADING, long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_compaction: bool,
     /// Select the earliest or latest bounded matches. Latest requires one session. Omit for
     /// earliest.
-    #[arg(long, value_enum)]
+    #[arg(help_heading = RESULTS_HEADING, long, value_enum)]
     pub match_window: Option<MatchWindow>,
-    /// Select a configured purpose bundle. Omit for none, which is also the only option until
-    /// `[search.purposes.<name>]` is configured.
-    #[arg(long)]
-    pub purpose: Option<String>,
-    /// Require a specific configured purpose version. Omit to accept whichever version the named
-    /// purpose currently resolves to; it has no meaning without --purpose.
-    #[arg(long, requires = "purpose")]
-    pub purpose_version: Option<std::num::NonZeroU32>,
-    /// Select receipt detail: none omits diagnostics, summary includes planner diagnostics, and
-    /// full adds resolved parameter origins.
-    #[arg(long, value_enum)]
-    pub receipt_level: Option<ReceiptLevel>,
     /// Show this many neighboring messages (0 or greater) on both sides of each match;
     /// 0 (the default) shows only the match.
-    #[arg(long, value_parser = parse_context_count)]
+    #[arg(help_heading = RESULTS_HEADING, long, value_parser = parse_context_count)]
     pub context: Option<i64>,
     /// Show this many neighboring messages (0 or greater) before each match
     /// (overrides --context for before). Omit to follow --context, which is 0 when it is also
     /// omitted.
-    #[arg(long, value_parser = parse_context_count)]
+    #[arg(help_heading = RESULTS_HEADING, long, value_parser = parse_context_count)]
     pub context_before: Option<i64>,
     /// Show this many neighboring messages (0 or greater) after each match
     /// (overrides --context for after). Omit to follow --context, which is 0 when it is also
     /// omitted.
-    #[arg(long, value_parser = parse_context_count)]
+    #[arg(help_heading = RESULTS_HEADING, long, value_parser = parse_context_count)]
     pub context_after: Option<i64>,
     /// Positive page size. Literal and regex select earliest matches unless --match-window latest
     /// is used with one session. With no configured operation/purpose default, omission returns
     /// every literal, regex, or no-text CLI match; MCP alone supplies an implicit finite page.
     /// Fuzzy ranks every eligible match and requires an explicit/configured finite page.
     /// Use --all-results to state an unbounded read explicitly in scripts.
-    #[arg(long, conflicts_with = "all_results")]
+    #[arg(help_heading = RESULTS_HEADING, long, conflicts_with = "all_results")]
     pub limit: Option<usize>,
     /// Return every literal, regex, or no-text match. Fuzzy search is always bounded.
-    #[arg(long, conflicts_with = "limit")]
+    #[arg(help_heading = RESULTS_HEADING, long, conflicts_with = "limit")]
     pub all_results: bool,
     /// Skip this many matching messages before returning results. Fuzzy offsets apply after the
     /// deterministic relevance order on the complete eligible corpus.
-    #[arg(long, default_value_t = 0)]
+    #[arg(help_heading = RESULTS_HEADING, long, default_value_t = 0)]
     pub offset: usize,
+    /// Optional payload groups. Repeat or comma-delimit names; --include none requests only the
+    /// semantic core and cannot be combined with another name. Omit for no optional group on this
+    /// surface, which is where the CLI differs from MCP: MCP adds normalized session metadata by
+    /// default because it answers across arbitrary sessions, while a CLI caller can see the paths
+    /// they searched.
+    #[arg(help_heading = PRESENTATION_HEADING, long, value_delimiter = ',', action = clap::ArgAction::Append)]
+    pub include: Option<Vec<CliMessageSearchInclude>>,
     /// Limit each returned message's displayed content without changing which messages return.
-    #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
+    #[arg(help_heading = PRESENTATION_HEADING, long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
     /// Compact or full presentation preset. Conflicts with explicit line or character budgets.
     /// Omit for this surface's own policy, which is the complete selected field with a match
     /// window of 220 characters unless search.message_search.match_evidence_max_chars sets
     /// another; presets exist to override that in one word.
-    #[arg(long, value_enum, conflicts_with_all = ["lines_per_message", "field_view_chars", "match_view_chars"])]
+    #[arg(help_heading = PRESENTATION_HEADING, long, value_enum, conflicts_with_all = ["lines_per_message", "field_view_chars", "match_view_chars"])]
     pub detail: Option<DetailLevel>,
     /// Selected-field boundary view: no-char-limit or a positive Unicode-scalar count. Omit for
     /// no-char-limit, so the CLI returns the complete field and leaves paging to the shell.
-    #[arg(long)]
+    #[arg(help_heading = PRESENTATION_HEADING, long)]
     pub field_view_chars: Option<CliFieldViewChars>,
     /// Match-centered view: minimal or a positive Unicode-scalar count. Omit for 220 characters
     /// around the match, unless search.message_search.match_evidence_max_chars sets another.
-    #[arg(long)]
+    #[arg(help_heading = PRESENTATION_HEADING, long)]
     pub match_view_chars: Option<CliMatchViewChars>,
+    /// Select a configured purpose bundle. Omit for none, which is also the only option until
+    /// `[search.purposes.<name>]` is configured.
+    #[arg(help_heading = ADVANCED_HEADING, long)]
+    pub purpose: Option<String>,
+    /// Require a specific configured purpose version. Omit to accept whichever version the named
+    /// purpose currently resolves to; it has no meaning without --purpose.
+    #[arg(help_heading = ADVANCED_HEADING, long, requires = "purpose")]
+    pub purpose_version: Option<std::num::NonZeroU32>,
+    /// Select receipt detail: none omits diagnostics, summary includes planner diagnostics, and
+    /// full adds resolved parameter origins.
+    #[arg(help_heading = ADVANCED_HEADING, long, value_enum)]
+    pub receipt_level: Option<ReceiptLevel>,
     /// Print the executable parameter catalogue and configured CLI defaults without searching the
     /// index. Search parameters conflict with this flag.
-    #[arg(long, conflicts_with = "search_request")]
+    #[arg(help_heading = ADVANCED_HEADING, long, conflicts_with = "search_request")]
     pub describe: bool,
     /// Resolve defaults for one caller surface. Requires --describe; omission describes this CLI.
-    #[arg(long, value_enum, requires = "describe")]
+    #[arg(help_heading = ADVANCED_HEADING, long, value_enum, requires = "describe")]
     pub describe_surface: Option<SearchSurface>,
     /// Output format. Search defaults to table; --describe defaults to and requires json. `plain`
     /// is headerless and tab-separated; `csv` includes the table header. JSON is one document;
     /// JSONL is an incrementally consumable stream.
-    #[arg(long, value_enum)]
+    #[arg(help_heading = PRESENTATION_HEADING, long, value_enum)]
     pub format: Option<OutputFormat>,
 }
 

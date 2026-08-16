@@ -47,11 +47,26 @@ use serde::Serialize;
 const GLOBAL_OPTIONS_HEADING: &str =
     "Shared options (parsed globally; applicability depends on the selected command)";
 
+/// The command groups the root help names, in the order the commands are listed. Every visible
+/// subcommand appears in exactly one group (`root_help_names_every_visible_command_once` pins
+/// that), so a reader sees the six everyday commands first and can tell them from maintenance,
+/// analytics, and expert tools without reading twenty-five one-line summaries.
+const ROOT_COMMAND_GROUPS: &str = "\
+Start here (everyday):   search, messages, show, list, resume, files
+Export and maintenance:  export, reindex, doctor, integrations, package, config, dates
+Analytics:               stats, repeats, vocab, planning, analyze, skills
+Expert:                  db, migrate, compact, mcp, tui
+
+Typical path: `aise search \"<topic>\" --when 30d` or `aise list --path <dir> --when 7d` to find a
+session, `aise messages search \"<phrase>\" --context 2` to find the exact turn, then
+`aise show <id>` or `aise messages get <id> --seq <N> --context 3` to read it.";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "aise",
     version,
-    about = "AI Session Search (aise): search local sessions from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI"
+    about = "AI Session Search (aise): search local sessions from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI",
+    after_help = ROOT_COMMAND_GROUPS
 )]
 struct Cli {
     /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
@@ -86,21 +101,25 @@ enum Commands {
     /// Rebuild the index from session files (incremental; `--full` reparses everything).
     ///
     /// Use `aise doctor` to see what is already indexed or diagnose indexing failures.
+    #[command(display_order = 21)]
     Reindex(ReindexArgs),
     /// Reclaim disk space: merge FTS segments, `VACUUM`, then truncate the WAL.
     ///
     /// Use `aise doctor` first to see whether the index is large enough to be worth compacting.
+    #[command(display_order = 42)]
     Compact,
     /// List recent sessions, optionally intersecting their known spans with a date period.
     ///
     /// Date bounds intersect the known indexed session span from created_at through updated_at.
     /// The span can contain gaps and is not continuous runtime.
+    #[command(display_order = 13)]
     List(QueryArgs),
     /// Search indexed sessions by keyword and date-span/metadata filters, ranked by relevance.
     ///
     /// Date bounds intersect the known indexed session span from created_at through updated_at.
     /// The span can contain gaps and is not continuous runtime.
     #[command(
+        display_order = 10,
         after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY` or select `--query-mode regex|fuzzy`."
     )]
     Search(SearchArgs),
@@ -108,25 +127,31 @@ enum Commands {
     ///
     /// Use `aise list` or `aise search` to find the session id, or `aise messages search` to find
     /// one turn inside it.
+    #[command(display_order = 12)]
     Show(ShowArgs),
     /// Resume a session in its native CLI: print the command, or run it with confirmation.
     ///
     /// Use `aise list` or `aise search` to find the session id first.
+    #[command(display_order = 14)]
     Resume(ResumeArgs),
     /// Export one full session or an explicitly selected bounded session bundle.
+    #[command(display_order = 20)]
     Export(ExportArgs),
     /// Search and read individual messages: conversation turns and tool evidence (search|get|timeline|evidence).
-    #[command(subcommand)]
+    #[command(display_order = 11, subcommand)]
     Messages(crate::messages::MessagesCmd),
     /// Aggregate slash-command usage frequency.
+    #[command(display_order = 33)]
     Planning(crate::analytics::PlanningArgs),
     /// Analyze indexed sessions with an optional validated JSON policy and publish one immutable bundle.
+    #[command(display_order = 34)]
     Analyze(AnalyzeArgs),
     /// Message counts by role.
     ///
     /// Every harness notice is left out: what the harness told the agent, not what a person or a
     /// model wrote. A raw `group by role` over the messages table counts those too and reports
     /// more; `aise messages search --kind harness-notice` returns them on their own.
+    #[command(display_order = 30)]
     Stats(crate::analytics::StatsArgs),
     /// How often a term appears across every indexed message, and in how many of them.
     ///
@@ -140,47 +165,52 @@ enum Commands {
     /// This counts the index itself, so unlike `aise stats` it counts every indexed message,
     /// harness notices included: hook and tool wording ranks here beside what people and models
     /// wrote. It reports how often, never which messages — `aise messages search` returns those.
+    #[command(display_order = 32)]
     Vocab(crate::analytics::VocabArgs),
     /// Find recurring phrases in what people wrote.
     ///
     /// User-role messages unless `--role` names another, so an assistant or tool phrase repeated
     /// across sessions is not reported by default.
+    #[command(display_order = 31)]
     Repeats(crate::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
-    #[command(subcommand)]
+    #[command(display_order = 15, subcommand)]
     Files(crate::files::FilesCmd),
     /// Manage executable aliases, client registrations, instructions, and skills.
-    #[command(subcommand)]
+    #[command(display_order = 23, subcommand)]
     Integrations(IntegrationsCmd),
     /// List, inspect, validate, create, or execute Agent Skill packages.
-    #[command(subcommand)]
+    #[command(display_order = 35, subcommand)]
     Skills(crate::skills::SkillsCmd),
     /// Inspect, check, or update the installed aise distribution.
-    #[command(subcommand)]
+    #[command(display_order = 24, subcommand)]
     Package(PackageCmd),
     /// Serve MCP JSON-RPC over standard input/output.
-    #[command(subcommand)]
+    #[command(display_order = 43, subcommand)]
     Mcp(crate::integrations::McpCmd),
     /// Expert read-only SQL over the local AI session-history index.
-    #[command(subcommand)]
+    #[command(display_order = 40, subcommand)]
     Db(crate::sql_query::DbCmd),
     /// Safely migrate or verify a session index database.
-    #[command(subcommand)]
+    #[command(display_order = 41, subcommand)]
     Migrate(MigrationCmd),
     /// Inspect effective configuration, its file, origins, and resolved filesystem paths.
-    #[command(subcommand)]
+    #[command(display_order = 25, subcommand)]
     Config(ConfigCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
     ///
     /// Referenced by every `--since`, `--until`, and `--when` flag; `aise list --since` is the usual caller.
+    #[command(display_order = 26)]
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
     ///
     /// Pass `--format json` for the machine-readable summary, and use `aise config paths` to see where files are read from.
+    #[command(display_order = 22)]
     Doctor(DoctorArgs),
     /// Launch the interactive terminal UI for browsing and resuming sessions.
     ///
     /// Use `aise search` or `aise messages search` for the same queries without the interface.
+    #[command(display_order = 44)]
     Tui,
 }
 
@@ -377,21 +407,26 @@ enum DoctorFormat {
     Json,
 }
 
+/// Help sections for `aise list`, `aise search`, and `aise analyze`, which flatten the same session
+/// filters: which sessions, when (the shared time-window section), and how the rows come back.
+const SESSION_FILTER_HEADING: &str = "Filters (which sessions)";
+const SESSION_OUTPUT_HEADING: &str = "Result window and output";
+
 #[derive(Debug, Args, Clone)]
 struct QueryArgs {
     #[command(flatten)]
     filters: SessionFilterArgs,
     /// Maximum number of rows to return. Omit to use `[search].default_limit`; zero means all.
-    #[arg(long)]
+    #[arg(help_heading = SESSION_OUTPUT_HEADING, long)]
     limit: Option<usize>,
     /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
     /// emit machine-readable rows.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    #[arg(help_heading = SESSION_OUTPUT_HEADING, long, value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
     /// Add optional fields to structured JSON/JSONL session rows. Repeat or comma-separate
     /// values. `raw-metadata` restores the provider metadata blob, which is omitted by default
     /// because it can be large. Table, CSV, and plain output keep their established columns.
-    #[arg(long, value_enum, value_delimiter = ',')]
+    #[arg(help_heading = SESSION_OUTPUT_HEADING, long, value_enum, value_delimiter = ',')]
     include: Vec<SessionInclude>,
 }
 
@@ -404,26 +439,27 @@ enum SessionInclude {
 #[derive(Debug, Args, Clone)]
 struct SessionFilterArgs {
     /// Restrict to one indexed session source; omit to include all nine.
-    #[arg(long)]
+    #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     /// Omit to search every allowed root.
-    #[arg(long)]
+    #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     path: Option<String>,
     /// Exclude sessions whose cwd, repo root, or transcript path starts with this path.
     /// Repeat to exclude multiple noisy worktrees or transcript roots. Omit to exclude none.
-    #[arg(long = "exclude-path")]
+    #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-path")]
     exclude_paths: Vec<String>,
     /// Exclude one exact session id. Repeat to exclude multiple sessions. Omit to exclude none.
-    #[arg(long = "exclude-session")]
+    #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-session")]
     exclude_sessions: Vec<String>,
     /// Restrict to one session class; one-value alias for --session-kinds. Omit for both classes.
-    #[arg(long = "session-kind", value_enum)]
+    #[arg(help_heading = SESSION_FILTER_HEADING, long = "session-kind", value_enum)]
     session_kind: Option<SessionKind>,
     /// Session classes to return: user for sessions you started, subagent for runs those
     /// sessions spawned. Omit for both. With --parent-session, use subagent or omit this option;
     /// user cannot match a spawned run.
     #[arg(
+        help_heading = SESSION_FILTER_HEADING,
         long = "session-kinds",
         value_enum,
         num_args = 1..,
@@ -433,12 +469,12 @@ struct SessionFilterArgs {
     session_kinds: Vec<SessionKind>,
     /// Restrict to runs spawned by this exact session id. Omit to include root and spawned runs
     /// alike. If a session class is also supplied, it must include subagent.
-    #[arg(long = "parent-session")]
+    #[arg(help_heading = SESSION_FILTER_HEADING, long = "parent-session")]
     parent_session: Option<String>,
     #[command(flatten)]
     dates: DateRange,
     /// Show only sessions that produced a parse warning.
-    #[arg(long)]
+    #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     warnings_only: bool,
 }
 
@@ -2294,6 +2330,106 @@ mod tests {
             invocations.push((index + 1, invocation));
         }
         invocations
+    }
+
+    /// The root help lists twenty-four commands. `ROOT_COMMAND_GROUPS` sorts them into everyday,
+    /// maintenance, analytics, and expert groups and `display_order` lists them in that order, so
+    /// a new command must be classified before it ships: every visible subcommand appears in the
+    /// grouping text exactly once, no group names a command that does not exist, and the rendered
+    /// help lists the everyday group first.
+    #[test]
+    fn root_help_names_every_visible_command_once_and_lists_everyday_commands_first() {
+        let command = Cli::command();
+        let visible: Vec<&str> = command
+            .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+            .map(|sub| sub.get_name())
+            .collect();
+        let grouped: Vec<&str> = ROOT_COMMAND_GROUPS
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':').map(|(_, names)| names))
+            .flat_map(|names| names.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        for name in &visible {
+            assert_eq!(
+                grouped.iter().filter(|g| g == &name).count(),
+                1,
+                "visible command `{name}` must appear exactly once in ROOT_COMMAND_GROUPS"
+            );
+        }
+        for name in &grouped {
+            assert!(
+                visible.contains(name),
+                "ROOT_COMMAND_GROUPS names `{name}`, which is not a visible command"
+            );
+        }
+        let rendered = Cli::command().render_help().to_string();
+        let commands_section = rendered
+            .split("Commands:")
+            .nth(1)
+            .and_then(|rest| rest.split("Options:").next())
+            .expect("root help has a Commands section");
+        let listed: Vec<&str> = commands_section
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let everyday = ["search", "messages", "show", "list", "resume", "files"];
+        assert_eq!(
+            &listed[..everyday.len()],
+            &everyday,
+            "the everyday commands lead the root help: {listed:?}"
+        );
+        assert!(
+            rendered.contains("Start here (everyday):"),
+            "the group legend is printed after the options"
+        );
+    }
+
+    /// `aise messages search` has thirty-nine options; every one is filed under a section so the
+    /// six a caller needs first are not buried in one alphabetical block. A new option must pick
+    /// a section: only `--help` and the positional query stay in the unnamed default section.
+    #[test]
+    fn messages_search_help_files_every_option_under_a_named_section() {
+        let root = Cli::command();
+        let messages = root
+            .find_subcommand("messages")
+            .expect("messages subcommand");
+        let search = messages
+            .find_subcommand("search")
+            .expect("messages search subcommand");
+        let unsectioned: Vec<String> = search
+            .get_arguments()
+            .filter(|arg| arg.get_help_heading().is_none())
+            .filter(|arg| !arg.is_positional() && arg.get_id() != "help")
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        assert!(
+            unsectioned.is_empty(),
+            "every messages-search option needs a help_heading; missing: {unsectioned:?}"
+        );
+        let rendered = search.clone().render_long_help().to_string();
+        let sections = [
+            "Query (what to find):",
+            "Filters (which messages):",
+            "Time window (formats: `aise dates`):",
+            "Result window and context (how many, from where):",
+            "Presentation and output (never changes which messages match):",
+            "Advanced (purpose bundles, receipts, self-description):",
+        ];
+        let mut last = 0;
+        for section in sections {
+            let position = rendered.find(section).unwrap_or_else(|| {
+                panic!("section `{section}` missing from messages search --help")
+            });
+            assert!(
+                position > last,
+                "sections must render in the documented order"
+            );
+            last = position;
+        }
     }
 
     /// The shipped skill and README are what an agent reads instead of `--help`, so an example
