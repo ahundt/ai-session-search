@@ -222,6 +222,9 @@ build_and_verify_python_artifacts() {
     mkdir -p "$output"
     uv run maturin build --release --locked --out "$output" || return
     uv run maturin sdist --out "$output" || return
+    # The same rewrite the publish.yml wheels job applies: maturin's embedded SBOM names
+    # this checkout, and verify_release_artifacts rejects a wheel that still does.
+    uv run python scripts/sanitize_sboms.py --root "$SCRIPT_DIR" "$output"/*.whl || return
     uv run python -m scripts.verify_release_artifacts "$output"/* || return
     local wheel
     wheel="$(find "$output" -maxdepth 1 -name '*.whl' -print -quit)"

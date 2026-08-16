@@ -77,6 +77,10 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           command: build
           args: --release --locked --out dist
+      # Same rewrite as the publish.yml wheels job: the embedded SBOM names this checkout,
+      # and verify_release_artifacts rejects a wheel that still does.
+      - run: uv run --isolated --no-project python scripts/sanitize_sboms.py --root "$GITHUB_WORKSPACE" dist/*.whl
+        shell: bash
       - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*.whl
         shell: bash
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

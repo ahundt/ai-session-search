@@ -207,6 +207,10 @@ jobs:
           CLAUDE_CONFIG_DIR: ${{ github.workspace }}/tests/aise-demo
           NO_COLOR: '1'
       - run: uv run maturin build --release --locked --out dist
+      # Same rewrite as the publish.yml wheels job: the embedded SBOM names this checkout,
+      # and verify_release_artifacts rejects a wheel that still does.
+      - run: uv run python scripts/sanitize_sboms.py --root "$GITHUB_WORKSPACE" dist/*.whl
+        shell: bash
       - run: uv run python -m scripts.verify_release_artifacts dist/*.whl
         shell: bash
       - name: Smoke-test the exact wheel outside the source environment
