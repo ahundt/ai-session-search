@@ -104,7 +104,15 @@ jobs:
           python-version: '3.12'
           enable-cache: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-      - run: uv build --no-sources --sdist --out-dir dist
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          # Same maturin the release uses; see the sdist job in publish.yml. `uv build --sdist`
+          # calls maturin as the PEP 517 backend but resolves it from the `maturin>=1.14.1,<2.0`
+          # range in pyproject.toml, so it could package a rehearsal sdist with a different
+          # maturin than the one that packages the released sdist.
+          maturin-version: v1.14.1
+          command: sdist
+          args: --out dist
       - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*.tar.gz
         shell: bash
       - run: uv run --isolated --no-project --with ./dist/*.tar.gz python scripts/verify_installed_distribution.py --source-root "$GITHUB_WORKSPACE"
