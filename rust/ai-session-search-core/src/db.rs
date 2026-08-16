@@ -8992,6 +8992,64 @@ mod tests {
         }
     }
 
+    /// The last row inside the corpus is returned, and the first offset past it is not.
+    ///
+    /// [`Db::fuzzy_ranking_window`] answers a page from the count when `offset >= corpus`, and the
+    /// two offsets either side of that comparison are where an off-by-one would flip: one row
+    /// silently dropped from the end of a deep page, or an empty page reported as scored. The
+    /// existing coverage uses offset zero and an offset far past any corpus, so both sit well away
+    /// from the boundary. The window is only measured when the requested page exceeds one scoring
+    /// batch, which is what the large limit is for.
+    #[test]
+    fn the_fuzzy_window_boundary_keeps_the_last_row_and_drops_the_first_one_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test');",
+            )
+            .unwrap();
+        let corpus = 4_usize;
+        for seq in 0..corpus {
+            db.conn
+                .execute(
+                    "insert into messages (session_id, provider, seq, role, content) \
+                     values ('s1', 'claude', ?, 'user', 'exec command output')",
+                    [seq],
+                )
+                .unwrap();
+        }
+
+        let filters = |offset: usize| MessageFilters {
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: FUZZY_SCORE_BATCH_SIZE + 100,
+            offset,
+            ..Default::default()
+        };
+
+        // The last offset inside the corpus still yields its one remaining row, scored.
+        let (hits, explain) = db
+            .search_messages_with_explain("exec", &filters(corpus - 1), true)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the last row is inside the corpus");
+        assert_eq!(explain.expect("receipt").candidates, Some(corpus as i64));
+
+        // The first offset past it is answered from the count, with nothing scored.
+        let (hits, explain) = db
+            .search_messages_with_explain("exec", &filters(corpus), true)
+            .unwrap();
+        assert!(hits.is_empty(), "one past the last row is an empty page");
+        let explain = explain.expect("receipt");
+        assert_eq!(explain.corpus, corpus as i64);
+        assert_eq!(
+            explain.candidates, None,
+            "an empty page from the count scored no row"
+        );
+    }
+
     /// A literal search finds Greek text ending in sigma, whichever spelling either side uses.
     ///
     /// End to end rather than at the matcher: the query needle, the trigram candidate selection,
