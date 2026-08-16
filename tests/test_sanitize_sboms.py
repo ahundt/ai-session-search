@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
-from scripts.sanitize_sboms import SanitizationError, sanitize_file
+from scripts.sanitize_sboms import SanitizationError, sanitize_file, sanitize_wheel_sboms
 
 
 def test_rewrites_workspace_paths_and_preserves_reference_graph(tmp_path: Path) -> None:
@@ -70,3 +75,94 @@ def test_rejects_remote_file_dependency_without_modifying_file(tmp_path: Path) -
         sanitize_file(sbom, workspace)
 
     assert sbom.read_text(encoding="utf-8") == original
+
+
+def _record_digest(payload: bytes) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+
+
+def _wheel_with_sbom(path: Path, sbom: dict, *, dist_info: str = "pkg-1.0.dist-info") -> str:
+    sbom_name = f"{dist_info}/sboms/pkg.cyclonedx.json"
+    sbom_bytes = json.dumps(sbom).encode()
+    record = f"pkg/__init__.py,sha256=abc,3\n{sbom_name},sha256={_record_digest(sbom_bytes)},{len(sbom_bytes)}\n{dist_info}/RECORD,,\n"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("pkg/__init__.py", "x=1")
+        archive.writestr(sbom_name, sbom_bytes)
+        archive.writestr(f"{dist_info}/RECORD", record)
+    return sbom_name
+
+
+def test_wheel_sboms_lose_the_build_machine_path_and_record_follows(tmp_path: Path) -> None:
+    """maturin records the checkout as `path+file://<checkout>/...` inside the wheel's PEP 770 SBOM.
+
+    A wheel therefore carries the directory it was built in: the maintainer's home locally, the
+    runner's checkout in CI. The build root is rewritten to the same `workspace:` form the separate
+    SBOMs get, and RECORD's hash and size for the rewritten member are updated so the wheel stays
+    installable. The build clock is untouched, so the SOURCE_DATE_EPOCH check still holds after.
+    """
+    root = tmp_path / "checkout"
+    (root / "rust/pkg").mkdir(parents=True)
+    wheel = tmp_path / "pkg-1.0-py3-none-any.whl"
+    sbom_name = _wheel_with_sbom(
+        wheel,
+        {
+            "bomFormat": "CycloneDX",
+            "metadata": {"timestamp": "2026-01-01T00:00:00Z", "component": {"bom-ref": f"path+file://{root}/rust/pkg#1.0"}},
+            "components": [{"purl": "pkg:cargo/serde@1.0", "bom-ref": "pkg:cargo/serde@1.0"}],
+        },
+    )
+
+    sanitize_wheel_sboms(wheel, root)
+
+    with zipfile.ZipFile(wheel) as archive:
+        assert archive.testzip() is None
+        sbom_bytes = archive.read(sbom_name)
+        document = json.loads(sbom_bytes)
+        assert document["metadata"]["component"]["bom-ref"] == "workspace:rust/pkg#1.0"
+        assert document["metadata"]["timestamp"] == "2026-01-01T00:00:00Z", "the build clock is untouched"
+        assert "path+file://" not in sbom_bytes.decode()
+        record = archive.read("pkg-1.0.dist-info/RECORD").decode()
+        assert f"{sbom_name},sha256={_record_digest(sbom_bytes)},{len(sbom_bytes)}" in record
+        assert "pkg/__init__.py,sha256=abc,3" in record, "other RECORD rows are untouched"
+        assert archive.namelist() == ["pkg/__init__.py", sbom_name, "pkg-1.0.dist-info/RECORD"], "member order is preserved"
+
+    first = wheel.read_bytes()
+    sanitize_wheel_sboms(wheel, root)
+    assert wheel.read_bytes() == first, "a second pass is a no-op, so the step is safe to rerun"
+
+
+def test_a_wheel_sbom_path_outside_the_checkout_is_refused_without_modifying_the_wheel(tmp_path: Path) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    wheel = tmp_path / "pkg-1.0-py3-none-any.whl"
+    _wheel_with_sbom(wheel, {"metadata": {"component": {"bom-ref": f"path+file://{tmp_path}/elsewhere#1.0"}}})
+    original = wheel.read_bytes()
+
+    with pytest.raises(SanitizationError, match="outside workspace"):
+        sanitize_wheel_sboms(wheel, root)
+
+    assert wheel.read_bytes() == original
+    assert sorted(tmp_path.iterdir()) == [root, wheel], "no temporary file is left beside the wheel"
+
+
+def test_command_line_accepts_wheels_beside_loose_sboms(tmp_path: Path) -> None:
+    """The wheels job in publish.yml calls the same script the sbom job does, on the wheel it built."""
+    root = tmp_path / "checkout"
+    (root / "rust/pkg").mkdir(parents=True)
+    wheel = tmp_path / "pkg-1.0-py3-none-any.whl"
+    _wheel_with_sbom(wheel, {"metadata": {"component": {"bom-ref": f"path+file://{root}/rust/pkg#1.0"}}})
+    loose = tmp_path / "loose.cdx.json"
+    loose.write_text(json.dumps({"bom-ref": f"path+file://{root}/rust/pkg#1.0"}), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "scripts/sanitize_sboms.py", "--root", str(root), str(wheel), str(loose)],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.stdout.splitlines() == [f"sanitized: {wheel}", f"sanitized: {loose}"]
+    with zipfile.ZipFile(wheel) as archive:
+        assert b"path+file://" not in archive.read("pkg-1.0.dist-info/sboms/pkg.cyclonedx.json")
+    assert json.loads(loose.read_text(encoding="utf-8")) == {"bom-ref": "workspace:rust/pkg#1.0"}

@@ -101,7 +101,9 @@ The release workflow follows this sequence:
 1. Run the complete reusable CI workflow at the tagged commit.
 2. Require the Git tag, Python version, and Rust crate version to represent the
    same release identity using the ecosystem-native spellings above.
-3. Build each wheel and native archive once on its matching native runner.
+3. Build each wheel and native archive once on its matching native runner, then
+   rewrite the wheel's embedded SBOM so workspace crates read `workspace:<path>`
+   rather than the runner's checkout path (`scripts/sanitize_sboms.py`).
 4. Build one sdist and generate locked Rust/Python SBOMs.
 5. Install and exercise each exact artifact outside the source environment.
 6. Aggregate the artifacts, reject missing or unexpected members, hash them,

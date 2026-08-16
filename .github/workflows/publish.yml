@@ -112,6 +112,18 @@ jobs:
           # The manylinux targets build inside a container, which does not inherit the
           # runner environment, so the variable has to be forwarded explicitly.
           docker-options: -e SOURCE_DATE_EPOCH
+      # maturin records the workspace crates in the wheel's embedded PEP 770 SBOM as
+      # path+file://<checkout>/rust/<crate>, so every runner's checkout path shipped inside
+      # the first release's wheels. This is the same rewrite the sbom job applies to the
+      # loose SBOMs, giving workspace:<relative>; the manylinux container mounts the checkout
+      # at the runner's own path, so one --root covers every matrix entry. RECORD is updated
+      # for the member and the pinned build clock is left alone, so the checks below still
+      # hold. The verify step and the verify job both reject a wheel that skipped this.
+      - name: Rewrite the embedded SBOM's checkout paths as workspace-relative
+        shell: bash
+        run: >-
+          uv run --isolated --no-project python scripts/sanitize_sboms.py
+          --root "$GITHUB_WORKSPACE" dist/*.whl
       # Exporting the variable and forwarding it into the container are two separate
       # claims, and only the wheel itself can settle the second. maturin writes the epoch
       # into the embedded SBOM's metadata.timestamp and drops serialNumber when it sees
