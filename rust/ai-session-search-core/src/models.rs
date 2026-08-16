@@ -2080,6 +2080,75 @@ mod tests {
         }
     }
 
+    /// Every typed value this crate writes as a string parses back as the same value.
+    ///
+    /// `as_str` is what the database, JSON output, and CLI display carry, and `from_str` is what
+    /// reads them back, so the pair is one contract exercised from two directions. Only two of the
+    /// enums had a round-trip test; the rest were covered from whichever side their feature needed,
+    /// which leaves a spelling that renders one way and parses another undetected until a stored
+    /// row or a piped value fails to decode.
+    #[test]
+    fn every_typed_value_parses_back_from_the_string_it_renders() {
+        use std::str::FromStr;
+
+        macro_rules! assert_round_trips {
+            ($($type:ty => [$($variant:expr),+ $(,)?]),+ $(,)?) => {
+                $($(
+                    let rendered = $variant.as_str();
+                    assert_eq!(
+                        <$type>::from_str(rendered).ok(),
+                        Some($variant),
+                        "{} renders as {rendered:?}, which parses back as something else",
+                        stringify!($variant),
+                    );
+                )+)+
+            };
+        }
+
+        assert_round_trips! {
+            Provider => [
+                Provider::Claude, Provider::ClaudeDesktop, Provider::Codex, Provider::Cursor,
+                Provider::Antigravity, Provider::Pi, Provider::PrimeAgent, Provider::AiStudio,
+                Provider::GeminiCli,
+            ],
+            Role => [Role::User, Role::Assistant, Role::Tool, Role::Slash, Role::Compaction],
+            MessageSearchMode => [
+                MessageSearchMode::Literal, MessageSearchMode::Regex, MessageSearchMode::Fuzzy,
+            ],
+            SearchField => [
+                SearchField::Content, SearchField::ToolName, SearchField::ToolArgument,
+            ],
+            MessageKind => [
+                MessageKind::Conversation, MessageKind::Compaction, MessageKind::ToolCall,
+                MessageKind::ToolResult, MessageKind::HarnessNotice, MessageKind::Unknown,
+            ],
+            MessageAuthorship => [
+                MessageAuthorship::Human, MessageAuthorship::Agent, MessageAuthorship::Harness,
+                MessageAuthorship::Generated, MessageAuthorship::Mixed, MessageAuthorship::Unknown,
+            ],
+            ContentPartAuthorship => [
+                ContentPartAuthorship::Human, ContentPartAuthorship::Agent,
+                ContentPartAuthorship::Harness, ContentPartAuthorship::Generated,
+                ContentPartAuthorship::Unknown,
+            ],
+            ContentPartOrigin => [
+                ContentPartOrigin::DirectInput, ContentPartOrigin::QuotedContent,
+                ContentPartOrigin::HarnessContext, ContentPartOrigin::GeneratedSummary,
+                ContentPartOrigin::ToolPayload, ContentPartOrigin::Unknown,
+            ],
+            MessageCorrelationAuthority => [
+                MessageCorrelationAuthority::Anthropic, MessageCorrelationAuthority::OpenAi,
+                MessageCorrelationAuthority::Cursor, MessageCorrelationAuthority::Google,
+                MessageCorrelationAuthority::Pi, MessageCorrelationAuthority::PrimeAgent,
+            ],
+            MessageRecordRelation => [
+                MessageRecordRelation::Original, MessageRecordRelation::Mirror,
+                MessageRecordRelation::Unknown,
+            ],
+            SessionKind => [SessionKind::User, SessionKind::Subagent],
+        }
+    }
+
     #[test]
     fn every_message_kind_round_trips_through_its_database_spelling() {
         use clap::ValueEnum;
