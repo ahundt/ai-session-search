@@ -144,6 +144,63 @@ def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:
     assert '"--renderer", "fontdue"' not in demo
 
 
+# The one place a build machine's home directory is allowed to appear, because the string is the
+# input under test: these fixtures feed the sanitizer the exact `path+file://` shape a CI-built
+# wheel carries, and the assertion is that the sanitizer rewrites it.
+_BUILD_PATH_FIXTURES = frozenset({"tests/test_release_artifacts.py"})
+
+
+def test_no_tracked_file_names_the_home_directory_it_was_written_on() -> None:
+    """A tracked file may name a home directory as `~` or a placeholder user, never a real one.
+
+    `sanitize_sboms.py` strips `path+file://<checkout>` out of wheel SBOMs so a published artifact
+    cannot say which machine built it. The repository is published too, so the same rule holds
+    here, and nothing enforced it: the measured-evidence table in the MCP client-limits document
+    wrote out the maintainer's own absolute `.local/bin/aise` path while every other document
+    wrote that same path as `~/.local/bin/aise`.
+
+    The check is against the home directory of whoever runs it, so it protects each contributor's
+    own path rather than one hard-coded name. Synthetic users (`/Users/x`, `/home/alice`) are
+    untouched by construction: they are nobody's home.
+    """
+    home = str(Path.home())
+    found = subprocess.run(
+        [
+            "git",
+            "grep",
+            "-I",
+            "--fixed-strings",
+            "--line-number",
+            home,
+            "--",
+            ".",
+            *(f":!{name}" for name in _BUILD_PATH_FIXTURES),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    # git grep exits 1 for no match and 0 for a match; anything else is the search itself failing,
+    # which would otherwise read as a clean repository.
+    assert found.returncode in (0, 1), f"git grep failed: {found.stderr}"
+    offenders = [":".join(hit.split(":", 2)[:2]) for hit in found.stdout.splitlines()]
+    # git grep reads a symlink's destination rather than the link, so the stored target gets its
+    # own check: an absolute target would carry the home directory it was created in.
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    offenders += [
+        name
+        for name in filter(None, tracked.split("\0"))
+        if (ROOT / name).is_symlink() and home in str((ROOT / name).readlink())
+    ]
+    assert not offenders, f"tracked content names the home directory {home}: {offenders}"
+
+
 def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf() -> None:
     """Both copies of the bundled skill must hold the same files with the same bytes.
 

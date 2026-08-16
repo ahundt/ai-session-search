@@ -268,7 +268,7 @@ Run through `aise mcp serve` as a client launches it, not only in tests.
 
 | Layer | Observed |
 |---|---|
-| Registered binary | `/Users/athundt/.local/bin/aise`, 1.0.0-rc.1, installed from the verified source tree with `uv tool install --force .`; Codex and Claude Code both register that exact path |
+| Registered binary | `~/.local/bin/aise`, 1.0.0-rc.1, installed from the verified source tree with `uv tool install --force .`; Codex and Claude Code both register that one absolute path, expanded from this home |
 | Current installed hashes | executable `255daf9919dd2bf57487ab83bc5be6cc316664e6be35ed4afaf5d78d4fe882a3`; native module `c4cc938c01f3acef765f8ef5c0e595d69b3b98f21ca7c3a272dfce52b950d632` (arm64) |
 | Retained release artifacts | The b246d1c wheel/sdist and their recorded hashes remain historical; they are not byte-identical to this source-installed follow-up |
 | Artifact the cold-agent runs used | executable `1804bdec7997aebc35ddd4f1c3fea05b3d57256f71b584bcc219dac011245293`, which differs from the release candidate only by two CLI help strings and emits the identical MCP catalogue and results |
