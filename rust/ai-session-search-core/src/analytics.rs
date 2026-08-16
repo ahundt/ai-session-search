@@ -755,6 +755,14 @@ fn repeat_filters(
     })
 }
 
+/// The text the repeat scan filters messages by, in both literal and regex mode. `--regex` used
+/// to travel inside the filters (`MessageFilters::regex`) while the query text was passed as
+/// `""`; when the two modes were unified under `match_mode` (2026-07-14) the blank stayed, so
+/// `aise repeats --regex PATTERN` mined every message and the pattern was never applied.
+fn repeat_query(args: &RepeatsArgs) -> &str {
+    args.query.as_deref().unwrap_or("")
+}
+
 fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
     let max_groups = args.max_groups.unwrap_or(config.repeat_max_groups);
     let max_examples_per_group = args
@@ -778,11 +786,7 @@ fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> 
         bail!("--phrase-max-words must be >= --phrase-min-words");
     }
     let filters = repeat_filters(db, args, Some(Role::User))?;
-    let query = if args.regex {
-        ""
-    } else {
-        args.query.as_deref().unwrap_or("")
-    };
+    let query = repeat_query(args);
     // Default/user repeat mining is evidence about what a person wrote, not every provider row
     // stored with `role=user`. Explicit assistant/tool/slash/compaction analysis retains its
     // role-based contract because those roles do not claim human authorship.
@@ -1195,6 +1199,76 @@ mod tests {
         assert!(!groups
             .iter()
             .any(|group| group.repeat.contains("generated")));
+    }
+
+    /// `--regex PATTERN` must narrow the mined messages by PATTERN. The pattern was passed as
+    /// `""` after the match modes were unified, so every message was mined and the documented
+    /// `--regex -- ^/\S+` example could not work.
+    #[test]
+    fn repeats_apply_the_regex_query_to_the_mined_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.execute_batch_for_test(
+            "insert into sessions (
+                     id, provider, provider_session_id, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values ('claude:repeat-regex', 'claude', 'repeat-regex', '',
+                           '/repeat-regex', 'v1', 'test');
+                 insert into messages (
+                     id, session_id, provider, seq, role, kind, content, authorship, record_relation
+                 ) values
+                   (201, 'claude:repeat-regex', 'claude', 0, 'user', 'conversation',
+                    '/plan the login fix', 'human', 'original'),
+                   (202, 'claude:repeat-regex', 'claude', 1, 'user', 'conversation',
+                    '/plan the login fix', 'human', 'original'),
+                   (203, 'claude:repeat-regex', 'claude', 2, 'user', 'conversation',
+                    'please rerun the login fix', 'human', 'original');",
+        )
+        .unwrap();
+        let regex_args = |pattern: &str| RepeatsArgs {
+            query: Some(pattern.to_string()),
+            regex: true,
+            role: None,
+            provider: None,
+            session_id: None,
+            path: None,
+            dates: DateRange::default(),
+            context: 0,
+            limit: 0,
+            max_groups: Some(0),
+            max_examples_per_group: Some(0),
+            min_matches: Some(2),
+            phrase_min_words: Some(2),
+            phrase_max_words: Some(4),
+            format: OutputFormat::Json,
+        };
+        let slash = regex_args(r"^/\S+");
+        assert_eq!(repeat_query(&slash), r"^/\S+");
+        let filters = repeat_filters(&db, &slash, Some(Role::User)).unwrap();
+        assert_eq!(filters.match_mode, MessageSearchMode::Regex);
+        let hits = db
+            .search_attributable_human_messages(repeat_query(&slash), &filters)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+            [0, 1],
+            "only the slash-command messages match ^/\\S+"
+        );
+
+        let none = regex_args("zzz_no_match");
+        let filters = repeat_filters(&db, &none, Some(Role::User)).unwrap();
+        assert!(db
+            .search_attributable_human_messages(repeat_query(&none), &filters)
+            .unwrap()
+            .is_empty());
+
+        let invalid = regex_args("[unclosed");
+        let filters = repeat_filters(&db, &invalid, Some(Role::User)).unwrap();
+        let error = db
+            .search_attributable_human_messages(repeat_query(&invalid), &filters)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid regex"), "{error}");
     }
 
     #[test]
