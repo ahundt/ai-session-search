@@ -164,10 +164,14 @@ def sanitize_wheel_sboms(wheel: pathlib.Path, root: pathlib.Path) -> None:
                     payload = rewritten[info.filename]
                 elif _WHEEL_RECORD_MEMBER.search(info.filename):
                     payload = _record_with(payload, rewritten)
-                # The member's own ZipInfo is written back, so every field travels across —
-                # including `extra`, `comment`, `internal_attr`, and the compression level, which
-                # a fresh ZipInfo would start empty. `writestr` recomputes the sizes and CRC for
-                # the payload it is given, which is what the two rewritten members need.
+                # The member's own ZipInfo is written back, so every field it carries travels
+                # across — `date_time`, `compress_type`, `external_attr`, `create_system`,
+                # `extra`, `comment`, `internal_attr` — each of which a fresh ZipInfo would start
+                # empty. The compression *level* is not among them: ZIP does not record it, so a
+                # ZipInfo read back from an archive has `_compresslevel` unset and the rebuild
+                # re-encodes at CPython's default, as the docstring above states. `writestr`
+                # recomputes the sizes and CRC for the payload it is given, which is what the two
+                # rewritten members need.
                 archive.writestr(info, payload)
         os.replace(temporary, wheel)
         temporary = None

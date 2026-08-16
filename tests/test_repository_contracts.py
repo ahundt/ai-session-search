@@ -560,14 +560,40 @@ def test_build_provenance_is_attested_only_for_a_real_tag_push() -> None:
         "the release-set verification must run before the attestation, so a rehearsal still "
         "proves the subject-path resolves to exactly the expected artifacts"
     )
+    # Slice the attestation's own step, from the `- ` that starts it to the next one. Asserting
+    # the gate merely appears somewhere before the attestation would also pass if it were moved
+    # onto the `sha256sum` step in between, leaving the attestation ungated on every dispatch.
+    step_start = verify.rindex("\n      - ", 0, attest)
+    step_end = verify.find("\n      - ", attest)
+    attest_step = verify[step_start : step_end if step_end != -1 else len(verify)]
     gate = "if: github.event_name == 'push'"
-    assert gate in verify[:attest], (
-        f"the attestation step must carry {gate!r}: it persists an entry that cannot be "
-        "deleted, so a workflow_dispatch rehearsal must not create one"
+    assert gate in attest_step, (
+        f"the attestation step itself must carry {gate!r}: it persists an entry that cannot be "
+        f"deleted, so a workflow_dispatch rehearsal must not create one. Step was:\n{attest_step}"
     )
-    assert verify[:attest].rindex(gate) > release_set, (
-        "the gate must sit on the attestation step itself, not on an earlier step"
-    )
+
+
+def test_readme_pre_release_disclosure_matches_the_declared_version() -> None:
+    # The README tells readers that `uv tool install` and `cargo install` resolve a release
+    # candidate because no stable version exists. That is true of every version this project has
+    # published so far and becomes false the moment `X.Y.Z` ships, at which point the sentence
+    # would tell people the opposite of what their resolver does. Tie it to the version the
+    # manifest declares, the way the other factual README claims here are tied to their source.
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    disclosure = "No stable version is published yet"
+
+    prerelease = any(marker in version for marker in ("a", "b", "rc", "dev"))
+    if prerelease:
+        assert disclosure in readme, (
+            f"version {version} is a pre-release, so the install block must say plain installs "
+            "resolve it"
+        )
+    else:
+        assert disclosure not in readme, (
+            f"version {version} is stable, so the install block must drop the pre-release "
+            "disclosure: both resolvers now prefer the stable release"
+        )
 
 
 def _workflow_jobs(text: str) -> dict[str, str]:
