@@ -43,7 +43,8 @@ config, surface config, or typed default). Fields:
 - `corpus`: every row the structural filters admit. It is counted from indexes:
   one pass over the smallest message-table index when no structural filter is set (a few seconds
   cold on a 23 GB, 2.7-million-message index, well under a second warm), and only the filtered
-  rows' index entries with `--role`, `--session-id`, `--workspace-path`, `--when`, or `--tool`.
+  rows' index entries with `--role`, `--session-id`, `--workspace-path`, `--when`, or
+  `--tool-name-contains`.
   An explicit `--kinds` set beyond `harness-notice`/`compaction` counts by reading rows. An index
   written by an aise before 1.0.0rc2 gains the supporting partial index at its next refresh.
 - `candidates`: rows the prefilter admitted before verification (absent for a verified scan or a

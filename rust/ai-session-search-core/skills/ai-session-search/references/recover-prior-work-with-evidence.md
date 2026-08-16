@@ -1,8 +1,8 @@
 # Recover prior work with evidence
 
 Use this workflow when broad AI-session research would consume substantial main-agent context.
-The harness owns delegation. AI Session Search supplies read-only MCP or CLI evidence and does not
-start, supervise, or impersonate an AI subagent.
+The harness starts and supervises the subagent; AI Session Search answers its read-only MCP or
+CLI queries.
 
 ## Decide whether to delegate
 
@@ -30,7 +30,7 @@ session_filters: <roles, message kinds, or session kinds that matter>
 discovery_kind: topic-overview | exact-evidence | topic-then-verify
 required_claims:
   - <claims that need direct support>
-index_freshness: existing-only | before-query
+index_freshness: existing-only | before-query   # before-query is a CLI flag; MCP calls accept auto | existing-only
 research_budget:
   max_elapsed_minutes: <optional positive integer>
   max_search_pages_per_query: <positive integer>

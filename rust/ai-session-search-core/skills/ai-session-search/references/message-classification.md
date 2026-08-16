@@ -55,7 +55,7 @@ Validation is strict, and every failure names the offending field:
 ## Selecting packages
 
 The first token after `aise skills` selects the primary package by catalog name, skill directory,
-or exact `SKILL.md` path. Repeat `--skill NAME_OR_PATH` to evaluate additional
+or exact `SKILL.md` path (a package named like a management verb runs as `aise skills run NAME`). Repeat `--skill NAME_OR_PATH` to evaluate additional
 message-classification packages afterward. Argument order is evaluation order:
 
 ```sh
@@ -83,7 +83,7 @@ capability for `aise` to run. `--output-dir` names the parent directory; set
 managed marker, so `aise` leaves it alone on `aise skills update`.
 
 Add its parent to `[skills].search_paths` in the aise config (`aise config file` prints the
-path), then:
+path; `aise config init` writes the file if it is absent), then:
 
 ```sh
 aise skills list                                   # confirm it is discovered and valid
@@ -124,7 +124,7 @@ aise skills corrections --format json
   "requested_selector": { "name": "corrections" },
   "resolved_skill": {
     "name": "corrections",
-    "package_version": "1.0.0-rc.1",
+    "package_version": "1.0.0-rc.2",
     "selected_location": { "kind": "embedded" },
     "execution_source": { "kind": "embedded" }
   },
@@ -133,21 +133,24 @@ aise skills corrections --format json
     "result": {
       "receipt": {
         "name": "corrections",
-        "version": "1.0.0-rc.1",
-        "sha256": "cea1…"
+        "version": "1.0.0-rc.2",
+        "sha256": "cc76…"
       },
       "report": {
         "policies": [
-          { "name": "corrections", "version": "1.0.0-rc.1", "sha256": "cea1…" }
+          { "name": "corrections", "version": "1.0.0-rc.2", "sha256": "cc76…" }
         ],
         "matches": [
           {
             "session_id": "claude:0f9c…",
+            "message_seq": 42,
             "provider": "claude",
-            "timestamp": "2026-06-03T00:00:00+00:00",
+            "ts": "2026-06-03T00:00:00+00:00",
             "policy_name": "corrections",
             "category": "skip_step",
             "matched_text": "you forgot",
+            "match_start_char": 0,
+            "match_end_char_exclusive": 10,
             "content": "you forgot the migration"
           }
         ]
@@ -159,8 +162,8 @@ aise skills corrections --format json
 
 `report.policies` is always present, including when `report.matches` is empty. Otherwise "these
 rules ran and found nothing" and "no rules ran" would look identical.
-`output.receipt` is the primary selected skill's policy receipt and equals the first entry in
-`report.policies`; the list also records every additional `--skill` policy in evaluation order.
+`output.result.receipt` is the primary selected skill's policy receipt and equals the first entry
+in `report.policies`; the list also records every additional `--skill` policy in evaluation order.
 
 `matched_text` is the substring that matched, **not** the rule that matched it.
 
@@ -212,8 +215,9 @@ context window, and explicit path selectors must be authorized by `[skills].sear
 
 By default only user-started sessions are scanned. In a spawned subagent run the `role='user'`
 rows are the **calling agent's** delegation prompt, not anything a person typed — and a prompt like
-"don't forget to check the tests" matches a built-in category exactly. Subagent sessions outnumber
-user-started ones roughly five to one, so including them by default would drown real corrections.
+"don't forget to check the tests" matches a built-in category exactly. On the machine this was
+measured, Claude Code subagent sessions outnumbered user-started ones roughly five to one, so
+including them by default would drown real corrections.
 
 Pass `--session-kinds user subagent` to scan both, or `--session-kinds subagent` for delegation
 prompts alone. This default deliberately differs from `aise search` and `aise list`, which return

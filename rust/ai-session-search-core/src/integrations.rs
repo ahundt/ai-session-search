@@ -5119,7 +5119,7 @@ mod tests {
             .expect("the managed skill includes its prior-work evidence recovery workflow")
             .content;
         assert!(prior_work_recovery.contains("bounded evidence packet"));
-        assert!(prior_work_recovery.contains("The harness owns delegation"));
+        assert!(prior_work_recovery.contains("The harness starts and supervises the subagent"));
     }
 
     #[test]

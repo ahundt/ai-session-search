@@ -201,14 +201,16 @@ lines, negative the last N, zero everything (which may be large). `--limit` on `
 selects oldest-first unless `--order newest`, which selects the last N and prints them
 oldest-first. To read further, continue from the next seq range (`seq_from = last seq + 1`)
 rather than re-requesting a larger `--limit` or `transcript_lines`, which re-sends what you
-already read; MCP mirrors this with `get_session(seq_from, seq_to)`, `search_messages` pages
-newest-first with `offset`, and `match_window=latest` (one `session_id`) selects the last
-occurrence inside each hit. Prefer compact evidence (`messages evidence`) first and one turn
+already read; MCP mirrors this with `get_session(seq_from, seq_to)`. `search_messages` pages in
+session/sequence order with `offset` (fuzzy pages by score); `match_window=latest` (requires
+one `session_id`) keeps the last N matching messages of that session instead of the first N,
+still returned oldest first. Prefer compact evidence (`messages evidence`) first and one turn
 (`messages get --seq`) over a larger transcript window.
 
 Presentation flags change display only; matches, ranking, result count, pagination, context
 membership, and reference extraction stay the same: `--context N` adds neighboring turns of any
-role (in plain output `*` marks the hit); `--lines-per-message N` keeps the first N lines,
+role (in table and plain output the `match` column is filled only on hit rows: the match
+evidence when the query produced one, otherwise `*`); `--lines-per-message N` keeps the first N lines,
 negative the last N, zero the complete content; MCP `field_view`/`match_view` are character
 budgets. For a search expected to return several hits, set `--lines-per-message` before
 increasing `--limit`: `--limit` bounds the hit count and `--lines-per-message` bounds each hit.
@@ -220,8 +222,8 @@ aise export SESSION_ID --format markdown --output session.md
 aise export --path ~/source/project --when 7d --limit 20 --output-dir /absolute/new/directory
 ```
 
-A filtered bundle creates a new immutable directory and requires an explicit bound unless every
-matching session is required.
+A filtered bundle creates a new immutable directory; `--limit` defaults to
+`[search].default_limit` (50) and `--limit 0` bundles every matching session.
 
 ### Analyze repeated behavior
 
@@ -245,10 +247,11 @@ them, and one `tool_call_id` can appear on several rows, so count distinct ids r
 Publish analysis only to a new absolute directory; add `--policy` only for a validated JSON
 `AnalysisPolicySpec`.
 
-The corrections categories live in this skill's adjacent `aise-capability.toml`. Categories and
-selected skills are evaluated in declaration order, the first match wins, and every run reports
-the exact capability digest. Point `--skill` at another skill directory to add its categories
-after these:
+The corrections categories are the `aise-capability.toml` embedded in the executable; the copy
+beside this SKILL.md documents them, and editing an installed copy changes nothing (make your
+own package below). Categories and selected skills are evaluated in declaration order, the
+first match wins, and every run reports the exact capability digest. Point `--skill` at another
+skill directory to add its categories after these:
 
 ```sh
 aise skills corrections --skill ./my-review --format json
@@ -263,13 +266,15 @@ Scaffold one from the shipped categories, validate it, register its parent, then
 ```sh
 aise skills create my-corrections --capability message-classification --output-dir ~/.claude/skills
 aise skills validate ~/.claude/skills/my-corrections
-# add "~/.claude/skills" to [skills].search_paths in the file `aise config file` prints
+# add "~/.claude/skills" to [skills].search_paths in the file `aise config file` prints (`aise config init` writes it if absent)
 aise skills list
 aise skills my-corrections --path ~/source/project --when 30d --format json
 aise skills corrections --skill ~/.claude/skills/my-corrections --format json   # defaults first, yours after
 ```
 
-`aise skills show my-corrections` prints where it resolved from and its categories in order.
+`aise skills show my-corrections` prints where it resolved from and its categories in order; a
+package named like a management verb (`list`, `show`, `validate`, `create`, `update`, `restore`)
+runs as `aise skills run <name>`.
 MCP runs the same package with `run_skill_capability(skill={"name":"my-corrections"})` or
 `skill={"path":...}` under a `[skills].search_paths` root, `additional_skills` for more
 packages, and `definition={"categories":[{"name":...,"patterns":[...]}]}` for one call's
