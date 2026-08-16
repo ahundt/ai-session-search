@@ -207,6 +207,17 @@ matches the query's characters in order with gaps between them, so a 3-character
 fragment and a positive `--limit` are the inputs. Every structurally eligible row is scored before
 the deterministic offset and limit slice is selected. A hit is identified by `(session_id, seq)`.
 
+Cost order on one corpus, cheapest first: `list`/`messages get`/`show` (indexed lookups,
+milliseconds) < literal or regex with a selective prefilter (word and trigram indexes admit
+candidates, then the exact predicate is verified: sub-second on a multi-million-message index for
+a rare fragment such as `ECONNRESET`; a common phrase such as `permission denied` costs more
+because more candidates are verified) < fuzzy (every structurally eligible row's selected field
+is read and scored, `O(T + N)` bytes and rows, so seconds on the same index). Structural filters
+(`--workspace-path`, `--session-id`, `--role`, `--when`, `--kinds`, `--tool-name-contains`) shrink
+every mode's work before the query runs, so add them before widening a query and before choosing
+fuzzy. `--all-results` makes output grow with the match count; `--context N` multiplies rows
+returned per hit; `--receipt-level summary|full` adds one index pass for the corpus count.
+
 ### Read one session: newest/oldest N, and page without re-reading
 
 ```sh
