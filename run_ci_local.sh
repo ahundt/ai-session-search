@@ -397,8 +397,15 @@ fi
 step "Verify Python version" uv run python --version
 step "Ruff" uv run ruff check .
 step "mypy" uv run mypy ai_session_search tests
-step "Native runtime/stub parity" uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
-step "Python tests" uv run pytest -m "not integration" --tb=short
+# The two steps that load the extension built above run with `--no-sync`, so the environment they
+# check is the one that guard just verified. `maturin develop --uv` leaves the project installed in
+# a state a later `uv run` treats as out of sync, and that `uv run` then uninstalls and reinstalls
+# the package before running its command -- observed directly as an "Uninstalled 1 package /
+# Installed 1 package" pair printed by the stubtest invocation itself, not by maturin. Replacing the
+# freshly built module underneath a step that exists to verify it defeats the guard above, and the
+# preceding `uv sync --locked --all-extras` is what makes skipping the sync safe.
+step "Native runtime/stub parity" uv run --no-sync python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
+step "Python tests" uv run --no-sync pytest -m "not integration" --tb=short
 step "Rust formatting" cargo fmt --all --check
 step "Rust check" cargo check --workspace --all-targets --all-features --locked
 step "Rust Clippy" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
