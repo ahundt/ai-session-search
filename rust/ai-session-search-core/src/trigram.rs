@@ -188,9 +188,12 @@ fn literal_to_trigrams(text: &str) -> Option<Vec<String>> {
     {
         return None;
     }
-    // Sigma needs no such fallback. FTS5 folds `Σ`, `σ`, and `ς` onto one form, so each spelling
-    // of a trigram selects the rows holding any of them, matching the verifier's own rule (see
-    // `crate::util::fold_caseless_char`) and keeping the candidate set a superset either way.
+    // Sigma needs no such fallback here. FTS5 folds `Σ`, `σ`, and `ς` onto one form, so each
+    // spelling of a trigram selects the rows holding any of them, matching the verifier's own rule
+    // (see `crate::util::fold_caseless_char`) and keeping the candidate set a superset either way.
+    // The pre-v4 custom index stores the spelling `str::to_lowercase` chose for each position
+    // instead, so a sigma query reaches its verifier by a direct scan; `Db::prepare_content_prefilter`
+    // owns that decision, since only that path reads the custom index.
     let chars: Vec<char> = lowercase.chars().collect();
     if chars.len() < MIN_TRIGRAM_CHARS {
         return None;

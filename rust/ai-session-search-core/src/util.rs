@@ -236,6 +236,16 @@ pub(crate) fn fold_caseless(value: &str) -> String {
     value.chars().flat_map(fold_caseless_char).collect()
 }
 
+/// The three ways Greek writes one letter, which [`fold_caseless_char`] brings together and
+/// [`str::to_lowercase`] keeps apart.
+///
+/// Text holding any of these is the only text those two rules can disagree about, so a component
+/// that lowercases on its own and compares the result against something this rule folded needs to
+/// recognize it. The pre-v4 trigram index is the one such component: it stores the spelling
+/// lowercasing chose for each position, so a query holding a sigma reaches its verifier another way
+/// (see [`crate::db::Db::prepare_content_prefilter`]).
+pub(crate) const SIGMAS: [char; 3] = ['Σ', 'σ', 'ς'];
+
 /// One needle-and-haystack case every caseless matcher in search has to agree on.
 ///
 /// The layers that answer "does this text contain this query" were written at different times and

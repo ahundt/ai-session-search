@@ -28,7 +28,7 @@ use crate::models::{
     SearchFilters, SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
-use crate::util::{fold_caseless, snippet_from_match, UnicodeLowerNeedle};
+use crate::util::{fold_caseless, snippet_from_match, UnicodeLowerNeedle, SIGMAS};
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
 /// the upstream session-only release never set SQLite's `pragma user_version`, so any pre-existing
@@ -3540,6 +3540,29 @@ impl Db {
         } else {
             None
         };
+        // The custom index tokenizes documents with `str::to_lowercase`, whose word-final `Σ`
+        // becomes `ς`, while the verifier folds every sigma onto `σ`
+        // (`crate::util::fold_caseless`). One sigma spelling therefore asks for trigrams the other
+        // spelling never stored, so a row the verifier accepts can be missing from the candidate
+        // set — a prefilter narrowing the result instead of widening it. Scan directly for those
+        // patterns and let the verifier decide. FTS5 folds all three sigmas onto one form, so the
+        // schema-v4 path above keeps its indexed candidates.
+        if pattern.contains(SIGMAS) {
+            let explain = if include_explain {
+                Some(SearchExplain {
+                    prefilter: None,
+                    candidates: None,
+                    prefilter_skipped: Some(
+                        "the pre-v4 compatibility index spells sigma by position, so this query scans directly"
+                            .into(),
+                    ),
+                    corpus: self.corpus_count(filters, corpus)?,
+                })
+            } else {
+                None
+            };
+            return Ok((false, explain));
+        }
         let Some(groups) = crate::trigram::trigram_prefilter_groups(pattern) else {
             let explain = if include_explain {
                 Some(SearchExplain {
@@ -9087,6 +9110,55 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(hits.len(), 2, "query {query:?} finds both spellings");
+        }
+    }
+
+    /// A database on the pre-v4 layout finds that same Greek text.
+    ///
+    /// Schema versions below 4 have no FTS5 trigram table and select candidates from the custom
+    /// [`crate::trigram_index`] instead. That index tokenizes a document with
+    /// [`str::to_lowercase`], which writes a word-final `Σ` as `ς`, while the verifier folds every
+    /// sigma onto `σ`. A query spelled with the other sigma then asks for a trigram no document
+    /// holds, and a row the verifier would accept never becomes a candidate — a prefilter narrowing
+    /// the result set instead of widening it, which is the one thing it may never do.
+    #[test]
+    fn a_pre_v4_literal_search_finds_greek_text_ending_in_sigma() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
+        seed_messages(
+            &db,
+            &[
+                ("user", "η ΟΔΟΣΣ που ψαχνω"),
+                ("user", "η οδοσς που ψαχνω επισης"),
+            ],
+        );
+
+        for query in ["ΟΔΟΣΣ", "οδοσς", "οδοσσ"] {
+            let (hits, explain) = db
+                .search_messages_with_explain(
+                    query,
+                    &MessageFilters {
+                        match_mode: MessageSearchMode::Literal,
+                        limit: 10,
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 2, "query {query:?} finds both spellings");
+            // Both rows come back because the scan reached the verifier, rather than because the
+            // index happened to hold the spelling that was asked for: the receipt names the skip.
+            let explain = explain.expect("receipt");
+            assert_eq!(explain.prefilter, None, "query {query:?} indexed nothing");
+            assert!(
+                explain
+                    .prefilter_skipped
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("sigma")),
+                "query {query:?} reports why it scanned: {:?}",
+                explain.prefilter_skipped
+            );
         }
     }
 
