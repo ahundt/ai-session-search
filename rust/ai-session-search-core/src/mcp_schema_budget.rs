@@ -584,9 +584,12 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     // 4_645 -> 4_706: `field_view`/`match_view` now state their omission value as the JSON a
     // caller sends (`{kind:max_chars,max_chars:220}`) because Claude Code drops `oneOf` from the
     // schema it shows the model, and `query`'s omission reads "without it every message the
-    // filters allow is eligible". 294 bytes remain below Codex's 5,000-byte description-deletion
-    // cliff.
-    ("search_messages", 4_706, 10),
+    // filters allow is eligible". 4_706 -> 4_741: `match_window` says which messages a page
+    // keeps (first N in session order, or last N of one session) instead of "which match per
+    // message", which described an occurrence choice the search never makes. 259 bytes remain
+    // below Codex's 5,000-byte description-deletion cliff; the 4,750 margin tripwire is 9 bytes
+    // away, so the next byte spent here needs a byte saved.
+    ("search_messages", 4_741, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
     // and `all_results` say "omit for" like every other property so the tool description's
     // omitted-values sentence can read them back. 279 bytes of headroom remain before Codex's

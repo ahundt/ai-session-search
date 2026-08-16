@@ -441,7 +441,8 @@ struct SessionFilterArgs {
     /// Restrict to one indexed session source; omit to include all nine.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     provider: Option<Provider>,
-    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
+    /// (a component boundary: `project` matches `project/src`, never `project-other`).
     /// Omit to search every allowed root.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     path: Option<String>,
@@ -2515,6 +2516,37 @@ mod tests {
     /// `aise messages search` has thirty-nine options; every one is filed under a section so the
     /// six a caller needs first are not buried in one alphabetical block. A new option must pick
     /// a section: only `--help` and the positional query stay in the unnamed default section.
+    /// Both path scopes match the exact directory and its component-boundary descendants
+    /// (`db::path_prefix_patterns`: exact, or `prefix/`-anchored `LIKE`), so `project` never
+    /// admits `project-other`; the help must say the same thing on both commands.
+    #[test]
+    fn path_scope_help_states_component_boundary_matching_on_both_commands() {
+        let root = Cli::command();
+        let mut search = root.find_subcommand("search").expect("search").clone();
+        let session_help = search.render_long_help().to_string();
+        let mut messages_search = root
+            .find_subcommand("messages")
+            .expect("messages")
+            .find_subcommand("search")
+            .expect("messages search")
+            .clone();
+        let message_help = messages_search.render_long_help().to_string();
+        for help in [&session_help, &message_help] {
+            assert!(
+                help.contains("component boundary"),
+                "path scope help must state component-boundary matching: {help}"
+            );
+            assert!(
+                !help.contains("sibling sharing the leading path"),
+                "a lexical sibling never matches: {help}"
+            );
+        }
+        assert!(
+            message_help.contains("last N matching messages of that session"),
+            "--match-window latest selects which messages, not which occurrence: {message_help}"
+        );
+    }
+
     #[test]
     fn messages_search_help_files_every_option_under_a_named_section() {
         let root = Cli::command();

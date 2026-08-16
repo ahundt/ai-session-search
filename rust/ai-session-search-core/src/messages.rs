@@ -682,8 +682,9 @@ pub struct MessageSearchArgs {
     /// Scope to one exact session id or unique prefix. Omit to search every session.
     #[arg(help_heading = FILTER_HEADING, long)]
     pub session_id: Option<String>,
-    /// Restrict to sessions whose working directory or repository root starts with this path
-    /// prefix, so a sibling sharing the leading path matches too. Omit to search every root.
+    /// Restrict to sessions whose working directory or repository root is this directory or a
+    /// descendant of it (a component boundary: `project` matches `project/src`, never
+    /// `project-other`). Omit to search every root.
     #[arg(help_heading = FILTER_HEADING, long)]
     pub workspace_path: Option<String>,
     /// Restrict to sessions whose transcript storage path starts with this path prefix. Omit to
@@ -718,8 +719,9 @@ pub struct MessageSearchArgs {
     /// Include context-compaction messages. Pass an explicit boolean.
     #[arg(help_heading = FILTER_HEADING, long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_compaction: bool,
-    /// Select the earliest or latest bounded matches. Latest requires one session. Omit for
-    /// earliest.
+    /// Which matching messages a bounded page keeps: earliest keeps the first N in
+    /// session/sequence order; latest keeps the last N matching messages of that session
+    /// (requires --session-id) and still returns them oldest first. Omit for earliest.
     #[arg(help_heading = RESULTS_HEADING, long, value_enum)]
     pub match_window: Option<MatchWindow>,
     /// Show this many neighboring messages (0 or greater) on both sides of each match;

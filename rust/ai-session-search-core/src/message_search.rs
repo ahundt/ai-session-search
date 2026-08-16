@@ -1319,7 +1319,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::MatchWindow,
-                "Which match per message.",
+                "First N matches in session order, or last N of one session.",
                 enum_domain(serialized_variants::<MatchWindow>()),
                 MessageSearchOmission::TypedDefault,
             ),
