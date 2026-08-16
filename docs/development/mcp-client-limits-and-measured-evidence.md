@@ -290,6 +290,31 @@ remedies named `context`, `detail` and `receipt_level` on every pageable tool, w
 and `preview_chars` -- three rejected arguments offered while the two that worked went
 unmentioned. All three are now read from the failed tool's own advertised schema.
 
+### What Claude Code hands the model, and what it does with `default`
+
+Observed 2026-08-15 from inside a Claude Code 2.1.233 session whose tools were loaded
+through its deferred-tool path (`ToolSearch`), against an installed server whose
+catalogue predates the removal of the `default` keyword:
+
+| Artifact | What the model was shown |
+|---|---|
+| `tool.description` | Intact for every tool, including the 1,850-character `search_messages` text and the full rejected-combinations block |
+| Property descriptions | Present only on `required` properties (`get_session.session_id`, `search_sessions.query`); absent on every optional property, so `search_messages`, which requires nothing, arrived with no property prose at all |
+| `default` | Kept where the value is non-falsy (`limit`, `transcript_lines: -40`, `include_compaction: true`, `field_view: {kind:max_chars,max_chars:220}`); dropped where it is `0`, `false`, or `[]` |
+| `minimum`, `oneOf` | Dropped; `field_view` arrived as `{"default": {...}}` with no `type` and no alternatives |
+| Calls | Every kept `default` was materialized into the call: `get_session(session_id, message_seq=5)` and `get_session(session_id, summary=true)` both returned "Use only one get_session output selector: summary, transcript_lines, message_seq, or seq_from/seq_to." because `transcript_lines: -40` was sent beside the selector the model wrote |
+
+Two consequences drive the current design. Every omission value is stated in a
+channel that reaches the model, which in this client is `tool.description`: the two
+message-search tools end with a generated `Omitted: ...` sentence read back from their
+own property prose, and `field_view`/`match_view` word their omission as the JSON a
+caller sends. And no tool advertises a `default` keyword at all, because a kept keyword
+becomes an argument the model never wrote (REQ013). Whether Claude Code's initial tool
+listing, as opposed to the deferred path, keeps optional-property descriptions is not
+verified here. JSON Schema 2020-12 §9.2 defines `default` as an annotation with no
+assertion or materialization semantics; the two client behaviours above are worth an
+upstream report, which only the maintainer publishes.
+
 ## Cold-agent decision tasks
 
 Five tasks, each run in a **fresh process** of each installed client, with a prompt that
