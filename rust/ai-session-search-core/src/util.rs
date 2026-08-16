@@ -1276,23 +1276,6 @@ pub fn datetime_from_mtime_ns(mtime_ns: i64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(secs, nanos)
 }
 
-/// Guarantee a session has dates: fall back to the observed file mtime for any of
-/// `created_at`/`updated_at`/`last_message_at` the parser left unset. This keeps session-span
-/// filters and recency sorting defined for providers without native timestamps; it does not prove
-/// continuous activity or reorder two parser-provided endpoints. Parser-provided dates win.
-/// Runs in `O(1)` time and memory and performs no I/O because the caller supplies `mtime_ns`.
-/// Fill the session's known span from what the parser found, then the file's mtime, and leave it
-/// ordered. `O(1)`, no I/O.
-///
-/// The span is `[created_at, updated_at]`. A missing end takes the file mtime; a missing start
-/// takes the end, a point span, because the only fact known is that the session was active then.
-/// It must never take the mtime: a Codex tail slice past the 1 MiB overlap carries no
-/// `session_meta`, a Pi or Prime tail of tool results advances only `updated_at`, and the mtime
-/// follows the last write, so filling the start from it produced `created_at > updated_at` and
-/// the reversed span aborted every refresh (and every read command that refreshes first) for as
-/// long as the file kept growing. Two contradictory native endpoints are stored ordered with the
-/// reversal named in `parse_warning`, where `aise doctor` and `--warnings-only` surface it, rather
-/// than stopping the reindex for every later source.
 /// Widen a session's observed start to include `timestamp`, keeping the earliest seen.
 ///
 /// Transcripts are append-only, so their records are normally in time order and "the first record
@@ -1325,6 +1308,22 @@ pub(crate) fn observe_session_end(
     }
 }
 
+/// Fill the session's known span from what the parser found, then the file's mtime, and leave it
+/// ordered. `O(1)` time and memory, and no I/O because the caller supplies `mtime_ns`.
+///
+/// The span is `[created_at, updated_at]`, and parser-provided endpoints win over the mtime. A
+/// missing end takes the file mtime, which keeps span filters and recency sorting defined for
+/// providers that record no timestamps; `last_message_at` follows the end. A missing start takes
+/// the end, a point span, because the only fact known is that the session was active then.
+///
+/// The start must never take the mtime. A Codex tail slice past the 1 MiB overlap carries no
+/// `session_meta`, a Pi or Prime tail of tool results advances only `updated_at`, and the mtime
+/// follows the last write, so filling the start from it produced `created_at > updated_at`, and
+/// the reversed span aborted every refresh — and every read command that refreshes first — for as
+/// long as the file kept growing. Two contradictory native endpoints are stored ordered with the
+/// reversal named in `parse_warning`, where `aise doctor` and `--warnings-only` surface it, rather
+/// than stopping the reindex for every later source. Filling a gap is all this does: it does not
+/// prove continuous activity.
 pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
     let mtime = datetime_from_mtime_ns(mtime_ns);
     if session.updated_at.is_none() {
