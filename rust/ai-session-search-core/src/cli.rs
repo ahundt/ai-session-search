@@ -551,40 +551,112 @@ impl SearchArgs {
         }
     }
 
-    /// `aise list` with the session filters, limit, and format this search request carried.
+    /// `aise list` with every session filter, result window, and output option this search carried.
     fn equivalent_list_command(&self) -> String {
-        let filters = &self.filters.filters;
-        let mut command = vec!["aise".to_string(), "list".to_string()];
-        let mut push = |flag: &str, value: &str| {
+        self.filters.as_list_command()
+    }
+}
+
+/// The token clap accepts for `value`, taken from clap's own variant table so a rendered command
+/// cannot drift from the parser that has to read it back.
+fn value_enum_token<T: clap::ValueEnum>(value: &T) -> String {
+    value
+        .to_possible_value()
+        .expect("a parsed filter value is always a selectable variant")
+        .get_name()
+        .to_string()
+}
+
+impl QueryArgs {
+    /// The `aise list` invocation that selects the same sessions and emits the same fields.
+    ///
+    /// `aise list` takes this exact type, so every option a caller typed is renderable and the
+    /// suggestion can be an equivalent command rather than an approximation of one. The fields are
+    /// destructured rather than read through `self`, so a later option added to `QueryArgs`,
+    /// `SessionFilterArgs`, or `DateRange` fails to compile here instead of silently narrowing the
+    /// suggested command.
+    fn as_list_command(&self) -> String {
+        let Self {
+            filters,
+            limit,
+            format,
+            include,
+        } = self;
+        let SessionFilterArgs {
+            provider,
+            path,
+            exclude_paths,
+            exclude_sessions,
+            session_kind,
+            session_kinds,
+            parent_session,
+            dates,
+            warnings_only,
+        } = filters;
+        let DateRange { since, until, when } = dates;
+
+        fn push(command: &mut Vec<String>, flag: &str, value: &str) {
             command.push(flag.to_string());
             command.push(
                 render_posix_shell_command(&[value.to_string()])
                     .unwrap_or_else(|_| format!("{value:?}")),
             );
-        };
-        if let Some(provider) = filters.provider {
-            push("--provider", provider.as_str());
         }
-        if let Some(path) = &filters.path {
-            push("--path", path);
+
+        let mut command = vec!["aise".to_string(), "list".to_string()];
+        if let Some(provider) = provider {
+            push(&mut command, "--provider", provider.as_str());
         }
-        for path in &filters.exclude_paths {
-            push("--exclude-path", path);
+        if let Some(path) = path {
+            push(&mut command, "--path", path);
         }
-        if let Some(when) = &filters.dates.when {
-            push("--when", when);
+        for path in exclude_paths {
+            push(&mut command, "--exclude-path", path);
         }
-        if let Some(since) = &filters.dates.since {
-            push("--since", since);
+        for session in exclude_sessions {
+            push(&mut command, "--exclude-session", session);
         }
-        if let Some(until) = &filters.dates.until {
-            push("--until", until);
+        if let Some(kind) = session_kind {
+            push(&mut command, "--session-kind", &value_enum_token(kind));
         }
-        if let Some(limit) = self.filters.limit {
-            push("--limit", &limit.to_string());
+        // One comma-joined token, which the `value_delimiter = ','` parser splits back into the
+        // same list. Separate tokens would let `num_args = 1..` swallow a following bare value.
+        if !session_kinds.is_empty() {
+            let kinds = session_kinds
+                .iter()
+                .map(value_enum_token)
+                .collect::<Vec<_>>()
+                .join(",");
+            push(&mut command, "--session-kinds", &kinds);
         }
-        if self.filters.format != OutputFormat::Table {
-            push("--format", self.filters.format.as_str());
+        if let Some(parent) = parent_session {
+            push(&mut command, "--parent-session", parent);
+        }
+        if let Some(when) = when {
+            push(&mut command, "--when", when);
+        }
+        if let Some(since) = since {
+            push(&mut command, "--since", since);
+        }
+        if let Some(until) = until {
+            push(&mut command, "--until", until);
+        }
+        if *warnings_only {
+            command.push("--warnings-only".to_string());
+        }
+        if let Some(limit) = limit {
+            push(&mut command, "--limit", &limit.to_string());
+        }
+        if *format != OutputFormat::Table {
+            push(&mut command, "--format", format.as_str());
+        }
+        if !include.is_empty() {
+            let fields = include
+                .iter()
+                .map(value_enum_token)
+                .collect::<Vec<_>>()
+                .join(",");
+            push(&mut command, "--include", &fields);
         }
         command.join(" ")
     }
@@ -2456,6 +2528,88 @@ mod tests {
             panic!("expected search command")
         };
         assert_eq!(args.ranking_query().unwrap(), "receipt corpus");
+    }
+
+    /// The suggested `aise list` has to select the same sessions and emit the same fields as the
+    /// search that produced it, or the error teaches a retry that answers a different question.
+    ///
+    /// `aise list` takes the very `QueryArgs` `aise search` flattens, so every option the caller
+    /// typed is renderable. Parsing the suggestion back and comparing it structurally to the
+    /// request proves that without pinning flag spelling or order, and it fails for any option a
+    /// later revision adds to `QueryArgs` and forgets to render.
+    #[test]
+    fn the_suggested_list_command_round_trips_every_session_filter_and_output_option() {
+        let typed = [
+            "aise",
+            "search",
+            "--provider",
+            "claude",
+            "--path",
+            "/work/repo",
+            "--exclude-path",
+            "/work/repo/vendor",
+            "--exclude-path",
+            "/work/repo/target",
+            "--exclude-session",
+            "claude:79accec8",
+            "--exclude-session",
+            "codex:1f2e3d4c",
+            "--session-kinds",
+            "user,subagent",
+            "--parent-session",
+            "claude:aabbccdd",
+            "--warnings-only",
+            "--since",
+            "2026-01-15",
+            "--until",
+            "2026-02",
+            "--limit",
+            "25",
+            "--format",
+            "json",
+            "--include",
+            "raw-metadata",
+        ];
+        let cli = Cli::try_parse_from(typed).expect("a query-less search parses");
+        let Commands::Search(args) = cli.command else {
+            panic!("expected search command")
+        };
+
+        let suggested = args.equivalent_list_command();
+        let parts = shlex::split(&suggested)
+            .unwrap_or_else(|| panic!("the suggested command is one POSIX line: {suggested}"));
+        let parsed = Cli::try_parse_from(&parts)
+            .unwrap_or_else(|error| panic!("the suggested command parses: {suggested}\n{error}"));
+        let Commands::List(listed) = parsed.command else {
+            panic!("the suggestion runs `aise list`: {suggested}")
+        };
+
+        assert_eq!(
+            format!("{listed:?}"),
+            format!("{:?}", args.filters),
+            "`{suggested}` selects a different session set or emits different fields than the \
+             search that suggested it"
+        );
+
+        // `--session-kind` is the one-value alias for `--session-kinds` and conflicts with it, so
+        // it needs its own request rather than another option on the one above.
+        let cli = Cli::try_parse_from(["aise", "search", "--session-kind", "subagent"]).unwrap();
+        let Commands::Search(args) = cli.command else {
+            panic!("expected search command")
+        };
+        let suggested = args.equivalent_list_command();
+        let parts = shlex::split(&suggested).expect("one POSIX line");
+        let Commands::List(listed) = Cli::try_parse_from(&parts)
+            .unwrap_or_else(|error| panic!("{suggested}\n{error}"))
+            .command
+        else {
+            panic!("the suggestion runs `aise list`: {suggested}")
+        };
+        assert_eq!(
+            format!("{listed:?}"),
+            format!("{:?}", args.filters),
+            "{suggested}"
+        );
     }
 
     /// The root help lists twenty-four commands. `ROOT_COMMAND_GROUPS` sorts them into everyday,
