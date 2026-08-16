@@ -590,7 +590,11 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     // description with no marker to the model.
     ("run_skill_capability", 4_747, 9),
     ("get_session", 4_064, 10),
-    ("search_sessions", 4_250, 8),
+    // 4_250 -> 4_306: `query` now states its matching model (case-insensitive substring of the
+    // whole query and of each word, fuzzy on title and paths, every-word bonus, no quote or
+    // boolean operators) instead of "keywords, a phrase, or a code snippet". 694 bytes remain
+    // below Codex's 5,000-byte cliff.
+    ("search_sessions", 4_306, 8),
     ("list_sessions", 3_892, 8),
     ("query_session_index", 1_724, 8),
     ("get_resume_command", 374, 8),

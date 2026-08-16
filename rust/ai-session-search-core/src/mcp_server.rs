@@ -4167,7 +4167,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Keywords, a phrase, or a code snippet to find in session titles and content."
+                                "description": "Plain text (no quote or boolean operators): the whole query and each whitespace-separated word match as case-insensitive substrings of title, summary, cwd, repo, preview, and transcript, plus a fuzzy match on title and paths; sessions matching every word rank first."
                             },
                             "provider": provider_filter_schema(&provider_values, provider_filter_description),
                             "path_prefix": session_path_prefix_schema(),

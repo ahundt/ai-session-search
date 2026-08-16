@@ -519,9 +519,13 @@ struct AnalyzeArgs {
 #[derive(Debug, Args)]
 struct SearchArgs {
     /// Session-level keywords, phrase, code snippet, path fragment, or title text to search for
-    /// and rank by. Required: to list sessions by their metadata alone (newest first), use
-    /// `aise list` with the same filters. A query starting with `-` is parsed as a flag here;
-    /// pass it after `--`, with every other flag before the `--`, e.g. `--limit 5 -- --path`.
+    /// and rank by. Plain text: the whole query and each whitespace-separated word match as
+    /// case-insensitive substrings of the title, summary, cwd, repo, preview, and transcript,
+    /// plus a fuzzy match on title and paths; sessions matching every word rank first; there
+    /// are no quote or boolean operators. Required: to list sessions by their metadata alone
+    /// (newest first), use `aise list` with the same filters. A query starting with `-` is
+    /// parsed as a flag here; pass it after `--`, with every other flag before the `--`, e.g.
+    /// `--limit 5 -- --path`.
     query: Option<String>,
     #[command(flatten)]
     filters: QueryArgs,
