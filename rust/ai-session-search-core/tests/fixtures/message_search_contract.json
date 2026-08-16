@@ -42,15 +42,15 @@
     }
   ],
   "text_cases": [
-    { "field": "content", "mode": "literal", "query": "cargo test", "expected_seq": [0, 2], "expected_corpus": 3 },
-    { "field": "content", "mode": "regex", "query": "cargo\\s+test", "expected_seq": [0, 2], "expected_corpus": 3 },
-    { "field": "content", "mode": "fuzzy", "query": "crgo tst", "expected_seq": [0, 2], "expected_corpus": 3 },
-    { "field": "tool_name", "mode": "literal", "query": "exec", "expected_seq": [0, 2], "expected_corpus": 2 },
-    { "field": "tool_name", "mode": "regex", "query": "^exec_", "expected_seq": [0, 2], "expected_corpus": 2 },
-    { "field": "tool_name", "mode": "fuzzy", "query": "excmd", "expected_seq": [0, 2], "expected_corpus": 3 },
-    { "field": "tool_argument", "mode": "literal", "query": "cargo test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 2 },
-    { "field": "tool_argument", "mode": "regex", "query": "cargo\\s+test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 2 },
-    { "field": "tool_argument", "mode": "fuzzy", "query": "crgo tst", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 3 }
+    { "field": "content", "mode": "literal", "query": "cargo test", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": true },
+    { "field": "content", "mode": "regex", "query": "cargo\\s+test", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": true },
+    { "field": "content", "mode": "fuzzy", "query": "crgo tst", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": true },
+    { "field": "tool_name", "mode": "literal", "query": "exec", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": false },
+    { "field": "tool_name", "mode": "regex", "query": "^exec_", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": false },
+    { "field": "tool_name", "mode": "fuzzy", "query": "excmd", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": true },
+    { "field": "tool_argument", "mode": "literal", "query": "cargo test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": true },
+    { "field": "tool_argument", "mode": "regex", "query": "cargo\\s+test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": true },
+    { "field": "tool_argument", "mode": "fuzzy", "query": "crgo tst", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 3, "expected_candidates_present": true }
   ],
   "all_cases": [
     { "field": "content", "expected_seq": [0, 1, 2, 3] },

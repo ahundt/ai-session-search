@@ -74,7 +74,13 @@ struct TextCase {
     #[serde(default)]
     argument_path: Option<String>,
     expected_seq: Vec<i64>,
+    /// The structural denominator: every row the filters admit for the searched field (the three
+    /// tool-call rows here), whatever the page size or how many matched.
     expected_corpus: i64,
+    /// Whether a candidate count exists: a trigram or raw-JSON prefilter ran, or fuzzy scoring
+    /// counted matches. A tool-name literal or regex search verifies in SQLite with no prefilter,
+    /// so it reports none rather than a number that would read as 100 % selectivity.
+    expected_candidates_present: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,7 +236,11 @@ fn current_text_modes_fields_results_paging_and_planner_are_frozen() {
 
         let receipt = receipt.unwrap_or_else(|| panic!("missing planner receipt for {case:?}"));
         assert_eq!(receipt.corpus, case.expected_corpus, "{case:?}");
-        assert!(receipt.candidates.is_some(), "{case:?}: {receipt:?}");
+        assert_eq!(
+            receipt.candidates.is_some(),
+            case.expected_candidates_present,
+            "{case:?}: {receipt:?}"
+        );
 
         let page = db
             .search_messages(
@@ -345,7 +355,11 @@ fn typed_service_preserves_frozen_modes_fields_results_and_planner_receipts() {
             .search_explanation()
             .unwrap_or_else(|| panic!("missing typed planner receipt for {case:?}"));
         assert_eq!(receipt.corpus, case.expected_corpus, "{case:?}");
-        assert!(receipt.candidates.is_some(), "{case:?}: {receipt:?}");
+        assert_eq!(
+            receipt.candidates.is_some(),
+            case.expected_candidates_present,
+            "{case:?}: {receipt:?}"
+        );
         assert!(response.parameter_origins().is_some(), "{case:?}");
         let document = serde_json::to_value(response.document()).unwrap();
         assert!(

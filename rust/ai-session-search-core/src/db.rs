@@ -176,31 +176,12 @@ pub(crate) enum SourceFileRefreshState {
     New,
 }
 
-enum PreparedMessageExplain {
-    Ready(Option<SearchExplain>),
-    DerivedFieldRows,
-}
-
 struct PreparedMessageQuery {
     sql: String,
     args: Vec<rusqlite::types::Value>,
-    explain: PreparedMessageExplain,
-}
-
-impl PreparedMessageQuery {
-    fn finish_explain(&self, rows_read: usize) -> Option<SearchExplain> {
-        match &self.explain {
-            PreparedMessageExplain::Ready(explain) => explain.clone(),
-            PreparedMessageExplain::DerivedFieldRows => Some(SearchExplain {
-                prefilter: None,
-                candidates: Some(rows_read as i64),
-                prefilter_skipped: Some(
-                    "derived field verified and paginated in SQLite".to_string(),
-                ),
-                corpus: rows_read as i64,
-            }),
-        }
-    }
+    /// The receipt this statement's plan produced, complete at prepare time; the rows a caller
+    /// then reads never change it (a `limit + 1` look-ahead used to be reported as the corpus).
+    explain: Option<SearchExplain>,
 }
 
 /// Corpus-size threshold below which a regex `messages search` skips the trigram prefilter and
@@ -2468,10 +2449,13 @@ impl Db {
     }
 
     /// Like [`Db::search_messages`], optionally returning the exact planner diagnostics used by
-    /// this search. This keeps the MCP `receipt_level`, CLI `--receipt-level`, and the search path on one shared
-    /// FTS/trigram decision instead of running the planner twice. Candidate counts are interpreted
-    /// with the named strategy: message IDs for content/tool-argument FTS, distinct names for the
-    /// bounded tool-name vocabulary, or retained top-K rows for pre-v4 compatibility streaming.
+    /// this search. This keeps the MCP `receipt_level`, CLI `--receipt-level`, and the search path
+    /// on one shared FTS/trigram decision instead of running the planner twice. In every receipt
+    /// `corpus` is the structural denominator, the rows the filters admit for the searched field,
+    /// read from indexes; `candidates` is the prefilter output still to be verified (content and
+    /// tool-argument trigram candidates) or the rows fuzzy scoring matched (content, tool name,
+    /// tool argument), and absent when the field was verified in SQLite with no prefilter (tool
+    /// name, literal or regex).
     pub fn search_messages_with_explain(
         &self,
         query: &str,
@@ -2526,7 +2510,7 @@ impl Db {
             } else {
                 None
             };
-            let explain = if self.schema_version()? >= 4 {
+            if self.schema_version()? >= 4 {
                 let prefilter = prefilter_pattern
                     .as_deref()
                     .and_then(crate::trigram::trigram_prefilter);
@@ -2564,8 +2548,7 @@ impl Db {
                     sql.push_str(" and m.id in (select id from _trigram_cand)");
                 }
                 explain
-            };
-            PreparedMessageExplain::Ready(explain)
+            }
         } else {
             let mut derived_explain = None;
             match (field, filters.match_mode) {
@@ -2642,24 +2625,31 @@ impl Db {
                         MessageSearchMode::Fuzzy => unreachable!("fuzzy query rejected above"),
                     }
                     if include_explain {
-                        // Preserve the published derived-field receipt: candidate/corpus counts are
-                        // authoritative projected matches, not the broader raw-JSON FTS superset.
-                        // Explain-only counting reruns this completed predicate without page/order;
-                        // ordinary retrieval pays no second query.
-                        let count_sql = format!("select count(*) from ({sql}) authoritative");
-                        let authoritative = self.conn.query_row(
-                            &count_sql,
-                            rusqlite::params_from_iter(args.iter()),
-                            |row| row.get::<_, i64>(0),
-                        )?;
+                        // The receipt keeps its published meaning: `corpus` is the structural
+                        // denominator (tool-call rows the filters admit, counted from the
+                        // partial tool-call index) and `candidates` the raw-JSON prefilter
+                        // output the projected predicate still verifies, a superset of the hits.
+                        // Ordinary retrieval pays neither count.
+                        let corpus =
+                            self.corpus_count_with_base("m.kind = 'tool_call'", filters)?;
+                        let candidates = prefilter
+                            .as_deref()
+                            .map(|fts_query| {
+                                self.fts5_candidate_count_with_base(
+                                    "m.kind = 'tool_call'",
+                                    filters,
+                                    fts_query,
+                                )
+                            })
+                            .transpose()?;
                         derived_explain = Some(SearchExplain {
                             prefilter: prefilter.clone(),
-                            candidates: Some(authoritative),
+                            candidates,
                             prefilter_skipped: prefilter.is_none().then(|| {
                                 "no JSON-stable required literal of at least three characters"
                                     .to_string()
                             }),
-                            corpus: authoritative,
+                            corpus,
                         });
                     }
                 }
@@ -2667,11 +2657,22 @@ impl Db {
                 (SearchField::Content, _) => unreachable!("content handled above"),
             }
             if include_explain {
-                derived_explain.map_or(PreparedMessageExplain::DerivedFieldRows, |explain| {
-                    PreparedMessageExplain::Ready(Some(explain))
-                })
+                match derived_explain {
+                    Some(explain) => Some(explain),
+                    // A literal or regex tool-name search verifies the name in SQLite with no
+                    // prefilter; the denominator is every named-tool row the filters admit,
+                    // read from the partial tool-name index.
+                    None => Some(SearchExplain {
+                        prefilter: None,
+                        candidates: None,
+                        prefilter_skipped: Some(
+                            "tool name verified in SQLite without a prefilter".to_string(),
+                        ),
+                        corpus: self.corpus_count_with_base("m.tool_name is not null", filters)?,
+                    }),
+                }
             } else {
-                PreparedMessageExplain::Ready(None)
+                None
             }
         };
 
@@ -2710,7 +2711,7 @@ impl Db {
             let prepared =
                 self.prepare_non_fuzzy_message_query(query, filters, include_explain, order)?;
             let hits = self.query_message_hits(&prepared.sql, &prepared.args)?;
-            let explain = prepared.finish_explain(hits.len());
+            let explain = prepared.explain.clone();
             return Ok((hits, explain));
         }
         if field != SearchField::Content {
@@ -2853,7 +2854,7 @@ impl Db {
                 boundary
             };
             let Some(boundary) = boundary else {
-                let explain = initial_prepared.finish_explain(0);
+                let explain = initial_prepared.explain.clone();
                 if let Some(snapshot) = owned_snapshot {
                     snapshot.rollback()?;
                 }
@@ -2938,15 +2939,24 @@ impl Db {
         Ok(MessageBatchVisitOutcome {
             rows_visited,
             exhausted,
-            explain: exhausted
-                .then(|| prepared.finish_explain(rows_visited))
-                .flatten(),
+            explain: exhausted.then(|| prepared.explain.clone()).flatten(),
         })
     }
 
     fn fts5_candidate_count(&self, filters: &MessageFilters, fts_query: &str) -> Result<i64> {
+        self.fts5_candidate_count_with_base("1 = 1", filters, fts_query)
+    }
+
+    /// [`Db::fts5_candidate_count`] over the rows that also satisfy `base_predicate`, an SQL
+    /// fragment over alias `m` (`"m.kind = 'tool_call'"` for tool-argument search).
+    fn fts5_candidate_count_with_base(
+        &self,
+        base_predicate: &str,
+        filters: &MessageFilters,
+        fts_query: &str,
+    ) -> Result<i64> {
         use rusqlite::types::Value;
-        let mut sql = String::from("select count(*) from messages m where 1 = 1");
+        let mut sql = format!("select count(*) from messages m where {base_predicate}");
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(
@@ -8678,6 +8688,51 @@ mod tests {
         assert_eq!(explain.candidates, Some(10_002));
     }
 
+    /// A literal or regex tool-name search verifies in SQLite with no prefilter, and its receipt
+    /// used to report the rows the caller's page happened to read (`limit + 1` with the CLI's
+    /// look-ahead, so `--limit 1` printed `2 / 2 corpus rows`). The receipt now carries the
+    /// structural denominator, tool-call and tool-result rows the filters admit, whatever the
+    /// page size, and no candidate count because nothing was prefiltered.
+    #[test]
+    fn tool_name_literal_receipt_reports_the_named_tool_corpus_independent_of_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test');
+                 insert into messages (session_id, provider, seq, role, kind, tool_name, content)
+                 values ('s1', 'claude', 0, 'tool', 'tool_call', 'exec_command', ''),
+                        ('s1', 'claude', 1, 'tool', 'tool_call', 'exec_command', ''),
+                        ('s1', 'claude', 2, 'tool', 'tool_call', 'apply_patch', ''),
+                        ('s1', 'claude', 3, 'user', 'conversation', null, 'no tool');",
+            )
+            .unwrap();
+        for limit in [1, 2, 10] {
+            let (hits, explain) = db
+                .search_messages_with_explain(
+                    "exec",
+                    &MessageFilters {
+                        field: Some(SearchField::ToolName),
+                        limit,
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 2.min(limit));
+            let explain = explain.unwrap();
+            assert_eq!(
+                explain.corpus, 3,
+                "limit {limit}: the denominator is every named-tool row the filters admit"
+            );
+            assert_eq!(explain.candidates, None, "nothing was prefiltered");
+            assert!(explain.prefilter_skipped.is_some());
+        }
+    }
+
     /// `offset` is caller input on every surface and no schema caps it. The ranked page
     /// (`offset + limit` rows) must be retained memory proportional to rows actually found, never
     /// a reservation sized by the request: `Vec::with_capacity(offset + limit)` panicked with
@@ -9978,15 +10033,25 @@ mod tests {
                 explain.prefilter.is_some(),
                 "tool-argument {match_mode:?} search should prefilter raw tool-call JSON: {explain:?}"
             );
-            assert_eq!(
-                explain.candidates,
-                Some(hits.len() as i64),
-                "published derived-field candidates count authoritative projected matches: {explain:?}"
+            // The receipt keeps the published meaning of its two counts: `corpus` is the
+            // structural denominator (every tool-call row the filters admit, 101 here) and
+            // `candidates` is the prefilter output still needing verification (a superset of
+            // the one hit, never more than the corpus). Reporting the authoritative match count
+            // in both fields made every prefiltered tool-argument search read as 100 %
+            // selectivity with the "low selectivity" hint attached.
+            assert!(
+                explain.corpus >= 101,
+                "corpus is the structural tool-call denominator: {explain:?}"
             );
-            assert_eq!(
-                explain.corpus,
-                explain.candidates.unwrap(),
-                "raw-JSON prefilter selectivity is internal until the receipt names it separately"
+            let candidates = explain.candidates.unwrap();
+            assert!(
+                candidates >= hits.len() as i64 && candidates <= explain.corpus,
+                "candidates are the prefilter superset of the hits: {explain:?}"
+            );
+            let summary = explain.summary(true);
+            assert!(
+                !summary.contains("low selectivity"),
+                "one hit in a hundred is not low selectivity: {summary}"
             );
         }
 
@@ -14742,8 +14807,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         seed_every_message_class(&db);
-        for (name, filters) in corpus_count_filter_cases() {
-            let statements = db.corpus_count_statements("1 = 1", &filters);
+        // The tool-argument receipt counts the same way over the tool-call rows, which the
+        // partial `idx_messages_tool_calls` answers because its predicate is the literal text.
+        let mut cases = corpus_count_filter_cases()
+            .into_iter()
+            .map(|(name, filters)| (name, "1 = 1", filters))
+            .collect::<Vec<_>>();
+        cases.push((
+            "tool_argument",
+            "m.kind = 'tool_call'",
+            MessageFilters::default(),
+        ));
+        for (name, base, filters) in cases {
+            let statements = db.corpus_count_statements(base, &filters);
             assert!(!statements.is_empty(), "{name}: no count statements");
             for (sql, args, _sign) in &statements {
                 let plan = query_plan(&db, sql, args);

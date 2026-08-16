@@ -1556,6 +1556,15 @@ impl SearchExplain {
                     self.corpus
                 )
             }
+            // A field verified in SQLite with no prefilter at all (a literal or regex tool-name
+            // search): the query scanned the corpus, so there is no candidate count to compare it
+            // against, and the reason is stated rather than the anchor advice, which would point
+            // at an index that field does not have.
+            (None, None) if has_content_query && self.prefilter_skipped.is_some() => format!(
+                "[explain] {}; scanned {} corpus rows",
+                self.prefilter_skipped.as_deref().unwrap_or("no prefilter"),
+                self.corpus
+            ),
             _ if has_content_query => format!(
                 "[explain] query has no >=3-char literal anchor → full scan of {} corpus rows",
                 self.corpus
@@ -2394,5 +2403,26 @@ mod tests {
         assert!(s.contains("trigram prefilter available"), "{s}");
         assert!(s.contains("skipped trigram prefilter"), "{s}");
         assert!(s.contains("direct scan of 25 corpus rows"), "{s}");
+    }
+
+    /// A tool-name literal or regex search verifies in SQLite with no prefilter and no candidate
+    /// count; the line names that and the corpus, and never the trigram-anchor advice, which
+    /// would point at an index the field does not have.
+    #[test]
+    fn explain_summary_names_a_verified_scan_without_inventing_a_candidate_count() {
+        let ex = SearchExplain {
+            prefilter: None,
+            candidates: None,
+            prefilter_skipped: Some("tool name verified in SQLite without a prefilter".to_string()),
+            corpus: 3,
+        };
+        let s = ex.summary(true);
+        assert!(
+            s.contains("tool name verified in SQLite without a prefilter"),
+            "{s}"
+        );
+        assert!(s.contains("scanned 3 corpus rows"), "{s}");
+        assert!(!s.contains("anchor"), "{s}");
+        assert!(!s.contains("%"), "{s}");
     }
 }
