@@ -211,13 +211,38 @@ pub fn truncate_for_display(value: &str, max_len: usize) -> String {
     truncate_for_display_with_extent(value, max_len).0
 }
 
-/// A reusable Unicode-caseless substring matcher for one already-lowercased needle.
+/// The caseless form of one scalar value: the rule every needle and haystack in search shares.
 ///
-/// Rust's [`str::to_lowercase`] can expand one scalar value into several (for example, `İ`), so
-/// byte-wise or scalar-wise case folding would not preserve the existing search contract. The
-/// streaming matcher feeds each scalar's full lowercase expansion through a KMP matcher instead;
-/// it therefore has the same sequence semantics as `haystack.to_lowercase().contains(...)` while
-/// retaining only the lowercased needle and its prefix table.
+/// Lowercasing, plus the one place where lowercasing is not enough to compare two spellings of the
+/// same letter. Greek writes lowercase sigma `ς` at the end of a word and `σ` elsewhere, and
+/// [`str::to_lowercase`] reproduces that rule, so `Σ` becomes one or the other depending on what
+/// follows — the only context-sensitive mapping in Rust's lowercasing. Comparing text that was
+/// lowered as a whole string against text lowered scalar by scalar then disagreed about the same
+/// word. Folding the three forms onto one, which is what Unicode caseless matching prescribes,
+/// makes the rule context-free, so a streaming matcher can apply it to a haystack it never
+/// materializes, and makes `ΟΔΟΣΣ` match itself, `ΟΔΟΣΣΑ`, and `οδοσς` alike.
+///
+/// A scalar can still expand into several (`İ` becomes `i` and a combining dot), which is why this
+/// yields an iterator rather than a `char`.
+pub(crate) fn fold_caseless_char(value: char) -> impl Iterator<Item = char> {
+    value.to_lowercase().map(|lowered| match lowered {
+        'ς' => 'σ',
+        other => other,
+    })
+}
+
+/// [`fold_caseless_char`] over a whole string, for needles and other values compared as a unit.
+pub(crate) fn fold_caseless(value: &str) -> String {
+    value.chars().flat_map(fold_caseless_char).collect()
+}
+
+/// A reusable Unicode-caseless substring matcher for one already-folded needle.
+///
+/// [`fold_caseless_char`] can expand one scalar value into several (for example, `İ`), so byte-wise
+/// comparison would not preserve the search contract. The streaming matcher feeds each scalar's
+/// full expansion through a KMP matcher instead; it therefore has the same sequence semantics as
+/// `fold_caseless(haystack).contains(...)` while retaining only the folded needle and its prefix
+/// table. Build the needle with [`fold_caseless`], so both sides of the comparison share one rule.
 pub(crate) struct UnicodeLowerNeedle {
     pattern: Vec<char>,
     prefix: Vec<usize>,
@@ -274,7 +299,7 @@ impl UnicodeLowerNeedle {
         let mut matched = 0_usize;
         for (offset, character) in haystack.char_indices() {
             let character_end = offset + character.len_utf8();
-            for (folded_index, lowered) in character.to_lowercase().enumerate() {
+            for (folded_index, lowered) in fold_caseless_char(character).enumerate() {
                 while matched > 0 && lowered != self.pattern[matched] {
                     matched = self.prefix[matched - 1];
                 }
@@ -316,7 +341,7 @@ fn source_start_of_folded_match(haystack: &str, end: usize, folded_len: usize) -
             break;
         }
         start = offset;
-        remaining = remaining.saturating_sub(character.to_lowercase().count());
+        remaining = remaining.saturating_sub(fold_caseless_char(character).count());
     }
     start
 }
@@ -636,7 +661,7 @@ pub fn snippet_from_match(value: &str, query: &str, max_len: usize) -> String {
     // `CAFÉ` for `café` is a hit this can center on. Folding only ASCII here would agree with it
     // on ASCII queries and quietly disagree on every other one, returning the head of the field
     // as the evidence for a match that is elsewhere in the text.
-    let query_lower = query.to_lowercase();
+    let query_lower = fold_caseless(query);
     if let Some(found) = UnicodeLowerNeedle::from_lowered(&query_lower).find_in(&compact) {
         return window_around_match(&compact, found, max_len);
     }
@@ -1699,6 +1724,65 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every Greek sigma is the same letter to a caseless search, whichever form is written.
+    ///
+    /// Greek writes lowercase sigma two ways: `ς` at the end of a word and `σ` everywhere else.
+    /// [`str::to_lowercase`] reproduces that rule, so `Σ` becomes `ς` or `σ` depending on what
+    /// follows it — the one place in Rust where lowercasing a string differs from lowercasing its
+    /// scalars one at a time. Lowering the query as a string while folding the haystack scalar by
+    /// scalar therefore compared `οδοσς` against `οδοσσ`, and a search for a word could miss that
+    /// exact word. Neither rule alone is enough: lowering both sides as strings still misses
+    /// `ΟΔΟΣΣ` inside `ΟΔΟΣΣΑ`, where the same letters are word-final in the query and medial in
+    /// the text. Folding the three forms together, which is what Unicode caseless matching
+    /// prescribes, is what makes the comparison hold in every direction.
+    #[test]
+    fn caseless_matching_treats_every_greek_sigma_as_the_same_letter() {
+        for (haystack, needle, expected) in [
+            ("ΟΔΟΣΣ", "ΟΔΟΣΣ", true),
+            ("ΟΔΟΣΣ", "οδοσς", true),
+            ("οδοσς", "ΟΔΟΣΣ", true),
+            ("οδοσς", "οδοσσ", true),
+            ("ΟΔΟΣΣΑ", "ΟΔΟΣΣ", true),
+            ("ΣΊΣΥΦΟΣ", "σίσυφος", true),
+            ("σίσυφος", "ΣΊΣΥΦΟΣ", true),
+            ("οδοσς", "οδοτ", false),
+        ] {
+            assert_eq!(
+                UnicodeLowerNeedle::from_lowered(&fold_caseless(needle)).contains(haystack),
+                expected,
+                "haystack={haystack:?}, needle={needle:?}"
+            );
+        }
+    }
+
+    /// Folding a string equals folding its scalars, which is what lets the matcher stream.
+    ///
+    /// The matcher never materializes a folded haystack; it feeds each scalar's expansion through
+    /// the needle. That is sound only while the fold is context-free, so this pins the property
+    /// rather than the sigma case that would break it.
+    #[test]
+    fn folding_a_string_equals_folding_each_of_its_scalars() {
+        for value in [
+            "ΟΔΟΣΣ",
+            "ΣΊΣΥΦΟΣ",
+            "Straße",
+            "İstanbul",
+            "МОСКВА",
+            "CAFÉ",
+            "plain",
+            "",
+        ] {
+            assert_eq!(
+                fold_caseless(value),
+                value
+                    .chars()
+                    .flat_map(fold_caseless_char)
+                    .collect::<String>(),
+                "{value:?}"
+            );
+        }
+    }
+
     #[test]
     fn windows_executable_names_follow_pathext_without_magic_extensions() {
         let names = executable_names_for("aise", true, Some(OsStr::new(".EXE;.CMD;.CUSTOM")));
@@ -2412,13 +2496,31 @@ pub(crate) mod tests {
     /// field, with the match nowhere in view.
     #[test]
     fn snippet_locates_the_same_match_the_session_matcher_ranked_on() {
-        // These are cases where `to_lowercase` differs from `to_ascii_lowercase`. Full case
-        // folding is a different operation and is deliberately not the contract here: `ß` and
-        // `ss` are distinct under `to_lowercase`, so the matcher does not equate them either.
+        // These are cases where the shared fold differs from `to_ascii_lowercase`. Full case
+        // folding is a wider operation and is deliberately not the contract here: `ß` and `ss`
+        // stay distinct, matching what the trigram index that selects candidates does.
+        //
+        // Sigma appears in both directions on purpose. Only the lowercase-text row was covered
+        // before, and it is the one direction that held while the query and the text were folded
+        // by different rules — so the pair that failed went unnoticed under a case labelled for it.
         let cases = [
             ("café", "CAFÉ", "ordinary accented text"),
             ("МОСКВА", "москва", "Cyrillic"),
-            ("ΣΊΣΥΦΟΣ", "σίσυφος", "Greek final sigma"),
+            (
+                "ΣΊΣΥΦΟΣ",
+                "σίσυφος",
+                "Greek final sigma, lowercase in the text",
+            ),
+            (
+                "σίσυφος",
+                "ΣΊΣΥΦΟΣ",
+                "Greek final sigma, uppercase in the text",
+            ),
+            (
+                "ΟΔΟΣΣ",
+                "ΟΔΟΣΣ",
+                "a Greek word that ends in sigma, matching itself",
+            ),
             (
                 "i\u{307}stanbul",
                 "İSTANBUL",
@@ -2426,7 +2528,7 @@ pub(crate) mod tests {
             ),
         ];
         for (query, occurrence, why) in cases {
-            let lowered = query.to_lowercase();
+            let lowered = fold_caseless(query);
             let value = format!(
                 "{}{occurrence}{}",
                 "padding ".repeat(30),

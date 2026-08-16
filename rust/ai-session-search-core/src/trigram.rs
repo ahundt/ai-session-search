@@ -188,6 +188,9 @@ fn literal_to_trigrams(text: &str) -> Option<Vec<String>> {
     {
         return None;
     }
+    // Sigma needs no such fallback. FTS5 folds `Σ`, `σ`, and `ς` onto one form, so each spelling
+    // of a trigram selects the rows holding any of them, matching the verifier's own rule (see
+    // `crate::util::fold_caseless_char`) and keeping the candidate set a superset either way.
     let chars: Vec<char> = lowercase.chars().collect();
     if chars.len() < MIN_TRIGRAM_CHARS {
         return None;

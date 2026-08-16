@@ -28,7 +28,7 @@ use crate::models::{
     SearchFilters, SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
-use crate::util::{snippet_from_match, UnicodeLowerNeedle};
+use crate::util::{fold_caseless, snippet_from_match, UnicodeLowerNeedle};
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
 /// the upstream session-only release never set SQLite's `pragma user_version`, so any pre-existing
@@ -2461,7 +2461,7 @@ impl Db {
                 filters.match_mode == MessageSearchMode::Literal && !query.is_empty();
             if literal_query {
                 sql.push_str(" and unicode_lower_contains(m.content, ?)");
-                args.push(Value::Text(query.to_lowercase()));
+                args.push(Value::Text(fold_caseless(query)));
             }
             if filters.match_mode == MessageSearchMode::Regex {
                 regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
@@ -2519,7 +2519,7 @@ impl Db {
             match (field, filters.match_mode) {
                 (SearchField::ToolName, MessageSearchMode::Literal) => {
                     sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
-                    args.push(Value::Text(query.to_lowercase()));
+                    args.push(Value::Text(fold_caseless(query)));
                 }
                 (SearchField::ToolName, MessageSearchMode::Regex) => {
                     regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
@@ -2578,7 +2578,7 @@ impl Db {
                             args.push(Value::Text(
                                 filters.argument_path.clone().unwrap_or_default(),
                             ));
-                            args.push(Value::Text(query.to_lowercase()));
+                            args.push(Value::Text(fold_caseless(query)));
                         }
                         MessageSearchMode::Regex => {
                             sql.push_str(" and rust_regexp(?, rust_json_pointer(?, m.content))");
@@ -2745,7 +2745,7 @@ impl Db {
             Normalization::Smart,
             AtomKind::Fuzzy,
         );
-        let query_lower = query.to_lowercase();
+        let query_lower = fold_caseless(query);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         let mut batch = Vec::with_capacity(FUZZY_SCORE_BATCH_SIZE);
@@ -3014,7 +3014,7 @@ impl Db {
             Normalization::Smart,
             AtomKind::Fuzzy,
         );
-        let query_lower = query.to_lowercase();
+        let query_lower = fold_caseless(query);
         let ranked_limit = match self.fuzzy_ranking_window(base_predicate, filters)? {
             FuzzyRankingWindow::Rank { limit, .. } => limit,
             FuzzyRankingWindow::PastCorpus { corpus } => {
@@ -3117,7 +3117,7 @@ impl Db {
         );
         let scored = score_fuzzy_derived_hits(
             &pattern,
-            &query.to_lowercase(),
+            &fold_caseless(query),
             SearchField::ToolName,
             None,
             rows,
@@ -3170,7 +3170,7 @@ impl Db {
             Normalization::Smart,
             AtomKind::Fuzzy,
         );
-        let query_lower = query.to_lowercase();
+        let query_lower = fold_caseless(query);
         let query_needle = UnicodeLowerNeedle::from_lowered(&query_lower);
         let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
         let mut utf32_buf = Vec::new();
@@ -3869,7 +3869,7 @@ impl Db {
             match filters.match_mode {
                 MessageSearchMode::Literal => {
                     sql.push_str(" and unicode_lower_contains(attributable.content, ?)");
-                    args.push(Value::Text(query.to_lowercase()));
+                    args.push(Value::Text(fold_caseless(query)));
                 }
                 MessageSearchMode::Regex => {
                     sql.push_str(" and rust_regexp(?, attributable.content)");
@@ -4690,7 +4690,7 @@ impl Db {
         scoring: &crate::config::ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
         self.validate_access_scope()?;
-        let query_lower = query.to_lowercase();
+        let query_lower = fold_caseless(query);
         let tokens: Vec<&str> = query_lower.split_whitespace().collect();
         let query_needle = UnicodeLowerNeedle::from_lowered(&query_lower);
         let token_needles = tokens
@@ -5495,7 +5495,7 @@ fn append_message_filters_with_class(
     if let Some(tool) = &filters.tool {
         // NULL tool_name rows are excluded because the scalar predicate returns false.
         sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
-        args.push(Value::Text(tool.to_lowercase()));
+        args.push(Value::Text(fold_caseless(tool)));
     }
     if let Some(seq_from) = filters.seq_from {
         sql.push_str(" and m.seq >= ?");
@@ -8989,6 +8989,46 @@ mod tests {
                 Some(4),
                 "{field:?}: every row scored"
             );
+        }
+    }
+
+    /// A literal search finds Greek text ending in sigma, whichever spelling either side uses.
+    ///
+    /// End to end rather than at the matcher: the query needle, the trigram candidate selection,
+    /// and the SQL scalar that verifies each candidate all have to agree about sigma, and each was
+    /// reached by a different route. The needle was lowered as a whole string, which turns a
+    /// word-final `Σ` into `ς`, while the scalar folded the stored text one character at a time
+    /// into `σ` — so a search for a word could return nothing for the message holding that word.
+    #[test]
+    fn a_literal_search_finds_greek_text_ending_in_sigma() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test');
+                 insert into messages (session_id, provider, seq, role, kind, content)
+                 values ('s1','claude',0,'user','message','η ΟΔΟΣΣ που ψαχνω'),
+                        ('s1','claude',1,'user','message','η οδοσς που ψαχνω επισης');",
+            )
+            .unwrap();
+
+        // Every spelling of the word selects both rows: the uppercase text, and the lowercase text
+        // whose sigma is written in its word-final form.
+        for query in ["ΟΔΟΣΣ", "οδοσς", "οδοσσ"] {
+            let hits = db
+                .search_messages(
+                    query,
+                    &MessageFilters {
+                        match_mode: MessageSearchMode::Literal,
+                        limit: 10,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 2, "query {query:?} finds both spellings");
         }
     }
 

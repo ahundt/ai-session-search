@@ -3810,7 +3810,7 @@ impl PreparedMatchEvidence {
         Ok(match query {
             MessageQuery::All => Self::All,
             MessageQuery::Literal(query) => Self::Literal {
-                lowered_query: query.as_str().to_lowercase(),
+                lowered_query: crate::util::fold_caseless(query.as_str()),
             },
             MessageQuery::Regex(query) => Self::Regex(regex::Regex::new(query.as_str())?),
             MessageQuery::Fuzzy(query) => Self::Fuzzy {
@@ -3933,11 +3933,17 @@ fn match_view_max_chars(
     }
 }
 
+/// Where `lowered_query` sits in `selected`, in source characters.
+///
+/// `lowered_query` is folded by [`crate::util::fold_caseless`] and this folds the text the same
+/// way, so the range it reports is the range the matcher that selected the row agreed on. Folding
+/// the two sides by different rules located nothing for text they spelled differently, and the
+/// caller then showed the head of the field as evidence for a match found elsewhere in it.
 fn literal_char_range(selected: &str, lowered_query: &str) -> Option<FieldCharRange> {
     let mut lowered = String::new();
     let mut original_char_for_lowered = Vec::new();
     for (original_char, value) in selected.chars().enumerate() {
-        for lowered_char in value.to_lowercase() {
+        for lowered_char in crate::util::fold_caseless_char(value) {
             lowered.push(lowered_char);
             original_char_for_lowered.push(original_char);
         }
