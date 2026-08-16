@@ -87,33 +87,70 @@ impl GeminiCliAdapter {
             .into_iter()
             .flatten()
         {
+            let timestamp = message
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_datetime);
+            let event_id = message
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty());
             let role = match message.get("type").and_then(Value::as_str) {
                 Some("user") => "user",
                 Some("gemini") => "assistant",
+                // Hook and CLI notices the harness wrote into the chat: what it told the agent,
+                // kept findable under `harness_notice` and out of results by default.
+                Some("warning" | "info" | "error") => {
+                    let content = content_text(message.get("content"));
+                    if !content.trim().is_empty() {
+                        messages.push(RawMessage::harness_notice(content, timestamp));
+                    }
+                    continue;
+                }
                 _ => continue,
             };
+            // The API echoes each tool result back as a `functionResponse` part on a user turn;
+            // the `gemini` turn's `toolCalls` already carry the same result with the call, so a
+            // user turn made only of echoes adds nothing.
+            if role == "user" && is_function_response_echo(message.get("content")) {
+                continue;
+            }
             let content = content_text(message.get("content"));
             let content = strip_references
                 .replace_all(&content, "")
                 .trim()
                 .to_string();
-            if content.is_empty() {
-                continue;
+            if !content.is_empty() {
+                let mut raw_message = RawMessage::message(role, content, timestamp, None);
+                if let Some(event_id) = event_id {
+                    raw_message = raw_message
+                        .with_native_event_identity(MessageCorrelationAuthority::Google, event_id);
+                }
+                messages.push(raw_message);
             }
-            let timestamp = message
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(parse_datetime);
-            let mut raw_message = RawMessage::message(role, content, timestamp, None);
-            if let Some(event_id) = message
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
+            // Tool traffic lives on the `gemini` turn: one call row (name, args, id) and, when the
+            // CLI recorded an outcome, one result row bound to the same id.
+            for call in message
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
             {
-                raw_message = raw_message
-                    .with_native_event_identity(MessageCorrelationAuthority::Google, event_id);
+                let Some(name) = call.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let call_id = call.get("id").and_then(Value::as_str);
+                let call_ts = call
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_datetime)
+                    .or(timestamp);
+                let args = call.get("args").cloned().unwrap_or(Value::Null);
+                messages.push(RawMessage::tool_call(name, args, call_id, call_ts));
+                if let Some(result) = tool_result_text(call) {
+                    messages.push(RawMessage::tool_result(name, result, call_id, call_ts));
+                }
             }
-            messages.push(raw_message);
         }
         let provider_id = data
             .get("sessionId")
@@ -158,6 +195,43 @@ fn referenced_file_block_regex() -> Result<&'static Regex> {
         })
         .as_ref()
         .map_err(|error| anyhow::anyhow!(error.clone()))
+}
+
+/// A user turn whose parts are all `functionResponse` echoes of tool results the `gemini` turn's
+/// `toolCalls` already carry.
+fn is_function_response_echo(content: Option<&Value>) -> bool {
+    match content {
+        Some(Value::Array(parts)) => {
+            !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|part| part.get("functionResponse").is_some())
+        }
+        _ => false,
+    }
+}
+
+/// The recorded outcome of one `toolCalls` entry: the CLI's rendered `resultDisplay` when it is
+/// text, else the `output` of the first `functionResponse` in `result`. `None` when the call has
+/// no recorded outcome (a cancelled or still-running call).
+fn tool_result_text(call: &Value) -> Option<String> {
+    if let Some(display) = call.get("resultDisplay").and_then(Value::as_str) {
+        let display = display.trim();
+        if !display.is_empty() {
+            return Some(display.to_string());
+        }
+    }
+    let output = call
+        .get("result")?
+        .as_array()?
+        .iter()
+        .find_map(|part| part.get("functionResponse"))?
+        .get("response")?
+        .get("output")?;
+    match output {
+        Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 fn content_text(content: Option<&Value>) -> String {
@@ -248,8 +322,10 @@ mod tests {
         assert_eq!(parsed.messages[1].content, "hi");
         assert_eq!(
             parsed.messages[0].provenance.authorship,
-            crate::models::MessageAuthorship::Unknown,
-            "Gemini CLI user-role rows can contain injected context and lack origin evidence"
+            crate::models::MessageAuthorship::Human,
+            "a Gemini CLI chat is one person-started session per file; its user turns are the \
+             person's prompts once referenced-file blocks are stripped and function responses \
+             are set aside"
         );
         assert_eq!(
             parsed.messages[1].provenance.authorship,
@@ -268,6 +344,105 @@ mod tests {
             assert_eq!(identity.scope, "gemini-cli:g1");
             assert_eq!(identity.id, expected_id);
         }
+    }
+
+    /// The chat file records tool traffic on the `gemini` turn (`toolCalls` with args and
+    /// result), echoes results back as `functionResponse` parts on a `user` turn, and writes
+    /// hook and CLI notices as `warning`/`info`/`error` turns. Every one of those was skipped or
+    /// mislabelled: 3,592 tool calls across 200 local files were absent from the index, and the
+    /// echoed responses were user-role conversation rows of unknown authorship.
+    #[test]
+    fn records_tool_calls_results_notices_and_human_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-2026-02-23T04-07-id.json");
+        fs::write(
+            &path,
+            r#"{"sessionId":"g2","messages":[
+              {"id":"u1","type":"user","content":"read the notes","timestamp":"2026-02-23T04:07:01Z"},
+              {"id":"a1","type":"gemini","content":[{"text":"reading"}],"timestamp":"2026-02-23T04:07:02Z",
+               "toolCalls":[{"id":"read_file-1","name":"read_file","args":{"path":"notes.md"},
+                 "result":[{"functionResponse":{"id":"read_file-1","name":"read_file","response":{"output":"line one"}}}],
+                 "status":"success","timestamp":"2026-02-23T04:07:03Z","resultDisplay":"line one"}]},
+              {"id":"u2","type":"user","content":[{"functionResponse":{"id":"read_file-1","name":"read_file","response":{"output":"line one"}}}],"timestamp":"2026-02-23T04:07:03Z"},
+              {"id":"w1","type":"warning","content":"Hook(s) [cleanup] failed for event SessionEnd.","timestamp":"2026-02-23T04:07:04Z"},
+              {"id":"a2","type":"gemini","content":[{"text":"done"}],"timestamp":"2026-02-23T04:07:05Z"}
+            ]}"#,
+        )
+        .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let source = source_file(Provider::GeminiCli, path, &metadata);
+        let parsed = GeminiCliAdapter::new(Vec::new()).parse(&source);
+
+        use crate::models::{MessageAuthorship, MessageKind, Role};
+        let rows: Vec<(Role, MessageKind, MessageAuthorship, Option<&str>)> = parsed
+            .messages
+            .iter()
+            .map(|m| {
+                (
+                    m.role,
+                    m.kind,
+                    m.provenance.authorship,
+                    m.tool_name.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    Role::User,
+                    MessageKind::Conversation,
+                    MessageAuthorship::Human,
+                    None
+                ),
+                (
+                    Role::Assistant,
+                    MessageKind::Conversation,
+                    MessageAuthorship::Agent,
+                    None
+                ),
+                (
+                    Role::Tool,
+                    MessageKind::ToolCall,
+                    MessageAuthorship::Agent,
+                    Some("read_file")
+                ),
+                (
+                    Role::Tool,
+                    MessageKind::ToolResult,
+                    MessageAuthorship::Generated,
+                    Some("read_file")
+                ),
+                (
+                    Role::User,
+                    MessageKind::HarnessNotice,
+                    MessageAuthorship::Harness,
+                    None
+                ),
+                (
+                    Role::Assistant,
+                    MessageKind::Conversation,
+                    MessageAuthorship::Agent,
+                    None
+                ),
+            ],
+            "{parsed:?}"
+        );
+        assert_eq!(
+            parsed.messages[2].tool_call_id.as_deref(),
+            Some("read_file-1")
+        );
+        assert_eq!(
+            parsed.messages[3].tool_call_id.as_deref(),
+            Some("read_file-1")
+        );
+        assert!(parsed.messages[2].content.contains("notes.md"));
+        assert_eq!(parsed.messages[3].content, "line one");
+        assert!(
+            !parsed.transcript_text.contains("notes.md"),
+            "tool traffic stays out of the session transcript, as for every other provider"
+        );
+        assert!(parsed.transcript_text.contains("read the notes"));
     }
 
     #[test]

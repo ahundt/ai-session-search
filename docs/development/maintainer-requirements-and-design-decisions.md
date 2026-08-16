@@ -457,6 +457,16 @@ canonical records rather than adapter-specific response models.
 Do not add a second parser for an opaque or duplicative database without evidence that it contains
 unique supported data.
 
+Authorship for a user turn comes from structural evidence: a per-message origin marker where the
+format has one (Antigravity's `USER_EXPLICIT`), otherwise the session's own start (Claude, Codex,
+Cursor, Pi: a session nothing spawned is a person's, a spawned run's user turns are the caller's
+delegation). Google AI Studio and Gemini CLI store one person-started chat per file with no spawn
+concept, so their user turns resolve to human by that same session-level evidence; the Gemini CLI
+adapter first sets aside the `functionResponse` echoes the API writes as user turns and records
+`toolCalls` as tool-call and tool-result rows and `warning`/`info`/`error` turns as harness
+notices, so no generated text is left in a user row to be called human. Both parse versions moved
+(`aistudio-v3`, `gemini-cli-v4`) so an existing index reparses those files at its next refresh.
+
 Adding a provider variant is an index-compatibility event even when the schema generation does not
 move: Prime Agent shipped at generation 5, so a `1.0.0rc1` executable opening an index that a later
 build has written cannot decode `sessions.provider` for those rows. Two aise executables on one

@@ -1208,8 +1208,8 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
         Provider::Antigravity => "antigravity-v3",
         Provider::Pi => "pi-v3",
         Provider::PrimeAgent => "prime-agent-v1",
-        Provider::AiStudio => "aistudio-v2",
-        Provider::GeminiCli => "gemini-cli-v3",
+        Provider::AiStudio => "aistudio-v3",
+        Provider::GeminiCli => "gemini-cli-v4",
     }
 }
 

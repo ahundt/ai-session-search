@@ -140,7 +140,9 @@ mod tests {
         assert_eq!(parsed.session.provider, Provider::AiStudio);
         assert_eq!(
             parsed.messages[0].provenance.authorship,
-            crate::models::MessageAuthorship::Unknown
+            crate::models::MessageAuthorship::Human,
+            "an AI Studio export is one person-started chat per file; its user turns are the \
+             person's prompts"
         );
         assert_eq!(
             parsed.messages[1].provenance.authorship,
@@ -158,7 +160,7 @@ mod tests {
         let markdown = adapter.parse(markdown_source);
         assert_eq!(
             markdown.messages[0].provenance.authorship,
-            crate::models::MessageAuthorship::Unknown
+            crate::models::MessageAuthorship::Human
         );
     }
 
