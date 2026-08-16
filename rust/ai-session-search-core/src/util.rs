@@ -1385,10 +1385,33 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
              `aise export {id}`"
         ));
     }
+    // A spawned run is not something Claude Code reopens: its transcript is a subagent record, not
+    // a session `claude --resume` resolves. Name the spawning session's own command instead of
+    // printing an id that fails at the prompt.
+    let spawned_by = session.parent_session_id.as_deref();
+    if let (Provider::Claude, Some(parent)) = (session.provider, spawned_by) {
+        let id = &session.id;
+        let parent_native = parent.split_once(':').map_or(parent, |(_, native)| native);
+        return Err(anyhow!(
+            "session {id} is a subagent run spawned by {parent}; Claude Code resumes only the \
+             spawning session: `claude --resume {parent_native}`. Read the run itself with `aise \
+             show {id}` or `aise export {id}`"
+        ));
+    }
     let cwd = session
         .cwd
         .clone()
         .filter(|path| PathBuf::from(path).exists());
+    // Pi and Prime Agent resolve a bare id only among the session directory's own files; a spawned
+    // run lives under the parent's artifact directory, and both CLIs accept a transcript path
+    // (`pi --session <path|id>`, `prime-agent --resume <path|id>`), which is what the plan names.
+    let pi_family_target = || {
+        if spawned_by.is_some() {
+            session.source_path.clone()
+        } else {
+            session.provider_session_id.clone()
+        }
+    };
     let command = match session.provider {
         Provider::Claude => vec![
             "claude".to_string(),
@@ -1403,12 +1426,12 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Pi => vec![
             "pi".to_string(),
             "--session".to_string(),
-            session.provider_session_id.clone(),
+            pi_family_target(),
         ],
         Provider::PrimeAgent => vec![
             "prime-agent".to_string(),
             "--resume".to_string(),
-            session.provider_session_id.clone(),
+            pi_family_target(),
         ],
         Provider::ClaudeDesktop
         | Provider::Cursor
@@ -1717,6 +1740,59 @@ pub(crate) mod tests {
                 ],
                 None,
             )
+        );
+    }
+
+    /// A spawned run (`parent_session_id` set) is a separate transcript file for Pi and Prime
+    /// Agent, stored under the parent's artifact directory rather than the session directory
+    /// their `--session`/`--resume <id>` resolvers list; both accept a path, so the plan names the
+    /// file. Claude Code has no path resume and its subagent transcripts are not sessions it can
+    /// reopen, so the plan is an error that names the spawning session's own resume command.
+    /// Before this, 111 of 119 Prime rows and 4,398 of 5,349 Claude rows on one real index were
+    /// printed with an id their CLI could not resolve.
+    #[test]
+    fn subagent_runs_resume_by_transcript_path_or_name_the_spawning_session() {
+        for (provider, binary, flag) in [
+            (Provider::PrimeAgent, "prime-agent", "--resume"),
+            (Provider::Pi, "pi", "--session"),
+        ] {
+            let path = std::path::Path::new(
+                "/tmp/session-artifacts/019fea39-38c2-710e-8100-3624dfc0ac07/sub-003151c9/019fefde-8f4b-71d9-8d4b-457c4f4ee729.jsonl",
+            );
+            let mut parsed = minimal_record(provider, path, String::new());
+            parsed.session.parent_session_id = Some(format!(
+                "{}:019fea39-38c2-710e-8100-3624dfc0ac07",
+                provider.as_str()
+            ));
+            let plan = with_stub_binary_on_path(binary, || resume_plan(&parsed.session)).unwrap();
+            assert_eq!(
+                plan.0,
+                vec![
+                    binary.to_string(),
+                    flag.to_string(),
+                    parsed.session.source_path.clone(),
+                ],
+                "{binary}: a spawned run resumes by its transcript path"
+            );
+        }
+
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            std::path::Path::new("/tmp/projects/x/agent-ad3f660161c4e678b.jsonl"),
+            String::new(),
+        );
+        parsed.session.parent_session_id =
+            Some("claude:f330ed56-af97-4b90-a866-99f0a6e11117".to_string());
+        let error = with_stub_binary_on_path("claude", || resume_plan(&parsed.session))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("claude --resume f330ed56-af97-4b90-a866-99f0a6e11117"),
+            "names the spawning session's resume command: {error}"
+        );
+        assert!(
+            error.contains(&format!("aise show {}", parsed.session.id)),
+            "offers reading the run here: {error}"
         );
     }
 
