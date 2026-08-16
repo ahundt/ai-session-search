@@ -909,12 +909,10 @@ enum ToolPaging {
 }
 
 impl ToolRecovery {
-    /// Read the page a call resolved to from the same advertised schema the caller read.
-    ///
-    /// The schema already carries each pageable tool's configured default in its `limit`
-    /// property, put there so the model can see it (the generated message-search schema descriptions).
-    /// Deriving from it keeps one owner: a tool that gains or loses pagination changes its schema
-    /// and this follows, where a hand-listed table would keep answering for the old surface.
+    /// Read which arguments a call can shrink from the same advertised schema the caller read,
+    /// and the page it resolved to from the configuration that rendered "omit for N" into that
+    /// schema's prose. A tool that gains or loses pagination changes its schema and the reducer
+    /// set follows; the page comes from `configured_omitted_page`, one owner per pageable tool.
     fn for_call(tool_name: &str, args: &Value, advertised: &Value, config: &Config) -> Self {
         let properties = advertised
             .as_array()
@@ -929,22 +927,19 @@ impl ToolRecovery {
         // the same set, and naming one a tool lacks hands the caller an argument its own schema
         // rejects while the one that would have worked goes unmentioned.
         let reducers = ReducingArguments::of(accepts);
-        let Some(limit_property) = properties.and_then(|properties| properties.get("limit")) else {
+        if !accepts("limit") {
             return Self {
                 paging: ToolPaging::Unpaged,
                 reducers,
             };
-        };
-        // An explicit argument wins, then the default the schema advertises, then the page the
-        // configuration resolves for the tools that state their omission value in prose rather
-        // than a `default` keyword (see `strip_default_keywords`). `limit=0` means "every match"
-        // on the session tools: unbounded, so there is no requested page to halve, but the tool
-        // still pages and a finite retry is still available.
+        }
+        // An explicit argument wins, then the page an omitted `limit` resolves to. No tool
+        // advertises a `default` keyword (see `no_tool_advertises_a_default_a_client_could_materialize_into_a_call`),
+        // so the omission value is read from the configuration that rendered it into the prose.
+        // `limit=0` means "every match" on the session tools: unbounded, so there is no requested
+        // page to halve, but the tool still pages and a finite retry is still available.
         let explicit = args.get("limit").and_then(Value::as_u64);
-        let paging = match explicit
-            .or_else(|| limit_property.get("default").and_then(Value::as_u64))
-            .or_else(|| configured_omitted_page(tool_name, config))
-        {
+        let paging = match explicit.or_else(|| configured_omitted_page(tool_name, config)) {
             Some(0) | None => ToolPaging::EveryMatch,
             Some(page) => usize::try_from(page)
                 .map(ToolPaging::Page)
@@ -954,10 +949,9 @@ impl ToolRecovery {
     }
 }
 
-/// The page an omitted `limit` resolves to on the tools whose schemas carry no `default` keyword:
-/// the same configured request that rendered "Omit for N" into their descriptions, so the model's
-/// text and the retry advice come from one owner. Tools that still advertise the keyword do not
-/// reach this.
+/// The page an omitted `limit` resolves to on each pageable tool: the same configuration that
+/// rendered "omit for N" / "(default N)" into its description, so the model's text and the retry
+/// advice come from one owner. `None` for a tool without a `limit`.
 fn configured_omitted_page(tool_name: &str, config: &Config) -> Option<u64> {
     match tool_name {
         "search_messages" => {
@@ -969,6 +963,9 @@ fn configured_omitted_page(tool_name: &str, config: &Config) -> Option<u64> {
             }
         }
         "run_skill_capability" => Some(config.mcp.run_message_classification_limit as u64),
+        "search_sessions" => Some(config.mcp.search_sessions_limit as u64),
+        "list_sessions" => Some(config.mcp.list_sessions_limit as u64),
+        "query_session_index" => Some(config.db.query_limit as u64),
         _ => None,
     }
 }
@@ -4183,13 +4180,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "when": session_span_when_schema(),
                             "limit": {
                                 "type": "integer", "minimum": 0,
-                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
-                                "default": config.mcp.search_sessions_limit
+                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit)
                             },
                             "offset": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Skip this many higher-ranked matches before returning the page. Ranking is deterministic for one fixed index (score descending, updated_at descending, id ascending), but the index is not snapshotted and can change between calls. Work and retained top-K state scale with offset + limit. Default 0.",
-                                "default": 0
+                                "description": "Skip this many higher-ranked matches before returning the page. Ranking is deterministic for one fixed index (score descending, updated_at descending, id ascending), but the index is not snapshotted and can change between calls. Work and retained top-K state scale with offset + limit. Default 0."
                             },
                             "include": raw_metadata_include_schema(),
                             "preview_chars": session_preview_chars_schema()
@@ -4212,15 +4207,13 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; truncated_evidence names categories with additional indexed entries. Mutually exclusive with transcript_lines and message_seq. Default false, which returns transcript lines instead.",
-                                "default": false
+                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; truncated_evidence names categories with additional indexed entries. Mutually exclusive with transcript_lines and message_seq. Default false, which returns transcript lines instead."
                             },
-                            "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items), "default": config.mcp.summary_items },
-                            "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true.", "default": [] },
+                            "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items) },
+                            "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true." },
                             "transcript_lines": {
                                 "type": "integer",
-                                "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Bound this when skimming many sessions: a negative tail shows how a session ended, a positive head shows how it started, and 0 is for complete capture only. To pinpoint one turn, use search_messages and pass its message_seq here instead of reading a large window. Mutually exclusive with summary and message_seq. Default when no output selector is provided: {}.", config.mcp.get_session_transcript_lines),
-                                "default": config.mcp.get_session_transcript_lines
+                                "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Bound this when skimming many sessions: a negative tail shows how a session ended, a positive head shows how it started, and 0 is for complete capture only. To pinpoint one turn, use search_messages and pass its message_seq here instead of reading a large window. Mutually exclusive with summary and message_seq. Default when no output selector is provided: {}.", config.mcp.get_session_transcript_lines)
                             },
                             "message_seq": {
                                 "type": "integer", "minimum": 0,
@@ -4236,25 +4229,21 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "context": {
                                 "type": "integer", "minimum": 0,
-                                "description": "When message_seq is provided, include this many turns before and after that message (default 0).",
-                                "default": 0
+                                "description": "When message_seq is provided, include this many turns before and after that message (default 0)."
                             },
                             "include_refs": {
                                 "type": "boolean",
-                                "description": "When message_seq is provided, include extracted URL-like references for each returned message (default false).",
-                                "default": false
+                                "description": "When message_seq is provided, include extracted URL-like references for each returned message (default false)."
                             },
-                            "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)) },
                             "lines_per_message": {
                                 "type": "integer",
-                                "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message),
-                                "default": config.mcp.lines_per_message
+                                "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message)
                             },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
-                                "description": "When message_seq is provided, concise (default) applies preview_chars after the per-message line window; detailed applies no additional character cap after that line window.",
-                                "default": "concise"
+                                "description": "When message_seq is provided, concise (default) applies preview_chars after the per-message line window; detailed applies no additional character cap after that line window."
                             }
                         },
                         "required": ["session_id"],
@@ -4284,13 +4273,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "when": session_span_when_schema(),
                             "limit": {
                                 "type": "integer", "minimum": 0,
-                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit),
-                                "default": config.mcp.list_sessions_limit
+                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit)
                             },
                             "offset": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Number of newest-first sessions to skip before returning this page. Default 0.",
-                                "default": 0
+                                "description": "Number of newest-first sessions to skip before returning this page. Default 0."
                             },
                             "include": raw_metadata_include_schema(),
                             "preview_chars": session_preview_chars_schema()
@@ -4523,11 +4510,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "properties": {
                             "sql": { "type": "string", "description": "Exactly one raw read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Prefer search_messages for accelerated content or regex search with context. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
                             "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
-                            "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit), "default": config.db.query_limit },
-                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0.", "default": 0 },
-                            "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("MCP-only raw-SQL availability guard in milliseconds (default {}). 0 disables interruption. This is independent of native CLI/Rust SQL defaults and does not apply to indexed search tools.", config.mcp.query_timeout_ms), "default": config.mcp.query_timeout_ms },
-                            "max_cell_chars": { "type": "integer", "minimum": 0, "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
+                            "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false)." },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit) },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0." },
+                            "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("MCP-only raw-SQL availability guard in milliseconds (default {}). 0 disables interruption. This is independent of native CLI/Rust SQL defaults and does not apply to indexed search tools.", config.mcp.query_timeout_ms) },
+                            "max_cell_chars": { "type": "integer", "minimum": 0, "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars) }
                         },
                         "additionalProperties": false
                     }
@@ -4795,30 +4782,10 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
                 "unsupported get_session include value: {unsupported}"
             ));
         }
-        reject_non_default(
-            args,
-            "include_refs",
-            json!(false),
-            "include_refs only applies with message_seq; summary already includes reference evidence",
-        )?;
-        reject_non_default(
-            args,
-            "context",
-            json!(0),
-            "context only applies with message_seq; summary includes follow-up commands for larger windows",
-        )?;
-        reject_non_default(
-            args,
-            "response_format",
-            json!("concise"),
-            "response_format only applies with message_seq; summary always returns structured evidence with bounded previews",
-        )?;
-        reject_non_default(
-            args,
-            "lines_per_message",
-            json!(config.mcp.lines_per_message),
-            "lines_per_message only applies with message_seq; summary uses preview_chars for its bounded previews",
-        )?;
+        reject_present(args, "include_refs", "include_refs only applies with message_seq; summary already includes reference evidence")?;
+        reject_present(args, "context", "context only applies with message_seq; summary includes follow-up commands for larger windows")?;
+        reject_present(args, "response_format", "response_format only applies with message_seq; summary always returns structured evidence with bounded previews")?;
+        reject_present(args, "lines_per_message", "lines_per_message only applies with message_seq; summary uses preview_chars for its bounded previews")?;
         let mut options = inspection_options_from_args(args, config)?;
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
         let inspection = CatalogService::new(db)
@@ -4840,12 +4807,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     }
 
     if has_range {
-        reject_non_default(
-            args,
-            "context",
-            json!(0),
-            "context only applies with message_seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]",
-        )?;
+        reject_present(args, "context", "context only applies with message_seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]")?;
         let session = db
             .resolve_session_record(session_id)
             .map_err(|e| format!("{e:#}"))?;
@@ -4853,48 +4815,29 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         return message_range_value(&session, seq_from, seq_to, &presentation, db)
             .and_then(ToolResponse::structured);
     }
-    reject_non_default(
+    reject_present(
         args,
         "summary_items",
-        json!(config.mcp.summary_items),
         "summary_items only applies with summary=true",
     )?;
-    reject_non_default(
-        args,
-        "include",
-        json!([]),
-        "include only applies with summary=true",
-    )?;
-    reject_non_default(
+    reject_present(args, "include", "include only applies with summary=true")?;
+    reject_present(
         args,
         "context",
-        json!(0),
         "context only applies with message_seq; transcript output uses transcript_lines",
     )?;
-    reject_non_default(
-        args,
-        "include_refs",
-        json!(false),
-        "include_refs only applies with message_seq; transcript output returns raw transcript lines",
-    )?;
-    reject_non_default(
+    reject_present(args, "include_refs", "include_refs only applies with message_seq; transcript output returns raw transcript lines")?;
+    reject_present(
         args,
         "preview_chars",
-        json!(config.mcp.preview_chars.max(1)),
         "preview_chars only applies to summary output and focused message context",
     )?;
-    reject_non_default(
+    reject_present(
         args,
         "response_format",
-        json!("concise"),
         "response_format only applies with message_seq; transcript output uses transcript_lines",
     )?;
-    reject_non_default(
-        args,
-        "lines_per_message",
-        json!(config.mcp.lines_per_message),
-        "lines_per_message caps each message and only applies with message_seq; transcript output windows the whole session with transcript_lines",
-    )?;
+    reject_present(args, "lines_per_message", "lines_per_message caps each message and only applies with message_seq; transcript output windows the whole session with transcript_lines")?;
     let selected_lines = transcript_lines.unwrap_or(config.mcp.get_session_transcript_lines);
 
     let full = db
@@ -5419,16 +5362,12 @@ fn inspection_options_from_args(
     })
 }
 
-fn reject_non_default(
-    args: &Value,
-    key: &str,
-    default: Value,
-    message: &str,
-) -> Result<(), String> {
-    if args
-        .get(key)
-        .is_some_and(|value| !value.is_null() && value != &default)
-    {
+/// Reject an argument the selected `get_session` output path cannot use. Presence is the test:
+/// no tool advertises a `default` keyword, so a present value is the caller's own even when it
+/// equals the omission value, and it participates in the rules exactly as on `search_messages`
+/// (comparing against the default was the one-day heuristic that inverted precedence there).
+fn reject_present(args: &Value, key: &str, message: &str) -> Result<(), String> {
+    if args.get(key).is_some_and(|value| !value.is_null()) {
         Err(message.to_string())
     } else {
         Ok(())
@@ -5696,7 +5635,6 @@ fn add_index_refresh_controls(response: &mut Value) {
             json!({
                 "type": "string",
                 "enum": ["auto", "existing-only"],
-                "default": "auto",
                 // The single highest-leverage description in the payload: one edit here lands on
                 // all eight tools. It also names the write, which the readOnlyHint annotation
                 // does not: `auto` may index new transcripts, so a tool declared read-only can
@@ -5893,8 +5831,7 @@ fn raw_metadata_include_schema() -> Value {
     json!({
         "type": "array",
         "items": { "type": "string", "enum": [INCLUDE_RAW_METADATA] },
-        "description": "Optional extra fields (default none). 'raw_metadata' restores each record's raw_metadata_json, the provider's verbatim metadata blob, which is omitted by default because it is unbounded: codex embeds its entire sandbox policy, about 2-3 KB per session.",
-        "default": []
+        "description": "Optional extra fields (default none). 'raw_metadata' restores each record's raw_metadata_json, the provider's verbatim metadata blob, which is omitted by default because it is unbounded: codex embeds its entire sandbox policy, about 2-3 KB per session."
     })
 }
 
@@ -7500,6 +7437,135 @@ mod tests {
         }
     }
 
+    /// The rule the message-search family adopted holds for every tool: no property advertises
+    /// a `default` keyword, and every property that resolves to something when omitted says so
+    /// in prose. Dogfooded 2026-08-15 from Claude Code 2.1.233 against `get_session`:
+    /// `get_session(session_id, message_seq)` and `get_session(session_id, summary=true)` were
+    /// both rejected with "Use only one get_session output selector" because the client
+    /// materialized `transcript_lines`' advertised default beside the selector the model wrote.
+    /// Keeping the keyword "only where a materialized default is harmless" is what let that
+    /// through: any presence-dependent rule added later breaks silently in that client. The
+    /// behavioural half of this test materializes whatever the served catalogue advertises into
+    /// one representative call per presence rule and requires the same outcome as omission, so
+    /// re-adding a keyword fails here rather than in a client.
+    #[test]
+    fn no_tool_advertises_a_default_a_client_could_materialize_into_a_call() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = advertised_tools(&config);
+        let tools = tools.as_array().expect("tools list");
+        assert!(
+            tools.len() >= 8,
+            "expected the full catalogue, got {}",
+            tools.len()
+        );
+
+        // Properties whose omission resolves to a value; each must say so ("omit"/"default").
+        let stated_in_prose: HashMap<&str, &[&str]> = HashMap::from([
+            ("search_sessions", &["include", "limit", "offset"][..]),
+            ("list_sessions", &["include", "limit", "offset"][..]),
+            (
+                "get_session",
+                &[
+                    "context",
+                    "include",
+                    "include_refs",
+                    "lines_per_message",
+                    "preview_chars",
+                    "response_format",
+                    "summary",
+                    "summary_items",
+                    "transcript_lines",
+                ][..],
+            ),
+            (
+                "query_session_index",
+                &[
+                    "include_internal",
+                    "limit",
+                    "max_cell_chars",
+                    "offset",
+                    "timeout_ms",
+                ][..],
+            ),
+        ]);
+        let mut materialized: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
+        for tool in tools {
+            let tool_name = tool["name"].as_str().expect("tool name");
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .expect("properties");
+            let mut defaults = serde_json::Map::new();
+            for (name, schema) in properties {
+                if let Some(default) = schema.get("default") {
+                    defaults.insert(name.clone(), default.clone());
+                }
+                let description = schema["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if stated_in_prose
+                    .get(tool_name)
+                    .is_some_and(|names| names.contains(&name.as_str()))
+                {
+                    assert!(
+                        description.contains("omit") || description.contains("default"),
+                        "{tool_name}.{name} must state what omission resolves to: {schema}"
+                    );
+                }
+            }
+            materialized.insert(tool_name.to_owned(), defaults);
+        }
+
+        // One call per presence rule; the outcome must not depend on what a client injects.
+        let representative: [(&str, Value); 6] = [
+            (
+                "get_session",
+                json!({ "session_id": "claude:test1", "message_seq": 0 }),
+            ),
+            (
+                "get_session",
+                json!({ "session_id": "claude:test1", "summary": true }),
+            ),
+            (
+                "get_session",
+                json!({ "session_id": "claude:test1", "seq_from": 0, "seq_to": 1 }),
+            ),
+            (
+                "search_messages",
+                json!({ "query": "hello", "all_results": true }),
+            ),
+            ("search_messages", json!({ "role": "user" })),
+            ("query_session_index", json!({ "schema_table": "sessions" })),
+        ];
+        for (tool_name, written) in representative {
+            let as_written = call_tool(tool_name, written.clone(), &config, &db);
+            let mut injected = written.as_object().cloned().expect("object arguments");
+            for (name, default) in &materialized[tool_name] {
+                injected
+                    .entry(name.clone())
+                    .or_insert_with(|| default.clone());
+            }
+            let with_defaults = call_tool(tool_name, Value::Object(injected), &config, &db);
+            assert!(
+                as_written["result"]["isError"].is_null(),
+                "{tool_name} rejects what the model wrote: {as_written}"
+            );
+            assert_eq!(
+                as_written["result"]["isError"], with_defaults["result"]["isError"],
+                "{tool_name}: materializing the advertised defaults changed the outcome of {written}: {with_defaults}"
+            );
+        }
+
+        for (tool_name, defaults) in &materialized {
+            assert!(
+                defaults.is_empty(),
+                "{tool_name} advertises `default` on {:?}; state the omission value in prose instead",
+                defaults.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// Claude Code materializes every JSON-schema `default` before it calls a tool, so a
     /// declared default makes an absent value and a typed one indistinguishable to the server.
     /// Dogfooded 2026-08-15 from Claude Code: `all_results` ("conflicts with limit"), `detail`
@@ -7661,7 +7727,7 @@ mod tests {
             .is_some_and(|order| order.contains("score")));
 
         let tool = tool_input_schema(&config, "search_sessions");
-        assert_eq!(tool["inputSchema"]["properties"]["offset"]["default"], 0);
+        assert!(tool["inputSchema"]["properties"]["offset"]["default"].is_null());
         assert!(tool["inputSchema"]["properties"]["offset"]["description"]
             .as_str()
             .is_some_and(|description| {
@@ -8977,7 +9043,10 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("include_refs only applies with message_seq"));
 
-        assert!(tool_get_session(
+        // A present value is the caller's own even when it equals the omission value: it is
+        // rejected on the path that cannot use it, exactly as on search_messages, so a client
+        // cannot inject a value the model never wrote and have it silently accepted.
+        let err = tool_get_session(
             &json!({
                 "session_id": "claude:test1",
                 "context": 0,
@@ -8988,7 +9057,12 @@ mod tests {
             &config,
             &db,
         )
-        .is_ok());
+        .unwrap_err();
+        assert!(
+            err.contains("context only applies with message_seq"),
+            "{err}"
+        );
+        assert!(tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).is_ok());
     }
 
     #[test]
@@ -9193,10 +9267,11 @@ mod tests {
 
         let tool = tool_input_schema(&config, "query_session_index");
         let schema = &tool["inputSchema"];
-        assert_eq!(schema["properties"]["timeout_ms"]["default"], 2_222);
+        assert!(schema["properties"]["timeout_ms"]["default"].is_null());
         let description = schema["properties"]["timeout_ms"]["description"]
             .as_str()
             .unwrap();
+        assert!(description.contains("(default 2222)"), "{description}");
         assert!(description.contains("MCP-only raw-SQL availability guard"));
         assert!(description.contains("independent of native CLI/Rust SQL defaults"));
         assert!(!description.contains("1111"));
@@ -13180,8 +13255,13 @@ mod tests {
         assert!(sql_description.contains("raw read-only SQL"));
         assert!(sql_description.contains("Prefer search_messages"));
         assert!(query_session_index["inputSchema"]["properties"]["schema_table"].is_object());
-        assert_eq!(
-            get_session["inputSchema"]["properties"]["summary"]["default"], false,
+        let get_session_prose = |property: &str| -> String {
+            let schema = &get_session["inputSchema"]["properties"][property];
+            assert!(schema["default"].is_null(), "{property}: {schema}");
+            schema["description"].as_str().unwrap().to_owned()
+        };
+        assert!(
+            get_session_prose("summary").contains("Default false"),
             "summary is opt-in"
         );
         assert!(get_session["inputSchema"]["properties"]["transcript_lines"].is_object());
@@ -13189,12 +13269,13 @@ mod tests {
         assert!(get_session["inputSchema"]["properties"]["seq"].is_null());
         assert!(get_session["inputSchema"]["properties"]["max_lines"].is_null());
         assert!(get_session["inputSchema"]["properties"]["view"].is_null());
-        assert_eq!(
-            get_session["inputSchema"]["properties"]["context"]["default"], 0,
+        assert!(
+            get_session_prose("context").contains("(default 0)"),
             "context defaults to 0 unless explicitly requested"
         );
-        assert_eq!(
-            get_session["inputSchema"]["properties"]["transcript_lines"]["default"], -40,
+        assert!(
+            get_session_prose("transcript_lines")
+                .contains("Default when no output selector is provided: -40"),
             "bare get_session is bounded by default"
         );
         assert!(
@@ -13655,24 +13736,19 @@ mod tests {
             .find(|t| t["name"] == "search_messages")
             .expect("search_messages advertised");
 
-        assert_eq!(
-            search_sessions["inputSchema"]["properties"]["limit"]["default"],
-            7
-        );
-        assert_eq!(
-            list_sessions["inputSchema"]["properties"]["limit"]["default"],
-            8
-        );
-        assert_eq!(
-            get_session["inputSchema"]["properties"]["transcript_lines"]["default"],
-            -3
-        );
-        assert_eq!(
-            get_session["inputSchema"]["properties"]["preview_chars"]["default"],
-            10
-        );
-        // The message-search family states its omission values in prose (no `default` keyword,
-        // see `strip_default_keywords`), rendered from the same configured request.
+        // Every tool states its configured omission value in prose and advertises no `default`
+        // keyword (see `no_tool_advertises_a_default_a_client_could_materialize_into_a_call`).
+        let prose = |tool: &Value, property: &str| -> String {
+            let schema = &tool["inputSchema"]["properties"][property];
+            assert!(schema["default"].is_null(), "{property}: {schema}");
+            schema["description"].as_str().unwrap().to_owned()
+        };
+        assert!(prose(search_sessions, "limit").contains("(default 7)"));
+        assert!(prose(list_sessions, "limit").contains("(default 8)"));
+        assert!(prose(get_session, "transcript_lines")
+            .contains("Default when no output selector is provided: -3"));
+        assert!(prose(get_session, "preview_chars").contains("(default 10)"));
+        // The message-search family renders its prose from the same configured request.
         let limit_prose = search_messages["inputSchema"]["properties"]["limit"]["description"]
             .as_str()
             .unwrap();
@@ -14921,7 +14997,13 @@ mod tests {
                 json!(["auto", "existing-only"]),
                 "{name} does not advertise the adapter's index-read policy"
             );
-            assert_eq!(control["default"], json!("auto"), "{name}");
+            assert!(control["default"].is_null(), "{name}");
+            assert!(
+                control["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("Omit for auto")),
+                "{name}"
+            );
         }
     }
 

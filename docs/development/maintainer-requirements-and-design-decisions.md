@@ -361,20 +361,25 @@ General configuration location and runtime overrides follow explicit option, app
 `AI_SESSION_SEARCH_*` environment variable, platform config, then embedded default. Full receipts
 must expose the selected origin rather than only the final value.
 
-MCP argument presence is the caller's own. The `search_messages` and `run_skill_capability`
-schemas state every omission value in the property description ("Omit for 20") and advertise no
-`default` keyword: Claude Code materializes each JSON-schema `default` into the call before
-dispatch, which made an absent value and a typed one indistinguishable to the server (a
-materialized `limit` beside `all_results` tripped the exclusivity rule; a materialized page size
-outranked a purpose bundle). Stripping values equal to the advertised default at dispatch was
-tried for one day (2026-08-15) and inverted the defect: a typed value equal to the default then
-lost to a purpose bundle on MCP while winning on the CLI and in Python, and full receipts reported
-it as a configured default rather than the call. Withholding the keyword removes the ambiguity at
-its source; the retry advice reads the resolved page from the same configured request that
-rendered the prose (`configured_omitted_page`), and
-`message_search_family_states_defaults_in_prose_and_advertises_no_default_keyword` pins both.
-The session tools keep their `default` keywords because for them an omitted and a typed default
-value resolve identically.
+MCP argument presence is the caller's own. No tool advertises a JSON-schema `default` keyword;
+every property that resolves to something when omitted says so in its description ("omit for
+20", "(default 10)"), and every effective default stays in the resolver. Claude Code materializes
+each advertised `default` into the call before dispatch, which made an absent value and a typed
+one indistinguishable to the server: on `search_messages` a materialized `limit` beside
+`all_results` tripped the exclusivity rule and a materialized page size outranked a purpose
+bundle (dogfooded 2026-08-15); on `get_session` a materialized `transcript_lines` beside
+`message_seq` or `summary=true` tripped the one-selector rule (dogfooded 2026-08-15 from Claude
+Code 2.1.233, after the message-search family had already dropped the keyword "only where it was
+harmful"; that exception is what let this through). Stripping values equal to the advertised
+default at dispatch was tried for one day (2026-08-15) and inverted the defect: a typed value
+equal to the default then lost to a purpose bundle on MCP while winning on the CLI and in Python,
+and full receipts reported it as a configured default rather than the call. Withholding the
+keyword everywhere removes the ambiguity at its source and needs no per-tool justification; the
+retry advice reads the resolved page from the same configuration that rendered the prose
+(`configured_omitted_page`), `get_session` rejects a present argument its selected output path
+cannot use (`reject_present`), and
+`no_tool_advertises_a_default_a_client_could_materialize_into_a_call` pins the rule for every
+tool by materializing whatever the catalogue advertises into representative calls.
 
 ### REQ014-use-platform-app-paths
 
