@@ -132,11 +132,21 @@ def _record_with(payload: bytes, rewritten: dict[str, bytes]) -> bytes:
 def sanitize_wheel_sboms(wheel: pathlib.Path, root: pathlib.Path) -> None:
     """Rewrite every SBOM member of `wheel` so no `path+file://` reference remains.
 
-    Every member is rewritten in its original order with its original ZipInfo, so the wheel is
-    byte-stable apart from the sanitized SBOMs and the RECORD rows that describe them, and the
-    build clock maturin stamped is untouched. A path outside `root` is refused before anything is
-    written: it means the wheel was built from a tree this script does not know, and silently
-    shipping the path is the failure this exists to stop.
+    ZIP has no in-place member replacement, so the archive is rebuilt: every member is written
+    back in its original order, carrying its own ZipInfo and therefore its date, compression
+    method, permissions, create system, extra field, comment, and internal attributes. The two
+    members that change are the SBOMs and the RECORD rows describing them; every other member's
+    content comes across byte for byte, and the build clock maturin stamped is untouched.
+
+    Compressed bytes are not preserved, because ZIP records no compression level and the rebuild
+    re-encodes with CPython's deflate rather than the builder's. On the published
+    `ai_session_search-1.0.0rc1-cp312-abi3-macosx_11_0_arm64.whl` that changed the compressed size
+    of 14 of 15 members. Nothing depends on those bytes: RECORD digests cover uncompressed
+    content, and the artifacts that get verified, attested, and uploaded are the sanitized ones.
+
+    A path outside `root` is refused before anything is written: it means the wheel was built from
+    a tree this script does not know, and silently shipping the path is the failure this exists to
+    stop.
     """
     root = root.resolve()
     with zipfile.ZipFile(wheel) as archive:
@@ -146,19 +156,24 @@ def sanitize_wheel_sboms(wheel: pathlib.Path, root: pathlib.Path) -> None:
     }
     if not rewritten:
         return
-    temporary = wheel.with_name(f".{wheel.name}.sanitizing")
-    with zipfile.ZipFile(temporary, "w") as archive:
-        for info, payload in members:
-            if info.filename in rewritten:
-                payload = rewritten[info.filename]
-            elif _WHEEL_RECORD_MEMBER.search(info.filename):
-                payload = _record_with(payload, rewritten)
-            replacement = zipfile.ZipInfo(info.filename, date_time=info.date_time)
-            replacement.compress_type = info.compress_type
-            replacement.external_attr = info.external_attr
-            replacement.create_system = info.create_system
-            archive.writestr(replacement, payload)
-    os.replace(temporary, wheel)
+    temporary: pathlib.Path | None = wheel.with_name(f".{wheel.name}.sanitizing")
+    try:
+        with zipfile.ZipFile(temporary, "w") as archive:
+            for info, payload in members:
+                if info.filename in rewritten:
+                    payload = rewritten[info.filename]
+                elif _WHEEL_RECORD_MEMBER.search(info.filename):
+                    payload = _record_with(payload, rewritten)
+                # The member's own ZipInfo is written back, so every field travels across —
+                # including `extra`, `comment`, `internal_attr`, and the compression level, which
+                # a fresh ZipInfo would start empty. `writestr` recomputes the sizes and CRC for
+                # the payload it is given, which is what the two rewritten members need.
+                archive.writestr(info, payload)
+        os.replace(temporary, wheel)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
