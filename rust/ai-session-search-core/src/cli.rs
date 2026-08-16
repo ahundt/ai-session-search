@@ -518,12 +518,70 @@ struct AnalyzeArgs {
 
 #[derive(Debug, Args)]
 struct SearchArgs {
-    /// Session-level keywords, phrase, code snippet, path fragment, or title text to search for.
-    /// A query starting with `-` is parsed as a flag here; pass it after `--`, with every other
-    /// flag before the `--`, e.g. `--limit 5 -- --path`.
-    query: String,
+    /// Session-level keywords, phrase, code snippet, path fragment, or title text to search for
+    /// and rank by. Required: to list sessions by their metadata alone (newest first), use
+    /// `aise list` with the same filters. A query starting with `-` is parsed as a flag here;
+    /// pass it after `--`, with every other flag before the `--`, e.g. `--limit 5 -- --path`.
+    query: Option<String>,
     #[command(flatten)]
     filters: QueryArgs,
+}
+
+impl SearchArgs {
+    /// The text to rank by, or the exact `aise list` invocation that answers a query-less request.
+    ///
+    /// clap's own "required arguments were not provided: <QUERY>" told a caller what was missing
+    /// and not what to run instead; agents in session history answered it by retrying with `""`,
+    /// which ranks every session against an empty needle. Both cases now name the command that
+    /// lists sessions by filters alone, with the filters the caller already typed.
+    fn ranking_query(&self) -> Result<&str> {
+        match self.query.as_deref().map(str::trim) {
+            Some(query) if !query.is_empty() => Ok(query),
+            _ => bail!(
+                "aise search ranks sessions by a query and none was given; to list sessions by \
+                 their metadata alone (newest first) run `{}`",
+                self.equivalent_list_command()
+            ),
+        }
+    }
+
+    /// `aise list` with the session filters, limit, and format this search request carried.
+    fn equivalent_list_command(&self) -> String {
+        let filters = &self.filters.filters;
+        let mut command = vec!["aise".to_string(), "list".to_string()];
+        let mut push = |flag: &str, value: &str| {
+            command.push(flag.to_string());
+            command.push(
+                render_posix_shell_command(&[value.to_string()])
+                    .unwrap_or_else(|_| format!("{value:?}")),
+            );
+        };
+        if let Some(provider) = filters.provider {
+            push("--provider", provider.as_str());
+        }
+        if let Some(path) = &filters.path {
+            push("--path", path);
+        }
+        for path in &filters.exclude_paths {
+            push("--exclude-path", path);
+        }
+        if let Some(when) = &filters.dates.when {
+            push("--when", when);
+        }
+        if let Some(since) = &filters.dates.since {
+            push("--since", since);
+        }
+        if let Some(until) = &filters.dates.until {
+            push("--until", until);
+        }
+        if let Some(limit) = self.filters.limit {
+            push("--limit", &limit.to_string());
+        }
+        if self.filters.format != OutputFormat::Table {
+            push("--format", self.filters.format.as_str());
+        }
+        command.join(" ")
+    }
 }
 
 #[derive(Debug, Args)]
@@ -946,15 +1004,16 @@ fn execute(cli: Cli) -> Result<()> {
             }
         }
         Commands::Search(args) => {
+            let query = args.ranking_query()?;
             let format = args.filters.format;
-            let include = args.filters.include;
+            let include = args.filters.include.clone();
             let filters = build_filters(
                 &args.filters.filters,
                 configured_search_limit(args.filters.limit, &config),
             )?;
             let current_repo = current_repo(&config);
             let hits = app.catalog().search_sessions(
-                &args.query,
+                query,
                 &filters,
                 current_repo.as_deref(),
                 &config.search.scoring,
@@ -965,7 +1024,7 @@ fn execute(cli: Cli) -> Result<()> {
                         println!("no sessions matched");
                     } else {
                         for hit in hits {
-                            print_search_hit(&hit, &args.query);
+                            print_search_hit(&hit, query);
                         }
                     }
                 }
@@ -2330,6 +2389,46 @@ mod tests {
             invocations.push((index + 1, invocation));
         }
         invocations
+    }
+
+    /// `aise search` without a query used to end in clap's bare "required arguments were not
+    /// provided: <QUERY>", and session history shows agents retrying with `""`, which ranks every
+    /// session against an empty needle. Both now name the `aise list` invocation that lists
+    /// sessions by the filters the caller already typed.
+    #[test]
+    fn session_search_without_a_query_names_the_equivalent_list_command() {
+        let cli = Cli::try_parse_from([
+            "aise",
+            "search",
+            "--path",
+            "/work/repo",
+            "--when",
+            "7d",
+            "--limit",
+            "10",
+        ])
+        .expect("a query-less search parses so the guidance can be rendered");
+        let Commands::Search(args) = cli.command else {
+            panic!("expected search command")
+        };
+        let error = args.ranking_query().unwrap_err().to_string();
+        assert!(
+            error.contains("aise list --path /work/repo --when 7d --limit 10"),
+            "{error}"
+        );
+
+        let cli = Cli::try_parse_from(["aise", "search", "   ", "--provider", "codex"]).unwrap();
+        let Commands::Search(args) = cli.command else {
+            panic!("expected search command")
+        };
+        let error = args.ranking_query().unwrap_err().to_string();
+        assert!(error.contains("aise list --provider codex"), "{error}");
+
+        let cli = Cli::try_parse_from(["aise", "search", "receipt corpus"]).unwrap();
+        let Commands::Search(args) = cli.command else {
+            panic!("expected search command")
+        };
+        assert_eq!(args.ranking_query().unwrap(), "receipt corpus");
     }
 
     /// The root help lists twenty-four commands. `ROOT_COMMAND_GROUPS` sorts them into everyday,
