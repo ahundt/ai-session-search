@@ -275,11 +275,14 @@ impl UnicodeLowerNeedle {
                     if matched == self.pattern.len() {
                         // This character supplied `folded_index + 1` of the needle's characters,
                         // which can be fewer than its whole expansion when the match ends inside
-                        // one. Only the rest were supplied by the characters before it.
+                        // one. Only the rest were supplied by the characters before it, and there
+                        // may be none: a needle short enough to sit entirely inside one
+                        // character's expansion consumes more folded characters than it has, so
+                        // the count saturates at zero and the backward walk has nothing to do.
                         let start = source_start_of_folded_match(
                             haystack,
                             offset,
-                            self.pattern.len() - (folded_index + 1),
+                            self.pattern.len().saturating_sub(folded_index + 1),
                         );
                         return Some(start..character_end);
                     }
@@ -2505,6 +2508,18 @@ pub(crate) mod tests {
             .find_in("İ")
             .expect("the expansion starts with i");
         assert_eq!(range, 0..2);
+
+        // ...and one satisfied by the *tail* of an expansion does too. `İ` is the only mapping
+        // that lengthens, so this needle consumes the second of its two folded characters and
+        // none of the characters before it: the count still to account for is zero, and
+        // computing it as `len - (index + 1)` underflowed. A debug build panicked inside the
+        // per-record ranking loop and the SQLite `unicode_lower_contains` scalar; a release
+        // build wrapped to `usize::MAX` and widened the range to the whole preceding text.
+        let range = UnicodeLowerNeedle::from_lowered("\u{307}")
+            .find_in("xxİyy")
+            .expect("the expansion ends with a combining dot");
+        assert_eq!(&"xxİyy"[range.clone()], "İ");
+        assert_eq!(range, 2..4);
     }
 
     #[test]
