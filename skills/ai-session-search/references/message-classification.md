@@ -71,20 +71,29 @@ silently changes measured output.
 ## Writing your own
 
 ```sh
-aise skills create my-corrections --output-dir ~/.claude/skills
+aise skills create my-corrections --capability message-classification --output-dir ~/.claude/skills
 aise skills validate ~/.claude/skills/my-corrections
 ```
 
-`create` seeds the file with the categories `aise` ships, so the usual path — start from the
-defaults, change what you disagree with — needs no transcription. The scaffold is yours: it carries
-no managed marker, so `aise` will never rewrite it.
+`--capability message-classification` seeds `aise-capability.toml` with the categories `aise`
+ships, so the usual path — start from the defaults, change what you disagree with — needs no
+transcription; without the flag `create` writes only `SKILL.md`, a harness-only skill with no
+capability for `aise` to run. `--output-dir` names the parent directory; set
+`[skills].authoring_root` in `config.toml` to omit it. The scaffold is yours: it carries no
+managed marker, so `aise` leaves it alone on `aise skills update`.
 
-Add its parent to `[skills].search_paths` in the aise config, then:
+Add its parent to `[skills].search_paths` in the aise config (`aise config file` prints the
+path), then:
 
 ```sh
 aise skills list                                   # confirm it is discovered and valid
 aise skills my-corrections --format json
 ```
+
+Edit `aise-capability.toml` to change what is measured: `[[categories]]` entries with a `name` and
+a `patterns` list of Rust regexes (see [Schema](#schema)); order is precedence and the first
+matching category wins. `SKILL.md` beside it is what the harness reads; `aise` runs only the
+capability file.
 
 ### Keep patterns narrow
 

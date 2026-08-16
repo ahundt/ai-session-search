@@ -332,8 +332,28 @@ categories after these:
 aise skills corrections --skill ./my-review --format json
 ```
 
-Read [references/message-classification.md](references/message-classification.md) before
-changing categories or regular expressions.
+### Create your own classification package
+
+A skill package is a directory holding `SKILL.md` (what the harness reads) and, beside it,
+`aise-capability.toml` (what `aise` runs: ordered `[[categories]]` of `name` + `patterns`).
+Scaffold one from the shipped categories, validate it, register its parent, then run it:
+
+```sh
+aise skills create my-corrections --capability message-classification --output-dir ~/.claude/skills
+aise skills validate ~/.claude/skills/my-corrections
+# add "~/.claude/skills" to [skills].search_paths in the file `aise config file` prints
+aise skills list
+aise skills my-corrections --path ~/source/project --when 30d --format json
+aise skills corrections --skill ~/.claude/skills/my-corrections --format json   # defaults first, yours after
+```
+
+`aise skills show my-corrections` prints where it resolved from and its categories in order.
+MCP runs the same package with `run_skill_capability(skill={"name":"my-corrections"})` or
+`skill={"path":...}` under a `[skills].search_paths` root, `additional_skills` for more
+packages, and `definition={"categories":[{"name":...,"patterns":[...]}]}` for one call's
+inline rules. Read [references/message-classification.md](references/message-classification.md)
+for the schema, precedence, and pattern guidance before changing categories or regular
+expressions.
 
 Search precise correction phrases such as `misunderstood`, `wrong repo`, `you forgot`, and
 `should have`, then add `--context 2`. Treat mirrored provider records as correlated unless their
