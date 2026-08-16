@@ -67,6 +67,10 @@ via rust's `cargo`:
 cargo install ai-session-search --locked && aise integrations install
 ```
 
+No stable version is published yet, so both commands resolve the newest release candidate and
+install it without warning. That is what their resolvers do when a package has only pre-releases.
+Pin an exact version to choose a different one.
+
 
 ## Quick start
 

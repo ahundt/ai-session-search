@@ -9,12 +9,17 @@ permission to publish a release; a maintainer must approve the protected
 ## One release identity, ecosystem-native versions
 
 Use one release identity with the canonical spelling required by each package
-ecosystem. For release candidate 1 of version 1.0.0, declare:
+ecosystem. For release candidate `N` of version `X.Y.Z`, declare:
 
 | Surface | Version |
 |---|---|
-| `pyproject.toml`, Python artifacts, and Git tag | `1.0.0rc1` and `v1.0.0rc1` |
-| Cargo manifests, Rust dependencies, and `.crate` artifact | `1.0.0-rc.1` |
+| `pyproject.toml`, Python artifacts, and Git tag | `X.Y.ZrcN` and `vX.Y.ZrcN` |
+| Cargo manifests, Rust dependencies, and `.crate` artifact | `X.Y.Z-rc.N` |
+
+A final release drops the suffix and spells `X.Y.Z` the same way on both sides.
+Read the version this checkout actually declares out of `pyproject.toml` and the
+Cargo manifests rather than from this table, which is a mapping and not a record
+of the current release.
 
 Do not force one spelling into the other ecosystem. Python release candidates
 use the normalized `X.Y.ZrcN` form defined by the
