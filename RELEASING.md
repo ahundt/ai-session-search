@@ -270,6 +270,13 @@ Before tagging, confirm:
   scripts.verify_release_artifacts` holds the enforced list.
 - Archives contain no demo media, absolute or traversal paths, legacy Python package
   directories, symlinks, or hard links.
+- The wheel's embedded SBOM (`.dist-info/sboms/*.cyclonedx.json`, written by maturin) names
+  the workspace crates as `workspace:<relative path>`: `scripts.prepare_packages` rewrites the
+  `path+file://<checkout>/...` references maturin records and refuses a wheel built outside
+  the checkout, so a locally prepared wheel never carries the build machine's directory. The
+  wheels `publish.yml` builds record the runner's checkout path there (`/Users/runner/work/...`
+  in the first published release); applying the same rewrite in the `wheels` job before
+  attestation is a maintainer decision because it changes the published bytes.
 
 ## TestPyPI rehearsal
 

@@ -7,17 +7,23 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
+import zipfile
 from collections.abc import Callable, Sequence
 
 from scripts.release_versions import cargo_version_for_python
+from scripts.sanitize_sboms import SanitizationError, sanitize
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "dist" / "packages"
@@ -41,9 +47,7 @@ def _cargo_version() -> str:
     with (ROOT / "rust/ai-session-search-core/Cargo.toml").open("rb") as stream:
         actual = str(tomllib.load(stream)["package"]["version"])
     if actual != expected:
-        raise PreparationError(
-            f"Cargo version {actual!r} must be {expected!r} for Python version {python_version!r}"
-        )
+        raise PreparationError(f"Cargo version {actual!r} must be {expected!r} for Python version {python_version!r}")
     return actual
 
 
@@ -108,7 +112,74 @@ def build_python(staging: pathlib.Path) -> list[pathlib.Path]:
             "uv-managed maturin must create exactly one local-platform wheel and one source distribution; "
             f"found wheels={len(wheels)}, sdist={expected_sdist.is_file()} in {staging}"
         )
+    sanitize_wheel_sboms(wheels[0], ROOT)
     return [*wheels, expected_sdist]
+
+
+# PEP 770 places SBOMs here; maturin writes one CycloneDX document per wheel and records the
+# checkout it built from as `path+file://<checkout>/rust/<crate>` on the workspace components,
+# so a wheel built at home carries the maintainer's home directory. The separate SBOMs are
+# already rewritten to `workspace:<relative>` by scripts.sanitize_sboms; this applies the same
+# rewrite inside the wheel and keeps RECORD's hash and size for the member correct.
+_WHEEL_SBOM_MEMBER = re.compile(r"\.dist-info/sboms/[^/]+\.json$")
+_WHEEL_RECORD_MEMBER = re.compile(r"\.dist-info/RECORD$")
+
+
+def _record_digest(payload: bytes) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+
+
+def _sanitized_sbom(wheel_name: str, member: str, payload: bytes, root: pathlib.Path) -> bytes:
+    try:
+        document = sanitize(json.loads(payload), root)
+    except SanitizationError as error:
+        raise PreparationError(f"{wheel_name}: {member}: {error}") from error
+    text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+    if "path+file://" in text:
+        raise PreparationError(f"{wheel_name}: {member} still names a local path after sanitizing")
+    return text.encode()
+
+
+def _record_with(payload: bytes, rewritten: dict[str, bytes]) -> bytes:
+    lines = []
+    for line in payload.decode().splitlines():
+        name = line.split(",", 1)[0]
+        if name in rewritten:
+            body = rewritten[name]
+            line = f"{name},sha256={_record_digest(body)},{len(body)}"
+        lines.append(line)
+    return ("\n".join(lines) + "\n").encode()
+
+
+def sanitize_wheel_sboms(wheel: pathlib.Path, root: pathlib.Path) -> None:
+    """Rewrite every SBOM member of `wheel` so no `path+file://` reference remains.
+
+    Every member is rewritten in its original order with its original ZipInfo, so the wheel is
+    byte-stable apart from the sanitized SBOMs and the RECORD rows that describe them. A path
+    outside `root` is refused rather than left in place: it means the wheel was built from a tree
+    this script does not know, and silently shipping the path is the failure this exists to stop.
+    """
+    root = root.resolve()
+    with zipfile.ZipFile(wheel) as archive:
+        members = [(info, archive.read(info.filename)) for info in archive.infolist()]
+    rewritten = {
+        info.filename: _sanitized_sbom(wheel.name, info.filename, payload, root) for info, payload in members if _WHEEL_SBOM_MEMBER.search(info.filename)
+    }
+    if not rewritten:
+        return
+    temporary = wheel.with_name(f".{wheel.name}.sanitizing")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        for info, payload in members:
+            if info.filename in rewritten:
+                payload = rewritten[info.filename]
+            elif _WHEEL_RECORD_MEMBER.search(info.filename):
+                payload = _record_with(payload, rewritten)
+            replacement = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            replacement.compress_type = info.compress_type
+            replacement.external_attr = info.external_attr
+            replacement.create_system = info.create_system
+            archive.writestr(replacement, payload)
+    os.replace(temporary, wheel)
 
 
 def verify_artifacts(artifacts: Sequence[pathlib.Path]) -> None:
@@ -133,9 +204,7 @@ def prepare_packages(
         raise PreparationError(f"unsupported package scope {scope!r}; choose: {', '.join(PACKAGE_SCOPES)}")
     output_dir = output_dir.resolve()
     if output_dir.exists():
-        raise PreparationError(
-            f"output path already exists: {output_dir}; choose a new --output-dir so stale and current artifacts cannot mix"
-        )
+        raise PreparationError(f"output path already exists: {output_dir}; choose a new --output-dir so stale and current artifacts cannot mix")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".aise-packages-", dir=output_dir.parent) as temporary:
@@ -162,9 +231,7 @@ def prepare_packages(
 
 
 def argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Prepare verified local Cargo and/or PyPI artifacts without uploading them. Defaults to the complete set."
-    )
+    parser = argparse.ArgumentParser(description="Prepare verified local Cargo and/or PyPI artifacts without uploading them. Defaults to the complete set.")
     parser.add_argument(
         "--package",
         choices=PACKAGE_SCOPES,
