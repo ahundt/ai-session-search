@@ -446,8 +446,9 @@ struct SessionFilterArgs {
     /// Omit to search every allowed root.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     path: Option<String>,
-    /// Exclude sessions whose cwd, repo root, or transcript path starts with this path.
-    /// Repeat to exclude multiple noisy worktrees or transcript roots. Omit to exclude none.
+    /// Exclude sessions whose cwd, repo root, or transcript path is this directory or a
+    /// descendant of it (component boundary). Repeat to exclude multiple noisy worktrees or
+    /// transcript roots. Omit to exclude none.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-path")]
     exclude_paths: Vec<String>,
     /// Exclude one exact session id. Repeat to exclude multiple sessions. Omit to exclude none.

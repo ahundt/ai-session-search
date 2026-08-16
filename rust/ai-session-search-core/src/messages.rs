@@ -687,15 +687,17 @@ pub struct MessageSearchArgs {
     /// `project-other`). Omit to search every root.
     #[arg(help_heading = FILTER_HEADING, long)]
     pub workspace_path: Option<String>,
-    /// Restrict to sessions whose transcript storage path starts with this path prefix. Omit to
-    /// search every transcript path.
+    /// Restrict to sessions whose transcript file is this path or under this directory (a
+    /// component boundary, so `logs` matches `logs/a.jsonl`, never `logs-old/`). Omit to search
+    /// every transcript path.
     #[arg(help_heading = FILTER_HEADING, long)]
     pub transcript_path: Option<String>,
-    /// Exclude a session working-directory or repository-root prefix. Repeatable; omit to exclude
-    /// no root.
+    /// Exclude sessions whose working directory or repository root is this directory or a
+    /// descendant of it (component boundary). Repeatable; omit to exclude no root.
     #[arg(help_heading = FILTER_HEADING, long = "exclude-workspace-path")]
     pub exclude_workspace_paths: Vec<String>,
-    /// Exclude a transcript storage prefix. Repeatable; omit to exclude no path.
+    /// Exclude sessions whose transcript file is this path or under this directory (component
+    /// boundary). Repeatable; omit to exclude no path.
     #[arg(help_heading = FILTER_HEADING, long = "exclude-transcript-path")]
     pub exclude_transcript_paths: Vec<String>,
     /// Exclude one exact session id. Repeat to exclude multiple sessions; omit to exclude none.

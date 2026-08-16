@@ -2079,13 +2079,12 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
             if !states {
                 unstated.push(format!("aise {} {}", leaf.join(" "), trimmed));
             }
-            // A filter that matches by prefix has to say so. `--workspace-path
-            // /Users/example/source/widget` also matches `/Users/example/source/widget-other`, and a
-            // reader who thinks it is an exact match reads a wider result set as a narrower one.
-            // `aise search --path` already says "starts with this path prefix" and
-            // `--exclude-workspace-path` says "prefix", so the two that do not are inconsistent
-            // with their own neighbours as well as with the MCP names, which spell it
-            // `workspace_path_prefix`.
+            // A path filter has to say how it matches. Every one goes through
+            // `db::path_prefix_patterns` (exact directory, or `prefix/`-anchored LIKE), so
+            // `--workspace-path /Users/example/source/widget` matches `widget/src` and never
+            // `widget-other`; a reader told only "prefix" would take the result set for wider
+            // than it is, and one told nothing cannot tell whether it is exact. The MCP names spell
+            // it `workspace_path_prefix`, so the help states the component boundary explicitly.
             let flag = trimmed.split_whitespace().next().unwrap_or_default();
             let prefix_matcher = matches!(
                 flag,
@@ -2096,7 +2095,9 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
                     | "--path"
                     | "--exclude-path"
             );
-            if prefix_matcher && !(lowered.contains("prefix") || lowered.contains("starts with")) {
+            if prefix_matcher
+                && !(lowered.contains("component boundary") || lowered.contains("descendant"))
+            {
                 unstated_prefix.push(format!("aise {} {flag}", leaf.join(" ")));
             }
         }
@@ -2104,8 +2105,9 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
 
     assert!(
         unstated_prefix.is_empty(),
-        "{} path filters match by prefix without saying so, so a caller cannot tell that a \
-         sibling directory sharing the leading path is also matched: {unstated_prefix:#?}",
+        "{} path filters do not say that they match the directory and its component-boundary \
+         descendants, so a caller cannot tell whether a sibling directory is excluded: \
+         {unstated_prefix:#?}",
         unstated_prefix.len()
     );
 

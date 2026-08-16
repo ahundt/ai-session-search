@@ -234,10 +234,11 @@ def test_single_python_executable_serves_initialize_and_exits_on_eof(tmp_path: P
     assert response["result"]["capabilities"]["tools"] == {}
     instructions = response["result"]["instructions"]
     assert "AI Session Search (`aise`)" in instructions
-    assert "`search_sessions`" in instructions
-    assert "`search_messages`" in instructions
-    assert "`get_session`" in instructions
-    assert len(instructions) <= 512
+    for tool in ("`list_sessions(", "`search_sessions(", "`search_messages(", "`get_session("):
+        assert tool in instructions
+    # A brevity budget for text every MCP client injects into its system prompt on initialize:
+    # the four-step workflow, the provider list, and the skill/CLI pointers fit in it.
+    assert len(instructions) <= 700
 
 
 def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> None:

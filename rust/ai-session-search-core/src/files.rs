@@ -677,7 +677,8 @@ pub struct FileScopeArgs {
     /// Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to sessions whose cwd, repo root, or transcript path starts with this path prefix.
+    /// Restrict to sessions whose cwd, repo root, or transcript path is this directory or a
+    /// descendant of it (component boundary).
     /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,

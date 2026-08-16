@@ -235,7 +235,8 @@ pub struct CorrectionsArgs {
     /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
+    /// (component boundary).
     /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
@@ -287,7 +288,8 @@ pub struct PlanningArgs {
     /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
+    /// (component boundary).
     /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
@@ -315,7 +317,8 @@ pub struct StatsArgs {
     /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
+    /// (component boundary).
     /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
@@ -685,7 +688,8 @@ pub struct RepeatsArgs {
     /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
+    /// (component boundary).
     /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
