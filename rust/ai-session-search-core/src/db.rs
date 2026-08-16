@@ -3303,23 +3303,29 @@ impl Db {
         self.corpus_count_with_base("1 = 1", filters)
     }
 
-    /// How many scored candidates a fuzzy page has to retain, bounded by the eligible corpus.
+    /// Whether a fuzzy page has any row to rank, and how many scored candidates it may retain.
     ///
     /// `offset + limit` is what the caller asked to rank, and both are theirs to choose: paging
     /// deep into a large result set is legitimate, which is why there is no arbitrary window cap.
-    /// Ranking further than there are rows to rank never is. Left unbounded, that retention target
-    /// was unreachable for a large offset — [`retain_top_fuzzy_hits`] truncates only above the
-    /// target — so the vector of scored rows, each carrying its message content, grew to every
-    /// matching row and `skip(offset)` then discarded all of it. Bounding the target by the corpus
-    /// makes peak retention `min(matching rows, offset + limit, corpus)` for every request.
+    /// Ranking further than there are rows to rank never is. An offset past the last eligible row
+    /// used to score the whole corpus anyway: [`retain_top_fuzzy_hits`] truncates only above the
+    /// retention target, an unreachable target never truncated, so the vector of scored rows — each
+    /// carrying its message content — grew to every matching row and `skip(offset)` then discarded
+    /// all of it. Answering that page from the count is what removes the cost.
+    ///
+    /// The `min` on the returned limit is a clamp, not that repair. Retention was always at most
+    /// the matching rows, which are at most the rows scanned, which are at most the corpus, so
+    /// taking the minimum cannot lower a peak; it only keeps `ranked_limit` from being a number no
+    /// run could reach. A deep page that does land inside the corpus still retains up to every
+    /// matching row, because scoring the complete corpus and keeping a top-K larger than it has no
+    /// smaller answer.
     ///
     /// The count reads covering indexes rather than message rows (see
     /// [`Db::filtered_corpus_count`]) and is taken only when the requested window exceeds one
-    /// scoring batch, so an ordinary page pays nothing for the bound and is told `None` back so it
-    /// counts on its own terms if a receipt needs one. `base_predicate` is the same fragment
-    /// [`Db::corpus_count_with_base`] takes, so each caller bounds against the rows it actually
-    /// scans; an over-estimate would only leave the window wider than needed, never truncate a
-    /// real page.
+    /// scoring batch, so an ordinary page pays nothing for it and is told `None` back so it counts
+    /// on its own terms if a receipt needs one. `base_predicate` is the same fragment
+    /// [`Db::corpus_count_with_base`] takes, so each caller measures the rows it actually scans; an
+    /// over-estimate would only leave the window wider than needed, never truncate a real page.
     fn fuzzy_ranking_window(
         &self,
         base_predicate: &str,

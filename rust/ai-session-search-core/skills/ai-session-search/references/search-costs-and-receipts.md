@@ -52,8 +52,9 @@ config, surface config, or typed default). Fields:
   rarer literal.
 - Exact and regex modes verify the requested predicate after candidate retrieval, so a prefilter
   changes cost, never membership. Fuzzy scores the complete eligible corpus and retains at most
-  `min(offset + limit, corpus)` ranked rows, so a huge `offset` costs no extra memory; an `offset`
-  at or past the last eligible row returns an empty page without scoring any row.
+  `min(offset + limit, corpus)` ranked rows. An `offset` at or past the last eligible row is
+  answered from the corpus count without scoring anything, which is what keeps a huge `offset`
+  cheap; a deep `offset` that does land inside the corpus still retains up to every matching row.
 
 The CLI prints the receipt with `--format json` (and a one-line `[explain]` summary on stderr);
 MCP returns it as `receipt` in the structured output.
