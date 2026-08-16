@@ -279,6 +279,8 @@ fn excluded_kinds_predicate() -> String {
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
 type ProgressReporter = Box<dyn Fn(&str) + Send + Sync>;
 
+/// Set once the unread `sessions_fts` copy an earlier build filled has been emptied; see `Db::init`.
+const SESSIONS_FTS_RETIRED_KEY: &str = "sessions_fts_retired";
 const AUTO_REINDEX_COMPLETED_MS_KEY: &str = "auto_reindex_completed_ms";
 const AUTO_REINDEX_COMPLETED_NS_KEY: &str = "auto_reindex_completed_ns";
 const AUTO_REINDEX_PARSER_CONTRACT_KEYS: [&str; 4] = [
@@ -1138,11 +1140,34 @@ impl Db {
         // `sessions_fts` (an FTS5 copy of every title, summary, preview, and transcript) stopped
         // being read on 2026-07-22, when session search moved to scoring the complete corpus, and
         // stayed maintained: on one real index it held 464 MB (a second copy of every transcript
-        // plus its tokens) and every session upsert re-tokenized the whole transcript into it. It
-        // is derived data, so dropping it loses nothing; the pages return to the freelist and
-        // `aise compact` gives them back to the filesystem. A no-op once gone.
-        self.conn
-            .execute_batch("drop table if exists sessions_fts")?;
+        // plus its tokens) and every session upsert re-tokenized the whole transcript into it. This
+        // build writes nothing into it. It is retired in place rather than removed: an aise before
+        // 1.0.0rc2 on the same machine (a pinned MCP registration, a second package manager)
+        // requires the table in its layout check, refuses existing-only reads without it, and on a
+        // writable open rebuilds every derived message-search index to restore it, after which
+        // this build would remove it again. So the copy an earlier build filled is emptied once
+        // (`SESSIONS_FTS_RETIRED_KEY`, the pages return to the freelist and `aise compact` gives
+        // them back), an empty table is kept for that older layout check, and an older writer that
+        // refills it is left alone.
+        let retired: bool = self.conn.query_row(
+            "select exists(select 1 from index_metadata where key = ?1)",
+            params![SESSIONS_FTS_RETIRED_KEY],
+            |row| row.get(0),
+        )?;
+        if !retired {
+            self.conn
+                .execute_batch("drop table if exists sessions_fts")?;
+            self.conn.execute(
+                "insert into index_metadata (key, value) values (?1, 1)
+                 on conflict(key) do update set value = excluded.value",
+                params![SESSIONS_FTS_RETIRED_KEY],
+            )?;
+        }
+        self.conn.execute_batch(
+            "create virtual table if not exists sessions_fts using fts5(
+                title, summary, preview_text, transcript_text
+            )",
+        )?;
         // External-content FTS over message bodies. Message search no longer lets FTS tokenization
         // define literal semantics, but this index is still kept current for vocabulary,
         // compatibility, and any future explicit word-search surface. The insert/delete/update
@@ -9301,40 +9326,62 @@ mod tests {
     }
 
     /// `sessions_fts` was maintained on every session write and read by nothing since session
-    /// search began scoring the complete corpus (2026-07-22). An index that still carries it (one
-    /// written before 1.0.0rc2) loses it at the next writable open, and no session write path
-    /// touches it afterwards.
+    /// search began scoring the complete corpus (2026-07-22). This build empties the copy an
+    /// earlier build filled exactly once, keeps an empty table for the layout check of an aise
+    /// before 1.0.0rc2 sharing the index, writes nothing into it, and leaves an older writer's
+    /// refill alone so two builds on one machine cannot take turns filling and emptying it.
     #[test]
-    fn open_drops_the_unread_session_fts_table_and_writes_never_recreate_it() {
+    fn open_retires_the_unread_session_fts_copy_once_and_keeps_the_empty_table_for_older_builds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         drop(Db::open(&path).unwrap());
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute_batch(
-                "create virtual table sessions_fts using fts5(title, summary, preview_text, transcript_text);",
-            )
-            .unwrap();
-        let db = Db::open(&path).unwrap();
-        let has_table = |db: &Db| -> bool {
-            db.conn
-                .query_row(
-                    "select exists(select 1 from sqlite_schema where name = 'sessions_fts')",
-                    [],
-                    |row| row.get(0),
+        let fill = || {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(
+                    "insert into sessions_fts(rowid, title, summary, preview_text, transcript_text)
+                     values (1, 'older build wrote this', '', '', '');",
                 )
+                .unwrap();
+        };
+        let fts_rows = |db: &Db| -> i64 {
+            db.conn
+                .query_row("select count(*) from sessions_fts", [], |row| row.get(0))
                 .unwrap()
         };
-        assert!(!has_table(&db), "open drops the unread FTS table");
+        // A fresh database: the table exists, empty, and the retirement is recorded.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(fts_rows(&db), 0);
         assert!(
             crate::indexer::current_schema_layout_problem(&db.conn)
                 .unwrap()
                 .is_none(),
-            "an index without sessions_fts is a complete current layout"
+            "the empty table satisfies the layout check an older build performs"
         );
         seed_messages(&db, &[("user", "hello")]);
+        assert_eq!(fts_rows(&db), 0, "no write path fills it");
         db.clear_all().unwrap();
-        assert!(!has_table(&db), "no write path recreates it");
+        drop(db);
+        // An older build sharing the index refills it; this build leaves that alone.
+        fill();
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            fts_rows(&reopened),
+            1,
+            "a refill by an older writer is left alone after the one-time retirement"
+        );
+        drop(reopened);
+        // A database an earlier build filled and this build has never opened: emptied once.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("delete from index_metadata where key = 'sessions_fts_retired';")
+            .unwrap();
+        let retired = Db::open(&path).unwrap();
+        assert_eq!(
+            fts_rows(&retired),
+            0,
+            "the earlier build's copy is emptied once"
+        );
     }
 
     #[test]

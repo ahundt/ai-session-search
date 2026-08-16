@@ -270,6 +270,7 @@ pub(crate) fn message_search_layout_problem(conn: &rusqlite::Connection) -> Resu
         "index_metadata",
         "messages",
         "file_edits",
+        "sessions_fts",
         "messages_fts",
         "messages_vocab",
         "messages_trigram",
