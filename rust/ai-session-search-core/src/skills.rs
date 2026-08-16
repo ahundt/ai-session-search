@@ -166,7 +166,7 @@ impl SkillsCmd {
                 error.print()?;
                 Ok(true)
             }
-            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+            Err(error) => Err(capability_argument_error(&error)),
             Ok(_) => Ok(false),
         }
     }
@@ -187,10 +187,24 @@ impl SkillsCmd {
         let args = MessageClassificationCommand::try_parse_from(
             std::iter::once(OsString::from("aise-skill-capability")).chain(capability_args),
         )
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .map_err(|error| capability_argument_error(&error))?
         .args;
         Ok(SkillExecution { selector, args })
     }
+}
+
+/// clap renders its own `error: ` prefix; the CLI runner prints every failure as `error: {message}`
+/// as well, so `aise skills corrections -- --help` used to print `error: error: unexpected
+/// argument '--help' found`. Keep clap's message and usage line, without its prefix.
+fn capability_argument_error(error: &clap::Error) -> anyhow::Error {
+    let rendered = error.to_string();
+    anyhow::anyhow!(
+        "{}",
+        rendered
+            .strip_prefix("error: ")
+            .unwrap_or(&rendered)
+            .trim_end()
+    )
 }
 
 pub(crate) fn parse_skill_selector(value: OsString) -> Result<crate::skill_catalog::SkillSelector> {
@@ -1472,6 +1486,21 @@ mod tests {
             !rendered.contains("aise-skill-capability"),
             "internal placeholder leaked into help:\n{rendered}"
         );
+    }
+
+    /// The runner prefixes every failure with `error: `; clap's own rendering carries the same
+    /// prefix, and `aise skills corrections -- --help` printed both.
+    #[test]
+    fn a_rejected_capability_argument_carries_one_error_prefix_and_the_usage_line() {
+        let command = SkillsCmd::Inferred(vec![
+            OsString::from("corrections"),
+            OsString::from("--"),
+            OsString::from("--help"),
+        ]);
+        let error = command.into_execution().unwrap_err().to_string();
+        assert!(!error.starts_with("error:"), "{error}");
+        assert!(error.contains("unexpected argument '--help'"), "{error}");
+        assert!(error.contains("Usage: aise skills <SKILL>"), "{error}");
     }
 
     #[test]

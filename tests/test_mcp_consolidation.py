@@ -112,6 +112,7 @@ def test_python_console_install_starts_the_canonical_refresh_child(tmp_path: Pat
                 "cursor",
                 "antigravity",
                 "pi",
+                "prime-agent",
                 "aistudio",
                 "gemini-cli",
             )
@@ -250,6 +251,7 @@ def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> No
         "cursor",
         "antigravity",
         "pi",
+        "prime-agent",
         "aistudio",
         "gemini-cli",
     ]

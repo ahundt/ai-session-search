@@ -60,6 +60,7 @@ def _config(tmp_path: Path, body: str = "") -> Path:
             "cursor",
             "antigravity",
             "pi",
+            "prime-agent",
             "aistudio",
             "gemini-cli",
         )

@@ -70,10 +70,12 @@ pub const TIME_WINDOW_HEADING: &str = "Time window (formats: `aise dates`)";
 // forms (enforced by clap).
 #[derive(Debug, Clone, Default, Args)]
 pub struct DateRange {
-    /// Inclusive lower bound of the query period. Accepts EDTF / ISO / duration / natural
-    /// language. Calendar and relative periods use UTC; exact RFC 3339 timestamps honor `Z` or
-    /// their explicit offset. Examples: `2026-01-15`, `2026-01`, `202X`, `7d`, `yesterday`.
-    /// See `aise dates`. Omit for no lower bound.
+    /// Inclusive lower bound of the query period. Session commands (`list`, `search`, `export`,
+    /// `analyze`) intersect it with each session's known span from created_at through updated_at;
+    /// message, file, and analytics commands compare each event's own timestamp. Accepts EDTF /
+    /// ISO / duration / natural language. Calendar and relative periods use UTC; exact RFC 3339
+    /// timestamps honor `Z` or their explicit offset. Examples: `2026-01-15`, `2026-01`, `202X`,
+    /// `7d`, `yesterday`. See `aise dates`. Omit for no lower bound.
     #[arg(long, help_heading = TIME_WINDOW_HEADING)]
     pub since: Option<String>,
     /// Inclusive upper bound of the query period. Same formats as `--since`; periods resolve to
