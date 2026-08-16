@@ -198,7 +198,9 @@ pub fn find_repo_root(cwd: &str) -> Option<String> {
 
 /// Whitespace-compact `value` and cap it to `max_len` **characters** (not bytes), so
 /// multibyte/emoji content is budgeted by visible length and never split mid-codepoint.
-/// When truncation is needed, 3 chars are reserved for the `...` ellipsis.
+/// The result is at most `max_len` characters for every cap, so a fixed-width column can spend
+/// its whole width here. When truncation is needed, 3 chars are reserved for the `...` ellipsis;
+/// a cap below 3 cannot afford one and keeps that many characters of content instead.
 ///
 /// The input is compacted lazily. A truncated result consumes only the raw-input prefix needed
 /// to observe `max_len + 1` compacted characters; a result that fits must consume the whole input
@@ -266,6 +268,9 @@ pub fn truncate_for_display_with_extent(value: &str, max_len: usize) -> (String,
     truncate_compacted_chars(value.chars(), max_len)
 }
 
+/// The marker a truncated result ends with, when the cap can afford it.
+const TRUNCATION_ELLIPSIS: &str = "...";
+
 fn truncate_compacted_chars(chars: impl Iterator<Item = char>, max_len: usize) -> (String, bool) {
     fn push_char(
         compact: &mut String,
@@ -274,11 +279,12 @@ fn truncate_compacted_chars(chars: impl Iterator<Item = char>, max_len: usize) -
         keep_bytes: &mut usize,
         keep_chars: usize,
         max_len: usize,
+        ellipsis: &str,
     ) -> bool {
         *compact_chars += 1;
         if *compact_chars > max_len {
             compact.truncate(*keep_bytes);
-            compact.push_str("...");
+            compact.push_str(ellipsis);
             return false;
         }
 
@@ -292,7 +298,18 @@ fn truncate_compacted_chars(chars: impl Iterator<Item = char>, max_len: usize) -
     // A small cap should never reserve in proportion to a huge input. The string grows only when
     // the requested character cap itself requires more retained output.
     let mut compact = String::with_capacity(max_len.min(256));
-    let keep_chars = max_len.saturating_sub(3);
+    // The ellipsis spends three characters of the budget, so a cap smaller than that cannot show
+    // one and still keep its promise. Those caps spend the whole budget on content instead: the
+    // result stays within `max_len`, and callers that need to know content was dropped read the
+    // extent flag from [`truncate_for_display_with_extent`] rather than looking for a marker.
+    // Counted in characters, like every other budget here, so the marker stays swappable.
+    let ellipsis_chars = TRUNCATION_ELLIPSIS.chars().count();
+    let ellipsis = if max_len >= ellipsis_chars {
+        TRUNCATION_ELLIPSIS
+    } else {
+        ""
+    };
+    let keep_chars = max_len - ellipsis.chars().count();
     let mut keep_bytes = 0;
     let mut compact_chars = 0;
     let mut saw_non_whitespace = false;
@@ -312,6 +329,7 @@ fn truncate_compacted_chars(chars: impl Iterator<Item = char>, max_len: usize) -
                 &mut keep_bytes,
                 keep_chars,
                 max_len,
+                ellipsis,
             ) {
                 return (compact, true);
             }
@@ -325,6 +343,7 @@ fn truncate_compacted_chars(chars: impl Iterator<Item = char>, max_len: usize) -
             &mut keep_bytes,
             keep_chars,
             max_len,
+            ellipsis,
         ) {
             return (compact, true);
         }
@@ -2124,8 +2143,47 @@ pub(crate) mod tests {
             truncate_for_display("\n alpha\t beta \r\n gamma ", 10),
             "alpha b..."
         );
-        assert_eq!(truncate_for_display("abcdef", 2), "...");
+        // A cap below the ellipsis width spends the whole budget on content, so the result still
+        // fits: returning the 3-character "..." for a 2-character cap would overrun a column
+        // sized from the same number.
+        assert_eq!(truncate_for_display("abcdef", 2), "ab");
+        assert_eq!(truncate_for_display("abcdef", 1), "a");
+        assert_eq!(truncate_for_display("abcdef", 0), "");
+        assert_eq!(truncate_for_display("abcdef", 3), "...");
+        assert_eq!(truncate_for_display("abc", 3), "abc");
         assert_eq!(truncate_for_display("   \n\t", 2), "");
+    }
+
+    /// Every cap holds its promise, for content that needs truncating and content that does not.
+    #[test]
+    fn truncate_for_display_never_returns_more_characters_than_its_cap() {
+        let values = [
+            "",
+            "   \n\t",
+            "a",
+            "abcdef",
+            " alpha\t beta \r\n gamma ",
+            "é 😀\u{2003}雪",
+            "\u{1f600}\u{1f600}\u{1f600}\u{1f600}",
+            "word-without-whitespace",
+        ];
+        for value in values {
+            for max_len in 0..=24 {
+                let (rendered, omitted) = truncate_for_display_with_extent(value, max_len);
+                assert!(
+                    rendered.chars().count() <= max_len,
+                    "value={value:?}, max_len={max_len}, rendered={rendered:?}"
+                );
+                // The extent flag is how a caller learns content was dropped, which is the only
+                // signal left once the cap is too small to show an ellipsis.
+                let compacted = compact_whitespace(value).chars().count();
+                assert_eq!(
+                    omitted,
+                    compacted > max_len,
+                    "value={value:?}, max_len={max_len}, rendered={rendered:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2135,8 +2193,12 @@ pub(crate) mod tests {
             if compact.chars().count() <= max_len {
                 compact
             } else {
-                let keep = max_len.saturating_sub(3);
-                format!("{}...", compact.chars().take(keep).collect::<String>())
+                let ellipsis = if max_len >= 3 { "..." } else { "" };
+                let keep = max_len - ellipsis.len();
+                format!(
+                    "{}{ellipsis}",
+                    compact.chars().take(keep).collect::<String>()
+                )
             }
         }
 
