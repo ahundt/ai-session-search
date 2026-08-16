@@ -29,8 +29,9 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
         |context| {
             type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
             // The query is constant across a statement; cache its streaming matcher once. This
-            // preserves `to_lowercase().contains(...)` expansion semantics without allocating a
-            // lowercased copy of every candidate row.
+            // preserves `fold_caseless(haystack).contains(...)` semantics, expansions included,
+            // without allocating a folded copy of every candidate row. The bound argument is
+            // already folded by the caller, so both sides share one rule.
             let lowercase_query = context.get_or_create_aux(1, |value| -> Result<_, BoxError> {
                 Ok(UnicodeLowerNeedle::from_lowered(value.as_str()?))
             })?;
@@ -140,22 +141,46 @@ mod tests {
     }
 
     #[test]
-    fn unicode_lower_contains_preserves_null_empty_and_unicode_behavior() {
+    fn unicode_lower_contains_preserves_null_behavior() {
         let conn = Connection::open_in_memory().unwrap();
         register(&conn).unwrap();
 
-        let values: (bool, bool, bool, bool) = conn
-            .query_row(
-                "select unicode_lower_contains(null, ''),
-                        unicode_lower_contains('', ''),
-                        unicode_lower_contains('CAFÉ', 'café'),
-                        unicode_lower_contains('Straße', 'strasse')",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+        // A null column is not text and contains nothing, which is what keeps a `tool_name is
+        // null` row out of a tool-name search without a second predicate saying so.
+        let value: bool = conn
+            .query_row("select unicode_lower_contains(null, '')", [], |row| {
+                row.get(0)
+            })
             .unwrap();
+        assert!(!value);
+    }
 
-        assert_eq!(values, (false, true, true, false));
+    /// The scalar SQLite calls answers the shared cases the same way the matcher does.
+    ///
+    /// This is the layer that decides which rows a literal search returns, and it reaches the
+    /// matcher by a different route than ranking or snippets do: the needle arrives as a bound
+    /// argument and is cached per statement. Driving it from the same table is what keeps a
+    /// case added for one layer from passing there while failing here.
+    #[test]
+    fn the_sql_scalar_answers_every_shared_caseless_case() {
+        let conn = Connection::open_in_memory().unwrap();
+        register(&conn).unwrap();
+
+        for case in crate::util::CASELESS_CASES {
+            let folded = crate::util::fold_caseless(case.needle);
+            let value: bool = conn
+                .query_row(
+                    "select unicode_lower_contains(?1, ?2)",
+                    rusqlite::params![case.haystack, folded],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                value, case.contains,
+                "{}: haystack={:?}, needle={:?}",
+                case.why, case.haystack, case.needle
+            );
+        }
     }
 
     #[test]

@@ -236,6 +236,186 @@ pub(crate) fn fold_caseless(value: &str) -> String {
     value.chars().flat_map(fold_caseless_char).collect()
 }
 
+/// One needle-and-haystack case every caseless matcher in search has to agree on.
+///
+/// The layers that answer "does this text contain this query" were written at different times and
+/// checked against different ad-hoc case lists, so they could disagree without any test noticing:
+/// a word-final Greek sigma made the query needle and the haystack walk fold two different ways,
+/// and the case list that named Greek sigma happened to use the one orientation that still held.
+/// A single table, consumed by every layer, means a case added once is answered everywhere.
+#[cfg(test)]
+pub(crate) struct CaselessCase {
+    pub(crate) haystack: &'static str,
+    pub(crate) needle: &'static str,
+    pub(crate) contains: bool,
+    pub(crate) why: &'static str,
+}
+
+/// The shared cases. Each letter that has more than one spelling appears in both directions,
+/// because a rule that folds one side only is exactly what these exist to catch.
+#[cfg(test)]
+pub(crate) const CASELESS_CASES: &[CaselessCase] = &[
+    CaselessCase {
+        haystack: "prefix",
+        needle: "",
+        contains: true,
+        why: "an empty needle is contained by anything",
+    },
+    CaselessCase {
+        haystack: "",
+        needle: "",
+        contains: true,
+        why: "including by empty text",
+    },
+    CaselessCase {
+        haystack: "",
+        needle: "a",
+        contains: false,
+        why: "empty text contains no letter",
+    },
+    CaselessCase {
+        haystack: "short",
+        needle: "longer",
+        contains: false,
+        why: "a needle longer than the text",
+    },
+    CaselessCase {
+        haystack: "abc",
+        needle: "abc",
+        contains: true,
+        why: "the whole text",
+    },
+    CaselessCase {
+        haystack: "abcd",
+        needle: "abc",
+        contains: true,
+        why: "at the start",
+    },
+    CaselessCase {
+        haystack: "zabc",
+        needle: "abc",
+        contains: true,
+        why: "at the end",
+    },
+    CaselessCase {
+        haystack: "MiXeD case",
+        needle: "mixed",
+        contains: true,
+        why: "ASCII case",
+    },
+    CaselessCase {
+        haystack: "mixed case",
+        needle: "MIXED",
+        contains: true,
+        why: "ASCII case, reversed",
+    },
+    CaselessCase {
+        haystack: "The CAFÉ is open",
+        needle: "café",
+        contains: true,
+        why: "accented text",
+    },
+    CaselessCase {
+        haystack: "the café is open",
+        needle: "CAFÉ",
+        contains: true,
+        why: "accented text, reversed",
+    },
+    CaselessCase {
+        haystack: "МОСКВА",
+        needle: "москва",
+        contains: true,
+        why: "Cyrillic",
+    },
+    CaselessCase {
+        haystack: "москва",
+        needle: "МОСКВА",
+        contains: true,
+        why: "Cyrillic, reversed",
+    },
+    CaselessCase {
+        haystack: "ΟΔΟΣΣ",
+        needle: "ΟΔΟΣΣ",
+        contains: true,
+        why: "a Greek word ending in sigma matches itself",
+    },
+    CaselessCase {
+        haystack: "ΟΔΟΣΣ",
+        needle: "οδοσς",
+        contains: true,
+        why: "uppercase text, word-final sigma in the needle",
+    },
+    CaselessCase {
+        haystack: "οδοσς",
+        needle: "ΟΔΟΣΣ",
+        contains: true,
+        why: "word-final sigma in the text",
+    },
+    CaselessCase {
+        haystack: "οδοσς",
+        needle: "οδοσσ",
+        contains: true,
+        why: "the two lowercase spellings of sigma",
+    },
+    CaselessCase {
+        haystack: "ΟΔΟΣΣΑ",
+        needle: "ΟΔΟΣΣ",
+        contains: true,
+        why: "word-final in the needle, medial in the text",
+    },
+    CaselessCase {
+        haystack: "ΣΊΣΥΦΟΣ",
+        needle: "σίσυφος",
+        contains: true,
+        why: "sigma at both ends of a word",
+    },
+    CaselessCase {
+        haystack: "σίσυφος",
+        needle: "ΣΊΣΥΦΟΣ",
+        contains: true,
+        why: "sigma at both ends, reversed",
+    },
+    CaselessCase {
+        haystack: "οδοσς",
+        needle: "οδοτ",
+        contains: false,
+        why: "a Greek word that is not there",
+    },
+    CaselessCase {
+        haystack: "İstanbul",
+        needle: "i\u{307}st",
+        contains: true,
+        why: "İ folds into two scalars",
+    },
+    CaselessCase {
+        haystack: "İstanbul",
+        needle: "unrelated",
+        contains: false,
+        why: "an expansion does not match anything",
+    },
+    // Sharp s stays distinct from `ss`. That is the contract, not an oversight: the FTS5 trigram
+    // index that selects candidates does not fold them together either, so a verifier that did
+    // would have to abandon the prefilter and scan the corpus for ordinary German text.
+    CaselessCase {
+        haystack: "Straße and STRASSE",
+        needle: "strasse",
+        contains: true,
+        why: "the spelled-out form matches itself",
+    },
+    CaselessCase {
+        haystack: "Straße only",
+        needle: "strasse",
+        contains: false,
+        why: "sharp s is a distinct letter here",
+    },
+    CaselessCase {
+        haystack: "emoji 😀 suffix",
+        needle: "😀",
+        contains: true,
+        why: "text outside the basic plane",
+    },
+];
+
 /// A reusable Unicode-caseless substring matcher for one already-folded needle.
 ///
 /// [`fold_caseless_char`] can expand one scalar value into several (for example, `İ`), so byte-wise
@@ -1724,7 +1904,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every Greek sigma is the same letter to a caseless search, whichever form is written.
+    /// The matcher answers every shared case, including both spellings of Greek sigma.
     ///
     /// Greek writes lowercase sigma two ways: `ς` at the end of a word and `σ` everywhere else.
     /// [`str::to_lowercase`] reproduces that rule, so `Σ` becomes `ς` or `σ` depending on what
@@ -1736,22 +1916,46 @@ pub(crate) mod tests {
     /// the text. Folding the three forms together, which is what Unicode caseless matching
     /// prescribes, is what makes the comparison hold in every direction.
     #[test]
-    fn caseless_matching_treats_every_greek_sigma_as_the_same_letter() {
-        for (haystack, needle, expected) in [
-            ("ΟΔΟΣΣ", "ΟΔΟΣΣ", true),
-            ("ΟΔΟΣΣ", "οδοσς", true),
-            ("οδοσς", "ΟΔΟΣΣ", true),
-            ("οδοσς", "οδοσσ", true),
-            ("ΟΔΟΣΣΑ", "ΟΔΟΣΣ", true),
-            ("ΣΊΣΥΦΟΣ", "σίσυφος", true),
-            ("σίσυφος", "ΣΊΣΥΦΟΣ", true),
-            ("οδοσς", "οδοτ", false),
-        ] {
+    fn the_matcher_answers_every_shared_caseless_case() {
+        for case in CASELESS_CASES {
             assert_eq!(
-                UnicodeLowerNeedle::from_lowered(&fold_caseless(needle)).contains(haystack),
-                expected,
-                "haystack={haystack:?}, needle={needle:?}"
+                UnicodeLowerNeedle::from_lowered(&fold_caseless(case.needle))
+                    .contains(case.haystack),
+                case.contains,
+                "{}: haystack={:?}, needle={:?}",
+                case.why,
+                case.haystack,
+                case.needle
             );
+        }
+    }
+
+    /// `find_in` agrees with `contains` about which cases match, and points inside the text.
+    ///
+    /// The two are separate walks over the same needle, and the range one of them returns is what
+    /// centers a snippet on the match. A case that matches but locates nothing shows the head of
+    /// the field as evidence for a match found elsewhere in it.
+    #[test]
+    fn locating_a_match_agrees_with_finding_one() {
+        for case in CASELESS_CASES {
+            let needle = UnicodeLowerNeedle::from_lowered(&fold_caseless(case.needle));
+            let range = needle.find_in(case.haystack);
+            assert_eq!(
+                range.is_some(),
+                case.contains,
+                "{}: haystack={:?}, needle={:?}",
+                case.why,
+                case.haystack,
+                case.needle
+            );
+            if let Some(range) = range {
+                assert!(
+                    case.haystack.get(range.clone()).is_some(),
+                    "{}: range {range:?} splits a character of {:?}",
+                    case.why,
+                    case.haystack
+                );
+            }
         }
     }
 
