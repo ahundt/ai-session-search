@@ -2997,9 +2997,12 @@ impl Db {
         // The dispatcher sends only fuzzy derived-field searches here. Literal and regex have one
         // owner in prepare_non_fuzzy_message_query(), including tool-argument trigram planning.
         debug_assert_eq!(filters.match_mode, MessageSearchMode::Fuzzy);
-        if field == SearchField::ToolArgument {
-            sql.push_str(" and m.kind = 'tool_call'");
-        }
+        // One predicate owns both the scan and the bound measured against it. Writing the
+        // restriction here and passing a different one to `fuzzy_ranking_window` sized the
+        // retention window and the receipt's `corpus` by rows this statement never visits.
+        let base_predicate = fuzzy_derived_scan_predicate(field);
+        sql.push_str(" and ");
+        sql.push_str(base_predicate);
         sql.push_str(if order == MessageOrder::NewestFirst {
             " order by m.session_id, m.seq desc"
         } else {
@@ -3012,7 +3015,7 @@ impl Db {
             AtomKind::Fuzzy,
         );
         let query_lower = query.to_lowercase();
-        let ranked_limit = match self.fuzzy_ranking_window("1 = 1", filters)? {
+        let ranked_limit = match self.fuzzy_ranking_window(base_predicate, filters)? {
             FuzzyRankingWindow::Rank { limit, .. } => limit,
             FuzzyRankingWindow::PastCorpus { corpus } => {
                 return Ok((
@@ -6013,6 +6016,20 @@ fn empty_past_corpus(corpus: i64) -> SearchExplain {
     }
 }
 
+/// The rows a fuzzy derived-field scan visits, as an SQL fragment over alias `m`.
+///
+/// One owner for the restriction keeps the statement and the bound measured against it in step:
+/// [`Db::fuzzy_ranking_window`] takes the same fragment so the corpus it counts is the corpus the
+/// scan reads. Tool-argument search restricts itself to tool calls, while the tool-name fallback
+/// (schema versions below 4, which have no tool-name vocabulary to search) visits every admitted
+/// row and lets scoring skip the ones carrying no tool name.
+const fn fuzzy_derived_scan_predicate(field: SearchField) -> &'static str {
+    match field {
+        SearchField::ToolArgument => "m.kind = 'tool_call'",
+        SearchField::ToolName | SearchField::Content => "1 = 1",
+    }
+}
+
 /// The outcome of sizing a fuzzy page's ranking window against the eligible corpus.
 ///
 /// See [`Db::fuzzy_ranking_window`], which explains why the window is bounded at all.
@@ -8973,6 +8990,66 @@ mod tests {
                 "{field:?}: every row scored"
             );
         }
+    }
+
+    /// A tool-argument window is bounded by the tool-call rows, not by every message.
+    ///
+    /// [`Db::fuzzy_ranking_window`] takes the base predicate so that "each caller measures the rows
+    /// it actually scans". The tool-argument scan restricts itself to `kind = 'tool_call'` but
+    /// passed `1 = 1` to the window, so a corpus of ordinary conversation rows sized the retention
+    /// bound and the receipt. A caller reading `corpus` then divides by a denominator the searched
+    /// field never had, and an offset already past every tool argument still looked like it landed
+    /// inside the corpus.
+    #[test]
+    fn a_tool_argument_window_counts_only_tool_call_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test');
+                 insert into messages (session_id, provider, seq, role, kind, tool_name, content)
+                 values ('s1','claude',0,'tool','tool_call','exec_command','{\"args\":{\"cmd\":\"needle\"}}');
+                 insert into messages (session_id, provider, seq, role, kind, content)
+                 values ('s1','claude',1,'user','message','needle in ordinary prose'),
+                        ('s1','claude',2,'assistant','message','needle again'),
+                        ('s1','claude',3,'user','message','needle once more');",
+            )
+            .unwrap();
+
+        let filters = |offset: usize| MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some("/cmd".to_string()),
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: 1,
+            offset,
+            ..Default::default()
+        };
+
+        // One tool call carries an argument; the three ordinary rows are not tool arguments at all.
+        let (hits, explain) = db
+            .search_messages_with_explain("needle", &filters(0), true)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "only the tool call has an argument");
+        assert_eq!(
+            explain.expect("receipt").corpus,
+            1,
+            "corpus is the rows the searched field admits"
+        );
+
+        // An offset past the only tool argument is answered from the count, with nothing scored.
+        let (hits, explain) = db
+            .search_messages_with_explain("needle", &filters(1_000_000_000), true)
+            .unwrap();
+        assert!(hits.is_empty());
+        let explain = explain.expect("an explained request returns a receipt");
+        assert_eq!(explain.corpus, 1, "ordinary rows are not tool arguments");
+        assert_eq!(
+            explain.candidates, None,
+            "no row scored, so no candidate count was measured"
+        );
     }
 
     /// An empty result describes itself the same way whatever page size asked for it.
