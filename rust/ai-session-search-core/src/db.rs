@@ -3334,7 +3334,12 @@ impl Db {
         }
         let corpus = self.corpus_count_with_base(base_predicate, filters)?;
         let corpus_rows = usize::try_from(corpus).unwrap_or(usize::MAX);
-        if filters.offset >= corpus_rows {
+        // A zero offset never skips anything, so it never lands past the last eligible row. The
+        // comparison alone would say otherwise for an empty corpus, where `0 >= 0` holds, and the
+        // receipt would blame an offset that is zero and drop `candidates` — a filter matching no
+        // rows would then describe itself one way under a small limit and another under a large
+        // one. An empty corpus scores nothing on the ordinary path anyway.
+        if filters.offset > 0 && filters.offset >= corpus_rows {
             return Ok(FuzzyRankingWindow::PastCorpus { corpus });
         }
         Ok(FuzzyRankingWindow::Rank {
@@ -8962,6 +8967,48 @@ mod tests {
                 "{field:?}: every row scored"
             );
         }
+    }
+
+    /// An empty result describes itself the same way whatever page size asked for it.
+    ///
+    /// The past-corpus check compared `offset >= corpus`, and `0 >= 0` holds, so a filter matching
+    /// no rows took the past-corpus path whenever `offset + limit` exceeded one scoring batch. Two
+    /// requests differing only in `limit` then returned different receipt shapes for the same empty
+    /// result, and the larger one blamed an offset that is zero and dropped `candidates` — the
+    /// count readers divide by `corpus` to get selectivity.
+    #[test]
+    fn an_empty_corpus_reports_the_same_receipt_whatever_the_page_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+
+        let receipt = |limit: usize| {
+            let (hits, explain) = db
+                .search_messages_with_explain(
+                    "anything",
+                    &MessageFilters {
+                        match_mode: MessageSearchMode::Fuzzy,
+                        limit,
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .unwrap();
+            assert!(hits.is_empty(), "limit {limit}");
+            explain.expect("an explained request returns a receipt")
+        };
+
+        // One page size stays under the scoring batch and the other exceeds it, which is what
+        // decides whether the corpus is counted up front at all.
+        let small = receipt(100);
+        let large = receipt(FUZZY_SCORE_BATCH_SIZE + 1);
+        assert_eq!(small.corpus, 0);
+        assert_eq!(large.corpus, 0);
+        assert_eq!(small.candidates, Some(0));
+        assert_eq!(
+            large.candidates, small.candidates,
+            "an empty corpus scored nothing either way; the count is 0, not absent"
+        );
+        assert_eq!(large.prefilter_skipped, small.prefilter_skipped);
     }
 
     #[test]
