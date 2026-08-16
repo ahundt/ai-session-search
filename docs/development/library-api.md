@@ -22,9 +22,16 @@ import ai_session_search as aise
 search = aise.SessionSearch()
 search.refresh()
 
+# Session and file queries share QueryScope; message search takes MessageScope, whose
+# workspace and provider fields are plural and message-specific.
 scope = aise.QueryScope(
     provider="codex",
     path_prefix="/path/to/project",
+    dates=aise.DateRange(when="7d"),
+)
+message_scope = aise.MessageScope(
+    providers=["codex"],
+    workspace_path_prefix="/path/to/project",
     dates=aise.DateRange(when="7d"),
 )
 
@@ -38,7 +45,7 @@ sessions = search.list_sessions(
 messages = search.search_messages(
     "authentication",
     aise.MessageSearchRequest(
-        scope=scope,
+        scope=message_scope,
         role="user",
         include_compaction=False,
         limit=50,
@@ -96,15 +103,11 @@ use ai_session_search::service::SessionSearch;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = SessionSearch::load()?;
+    // Every field but the limit keeps its default, including session_kinds, which returns both
+    // user-started sessions and the subagent runs they spawned.
     let sessions = app.catalog().list_sessions(&SearchFilters {
-        provider: None,
-        path_prefix: None,
-        exclude_path_prefixes: Vec::new(),
-        exclude_session_ids: Vec::new(),
-        since: None,
-        until: None,
         limit: 20,
-        warnings_only: false,
+        ..SearchFilters::default()
     })?;
     let status = app.index().status()?;
     println!("{} sessions; {} repairs", sessions.len(), status.repair_commands.len());
@@ -138,9 +141,9 @@ ordinary requirement, so `version = "1"` matches no published candidate until
 ### Stable result shapes
 
 Public result types are part of the contract and keep their shape across both
-libraries. `CompactOutcome`, returned by the compaction service, reports exact
-byte counts alongside binary `MiB` units, so a caller reading either field does
-not have to infer the other.
+libraries. `CompactOutcome`, returned by the compaction service, reports
+`before_bytes`, `after_bytes`, and `reclaimed_bytes` as exact byte counts (Rust exposes
+`reclaimed_bytes()` as a method); any human-readable unit is the caller's rendering.
 
 ## Shared semantics
 

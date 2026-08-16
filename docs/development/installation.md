@@ -133,8 +133,8 @@ point to the canonical package from `~/.claude/skills/` (Claude Code CLI/Desktop
 App/IDE), `~/.gemini/antigravity-cli/skills/` (Antigravity CLI),
 `~/.pi/agent/skills/` (Pi), and `~/.prime/agent/skills/` (Prime Agent). Pi and Prime also read
 `~/.agents/skills/`, but their native links make explicit installs and lifecycle status independent
-of Codex detection. Both accept repeatable `--skill PATH`; that explicit flag remains active with
-`--no-skills`, which only disables discovery. Selecting several
+of Codex detection. Pi's and Prime's own CLIs accept a repeatable `--skill PATH`, and their
+`--no-skills` only disables discovery, so an explicit path stays active. Selecting several
 harnesses keeps every selected discovery directory; shared destinations are deduplicated. Use
 repeatable `--skill-root DIR` for one or more exact additional package destinations. Each custom
 directory must end in `ai-session-search`; it names a package directory, not a file inside one.
@@ -216,7 +216,8 @@ Neither MCP nor package-manager uninstall deletes the index, configuration, or
 source session files.
 
 Integration lifecycle operations are `aise integrations install`, `status`,
-`uninstall`, and `recover`. The `aise mcp` namespace contains only `serve`.
+`uninstall`, and `recover`. The `aise mcp` namespace has one user-facing command, `serve`
+(`aise mcp schema-budget` is a hidden maintainer measurement).
 `aise integrations install` does not bypass package
 ownership: the running CLI must already be provided by uv, Cargo, pip, or a
 verified native archive. It verifies that `aise` is on `PATH`, then installs or

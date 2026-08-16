@@ -360,7 +360,7 @@ tradeoff is worth it.
 | `aise messages search\|get\|timeline\|evidence` | Query normalized turns and tool evidence |
 | `aise files search\|history\|cross-ref\|extract` | Locate and reconstruct edited files |
 | `aise skills corrections`, `aise planning`, `aise stats` | Deterministic message classification and indexed behavioral summaries |
-| `aise skills list\|show\|validate\|create\|update\|restore` | Inspect, author, and repair skill packages |
+| `aise skills list\|show\|validate\|create\|update\|restore\|run` | Inspect, author, repair, and run skill packages |
 | `aise vocab`, `aise repeats` | Count how often a term appears and in how many messages (`--prefix` looks one up), or find recurring phrases |
 | `aise export` | Render one session, or publish an explicitly selected bundle |
 | `aise analyze` | Apply a validated policy and publish an immutable analysis bundle |

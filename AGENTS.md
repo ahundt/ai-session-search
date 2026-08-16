@@ -8,7 +8,8 @@ the binding surface and the tests that must exercise it.
 
 ## Setup
 
-Rust 1.88 or newer, CPython 3.12 or newer with the standard GIL, and uv.
+Rust 1.88 or newer, CPython 3.12 through 3.14 with the standard GIL (3.12 is the floor;
+3.12–3.14 are what CI tests), and uv.
 
 ```bash
 uv sync --locked --all-extras

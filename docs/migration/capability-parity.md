@@ -86,7 +86,7 @@ retained as a fallback after its replacement gate passes.
 | `export_sessions_markdown`, legacy `export recent` | `CatalogService::list_sessions` followed by `ExportService::render_full` on the same `SessionSearch` | Prefer composition. Add `render_many` only if profiling proves repeated setup or snapshot drift; destination naming/atomic publication belongs outside rendering |
 | `get_clipboard_content` | `MessageService::search` with tool-call kind, tool name, and RFC 6901 argument pointer | Postponed shell interpretation. Do not hardcode `pbcopy`, heredocs, or any uncommon tool in core |
 | `AISession` facade, legacy models/filters/formatters/protocols | `SessionSearch` plus immutable PyO3 request objects and typed results | Deleted at the major boundary after native import/API and installed-wheel gates passed; no weakening aliases remain |
-| source/config CRUD Typer commands | `Config`, `SourceService::inventory`, `migrate config`, `config init/show/path` | Default discovery needs no CRUD. Add a typed Rust config mutation transaction only if a task test shows manual TOML editing is inadequate; never revive JSON and Python discovery caches |
+| source/config CRUD Typer commands | `Config`, `SourceService::inventory`, `migrate config`, `config init/show/file/paths` | Default discovery needs no CRUD. Add a typed Rust config mutation transaction only if a task test shows manual TOML editing is inadequate; never revive JSON and Python discovery caches |
 | analysis document scan, instruction history, vocabulary | `AnalysisService::documents`, `MessageService::search`, Rust vocabulary primitives | Python scan/orchestration deleted after useful outcomes moved to Rust and the same request/result types were bound to Python |
 | graph/taxonomy/organization | `AnalysisService::run` + `AnalysisPublicationPlan` + `AnalysisPolicySpec` | Python orchestration and symlink mutation are deleted. Rust owns canonical IDs, explicit/ambiguous relationships, bounded vocabulary, score-ranked dashboards, and immutable bundles; all-pairs similarity was not ported |
 
@@ -105,8 +105,8 @@ After, Python composes immutable requests over the Rust-owned index and lifecycl
 ```python
 from ai_session_search import (
     DateRange,
-    MessageQuery,
-    QueryScope,
+    MessageScope,
+    MessageSearchRequest,
     SessionQuery,
     SessionSearch,
 )
@@ -114,8 +114,8 @@ from ai_session_search import (
 search = SessionSearch()
 hits = search.search_messages(
     "timeout",
-    MessageQuery(
-        scope=QueryScope(dates=DateRange(since="7d")),
+    MessageSearchRequest(
+        scope=MessageScope(dates=DateRange(since="7d")),
         role="user",
     ),
 )
@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // returns both user-started sessions and the subagent runs they spawned.
         ..SearchFilters::default()
     })?;
-    let messages = app.messages().search("timeout", &MessageFilters::default())?;
+    let messages = app.messages().search_legacy("timeout", &MessageFilters::default())?;
     let status = app.index().status()?;
     println!("{} {} {}", sessions.len(), messages.len(), status.repair_commands.len());
     Ok(())

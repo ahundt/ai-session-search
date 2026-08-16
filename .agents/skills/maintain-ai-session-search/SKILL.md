@@ -161,7 +161,9 @@ identity and does not determine priority.
    Decide which problems the owning service solves automatically, which choices must stay explicit,
    who owns cleanup, what every boundary returns, and the exact recovery guidance for conditions
    that genuinely require user or maintainer action.
-3. **Design (`REQ001-preserve-user-data` through `REQ025-justify-timeouts`).** Start at the shared
+3. **Design (the P0 data and contract items, `REQ001-preserve-user-data` through
+   `REQ012-reject-invalid-combinations`, and every P1 item, `REQ013-resolve-parameters-by-origin`
+   through `REQ025-justify-timeouts`).** Start at the shared
    typed service and preserve deliberate surface differences, provider normalization, platform
    paths, ownership states, and parameter precedence. Prefer one strong composable mechanism;
    record serious alternatives and why the selected design is easier to use correctly and harder

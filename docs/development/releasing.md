@@ -81,7 +81,8 @@ Python matrix separately imports and tests CPython 3.12 through 3.14 on Linux, m
 with Linux ARM64 and macOS x86_64 additions. Release workflows remain responsible for installing
 and smoke-testing each exact wheel and native archive on its target runner.
 
-The Linux ARM64 runner is currently a GitHub public-preview runner. Treat loss
+The Linux ARM64 runner label used here (`ubuntu-24.04-arm`) was a GitHub public-preview
+runner when adopted. Treat loss
 of that hosted label as an infrastructure failure, not evidence that ARM64 may
 be silently dropped. The current labels and architectures are defined in the
 [GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
@@ -318,6 +319,6 @@ Before every release:
    subprocesses; verify scoped resources and temporary files are cleaned up.
 5. Record measured latency and memory regressions against the prior release.
 
-Source links in this document were reviewed on 2026-07-13. Re-check them when
+Source links in this document were last reviewed on 2026-07-13. Re-check them when
 tool versions or hosted runner labels change; do not treat a copied workflow as
 permanent evidence of current best practice.

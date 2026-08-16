@@ -306,8 +306,9 @@ shipped budget in force while appearing to change it.
 
 The budget matters because the schema is not fixed. Several generated descriptions interpolate
 resolved configuration values, so an operator's own settings change the size of the schema this
-server emits: `search_messages` measures 4,631 bytes as Codex counts it by default, a 369-byte
-margin under Codex's 5,000, and a first configured `[search.purposes.<name>]` bundle spends
+server emits: `search_messages` measures 4,741 bytes as Codex counts it by default (the figure
+pinned in `EMITTED_ARTIFACT_CEILINGS`), a 259-byte margin under Codex's 5,000, and a first
+configured `[search.purposes.<name>]` bundle spends
 about 100 of those bytes with each further bundle spending about 45. Past that limit Codex
 deletes every parameter
 description and emits no marker, so the server measures its own catalogue when it builds it and

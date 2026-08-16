@@ -29,8 +29,13 @@ composable simplifications.
 
 ## Non-negotiable invariants
 
+Recorded as they applied during the migration. The branch and no-push rules ended when the
+first release candidate was tagged and published from `main` through `publish.yml`; publishing
+remains a maintainer action through the protected environments named in `RELEASING.md`.
+
 - Work locally on `feat/ai-session-search-rust-migration`; no public remote or push
-  without a new explicit one-time authorization.
+  without a new explicit one-time authorization. (Historical; superseded by the published
+  release process.)
 - Search for semantic duplication before each extraction or port.
 - Use TDD for behavior, failure, lifecycle, and migration changes.
 - Preserve session data and rollback capability; derived indexes may be rebuilt but
@@ -85,13 +90,14 @@ composable simplifications.
   registry/Git/path, sdist fallback, platform wheels, native archives, and installers.
 - [x] Generate Apache-2.0 metadata, provenance, relevant NOTICE content, third-party
   license inventory, SBOM, checksums, and artifact-content tests.
-- [ ] **Postponed until an explicitly authorized public release:** Sign and attest release artifacts;
-  local work must not manufacture or publish release identity.
+- [x] Sign and attest release artifacts: done by `publish.yml` for the first published tag
+  (GitHub build-provenance attestations, PyPI attestations); local work never manufactures
+  release identity.
 - [x] Build immutable local release candidates once, install-test the exact ARM64 macOS
   artifacts, migrate the local installation with rollback ready, and retire duplicate
   local runtime paths only after acceptance.
-- [ ] **Postponed while public/GitHub-facing actions are prohibited:** Execute the immutable artifact matrix on hosted Linux, macOS x86_64, and Windows
-  runners during an explicitly authorized release operation.
+- [x] Execute the immutable artifact matrix on hosted Linux, macOS x86_64, and Windows
+  runners: done by the tag-triggered `publish.yml` for the first published tag.
 - [x] As the final CLI/MCP architectural step, move stdio serving to `aise mcp serve`,
   update every installer/config contract, rerun startup/shutdown/parity/install gates,
   and remove the temporary second executable after those gates pass.
@@ -290,11 +296,11 @@ composable simplifications.
   targets. Installed SHA-256 is
   `826b778086dec09fe08990e56059dfc97b5e878a86570406628adbccf490f11c` with rollback
   `~/.local/bin/aise.rollback.20260714203637`. No push or publication occurred.
-- [ ] **Release-gated (requires fresh explicit user authorization; no push, no publication):**
-  signing/attestation, hosted Linux/macOS-x86_64/Windows runner matrix (includes the
-  non-UTF-8-path portability case and hosted exact-MSRV job), crates.io/PyPI/GitHub
-  publication, exhaustive external-writer/crash injection for DB migration, and any demo
-  media publication (never commit media).
+- [x] Release-gated items completed with the first published tag through `publish.yml`:
+  signing/attestation, the hosted Linux/macOS-x86_64/Windows runner matrix (including the
+  non-UTF-8-path portability case and the exact-MSRV job), and crates.io/PyPI/GitHub
+  publication. Still open: exhaustive external-writer/crash injection for DB migration.
+  Demo media is attached through the GitHub release UI and never committed.
 
 ## Verified implementation checkpoints
 
