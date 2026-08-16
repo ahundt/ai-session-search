@@ -2667,8 +2667,6 @@ impl Db {
         include_explain: bool,
         order: MessageOrder,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
-        use rusqlite::types::Value;
-
         self.validate_access_scope()?;
         filters.validate(query)?;
         let field = filters.field.unwrap_or(SearchField::Content);
@@ -2679,6 +2677,38 @@ impl Db {
             let explain = prepared.explain.clone();
             return Ok((hits, explain));
         }
+        // Every statement of one fuzzy search reads one snapshot, whichever surface asked for it.
+        //
+        // A fuzzy search runs several: the ranking window's corpus count, the tool-name
+        // vocabulary, the row scan, and the receipt's own counts. Each on its own would see
+        // whatever the indexer had committed by the time it ran, so a refresh landing mid-search
+        // could have the receipt describe a corpus the returned rows never came from, or leave a
+        // row counted but never scored. `MessageService` already opens a snapshot around its own
+        // path and `with_read_snapshot` then runs inline, so this is the guarantee for callers
+        // holding `Db` directly — the Rust library API, and the tools and tests that use it.
+        //
+        // Only the fuzzy branch is wrapped. The non-fuzzy prefilter can build the legacy custom
+        // trigram base ([`Db::ensure_trigram_base`]), which takes a write transaction and cannot
+        // nest inside a read snapshot; fuzzy scoring performs no index maintenance.
+        self.with_read_snapshot(|| {
+            self.fuzzy_search_in_snapshot(query, filters, field, include_explain, order)
+        })
+    }
+
+    fn fuzzy_search_in_snapshot(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        field: SearchField,
+        include_explain: bool,
+        order: MessageOrder,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        use rusqlite::types::Value;
+
+        debug_assert!(
+            !self.conn.is_autocommit(),
+            "every statement of one fuzzy search must share one read snapshot"
+        );
         if field != SearchField::Content {
             return self.search_derived_message_field(
                 query,
@@ -2954,12 +2984,9 @@ impl Db {
             && filters.match_mode == MessageSearchMode::Fuzzy
             && self.schema_version()? >= 4
         {
-            // Vocabulary, per-tier rows, and the explain counts are separate statements; one
-            // read snapshot keeps them on the same data whichever surface called (MessageService
-            // already holds one, and `with_read_snapshot` then runs inline).
-            return self.with_read_snapshot(|| {
-                self.search_tool_name_fuzzy_indexed(query, filters, include_explain)
-            });
+            // Vocabulary, per-tier rows, and the explain counts are separate statements; the
+            // snapshot `search_messages_with_explain_order` opens keeps them on the same data.
+            return self.search_tool_name_fuzzy_indexed(query, filters, include_explain);
         }
         let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
