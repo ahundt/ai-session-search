@@ -38,7 +38,8 @@ use crate::util::{snippet_from_match, UnicodeLowerNeedle};
 /// re-parsed; an upgrading user then reindexes once.
 ///
 ///   1: message-level index — the first versioned schema, layered over the upstream session-only
-///      schema (`sessions` + `transcripts` + `sessions_fts`). It adds the per-message `messages`
+///      schema (`sessions` + `transcripts` + a `sessions_fts` table dropped on open since 1.0.0rc2,
+///      unread since session search began scoring the complete corpus). It adds the per-message `messages`
 ///      table (normalized role / `tool_name` / ts / compaction across all providers) with its
 ///      `messages_fts` word index and the custom, parallel-built [`crate::trigram_index`]
 ///      substring/regex prefilter (`trigram_postings` / `trigram_meta`), plus the `file_edits`
@@ -1134,23 +1135,14 @@ impl Db {
                  select raise(abort, 'message correlation authority, scope, and id must be all null or all non-null');
              end;",
         )?;
-        // Migrate: drop old contentless FTS table if present, then create regular FTS table
-        let fts_sql: Option<String> = self
-            .conn
-            .query_row(
-                "select sql from sqlite_master where type='table' and name='sessions_fts'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if fts_sql.as_ref().is_some_and(|sql| sql.contains("content=")) {
-            self.conn.execute_batch("drop table sessions_fts")?;
-        }
-        self.conn.execute_batch(
-            "create virtual table if not exists sessions_fts using fts5(
-                title, summary, preview_text, transcript_text
-            )",
-        )?;
+        // `sessions_fts` (an FTS5 copy of every title, summary, preview, and transcript) stopped
+        // being read on 2026-07-22, when session search moved to scoring the complete corpus, and
+        // stayed maintained: on one real index it held 464 MB (a second copy of every transcript
+        // plus its tokens) and every session upsert re-tokenized the whole transcript into it. It
+        // is derived data, so dropping it loses nothing; the pages return to the freelist and
+        // `aise compact` gives them back to the filesystem. A no-op once gone.
+        self.conn
+            .execute_batch("drop table if exists sessions_fts")?;
         // External-content FTS over message bodies. Message search no longer lets FTS tokenization
         // define literal semantics, but this index is still kept current for vocabulary,
         // compatibility, and any future explicit word-search surface. The insert/delete/update
@@ -1255,26 +1247,6 @@ impl Db {
         if message_search_layout_problem.is_some() && crate::indexer::base_data_intact(&self.conn)?
         {
             self.migrate_message_search_schema_exclusive()?;
-        }
-        // Auto-populate FTS if sessions exist but FTS is empty (e.g. after schema upgrade)
-        let sessions_exist: bool =
-            self.conn
-                .query_row("select exists(select 1 from sessions)", [], |row| {
-                    row.get(0)
-                })?;
-        let indexed_sessions_exist: bool =
-            self.conn
-                .query_row("select exists(select 1 from sessions_fts)", [], |row| {
-                    row.get(0)
-                })?;
-        if sessions_exist && !indexed_sessions_exist {
-            self.conn.execute(
-                "insert into sessions_fts (rowid, title, summary, preview_text, transcript_text)
-                 select s.rowid, s.title, s.summary, s.preview_text, coalesce(t.transcript_text, '')
-                 from sessions s
-                 left join transcripts t on t.session_id = s.id",
-                [],
-            )?;
         }
         // Evolve an existing `files_seen` (a rebuildable cache) to carry the tail-parse
         // checkpoint columns. `create table if not exists` won't add columns to a table that
@@ -1512,8 +1484,8 @@ impl Db {
     /// — measured to roughly DOUBLE its on-disk size (≈1.0 GB → ≈2.0 GB on a 637k-message corpus)
     /// and to slow queries. `'optimize'` merges them, freeing the redundant pages (reused by later
     /// writes, or returned to the OS by a one-time `VACUUM`). Call ONLY after a full reindex: it
-    /// rewrites the whole index, so it must never run on the per-command incremental path. Cheap for
-    /// the tiny `sessions_fts`; the cost is in `messages_fts`, amortized over a rare full rebuild.
+    /// rewrites the whole index, so it must never run on the per-command incremental path. The cost
+    /// is in `messages_fts`, amortized over a rare full rebuild.
     pub fn optimize_fts(&self) -> Result<()> {
         self.conn
             .execute_batch("insert into messages_fts(messages_fts) values('optimize');")?;
@@ -1522,8 +1494,6 @@ impl Db {
                 "insert into messages_trigram(messages_trigram) values('optimize');",
             )?;
         }
-        self.conn
-            .execute_batch("insert into sessions_fts(sessions_fts) values('optimize');")?;
         Ok(())
     }
 
@@ -1646,7 +1616,6 @@ impl Db {
         self.with_immediate_transaction(|| {
             self.conn.execute_batch(
                 "
-                delete from sessions_fts;
                 delete from transcripts;
                 delete from messages;
                 delete from file_edits;
@@ -1818,23 +1787,10 @@ impl Db {
         // mutable sidecar metadata can change the provider session ID; remove prior identities
         // for this provider/source in the same transaction before publishing the replacement.
         // Preserve unrelated providers even if they happen to name the same filesystem path.
-        tx.execute(
-            "delete from sessions_fts where rowid in (
-                 select rowid from sessions
-                 where provider = ?1 and source_path = ?2 and id != ?3
-             )",
-            params![session.provider.as_str(), session.source_path, session.id],
-        )?;
         for alias in source_aliases
             .iter()
             .filter(|alias| alias.as_str() != session.source_path)
         {
-            tx.execute(
-                "delete from sessions_fts where rowid in (
-                     select rowid from sessions where provider = ?1 and source_path = ?2
-                 )",
-                params![session.provider.as_str(), alias],
-            )?;
             tx.execute(
                 "delete from sessions where provider = ?1 and source_path = ?2",
                 params![session.provider.as_str(), alias],
@@ -1909,21 +1865,6 @@ impl Db {
             on conflict(session_id) do update set transcript_text = excluded.transcript_text
             ",
             params![session.id, parsed.transcript_text],
-        )?;
-        // Update FTS index: delete old entry then insert new one
-        tx.execute(
-            "insert or replace into sessions_fts (rowid, title, summary, preview_text, transcript_text)
-             values (
-                 (select rowid from sessions where id = ?1),
-                 ?2, ?3, ?4, ?5
-             )",
-            params![
-                session.id,
-                session.title,
-                session.summary,
-                session.preview_text,
-                parsed.transcript_text,
-            ],
         )?;
         tx.execute(
             "
@@ -2162,14 +2103,6 @@ impl Db {
                 params![session.id, tail.new_transcript],
             )?;
         }
-        tx.execute(
-            "insert or replace into sessions_fts (rowid, title, summary, preview_text, transcript_text)
-             select s.rowid, s.title, s.summary, s.preview_text, coalesce(t.transcript_text, '')
-             from sessions s left join transcripts t on t.session_id = s.id
-             where s.id = ?1",
-            params![session.id],
-        )?;
-
         // Persist the checkpoint + refresh files_seen mtime/size in the same transaction.
         tx.execute(
             "update files_seen set
@@ -8947,19 +8880,6 @@ mod tests {
                     params![id, format!("/{id}.jsonl")],
                 )
                 .unwrap();
-            let rowid: i64 = db
-                .conn
-                .query_row("select rowid from sessions where id = ?1", [id], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            db.conn
-                .execute(
-                    "insert into sessions_fts(rowid, title, summary, preview_text, transcript_text) \
-                     values (?1,'','','alpha preview','')",
-                    params![rowid],
-                )
-                .unwrap();
         }
 
         let scoring = crate::config::ScoringConfig::default();
@@ -9059,19 +8979,6 @@ mod tests {
                          source_path, parse_version, discovery_source
                      ) values (?1,'claude',?1,?2,?3,?4,'1','test')",
                     params![id, title, preview, format!("/{id}.jsonl")],
-                )
-                .unwrap();
-            let rowid: i64 = db
-                .conn
-                .query_row("select rowid from sessions where id = ?1", [id], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            db.conn
-                .execute(
-                    "insert into sessions_fts(rowid, title, summary, preview_text, transcript_text)
-                     values (?1,?2,'',?3,'')",
-                    params![rowid, title, preview],
                 )
                 .unwrap();
         }
@@ -9393,64 +9300,41 @@ mod tests {
         assert_eq!(count("original"), 0, "stale term dropped after update");
     }
 
+    /// `sessions_fts` was maintained on every session write and read by nothing since session
+    /// search began scoring the complete corpus (2026-07-22). An index that still carries it (one
+    /// written before 1.0.0rc2) loses it at the next writable open, and no session write path
+    /// touches it afterwards.
     #[test]
-    fn sessions_fts_upsert_replaces_stale_terms() {
-        // Re-indexing a session whose title changed (the normal incremental-reindex
-        // path) must not leave the old title's terms searchable in sessions_fts — a
-        // regular (non-external-content) FTS5 table reached via the `insert or replace`
-        // in upsert_session. If stale terms persisted, FTS search would return false
-        // positives for content the session no longer contains.
+    fn open_drops_the_unread_session_fts_table_and_writes_never_recreate_it() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
-        db.conn
-            .execute(
-                "insert into sessions (id, provider, provider_session_id, preview_text, \
-                 source_path, parse_version, discovery_source) \
-                 values ('s1','claude','s1','','/p','1','test')",
-                [],
+        let path = dir.path().join("index.db");
+        drop(Db::open(&path).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "create virtual table sessions_fts using fts5(title, summary, preview_text, transcript_text);",
             )
             .unwrap();
-        let rowid: i64 = db
-            .conn
-            .query_row("select rowid from sessions where id='s1'", [], |r| r.get(0))
-            .unwrap();
-        // Mirror upsert_session's exact FTS write (db.rs:316-329).
-        let upsert_fts = |title: &str| {
-            db.conn
-                .execute(
-                    "insert or replace into sessions_fts \
-                     (rowid, title, summary, preview_text, transcript_text) \
-                     values (?1, ?2, '', '', '')",
-                    params![rowid, title],
-                )
-                .unwrap();
-        };
-        let count = |term: &str| -> i64 {
+        let db = Db::open(&path).unwrap();
+        let has_table = |db: &Db| -> bool {
             db.conn
                 .query_row(
-                    "select count(*) from sessions_fts where sessions_fts match ?1",
-                    params![term],
-                    |r| r.get(0),
+                    "select exists(select 1 from sqlite_schema where name = 'sessions_fts')",
+                    [],
+                    |row| row.get(0),
                 )
                 .unwrap()
         };
-        upsert_fts("alphaunique");
-        assert_eq!(
-            count("alphaunique"),
-            1,
-            "first index makes the title searchable"
+        assert!(!has_table(&db), "open drops the unread FTS table");
+        assert!(
+            crate::indexer::current_schema_layout_problem(&db.conn)
+                .unwrap()
+                .is_none(),
+            "an index without sessions_fts is a complete current layout"
         );
-        upsert_fts("betaunique");
-        assert_eq!(
-            count("betaunique"),
-            1,
-            "re-index makes the new title searchable"
-        );
-        assert_eq!(
-            count("alphaunique"),
-            0,
-            "re-index must drop the old title's terms (no FTS ghost postings)"
-        );
+        seed_messages(&db, &[("user", "hello")]);
+        db.clear_all().unwrap();
+        assert!(!has_table(&db), "no write path recreates it");
     }
 
     #[test]
