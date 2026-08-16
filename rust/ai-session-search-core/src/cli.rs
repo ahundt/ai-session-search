@@ -784,36 +784,57 @@ where
 
     let normalized = std::iter::once(program)
         .chain(global_tokens)
-        .chain(command_tokens)
+        .chain(command_tokens.iter().cloned())
         .collect::<Vec<_>>();
     Cli::try_parse_from(&normalized)
-        .map_err(|error| clarify_stale_message_argument(error, &normalized))
+        .map_err(|error| clarify_stale_message_argument(error, &command_tokens))
 }
 
 /// Replace Clap's edit-distance guess only for removed message-search arguments whose meaning is
 /// known. The stale names remain rejected: accepting aliases would silently preserve old scope
-/// semantics. Parsing and lookup are O(A) over the argument vector with O(1) extra state.
-fn clarify_stale_message_argument(mut error: clap::Error, args: &[OsString]) -> clap::Error {
+/// semantics. `command_tokens` are the arguments after the hoisted globals, so a leading
+/// `--index-refresh` does not hide the subcommand; the offending flag comes from the error's own
+/// `InvalidArg` context, so `--project=/x` is recognized too, and the usage line is replaced with
+/// the subcommand's real usage rather than the one clap built around its guess. O(A) over the
+/// argument vector with O(1) extra state.
+fn clarify_stale_message_argument(
+    mut error: clap::Error,
+    command_tokens: &[OsString],
+) -> clap::Error {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
 
     if error.kind() != ErrorKind::UnknownArgument
-        || args.get(1).and_then(|value| value.to_str()) != Some("messages")
-        || args.get(2).and_then(|value| value.to_str()) != Some("search")
+        || command_tokens.first().and_then(|value| value.to_str()) != Some("messages")
+        || command_tokens.get(1).and_then(|value| value.to_str()) != Some("search")
     {
         return error;
     }
-    let replacement = if args.iter().any(|value| value == "--project") {
-        Some("--workspace-path")
-    } else if args.iter().any(|value| value == "--type") {
-        Some("--role")
-    } else {
-        None
+    let invalid = match error.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(value)) => value.clone(),
+        _ => return error,
     };
-    if let Some(replacement) = replacement {
-        error.insert(
-            ContextKind::SuggestedArg,
-            ContextValue::String(replacement.to_string()),
-        );
+    let stale = invalid
+        .split_once('=')
+        .map_or(invalid.as_str(), |(name, _)| name);
+    let replacement = match stale {
+        "--project" => "--workspace-path",
+        "--type" => "--role",
+        _ => return error,
+    };
+    error.insert(
+        ContextKind::SuggestedArg,
+        ContextValue::String(replacement.to_string()),
+    );
+    // `build()` propagates the binary-name chain, so the usage reads `aise messages search ...`
+    // rather than the bare `search ...` an unbuilt subcommand renders.
+    let mut root = Cli::command();
+    root.build();
+    if let Some(usage) = root
+        .find_subcommand_mut("messages")
+        .and_then(|messages| messages.find_subcommand_mut("search"))
+        .map(clap::Command::render_usage)
+    {
+        error.insert(ContextKind::Usage, ContextValue::StyledStr(usage));
     }
     error
 }
@@ -3557,6 +3578,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(kind.contains("--role"), "{kind}");
+
+        // The tip keys on the argument clap rejected, so a leading global option, the `=` form,
+        // and the usage line all agree; before this the usage line still read
+        // `aise messages search --role <ROLE> [QUERY]` under a `--workspace-path` tip.
+        for invocation in [
+            vec![
+                "aise",
+                "--index-refresh",
+                "existing-only",
+                "messages",
+                "search",
+                "--project",
+                "/tmp/project",
+                "workflow",
+            ],
+            vec![
+                "aise",
+                "messages",
+                "search",
+                "--project=/tmp/project",
+                "workflow",
+            ],
+        ] {
+            let text = parse_cli_from(invocation.clone()).unwrap_err().to_string();
+            assert!(text.contains("--workspace-path"), "{invocation:?}: {text}");
+            assert!(!text.contains("--role"), "{invocation:?}: {text}");
+        }
+        assert!(
+            !project.contains("--role"),
+            "usage line must not name --role: {project}"
+        );
+        assert!(
+            project.contains("Usage: aise messages search [OPTIONS] [QUERY]"),
+            "the usage line is the subcommand's real usage: {project}"
+        );
     }
 
     #[test]
