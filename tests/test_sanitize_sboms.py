@@ -16,11 +16,26 @@ import pytest
 from scripts.sanitize_sboms import SanitizationError, sanitize_file, sanitize_wheel_sboms
 
 
+def _path_reference(crate: Path, fragment: str) -> str:
+    """Build the reference cargo writes for a path dependency, as cargo writes it.
+
+    `Path.as_uri()` is what makes this portable. Cargo formats a path source as a URL with an
+    empty host, so the checkout arrives as `path+file:///Users/you/checkout/rust/pkg` on POSIX and
+    `path+file:///C:/Users/you/checkout/rust/pkg` on Windows -- verified against
+    `cargo metadata --format-version 1`, whose package ids carry exactly this shape.
+
+    Interpolating a raw path into `path+file://{crate}` produces that shape only where paths begin
+    with a separator. On Windows it produces `path+file://C:\\Users\\...`, whose drive letter
+    parses as the URL host, so the sanitizer rejects the very checkout it was pointed at.
+    """
+    return f"path+{crate.as_uri()}#{fragment}"
+
+
 def test_rewrites_workspace_paths_and_preserves_reference_graph(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     crate = workspace / "rust" / "core"
     crate.mkdir(parents=True)
-    reference = f"path+{crate.as_uri()}#core@1.0.0"
+    reference = _path_reference(crate, "core@1.0.0")
     sbom = workspace / "core.cdx.json"
     sbom.write_text(
         json.dumps(
@@ -53,7 +68,7 @@ def test_rejects_local_dependency_outside_workspace_without_modifying_file(tmp_p
     outside = tmp_path / "outside"
     outside.mkdir()
     sbom = workspace / "core.cdx.json"
-    original = json.dumps({"bom-ref": f"path+{outside.as_uri()}#outside@1.0.0"})
+    original = json.dumps({"bom-ref": _path_reference(outside, "outside@1.0.0")})
     sbom.write_text(original, encoding="utf-8")
 
     with pytest.raises(SanitizationError, match="outside workspace"):
@@ -107,7 +122,7 @@ def test_wheel_sboms_lose_the_build_machine_path_and_record_follows(tmp_path: Pa
         wheel,
         {
             "bomFormat": "CycloneDX",
-            "metadata": {"timestamp": "2026-01-01T00:00:00Z", "component": {"bom-ref": f"path+file://{root}/rust/pkg#1.0"}},
+            "metadata": {"timestamp": "2026-01-01T00:00:00Z", "component": {"bom-ref": _path_reference(root / "rust/pkg", "1.0")}},
             "components": [{"purl": "pkg:cargo/serde@1.0", "bom-ref": "pkg:cargo/serde@1.0"}],
         },
     )
@@ -151,7 +166,7 @@ def test_a_member_the_sanitizer_does_not_rewrite_keeps_all_of_its_zip_metadata(t
     (root / "rust/pkg").mkdir(parents=True)
     wheel = tmp_path / "pkg-1.0-py3-none-any.whl"
     sbom_name = "pkg-1.0.dist-info/sboms/pkg.cyclonedx.json"
-    sbom_bytes = json.dumps({"metadata": {"component": {"bom-ref": f"path+file://{root}/rust/pkg#1.0"}}}).encode()
+    sbom_bytes = json.dumps({"metadata": {"component": {"bom-ref": _path_reference(root / "rust/pkg", "1.0")}}}).encode()
     untouched = zipfile.ZipInfo("pkg/__init__.py", date_time=(2026, 1, 2, 3, 4, 6))
     untouched.compress_type = zipfile.ZIP_DEFLATED
     untouched.external_attr = 0o644 << 16
@@ -196,7 +211,7 @@ def test_every_member_keeps_its_exact_content_through_the_rewrite(tmp_path: Path
         "pkg/text.txt": "café \U0001f600\n".encode(),
     }
     sbom_name = "pkg-1.0.dist-info/sboms/pkg.cyclonedx.json"
-    sbom_bytes = json.dumps({"metadata": {"component": {"bom-ref": f"path+file://{root}/rust/pkg#1.0"}}}).encode()
+    sbom_bytes = json.dumps({"metadata": {"component": {"bom-ref": _path_reference(root / "rust/pkg", "1.0")}}}).encode()
     with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, payload in payloads.items():
             archive.writestr(name, payload)
@@ -215,7 +230,7 @@ def test_a_wheel_sbom_path_outside_the_checkout_is_refused_without_modifying_the
     root = tmp_path / "checkout"
     root.mkdir()
     wheel = tmp_path / "pkg-1.0-py3-none-any.whl"
-    _wheel_with_sbom(wheel, {"metadata": {"component": {"bom-ref": f"path+file://{tmp_path}/elsewhere#1.0"}}})
+    _wheel_with_sbom(wheel, {"metadata": {"component": {"bom-ref": _path_reference(tmp_path / "elsewhere", "1.0")}}})
     original = wheel.read_bytes()
 
     with pytest.raises(SanitizationError, match="outside workspace"):
@@ -230,9 +245,9 @@ def test_command_line_accepts_wheels_beside_loose_sboms(tmp_path: Path) -> None:
     root = tmp_path / "checkout"
     (root / "rust/pkg").mkdir(parents=True)
     wheel = tmp_path / "pkg-1.0-py3-none-any.whl"
-    _wheel_with_sbom(wheel, {"metadata": {"component": {"bom-ref": f"path+file://{root}/rust/pkg#1.0"}}})
+    _wheel_with_sbom(wheel, {"metadata": {"component": {"bom-ref": _path_reference(root / "rust/pkg", "1.0")}}})
     loose = tmp_path / "loose.cdx.json"
-    loose.write_text(json.dumps({"bom-ref": f"path+file://{root}/rust/pkg#1.0"}), encoding="utf-8")
+    loose.write_text(json.dumps({"bom-ref": _path_reference(root / "rust/pkg", "1.0")}), encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, "scripts/sanitize_sboms.py", "--root", str(root), str(wheel), str(loose)],
