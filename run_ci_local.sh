@@ -217,6 +217,39 @@ step() {
     fi
 }
 
+# The version a tool is pinned to in the workflow's `env:` block. Reading it from there keeps this
+# gate from checking one version while CI installs another; a second copy of the number here would
+# be a second thing to update.
+workflow_pin() {
+    sed -n "s/^  $1: *['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\} *$/\1/p" .github/workflows/ci.yml | head -1
+}
+
+# The crates.io job packages the crate on every push, and packaging reads the manifest's `include`
+# and `exclude` rather than the working tree, so a file a build needs can be missing from the
+# package while every local build still succeeds.
+package_rust_crate() {
+    cargo package -p ai-session-search --locked
+}
+
+# The licenses job regenerates this inventory on every push, so a dependency change that breaks the
+# generator fails there. Writing into the run's temporary directory keeps the checkout clean.
+build_python_license_inventory() {
+    uv run --no-sync python scripts/python_license_inventory.py \
+        --output "$STATE_ROOT/python-runtime-licenses.md"
+}
+
+# The workflow-security job runs this on every push. `uv` already gates this script, and `--offline`
+# keeps the scan itself from reaching the network.
+scan_workflow_security() {
+    local version
+    version="$(workflow_pin ZIZMOR_VERSION)"
+    if [ -z "$version" ]; then
+        printf 'could not read ZIZMOR_VERSION from .github/workflows/ci.yml\n' >&2
+        return 1
+    fi
+    uv tool run --from "zizmor==$version" zizmor --offline .
+}
+
 # Rustdoc rejects what compiling accepts: a public item linking a private one resolves for a
 # reader with the private docs and dangles for everyone else, so CI builds the docs with warnings
 # denied. Without this step the failure first appears on a hosted runner, after a push, for a doc
@@ -420,8 +453,23 @@ step "Rust Clippy" cargo clippy --workspace --all-targets --all-features --locke
 step "Rust tests" cargo test --workspace --all-targets --all-features --locked
 step "Rust public API doctests" cargo test -p ai-session-search -p ai-session-search-api-consumer --doc --all-features --locked
 step "Rust documentation" build_rust_documentation
+step "Rust crate packaging" package_rust_crate
 step "Release executable and MCP schema" build_and_verify_release_executable
 step "Python artifacts and install pathways" build_and_verify_python_artifacts
+step "Python runtime license inventory" build_python_license_inventory
+
+# `cargo deny` needs the pinned binary installed, so this follows the actionlint pattern below:
+# report the skip and the exact install command rather than installing anything.
+if command -v cargo-deny >/dev/null 2>&1; then
+    step "Dependency advisories, licenses, sources, and bans" \
+        cargo deny --locked check advisories licenses sources bans
+else
+    printf '\n%bSKIPPED: cargo-deny is not installed%b\n' "$YELLOW" "$NC"
+    printf 'The licenses CI job runs it and blocks the merge. Install the pinned version:\n'
+    printf '  cargo install cargo-deny --version %s --locked\n' "$(workflow_pin CARGO_DENY_VERSION)"
+fi
+
+step "Workflow security scan" scan_workflow_security
 
 # No file arguments, so a workflow added later is checked without editing this line.
 if command -v actionlint >/dev/null 2>&1; then
