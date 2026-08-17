@@ -217,6 +217,14 @@ step() {
     fi
 }
 
+# Rustdoc rejects what compiling accepts: a public item linking a private one resolves for a
+# reader with the private docs and dangles for everyone else, so CI builds the docs with warnings
+# denied. Without this step the failure first appears on a hosted runner, after a push, for a doc
+# comment the local gate read as fine.
+build_rust_documentation() {
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+}
+
 build_and_verify_python_artifacts() {
     local output="$STATE_ROOT/dist"
     mkdir -p "$output"
@@ -411,6 +419,7 @@ step "Rust check" cargo check --workspace --all-targets --all-features --locked
 step "Rust Clippy" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 step "Rust tests" cargo test --workspace --all-targets --all-features --locked
 step "Rust public API doctests" cargo test -p ai-session-search -p ai-session-search-api-consumer --doc --all-features --locked
+step "Rust documentation" build_rust_documentation
 step "Release executable and MCP schema" build_and_verify_release_executable
 step "Python artifacts and install pathways" build_and_verify_python_artifacts
 
