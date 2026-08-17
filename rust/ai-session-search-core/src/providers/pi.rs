@@ -30,6 +30,9 @@ enum PiSessionLayout {
 
 pub struct PiAdapter {
     roots: Vec<PathBuf>,
+    /// Configured roots that [`sessions_root`] resolved to a `sessions` child, listed one level
+    /// deep so the transcripts in the configured path itself are kept alongside that child's.
+    direct_roots: Vec<PathBuf>,
     id_re: Regex,
     provider: Provider,
     layout: PiSessionLayout,
@@ -45,8 +48,21 @@ impl PiAdapter {
     }
 
     fn with_layout(roots: Vec<PathBuf>, provider: Provider, layout: PiSessionLayout) -> Self {
+        // Each root is resolved once: the directory to walk, plus the configured root itself
+        // whenever resolution moved into its `sessions` child and left its own transcripts
+        // outside the walk.
+        let mut walked = Vec::with_capacity(roots.len());
+        let mut direct_roots = Vec::new();
+        for root in roots {
+            let resolved = sessions_root(&root);
+            if resolved != root {
+                direct_roots.push(root);
+            }
+            walked.push(resolved);
+        }
         Self {
-            roots: roots.iter().map(|root| sessions_root(root)).collect(),
+            roots: walked,
+            direct_roots,
             id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
                 .expect("valid regex"),
             provider,
@@ -69,6 +85,7 @@ impl PiAdapter {
     pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
         let walked = walk_roots(&self.roots, None);
+        let mut warnings = walked.warnings;
         for entry in walked.entries {
             let root = &entry.root;
             let path = &entry.path;
@@ -80,39 +97,67 @@ impl PiAdapter {
             // session.jsonl) and are sessions of their own. Anything nested that names no
             // parent session directory is neither, so it stays out rather than becoming a
             // session with an invented identity.
-            let is_session = match self.layout {
-                PiSessionLayout::ProjectDirectories => {
-                    is_top_level_session(root, path) || self.spawn_origin(root, path).is_some()
-                }
-                // Prime root and RLM-child transcripts are UUID-named. Its sibling
-                // `rlm-subagents.jsonl` is a registry, not a transcript, so reject every
-                // non-UUID filename before parsing.
-                PiSessionLayout::PrimeAgent => {
-                    self.has_uuid_filename(path)
-                        && (is_top_level_session(root, path)
-                            || self.spawn_origin(root, path).is_some())
-                }
-            };
+            let is_session = self.filename_admits_transcript(path)
+                && (is_top_level_session(root, path) || self.spawn_origin(root, path).is_some());
             if !is_session {
                 continue;
             }
-            let mtime_ns = entry
-                .metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|value| value.as_nanos() as i64)
-                .unwrap_or_default();
-            files.push(SourceFile {
-                provider: self.provider,
-                path: entry.path,
-                mtime_ns,
-                size_bytes: entry.metadata.len() as i64,
-            });
+            files.push(self.source_file(entry));
+        }
+        // Transcripts sitting directly in a configured root whose walk moved into that root's
+        // `sessions` child. Both layouts put JSON Lines in exactly this place — an agent home's
+        // `run-history.jsonl`, a directly configured project's own transcripts — so which one
+        // this is cannot be read off the directory tree, and reading it off the child alone
+        // dropped every transcript in the configured path. Pi opens a transcript with a
+        // `session` record and opens its bookkeeping with something else, so that record is what
+        // separates them. Listing one level deep keeps this to the root's own entries: the
+        // `sessions` child is already walked above, so nothing is reported twice and the walk
+        // costs what it did before.
+        let listed = walk_roots(&self.direct_roots, Some(1));
+        warnings.extend(listed.warnings);
+        for entry in listed.entries {
+            if !is_jsonl(&entry.path)
+                || !self.filename_admits_transcript(&entry.path)
+                || !opens_with_session_record(&entry.path)
+            {
+                continue;
+            }
+            files.push(self.source_file(entry));
         }
         ProviderDiscovery {
             sources: files,
-            warnings: walked.warnings,
+            warnings,
+        }
+    }
+
+    /// Whether this layout admits `path` as a transcript on its filename alone.
+    ///
+    /// Pi names a transcript however it likes, so its own layout asks nothing of the name. Prime
+    /// root and RLM-child transcripts are UUID-named, and its sibling `rlm-subagents.jsonl` is a
+    /// registry rather than a transcript, so that layout rejects every non-UUID filename before
+    /// parsing.
+    fn filename_admits_transcript(&self, path: &Path) -> bool {
+        match self.layout {
+            PiSessionLayout::ProjectDirectories => true,
+            PiSessionLayout::PrimeAgent => self.has_uuid_filename(path),
+        }
+    }
+
+    /// One discovered path as the source file the indexer reads, with the metadata the walk
+    /// already read rather than a second `stat`.
+    fn source_file(&self, entry: crate::providers::DiscoveredPath) -> SourceFile {
+        let mtime_ns = entry
+            .metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos() as i64)
+            .unwrap_or_default();
+        SourceFile {
+            provider: self.provider,
+            path: entry.path,
+            mtime_ns,
+            size_bytes: entry.metadata.len() as i64,
         }
     }
 
@@ -454,6 +499,13 @@ impl PiAdapter {
 /// strength of the name dropped every transcript sitting in that project — silently, because
 /// discovery warns only about I/O. What tells the two layouts apart is whether the child holds
 /// `.jsonl` files where pi keeps them.
+///
+/// A root can be both at once, and then the child answers only half the question: it says where
+/// pi's own store is without saying that the configured path holds nothing itself. Redirecting
+/// here therefore moves the walk without giving anything up —
+/// [`PiAdapter::discover_with_warnings`] lists the configured root's own entries alongside it,
+/// admitting a `.jsonl` there on the `session` record pi opens a transcript with, which is what
+/// leaves `run-history.jsonl` and `extensions/*.jsonl` out.
 fn sessions_root(root: &Path) -> PathBuf {
     let nested = root.join("sessions");
     if holds_transcripts(&nested) {
@@ -486,6 +538,38 @@ fn holds_transcripts(directory: &Path) -> bool {
 /// Whether `path` names a JSON Lines file, the only extension pi writes a transcript to.
 fn is_jsonl(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+}
+
+/// Whether `path` opens with the `session` record pi and prime begin a transcript with.
+///
+/// The one question discovery asks about a file's contents, and it asks it in the one place the
+/// directory tree cannot answer: a `.jsonl` sitting beside a `sessions` directory is a transcript
+/// in a directly configured project and bookkeeping in an agent home, and the two look identical
+/// from outside. [`crate::providers::pi::PiAdapter::parse_reader`] reads the same record for the
+/// session id, cwd, and start time, so this agrees with what parsing would make of the file.
+///
+/// Reads the first line rather than the file: a transcript's opening record is short, and a file
+/// that turns out to be a large log is closed after it. An unreadable file answers `false`,
+/// leaving it where the same file already sat when the walk skipped it.
+fn opens_with_session_record(path: &Path) -> bool {
+    use std::io::BufRead as _;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first = String::new();
+    if std::io::BufReader::new(file).read_line(&mut first).is_err() {
+        return false;
+    }
+    serde_json::from_str::<Value>(&first)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|kind| kind == "session")
+        })
+        .unwrap_or(false)
 }
 
 /// A session file is "top level" when it sits at most one directory below the sessions root.
@@ -1127,6 +1211,91 @@ mod tests {
             .map(|source| source.path)
             .collect();
         assert_eq!(found, vec![transcript_path]);
+    }
+
+    /// A root holding transcripts of its own keeps them when its `sessions` child holds
+    /// transcripts too.
+    ///
+    /// The two layouts look identical from the directory tree alone: an agent home keeps
+    /// bookkeeping beside `sessions/`, and a project root configured directly can keep
+    /// transcripts beside a `sessions/` of its own. Reading the child as proof of an agent home
+    /// and walking only it dropped everything sitting in the configured path — silently, since
+    /// discovery warns only about I/O. What tells a transcript from bookkeeping is the `session`
+    /// record pi opens a transcript with, so the files directly in the root are admitted on that
+    /// evidence and the walk below `sessions/` is unchanged.
+    #[test]
+    fn a_root_keeps_its_own_transcripts_when_its_sessions_child_holds_transcripts_too() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("demo");
+        fs::create_dir_all(&root).unwrap();
+
+        let direct_path = root.join("2026-06-18T17-31-17-343Z.jsonl");
+        fs::write(
+            &direct_path,
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
+"#,
+        )
+        .unwrap();
+
+        // A `sessions` child holding a transcript is what makes the root ambiguous.
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        let child_path = root.join("sessions").join("2026-06-19T09-00-00-000Z.jsonl");
+        fs::write(
+            &child_path,
+            r#"{"type":"session","version":3,"id":"029edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-19T09:00:00.000Z","cwd":"/Users/example/src/demo"}
+"#,
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let mut found: Vec<_> = adapter
+            .discover()
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        found.sort();
+        let mut expected = vec![direct_path, child_path];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    /// Bookkeeping pi keeps beside `sessions/` stays out, and each transcript is reported once.
+    ///
+    /// Admitting the configured root's own transcripts alongside its `sessions` child is what
+    /// keeps a mixed root whole, and `run-history.jsonl` sits in exactly the place those
+    /// transcripts do. It opens with its own record rather than pi's `session` record, which is
+    /// the evidence that separates them. The root's listing stops one level down, at the
+    /// `sessions` directory rather than inside it, so what that child holds is discovered by the
+    /// walk alone and a transcript directly inside it has one entry rather than two.
+    #[test]
+    fn an_agent_home_admits_its_sessions_child_alone_and_reports_each_transcript_once() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("agent");
+        fs::create_dir_all(root.join("sessions")).unwrap();
+
+        // Directly inside `sessions/`, so the child walk and the root listing both reach it.
+        let shared_path = root.join("sessions").join("2026-06-19T09-00-00-000Z.jsonl");
+        fs::write(
+            &shared_path,
+            r#"{"type":"session","version":3,"id":"029edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-19T09:00:00.000Z","cwd":"/Users/example/src/demo"}
+"#,
+        )
+        .unwrap();
+
+        // Pi's own bookkeeping beside `sessions/`: JSON Lines, and no `session` record.
+        fs::write(
+            root.join("run-history.jsonl"),
+            "{\"agent\":\"reviewer\",\"status\":\"ok\",\"duration\":216169}\n",
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let found: Vec<_> = adapter
+            .discover()
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(found, vec![shared_path]);
     }
 
     /// A transcript keeps being discovered whatever its file is called, and a `sessions`
