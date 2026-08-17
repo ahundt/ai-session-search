@@ -2212,9 +2212,9 @@ impl Db {
     /// applies to the terms the prefix kept, so a matching prefix never returns an empty page
     /// because commoner terms filled the limit first. Matching is case-insensitive because both
     /// sources case-fold as they tokenize and neither stores an uppercase term, so the prefix is
-    /// folded here rather than left to report nothing for `Cargo`. The fold is
-    /// [`crate::util::fold_caseless`], the same rule FTS5 tokenizes with: it brings `Σ`, `σ`, and
-    /// `ς` together the way the stored terms already are, where [`str::to_lowercase`] writes a
+    /// folded here rather than left to report nothing for `Cargo`. The fold is the caseless rule
+    /// every needle in search shares, which is the one FTS5 tokenizes with: it brings `Σ`, `σ`,
+    /// and `ς` together the way the stored terms already are, where [`str::to_lowercase`] writes a
     /// word-final `Σ` as `ς` and asks for a term neither source stores.
     pub fn vocabulary(
         &self,
