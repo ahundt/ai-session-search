@@ -2212,7 +2212,10 @@ impl Db {
     /// applies to the terms the prefix kept, so a matching prefix never returns an empty page
     /// because commoner terms filled the limit first. Matching is case-insensitive because both
     /// sources case-fold as they tokenize and neither stores an uppercase term, so the prefix is
-    /// folded here rather than left to report nothing for `Cargo`.
+    /// folded here rather than left to report nothing for `Cargo`. The fold is
+    /// [`crate::util::fold_caseless`], the same rule FTS5 tokenizes with: it brings `Σ`, `σ`, and
+    /// `ς` together the way the stored terms already are, where [`str::to_lowercase`] writes a
+    /// word-final `Σ` as `ς` and asks for a term neither source stores.
     pub fn vocabulary(
         &self,
         trigram: bool,
@@ -2238,7 +2241,7 @@ impl Db {
         };
 
         let folded = prefix
-            .map(str::to_lowercase)
+            .map(fold_caseless)
             .filter(|prefix| !prefix.is_empty());
         let mut args: Vec<Value> = vec![Value::Integer(lim)];
         let mut filter = String::new();
@@ -14707,6 +14710,47 @@ mod tests {
             schema_before,
             "reading v4 trigram vocabulary must not mutate any schema object"
         );
+    }
+
+    /// A vocabulary prefix reaches the term the index stored, whichever sigma the caller typed.
+    ///
+    /// FTS5 folds all three of `Σ`, `σ`, and `ς` onto `σ` as it tokenizes, which is the rule
+    /// [`crate::util::fold_caseless`] applies and the rule [`str::to_lowercase`] does not:
+    /// lowercasing writes a word-final `Σ` as `ς`, a spelling no term in either source is stored
+    /// under. Folding the prefix by that rule asked for a term that cannot exist, so every
+    /// spelling of a sigma-final prefix reported nothing at all while the term sat in the index.
+    #[test]
+    fn a_vocabulary_prefix_ending_in_sigma_finds_the_term_the_index_folded_it_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("user", "ΟΔΟΣ ΟΔΟΣΣΑ")]);
+
+        // One term, because tokenizing folded the two sigma spellings together.
+        let stored: Vec<String> = db
+            .vocabulary(false, 0, Some("οδοσ"))
+            .unwrap()
+            .into_iter()
+            .map(|(term, _, _)| term)
+            .collect();
+        assert_eq!(
+            stored,
+            vec!["οδοσ".to_string(), "οδοσσα".to_string()],
+            "the folded spelling is what the index stores"
+        );
+
+        for prefix in ["ΟΔΟΣ", "οδος", "Οδος"] {
+            let terms: Vec<String> = db
+                .vocabulary(false, 0, Some(prefix))
+                .unwrap()
+                .into_iter()
+                .map(|(term, _, _)| term)
+                .collect();
+            assert_eq!(
+                terms,
+                vec!["οδοσ".to_string(), "οδοσσα".to_string()],
+                "prefix {prefix:?} reaches the terms the index folded it to"
+            );
+        }
     }
 
     #[test]
