@@ -982,8 +982,12 @@ mod tests {
                 required_stems,
                 held_out,
             } = case;
-            let mut trigrams: Vec<String> = query
-                .to_lowercase()
+            // The needle rule the shipped scorer uses, applied to the candidate trigrams, the
+            // bound needle below, and the expected-result check further down. Lowercasing
+            // instead writes a word-final `Σ` as `ς`, which is a spelling the production path
+            // never asks for, so a benchmark digest taken that way measures a rule aise does not
+            // ship.
+            let mut trigrams: Vec<String> = crate::util::fold_caseless(query)
                 .chars()
                 .collect::<Vec<_>>()
                 .windows(3)
@@ -1005,7 +1009,7 @@ mod tests {
                         trigrams_json,
                         1_200_i64,
                         query,
-                        query.to_lowercase(),
+                        crate::util::fold_caseless(query),
                         10_i64,
                         word_match
                     ],
@@ -1045,8 +1049,8 @@ mod tests {
                 );
             }
             let relevant_rank = rows.iter().position(|row| {
-                let content = row.5.to_lowercase();
-                content.contains(&query.to_lowercase())
+                let content = crate::util::fold_caseless(&row.5);
+                content.contains(&crate::util::fold_caseless(query))
                     || required_stems.iter().all(|stem| content.contains(stem))
             });
             assert!(

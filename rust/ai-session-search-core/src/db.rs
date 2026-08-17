@@ -10721,8 +10721,12 @@ mod tests {
                 } else if offset > 0 {
                     sql.push_str(" limit -1 offset ?3");
                 }
+                // `unicode_lower_contains` takes an already-folded needle, so the oracle folds it
+                // the way every production caller does. Lowercasing here would make the
+                // comparison run against a rule aise does not ship, and the sigma spellings are
+                // exactly where the two disagree.
                 let query_arg = if mode == MessageSearchMode::Literal {
-                    query.to_lowercase()
+                    fold_caseless(query)
                 } else {
                     query.to_string()
                 };
@@ -10819,7 +10823,9 @@ mod tests {
                 )
                 .unwrap();
             statement
-                .query_map([query], |row| {
+                // Folded for the same reason the oracle above folds: the scalar's needle
+                // argument arrives folded from every production caller.
+                .query_map([fold_caseless(query)], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                 })
                 .unwrap()
