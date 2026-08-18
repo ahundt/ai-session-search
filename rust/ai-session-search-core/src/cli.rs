@@ -894,9 +894,17 @@ fn clarify_stale_message_argument(
     let stale = invalid
         .split_once('=')
         .map_or(invalid.as_str(), |(name, _)| name);
+    // Two shapes of rename, both beyond clap's edit distance. A scope rename maps name to name, and
+    // left to itself clap picks a near-miss with the wrong meaning: `--project` guesses `--role`,
+    // the defect this table was built for. A mode rename maps a bare flag to a flag AND a value, so
+    // no single argument name is close enough and clap offers nothing at all. Removing any row
+    // below restores that build's behavior, which the tests cover in both directions.
     let replacement = match stale {
         "--project" => "--workspace-path",
         "--type" => "--role",
+        "--regex" => "--query-mode regex",
+        "--fuzzy" => "--query-mode fuzzy",
+        "--explain" => "--receipt-level summary",
         _ => return error,
     };
     error.insert(
@@ -3804,6 +3812,53 @@ mod tests {
             project.contains("Usage: aise messages search [OPTIONS] [QUERY]"),
             "the usage line is the subcommand's real usage: {project}"
         );
+    }
+
+    /// The mode renames need the same treatment as the scope renames, and cannot get it from clap.
+    ///
+    /// `--project`/`--type` reach their replacement through clap's edit distance because the new
+    /// name is one word. `--regex`/`--fuzzy`/`--explain` became a flag PLUS a value, so no single
+    /// argument name is close enough and clap falls through to `to pass '--regex' as a value, use
+    /// `-- --regex``, which is never what the caller meant. These three are the spellings
+    /// `every_documented_aise_example_parses_against_the_current_cli` removed from the shipped
+    /// documents; an agent carrying them in memory or in third-party notes still reaches the CLI
+    /// with them, so the CLI is where the answer has to be.
+    #[test]
+    fn stale_message_mode_flags_name_the_canonical_replacement_and_its_value() {
+        for (stale, replacement) in [
+            ("--regex", "--query-mode regex"),
+            ("--fuzzy", "--query-mode fuzzy"),
+            ("--explain", "--receipt-level summary"),
+        ] {
+            let text = parse_cli_from(["aise", "messages", "search", "workflow", stale])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                text.contains(replacement),
+                "`{stale}` must name `{replacement}`: {text}"
+            );
+            assert!(
+                !text.contains(&format!("use `-- {stale}`")),
+                "`{stale}` must not fall through to clap's pass-as-value tip: {text}"
+            );
+            assert!(
+                text.contains("Usage: aise messages search [OPTIONS] [QUERY]"),
+                "`{stale}` keeps the subcommand's real usage line: {text}"
+            );
+        }
+    }
+
+    /// The renames stay rejections, never working aliases: accepting `--regex` would keep two
+    /// vocabularies alive indefinitely, while a rejection that teaches the current spelling
+    /// converges on one.
+    #[test]
+    fn stale_message_mode_flags_remain_rejected() {
+        for stale in ["--regex", "--fuzzy", "--explain"] {
+            assert!(
+                parse_cli_from(["aise", "messages", "search", "workflow", stale]).is_err(),
+                "`{stale}` stays rejected"
+            );
+        }
     }
 
     #[test]
