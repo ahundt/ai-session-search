@@ -234,6 +234,69 @@ def test_no_tracked_file_names_the_home_directory_it_was_written_on() -> None:
     assert not offenders, f"tracked content names the home directory {home}: {offenders}"
 
 
+# Text clap renders itself, in clap's own quoting. A negative assertion about one of these spelled
+# with different quote characters cannot match, so it passes while the behavior it forbids happens.
+_CLAP_RENDERED_PHRASES = (
+    "error: unexpected argument '{arg}' found",
+    "tip: a similar argument exists: '{arg}'",
+    "tip: a similar subcommand exists: '{arg}'",
+    "tip: to pass '{arg}' as a value, use '-- {arg}'",
+)
+# The three quote characters clap and this codebase actually emit; curly quotes appear in prose,
+# never in rendered CLI output, so including them would only trip the ambiguous-character lint.
+_QUOTE_CHARACTERS = "`'\""
+_FORMAT_PLACEHOLDER = re.compile(r"\{[^{}]*\}")
+_NEGATIVE_CONTAINS = (
+    re.compile(r"!\s*[A-Za-z_][\w.()\[\]&*]*\s*\.contains\(\s*&?\"((?:[^\"\\]|\\.)*)\""),
+    re.compile(
+        r"!\s*[A-Za-z_][\w.()\[\]&*]*\s*\.contains\(\s*&format!\(\s*\"((?:[^\"\\]|\\.)*)\""
+    ),
+)
+
+
+def _quote_and_placeholder_insensitive(text: str) -> str:
+    without_quotes = "".join(character for character in text if character not in _QUOTE_CHARACTERS)
+    return _FORMAT_PLACEHOLDER.sub("\x00", without_quotes)
+
+
+def test_no_negative_assertion_names_clap_output_in_the_wrong_quotes() -> None:
+    """A negative assertion about clap's own output has to be spelled the way clap renders it.
+
+    `cli.rs` asserted the renamed-flag error does not fall through to clap's pass-as-value tip,
+    written as ``use `-- {stale}` `` in backticks. clap renders `use '-- --regex'` in single quotes,
+    so the assertion could never match, never fail, and the tip was printed next to the correct
+    suggestion for four of the five renamed flags until it was found by reading the real output.
+
+    Matching ignores quote characters and format-placeholder names, because the assertion and the
+    rendering name their placeholder differently; comparing the two literally is what misses the
+    case. An assertion whose exact text a phrase already contains is left alone.
+    """
+    rendered = {
+        _quote_and_placeholder_insensitive(phrase): phrase for phrase in _CLAP_RENDERED_PHRASES
+    }
+    sources = subprocess.run(
+        ["git", "ls-files", "-z", "*.rs"], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout
+    offenders: list[str] = []
+    for name in filter(None, sources.split("\0")):
+        text = (ROOT / name).read_text(encoding="utf-8", errors="replace")
+        for pattern in _NEGATIVE_CONTAINS:
+            for match in pattern.finditer(text):
+                needle = match.group(1)
+                if not any(quote in needle for quote in _QUOTE_CHARACTERS):
+                    continue
+                if any(needle in phrase for phrase in _CLAP_RENDERED_PHRASES):
+                    continue
+                loose = _quote_and_placeholder_insensitive(needle)
+                shadowed = [
+                    phrase for key, phrase in rendered.items() if loose and loose in key
+                ]
+                if shadowed:
+                    line = text[: match.start()].count("\n") + 1
+                    offenders.append(f"{name}:{line} asserts {needle!r}, clap renders {shadowed[0]!r}")
+    assert not offenders, "negative assertions that cannot fail: " + "; ".join(offenders)
+
+
 def test_a_repository_local_worktree_leaves_the_release_status_check_clean() -> None:
     """RELEASING.md requires `git status --short` to be clean before tagging, so a second checkout
     placed under `.worktrees/` has to be ignored.
