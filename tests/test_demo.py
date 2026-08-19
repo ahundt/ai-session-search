@@ -1100,7 +1100,7 @@ def _run(
     show_prompt: bool = True,
     shell: bool = False,
     env: dict[str, str] | None = None,
-    check: bool = False,
+    check: bool = True,
 ) -> subprocess.CompletedProcess:
     """Print a shell prompt + command (with typing effect), then run it.
 
@@ -1108,7 +1108,8 @@ def _run(
     shell=True: needed only for commands with real shell pipes (|).
     env=None (default): DEMO_ENV. The MCP act passes MCP_DEMO_ENV so that integration
     commands read and print a throwaway HOME instead of the recording machine's real one.
-    check=True: raise when an act that promises successful output exits unsuccessfully.
+    check=True (default): raise when an executed act exits unsuccessfully. Set false only for a
+    demonstration whose expected behavior is a nonzero command and whose error output is asserted.
     """
     if show_prompt:
         _type("\n\033[1;32m$\033[0m ", delay=0)
@@ -1366,16 +1367,15 @@ def run_post_b_acts() -> None:
     pause(7.0)
 
     # ── Act 4: the recovery scenario — narrative + actual command ──────────
-    # Use --version 2, whose full content was captured. The default selects the
-    # later Edit-derived version and correctly reports that no recovery file was
-    # captured for it.
+    # Version 1 is the complete Write snapshot. The later Edit-derived version has no complete
+    # replay path, so presenting it as recoverable would turn this success demo into an error.
     section("The scenario — git reset --hard destroyed your unstaged edits")
     pause(2.0)
     _type("\n\033[1;33m  Disaster:\033[0m  git reset --hard wiped unstaged changes\n", delay=0.03)
     _type("\033[1;33m  Git says:\033[0m  clean working tree (the edits are gone)\n", delay=0.03)
     _type("\033[1;32m  aise can recover versions whose content was captured:\033[0m\n\n", delay=0.03)
     pause(2.0)
-    _run(f"aise files extract transformer.py --version 2 --session-id {_S4} {PROV}")
+    _run(f"aise files extract transformer.py --version 1 --session-id {_S4} {PROV}")
     pause(7.0)
 
     # ── Done ─────────────────────────────────────────────────────────────────
@@ -1416,10 +1416,10 @@ def run_post_d_acts() -> None:
     pause(7.0)
 
     # ── Act 3: files extract — recover file content ───────────────────────
-    # Use --version 2 (latest Write-based version with a file on disk).
+    # Use version 1, the complete Write snapshot; version 2 is a path-only Edit with no replay.
     section("Recover file content — the intermediate version git never saw")
     pause(2.0)
-    _run(f"aise files extract transformer.py --version 2 --session-id {_S4} {PROV}")
+    _run(f"aise files extract transformer.py --version 1 --session-id {_S4} {PROV}")
     pause(7.0)
 
     # ── Act 4: built-in corrections skill — find patterns ────────────────
@@ -2125,7 +2125,7 @@ class TestDemoFree:
         )
 
         with pytest.raises(subprocess.CalledProcessError):
-            _run("aise messages search needle", show_prompt=False, check=True)
+            _run("aise messages search needle", show_prompt=False)
 
     def test_post_a_commands_use_supported_modes_and_fail_on_command_errors(
         self, monkeypatch: pytest.MonkeyPatch
