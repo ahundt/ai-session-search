@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Nisarg Patel
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
@@ -30,8 +31,8 @@ enum PiSessionLayout {
 
 pub struct PiAdapter {
     roots: Vec<PathBuf>,
-    /// Configured roots that [`sessions_root`] resolved to a `sessions` child, listed one level
-    /// deep so the transcripts in the configured path itself are kept alongside that child's.
+    /// Configured roots that [`sessions_root`] resolved to a `sessions` child, listed through the
+    /// supported project depth so their own transcripts are kept alongside that child's.
     direct_roots: Vec<PathBuf>,
     id_re: Regex,
     provider: Provider,
@@ -84,6 +85,7 @@ impl PiAdapter {
 
     pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
+        let mut seen = HashSet::new();
         let walked = walk_roots(&self.roots, None);
         let mut warnings = walked.warnings;
         for entry in walked.entries {
@@ -99,7 +101,7 @@ impl PiAdapter {
             // session with an invented identity.
             let is_session = self.filename_admits_transcript(path)
                 && (is_top_level_session(root, path) || self.spawn_origin(root, path).is_some());
-            if !is_session {
+            if !is_session || !seen.insert(path.to_path_buf()) {
                 continue;
             }
             files.push(self.source_file(entry));
@@ -110,15 +112,18 @@ impl PiAdapter {
         // this is cannot be read off the directory tree, and reading it off the child alone
         // dropped every transcript in the configured path. Pi opens a transcript with a
         // `session` record and opens its bookkeeping with something else, so that record is what
-        // separates them. Listing one level deep keeps this to the root's own entries: the
-        // `sessions` child is already walked above, so nothing is reported twice and the walk
-        // costs what it did before.
-        let listed = walk_roots(&self.direct_roots, Some(1));
+        // separates them. Listing through depth two preserves both supported project shapes:
+        // transcripts directly in the root and under its encoded-project directory. The resolved
+        // `sessions` child is already walked above, so exclude every walked root before opening a
+        // candidate and retain each source path once when configured roots overlap.
+        let listed = walk_roots(&self.direct_roots, Some(2));
         warnings.extend(listed.warnings);
         for entry in listed.entries {
-            if !is_jsonl(&entry.path)
+            if self.roots.iter().any(|root| entry.path.starts_with(root))
+                || !is_jsonl(&entry.path)
                 || !self.filename_admits_transcript(&entry.path)
                 || !opens_with_session_record(&entry.path)
+                || !seen.insert(entry.path.clone())
             {
                 continue;
             }
@@ -1259,14 +1264,58 @@ mod tests {
         assert_eq!(found, expected);
     }
 
+    /// The ordinary depth-two project layout stays visible when a `sessions` child redirects the
+    /// main walk.
+    ///
+    /// A directly configured project can contain both `<root>/<encoded-cwd>/<file>.jsonl` and a
+    /// `sessions` child. Resolving the latter must not reduce the root's own discovery to files
+    /// directly beside that child, and scanning the configured root must not report the child a
+    /// second time.
+    #[test]
+    fn a_mixed_root_keeps_its_depth_two_project_transcript_without_duplicating_its_sessions_child()
+    {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("demo");
+        let project = root.join("--Users-example-src-demo--");
+        let sessions_project = root.join("sessions").join("--Users-example-src-child--");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&sessions_project).unwrap();
+
+        let direct_path = project.join("2026-06-18T17-31-17-343Z.jsonl");
+        fs::write(
+            &direct_path,
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
+"#,
+        )
+        .unwrap();
+        let child_path = sessions_project.join("2026-06-19T09-00-00-000Z.jsonl");
+        fs::write(
+            &child_path,
+            r#"{"type":"session","version":3,"id":"029edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-19T09:00:00.000Z","cwd":"/Users/example/src/child"}
+"#,
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let mut found: Vec<_> = adapter
+            .discover()
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        found.sort();
+        let mut expected = vec![direct_path, child_path];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
     /// Bookkeeping pi keeps beside `sessions/` stays out, and each transcript is reported once.
     ///
     /// Admitting the configured root's own transcripts alongside its `sessions` child is what
     /// keeps a mixed root whole, and `run-history.jsonl` sits in exactly the place those
     /// transcripts do. It opens with its own record rather than pi's `session` record, which is
-    /// the evidence that separates them. The root's listing stops one level down, at the
-    /// `sessions` directory rather than inside it, so what that child holds is discovered by the
-    /// walk alone and a transcript directly inside it has one entry rather than two.
+    /// the evidence that separates them. The root's depth-two listing excludes every resolved
+    /// walk root before opening candidates, so what the `sessions` child holds is discovered by
+    /// the walk alone and a transcript inside it has one entry rather than two.
     #[test]
     fn an_agent_home_admits_its_sessions_child_alone_and_reports_each_transcript_once() {
         let temp = tempdir().expect("tempdir");
