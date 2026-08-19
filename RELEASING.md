@@ -58,8 +58,10 @@ not define the public compatibility contract. Release tools (uv, cargo-cyclonedx
 are pinned by version in `.github/workflows/ci.yml`, `prepare-packages.yml`, and `publish.yml`;
 change them only in a separate reviewed toolchain change.
 
-Behavior changes that ship in a release are described in the GitHub release notes for that
-version and in the requirements document, not here.
+Behavior changes that ship in a release are described in [CHANGELOG.md](CHANGELOG.md), not here.
+Accumulate them under `## [Unreleased]` as they land, so the section is written by the people who
+made the changes rather than reconstructed from history at tag time. The release notes for a
+version are that version's changelog section.
 
 ## Release blockers
 
@@ -265,6 +267,10 @@ Before tagging, confirm:
 
 - The release branch started from a green `main` commit and contains only reviewed version or
   release corrections. Do not rewrite shared history or force-push.
+- `CHANGELOG.md` carries this version: rename `## [Unreleased]` to `## [X.Y.ZrcN] - YYYY-MM-DD`
+  with the tag's date, add a fresh empty `## [Unreleased]` above it, and point the link
+  definitions at the new tag. Anything a user has to do when upgrading belongs first in that
+  section.
 - `git status --short` is clean.
 - The staged release diff was inspected before its version commit.
 - `python -m scripts.verify_release_metadata --tag vX.Y.ZrcN` passes.

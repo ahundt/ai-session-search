@@ -443,6 +443,7 @@ uv run ruff check . && uv run mypy ai_session_search tests
 uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
 ```
 
+[CHANGELOG.md](CHANGELOG.md) records what changed in each release and what to do when upgrading.
 [CONTRIBUTING.md](CONTRIBUTING.md) covers review expectations, and the
 [documentation index](docs/README.md) separates user guides from maintainer and migration
 records.
