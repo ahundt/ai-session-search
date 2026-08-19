@@ -1730,13 +1730,13 @@ def audit_rendered_text_for_pii(rendered: str) -> list[str]:
 _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     ("assistant",        "Act 1: stats shows indexed assistant message count"),
     ("cafe0001",         "Act 2: list shows synthetic session UUIDs"),
-    ("authentication",   "Act 3: message search finds authentication"),
-    (".py",              "Act 4: files search shows Python files"),
+    ("JWT authentication utilities", "Act 3: message search returns authentication content"),
+    ("transformer.py",   "Act 4: files search returns a Python file"),
     ("regression",       "Act 5: corrections skill classifies correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
     ("Explore",          "Act 7: subagent listing shows the agent type from the sidecar"),
     ("configured",       "Act 8: MCP server registered into detected clients"),
-    ("integrations",     "Act 9: one executable advertises integration management"),
+    ("Usage: aise",      "Act 9: one executable prints its command surface"),
 )
 
 # Checks for the --post-a self-improvement loop demo.
@@ -1758,8 +1758,8 @@ _POST_A_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
 # Checks for the --post-b file recovery demo.
 _POST_B_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     # Act 1: files search
-    ("transformer.py",  "Act 1: files search shows transformer.py"),
-    (".py",             "Act 1: files search shows Python files"),
+    ("/Users/demo/datapipe/pipeline/transformer.py", "Act 1: files search returns transformer.py"),
+    ("/Users/demo/mlresearch/train.py", "Act 1: files search returns another Python file"),
     # Act 2: files history
     ("Write",           "Act 2: files history shows the first written version"),
     ("Edit",            "Act 2: files history shows the subsequent edited version"),
@@ -1774,13 +1774,13 @@ _POST_B_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
 # Checks for the --post-d broader audience demo.
 _POST_D_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     # Act 1: messages search shows authentication result
-    ("authentication",  "Act 1: messages search finds authentication topic"),
-    # Act 2: files history shows version timeline
-    ("version",         "Act 2: files history shows the version timeline"),
+    ("JWT authentication utilities", "Act 1: messages search returns authentication content"),
+    # Act 2: files history shows the Edit-derived version
+    ("Edit",            "Act 2: files history returns the version timeline"),
     # Act 3: files extract shows file content
-    ("transform",       "Act 3: extract shows transformer.py content"),
+    ("normalize_timestamps", "Act 3: extract returns transformer.py content"),
     # Act 4: corrections skill output
-    ("corrections",     "Act 4: corrections skill produced output"),
+    ("skip_step",       "Act 4: corrections skill returns classified output"),
     # Act 5: messages get shows session content
     ("cross-validation", "Act 5: messages get shows session content"),
     # Done banner
