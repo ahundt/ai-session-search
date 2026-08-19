@@ -234,6 +234,38 @@ def test_no_tracked_file_names_the_home_directory_it_was_written_on() -> None:
     assert not offenders, f"tracked content names the home directory {home}: {offenders}"
 
 
+def test_a_repository_local_worktree_leaves_the_release_status_check_clean() -> None:
+    """RELEASING.md requires `git status --short` to be clean before tagging, so a second checkout
+    placed under `.worktrees/` has to be ignored.
+
+    Tooling creates repository-local worktrees at `.worktrees/<name>`. One sitting there untracked
+    reported `?? .worktrees/` at a release tip and blocked that precondition, while shipping
+    nothing: the crate, wheel, and sdist built at the time carried no entry from that path.
+    `run_ci_local.sh` separately bounds its workflow scan to `.github` so the same directory cannot
+    be audited as part of this checkout.
+    """
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--quiet", ".worktrees/example-branch/Cargo.toml"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    # check-ignore exits 0 when the path is ignored, 1 when it is not, and 128 on a usage error.
+    assert ignored.returncode == 0, (
+        "a worktree under .worktrees/ would show in `git status --short` and block tagging: "
+        f"check-ignore exited {ignored.returncode} {ignored.stderr}"
+    )
+
+    status = subprocess.run(
+        ["git", "status", "--short", "--untracked-files=all", "--", ".worktrees"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert not status.strip(), f"`.worktrees` still reaches git status: {status!r}"
+
+
 def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf() -> None:
     """Both copies of the bundled skill must hold the same files with the same bytes.
 
