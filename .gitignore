@@ -84,6 +84,11 @@ test_results*.xml
 # Project
 target/
 
+# Repository-local git worktrees. Tooling puts a second checkout under `.worktrees/<name>`, which
+# left untracked makes `git status --short` report it — the condition RELEASING.md requires to be
+# clean before tagging. `run_ci_local.sh` already bounds its workflow scan away from this path.
+.worktrees/
+
 # Local planning notes (not for distribution)
 notes/
 
