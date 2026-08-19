@@ -83,6 +83,15 @@ impl PiAdapter {
         self.discover_with_warnings().sources
     }
 
+    /// Discover this adapter's transcripts, reporting each source path once.
+    ///
+    /// Two walks: the resolved roots at full depth, then the configured roots that resolved to a
+    /// `sessions` child, listed through depth two. Time is `O(E * R)` for `E` walked entries and
+    /// `R` configured roots, `R` being the handful a user names; retained memory is `O(F)` for `F`
+    /// accepted transcripts, one owned path in the result and one in the duplicate set. Both guards
+    /// in the second walk are load-bearing and neither subsumes the other: excluding walked roots
+    /// keeps the first walk's own entries out, and the set keeps one path out of two configured
+    /// roots that nest.
     pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
         let mut seen = HashSet::new();
