@@ -3276,6 +3276,16 @@ impl Db {
         Ok((hits, explain))
     }
 
+    /// Collect every row the prepared statement returns.
+    ///
+    /// Retained memory is `O(R)` in the returned rows and their content bytes, because the caller
+    /// is handed the whole page at once. `R` is bounded by whatever `LIMIT` the request carried, and
+    /// an omitted limit means all results on the Rust, Python, and CLI surfaces, so a query matching
+    /// the corpus retains the corpus. That is the contract those surfaces promise rather than an
+    /// unbounded accident: MCP supplies a finite page instead, and Rust aborts on allocation failure,
+    /// so a stated bound is the only defense a caller has. Work scanned is independent of `R` — the
+    /// verification cost belongs to the statement, which is why a small `LIMIT` returns sooner
+    /// without finishing sooner.
     fn query_message_hits(
         &self,
         sql: &str,
