@@ -107,6 +107,37 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
         assert f'    "{tool_name}",' in distribution_verifier
 
 
+def test_local_ci_builds_the_same_dependency_license_inventories_as_hosted_ci() -> None:
+    script = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert 'local environment="$STATE_ROOT/licenses-env"' in script
+    assert script.count('UV_PROJECT_ENVIRONMENT="$environment"') == 2
+    assert "uv sync --locked --no-dev" in script
+    assert "uv run --no-sync python scripts/python_license_inventory.py" in script
+    assert "cargo deny list" in script
+    assert "cargo deny list > rust-dependency-licenses.txt" in workflow
+    assert "if-no-files-found: error" in workflow
+
+
+def test_local_ci_checks_workflow_pins_and_reports_skipped_tools() -> None:
+    script = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+
+    assert "SKIPPED_COUNT=0" in script
+    assert "Skipped: %s" in script
+    assert "require_workflow_pin cargo-deny CARGO_DENY_VERSION" in script
+    assert "require_workflow_pin actionlint ACTIONLINT_VERSION" in script
+    assert "actionlint/cmd/actionlint@latest" not in script
+
+
+def test_local_gate_guidance_names_the_required_commands_that_remain_ci_owned() -> None:
+    guidance = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+    assert "runs every command the required jobs run on a push" not in guidance
+    assert "MSRV" in guidance
+    assert "registry, path, and Git install pathways" in guidance
+
+
 def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:
     script = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
 

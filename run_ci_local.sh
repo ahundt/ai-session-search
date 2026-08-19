@@ -18,6 +18,7 @@ NC='\033[0m'
 
 FAILED_COUNT=0
 PASSED_COUNT=0
+SKIPPED_COUNT=0
 FAILED_NAMES=""
 LOCK_KEY="$(printf '%s' "$SCRIPT_DIR" | cksum | awk '{print $1}')"
 LOCAL_CI_LOCK="${TMPDIR:-/tmp}/ai-session-search-local-ci.${UID:-unknown}.$LOCK_KEY.lock"
@@ -224,6 +225,26 @@ workflow_pin() {
     sed -n "s/^  $1: *['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\} *$/\1/p" .github/workflows/ci.yml | head -1
 }
 
+# Refuse to describe an installed policy tool as the hosted check when it is a different version.
+# Missing tools remain named skips below; a present but mismatched tool is a failed check because
+# running it would provide misleading parity evidence.
+require_workflow_pin() {
+    local tool="$1"
+    local pin_name="$2"
+    local expected installed
+    expected="$(workflow_pin "$pin_name")"
+    if [ -z "$expected" ]; then
+        printf 'could not read %s from .github/workflows/ci.yml\n' "$pin_name" >&2
+        return 1
+    fi
+    installed="$("$tool" --version 2>&1 | head -1 | grep -Eo '[0-9]+([.][0-9]+)+' | head -1)"
+    if [ "$installed" != "$expected" ]; then
+        printf '%s %s is installed, but CI pins %s\n' \
+            "$tool" "${installed:-unknown}" "$expected" >&2
+        return 1
+    fi
+}
+
 # The crates.io job packages the crate on every push, and packaging reads the manifest's `include`
 # and `exclude` rather than the working tree, so a file a build needs can be missing from the
 # package while every local build still succeeds.
@@ -231,11 +252,28 @@ package_rust_crate() {
     cargo package -p ai-session-search --locked
 }
 
-# The licenses job regenerates this inventory on every push, so a dependency change that breaks the
-# generator fails there. Writing into the run's temporary directory keeps the checkout clean.
+# The licenses job regenerates this inventory from a runtime-only environment on every push. The
+# gate's active environment contains development tools, so reproduce the hosted population in
+# temporary state instead of resyncing and removing tools from the developer's environment.
 build_python_license_inventory() {
-    uv run --no-sync python scripts/python_license_inventory.py \
-        --output "$STATE_ROOT/python-runtime-licenses.md"
+    local environment="$STATE_ROOT/licenses-env"
+    UV_PROJECT_ENVIRONMENT="$environment" uv sync --locked --no-dev || return
+    UV_PROJECT_ENVIRONMENT="$environment" uv run --no-sync python scripts/python_license_inventory.py \
+        --output "$STATE_ROOT/python-runtime-licenses.md" || return
+    if [ ! -s "$STATE_ROOT/python-runtime-licenses.md" ]; then
+        printf 'Python runtime license inventory is empty\n' >&2
+        return 1
+    fi
+}
+
+# Match the licenses job's second uploaded artifact and fail when it would be empty.
+list_rust_dependency_licenses() {
+    local output="$STATE_ROOT/rust-dependency-licenses.txt"
+    cargo deny list >"$output" || return
+    if [ ! -s "$output" ]; then
+        printf 'Rust dependency license inventory is empty\n' >&2
+        return 1
+    fi
 }
 
 # The workflow-security job runs this on every push. `uv` already gates this script, and `--offline`
@@ -461,11 +499,14 @@ step "Python runtime license inventory" build_python_license_inventory
 # `cargo deny` needs the pinned binary installed, so this follows the actionlint pattern below:
 # report the skip and the exact install command rather than installing anything.
 if command -v cargo-deny >/dev/null 2>&1; then
+    step "Pinned cargo-deny version" require_workflow_pin cargo-deny CARGO_DENY_VERSION
     step "Dependency advisories, licenses, sources, and bans" \
         cargo deny --locked check advisories licenses sources bans
+    step "Rust dependency license inventory" list_rust_dependency_licenses
 else
-    printf '\n%bSKIPPED: cargo-deny is not installed%b\n' "$YELLOW" "$NC"
-    printf 'The licenses CI job runs it and blocks the merge. Install the pinned version:\n'
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 2))
+    printf '\n%bSKIPPED: cargo-deny is not installed (2 checks)%b\n' "$YELLOW" "$NC"
+    printf 'The licenses CI job runs both checks and blocks the merge. Install the pinned version:\n'
     printf '  cargo install cargo-deny --version %s --locked\n' "$(workflow_pin CARGO_DENY_VERSION)"
 fi
 
@@ -473,12 +514,15 @@ step "Workflow security scan" scan_workflow_security
 
 # No file arguments, so a workflow added later is checked without editing this line.
 if command -v actionlint >/dev/null 2>&1; then
+    step "Pinned actionlint version" require_workflow_pin actionlint ACTIONLINT_VERSION
     step "GitHub workflow syntax" actionlint
 else
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
     printf '\n%bSKIPPED: actionlint is not installed%b\n' "$YELLOW" "$NC"
     printf 'The workflow-security CI job runs it and blocks the merge, so a syntax error\n'
     printf 'found there costs a round trip. Install it to see it here first:\n'
-    printf '  go install github.com/rhysd/actionlint/cmd/actionlint@latest\n'
+    printf '  go install github.com/rhysd/actionlint/cmd/actionlint@v%s\n' \
+        "$(workflow_pin ACTIONLINT_VERSION)"
 fi
 
 # actionlint hands run: bodies to shellcheck, which only understands POSIX shells,
@@ -487,6 +531,7 @@ fi
 step "Workflow PowerShell syntax" uv run --script scripts/check_workflow_powershell.py
 
 printf '\n%b=== Summary ===%b\nPassed: %s\n' "$BOLD" "$NC" "$PASSED_COUNT"
+printf 'Skipped: %s\n' "$SKIPPED_COUNT"
 if [ "$FAILED_COUNT" -gt 0 ]; then
     printf '%bFailed: %s%b\n%b\n' "$RED" "$FAILED_COUNT" "$NC" "$FAILED_NAMES"
     # Disk-pressure (ENOSPC) recovery is deliberately opt-in: this gate never deletes
@@ -500,4 +545,9 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
     printf 'Shared caches (~/.cargo, uv cache) are never deleted by this script.\n' >&2
     exit 1
 fi
-printf '%bAll executed checks passed.%b\n' "$GREEN" "$NC"
+if [ "$SKIPPED_COUNT" -gt 0 ]; then
+    printf '%bAll executed checks passed; %s optional checks skipped.%b\n' \
+        "$GREEN" "$SKIPPED_COUNT" "$NC"
+else
+    printf '%bAll executed checks passed.%b\n' "$GREEN" "$NC"
+fi

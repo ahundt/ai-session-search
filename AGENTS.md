@@ -26,19 +26,17 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 uv run ruff check . && uv run mypy ai_session_search tests
 ```
 
-The gate runs every command the required jobs run on a push, so what a green run leaves untested is
-the platform rather than the command. macOS, Windows, and Linux, on x86_64 and arm64 across CPython
-3.12 to 3.14, are exercised only by the required CI matrix, which has caught what a green local gate
-did not: a test building a `file://` URL by string interpolation passed everywhere paths start with
-a separator and failed on all three Windows jobs, where the drive letter parses as the URL host
-instead.
+The gate reproduces the required Rust, Python, license, and workflow-security commands that use the
+current host and toolchain. The required CI matrix still owns the MSRV build, macOS/Windows/Linux and
+CPython 3.12–3.14 coverage, and registry, path, and Git install pathways. That matrix has caught what
+a green local gate could not: a test building a `file://` URL by string interpolation passed where
+paths start with a separator and failed on Windows, where the drive letter parses as the URL host.
 
-Keep that first sentence true when a job gains a step. A command in a required job with no step
-here makes a green run mean less than it reads as: `cargo doc` was missing once, and a public item
-linking a private one passed 17 of 17 locally and failed the `rust` job after a push. Tools the
-gate does not install — `actionlint`, `cargo-deny` — report a named skip and the exact pinned
-install command instead, and `workflow_pin` reads those versions out of the workflow so the gate
-checks the version CI installs.
+Keep this command map accurate when a required job changes. A missing local command makes a green
+run mean less than it reads as: `cargo doc` was absent once, and a public item linking a private one
+passed locally before failing the hosted `rust` job. Tools the gate does not install — `actionlint`,
+`cargo-deny` — report named skips and exact pinned install commands; when installed, their versions
+must match the workflow pins before their results count as hosted-command evidence.
 
 Run the gate with no environment prefix. Never prefix
 `AI_SESSION_SEARCH_RUSTC_WRAPPER=`: it exports an empty `RUSTC_WRAPPER` and
