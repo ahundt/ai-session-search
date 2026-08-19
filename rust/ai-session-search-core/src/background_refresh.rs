@@ -909,6 +909,64 @@ mod tests {
         assert_ne!(refresh.next_command.as_deref(), Some("aise reindex --full"));
     }
 
+    /// A build without the failure classification still reads a report that carries it.
+    ///
+    /// Both directions have to hold, because long-lived server processes on one machine are
+    /// commonly different builds and either can be the one that reads. The other direction — this
+    /// build reading a report with no classification — is
+    /// `an_unclassified_failure_still_asks_for_a_correction`. This one is the direction no test in
+    /// this crate can reach by construction, since the older struct no longer exists here, so it is
+    /// restated locally: same field names, no `failure_kind`, and serde's default of ignoring
+    /// unknown fields is what makes the read succeed.
+    #[test]
+    fn a_build_without_the_failure_classification_still_reads_a_report_that_has_one() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreClassificationReport {
+            #[serde(default)]
+            database_path: Option<String>,
+            origin: BackgroundRefreshOrigin,
+            state: BackgroundRefreshState,
+            started_at: chrono::DateTime<Utc>,
+            finished_at: Option<chrono::DateTime<Utc>>,
+            process_id: u32,
+            schema_generation_before: Option<i64>,
+            schema_generation_after: Option<i64>,
+            #[serde(alias = "files_seen")]
+            files_discovered: Option<usize>,
+            files_processed: Option<usize>,
+            sessions_updated: Option<usize>,
+            error: Option<String>,
+        }
+
+        let classified = BackgroundRefreshReport {
+            database_path: Some("/tmp/index.db".to_string()),
+            origin: BackgroundRefreshOrigin::Mcp,
+            state: BackgroundRefreshState::Failed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            process_id: 42,
+            schema_generation_before: Some(4),
+            schema_generation_after: None,
+            files_discovered: Some(10),
+            files_processed: Some(3),
+            sessions_updated: None,
+            error: Some("database or disk is full".to_string()),
+            failure_kind: Some(RefreshFailureKind::StorageFull),
+        };
+        let encoded = serde_json::to_string(&classified).expect("serialize");
+        assert!(
+            encoded.contains("\"failure_kind\":\"storage_full\""),
+            "{encoded}"
+        );
+
+        let older: PreClassificationReport =
+            serde_json::from_str(&encoded).expect("a build without the field still reads this");
+        assert_eq!(older.state, BackgroundRefreshState::Failed);
+        assert_eq!(older.error.as_deref(), Some("database or disk is full"));
+        assert_eq!(older.process_id, 42);
+    }
+
     /// An older report, written before failures were classified, keeps the behavior it was written
     /// for rather than being read as a self-clearing one.
     #[test]

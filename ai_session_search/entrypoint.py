@@ -99,7 +99,11 @@ def cli_main() -> None:
         exit_code = _run_cli_command(list(args))
     except BrokenPipeError:
         return
-    except RuntimeError as error:
+    # `OSError` is what the binding raises when a filesystem or the index database runs out of
+    # space, because that is what a Python caller already catches for a full disk; every other
+    # failure stays `RuntimeError`. Both end the same way here, as one `error: ...` line and exit 1.
+    # `BrokenPipeError` is itself an `OSError`, so its arm above has to keep coming first.
+    except (RuntimeError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(1) from None
     if exit_code:

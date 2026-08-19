@@ -183,3 +183,36 @@ def test_normal_cli_treats_a_downstream_broken_pipe_as_success(
     )
 
     entrypoint.cli_main()
+
+
+def test_a_storage_failure_reaches_the_same_clean_exit_as_any_other_runtime_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A full disk exits through the console script the way every other failure does.
+
+    The native binding raises `OSError` for storage exhaustion, which is what a Python caller
+    already catches for a full disk, while every other failure stays `RuntimeError`. This entry
+    point caught only `RuntimeError`, so the change in the binding would otherwise have turned a
+    one-line `error: ...` and exit 1 into a raw traceback — for the exact condition whose whole
+    point was to tell the reader what to do.
+    """
+
+    def run_cli_command(_args: list[str]) -> int:
+        raise OSError("failed to write staging file: No space left on device (os error 28)")
+
+    monkeypatch.setattr(sys, "argv", ["aise", "reindex"])
+    monkeypatch.setattr(entrypoint, "_publish_install_evidence", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "ai_session_search._native",
+        _native_module(serve_mcp=lambda: None, run_cli_command=run_cli_command),
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        entrypoint.cli_main()
+
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: failed to write staging file")
+    assert "Traceback" not in captured.err
