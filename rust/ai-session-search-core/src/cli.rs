@@ -894,11 +894,12 @@ fn clarify_stale_message_argument(
     let stale = invalid
         .split_once('=')
         .map_or(invalid.as_str(), |(name, _)| name);
-    // Two shapes of rename, both beyond clap's edit distance. A scope rename maps name to name, and
-    // left to itself clap picks a near-miss with the wrong meaning: `--project` guesses `--role`,
-    // the defect this table was built for. A mode rename maps a bare flag to a flag AND a value, so
-    // no single argument name is close enough and clap offers nothing at all. Removing any row
-    // below restores that build's behavior, which the tests cover in both directions.
+    // Two shapes of rename, neither reachable through clap's edit distance. A scope rename maps name
+    // to name, where clap either guesses a near-miss with the wrong meaning — `--project` guesses
+    // `--role`, the defect this table was built for — or, as with `--type`, guesses nothing. A mode
+    // rename maps a bare flag to a flag AND a value, so no single argument name is close enough and
+    // clap offers nothing at all. Removing any row below restores that build's behavior, which the
+    // tests cover in both directions.
     let replacement = match stale {
         "--project" => "--workspace-path",
         "--type" => "--role",
@@ -911,6 +912,12 @@ fn clarify_stale_message_argument(
         ContextKind::SuggestedArg,
         ContextValue::String(replacement.to_string()),
     );
+    // clap adds `to pass '--type' as a value, use '-- --type'` whenever it has no suggestion of its
+    // own, which is every mode rename plus `--type`. Searching for the literal text `--type` is
+    // never what someone who typed a retired flag meant, so that tip competes with the answer this
+    // table just supplied. Clearing it is also what makes all five renames render alike: `--project`
+    // never showed the tip, because clap did have a guess there — the wrong one.
+    error.insert(ContextKind::Suggested, ContextValue::None);
     // `build()` propagates the binary-name chain, so the usage reads `aise messages search ...`
     // rather than the bare `search ...` an unbuilt subcommand renders.
     let mut root = Cli::command();
@@ -3816,13 +3823,11 @@ mod tests {
 
     /// The mode renames need the same treatment as the scope renames, and cannot get it from clap.
     ///
-    /// `--project`/`--type` reach their replacement through clap's edit distance because the new
-    /// name is one word. `--regex`/`--fuzzy`/`--explain` became a flag PLUS a value, so no single
-    /// argument name is close enough and clap falls through to `to pass '--regex' as a value, use
-    /// `-- --regex``, which is never what the caller meant. These three are the spellings
-    /// `every_documented_aise_example_parses_against_the_current_cli` removed from the shipped
-    /// documents; an agent carrying them in memory or in third-party notes still reaches the CLI
-    /// with them, so the CLI is where the answer has to be.
+    /// A mode rename maps a bare flag to a flag AND a value, so no single argument name is within
+    /// clap's edit distance and clap offers nothing of its own. `--regex`/`--fuzzy`/`--explain` are
+    /// the spellings `every_documented_aise_example_parses_against_the_current_cli` removed from the
+    /// shipped documents; an agent carrying them in memory or in third-party notes still reaches the
+    /// CLI with them, so the CLI is where the answer has to be.
     #[test]
     fn stale_message_mode_flags_name_the_canonical_replacement_and_its_value() {
         for (stale, replacement) in [
@@ -3838,12 +3843,37 @@ mod tests {
                 "`{stale}` must name `{replacement}`: {text}"
             );
             assert!(
-                !text.contains(&format!("use `-- {stale}`")),
-                "`{stale}` must not fall through to clap's pass-as-value tip: {text}"
-            );
-            assert!(
                 text.contains("Usage: aise messages search [OPTIONS] [QUERY]"),
                 "`{stale}` keeps the subcommand's real usage line: {text}"
+            );
+        }
+    }
+
+    /// Every rename answers with the replacement alone, with no competing tip.
+    ///
+    /// clap adds `to pass '--regex' as a value, use '-- --regex'` whenever it has no suggestion of
+    /// its own, which is true for every mode rename and for `--type`. Searching for the literal text
+    /// `--regex` is never what a caller who typed a retired flag meant, and once the table knows the
+    /// exact replacement that second tip competes with the answer. `--project` never showed it,
+    /// because clap had its own (wrong) guess there, so suppressing it is also what makes all five
+    /// renames render the same way.
+    ///
+    /// The assertion names the tip by its quote-independent phrase. Spelling it with the wrong
+    /// quote characters is how the first version of this check passed while the tip was still
+    /// printed.
+    #[test]
+    fn stale_message_flags_answer_with_the_replacement_and_no_pass_as_value_tip() {
+        for stale in ["--project", "--type", "--regex", "--fuzzy", "--explain"] {
+            let text = parse_cli_from(["aise", "messages", "search", "workflow", stale])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                text.contains("a similar argument exists"),
+                "`{stale}` names its replacement: {text}"
+            );
+            assert!(
+                !text.contains("as a value"),
+                "`{stale}` must not also offer clap's pass-as-value tip: {text}"
             );
         }
     }
