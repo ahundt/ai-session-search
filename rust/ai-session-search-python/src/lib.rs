@@ -51,7 +51,7 @@ use ai_session_search::{
     MessageSearchBatch as CoreMessageSearchBatch, MessageSearchBatches as CoreMessageSearchBatches,
     MessageSearchCompletion as CoreMessageSearchCompletion,
 };
-use pyo3::exceptions::{PyBrokenPipeError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyBrokenPipeError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -225,6 +225,11 @@ fn _run_cli_command(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
         ai_session_search::run_cli_from_python(argv).map_err(|error| {
             if ai_session_search::is_broken_pipe_error(&error) {
                 PyBrokenPipeError::new_err(format!("{error:#}"))
+            } else if ai_session_search::is_storage_full_error(&error) {
+                // `OSError` is what a Python caller already catches for a full disk, and the text
+                // comes from the same formatter the executable prints, so neither surface answers
+                // this condition better than the other.
+                PyOSError::new_err(ai_session_search::error_message_with_recovery(&error))
             } else {
                 runtime_error(error)
             }

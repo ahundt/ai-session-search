@@ -7,7 +7,12 @@ fn main() {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(error) if ai_session_search::is_broken_pipe_error(&error) => {}
         Err(error) => {
-            eprintln!("error: {error:#}");
+            // Formatting lives in the library so what this prints is what the Python binding
+            // raises, and so the exact text a reader sees has a test.
+            eprintln!(
+                "error: {}",
+                ai_session_search::error_message_with_recovery(&error)
+            );
             std::process::exit(1);
         }
     }

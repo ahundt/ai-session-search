@@ -164,6 +164,29 @@ pub fn is_storage_full_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// The sentence a caller needs after an operation stopped because storage is full.
+///
+/// An operating system reports a full disk as one clause with no advice. The two facts a reader
+/// cannot derive from it are what survived and what to do next, so both are stated here once.
+const STORAGE_FULL_GUIDANCE: &str =
+    "There is no free space left for this write. No partial file replaced a complete one: file \
+     writes publish by atomic rename and database writes roll back, so already-indexed history \
+     stays searchable. Free space, then rerun; `aise doctor` reports index readiness.";
+
+/// Render an application error for a person, adding recovery guidance the error itself lacks.
+///
+/// Every entry point that ends a run formats through this, so what a reader is told does not depend
+/// on whether they reached aise through the executable or through the Python binding. Cost is one
+/// formatting pass plus `O(chain depth)` classification.
+#[doc(hidden)]
+pub fn error_message_with_recovery(error: &anyhow::Error) -> String {
+    let rendered = format!("{error:#}");
+    if is_storage_full_error(error) {
+        return format!("{rendered}\n{STORAGE_FULL_GUIDANCE}");
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod storage_pressure_tests {
     /// Both sources of a full-disk failure classify the same way on every supported platform.
@@ -184,6 +207,39 @@ mod storage_pressure_tests {
         ))
         .context("could not commit the index transaction");
         assert!(super::is_storage_full_error(&database), "{database:#}");
+    }
+
+    /// What a reader is told is what the entry points print, because both format through here.
+    ///
+    /// A full disk arrives as one clause — `No space left on device (os error 28)`, or the Windows
+    /// equivalent — and a reader acting on it needs two things that clause never carries: whether
+    /// their indexed history survived, and what to do. Testing the formatter rather than each
+    /// entry point is what makes this checkable without a full disk on three platforms; the
+    /// executable and the Python binding both call it and add no wording of their own.
+    #[test]
+    fn a_storage_failure_is_rendered_with_what_survived_and_what_to_do() {
+        let rendered = super::error_message_with_recovery(
+            &anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                .context("failed to write staging file"),
+        );
+        assert!(
+            rendered.contains("failed to write staging file"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("no free space"), "{rendered}");
+        assert!(rendered.contains("stays searchable"), "{rendered}");
+        assert!(rendered.contains("aise doctor"), "{rendered}");
+    }
+
+    /// An unrelated failure is rendered exactly as before, with nothing appended.
+    #[test]
+    fn an_unrelated_failure_gains_no_storage_guidance() {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("failed to write staging file");
+        assert_eq!(
+            super::error_message_with_recovery(&error),
+            format!("{error:#}")
+        );
     }
 
     /// Failures that need a correction stay outside the wait-and-retry classification.
