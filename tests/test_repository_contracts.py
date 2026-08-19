@@ -128,6 +128,8 @@ def test_local_ci_checks_workflow_pins_and_reports_skipped_tools() -> None:
     assert "require_workflow_pin cargo-deny CARGO_DENY_VERSION" in script
     assert "require_workflow_pin actionlint ACTIONLINT_VERSION" in script
     assert "actionlint/cmd/actionlint@latest" not in script
+    assert 'zizmor --offline .github' in script
+    assert 'zizmor --offline .\n' not in script
 
 
 def test_local_gate_guidance_names_the_required_commands_that_remain_ci_owned() -> None:

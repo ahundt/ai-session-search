@@ -285,7 +285,9 @@ scan_workflow_security() {
         printf 'could not read ZIZMOR_VERSION from .github/workflows/ci.yml\n' >&2
         return 1
     fi
-    uv tool run --from "zizmor==$version" zizmor --offline .
+    # Bound the local scan to this checkout's GitHub configuration. A repository-local worktree
+    # can sit below `.worktrees/`; scanning `.` would audit that unrelated checkout as well.
+    uv tool run --from "zizmor==$version" zizmor --offline .github
 }
 
 # Rustdoc rejects what compiling accepts: a public item linking a private one resolves for a
