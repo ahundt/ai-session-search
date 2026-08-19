@@ -24,6 +24,18 @@ const REPORT_FILE_NAME: &str = "background-refresh-status.json";
 const MAX_REPORT_BYTES: u64 = 64 * 1024;
 const MAX_ERROR_CHARS: usize = 4_096;
 const PROGRESS_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a caller should wait before re-reading readiness while another process holds the
+/// writer, or a recorded update is no longer running.
+///
+/// One second, because the condition is another process finishing work it has already started.
+const CONTENDED_RETRY_INTERVAL_MS: u64 = 1_000;
+/// How long a caller should wait before re-reading readiness after a refresh ran out of space.
+///
+/// A minute rather than a second: free space returns when a person or another program releases it,
+/// which takes minutes to days, and a one-second poll against a full disk only repeats a failing
+/// write. This is the interval a caller is told to wait, not a loop this process runs, so it is a
+/// stated policy rather than a knob.
+const STORAGE_RETRY_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +72,26 @@ struct BackgroundRefreshReport {
     files_processed: Option<usize>,
     sessions_updated: Option<usize>,
     error: Option<String>,
+    /// Why the failure happened, when the writer could tell a self-clearing cause from one that
+    /// needs a correction.
+    ///
+    /// Optional and defaulted so the report stays readable in both directions: a build that
+    /// predates this field ignores it, and this build reads an older report as an unclassified
+    /// failure. Long-lived server processes on one machine are commonly different builds, so a
+    /// report either build can only half-read would break the running one.
+    #[serde(default)]
+    failure_kind: Option<RefreshFailureKind>,
+}
+
+/// A refresh failure cause that changes what the caller should do next.
+///
+/// The variants name conditions, so a reader that meets an unknown one can still act on the state
+/// and message it already understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RefreshFailureKind {
+    /// A filesystem or the index database ran out of space.
+    StorageFull,
 }
 
 pub(crate) fn run(
@@ -81,6 +113,7 @@ pub(crate) fn run(
         files_processed: None,
         sessions_updated: None,
         error: None,
+        failure_kind: None,
     };
     let mut elected = false;
 
@@ -139,6 +172,11 @@ pub(crate) fn run(
         Err(error) => {
             report.state = BackgroundRefreshState::Failed;
             report.error = Some(bounded_error(&format!("{error:#}")));
+            // Classified here, where the typed error still exists. The report keeps only the
+            // formatted text, and rediscovering the cause by matching words in that text would
+            // depend on the operating system's phrasing.
+            report.failure_kind =
+                crate::is_storage_full_error(error).then_some(RefreshFailureKind::StorageFull);
         }
     }
     // A contender that never acquired the update permit owns no durable receipt. Publishing its
@@ -265,40 +303,51 @@ fn refresh_status_from_report(
         BackgroundRefreshOrigin::Cli => IndexRefreshTrigger::CommandLine,
         BackgroundRefreshOrigin::Mcp => IndexRefreshTrigger::Mcp,
     });
-    let (state, retry_after_ms, message, next_command) = match report.state {
-        BackgroundRefreshState::Running if running_lock_is_held => (
+    let (state, retry_after_ms, message, next_command) = match (report.state, report.failure_kind) {
+        (BackgroundRefreshState::Running, _) if running_lock_is_held => (
             IndexRefreshState::Indexing,
-            Some(1_000),
+            Some(CONTENDED_RETRY_INTERVAL_MS),
             Some("Session history indexing is running.".to_string()),
             None,
         ),
-        BackgroundRefreshState::Running => (
+        (BackgroundRefreshState::Running, _) => (
             IndexRefreshState::Postponed,
-            Some(1_000),
+            Some(CONTENDED_RETRY_INTERVAL_MS),
             Some(
                 "The recorded index update is no longer running; the next MCP start will retry."
                     .to_string(),
             ),
             Some("aise reindex".to_string()),
         ),
-        BackgroundRefreshState::Updated | BackgroundRefreshState::SkippedFresh => {
+        (BackgroundRefreshState::Updated | BackgroundRefreshState::SkippedFresh, _) => {
             (IndexRefreshState::Fresh, None, None, None)
         }
-        BackgroundRefreshState::SkippedBusy => (
+        (BackgroundRefreshState::SkippedBusy, _) => (
             IndexRefreshState::Postponed,
-            Some(1_000),
+            Some(CONTENDED_RETRY_INTERVAL_MS),
             Some(
                 "Another process owns the index writer; automatic refresh will retry.".to_string(),
             ),
             None,
         ),
-        BackgroundRefreshState::Cancelled => (
+        (BackgroundRefreshState::Cancelled, _) => (
             IndexRefreshState::Postponed,
-            Some(1_000),
+            Some(CONTENDED_RETRY_INTERVAL_MS),
             Some("The index update was cancelled before completion.".to_string()),
             Some("aise reindex".to_string()),
         ),
-        BackgroundRefreshState::Failed => (
+        // A full disk clears without anything in the checkout changing, so it is postponed rather
+        // than failed: the caller is given an interval to wait and a command that reports readiness,
+        // instead of a reindex that would fail again now and rebuild from scratch later.
+        (BackgroundRefreshState::Failed, Some(RefreshFailureKind::StorageFull)) => (
+            IndexRefreshState::Postponed,
+            Some(STORAGE_RETRY_INTERVAL_MS),
+            Some(storage_full_refresh_message(report.error.as_deref())),
+            Some("aise doctor".to_string()),
+        ),
+        // Including a report written before failures carried a cause, which stays in the state its
+        // writer meant rather than being read as self-clearing.
+        (BackgroundRefreshState::Failed, None) => (
             IndexRefreshState::FailedWithRecovery,
             None,
             Some(failed_refresh_message(report.error.as_deref())),
@@ -397,15 +446,36 @@ fn bounded_error(error: &str) -> String {
     error.chars().take(MAX_ERROR_CHARS).collect()
 }
 
-fn failed_refresh_message(error: Option<&str>) -> String {
-    const GUIDANCE: &str = "Fix the reported parser, configuration, or filesystem cause before retrying; reindexing unchanged code and inputs will repeat the failure.";
-    let cause = error.unwrap_or("The automatic index update failed without recording an error.");
-    let reserved = GUIDANCE.chars().count() + 1;
+/// Join a recorded cause to its guidance without exceeding [`MAX_ERROR_CHARS`].
+///
+/// The guidance is what makes the message actionable, so the cause is what gets shortened when the
+/// two together would exceed the bound.
+fn bounded_refresh_message(cause: &str, guidance: &str) -> String {
+    let reserved = guidance.chars().count() + 1;
     let cause: String = cause
         .chars()
         .take(MAX_ERROR_CHARS.saturating_sub(reserved))
         .collect();
-    format!("{cause}\n{GUIDANCE}")
+    format!("{cause}\n{guidance}")
+}
+
+fn failed_refresh_message(error: Option<&str>) -> String {
+    const GUIDANCE: &str = "Fix the reported parser, configuration, or filesystem cause before retrying; reindexing unchanged code and inputs will repeat the failure.";
+    let cause = error.unwrap_or("The automatic index update failed without recording an error.");
+    bounded_refresh_message(cause, GUIDANCE)
+}
+
+/// Guidance for a refresh that stopped because a filesystem or the index database ran out of space.
+///
+/// This says three things a caller acting on it needs and cannot infer: the previous snapshot is
+/// still searchable, because durable writes stage beside their destination and publish by rename;
+/// nothing in the checkout needs correcting; and the automatic refresh resumes once space exists,
+/// so no reindex is required.
+fn storage_full_refresh_message(error: Option<&str>) -> String {
+    const GUIDANCE: &str = "The index update stopped because there is no free space left for it. The last completed index stays searchable, and the automatic update resumes on its own once free space is available, so no reindex is needed.";
+    let cause =
+        error.unwrap_or("The automatic index update ran out of space without recording an error.");
+    bounded_refresh_message(cause, GUIDANCE)
 }
 
 #[cfg(test)]
@@ -453,6 +523,7 @@ mod tests {
             files_processed: None,
             sessions_updated: None,
             error: None,
+            failure_kind: None,
         };
         write_best_effort(&config, &report);
         let db = crate::db::Db::open(&config.db_path()).unwrap();
@@ -499,6 +570,7 @@ mod tests {
             files_processed: Some(40),
             sessions_updated: Some(39),
             error: None,
+            failure_kind: None,
         };
         write_best_effort(&config, &active_report);
 
@@ -579,6 +651,7 @@ mod tests {
                 files_processed: None,
                 sessions_updated: None,
                 error: None,
+                failure_kind: None,
             };
             write_best_effort(&config, &report);
             assert_eq!(
@@ -617,6 +690,7 @@ mod tests {
                 sessions_updated: Some(2),
                 error: (state == BackgroundRefreshState::Failed)
                     .then(|| "older parser failure".to_string()),
+                failure_kind: None,
             };
             write_best_effort(&config, &report);
             db.mark_auto_reindex_complete().unwrap();
@@ -653,6 +727,7 @@ mod tests {
             files_processed: Some(3),
             sessions_updated: Some(2),
             error: Some("older parser failure".to_string()),
+            failure_kind: None,
         };
         write_best_effort(&config, &report);
         db.mark_auto_reindex_complete_at(completed_at).unwrap();
@@ -705,6 +780,7 @@ mod tests {
                 sessions_updated: Some(2),
                 error: (state == BackgroundRefreshState::Failed)
                     .then(|| "newer parser failure".to_string()),
+                failure_kind: None,
             };
             write_best_effort(&config, &report);
 
@@ -736,6 +812,7 @@ mod tests {
             files_processed: Some(3),
             sessions_updated: Some(2),
             error: None,
+            failure_kind: None,
         };
         write_best_effort(&config, &report);
         db.mark_auto_reindex_complete().unwrap();
@@ -769,6 +846,7 @@ mod tests {
             files_processed: Some(3),
             sessions_updated: None,
             error: Some("invalid provenance from the Claude parser".to_string()),
+            failure_kind: None,
         };
         write_best_effort(&config, &report);
 
@@ -785,6 +863,82 @@ mod tests {
         let bounded = failed_refresh_message(Some(&"x".repeat(MAX_ERROR_CHARS * 2)));
         assert!(bounded.chars().count() <= MAX_ERROR_CHARS);
         assert!(bounded.ends_with("unchanged code and inputs will repeat the failure."));
+    }
+
+    /// A refresh stopped by a full disk waits for space instead of demanding a full reindex.
+    ///
+    /// Free space returns on its own, sometimes in minutes and sometimes in days, and nothing in
+    /// the checkout or the configuration needs correcting for the next attempt to succeed.
+    /// Reporting this like a parser fault answered a self-clearing condition with
+    /// `FailedWithRecovery`, no retry interval, and `aise reindex --full` — the most expensive
+    /// command available, which fails again while the disk is still full and rebuilds from scratch
+    /// once it is not. The searchable snapshot survives either way, because every durable write
+    /// stages beside its destination and publishes by rename, so the message says so rather than
+    /// leaving the reader to assume the index was lost.
+    #[test]
+    fn a_refresh_stopped_by_a_full_disk_waits_for_space_and_keeps_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        let report = BackgroundRefreshReport {
+            database_path: Some(crate::util::normalize_path(&config.db_path())),
+            origin: BackgroundRefreshOrigin::Mcp,
+            state: BackgroundRefreshState::Failed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            process_id: 42,
+            schema_generation_before: Some(4),
+            schema_generation_after: None,
+            files_discovered: Some(10),
+            files_processed: Some(3),
+            sessions_updated: None,
+            error: Some("could not commit the index transaction: database or disk is full".into()),
+            failure_kind: Some(RefreshFailureKind::StorageFull),
+        };
+        write_best_effort(&config, &report);
+
+        let refresh = readiness_status(&config, &db).unwrap().refresh;
+        assert_eq!(refresh.state, IndexRefreshState::Postponed);
+        assert_eq!(refresh.retry_after_ms, Some(STORAGE_RETRY_INTERVAL_MS));
+        let message = refresh.message.unwrap();
+        assert!(message.contains("database or disk is full"), "{message}");
+        assert!(message.contains("free space"), "{message}");
+        assert!(message.contains("searchable"), "{message}");
+        assert_ne!(refresh.next_command.as_deref(), Some("aise reindex --full"));
+    }
+
+    /// An older report, written before failures were classified, keeps the behavior it was written
+    /// for rather than being read as a self-clearing one.
+    #[test]
+    fn an_unclassified_failure_still_asks_for_a_correction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        let report = BackgroundRefreshReport {
+            database_path: Some(crate::util::normalize_path(&config.db_path())),
+            origin: BackgroundRefreshOrigin::Mcp,
+            state: BackgroundRefreshState::Failed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            process_id: 42,
+            schema_generation_before: Some(4),
+            schema_generation_after: None,
+            files_discovered: Some(10),
+            files_processed: Some(3),
+            sessions_updated: None,
+            error: Some("invalid provenance from the Claude parser".to_string()),
+            failure_kind: None,
+        };
+        write_best_effort(&config, &report);
+
+        let refresh = readiness_status(&config, &db).unwrap().refresh;
+        assert_eq!(refresh.state, IndexRefreshState::FailedWithRecovery);
+        assert_eq!(refresh.retry_after_ms, None);
+        assert_eq!(refresh.next_command.as_deref(), Some("aise reindex --full"));
     }
 
     #[test]
@@ -818,6 +972,7 @@ mod tests {
             files_processed: Some(9),
             sessions_updated: Some(3),
             error: None,
+            failure_kind: None,
         };
         write_best_effort(&config, &report);
         assert_eq!(

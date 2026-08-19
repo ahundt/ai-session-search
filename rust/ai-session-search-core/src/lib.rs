@@ -135,3 +135,69 @@ pub fn is_broken_pipe_error(error: &anyhow::Error) -> bool {
                 .is_some_and(|error| error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe))
     })
 }
+
+/// Return whether an application error means a filesystem or the index database ran out of space.
+///
+/// Inspecting the short error chain is `O(chain depth)` time and `O(1)` memory. One classifier
+/// covers both ways a write reports exhaustion, and both are already platform-independent, so this
+/// needs no per-platform branch: `std::io::ErrorKind::StorageFull` is what the standard library
+/// maps `ENOSPC` to on Unix and `ERROR_DISK_FULL`/`ERROR_HANDLE_DISK_FULL` to on Windows, and
+/// SQLite reports `SQLITE_FULL` identically everywhere. Matching a raw platform error number here
+/// instead would need one arm per target and would silently classify nothing on the targets it
+/// missed.
+///
+/// Callers use this to separate a condition that clears by itself, sometimes after days, from one
+/// that needs a correction before the next attempt can succeed.
+#[doc(hidden)]
+pub fn is_storage_full_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull)
+            || cause
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(|error| error.io_error_kind() == Some(std::io::ErrorKind::StorageFull))
+            || cause
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                .is_some_and(|code| code == rusqlite::ErrorCode::DiskFull)
+    })
+}
+
+#[cfg(test)]
+mod storage_pressure_tests {
+    /// Both sources of a full-disk failure classify the same way on every supported platform.
+    ///
+    /// A staged file write reports it as `std::io::ErrorKind::StorageFull`, and the index database
+    /// reports it as SQLite's `SQLITE_FULL`; a caller deciding whether to wait or to ask for a
+    /// correction has to treat them alike. Neither spelling is platform-specific, which is why one
+    /// code path serves Unix and Windows.
+    #[test]
+    fn storage_exhaustion_is_recognized_from_the_filesystem_and_from_sqlite() {
+        let staged = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("failed to write staging file /tmp/index.db.stage");
+        assert!(super::is_storage_full_error(&staged), "{staged:#}");
+
+        let database = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        ))
+        .context("could not commit the index transaction");
+        assert!(super::is_storage_full_error(&database), "{database:#}");
+    }
+
+    /// Failures that need a correction stay outside the wait-and-retry classification.
+    #[test]
+    fn other_failures_are_not_reported_as_storage_exhaustion() {
+        for error in [
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("database is locked".to_string()),
+            )),
+        ] {
+            assert!(!super::is_storage_full_error(&error), "{error:#}");
+        }
+    }
+}

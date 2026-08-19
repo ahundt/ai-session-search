@@ -151,6 +151,19 @@ Do not return generic “retry,” “restart,” “remove when done,” “inv
 administrator” text when the system has more specific context. Errors remain bounded and redact
 secrets, but preserving actionability takes priority over shaving a few diagnostic bytes.
 
+A condition that clears without anyone changing the checkout is reported as waiting, not as failed.
+Exhausted storage is the case in hand: free space returns when a person or another program releases
+it, which can take minutes or days, so the automatic index refresh reports `postponed` with a
+retry interval, states that the last completed snapshot stays searchable, and names a status command
+rather than `aise reindex --full`, which would fail again while the disk is full and rebuild from
+scratch once it is not. Classify such a cause where the typed error still exists and carry the
+classification forward; rediscovering it later by matching words in a formatted message would depend
+on the operating system's phrasing. One classifier covers every supported platform, because
+`std::io::ErrorKind::StorageFull` is what the standard library maps `ENOSPC` and Windows'
+`ERROR_DISK_FULL`/`ERROR_HANDLE_DISK_FULL` to, and SQLite reports `SQLITE_FULL` identically
+everywhere; matching raw platform error numbers instead would need one arm per target and would
+classify nothing on the targets it missed.
+
 ### REQ010-protect-complexity-bounds
 
 For every performance-sensitive path, name the relevant input symbols, state present and worst-case
@@ -648,7 +661,7 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 | Contract | Primary implementation | Representative verification |
 | --- | --- | --- |
 | `REQ037-explore-before-change`; `REQ038-map-semantic-ownership`; `REQ039-reuse-or-improve-architecture`; `REQ048-adopt-proven-libraries`; `REQ040-eliminate-semantic-duplication`; `REQ043-reread-active-plans-after-compaction` | repository guidance, complete active plans, architecture seams, dependency manifests/locks/imports, upstream primary sources, git history, installed state, prior-session evidence, and current-session changes | end-to-end plan reread after compaction/resumption, plan-to-diff regression audit, graph plus coverage when available, exact-source review, dependency/library comparison, history diff, installed reproduction |
-| `REQ041-optimize-multi-objective-outcomes`; `REQ044-automate-safe-problem-solving`; `REQ045-own-and-clean-resources`; `REQ046-preserve-boundary-results`; `REQ047-return-actionable-recovery` | typed service owners, iterator/transaction/subprocess lifecycles, Rust/PyO3/Python adapters, CLI/MCP termination, installers/updaters, public error types | automatic-recovery and invalid-use fixtures; completion/break/drop/cancel/error/broken-pipe cleanup; GIL/mutex tests; return/error parity; actionable-error snapshots with preserved/cleaned-state assertions |
+| `REQ041-optimize-multi-objective-outcomes`; `REQ044-automate-safe-problem-solving`; `REQ045-own-and-clean-resources`; `REQ046-preserve-boundary-results`; `REQ047-return-actionable-recovery` | typed service owners, iterator/transaction/subprocess lifecycles, Rust/PyO3/Python adapters, CLI/MCP termination, installers/updaters, public error types, `lib.rs` error classifiers, `durable_fs.rs`, `background_refresh.rs` | automatic-recovery and invalid-use fixtures; completion/break/drop/cancel/error/broken-pipe cleanup; GIL/mutex tests; return/error parity; actionable-error snapshots with preserved/cleaned-state assertions; storage-exhaustion classified from both the filesystem and SQLite, and reported as postponed with a retry interval rather than as a failure needing a reindex |
 | `REQ010-protect-complexity-bounds`; `REQ030-benchmark-risky-paths` | `db.rs`, `service.rs`, `trigram_index.rs`, `analysis_pipeline.rs`, `files.rs`, `scripts/benchmark_release.py` | complexity comments/tests, deterministic scale fixtures, latency/CPU/RSS/output benchmark reports |
 | `REQ002-share-typed-contract`; `REQ003-preserve-surface-semantics`; `REQ004-separate-retrieval-presentation`; `REQ005-return-match-evidence`; `REQ006-report-extent-honestly`; `REQ007-preserve-page-identity`; `REQ008-reject-hidden-cutoffs`; `REQ009-bound-fuzzy-search`; `REQ012-reject-invalid-combinations`; `REQ013-resolve-parameters-by-origin` | `rust/ai-session-search-core/src/message_search.rs`, `service.rs`, `messages.rs`, `mcp_server.rs` | `rust/ai-session-search-core/tests/message_search_contract.rs`, service/MCP unit tests, `tests/test_native_binding.py` |
 | `REQ011-validate-language-boundaries` | `rust/ai-session-search-python/src/lib.rs`, `ai_session_search/_native.pyi` | native binding tests, stubtest, runtime/stub parity |
