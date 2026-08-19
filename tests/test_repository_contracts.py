@@ -245,13 +245,22 @@ _CLAP_RENDERED_PHRASES = (
 # The three quote characters clap and this codebase actually emit; curly quotes appear in prose,
 # never in rendered CLI output, so including them would only trip the ambiguous-character lint.
 _QUOTE_CHARACTERS = "`'\""
-_FORMAT_PLACEHOLDER = re.compile(r"\{[^{}]*\}")
-_NEGATIVE_CONTAINS = (
-    re.compile(r"!\s*[A-Za-z_][\w.()\[\]&*]*\s*\.contains\(\s*&?\"((?:[^\"\\]|\\.)*)\""),
-    re.compile(
-        r"!\s*[A-Za-z_][\w.()\[\]&*]*\s*\.contains\(\s*&format!\(\s*\"((?:[^\"\\]|\\.)*)\""
-    ),
+# `"..."` with escapes, and `r"..."` / `r#"..."#` raw strings, which take no escapes. Both forms
+# appear in this codebase, and a check that reads only the first would miss the same defect written
+# the other way.
+_RUST_STRING = re.compile(
+    r"""r(?P<hashes>\#*)"(?P<raw>.*?)"(?P=hashes)|"(?P<plain>(?:[^"\\]|\\.)*)\"""",
+    re.DOTALL,
 )
+_NEGATIVE_CONTAINS = re.compile(r"!\s*[A-Za-z_][\w.()\[\]&*]*\s*\.contains\(\s*&?(?:format!\(\s*)?")
+
+
+_FORMAT_PLACEHOLDER = re.compile(r"\{[^{}]*\}")
+
+
+def _placeholder_insensitive(text: str) -> str:
+    """Normalize placeholder names but keep quote characters, so quoting still decides a match."""
+    return _FORMAT_PLACEHOLDER.sub("\x00", text)
 
 
 def _quote_and_placeholder_insensitive(text: str) -> str:
@@ -267,9 +276,12 @@ def test_no_negative_assertion_names_clap_output_in_the_wrong_quotes() -> None:
     so the assertion could never match, never fail, and the tip was printed next to the correct
     suggestion for four of the five renamed flags until it was found by reading the real output.
 
-    Matching ignores quote characters and format-placeholder names, because the assertion and the
-    rendering name their placeholder differently; comparing the two literally is what misses the
-    case. An assertion whose exact text a phrase already contains is left alone.
+    Scope, deliberately narrow: this decides the case where the assertion keeps clap's placeholder,
+    spelled with its own name — `{stale}` against clap's `{arg}` — which is the form the defect took
+    and the form that can be decided without guessing. An assertion that spells the value outright,
+    `exists: `--role`` against `exists: '--role'`, normalizes to the same text as the correctly
+    quoted version, so flagging it would flag the correct spelling too. A wider version of this check
+    was written, measured against both, and reverted for exactly that false positive.
     """
     rendered = {
         _quote_and_placeholder_insensitive(phrase): phrase for phrase in _CLAP_RENDERED_PHRASES
@@ -280,20 +292,26 @@ def test_no_negative_assertion_names_clap_output_in_the_wrong_quotes() -> None:
     offenders: list[str] = []
     for name in filter(None, sources.split("\0")):
         text = (ROOT / name).read_text(encoding="utf-8", errors="replace")
-        for pattern in _NEGATIVE_CONTAINS:
-            for match in pattern.finditer(text):
-                needle = match.group(1)
-                if not any(quote in needle for quote in _QUOTE_CHARACTERS):
-                    continue
-                if any(needle in phrase for phrase in _CLAP_RENDERED_PHRASES):
-                    continue
-                loose = _quote_and_placeholder_insensitive(needle)
-                shadowed = [
-                    phrase for key, phrase in rendered.items() if loose and loose in key
-                ]
-                if shadowed:
-                    line = text[: match.start()].count("\n") + 1
-                    offenders.append(f"{name}:{line} asserts {needle!r}, clap renders {shadowed[0]!r}")
+        for call in _NEGATIVE_CONTAINS.finditer(text):
+            literal = _RUST_STRING.match(text, call.end())
+            if literal is None:
+                continue
+            raw = literal.group("raw")
+            needle = raw if raw is not None else literal.group("plain")
+            if not any(quote in needle for quote in _QUOTE_CHARACTERS):
+                continue
+            # Already spelled clap's way. The comparison normalizes placeholder names but keeps
+            # quote characters, because an assertion naming its own placeholder — `{stale}` where
+            # clap writes `{arg}` — is correct as long as the quotes around it match, and requiring
+            # the names to match too reported the correctly quoted spelling as a defect.
+            correct = _placeholder_insensitive(needle)
+            if any(correct in _placeholder_insensitive(phrase) for phrase in _CLAP_RENDERED_PHRASES):
+                continue
+            loose = _quote_and_placeholder_insensitive(needle)
+            shadowed = [phrase for key, phrase in rendered.items() if loose and loose in key]
+            if shadowed:
+                line = text[: call.start()].count("\n") + 1
+                offenders.append(f"{name}:{line} asserts {needle!r}, clap renders {shadowed[0]!r}")
     assert not offenders, "negative assertions that cannot fail: " + "; ".join(offenders)
 
 
