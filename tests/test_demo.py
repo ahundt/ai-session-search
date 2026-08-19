@@ -1100,6 +1100,7 @@ def _run(
     show_prompt: bool = True,
     shell: bool = False,
     env: dict[str, str] | None = None,
+    check: bool = False,
 ) -> subprocess.CompletedProcess:
     """Print a shell prompt + command (with typing effect), then run it.
 
@@ -1107,6 +1108,7 @@ def _run(
     shell=True: needed only for commands with real shell pipes (|).
     env=None (default): DEMO_ENV. The MCP act passes MCP_DEMO_ENV so that integration
     commands read and print a throwaway HOME instead of the recording machine's real one.
+    check=True: raise when an act that promises successful output exits unsuccessfully.
     """
     if show_prompt:
         _type("\n\033[1;32m$\033[0m ", delay=0)
@@ -1119,6 +1121,8 @@ def _run(
         capture_output=False,   # let output flow to terminal (captured by asciinema)
         text=True,
     )
+    if check:
+        result.check_returncode()
     return result
 
 
@@ -1279,22 +1283,27 @@ def run_post_a_acts() -> None:
     # ── Act 1: built-in corrections skill, --since 30d ────────────────────────
     section("Step 1: What mistakes did I keep correcting? — 30 days of patterns")
     pause(2.0)
-    _run(f"aise skills corrections --since 30d {PROV}")
+    _run(f"aise skills corrections --since 30d {PROV}", check=True)
     pause(7.0)
 
     # ── Act 2: regex search — find corrections the classifier missed ─────────
     section("Step 2: Dig deeper — search your own words for correction patterns")
     pause(2.0)
     _run(
-        f'aise messages search "forgot|missed|wrong" --role user --regex'
-        f' --context-after 2 {PROV}'
+        f'aise messages search "forgot|missed|wrong" --role user --query-mode regex'
+        f' --context-after 2 {PROV}',
+        check=True,
     )
     pause(7.0)
 
-    # ── Act 3: targeted search in sessions with known corrections ─────────────
+    # ── Act 3: targeted search in a session with known corrections ────────────
     section("Step 3: Zoom in — search a specific session for follow-up context")
     pause(2.0)
-    _run(f'aise messages search "you forgot" --context-after 3 {PROV}')
+    _run(
+        f'aise messages search "you forgot" --session-id {_S4}'
+        f' --context-after 3 {PROV}',
+        check=True,
+    )
     pause(7.0)
 
     # ── Act 4: the CLAUDE.md fix ──────────────────────────────────────────────
@@ -1307,7 +1316,7 @@ def run_post_a_acts() -> None:
     # ── Act 5: a week later — verify the loop closed ────────────────────────
     section("Step 5: Verify — did the fix actually work?")
     pause(2.0)
-    _run(f"aise skills corrections --since 7d {PROV}")
+    _run(f"aise skills corrections --since 7d {PROV}", check=True)
     pause(7.0)
 
     # ── Done ─────────────────────────────────────────────────────────────────
@@ -1733,9 +1742,9 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
 # Checks for the --post-a self-improvement loop demo.
 _POST_A_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     # Act 1: built-in corrections skill, --since 30d
-    ("corrections",  "Act 1: corrections skill produced output"),
-    # Act 2: regex search forgot|missed|wrong
-    ("missed",       "Act 2: regex search finds correction patterns across sessions"),
+    ("skip_step",    "Act 1: corrections skill produced classified output"),
+    # Act 2: regex search forgot|missed|wrong; this context is not echoed by the command.
+    ("You're right. Running with uv run python", "Act 2: regex search returned result context"),
     # Act 3: targeted search "you forgot"
     ("You forgot",   "Act 3: targeted search finds 'you forgot' in sessions"),
     # Act 4: CLAUDE.md fix — section header written by section()
@@ -2104,6 +2113,39 @@ class TestDemoFree:
         for fragment, desc in _VERIFY_CHECKS:
             assert fragment in combined, \
                 f"MISSING: {desc} — expected {fragment!r} in output:\n{combined[-2000:]}"
+
+    def test_run_check_raises_when_a_demo_command_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A checked command cannot become successful-looking recording output."""
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess("aise", 2),
+        )
+
+        with pytest.raises(subprocess.CalledProcessError):
+            _run("aise messages search needle", show_prompt=False, check=True)
+
+    def test_post_a_commands_use_supported_modes_and_fail_on_command_errors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every executed Post A command uses current CLI syntax and must succeed."""
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def fake_run(cmd: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(sys.modules[__name__], "_run", fake_run)
+        monkeypatch.setattr(sys.modules[__name__], "pause", lambda _seconds: None)
+        run_post_a_acts()
+
+        assert len(calls) == 4
+        assert '--query-mode regex' in calls[1][0]
+        assert '--regex' not in calls[1][0]
+        assert f'--session-id {_S4}' in calls[2][0]
+        assert all(kwargs.get("check") is True for _, kwargs in calls)
 
     def test_post_a_acts_full_pathway(self) -> None:
         """Run all Post A demo acts end-to-end and verify expected output."""
