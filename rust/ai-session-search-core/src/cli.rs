@@ -917,6 +917,13 @@ fn clarify_stale_message_argument(
     // never what someone who typed a retired flag meant, so that tip competes with the answer this
     // table just supplied. Clearing it is also what makes all five renames render alike: `--project`
     // never showed the tip, because clap did have a guess there — the wrong one.
+    //
+    // This clears a whole context slot, and for an unknown argument clap fills that slot with one of
+    // exactly two things: the pass-as-value tip above, or `'<subcommand> <flag>' exists` when the
+    // flag belongs to a child command. Only the first is reachable here, because clap looks for that
+    // second case among the current command's children and `messages search` has none — an invariant
+    // `message_search_has_no_subcommands_so_clearing_the_suggestion_slot_drops_only_the_value_tip`
+    // holds, so adding a child command fails there rather than silently deleting its suggestion.
     error.insert(ContextKind::Suggested, ContextValue::None);
     // `build()` propagates the binary-name chain, so the usage reads `aise messages search ...`
     // rather than the bare `search ...` an unbuilt subcommand renders.
@@ -3876,6 +3883,35 @@ mod tests {
                 "`{stale}` must not also offer clap's pass-as-value tip: {text}"
             );
         }
+    }
+
+    /// Clearing clap's suggestion slot for a renamed flag can only drop the pass-as-value tip.
+    ///
+    /// `clarify_stale_message_argument` clears `ContextKind::Suggested` whole. For an unknown
+    /// argument clap fills that slot with one of two things: the pass-as-value tip, or
+    /// `'<subcommand> <flag>' exists` when the flag belongs to a child of the command that rejected
+    /// it. The second is what makes clearing the slot lossy, and it is unreachable only while
+    /// `messages search` has no children — `--regex`, for one, is a real flag on `aise repeats`, so
+    /// the case is not hypothetical, only out of reach from this command. Giving `messages search`
+    /// a subcommand would put it in reach; this fails first.
+    #[test]
+    fn message_search_has_no_subcommands_so_clearing_the_suggestion_slot_drops_only_the_value_tip()
+    {
+        let mut root = Cli::command();
+        root.build();
+        let search = root
+            .find_subcommand_mut("messages")
+            .and_then(|messages| messages.find_subcommand_mut("search"))
+            .expect("messages search exists");
+        let children: Vec<_> = search
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect();
+        assert!(
+            children.is_empty(),
+            "clearing the suggestion slot would now delete clap's `'<subcommand> <flag>' exists` \
+             tip: {children:?}"
+        );
     }
 
     /// The renames stay rejections, never working aliases: accepting `--regex` would keep two
