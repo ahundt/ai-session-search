@@ -3362,11 +3362,35 @@ fn status_skill_file(
         )?);
     }
 
-    if states
+    let absent = states
         .iter()
-        .all(|state| *state == ManagedFileState::Missing)
-    {
+        .filter(|state| **state == ManagedFileState::Missing)
+        .count();
+    if absent == states.len() {
         return Ok(ManagedFileState::Missing.label().to_string());
+    }
+    // Some files gone is a different fact from every file gone, and `max()` alone gave both the
+    // same word: an install one reference file short of a newer build reported `missing` while
+    // four of five files were byte-current, which reads as "nothing is installed" about a working
+    // skill. The count is the actionable part, and the repair rewrites only what is absent.
+    if absent > 0 {
+        let remaining = states
+            .iter()
+            .filter(|state| **state != ManagedFileState::Missing)
+            .copied()
+            .max()
+            .unwrap_or(ManagedFileState::Current);
+        let mut label = format!(
+            "incomplete: {absent} of {} managed files missing; `aise integrations install` \
+             restores them",
+            states.len()
+        );
+        // A package can be short some files and hold damaged ones at the same time. Reporting only
+        // the count would drop the second fact, which the repair does not address.
+        if remaining != ManagedFileState::Current {
+            label.push_str(&format!("; remaining files {}", remaining.label()));
+        }
+        return Ok(label);
     }
     let worst = states
         .into_iter()
@@ -5040,14 +5064,17 @@ mod tests {
 
         // A skill missing one reference file is NOT `configured`: reporting the anchor alone
         // would call a half-installed directory healthy, which is what an interrupted upgrade
-        // leaves behind.
+        // leaves behind. It is not `missing` either, which would say the package is absent when
+        // every other file is current.
         fs::remove_file(root.join("references/message-classification.md")).unwrap();
-        assert_eq!(
-            status_skill_file(&target, &absent).unwrap(),
-            "missing",
-            "a deleted managed file is reported as missing, the actionable fact, rather than \
-             summarized away by the two files that are still current"
+        let partial = status_skill_file(&target, &absent).unwrap();
+        assert!(
+            partial.starts_with("incomplete: 1 of 5 managed files missing"),
+            "a deleted managed file is reported with its count, the actionable fact, rather than \
+             summarized away by the files that are still current or overstated as an absent \
+             package: {partial}"
         );
+        assert!(partial.contains("aise integrations install"), "{partial}");
         let repair = normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap();
         assert_eq!(repair.len(), 1, "repair rewrites only the missing file");
         execute_planned_transaction(&receipt, &repair).unwrap();
@@ -5964,6 +5991,21 @@ mod tests {
         fs::remove_file(root.join("references/message-classification.md")).unwrap();
 
         let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        let partial = status_skill_file(&target, &manifest).unwrap();
+        assert!(
+            partial.starts_with("incomplete: 1 of 5 managed files missing"),
+            "{partial}"
+        );
+
+        // Every file gone is a different fact from one file gone, and the words have to differ:
+        // `aise integrations status` printed `missing` for a package whose other four files were
+        // byte-current, which reads as "nothing is installed" about a working skill.
+        for file in target.package.files {
+            let path = root.join(file.relative_path);
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
         assert_eq!(status_skill_file(&target, &manifest).unwrap(), "missing");
     }
 
