@@ -168,10 +168,15 @@ pub fn is_storage_full_error(error: &anyhow::Error) -> bool {
 ///
 /// An operating system reports a full disk as one clause with no advice. The two facts a reader
 /// cannot derive from it are what survived and what to do next, so both are stated here once.
+///
+/// The claim is that the indexed history is intact, which is what atomic publication and
+/// transaction rollback actually guarantee. It deliberately stops short of promising that a new
+/// process can open the index right now: a WAL database whose `-shm` sidecar is absent needs to
+/// create one, and on a completely full disk that creation is itself a write that can fail.
 const STORAGE_FULL_GUIDANCE: &str =
     "There is no free space left for this write. No partial file replaced a complete one: file \
-     writes publish by atomic rename and database writes roll back, so already-indexed history \
-     stays searchable. Free space, then rerun; `aise doctor` reports index readiness.";
+     writes publish by atomic rename and database writes roll back, so the history already indexed \
+     is intact. Free space, then rerun; `aise doctor` reports index readiness.";
 
 /// Render an application error for a person, adding recovery guidance the error itself lacks.
 ///
@@ -227,8 +232,11 @@ mod storage_pressure_tests {
             "{rendered}"
         );
         assert!(rendered.contains("no free space"), "{rendered}");
-        assert!(rendered.contains("stays searchable"), "{rendered}");
+        assert!(rendered.contains("is intact"), "{rendered}");
         assert!(rendered.contains("aise doctor"), "{rendered}");
+        // Availability is not promised, only integrity: creating an absent WAL sidecar is itself a
+        // write, so a new process opening the index on a full disk can still fail.
+        assert!(!rendered.contains("searchable"), "{rendered}");
     }
 
     /// An unrelated failure is rendered exactly as before, with nothing appended.
