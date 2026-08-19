@@ -315,6 +315,33 @@ def test_no_negative_assertion_names_clap_output_in_the_wrong_quotes() -> None:
     assert not offenders, "negative assertions that cannot fail: " + "; ".join(offenders)
 
 
+def test_every_actions_definition_lives_where_the_local_workflow_scan_looks() -> None:
+    """The local and hosted workflow-security scans have to audit the same files.
+
+    Hosted CI runs `zizmor --offline .`; the local gate runs `zizmor --offline .github`, bounded
+    that way so a repository-local worktree under `.worktrees/` is not audited as part of this
+    checkout. The two agree only while every file zizmor audits sits under `.github`. Workflows are
+    there by GitHub's own rule, but a composite action is a plain `action.yml` that can live in any
+    directory, and one added outside `.github` would be scanned hosted and skipped locally — the
+    exact divergence the gate exists to prevent, and one that would surface as a surprise CI
+    failure rather than a local one.
+    """
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "action.yml", "action.yaml", "*/action.yml", "*/action.yaml"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    stray = [
+        name for name in filter(None, tracked.split("\0")) if not name.startswith(".github/")
+    ]
+    assert not stray, (
+        "these Actions definitions are audited by the hosted `zizmor --offline .` and skipped by "
+        f"the local `zizmor --offline .github`: {stray}"
+    )
+
+
 def test_a_repository_local_worktree_leaves_the_release_status_check_clean() -> None:
     """RELEASING.md requires `git status --short` to be clean before tagging, so a second checkout
     placed under `.worktrees/` has to be ignored.
