@@ -46,7 +46,7 @@ Homepage = "https://github.com/ahundt/ai-session-search"
 Documentation = "https://github.com/ahundt/ai-session-search/blob/main/README.md"
 Repository = "https://github.com/ahundt/ai-session-search"
 Issues = "https://github.com/ahundt/ai-session-search/issues"
-Changelog = "https://github.com/ahundt/ai-session-search/releases"
+Changelog = "https://github.com/ahundt/ai-session-search/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "rust/ai-session-search-python/Cargo.toml"
