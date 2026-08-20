@@ -34,6 +34,11 @@ RELEASE_DOC_REQUIREMENTS = ("docs/development/library-api.md",)
 _DOCUMENTED_REQUIREMENT = re.compile(
     re.escape(CORE_CRATE) + r'\s*=\s*\{[^}]*\bversion\s*=\s*"([^"]+)"'
 )
+# The changelog section for the released version is that release's notes, so the release
+# job publishes it verbatim. Keep a Changelog spells a released section as
+# "## [1.2.3] - 2026-01-02"; "## [Unreleased]" carries no date and never matches a tag.
+CHANGELOG = "CHANGELOG.md"
+_CHANGELOG_SECTION = re.compile(r"^## \[(?P<version>[^]]+)\](?P<dated> - \d{4}-\d{2}-\d{2})?\s*$")
 
 
 class ReleaseMetadataError(ValueError):
@@ -85,6 +90,41 @@ def _verify_documented_requirements(root: pathlib.Path, cargo_version: str) -> N
             )
 
 
+def release_notes(root: pathlib.Path, version: str) -> str:
+    """Return the changelog body describing ``version``, without its heading.
+
+    The section runs from its own heading to the next one, so what a reader sees in the file
+    is what the release publishes. A tag is permanent, so a missing, undated, or empty section
+    is reported here rather than discovered on the published release.
+    """
+    body: list[str] | None = None
+    for line in (root / CHANGELOG).read_text(encoding="utf-8").splitlines():
+        section = _CHANGELOG_SECTION.match(line)
+        if section is None:
+            if body is not None:
+                body.append(line)
+            continue
+        if body is not None:
+            break
+        if section["version"] == version:
+            if section["dated"] is None:
+                raise ReleaseMetadataError(
+                    f"{CHANGELOG} section '## [{version}]' needs the release date, "
+                    f"written as '## [{version}] - YYYY-MM-DD'"
+                )
+            body = []
+    if body is None:
+        raise ReleaseMetadataError(
+            f"{CHANGELOG} has no '## [{version}]' section; rename '## [Unreleased]' to "
+            f"'## [{version}] - YYYY-MM-DD', open a fresh unreleased heading above it, and "
+            "point the link definitions at the new tag"
+        )
+    notes = "\n".join(body).strip()
+    if not notes:
+        raise ReleaseMetadataError(f"{CHANGELOG} section '## [{version}]' describes no changes")
+    return notes + "\n"
+
+
 def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
     project = _manifest(root / "pyproject.toml")
     core = _manifest(root / "rust/ai-session-search-core/Cargo.toml")
@@ -121,6 +161,7 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
                 f"instead of the release version {cargo_version!r}"
             )
     _verify_documented_requirements(root, cargo_version)
+    release_notes(root, version)
     return version
 
 
@@ -147,9 +188,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--tag", required=True)
+    parser.add_argument(
+        "--notes-out",
+        type=pathlib.Path,
+        help="write the release's changelog section here for the GitHub Release body",
+    )
     args = parser.parse_args(argv)
     try:
-        print(verify_release_metadata(args.root, args.tag))
+        version = verify_release_metadata(args.root, args.tag)
+        if args.notes_out is not None:
+            args.notes_out.write_text(release_notes(args.root, version), encoding="utf-8")
+        print(version)
     except (KeyError, OSError, ReleaseMetadataError, tomllib.TOMLDecodeError) as error:
         print(f"release metadata verification failed: {error}", file=sys.stderr)
         return 1

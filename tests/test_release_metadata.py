@@ -11,14 +11,34 @@ from scripts.release_versions import cargo_version_for_python
 from scripts.verify_release_metadata import (
     ReleaseMetadataError,
     reconcile_registry_artifacts,
+    release_notes,
     verify_release_metadata,
 )
+
+
+def _write_changelog(
+    root: Path,
+    version: str,
+    *,
+    heading_suffix: str = " - 2026-01-02",
+    body: str = "### Fixed\n\n- A concrete change.\n",
+) -> None:
+    (root / "CHANGELOG.md").write_text(
+        "# Changelog\n\n"
+        "## [Unreleased]\n\n"
+        f"## [{version}]{heading_suffix}\n\n"
+        f"{body}\n"
+        "## [0.9.0] - 2025-12-01\n\n"
+        "First release.\n",
+        encoding="utf-8",
+    )
 
 
 def _write_manifests(
     root: Path, python_version: str = "1.0.0", cargo_version: str | None = None
 ) -> None:
     cargo_version = cargo_version or python_version
+    _write_changelog(root, python_version)
     (root / "skills/ai-session-search").mkdir(parents=True)
     (root / "rust/ai-session-search-core").mkdir(parents=True)
     (root / "rust/ai-session-search-core/skills/ai-session-search").mkdir(parents=True)
@@ -156,6 +176,44 @@ def test_release_metadata_rejects_a_removed_documented_core_requirement(tmp_path
 
     with pytest.raises(ReleaseMetadataError, match="documents no ai-session-search version"):
         verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
+def test_release_metadata_rejects_a_tag_the_changelog_does_not_describe(tmp_path: Path) -> None:
+    # 1.0.0rc1 shipped with no release notes at all. The pre-tag checklist bullet that
+    # replaced that habit is a line a human reads, so only this gate reports skipping it.
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+    _write_changelog(tmp_path, "1.0.0rc1")
+
+    with pytest.raises(ReleaseMetadataError, match=r"CHANGELOG\.md has no"):
+        verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
+def test_release_metadata_rejects_a_changelog_section_left_undated(tmp_path: Path) -> None:
+    # A heading renamed off `## [Unreleased]` without its date means the pre-tag step
+    # stopped halfway, and the published notes would carry no release date.
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+    _write_changelog(tmp_path, "1.0.0rc2", heading_suffix="")
+
+    with pytest.raises(ReleaseMetadataError, match="needs the release date"):
+        verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
+def test_release_metadata_rejects_an_empty_changelog_section(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+    _write_changelog(tmp_path, "1.0.0rc2", body="")
+
+    with pytest.raises(ReleaseMetadataError, match="describes no changes"):
+        verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
+def test_release_notes_return_one_version_section(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+
+    notes = release_notes(tmp_path, "1.0.0rc2")
+
+    assert notes == "### Fixed\n\n- A concrete change.\n"
+    assert "Unreleased" not in notes
+    assert "First release." not in notes
 
 
 @pytest.mark.parametrize(

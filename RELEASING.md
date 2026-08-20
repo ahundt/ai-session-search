@@ -61,7 +61,8 @@ change them only in a separate reviewed toolchain change.
 Behavior changes that ship in a release are described in [CHANGELOG.md](CHANGELOG.md), not here.
 Accumulate them under `## [Unreleased]` as they land, so the section is written by the people who
 made the changes rather than reconstructed from history at tag time. The release notes for a
-version are that version's changelog section.
+version are that version's changelog section: the metadata gate refuses a tag the changelog does
+not describe, and publishes the section it validated as the GitHub Release body.
 
 ## Release blockers
 
@@ -270,7 +271,8 @@ Before tagging, confirm:
 - `CHANGELOG.md` carries this version: rename `## [Unreleased]` to `## [X.Y.ZrcN] - YYYY-MM-DD`
   with the tag's date, add a fresh empty `## [Unreleased]` above it, and point the link
   definitions at the new tag. Anything a user has to do when upgrading belongs first in that
-  section.
+  section, because the whole section is published as the release body. The metadata gate rejects
+  a missing, undated, or empty section, and `--notes-out FILE` writes the body it would publish.
 - `git status --short` is clean.
 - The staged release diff was inspected before its version commit.
 - `python -m scripts.verify_release_metadata --tag vX.Y.ZrcN` passes.
