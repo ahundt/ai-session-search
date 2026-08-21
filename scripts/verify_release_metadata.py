@@ -12,6 +12,7 @@ import re
 import sys
 import tomllib
 from collections.abc import Mapping
+from datetime import date
 
 from scripts.release_versions import cargo_version_for_python
 
@@ -38,7 +39,7 @@ _DOCUMENTED_REQUIREMENT = re.compile(
 # job publishes it verbatim. Keep a Changelog spells a released section as
 # "## [1.2.3] - 2026-01-02"; "## [Unreleased]" carries no date and never matches a tag.
 CHANGELOG = "CHANGELOG.md"
-_CHANGELOG_SECTION = re.compile(r"^## \[(?P<version>[^]]+)\](?P<dated> - \d{4}-\d{2}-\d{2})?\s*$")
+_CHANGELOG_SECTION = re.compile(r"^## \[(?P<version>[^]]+)\](?: - (?P<date>\d{4}-\d{2}-\d{2}))?\s*$")
 
 
 class ReleaseMetadataError(ValueError):
@@ -91,35 +92,48 @@ def _verify_documented_requirements(root: pathlib.Path, cargo_version: str) -> N
 
 
 def release_notes(root: pathlib.Path, version: str) -> str:
-    """Return the changelog body describing ``version``, without its heading.
+    """Return the one valid dated changelog body describing ``version``.
 
-    The section runs from its own heading to the next one, so what a reader sees in the file
-    is what the release publishes. A tag is permanent, so a missing, undated, or empty section
-    is reported here rather than discovered on the published release.
+    The section runs from its own heading to the next one, so what a reader sees in the file is
+    what the release publishes. A tag is permanent: missing, duplicate, undated, impossible-date,
+    or empty sections are reported here rather than discovered on the published release.
     """
-    body: list[str] | None = None
-    for line in (root / CHANGELOG).read_text(encoding="utf-8").splitlines():
-        section = _CHANGELOG_SECTION.match(line)
-        if section is None:
-            if body is not None:
-                body.append(line)
-            continue
-        if body is not None:
-            break
-        if section["version"] == version:
-            if section["dated"] is None:
-                raise ReleaseMetadataError(
-                    f"{CHANGELOG} section '## [{version}]' needs the release date, "
-                    f"written as '## [{version}] - YYYY-MM-DD'"
-                )
-            body = []
-    if body is None:
+    lines = (root / CHANGELOG).read_text(encoding="utf-8").splitlines()
+    headings = [
+        (index, section)
+        for index, line in enumerate(lines)
+        if (section := _CHANGELOG_SECTION.match(line)) is not None
+    ]
+    matches = [(index, section) for index, section in headings if section["version"] == version]
+    if not matches:
         raise ReleaseMetadataError(
             f"{CHANGELOG} has no '## [{version}]' section; rename '## [Unreleased]' to "
             f"'## [{version}] - YYYY-MM-DD', open a fresh unreleased heading above it, and "
             "point the link definitions at the new tag"
         )
-    notes = "\n".join(body).strip()
+    if len(matches) != 1:
+        raise ReleaseMetadataError(
+            f"{CHANGELOG} has more than one '## [{version}]' section; each release version "
+            "must have exactly one body"
+        )
+
+    start, section = matches[0]
+    release_date = section["date"]
+    if release_date is None:
+        raise ReleaseMetadataError(
+            f"{CHANGELOG} section '## [{version}]' needs the release date, "
+            f"written as '## [{version}] - YYYY-MM-DD'"
+        )
+    try:
+        date.fromisoformat(release_date)
+    except ValueError as error:
+        raise ReleaseMetadataError(
+            f"{CHANGELOG} section '## [{version}]' needs a valid ISO calendar date; "
+            f"found {release_date!r}"
+        ) from error
+
+    end = next((index for index, _ in headings if index > start), len(lines))
+    notes = "\n".join(lines[start + 1 : end]).strip()
     if not notes:
         raise ReleaseMetadataError(f"{CHANGELOG} section '## [{version}]' describes no changes")
     return notes + "\n"

@@ -206,6 +206,30 @@ def test_release_metadata_rejects_an_empty_changelog_section(tmp_path: Path) -> 
         verify_release_metadata(tmp_path, "v1.0.0rc2")
 
 
+@pytest.mark.parametrize("release_date", ["2026-02-30", "2026-99-99", "0000-00-00"])
+def test_release_metadata_rejects_an_impossible_changelog_date(
+    tmp_path: Path, release_date: str
+) -> None:
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+    _write_changelog(tmp_path, "1.0.0rc2", heading_suffix=f" - {release_date}")
+
+    with pytest.raises(ReleaseMetadataError, match="valid ISO calendar date"):
+        verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
+def test_release_metadata_rejects_duplicate_version_sections(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(
+        changelog.read_text(encoding="utf-8")
+        + "\n## [1.0.0rc2] - 2026-01-03\n\nA conflicting second body.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseMetadataError, match=r"more than one.*1\.0\.0rc2"):
+        verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
 def test_release_notes_return_one_version_section(tmp_path: Path) -> None:
     _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
 
