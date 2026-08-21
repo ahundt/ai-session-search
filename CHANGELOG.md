@@ -62,8 +62,9 @@ consumer comparing receipt numbers with 1.0.0rc1 sees different values for some 
 - `aise integrations status` distinguishes a package whose files are all absent from one missing
   some, reporting the count and the command that restores them.
 - An index refresh stopped by a full disk reports `postponed` with a retry interval and states that
-  the last completed index stays searchable. It no longer asks for `aise reindex --full`, which
-  would fail again while the disk is full.
+  the last completed index remains intact. After space is freed it names the incremental
+  `aise reindex` retry and `aise doctor` verification instead of promising an ownerless timer or
+  asking for `aise reindex --full`, which would fail again while the disk is full.
 - A command that runs out of disk space says what survived and what to do next. The Python API
   raises `OSError` for that case, matching what Python callers already catch for a full disk.
 - The `search_messages` MCP description states what computing a receipt's corpus count costs, so a

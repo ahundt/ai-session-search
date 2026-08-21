@@ -337,13 +337,14 @@ fn refresh_status_from_report(
             Some("aise reindex".to_string()),
         ),
         // A full disk clears without anything in the checkout changing, so it is postponed rather
-        // than failed: the caller is given an interval to wait and a command that reports readiness,
-        // instead of a reindex that would fail again now and rebuild from scratch later.
+        // than failed. No one-shot detached child or idle MCP worker owns a retry timer, however, so
+        // the status names the incremental retry a user can reliably start after freeing space.
+        // `--full` would only repeat the failure now and rebuild needlessly later.
         (BackgroundRefreshState::Failed, Some(RefreshFailureKind::StorageFull)) => (
             IndexRefreshState::Postponed,
             Some(STORAGE_RETRY_INTERVAL_MS),
             Some(storage_full_refresh_message(report.error.as_deref())),
-            Some("aise doctor".to_string()),
+            Some("aise reindex".to_string()),
         ),
         // Including a report written before failures carried a cause, which stays in the state its
         // writer meant rather than being read as self-clearing.
@@ -467,12 +468,12 @@ fn failed_refresh_message(error: Option<&str>) -> String {
 
 /// Guidance for a refresh that stopped because a filesystem or the index database ran out of space.
 ///
-/// This says three things a caller acting on it needs and cannot infer: the previous snapshot is
-/// still searchable, because durable writes stage beside their destination and publish by rename;
-/// nothing in the checkout needs correcting; and the automatic refresh resumes once space exists,
-/// so no reindex is required.
+/// This says what a caller acting on it needs and cannot infer: the previous snapshot remains
+/// intact because durable writes publish atomically or roll back; freeing space is the correction;
+/// the incremental reindex is the reliable retry; and `aise doctor` verifies readiness. It does not
+/// promise immediate availability on a full disk or an automatic timer no lifecycle owner runs.
 fn storage_full_refresh_message(error: Option<&str>) -> String {
-    const GUIDANCE: &str = "The index update stopped because there is no free space left for it. The last completed index stays searchable, and the automatic update resumes on its own once free space is available, so no reindex is needed.";
+    const GUIDANCE: &str = "The index update stopped because there is no free space left for it. The last completed index remains intact. Free space, then run `aise reindex`; it continues incrementally, so no full rebuild is needed. Run `aise doctor` to verify readiness.";
     let cause =
         error.unwrap_or("The automatic index update ran out of space without recording an error.");
     bounded_refresh_message(cause, GUIDANCE)
@@ -865,18 +866,15 @@ mod tests {
         assert!(bounded.ends_with("unchanged code and inputs will repeat the failure."));
     }
 
-    /// A refresh stopped by a full disk waits for space instead of demanding a full reindex.
+    /// A refresh stopped by a full disk waits for space without promising an ownerless retry.
     ///
-    /// Free space returns on its own, sometimes in minutes and sometimes in days, and nothing in
-    /// the checkout or the configuration needs correcting for the next attempt to succeed.
-    /// Reporting this like a parser fault answered a self-clearing condition with
-    /// `FailedWithRecovery`, no retry interval, and `aise reindex --full` — the most expensive
-    /// command available, which fails again while the disk is still full and rebuilds from scratch
-    /// once it is not. The searchable snapshot survives either way, because every durable write
-    /// stages beside its destination and publishes by rename, so the message says so rather than
-    /// leaving the reader to assume the index was lost.
+    /// Free space can return minutes or days later, but neither the one-shot detached refresh child
+    /// nor an idle MCP worker owns a timer. Status therefore names the incremental retry the user
+    /// can reliably start, and `aise doctor` as verification. It also claims integrity rather than
+    /// availability: atomic file publication and database rollback preserve the previous index,
+    /// but a new process on a completely full disk may be unable to create a missing WAL sidecar.
     #[test]
-    fn a_refresh_stopped_by_a_full_disk_waits_for_space_and_keeps_the_snapshot() {
+    fn a_refresh_stopped_by_a_full_disk_names_the_retry_and_preserved_state_honestly() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
@@ -905,8 +903,11 @@ mod tests {
         let message = refresh.message.unwrap();
         assert!(message.contains("database or disk is full"), "{message}");
         assert!(message.contains("free space"), "{message}");
-        assert!(message.contains("searchable"), "{message}");
-        assert_ne!(refresh.next_command.as_deref(), Some("aise reindex --full"));
+        assert!(message.contains("intact"), "{message}");
+        assert!(message.contains("aise doctor"), "{message}");
+        assert!(!message.contains("searchable"), "{message}");
+        assert!(!message.contains("on its own"), "{message}");
+        assert_eq!(refresh.next_command.as_deref(), Some("aise reindex"));
     }
 
     /// A build without the failure classification still reads a report that carries it.

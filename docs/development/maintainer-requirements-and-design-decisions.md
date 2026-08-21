@@ -153,12 +153,15 @@ secrets, but preserving actionability takes priority over shaving a few diagnost
 
 A condition that clears without anyone changing the checkout is reported as waiting, not as failed.
 Exhausted storage is the case in hand: free space returns when a person or another program releases
-it, which can take minutes or days, so the automatic index refresh reports `postponed` with a
-retry interval, states that the last completed snapshot stays searchable, and names a status command
-rather than `aise reindex --full`, which would fail again while the disk is full and rebuild from
-scratch once it is not. Classify such a cause where the typed error still exists and carry the
-classification forward; rediscovering it later by matching words in a formatted message would depend
-on the operating system's phrasing. One classifier covers every supported platform, because
+it, which can take minutes or days, so the automatic index refresh reports `postponed` with a retry
+interval and states that the last completed snapshot remains intact. A one-shot detached child and
+an idle MCP worker own no retry timer, so status must not promise that work resumes merely because
+space returned: it names the reliable incremental `aise reindex` retry and `aise doctor` as the
+verification step. It never asks for `aise reindex --full`, which would fail again while the disk is
+full and rebuild from scratch once it is not. Classify such a cause where the typed error still
+exists and carry the classification forward; rediscovering it later by matching words in a formatted
+message would depend on the operating system's phrasing. One classifier covers every supported
+platform, because
 `std::io::ErrorKind::StorageFull` is what the standard library maps `ENOSPC` and Windows'
 `ERROR_DISK_FULL`/`ERROR_HANDLE_DISK_FULL` to, and SQLite reports `SQLITE_FULL` identically
 everywhere; matching raw platform error numbers instead would need one arm per target and would
