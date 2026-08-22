@@ -311,7 +311,7 @@ impl OfficialMcpServer {
         transport: T,
     ) -> Result<
         rmcp::service::RunningService<rmcp::RoleServer, Self>,
-        rmcp::service::ServerInitializeError,
+        Box<rmcp::service::ServerInitializeError>,
     >
     where
         T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
@@ -325,7 +325,7 @@ impl OfficialMcpServer {
             inner: transport,
             refresh: Arc::clone(&self.refresh_after_delivery),
         };
-        self.serve(transport).await
+        self.serve(transport).await.map_err(Box::new)
     }
 
     #[cfg(test)]
