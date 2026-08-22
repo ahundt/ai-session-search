@@ -19,7 +19,7 @@ One release has one identity, spelled the way each ecosystem requires:
 | Final X.Y.Z (including patch releases) | `X.Y.Z`, tag `vX.Y.Z` | `X.Y.Z` |
 
 `scripts/release_versions.py` is the sole mapping between the two spellings. Preparing a
-release means setting all seven declarations to the new version in one commit and tagging that
+release means setting all eight declarations to the new version in one commit and tagging that
 commit. The consumer crate stays unpublished at `0.0.0`; only its requirement on the released
 core crate carries the release version:
 
@@ -32,6 +32,7 @@ core crate carries the release version:
 | `tests/rust-api-consumer/Cargo.toml` | `dependencies.ai-session-search.version` |
 | `skills/ai-session-search/SKILL.md` | `metadata.version` |
 | `rust/ai-session-search-core/skills/ai-session-search/SKILL.md` | `metadata.version` |
+| `docs/development/library-api.md` | the `ai-session-search = { version = "…" }` snippet |
 
 Cargo resolves a stale `X.Y.Z-rc.N` requirement against a newer core crate without complaint,
 so `cargo check --locked` cannot report either dependency drifting. The metadata gate is the
@@ -73,7 +74,10 @@ Registration is done once and holds for every later release. Confirm rather than
   `https://crates.io/crates/ai-session-search/settings`.
 - The PyPI trusted publisher is registered for the same repository, workflow, and environment
   `pypi` (a pending publisher until the first upload creates the project, an ordinary project
-  publisher afterwards).
+  publisher afterwards). The settings page re-prompts for the account password. Once a version
+  exists, the registry serves the identity it accepted and reading that needs no password:
+  `https://pypi.org/integrity/ai-session-search/<version>/<file>/provenance` returns the recorded
+  `repository`, `workflow`, and `environment`.
 - GitHub environments `crates-io`, `pypi`, and `release` have the intended maintainers and
   approval rules.
 - The `release-tags` ruleset is active over `refs/tags/v*`:
@@ -189,7 +193,16 @@ assuming the version string carried through:
 | --- | --- | --- |
 | GitHub Release | Explicit `--prerelease`, chosen by the `case` on the tag in the `release` job | `gh release view vX.Y.ZrcN --json isPrerelease` |
 | PyPI | Implicit in the PEP 440 spelling `X.Y.ZrcN` | `curl -s https://pypi.org/pypi/ai-session-search/json` and read `info.version` |
-| crates.io | Implicit in the SemVer spelling `X.Y.Z-rc.N` | `curl -s https://crates.io/api/v1/crates/ai-session-search` and read `max_stable_version` |
+| crates.io | Implicit in the SemVer spelling `X.Y.Z-rc.N` | the command below, reading `max_stable_version` |
+
+crates.io answers its API with HTTP 403 and a [data access policy](https://crates.io/data-access)
+error unless the request identifies its caller, and curl's default `User-Agent` does not, so name
+the caller:
+
+```bash
+curl -s -H 'User-Agent: ai-session-search release check (https://github.com/ahundt/ai-session-search)' \
+  https://crates.io/api/v1/crates/ai-session-search
+```
 
 The GitHub flag is the only one a release can get wrong on its own; the other two follow from
 the version string the metadata gate already pins. crates.io reporting
@@ -298,11 +311,15 @@ crates.io has no test registry, so only the Python half can be rehearsed. Do it 
 `pypi`, because a rejected wheel tag or unrenderable metadata cannot be fixed in place once
 crates.io has published an immutable version.
 
-Register a pending publisher on TestPyPI, which is a separate account from PyPI, using the same
-project, owner, and workflow values as PyPI but environment `testpypi`. TestPyPI re-prompts for
-the account password before accepting publisher changes; a submission made after that window
-lapses is discarded without an error, so confirm the publisher appears under **Pending
-publishers** before continuing.
+TestPyPI is a separate account from PyPI and needs its own publisher, carrying the same project,
+owner, and workflow values but environment `testpypi`. It follows the same lifecycle as PyPI's:
+pending until the first upload creates the project, an ordinary project publisher afterwards.
+Once a version exists, confirm it by reading the identity TestPyPI recorded, which needs no
+password: `https://test.pypi.org/integrity/ai-session-search/<version>/<file>/provenance`.
+
+To register one the first time: TestPyPI re-prompts for the account password before accepting
+publisher changes, and a submission made after that window lapses is discarded without an error,
+so confirm the publisher appears under **Pending publishers** before continuing.
 
 `gh workflow run publish.yml --ref vX.Y.ZrcN` then reuses the same build and verification
 pipeline and uploads to TestPyPI. Confirm it installs:
