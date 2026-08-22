@@ -109,9 +109,9 @@ consumer comparing receipt numbers with 1.0.0rc1 sees different values for some 
 
 ### Security
 
-- Published wheels no longer name the machine that built them. The embedded CycloneDX SBOM records
-  workspace crates by relative path, and artifact verification rejects a wheel that still carries a
-  build directory.
+- Published wheels no longer record the directory they were built in. The embedded CycloneDX SBOM
+  names workspace crates by relative path, and artifact verification rejects a wheel that still
+  carries a build directory.
 - Wheels build reproducibly from a pinned `SOURCE_DATE_EPOCH`, and artifact verification proves the
   build received it.
 - Build provenance attestation runs only for a real tag push.
