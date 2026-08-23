@@ -16,8 +16,8 @@ compatibility baseline; tags below it do not define a compatibility contract.
 ### Changed
 
 - The bundled SQLite moves from 3.50.2 to 3.53.2, through rusqlite 0.40. Measured over 52 paired
-  benchmark cases on a generated fixture, every required result digest matched and peak memory
-  stayed within 1.7%, except the terminal UI's startup, which dropped 10%.
+  benchmark cases on a generated fixture, every required result digest matched, and peak memory
+  moved between -10% and +2.6%, the largest drop being the terminal UI's startup.
 
 ### Fixed
 
