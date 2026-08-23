@@ -1,5 +1,17 @@
 version: 2
 
+# Version updates only. Dependabot security updates are a separate repository setting and are
+# currently off, so nothing here reacts to an advisory. Rust is covered anyway: the required
+# `workflow-security` job runs `cargo deny --locked check advisories`, which denies a RustSec
+# advisory with no exceptions. GitHub Actions and Python have no equivalent gate.
+#
+# Every action is pinned to a commit SHA with its release tag in a trailing comment. The comment
+# is load-bearing, not decoration: when a pinned SHA carries no tag, Dependabot falls through to
+# the head of the containing branch and proposes unreleased code
+# (https://github.com/dependabot/dependabot-core/issues/14716). That is how PR #15 came to
+# propose Swatinem/rust-cache f0d9c388, a master commit eleven days newer than v2.9.2. Check any
+# action bump against `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` before merging it.
+
 updates:
   - package-ecosystem: "uv"
     directory: "/"
@@ -8,6 +20,16 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    groups:
+      # Every Requires-Dist entry is gated behind `extra == 'dev'`, so these are build and test
+      # tools. One pull request per week for the routine moves, with majors kept separate.
+      python-dev-tools:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "cargo"
     directory: "/"
@@ -16,7 +38,20 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    groups:
+      # 227 crates in the normal dependency graph against a five-pull-request ceiling: ungrouped,
+      # routine patch bumps can fill every slot and hide the update that matters. Majors stay
+      # individual because they are the ones that need a migration, as rusqlite 0.37 to 0.40 did.
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
+  # Deliberately ungrouped. These bumps land in publish.yml, which signs the release attestation
+  # and publishes to crates.io and PyPI, so each one stays separately reviewable and revertible.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
