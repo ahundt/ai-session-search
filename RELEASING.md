@@ -403,6 +403,77 @@ when you inspect a later pause. Do not rebuild or replace an artifact between st
 third-party Action must remain pinned to a reviewed commit SHA. Attestations supplement artifact
 inspection; they do not prove an artifact safe.
 
+## Running a release, step by step
+
+Each step gives both paths. The browser suits an irreversible step you want to look at first; the
+commands suit inspection and repetition. They do the same thing.
+
+**1. Create and push the tag.** Only the repository admin role can, per the `release-tags` ruleset.
+
+```bash
+git tag -a vX.Y.ZrcN -m "AI Session Search X.Y.ZrcN"
+git push origin vX.Y.ZrcN
+git rev-list -n1 vX.Y.ZrcN   # must equal the commit CI passed on
+```
+
+**2. Find the run and watch it.**
+
+- Browser: `https://github.com/<owner>/<repo>/actions/workflows/publish.yml`, newest run.
+- Commands:
+
+```bash
+RID=$(gh run list --workflow publish.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run watch "$RID"
+gh run view "$RID" --json status,jobs \
+  --jq '{status, waiting:[.jobs[]|select(.status=="waiting")|.name],
+         failed:[.jobs[]|select(.conclusion!="" and .conclusion!="success" and .conclusion!="skipped")|.name]}'
+```
+
+**3. Inspect the artifacts before the first approval.** The `verify` job already enforced the
+complete set and `publish-testpypi` already installed the wheel from TestPyPI, so this is a second
+pair of eyes. Expect five wheels, one sdist, one crate, five native archives, `SHA256SUMS`, three
+CycloneDX SBOMs, and separate Python and Rust license inventories.
+
+- Browser: the run summary lists them, and the `verify` job log shows the `--release-set` result.
+  Attestations are at `https://github.com/<owner>/<repo>/attestations`.
+- Commands, which re-run the same check on the downloaded bytes:
+
+```bash
+CHECKOUT=$PWD
+# One --name per call. Passing several to one call makes gh create a directory per artifact,
+# which separates SHA256SUMS from the files it lists.
+for a in verified-python-distributions verified-native-distributions \
+         verified-crate-distribution verified-release-metadata; do
+  gh run download "$RID" --name "$a" --dir /tmp/release
+done
+cd /tmp/release && shasum -a 256 -c SHA256SUMS
+# Absolute paths: --directory runs the verifier from the checkout, where a relative path
+# resolves against the wrong root.
+find "$PWD" -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+  | xargs -0 uv run --directory "$CHECKOUT" python -m scripts.verify_release_artifacts \
+      --release-set --version X.Y.ZrcN
+```
+
+**4. Approve `crates-io`, then `pypi`, then `release`.** Each pause appears only after the
+previous job finishes, so approve one at a time.
+
+- Browser: the yellow **Review deployments** banner on the run page, tick one environment,
+  **Approve and deploy**.
+- Commands, which need a token carrying `repo` and `workflow` scope:
+
+```bash
+gh api "repos/<owner>/<repo>/actions/runs/$RID/pending_deployments" \
+  --jq '.[] | "\(.environment.id) \(.environment.name) can_approve=\(.current_user_can_approve)"'
+gh api -X POST "repos/<owner>/<repo>/actions/runs/$RID/pending_deployments" \
+  -F 'environment_ids[]=<id>' -f state=approved -f comment='<version> <environment>'
+```
+
+**5. Attach the demo media** through the release page's **Edit** view. This has no command-line
+equivalent, and demo media is never committed to the repository or the archives.
+
+**6. Verify the three pre-release surfaces**, per [Pre-release semantics](#pre-release-semantics).
+`gh release view vX.Y.ZrcN --json isPrerelease` is the only one a release can get wrong on its own.
+
 ## Post-release and recovery
 
 Install the published version into clean Cargo and Python environments. Verify `aise --version`,
