@@ -45,7 +45,7 @@ uv run python -m scripts.verify_release_metadata --tag vX.Y.ZrcN
 What is published is recorded by the registries and by `git tag`, never by this file: `git tag
 --list 'v*'`, `https://crates.io/crates/ai-session-search`, and
 `https://pypi.org/project/ai-session-search/`. The working tree declares the next candidate in
-the seven locations above.
+the eight locations above.
 
 ## Toolchain and compatibility
 
@@ -307,9 +307,15 @@ Before tagging, confirm:
 
 ## TestPyPI rehearsal
 
-crates.io has no test registry, so only the Python half can be rehearsed. Do it before approving
-`pypi`, because a rejected wheel tag or unrenderable metadata cannot be fixed in place once
-crates.io has published an immutable version.
+crates.io has no test registry, so only the Python half can be rehearsed. The tag push rehearses
+it automatically: `publish-testpypi` runs on both triggers and `publish-crate` waits for it, so a
+rejected wheel tag or unrenderable metadata stops the release while every registry version is
+still repairable. The 1.0.0rc2 tag push is why it works that way, because the job was
+dispatch-only then and reported `skipped` while the crate went to crates.io.
+
+The job uploads the verified wheels and sdist, then installs the release from TestPyPI alone and
+runs `aise --version`, because an accepted upload is a weaker property than an installable wheel.
+`skip-existing` keeps a tag push working after a dispatch already rehearsed that version.
 
 TestPyPI is a separate account from PyPI and needs its own publisher, carrying the same project,
 owner, and workflow values but environment `testpypi`. It follows the same lifecycle as PyPI's:
@@ -321,8 +327,9 @@ To register one the first time: TestPyPI re-prompts for the account password bef
 publisher changes, and a submission made after that window lapses is discarded without an error,
 so confirm the publisher appears under **Pending publishers** before continuing.
 
-`gh workflow run publish.yml --ref vX.Y.ZrcN` then reuses the same build and verification
-pipeline and uploads to TestPyPI. Confirm it installs:
+To rehearse before tagging, or to rehearse a ref on its own,
+`gh workflow run publish.yml --ref <ref>` reuses the same build and verification pipeline and
+stops after TestPyPI. The same install check runs inside the job; to repeat it by hand:
 
 ```bash
 uv run --isolated --no-project --default-index https://test.pypi.org/simple/ \
@@ -336,12 +343,12 @@ dependency to resolve. A project with runtime dependencies absent from TestPyPI 
 and `--index-strategy unsafe-best-match` instead. `--no-project` keeps this checkout's own
 `pyproject.toml` out of the resolution.
 
-`publish-crate`, `publish`, and `release` are gated on `github.event_name == 'push'` and
-`publish-testpypi` on `workflow_dispatch`, and those are the only triggers, so a dispatch can
-never reach a production registry and a tag push can never reach TestPyPI. A rehearsal consumes
-the version on TestPyPI; a second attempt at the same version needs a new one.
+`publish-crate`, `publish`, and `release` are gated on `github.event_name == 'push'`, and those
+are the only triggers, so a dispatch stops at TestPyPI and can never reach a production registry.
+`publish-testpypi` carries no event gate, which is what makes the rehearsal part of a release
+rather than a step beside it.
 
-The GitHub provenance attestation in the `verify` job is gated on `push` for the same reason.
+The GitHub provenance attestation in the `verify` job stays gated on `push`, unlike the rehearsal.
 `actions/attest-build-provenance` has no dry-run — `push-to-registry` only controls registry
 push and `create-storage-record` only controls artifact metadata — so every invocation signs an
 attestation into the repository's list, and there is no API to remove one. A rehearsal would
@@ -377,23 +384,24 @@ holds that role and is unaffected.
 3. installs and tests the exact artifacts on their target runners;
 4. verifies the complete artifact set, writes `SHA256SUMS`, and creates GitHub build-provenance
    attestations;
-5. reproduces the attested crate, then compares the registry's recorded sha256 for this
+5. uploads the verified wheels and sdist to TestPyPI and installs the release from that index
+   alone, so an unusable distribution stops the release before any immutable version exists.
+   The `testpypi` environment has no approval rule, so this adds no pause;
+6. reproduces the attested crate, then compares the registry's recorded sha256 for this
    version before requesting short-lived crates.io credentials. An absent version publishes; a
    version already carrying the attested checksum is skipped so a retry reaches the remaining
    jobs; a version carrying different bytes fails, because the tag would otherwise try to
    replace an immutable release;
-6. pauses at `crates-io`, publishes through OIDC, then pauses at `pypi` and publishes the
+7. pauses at `crates-io`, publishes through OIDC, then pauses at `pypi` and publishes the
    verified wheel/sdist set with PyPI attestations;
-7. pauses at `release` and creates the GitHub release (marked pre-release for an `rcN` tag)
+8. pauses at `release` and creates the GitHub release (marked pre-release for an `rcN` tag)
    from the same verified artifacts.
 
-Approve protected environments only in that order. Do not rebuild or replace an artifact
-between stages. Before the first approval, confirm five wheels, one sdist, one crate, five
-native archives, checksums, three CycloneDX SBOMs, separate Python/Rust license inventories,
-and attestations. Every third-party Action must remain pinned to a reviewed commit SHA.
-Attestations supplement artifact inspection; they do not prove an artifact safe. Demo media for
-the release page is attached through the GitHub release UI by the maintainer and is never
-committed to the repository or the archives.
+Approve protected environments only in that order. The `needs` chain enforces it, so an
+out-of-order approval is impossible, but the order still decides what has already been published
+when you inspect a later pause. Do not rebuild or replace an artifact between stages. Every
+third-party Action must remain pinned to a reviewed commit SHA. Attestations supplement artifact
+inspection; they do not prove an artifact safe.
 
 ## Post-release and recovery
 

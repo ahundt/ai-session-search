@@ -764,6 +764,36 @@ def test_wheels_job_proves_the_pinned_build_clock_reached_the_build() -> None:
     assert '--source-date-epoch "$SOURCE_DATE_EPOCH"' in wheels
 
 
+def test_the_testpypi_rehearsal_gates_the_first_immutable_publication() -> None:
+    # A rehearsal that only a separate manual dispatch can reach is one a release can skip, and
+    # the 1.0.0rc2 tag push did skip it: `publish-testpypi` reported `skipped` while the crate
+    # went to crates.io. Registry versions are immutable, so a wheel problem found afterwards
+    # costs a whole new version rather than a re-upload.
+    #
+    # Two properties make the rehearsal a gate instead of an option, and both are asserted
+    # because either alone is satisfiable while the release still publishes unrehearsed bytes:
+    # the job runs on a tag push at all, and `publish-crate` waits for its result.
+    jobs = _workflow_jobs((ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8"))
+    testpypi, crate = jobs["publish-testpypi"], jobs["publish-crate"]
+
+    assert "github.event_name" not in testpypi, (
+        "publish-testpypi must run on a tag push as well as a dispatch; an event gate here is "
+        f"what let a release publish without rehearsing. Job was:\n{testpypi}"
+    )
+    assert "needs: [verify, publish-testpypi]" in crate, (
+        "publish-crate must wait for publish-testpypi, so a rejected wheel or unrenderable "
+        "metadata stops the release while every registry version is still repairable"
+    )
+    # TestPyPI rejects re-uploading a file it already holds, so without this a tag push fails
+    # for any version a dispatch rehearsed first: the check passing would break the release.
+    assert "skip-existing: true" in testpypi
+
+    # An accepted upload is a weaker property than an installable wheel. Without this the job
+    # would go green on a distribution nothing can install, which is the failure the rehearsal
+    # exists to catch.
+    assert "--default-index https://test.pypi.org/simple/" in testpypi
+
+
 def test_build_provenance_is_attested_only_for_a_real_tag_push() -> None:
     # `actions/attest-build-provenance` has no dry-run: `push-to-registry` only controls
     # registry push, `create-storage-record` only controls artifact metadata, and every

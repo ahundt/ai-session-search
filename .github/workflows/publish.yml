@@ -406,7 +406,7 @@ jobs:
           if-no-files-found: error
 
   publish-crate:
-    needs: verify
+    needs: [verify, publish-testpypi]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -473,9 +473,16 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
+  # Runs on both triggers, and `publish-crate` waits for it, so the rehearsal gates the first
+  # immutable publication instead of being a separate step a release can forget. A rejected wheel
+  # tag or unrenderable metadata is repairable while nothing has been published; once crates.io
+  # holds the version, the only repair is a new one.
+  #
+  # `skip-existing` keeps a tag push working after a dispatch already rehearsed that version:
+  # TestPyPI rejects a re-upload of the same file, which would otherwise fail the release for a
+  # check that had already passed.
   publish-testpypi:
     needs: verify
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: testpypi
@@ -490,6 +497,30 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           attestations: true
+          skip-existing: true
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      # An accepted upload is weaker than an installable wheel, and the difference is what a
+      # rehearsal exists to catch. `--default-index` replaces PyPI rather than adding to it, so
+      # this fails if anything has to come from the production index; every Requires-Dist entry
+      # in the wheel is gated behind `extra == 'dev'`, leaving no runtime dependency to resolve.
+      # TestPyPI's simple index trails the upload by seconds, hence the retry.
+      - name: Install the rehearsed distribution from TestPyPI alone
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in 1 2 3 4 5 6; do
+            if uv run --isolated --no-project \
+              --default-index https://test.pypi.org/simple/ \
+              --with "ai-session-search==${version}" aise --version; then
+              exit 0
+            fi
+            echo "attempt ${attempt} failed; TestPyPI index may still be catching up"
+            sleep 20
+          done
+          echo "::error::ai-session-search ${version} did not install from TestPyPI"
+          exit 1
 
   publish:
     needs: [verify, publish-crate]
