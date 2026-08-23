@@ -371,7 +371,14 @@ struct ProgressHandlerReset<'connection>(&'connection Connection);
 
 impl Drop for ProgressHandlerReset<'_> {
     fn drop(&mut self) {
-        self.0.progress_handler(0, None::<fn() -> bool>);
+        // rusqlite 0.40 reports whether clearing the handler succeeded. Drop cannot propagate,
+        // and leaving this query's expired deadline installed would stop the next query on the
+        // same connection, so surface it where a caller can act: debug and test builds.
+        let cleared = self.0.progress_handler(0, None::<fn() -> bool>);
+        debug_assert!(
+            cleared.is_ok(),
+            "clearing the SQLite progress handler failed: {cleared:?}"
+        );
     }
 }
 
@@ -535,15 +542,20 @@ pub(crate) fn with_sqlite_query_control<T>(
         })
         .transpose()?;
     let progress_cancellation = cancellation.clone();
-    connection.progress_handler(
-        QUERY_PROGRESS_HANDLER_OPCODES,
-        Some(move || {
-            progress_cancellation
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Acquire))
-                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-        }),
-    );
+    // Propagated rather than ignored: a handler that failed to install leaves the query with
+    // neither its deadline nor its cancellation, so it would run to completion while the caller
+    // believes both are armed.
+    connection
+        .progress_handler(
+            QUERY_PROGRESS_HANDLER_OPCODES,
+            Some(move || {
+                progress_cancellation
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+                    || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            }),
+        )
+        .with_context(|| format!("{operation} could not arm its query stop conditions"))?;
     let reset = ProgressHandlerReset(connection);
     let result = run();
     drop(reset);
@@ -695,16 +707,23 @@ impl Db {
         self.conn.get_interrupt_handle()
     }
 
-    pub(crate) fn interrupt_while(&self, cancellation: Arc<AtomicBool>) {
-        self.conn.progress_handler(
-            QUERY_PROGRESS_HANDLER_OPCODES,
-            Some(move || cancellation.load(Ordering::Acquire)),
-        );
+    /// Arm this connection so a raised `cancellation` flag stops the running query.
+    ///
+    /// Returns the failure instead of swallowing it: a caller that believes cancellation is
+    /// armed, on a connection where it is not, waits for a query it can no longer stop.
+    pub(crate) fn interrupt_while(&self, cancellation: Arc<AtomicBool>) -> Result<()> {
+        self.conn
+            .progress_handler(
+                QUERY_PROGRESS_HANDLER_OPCODES,
+                Some(move || cancellation.load(Ordering::Acquire)),
+            )
+            .context("could not arm query cancellation on this connection")
     }
 
-    pub(crate) fn install_query_cancellation(&self, cancellation: &QueryCancellation) {
-        self.interrupt_while(cancellation.flag_arc());
+    pub(crate) fn install_query_cancellation(&self, cancellation: &QueryCancellation) -> Result<()> {
+        self.interrupt_while(cancellation.flag_arc())?;
         cancellation.register(&self.conn);
+        Ok(())
     }
 
     pub(crate) fn with_read_snapshot<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -3732,11 +3751,26 @@ impl Db {
         sql.push_str(" order by a.ord, m.seq");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
-            Ok((row.get::<_, usize>(0)?, row_to_message_hit_at(row, 1)?))
+            // `ord` is json_each's key over the bounds array, so it numbers the anchors from
+            // zero and indexes `windows` directly. SQLite stores it as an i64 and rusqlite
+            // stopped converting integers to usize in 0.38, so read the stored width and
+            // narrow once here.
+            Ok((row.get::<_, i64>(0)?, row_to_message_hit_at(row, 1)?))
         })?;
         for row in rows {
-            let (ordinal, hit) = row?;
-            windows[ordinal].push(hit);
+            let (ord, hit) = row?;
+            // A negative or oversized ordinal would index outside `windows`. Indexing panics
+            // there; naming the value and the bound reports which query produced it.
+            let window = usize::try_from(ord)
+                .ok()
+                .and_then(|ordinal| windows.get_mut(ordinal))
+                .with_context(|| {
+                    format!(
+                        "context window ordinal {ord} falls outside the {} anchors queried",
+                        anchors.len()
+                    )
+                })?;
+            window.push(hit);
         }
         Ok(windows)
     }
@@ -9049,7 +9083,9 @@ mod tests {
             )
             .unwrap();
         let corpus = 4_usize;
-        for seq in 0..corpus {
+        // `seq` is a SQLite integer column: bind the width SQLite stores, which rusqlite 0.40
+        // no longer infers from usize.
+        for seq in 0..corpus as i64 {
             db.conn
                 .execute(
                     "insert into messages (session_id, provider, seq, role, content) \
@@ -11783,7 +11819,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
-        db.interrupt_while(Arc::clone(&cancellation));
+        db.interrupt_while(Arc::clone(&cancellation))
+            .expect("arming cancellation is a precondition of this test");
 
         // Setting the flag before SQLite starts the statement reproduces the race that a one-shot
         // InterruptHandle cannot cover: interrupt() is a no-op when no statement is active.
@@ -11815,7 +11852,8 @@ mod tests {
         let cancellation = QueryCancellation::new();
 
         cancellation.cancel();
-        db.install_query_cancellation(&cancellation);
+        db.install_query_cancellation(&cancellation)
+            .expect("arming cancellation is a precondition of this test");
 
         let error = db
             .conn

@@ -44,7 +44,7 @@ regex = "1.12"
 regex-syntax = "0.8"
 rmcp = { version = "3.1.0", default-features = false, features = ["server", "transport-io"] }
 unicode-segmentation = "1.13"
-rusqlite = { version = "0.37", features = ["backup", "bundled", "chrono", "functions", "hooks"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled", "chrono", "functions", "hooks"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 semver = "1.0"
