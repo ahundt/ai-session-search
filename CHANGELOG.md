@@ -13,6 +13,19 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
+### Changed
+
+- The bundled SQLite moves from 3.50.2 to 3.53.2, through rusqlite 0.40. Measured over 52 paired
+  benchmark cases on a generated fixture, every required result digest matched and peak memory
+  stayed within 1.7%, except the terminal UI's startup, which dropped 10%.
+
+### Fixed
+
+- A tool call that cannot arm its own cancellation now says so. It previously ran uncancellable
+  while the client believed its cancellation still applied.
+- A `query_session_index` call whose read-only restriction fails to install is refused rather than
+  run without it.
+
 ## [1.0.0rc2] - 2026-08-22
 
 ### Upgrading and breaking changes

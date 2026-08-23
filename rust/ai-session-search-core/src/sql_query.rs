@@ -384,10 +384,18 @@ fn schema_summary_connection(
 
 fn with_read_only_authorizer<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
     conn.execute_batch("pragma query_only = on")?;
-    conn.authorizer(Some(read_only_authorizer));
+    // Fail closed. rusqlite 0.40 reports whether the authorizer installed, and running the
+    // caller's SQL after a failed install would drop the read-only restriction this function
+    // exists to impose.
+    conn.authorizer(Some(read_only_authorizer))
+        .context("could not install the read-only SQL authorizer")?;
     let result = f();
-    conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
-    result
+    let cleared = conn
+        .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
+        .context("could not clear the read-only SQL authorizer");
+    // The caller asked about their query, so its own error wins. A failed clear leaves the
+    // authorizer installed, which restricts later statements rather than loosening them.
+    result.and_then(|value| cleared.map(|()| value))
 }
 
 struct ColumnNames {

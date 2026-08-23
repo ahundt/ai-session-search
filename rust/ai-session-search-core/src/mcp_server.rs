@@ -761,7 +761,14 @@ fn execute_official_tool_call(
             );
         }
     };
-    app.database().install_query_cancellation(&cancellation);
+    // Reported rather than ignored: this call would otherwise run uncancellable while the
+    // client believes its cancellation notification still applies.
+    if let Err(error) = app.database().install_query_cancellation(&cancellation) {
+        return (
+            rmcp_tool_error(format!("failed to arm query cancellation: {error:#}")),
+            false,
+        );
+    }
     #[cfg(test)]
     let _reader_activity = reader_probe.as_ref().map(|probe| probe.enter());
     if cancellation.is_cancelled() {

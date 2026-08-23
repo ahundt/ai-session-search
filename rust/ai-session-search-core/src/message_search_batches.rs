@@ -380,7 +380,7 @@ impl MessageSearchBatches {
                         "exhaustive batched message search requires database schema {}; run `aise reindex --full`, then retry",
                         crate::db::SCHEMA_VERSION
                     );
-                    db.interrupt_while(Arc::clone(&worker_cancellation));
+                    db.interrupt_while(Arc::clone(&worker_cancellation))?;
                     db.with_read_snapshot(|| {
                         let service = MessageService::new(&config, &db, surface);
                         let plan = service.plan(request)?;
