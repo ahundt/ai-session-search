@@ -586,6 +586,10 @@ jobs:
           # infer the target from and exits 1 with "not a git repository". Every
           # operation here is API-backed, including --verify-tag, which checks the
           # remote tag, so naming the repository is enough and a checkout is not.
+          # --title is explicit because --generate-notes used to supply it: dropping that flag
+          # for --notes-file left v1.0.0rc2 with an empty release name, where v1.0.0rc1 reads
+          # "v1.0.0rc1". The web UI falls back to the tag, so nothing failed and the API
+          # returned "" for name.
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
             --verify-tag --notes-file notes/release-notes.md $prerelease

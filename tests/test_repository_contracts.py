@@ -764,6 +764,16 @@ def test_wheels_job_proves_the_pinned_build_clock_reached_the_build() -> None:
     assert '--source-date-epoch "$SOURCE_DATE_EPOCH"' in wheels
 
 
+def test_the_github_release_carries_an_explicit_title() -> None:
+    # `--generate-notes` set the release title as a side effect. Replacing it with
+    # `--notes-file`, so the body is the changelog section, silently dropped the title:
+    # v1.0.0rc1 reads "v1.0.0rc1" and v1.0.0rc2's name came back "". Nothing failed, because
+    # the web UI falls back to the tag, which is why only an assertion catches it.
+    release = _workflow_jobs((ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8"))["release"]
+
+    assert '--title "$GITHUB_REF_NAME"' in release
+
+
 def test_the_testpypi_rehearsal_gates_the_first_immutable_publication() -> None:
     # A rehearsal that only a separate manual dispatch can reach is one a release can skip, and
     # the 1.0.0rc2 tag push did skip it: `publish-testpypi` reported `skipped` while the crate
