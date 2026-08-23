@@ -11,6 +11,11 @@ version: 2
 # (https://github.com/dependabot/dependabot-core/issues/14716). That is how PR #15 came to
 # propose Swatinem/rust-cache f0d9c388, a master commit eleven days newer than v2.9.2. Check any
 # action bump against `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` before merging it.
+#
+# dtolnay/rust-toolchain publishes no tags at all, so its comment names a branch instead. Its SHA
+# has to stay within master's history, because upstream garbage-collects commits that are not, and
+# master's action.yml requires an explicit `toolchain` input where the stable, nightly, and beta
+# branches each default to their own. A contract test holds the second half of that.
 
 updates:
   - package-ecosystem: "uv"

@@ -132,6 +132,39 @@ def test_local_ci_checks_workflow_pins_and_reports_skipped_tools() -> None:
     assert 'zizmor --offline .\n' not in script
 
 
+def test_every_rust_toolchain_step_names_the_toolchain_it_installs() -> None:
+    """`dtolnay/rust-toolchain` takes its default toolchain from the branch the pinned commit sits
+    on, so a SHA-pinned step that omits the input is silently coupled to that branch.
+
+    Upstream's README requires a SHA "within the history of the master branch", because "Any commit
+    that is not within the history of master will eventually get garbage-collected and your
+    workflows will fail" -- and master's `action.yml` declares `toolchain` as `required: true` with
+    no default, while the `stable`, `nightly`, and `beta` branches each supply their own. A step
+    pinned to master history and relying on the default therefore fails at run time with
+    "'toolchain' is a required input", which is a hosted-only failure this checks for locally.
+    """
+    uses = re.compile(r"^(\s*)- uses: dtolnay/rust-toolchain@")
+    offenders = []
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        lines = workflow.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            found = uses.match(line)
+            if not found:
+                continue
+            indent = len(found.group(1))
+            step = []
+            for following in lines[index + 1 :]:
+                if following.strip() and len(following) - len(following.lstrip()) <= indent:
+                    break
+                step.append(following)
+            if not any(entry.strip().startswith("toolchain:") for entry in step):
+                offenders.append(f"{workflow.name}:{index + 1}")
+    assert not offenders, (
+        "these dtolnay/rust-toolchain steps install whichever toolchain the pinned commit's branch "
+        f"defaults to, and fail outright when it is pinned to master history: {offenders}"
+    )
+
+
 def test_local_gate_guidance_names_the_required_commands_that_remain_ci_owned() -> None:
     guidance = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
