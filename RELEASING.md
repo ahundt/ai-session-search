@@ -95,7 +95,7 @@ Do not create a tag until these are also true of the specific release:
   `REQ006-report-extent-honestly` in
   `docs/development/maintainer-requirements-and-design-decisions.md`.
 
-These block the tag because the workflow publishes in the order crates.io, PyPI, then GitHub
+These block the tag because the workflow publishes in the order TestPyPI, crates.io, PyPI, then GitHub
 Release, and registry versions are immutable.
 
 ## One-time account and publisher setup
@@ -345,8 +345,7 @@ and `--index-strategy unsafe-best-match` instead. `--no-project` keeps this chec
 
 `publish-crate`, `publish`, and `release` are gated on `github.event_name == 'push'`, and those
 are the only triggers, so a dispatch stops at TestPyPI and can never reach a production registry.
-`publish-testpypi` carries no event gate, which is what makes the rehearsal part of a release
-rather than a step beside it.
+`publish-testpypi` carries no event gate, so every release rehearses.
 
 The GitHub provenance attestation in the `verify` job stays gated on `push`, unlike the rehearsal.
 `actions/attest-build-provenance` has no dry-run — `push-to-registry` only controls registry
@@ -468,8 +467,12 @@ gh api -X POST "repos/<owner>/<repo>/actions/runs/$RID/pending_deployments" \
   -F 'environment_ids[]=<id>' -f state=approved -f comment='<version> <environment>'
 ```
 
-**5. Attach the demo media** through the release page's **Edit** view. This has no command-line
-equivalent, and demo media is never committed to the repository or the archives.
+**5. Demo media needs nothing per release.** The demo is one GIF in `README.md`, uploaded once by
+dragging it into the GitHub web editor, which stores it under `user-attachments` and leaves an
+`<img>` tag behind. Every release shows that same recording, and neither 1.0.0rc1 nor 1.0.0rc2
+carries demo media as a release asset. Re-record it only when the CLI it shows has changed:
+`uv run python tests/test_demo.py --record`, then replace the image through the web editor. The
+recording stays untracked, and `verify_release_artifacts` rejects an archive that contains one.
 
 **6. Verify the three pre-release surfaces**, per [Pre-release semantics](#pre-release-semantics).
 `gh release view vX.Y.ZrcN --json isPrerelease` is the only one a release can get wrong on its own.
