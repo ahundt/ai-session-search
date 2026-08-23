@@ -720,7 +720,10 @@ impl Db {
             .context("could not arm query cancellation on this connection")
     }
 
-    pub(crate) fn install_query_cancellation(&self, cancellation: &QueryCancellation) -> Result<()> {
+    pub(crate) fn install_query_cancellation(
+        &self,
+        cancellation: &QueryCancellation,
+    ) -> Result<()> {
         self.interrupt_while(cancellation.flag_arc())?;
         cancellation.register(&self.conn);
         Ok(())
