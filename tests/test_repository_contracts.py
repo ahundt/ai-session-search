@@ -165,6 +165,47 @@ def test_every_rust_toolchain_step_names_the_toolchain_it_installs() -> None:
     )
 
 
+def test_the_release_check_runs_the_cargo_command_the_readme_gives() -> None:
+    """The post-publish check is the only gate that can catch a broken registry install.
+
+    `cargo install` takes a pre-release only when a requirement asks for one, so while crates.io
+    holds nothing but release candidates a bare `cargo install ai-session-search --locked` fails
+    with "could not find `ai-session-search` in registry `crates-io` with version `*`". That
+    shipped on the README, because the check in RELEASING.md substituted `cargo add`, which
+    resolves candidates happily, and the `rust-install` CI job only exercises `--path` and
+    `--git`, which resolve no registry version and run before the crate is published.
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+
+    documented = re.search(r"^cargo install ai-session-search[^\n&]*", readme, re.MULTILINE)
+    assert documented, "README no longer gives a cargo install command"
+    command = documented.group(0).strip()
+
+    # RELEASING.md records each command with its measured outcome, the failing bare form
+    # included, so presence alone proves nothing. Pair each command with the outcome that
+    # follows it and require the README's to be the one that installs. An outcome runs from
+    # the arrow on the command's own line through the indented continuations under it.
+    lines = releasing.splitlines()
+    outcomes = {}
+    for index, line in enumerate(lines):
+        if not line.startswith("cargo install ai-session-search"):
+            continue
+        invocation, _, outcome = line.partition("->")
+        for following in lines[index + 1 :]:
+            if not following.startswith(" "):
+                break
+            outcome += following
+        outcomes[invocation.strip()] = outcome
+    assert command in outcomes, (
+        f"RELEASING.md records no outcome for the README's {command!r}, so a registry install can "
+        "fail for users while the release check reports success"
+    )
+    assert "Installing" in outcomes[command] and "error" not in outcomes[command], (
+        f"RELEASING.md records the README's {command!r} as failing: {outcomes[command]!r}"
+    )
+
+
 def test_local_gate_guidance_names_the_required_commands_that_remain_ci_owned() -> None:
     guidance = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
 

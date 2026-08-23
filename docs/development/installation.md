@@ -65,8 +65,15 @@ python -m pip install ai-session-search
 Install the native Rust command from crates.io:
 
 ```bash
-cargo install ai-session-search --locked
+cargo install ai-session-search --locked --version '^1.0.0-rc'
 ```
+
+`cargo install` declines a pre-release unless a requirement asks for one, and crates.io currently
+carries only release candidates, so a bare `cargo install ai-session-search` reports `could not
+find ai-session-search in registry crates-io with version *`. The range above matches the
+candidates and every later stable, so it keeps working once 1.0.0 ships. The `uv` and `pip`
+commands need no equivalent: their resolvers use a pre-release when it is the only version
+available.
 
 These package installation commands do not create aliases, register MCP servers, write
 managed Markdown or skills, or install client hooks. The common
@@ -96,7 +103,7 @@ separate transactions, so a package-manager failure never edits client files:
 
 ```bash
 uv tool install ai-session-search && aise integrations install
-cargo install ai-session-search --locked && aise integrations install
+cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrations install
 ```
 
 This follows the same proven lifecycle as RTK (`rtk` installation followed by
@@ -183,7 +190,7 @@ uv tool upgrade ai-session-search && aise integrations install
 uv tool uninstall ai-session-search
 uv remove ai-session-search
 python -m pip uninstall ai-session-search
-cargo install ai-session-search --locked && aise integrations install
+cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrations install
 cargo uninstall ai-session-search
 ```
 
