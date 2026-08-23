@@ -209,25 +209,45 @@ the version string the metadata gate already pins. crates.io reporting
 `"max_stable_version": null` is the positive signal that it classified the version as a
 pre-release. A final `X.Y.Z` tag takes the non-prerelease branch of the same `case`.
 
-### While no stable version exists, plain installs resolve to the newest release candidate
+### While no stable version exists, Python installs take the newest candidate and `cargo install` refuses
 
-This surprises people, so do not "fix" it. Measured against `1.0.0rc1` while it was the only
-published version:
+Check every command the documentation gives, one at a time. Measured while `1.0.0rc1` and
+`1.0.0rc2` were the only published versions:
 
 ```
-uv pip install ai-session-search              -> ai-session-search==1.0.0rc1
-cargo add ai-session-search --dry-run         -> Adding ai-session-search v1.0.0-rc.1
+uv tool install ai-session-search             -> ai-session-search==1.0.0rc2
+uv pip install ai-session-search              -> ai-session-search==1.0.0rc2
+uv add ai-session-search                      -> ai-session-search==1.0.0rc2
+python -m pip install ai-session-search       -> ai-session-search-1.0.0rc2
+cargo add ai-session-search                   -> Adding ai-session-search v1.0.0-rc.2
+cargo install ai-session-search --locked      -> error: could not find `ai-session-search`
+                                                 in registry `crates-io` with version `*`
+cargo install ai-session-search --locked --version '^1.0.0-rc'
+                                              -> Installing ai-session-search v1.0.0-rc.2
 ```
 
-Neither warns. This is specified behavior, not a marking failure.
+The last line is the command the README gives, so run that one against a throwaway `--root` and
+require it to install.
+
+The Python result surprises people, so do not "fix" it.
 [PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases) excludes pre-releases
 from version specifiers "unless they are already present on the system, explicitly requested by
 the user, or if the only available version that satisfies the version specifier is a
-pre-release." Cargo resolves the same way when a crate has no stable version. Once any stable
-version exists, both resolvers prefer it and a release candidate is reachable only by an
-explicit pin. Do not publish a stable version merely to change this, and do not yank a
-candidate to hide it; if plain installs must not reach a pre-release, the only real options are
-to keep release candidates off the public registries or to say so in the README.
+pre-release." Once any stable version exists those resolvers prefer it and a release candidate
+is reachable only by an explicit pin. Do not publish a stable version merely to change this, and
+do not yank a candidate to hide it; if plain installs must not reach a pre-release, the only
+real options are to keep release candidates off the public registries or to say so in the README.
+
+Cargo splits on the verb. `cargo add` resolves a candidate the same way Python does, while
+`cargo install` takes one only when a requirement asks for it, which is why the documented Cargo
+command carries `--version '^1.0.0-rc'`. That range matches the candidates and every later
+stable, verified against `clap`, whose `^4.0.0-rc` requirement resolves to a `4.x` stable, so the
+line survives the 1.0.0 release unedited.
+
+Check `cargo install` itself here, because nothing upstream of this point can. The `rust-install`
+CI job exercises the `--path` and `--git` shapes, which resolve no registry version at all, and
+the crate is unpublished while that job runs. Substituting `cargo add` reports success against a
+registry where the documented command fails.
 
 ## Local gate
 

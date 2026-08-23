@@ -186,8 +186,13 @@ uv tool install ai-session-search
 uvx --from ai-session-search aise --help
 uv add ai-session-search
 python -m pip install ai-session-search
-cargo install ai-session-search --locked
+cargo install ai-session-search --locked --version '^1.0.0-rc'
 ```
+
+The Cargo requirement is load-bearing while only release candidates are published: `cargo install`
+declines a pre-release unless one is asked for, so a bare invocation fails against the registry.
+CI exercises the `--path` and `--git` shapes, which resolve no registry version and cannot catch
+that, which leaves the post-publish check in [RELEASING.md](../../RELEASING.md) as the gate.
 
 `uv` is the preferred Python project and tool manager. `pip` remains supported
 because it is Python's baseline installer. Cargo path and Git installs are

@@ -64,12 +64,14 @@ uv tool install ai-session-search && aise integrations install
 via rust's `cargo`:
 
 ```bash
-cargo install ai-session-search --locked && aise integrations install
+cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrations install
 ```
 
-No stable version is published yet, so both commands resolve the newest release candidate and
-install it without warning. That is what their resolvers do when a package has only pre-releases.
-Pin an exact version to choose a different one.
+No stable version is published yet. The `uv` command resolves the newest release candidate and
+installs it without warning, which is what Python resolvers do for a package that has only
+pre-releases. `cargo install` declines a pre-release unless a requirement asks for one, so the
+Cargo command carries `--version '^1.0.0-rc'`; that range also matches every later stable, so it
+keeps working once 1.0.0 ships. Name an exact version to choose a different one.
 
 
 ## Quick start
