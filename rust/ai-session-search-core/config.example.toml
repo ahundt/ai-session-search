@@ -80,6 +80,26 @@ mode = "all"
 roots = []
 include_invocation_directory = false
 
+# New configurations may replace [search.scope] with one [search.permissions] panel; never
+# configure both. Generate a canonical absolute-root example with:
+#   aise permissions init --preset current-directory --profile work --dry-run
+# Effects are allow, grantable block, and non-overrideable hard-block. Rules AND populated
+# fields; repeated rules OR. Validate before use with `aise permissions validate`.
+#
+# [search.permissions]
+# ceiling_profile = "unrestricted"
+# default_profile = "work"
+#
+# [search.permissions.profiles.work]
+# default = "block"
+#
+# [[search.permissions.profiles.work.rules]]
+# rule_id = "project-read"
+# effect = "allow"
+# resource = "session"
+# operation = ["read"]
+# session_workspace_root = ["/absolute/project"]
+
 # Optional versioned purpose bundles fill only omitted soft preferences. They cannot
 # change query interpretation, caller filters, authority, or hard budgets. No built-in
 # purpose ships without labeled replay evidence.

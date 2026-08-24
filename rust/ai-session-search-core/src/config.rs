@@ -427,9 +427,11 @@ pub struct SearchConfig {
     /// Optional hard ceilings. Every omitted field preserves current runtime behavior.
     #[serde(default)]
     pub budgets: SearchBudgetConfig,
-    /// Trusted search authority. `all` preserves current unrestricted behavior.
+    /// Trusted legacy search authority. `all` preserves current unrestricted behavior.
     #[serde(default)]
     pub scope: SearchScopeConfig,
+    /// Typed search-result permission profiles. Omission preserves legacy behavior.
+    pub permissions: Option<crate::search_scope::SearchPermissionsConfig>,
     /// User-defined, versioned soft preference bundles. No built-in purpose ships by default.
     #[serde(default)]
     pub purposes: BTreeMap<String, PurposeDefinition>,
@@ -1135,6 +1137,7 @@ impl Default for Config {
                 message_search: MessageSearchConfig::default(),
                 budgets: SearchBudgetConfig::default(),
                 scope: SearchScopeConfig::default(),
+                permissions: None,
                 purposes: BTreeMap::new(),
             },
             analytics: AnalyticsConfig::default(),
@@ -1372,6 +1375,16 @@ impl Config {
             .get("search")
             .and_then(|search| search.get("scope"))
             .is_some();
+        let has_search_permissions_config = document
+            .get("search")
+            .and_then(|search| search.get("permissions"))
+            .is_some();
+        if has_search_scope_config && has_search_permissions_config {
+            bail!(
+                "config {} contains both search.scope and search.permissions; remove one authority panel or run `aise permissions init --dry-run` to compare them",
+                config_path.display()
+            );
+        }
         let has_search_messages_limit_config =
             toml_has_key(&document, "mcp", "search_messages_limit");
         let has_max_tool_result_chars_config =
@@ -1739,6 +1752,19 @@ impl Config {
             crate::search_scope::validate_configured_root(std::path::Path::new(root)).map_err(
                 |error| anyhow::anyhow!("search.scope.roots entry {root:?}: {error}; {FIX}"),
             )?;
+        }
+        if let Some(permissions) = &self.search.permissions {
+            if self.search.scope.mode != SearchScopeMode::All
+                || !self.search.scope.roots.is_empty()
+                || self.search.scope.include_invocation_directory
+            {
+                bail!(
+                    "search.scope and search.permissions cannot both configure authority; remove one panel or run `aise permissions init --dry-run`; {FIX}"
+                );
+            }
+            permissions
+                .validate()
+                .map_err(|error| anyhow::anyhow!("invalid search.permissions: {error}; {FIX}"))?;
         }
         // A key naming no row would otherwise sit in config.toml looking like it raised a budget
         // while the shipped one stayed in force, which is the failure this whole surface exists
@@ -2392,6 +2418,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dash-separated phrase"));
+    }
+
+    #[test]
+    fn resolver_rejects_explicit_legacy_and_typed_authority_panels_together() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[search.scope]\nmode = \"all\"\n\
+             [search.permissions]\ndefault_profile = \"unrestricted\"\n",
+        )
+        .unwrap();
+        let error = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(config_path),
+                ..ConfigOverrides::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("search.scope"), "{error}");
+        assert!(error.contains("search.permissions"), "{error}");
     }
 
     #[test]

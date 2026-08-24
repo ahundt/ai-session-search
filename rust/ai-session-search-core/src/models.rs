@@ -1081,6 +1081,9 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MessageFilters {
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub authorization_operation: Option<crate::search_scope::SearchOperation>,
     pub role: Option<Role>,
     /// Which semantic message classes to return. `None` selects the default set
     /// ([`MessageKind::default_search_set`]): every class except `HarnessNotice`, which is
@@ -1615,6 +1618,8 @@ pub struct PlanningCount {
 /// deterministic order.
 #[derive(Debug, Clone, Default)]
 pub struct FileQuery {
+    #[doc(hidden)]
+    pub authorization_operation: Option<crate::search_scope::SearchOperation>,
     pub pattern: Option<String>,
     /// Restrict to one indexed session source.
     pub provider: Option<Provider>,

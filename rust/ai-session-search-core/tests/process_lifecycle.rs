@@ -1073,7 +1073,7 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
         response["page"]["returned"], 1,
         "self-healed search must return the intact message: {response}"
     );
-    assert_eq!(response["response_schema_version"], 1);
+    assert_eq!(response["response_schema_version"], 2);
     assert_eq!(
         response["results"][0]["message_ref"]["session_id"],
         "claude:heal"
@@ -1200,7 +1200,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             response["page"]["returned"], 1,
             "{field}/{mode}: {response}"
         );
-        assert_eq!(response["response_schema_version"], 1, "{field}/{mode}");
+        assert_eq!(response["response_schema_version"], 2, "{field}/{mode}");
         assert_eq!(
             response["results"][0]["message_ref"]["session_id"], "claude:matrix",
             "{field}/{mode}"

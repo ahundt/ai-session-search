@@ -35,6 +35,7 @@ dependencies = [
  "regex-syntax",
  "rmcp",
  "rusqlite",
+ "schemars",
  "semver",
  "serde",
  "serde_json",
@@ -2156,6 +2157,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "url",
  "uuid",
 ]
 

@@ -1116,11 +1116,12 @@ class _MessageSearchReceipt(TypedDict, total=False):
 
 @final
 class MessageSearchResponse:
-    """Canonical version-1 response; ``results`` is the ordinary materialized Python list."""
+    """Canonical version-2 response; ``results`` is the ordinary materialized Python list."""
 
     response_schema_version: int
     coordinate_unit: Literal["unicode_scalar"]
     effective_request: _MessageSearchEffectiveRequest
+    source_completeness: Literal["complete", "policy-restricted"]
     results: list[_MessageSearchResult]
     page: _MessageSearchPage
     included: _MessageSearchIncluded | None
@@ -1299,6 +1300,7 @@ class SessionSearch:
         config_path: str | Path | None = None,
         cache_dir: str | Path | None = None,
         threads: int | None = None,
+        trusted_adapter_attestation_json: str | None = None,
     ) -> Self: ...
     @property
     def db_path(self) -> Path: ...

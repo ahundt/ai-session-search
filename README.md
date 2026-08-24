@@ -335,9 +335,24 @@ Precedence runs from CLI argument, to environment variable, to TOML, to the plat
 
 Search is unrestricted by default. An opt-in `[search.scope]` panel confines reads to configured
 absolute roots, the invocation directory, and live MCP client roots; restricted mode fails closed
-without authority and disables arbitrary content SQL. See
+without authority and disables arbitrary content SQL. This protects AISE interfaces, not against
+same-user code that can open the index or transcripts directly; that threat needs OS/process isolation. See
 [search access scope](docs/development/configuration.md#search-access-scope). Legacy settings
 import through `aise migrate config`.
+
+New restrictions use typed `[search.permissions]` profiles. Draft a cwd-bound profile with
+`aise permissions init --preset current-directory --profile work --dry-run`, then inspect it with
+`aise permissions validate` and `aise permissions status --effective`. Use
+`current-directory-locked` when access outside that cwd must require a config edit. Generated MCP
+registrations can pin a profile and known harness with
+`aise integrations install --permission-profile work`. Standalone reads capture cwd automatically;
+validated MCP roots stay connection-local. Exact model rules require a versioned native adapter.
+Caller declarations are diagnostic and narrow-only: they never satisfy allow rules.
+
+Grantable blocks use bounded pending requests. MCP clients with verified standard elicitation can
+approve inline; unsupported or headless clients fail closed and return a request ID for
+human-controlled `aise permissions grant`. Atomic admission is never refunded after query failure
+or cancellation. Ceilings, hard blocks, live roots, and restrictive overlays remain absolute.
 
 ## Index maintenance
 

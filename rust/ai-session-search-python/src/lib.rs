@@ -3528,6 +3528,7 @@ impl FileQuery {
         let scope = self.scope.resolve(app)?;
         let (since, until) = scope.bounds;
         Ok(CoreFileQuery {
+            authorization_operation: None,
             pattern,
             provider: scope.provider,
             session_id: scope.session_id,
@@ -3619,7 +3620,7 @@ fn capped_native_hits(hits: Vec<MessageHit>, lines_per_message: i64) -> Vec<Nati
         .collect()
 }
 
-/// Canonical version-1 message-search document projected into Python-native dictionaries.
+/// Canonical version-2 message-search document projected into Python-native dictionaries.
 ///
 /// Each result is converted independently, keeping transient Rust-to-Python encoding memory
 /// bounded by the largest result rather than constructing a second whole-response JSON tree.
@@ -3635,6 +3636,8 @@ struct NativeMessageSearchResponse {
     coordinate_unit: &'static str,
     #[pyo3(get)]
     effective_request: Py<PyAny>,
+    #[pyo3(get)]
+    source_completeness: &'static str,
     #[pyo3(get)]
     results: Vec<Py<PyAny>>,
     #[pyo3(get)]
@@ -3676,6 +3679,12 @@ impl NativeMessageSearchResponse {
                 ai_session_search::message_search::MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
             coordinate_unit: "unicode_scalar",
             effective_request,
+            source_completeness: match response.source_completeness() {
+                ai_session_search::message_search::SourceCompleteness::Complete => "complete",
+                ai_session_search::message_search::SourceCompleteness::PolicyRestricted => {
+                    "policy-restricted"
+                }
+            },
             results,
             page,
             included,
@@ -4280,12 +4289,13 @@ struct SessionSearch {
 #[pymethods]
 impl SessionSearch {
     #[new]
-    #[pyo3(signature = (db_path=None, *, config_path=None, cache_dir=None, threads=None))]
+    #[pyo3(signature = (db_path=None, *, config_path=None, cache_dir=None, threads=None, trusted_adapter_attestation_json=None))]
     fn new(
         db_path: Option<PathBuf>,
         config_path: Option<PathBuf>,
         cache_dir: Option<PathBuf>,
         threads: Option<usize>,
+        trusted_adapter_attestation_json: Option<&str>,
     ) -> PyResult<Self> {
         for (name, path) in [
             ("db_path", db_path.as_ref()),
@@ -4314,7 +4324,26 @@ impl SessionSearch {
         })
         .map_err(runtime_error)?
         .config;
-        let inner = CoreSessionSearch::open(config).map_err(runtime_error)?;
+        let inner = if let Some(encoded) = trusted_adapter_attestation_json {
+            let attestation = serde_json::from_str::<
+                ai_session_search::search_scope::NativeAdapterAttestation,
+            >(encoded)
+            .map_err(|error| {
+                PyValueError::new_err(format!(
+                    "trusted_adapter_attestation_json must be a versioned attestation object: {error}"
+                ))
+            })?;
+            let policy_inputs = ai_session_search::search_scope::TrustedPolicyInputs::default()
+                .with_native_adapter_attestation(attestation)
+                .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+            let access_inputs =
+                ai_session_search::TrustedAccessInputs::capture(&config.search.scope, Vec::new())
+                    .map_err(runtime_error)?;
+            CoreSessionSearch::open_with_policy_inputs(config, access_inputs, policy_inputs)
+                .map_err(runtime_error)?
+        } else {
+            CoreSessionSearch::open(config).map_err(runtime_error)?
+        };
         Ok(Self {
             inner: Mutex::new(inner),
         })

@@ -1634,6 +1634,7 @@ fn emit_message_search_machine_response(
                 response_schema_version: u32,
                 coordinate_unit: crate::message_search::CoordinateUnit,
                 effective_request: &'a crate::message_search::ResolvedMessageSearchRequest,
+                source_completeness: crate::message_search::SourceCompleteness,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 included: Option<&'a crate::message_search::MessageSearchIncludedData>,
             }
@@ -1661,6 +1662,7 @@ fn emit_message_search_machine_response(
                 response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
                 coordinate_unit: crate::message_search::CoordinateUnit::UnicodeScalar,
                 effective_request: response.request(),
+                source_completeness: response.source_completeness(),
                 included: response.has_included_data().then(|| response.included()),
             };
             serde_json::to_writer(&mut out, &metadata)?;

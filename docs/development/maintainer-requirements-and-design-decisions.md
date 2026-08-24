@@ -361,6 +361,26 @@ Validate the resolved request, not parameters in isolation. Examples include:
 - mutually exclusive kind selectors cannot silently overwrite one another;
 - a resolved message-kind set that can match nothing is an error.
 
+### REQ049-enforce-search-result-authority
+
+Search-result authority belongs in one immutable typed policy resolved when `SessionSearch` opens
+and installed on `Db`, below CLI/MCP/Python adapters and before counts, ranking, paging, context,
+grouping, export, or exact-ID resolution. Session authority is inherited by messages and file edits.
+Every public read or side-effecting operation must be classified explicitly; a new surface never
+inherits unrestricted access merely because an adapter omitted a check.
+
+The compatibility default remains unrestricted. Explicit legacy `[search.scope] mode =
+"allowed-roots"` retains its additive configured-root, invocation-directory, and live MCP-root
+semantics until an equivalent migration is proven. Restricted raw SQL remains unavailable, hidden
+exact IDs retain the ordinary no-match shape, malformed or missing authority fails before data
+access, and config or request arguments may narrow but never select wider authority.
+
+Application policy protects cooperative interfaces and accidental cross-project disclosure. It is
+not confidentiality from arbitrary same-UID code that can directly open the index or transcripts;
+that threat requires a separately protected broker or OS/process isolation. Status, documentation,
+and tests must distinguish these enforcement strengths rather than presenting row filtering as a
+sandbox.
+
 ## P1 — product and integration contracts
 
 ### REQ013-resolve-parameters-by-origin
@@ -668,6 +688,7 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 | `REQ010-protect-complexity-bounds`; `REQ030-benchmark-risky-paths` | `db.rs`, `service.rs`, `trigram_index.rs`, `analysis_pipeline.rs`, `files.rs`, `scripts/benchmark_release.py` | complexity comments/tests, deterministic scale fixtures, latency/CPU/RSS/output benchmark reports |
 | `REQ002-share-typed-contract`; `REQ003-preserve-surface-semantics`; `REQ004-separate-retrieval-presentation`; `REQ005-return-match-evidence`; `REQ006-report-extent-honestly`; `REQ007-preserve-page-identity`; `REQ008-reject-hidden-cutoffs`; `REQ009-bound-fuzzy-search`; `REQ012-reject-invalid-combinations`; `REQ013-resolve-parameters-by-origin` | `rust/ai-session-search-core/src/message_search.rs`, `service.rs`, `messages.rs`, `mcp_server.rs` | `rust/ai-session-search-core/tests/message_search_contract.rs`, service/MCP unit tests, `tests/test_native_binding.py` |
 | `REQ011-validate-language-boundaries` | `rust/ai-session-search-python/src/lib.rs`, `ai_session_search/_native.pyi` | native binding tests, stubtest, runtime/stub parity |
+| `REQ049-enforce-search-result-authority` | `search_scope.rs`, `service.rs`, `db.rs`, CLI/MCP/Python adapters, permission config/state | `rust/ai-session-search-core/tests/search_permission_contract.rs`, shared evaluator/SQL equivalence tests, operation-registry coverage, hidden-ID/raw-SQL/leakage fixtures, application-versus-broker dogfood |
 | `REQ014-use-platform-app-paths`; `REQ015-separate-app-harness-roots`; `REQ016-support-multiple-skill-roots`; `REQ017-preserve-install-ownership`; `REQ018-preserve-unmanaged-content`; `REQ019-verify-each-harness` | `config.rs`, `integrations.rs`, `skills.rs`, `skill_manifest.rs`, `text_file_transaction.rs` | integration/config unit tests and repository contracts |
 | `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
 | `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |

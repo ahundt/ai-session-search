@@ -32,11 +32,11 @@ const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use
 /// The block for a harness that registers the MCP server (and the server's own `initialize`
 /// instructions). It names the same four steps as `CLI_INSTRUCTIONS_LINE` in the same order,
 /// with the MCP tool for each, so an agent reads one workflow whichever surface it holds.
-const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) via the `ai-session-search` MCP server: `list_sessions(path_prefix, when, limit)` for recent sessions by directory or period, `search_sessions(query, when, limit)` for sessions by topic, `search_messages(query, context, limit)` for the exact turn, then read it with `get_session(session_id, message_seq)`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, path, context, and time range. The installed `ai-session-search` skill has the full workflow; without MCP, `aise` on the shell does the same (`aise <command> --help`).";
+const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) through MCP: `list_sessions(path_prefix, when, limit)` for recent sessions, `search_sessions(query, when, limit)` by topic, `search_messages(query, context, limit)` for the exact turn, then read it with `get_session(session_id, message_seq)`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI. Prefer observed harness, cwd, and MCP roots. On `caller-context-unavailable`, run `aise integrations status` once; declarations only narrow and never grant. See the installed `ai-session-search` skill; without MCP, use `aise <command> --help`.";
 /// The block for a harness that has no MCP registration for aise (Pi, Prime Agent). It leads with
 /// the three CLI commands that cover the common path and names the installed skill, because the
 /// MCP-first sentence above sends such an agent to a tool it cannot call.
-const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; on this harness the `aise` command and the installed skill are the whole integration. List recent sessions with `aise list --path <dir> --when 7d --limit 10`, find sessions by topic with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; `aise <command> --help` lists every current flag.";
+const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; on this harness the `aise` command and the installed skill are the whole integration. List recent sessions with `aise list --path <dir> --when 7d --limit 10`, find sessions by topic with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. Prefer the observed working directory. If a policy reports `caller-context-unavailable`, ask once for the adapter action from `aise integrations status`; caller declarations can narrow or diagnose a request but never grant access. The installed `ai-session-search` skill documents the full workflow; `aise <command> --help` lists every current flag.";
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
@@ -267,6 +267,13 @@ pub struct IntegrationInstallArgs {
     /// installation. Pass an explicit path to select a different installation.
     #[arg(long)]
     pub binary: Option<PathBuf>,
+    /// Pin one configured AISE permission profile in generated MCP launch arguments. Omit to use
+    /// the config's default profile without a protected launch selection.
+    #[arg(long)]
+    pub permission_profile: Option<String>,
+    /// Resolved by the CLI after validating `permission_profile`; never caller-supplied.
+    #[arg(skip)]
+    pub(crate) permission_config_path: Option<PathBuf>,
     /// Do not add AI Session Search MCP registrations to client configuration files.
     #[arg(long)]
     pub no_mcp: bool,
@@ -484,6 +491,12 @@ struct Target {
     format: ConfigFormat,
     detect_paths: Vec<PathBuf>,
     detect_binaries: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct PermissionLaunchBinding {
+    config_path: PathBuf,
+    profile: String,
 }
 
 #[derive(Debug, Clone)]
@@ -931,12 +944,21 @@ pub(crate) fn install_with_receipt(
         &skill_targets,
     )?
     .retired_roots;
-    let mutations = preflight_install(
+    let permission_binding = match (args.permission_profile, args.permission_config_path) {
+        (Some(profile), Some(config_path)) => Some(PermissionLaunchBinding {
+            config_path,
+            profile,
+        }),
+        (None, None) => None,
+        _ => bail!("internal permission launch binding is incomplete"),
+    };
+    let mutations = preflight_install_with_binding(
         &targets,
         &instruction_targets,
         &skill_targets,
         &binary,
         Some(&manifest),
+        permission_binding.as_ref(),
     )?;
     let skill_manifest = crate::skill_manifest::load_manifest(&manifest)?;
     let skill_file_changes = skill_targets
@@ -2214,12 +2236,31 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
     )?)?)
 }
 
+#[cfg(test)]
 fn preflight_install(
     targets: &[Target],
     instruction_targets: &[InstructionTarget],
     skill_targets: &[SkillTarget],
     binary: &Path,
     manifest_path: Option<&Path>,
+) -> Result<Vec<PlannedFileMutation>> {
+    preflight_install_with_binding(
+        targets,
+        instruction_targets,
+        skill_targets,
+        binary,
+        manifest_path,
+        None,
+    )
+}
+
+fn preflight_install_with_binding(
+    targets: &[Target],
+    instruction_targets: &[InstructionTarget],
+    skill_targets: &[SkillTarget],
+    binary: &Path,
+    manifest_path: Option<&Path>,
+    permission_binding: Option<&PermissionLaunchBinding>,
 ) -> Result<Vec<PlannedFileMutation>> {
     let skill_manifest = match manifest_path {
         Some(path) => crate::skill_manifest::load_manifest(path)?,
@@ -2228,7 +2269,11 @@ fn preflight_install(
     let mut mutations = Vec::new();
     let mut retired_skill_roots = Vec::new();
     for target in targets {
-        mutations.extend(plan_upsert_target(target, binary)?);
+        mutations.extend(plan_upsert_target_with_binding(
+            target,
+            binary,
+            permission_binding,
+        )?);
     }
     for target in instruction_targets {
         mutations.extend(plan_upsert_instruction_file(target)?);
@@ -3399,44 +3444,76 @@ fn status_skill_file(
     Ok(worst.label().to_string())
 }
 
+#[cfg(test)]
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
+    plan_upsert_target_with_binding(target, binary, None)
+}
+
+fn plan_upsert_target_with_binding(
+    target: &Target,
+    binary: &Path,
+    permission_binding: Option<&PermissionLaunchBinding>,
+) -> Result<Vec<PlannedFileMutation>> {
     let binary = binary_config_value(binary)?;
+    let args = mcp_launch_args(permission_binding, target.label)?;
     match target.format {
         ConfigFormat::JsonMcpServers => plan_upsert_keyed_json_server(
             &target.path,
             "mcpServers",
-            json!({
-                "command": binary,
-                "args": ["mcp", "serve"]
-            }),
+            json!({"command": binary, "args": args}),
         ),
-        ConfigFormat::CodexToml => plan_upsert_codex_mcp_server(&target.path, binary),
+        ConfigFormat::CodexToml => {
+            plan_upsert_codex_mcp_server_with_args(&target.path, binary, &args)
+        }
         ConfigFormat::VscodeServers => plan_upsert_keyed_json_server(
             &target.path,
             "servers",
-            json!({
-                "type": "stdio",
-                "command": binary,
-                "args": ["mcp", "serve"]
-            }),
+            json!({"type": "stdio", "command": binary, "args": args}),
         ),
         ConfigFormat::ZedContextServers => plan_upsert_keyed_json_server(
             &target.path,
             "context_servers",
-            json!({
-                "command": binary,
-                "args": ["mcp", "serve"]
-            }),
+            json!({"command": binary, "args": args}),
         ),
-        ConfigFormat::OpenCode => plan_upsert_keyed_json_server(
-            &target.path,
-            "mcp",
-            json!({
-                "command": [binary, "mcp", "serve"],
-                "enabled": true
-            }),
-        ),
+        ConfigFormat::OpenCode => {
+            let command = std::iter::once(binary.to_owned())
+                .chain(args)
+                .collect::<Vec<_>>();
+            plan_upsert_keyed_json_server(
+                &target.path,
+                "mcp",
+                json!({"command": command, "enabled": true}),
+            )
+        }
     }
+}
+
+fn mcp_launch_args(
+    permission_binding: Option<&PermissionLaunchBinding>,
+    target_label: &str,
+) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    if let Some(binding) = permission_binding {
+        args.extend([
+            "--config".to_owned(),
+            binary_config_value(&binding.config_path)?.to_owned(),
+            "--launch-permission-profile".to_owned(),
+            binding.profile.clone(),
+        ]);
+        let harness = match target_label {
+            "claude" => Some("claude"),
+            "codex" => Some("codex"),
+            "vscode" => Some("vscode"),
+            "zed" => Some("zed"),
+            "opencode" => Some("opencode"),
+            _ => None,
+        };
+        if let Some(harness) = harness {
+            args.extend(["--launch-caller-harness".to_owned(), harness.to_owned()]);
+        }
+    }
+    args.extend(["mcp".to_owned(), "serve".to_owned()]);
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -3555,7 +3632,16 @@ fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
     )?)?)
 }
 
+#[cfg(test)]
 fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<PlannedFileMutation>> {
+    plan_upsert_codex_mcp_server_with_args(path, binary, &["mcp".to_owned(), "serve".to_owned()])
+}
+
+fn plan_upsert_codex_mcp_server_with_args(
+    path: &Path,
+    binary: &str,
+    launch_args: &[String],
+) -> Result<Vec<PlannedFileMutation>> {
     let original = read_optional_utf8_regular_file(path)?;
     let text = original.as_deref().unwrap_or_default();
     let mut document = parse_codex_document(path, text)?;
@@ -3572,7 +3658,7 @@ fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<Planned
     let mut server = toml_edit::Table::new();
     server.insert("command", toml_edit::value(binary));
     let mut args = toml_edit::Array::new();
-    args.extend(["mcp", "serve"]);
+    args.extend(launch_args.iter().map(String::as_str));
     server.insert("args", toml_edit::value(args));
     for legacy_name in LEGACY_SERVER_NAMES {
         servers.remove(legacy_name);
@@ -3670,6 +3756,7 @@ fn parse_json_object_or_empty(path: &Path, text: Option<&str>) -> Result<Map<Str
     }
 }
 
+#[cfg(test)]
 fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
     value.and_then(Value::as_array).is_some_and(|items| {
         items.len() == expected.len()
@@ -3678,6 +3765,15 @@ fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
                 .zip(expected)
                 .all(|(item, expected)| item.as_str() == Some(*expected))
     })
+}
+
+fn mcp_launch_args_are_current(args: &[&str]) -> bool {
+    matches!(args, ["mcp", "serve"])
+        || matches!(
+            args,
+            ["--config", config, "--launch-permission-profile", profile, "mcp", "serve"]
+                if !config.is_empty() && !profile.is_empty()
+        )
 }
 
 fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
@@ -3691,10 +3787,17 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
                     .get("command")
                     .and_then(Value::as_array)
                     .is_some_and(|command| {
-                        command.len() == 3
-                            && command[0].as_str().is_some_and(|value| !value.is_empty())
-                            && command[1].as_str() == Some("mcp")
-                            && command[2].as_str() == Some("serve")
+                        command
+                            .first()
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.is_empty())
+                            && mcp_launch_args_are_current(
+                                &command[1..]
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>(),
+                            )
+                            && command[1..].iter().all(Value::is_string)
                     })
         }
         ConfigFormat::JsonMcpServers
@@ -3708,7 +3811,15 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
                 || entry.get("type").and_then(Value::as_str) == Some("stdio");
             command_is_set
                 && type_is_valid
-                && json_array_is_strings(entry.get("args"), &["mcp", "serve"])
+                && entry
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .is_some_and(|args| {
+                        args.iter().all(Value::is_string)
+                            && mcp_launch_args_are_current(
+                                &args.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+                            )
+                    })
         }
         ConfigFormat::CodexToml => false,
     }
@@ -3763,9 +3874,11 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
                     .and_then(toml_edit::Item::as_value)
                     .and_then(toml_edit::Value::as_array)
                     .is_some_and(|items| {
-                        items.len() == 2
-                            && items.get(0).and_then(toml_edit::Value::as_str) == Some("mcp")
-                            && items.get(1).and_then(toml_edit::Value::as_str) == Some("serve")
+                        let values = items
+                            .iter()
+                            .filter_map(toml_edit::Value::as_str)
+                            .collect::<Vec<_>>();
+                        values.len() == items.len() && mcp_launch_args_are_current(&values)
                     }) =>
         {
             "configured"
@@ -4340,6 +4453,42 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "cannot determine the home directory for MCP client configuration; set HOME or USERPROFILE"
+        );
+    }
+
+    #[test]
+    fn permission_binding_pins_config_profile_and_harness_in_generated_mcp_arguments() {
+        let dir = tempdir().unwrap();
+        let target = Target {
+            label: "claude",
+            path: dir.path().join("mcp.json"),
+            format: ConfigFormat::JsonMcpServers,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        };
+        let binding = PermissionLaunchBinding {
+            config_path: dir.path().join("aise-config.toml"),
+            profile: "work-read".to_owned(),
+        };
+        let mutations =
+            plan_upsert_target_with_binding(&target, Path::new("/bin/aise"), Some(&binding))
+                .unwrap();
+        let PlannedFileMutation::Write { content, .. } = &mutations[0] else {
+            panic!("MCP registration is a write")
+        };
+        let document: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(
+            document["mcpServers"][SERVER_NAME]["args"],
+            json!([
+                "--config",
+                binding.config_path.to_string_lossy(),
+                "--launch-permission-profile",
+                "work-read",
+                "--launch-caller-harness",
+                "claude",
+                "mcp",
+                "serve"
+            ])
         );
     }
 

@@ -52,8 +52,15 @@ pub fn serve() -> anyhow::Result<()> {
 
 /// Serve with configuration already resolved by an embedding CLI or API.
 pub fn serve_with_config(config: Config) -> anyhow::Result<()> {
+    serve_with_config_and_policy_inputs(config, crate::search_scope::TrustedPolicyInputs::default())
+}
+
+pub fn serve_with_config_and_policy_inputs(
+    config: Config,
+    policy_inputs: crate::search_scope::TrustedPolicyInputs,
+) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(async move {
-        OfficialMcpServer::new(config)?
+        OfficialMcpServer::new_with_policy_inputs(config, policy_inputs)?
             .serve_transport(rmcp::transport::stdio())
             .await?
             .waiting()
@@ -68,6 +75,7 @@ pub fn serve_with_config(config: Config) -> anyhow::Result<()> {
 /// application data, validated client roots, the generated tool catalogue, and refresh work.
 struct McpState {
     config: Config,
+    policy_inputs: crate::search_scope::TrustedPolicyInputs,
     app: Option<SessionSearch>,
     harness_roots: Vec<std::path::PathBuf>,
     roots_error: Option<String>,
@@ -81,6 +89,26 @@ struct McpState {
 /// The mutex protects preparation, refresh scheduling, the tool catalogue, and root-authority
 /// state. Each tool call releases that mutex before opening an independent prepared SQLite reader
 /// and moving blocking database work off the async runtime.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct PermissionApprovalForm {
+    /// Confirm this bounded request.
+    approve: bool,
+    /// Number of admitted operations, from 1 through the policy maximum.
+    uses: Option<u64>,
+    /// Optional duration such as 30s, 10m, 2h, or 1d.
+    expires_in: Option<String>,
+    /// Optional lifecycle: connection-close or session-end.
+    until: Option<String>,
+}
+
+rmcp::elicit_safe!(PermissionApprovalForm);
+
+struct McpPermissionClaim {
+    store: crate::permission_store::PermissionStore,
+    grant_id: String,
+    operation_id: String,
+}
+
 pub struct OfficialMcpServer {
     inner: Arc<Mutex<McpState>>,
     reader_runtime: Arc<ExecutionRuntime>,
@@ -281,11 +309,31 @@ type TestRefreshRunner = Arc<dyn Fn(&Config, &AtomicBool) + Send + Sync>;
 
 impl OfficialMcpServer {
     pub fn new(config: Config) -> anyhow::Result<Self> {
-        let reader_bound = config.resolve_mcp_max_concurrent_reads()?;
-        Self::with_reader_bound(config, reader_bound)
+        Self::new_with_policy_inputs(config, crate::search_scope::TrustedPolicyInputs::default())
     }
 
+    pub fn new_with_policy_inputs(
+        config: Config,
+        policy_inputs: crate::search_scope::TrustedPolicyInputs,
+    ) -> anyhow::Result<Self> {
+        let reader_bound = config.resolve_mcp_max_concurrent_reads()?;
+        Self::with_reader_bound_and_policy_inputs(config, policy_inputs, reader_bound)
+    }
+
+    #[cfg(test)]
     fn with_reader_bound(config: Config, reader_bound: NonZeroUsize) -> anyhow::Result<Self> {
+        Self::with_reader_bound_and_policy_inputs(
+            config,
+            crate::search_scope::TrustedPolicyInputs::default(),
+            reader_bound,
+        )
+    }
+
+    fn with_reader_bound_and_policy_inputs(
+        config: Config,
+        policy_inputs: crate::search_scope::TrustedPolicyInputs,
+        reader_bound: NonZeroUsize,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             reader_bound.get() <= tokio::sync::Semaphore::MAX_PERMITS,
             "MCP reader bound {} exceeds Tokio semaphore maximum {}",
@@ -294,7 +342,7 @@ impl OfficialMcpServer {
         );
         let workers = NonZeroUsize::new(config.resolve_threads())
             .expect("Config::resolve_threads always returns at least one");
-        let inner = Arc::new(Mutex::new(McpState::new(config)));
+        let inner = Arc::new(Mutex::new(McpState::new(config, policy_inputs)));
         Ok(Self {
             refresh_after_delivery: Arc::new(RefreshAfterDelivery::new(Arc::clone(&inner))),
             inner,
@@ -395,11 +443,14 @@ impl rmcp::ServerHandler for OfficialMcpServer {
         let permits = Arc::clone(&self.reader_permits);
         let request_cancellation = context.ct;
         let request_id = context.id;
+        let peer = context.peer;
         #[cfg(test)]
         let reader_probe = self.reader_probe.clone();
         #[cfg(test)]
         let admission_probe = reader_probe.clone();
         async move {
+            let (admitted_selector, permission_claim) =
+                prepare_mcp_permission(&inner, &request, &peer, &request_id).await?;
             #[cfg(test)]
             if let Some(probe) = &admission_probe {
                 probe.record_admission_attempt();
@@ -432,6 +483,7 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                         &runtime,
                         request,
                         worker_cancellation,
+                        admitted_selector,
                         #[cfg(test)]
                         reader_probe,
                     ),
@@ -458,12 +510,27 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                 }
             };
             cancel_on_drop.disarm();
-            let ((tool_result, refresh_after_call), permit) = result?;
-            if refresh_after_call {
-                refresh_after_delivery
-                    .register(request_id, permit)
-                    .map_err(|error| rmcp::ErrorData::internal_error(error, None))?;
+            if result.is_err() {
+                finish_mcp_permission_claim(
+                    permission_claim,
+                    crate::permission_store::ClaimTerminal::Cancelled,
+                )?;
+                return Err(result.expect_err("checked above"));
             }
+            let ((tool_result, refresh_after_call), permit) = result.expect("checked above");
+            if refresh_after_call {
+                if let Err(error) = refresh_after_delivery.register(request_id, permit) {
+                    finish_mcp_permission_claim(
+                        permission_claim,
+                        crate::permission_store::ClaimTerminal::TransportFailed,
+                    )?;
+                    return Err(rmcp::ErrorData::internal_error(error, None));
+                }
+            }
+            finish_mcp_permission_claim(
+                permission_claim,
+                crate::permission_store::ClaimTerminal::Succeeded,
+            )?;
             Ok(tool_result.into())
         }
     }
@@ -503,6 +570,259 @@ impl rmcp::ServerHandler for OfficialMcpServer {
             refresh_official_roots_authority(inner, roots_refresh, context.peer).await;
         }
     }
+}
+
+async fn prepare_mcp_permission(
+    inner: &Arc<Mutex<McpState>>,
+    request: &rmcp::model::CallToolRequestParams,
+    peer: &rmcp::service::Peer<rmcp::RoleServer>,
+    request_id: &rmcp::model::RequestId,
+) -> Result<
+    (
+        Option<crate::search_scope::SessionPolicySelector>,
+        Option<McpPermissionClaim>,
+    ),
+    rmcp::ErrorData,
+> {
+    let Some(workspace) = request
+        .arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get("workspace_path_prefix"))
+        .and_then(Value::as_str)
+    else {
+        return Ok((None, None));
+    };
+    let selector = crate::search_scope::SessionPolicySelector::workspace_root(
+        crate::search_scope::SearchOperation::Read,
+        std::path::Path::new(workspace),
+    );
+    let (search, policy_inputs, state_path, generation) = {
+        let state = inner.lock().map_err(|_| {
+            rmcp::ErrorData::internal_error("MCP state lock is poisoned".to_owned(), None)
+        })?;
+        let Some(permissions) = state.config.search.permissions.as_ref() else {
+            return Ok((None, None));
+        };
+        let generation = state.policy_inputs.policy_generation.ok_or_else(|| {
+            rmcp::ErrorData::internal_error(
+                "permission policy generation is unavailable".to_owned(),
+                None,
+            )
+        })?;
+        let state_path = permissions
+            .permission_state_database
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                rmcp::ErrorData::internal_error(
+                    "permission state database is unavailable to the MCP server".to_owned(),
+                    None,
+                )
+            })?;
+        (
+            state.config.search.clone(),
+            state.policy_inputs.clone(),
+            state_path,
+            generation,
+        )
+    };
+    let policy =
+        crate::search_scope::EffectiveSearchPolicy::resolve(&search, policy_inputs.clone())
+            .map_err(|error| rmcp::ErrorData::internal_error(format!("{error:#}"), None))?;
+    let crate::search_scope::PolicyPreflightDecision::Request {
+        max_uses,
+        max_expires_in_seconds,
+        allowed_until,
+        selector_digest,
+    } = policy.preflight_session_selector(&selector)
+    else {
+        return match policy.preflight_session_selector(&selector) {
+            crate::search_scope::PolicyPreflightDecision::HardBlock => {
+                Err(rmcp::ErrorData::invalid_params(
+                    "permission request is hard-blocked and cannot be overridden".to_owned(),
+                    None,
+                ))
+            }
+            _ => Ok((None, None)),
+        };
+    };
+    let caller_binding = policy_inputs
+        .caller_context_binding()
+        .map_err(|error| rmcp::ErrorData::internal_error(format!("{error:#}"), None))?;
+    let pending_input = crate::permission_store::PendingRequestInput {
+        policy_generation: generation,
+        caller_context_binding: caller_binding.clone(),
+        operation: crate::search_scope::SearchOperation::Read,
+        selector_digest,
+    };
+    let selector_for_request = selector.clone();
+    let request_store_path = state_path.clone();
+    let request_id_value = tokio::task::spawn_blocking(move || {
+        let store = crate::permission_store::PermissionStore::open(&request_store_path)?;
+        store.create_typed_pending_request(
+            pending_input,
+            &selector_for_request,
+            crate::permission_store::PermissionRequestBounds {
+                max_uses: std::num::NonZeroU64::new(max_uses).expect("policy max_uses is nonzero"),
+                max_expires_in_seconds,
+            },
+            chrono::Utc::now().timestamp(),
+        )
+    })
+    .await
+    .map_err(|error| {
+        rmcp::ErrorData::internal_error(format!("permission request worker failed: {error}"), None)
+    })?
+    .map_err(|error| rmcp::ErrorData::internal_error(format!("{error:#}"), None))?;
+
+    let form = peer
+        .elicit::<PermissionApprovalForm>(format!(
+            "AISE requests read access under {}. This request is bounded to at most {max_uses} admitted operation(s). Pending request: {}",
+            selector.workspace_root.display(),
+            request_id_value.as_str()
+        ))
+        .await
+        .map_err(|error| {
+            rmcp::ErrorData::invalid_params(
+                format!(
+                    "permission approval required: request_id={}; this client did not complete a verified MCP elicitation ({error})",
+                    request_id_value.as_str()
+                ),
+                None,
+            )
+        })?
+        .ok_or_else(|| {
+            rmcp::ErrorData::invalid_params(
+                format!(
+                    "permission approval supplied no decision for request_id={}",
+                    request_id_value.as_str()
+                ),
+                None,
+            )
+        })?;
+    if !form.approve {
+        return Err(rmcp::ErrorData::invalid_params(
+            format!(
+                "permission request {} was declined",
+                request_id_value.as_str()
+            ),
+            None,
+        ));
+    }
+    let uses = form.uses.unwrap_or(1);
+    if uses == 0 || uses > max_uses {
+        return Err(rmcp::ErrorData::invalid_params(
+            format!("uses must be an integer from 1 through {max_uses}, got {uses}"),
+            None,
+        ));
+    }
+    let expires_in_seconds = form
+        .expires_in
+        .as_deref()
+        .map(crate::search_scope::parse_permission_duration_seconds)
+        .transpose()
+        .map_err(|error| rmcp::ErrorData::invalid_params(format!("{error:#}"), None))?;
+    if let Some(seconds) = expires_in_seconds {
+        let Some(maximum) = max_expires_in_seconds else {
+            return Err(rmcp::ErrorData::invalid_params(
+                "expires_in is not allowed by this grant envelope".to_owned(),
+                None,
+            ));
+        };
+        if seconds > maximum {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!("expires_in exceeds the accepted maximum of {maximum}s"),
+                None,
+            ));
+        }
+    }
+    if let Some(until) = form.until.as_deref() {
+        let parsed = match until {
+            "connection-close" => crate::search_scope::GrantUntil::ConnectionClose,
+            "session-end" => crate::search_scope::GrantUntil::SessionEnd,
+            _ => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!("until must be connection-close or session-end, got {until:?}"),
+                    None,
+                ));
+            }
+        };
+        if !allowed_until.contains(&parsed) {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!("until={until} is not allowed by this grant envelope"),
+                None,
+            ));
+        }
+        if parsed == crate::search_scope::GrantUntil::SessionEnd {
+            return Err(rmcp::ErrorData::invalid_params(
+                "until=session-end requires a trusted native session lifecycle adapter".to_owned(),
+                None,
+            ));
+        }
+        if uses != 1 {
+            return Err(rmcp::ErrorData::invalid_params(
+                "until=connection-close currently requires uses=1".to_owned(),
+                None,
+            ));
+        }
+    }
+    let expires_at =
+        expires_in_seconds.map(|seconds| chrono::Utc::now().timestamp().saturating_add(seconds));
+    let uses = std::num::NonZeroU64::new(uses).expect("validated nonzero");
+    let operation_id = format!("{request_id:?}");
+    let admission_operation_id = operation_id.clone();
+    let grant_store_path = state_path;
+    let request_string = request_id_value.as_str().to_owned();
+    let claim = tokio::task::spawn_blocking(move || -> anyhow::Result<McpPermissionClaim> {
+        let store = crate::permission_store::PermissionStore::open(&grant_store_path)?;
+        let grant = store.approve_request(
+            &request_string,
+            crate::permission_store::GrantApproval {
+                uses: Some(uses),
+                expires_at_epoch_seconds: expires_at,
+            },
+            chrono::Utc::now().timestamp(),
+        )?;
+        match store.admit(&crate::permission_store::AdmissionInput {
+            grant_id: grant.as_str(),
+            operation_id: &admission_operation_id,
+            policy_generation: generation,
+            caller_context_binding: &caller_binding,
+            operation: crate::search_scope::SearchOperation::Read,
+            now_epoch_seconds: chrono::Utc::now().timestamp(),
+        })? {
+            crate::permission_store::AdmissionOutcome::Admitted => Ok(McpPermissionClaim {
+                store,
+                grant_id: grant.as_str().to_owned(),
+                operation_id: admission_operation_id,
+            }),
+            outcome => anyhow::bail!(
+                "permission operation was already delivered and will not execute again: {outcome:?}"
+            ),
+        }
+    })
+    .await
+    .map_err(|error| {
+        rmcp::ErrorData::internal_error(
+            format!("permission admission worker failed: {error}"),
+            None,
+        )
+    })?
+    .map_err(|error| rmcp::ErrorData::internal_error(format!("{error:#}"), None))?;
+    Ok((Some(selector), Some(claim)))
+}
+
+fn finish_mcp_permission_claim(
+    claim: Option<McpPermissionClaim>,
+    terminal: crate::permission_store::ClaimTerminal,
+) -> Result<(), rmcp::ErrorData> {
+    if let Some(claim) = claim {
+        claim
+            .store
+            .finish_claim(&claim.grant_id, &claim.operation_id, terminal)
+            .map_err(|error| rmcp::ErrorData::internal_error(format!("{error:#}"), None))?;
+    }
+    Ok(())
 }
 
 #[allow(deprecated)]
@@ -609,11 +929,30 @@ async fn refresh_official_roots_authority(
                 server.app = None;
                 match validated {
                     Ok(roots) => {
-                        server.harness_roots = roots;
+                        server.harness_roots = roots.clone();
+                        server.policy_inputs.caller_context.live_workspace_roots = roots;
+                        server
+                            .policy_inputs
+                            .caller_context
+                            .live_workspace_roots_origin =
+                            Some(crate::search_scope::CallerContextOrigin::McpRoots);
+                        server
+                            .policy_inputs
+                            .caller_context
+                            .live_workspace_roots_generation = server
+                            .policy_inputs
+                            .caller_context
+                            .live_workspace_roots_generation
+                            .saturating_add(1);
                         server.roots_error = None;
                     }
                     Err(error) => {
                         server.harness_roots.clear();
+                        server
+                            .policy_inputs
+                            .caller_context
+                            .live_workspace_roots
+                            .clear();
                         server.roots_error = Some(mcp_roots_recovery_error(&error));
                     }
                 }
@@ -634,6 +973,7 @@ fn execute_official_tool_call(
     runtime: &Arc<ExecutionRuntime>,
     request: rmcp::model::CallToolRequestParams,
     cancellation: Arc<QueryCancellation>,
+    admitted_selector: Option<crate::search_scope::SessionPolicySelector>,
     #[cfg(test)] reader_probe: Option<Arc<TestReaderProbe>>,
 ) -> (rmcp::model::CallToolResult, bool) {
     // This value exists only across preparation and immediate dispatch. Keeping it inline avoids a
@@ -652,7 +992,12 @@ fn execute_official_tool_call(
         /// connection and scans the catalogue, which is blocking database work; the type-level
         /// contract above says a tool call does that with the mutex released.
         SchemaOnly(Config, usize, ToolRecovery),
-        Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
+        Reader(
+            Config,
+            crate::search_scope::TrustedAccessInputs,
+            crate::search_scope::TrustedPolicyInputs,
+            bool,
+        ),
     }
 
     let args = Value::Object(request.arguments.unwrap_or_default());
@@ -721,7 +1066,17 @@ fn execute_official_tool_call(
             .map_err(|error| format!("{error:#}"))?;
         let refresh_after_call = config.index.refresh == crate::config::IndexRefresh::Auto;
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        Ok(Preparation::Reader(config, inputs, refresh_after_call))
+        let mut policy_inputs = server.policy_inputs.clone();
+        policy_inputs.operation = Some(mcp_tool_operation(tool_name));
+        if let Some(selector) = admitted_selector.clone() {
+            policy_inputs.admitted_grant_selectors.push(selector);
+        }
+        Ok(Preparation::Reader(
+            config,
+            inputs,
+            policy_inputs,
+            refresh_after_call,
+        ))
     })();
 
     let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
@@ -735,7 +1090,7 @@ fn execute_official_tool_call(
         ),
         Err(error) => rmcp_tool_error(error),
     };
-    let (config, inputs, refresh_after_call) = match prepared {
+    let (config, inputs, policy_inputs, refresh_after_call) = match prepared {
         Ok(Preparation::Direct(result, ceiling, recovery)) => {
             return (deliver(result, ceiling, recovery), false);
         }
@@ -747,12 +1102,17 @@ fn execute_official_tool_call(
             let result = tool_query_session_index_cancellable(&args, &config, Some(&cancellation));
             return (deliver(result, ceiling, recovery), false);
         }
-        Ok(Preparation::Reader(config, inputs, refresh_after_call)) => {
-            (config, inputs, refresh_after_call)
+        Ok(Preparation::Reader(config, inputs, policy_inputs, refresh_after_call)) => {
+            (config, inputs, policy_inputs, refresh_after_call)
         }
         Err(error) => return (rmcp_tool_error(error), false),
     };
-    let app = match SessionSearch::open_prepared_reader(config, inputs, Arc::clone(runtime)) {
+    let app = match SessionSearch::open_prepared_reader_with_policy_inputs(
+        config,
+        inputs,
+        policy_inputs,
+        Arc::clone(runtime),
+    ) {
         Ok(app) => app,
         Err(error) => {
             return (
@@ -1540,9 +1900,13 @@ fn rmcp_tool_error(error: String) -> rmcp::model::CallToolResult {
 }
 
 impl McpState {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, mut policy_inputs: crate::search_scope::TrustedPolicyInputs) -> Self {
+        policy_inputs
+            .operation
+            .get_or_insert(crate::search_scope::SearchOperation::Read);
         Self {
             config,
+            policy_inputs,
             app: None,
             harness_roots: Vec::new(),
             roots_error: None,
@@ -1585,7 +1949,23 @@ impl McpState {
         if let Some(error) = &self.roots_error {
             anyhow::bail!("invalid MCP roots authority: {error}");
         }
-        open_mcp_app(&mut self.app, &self.config, &self.harness_roots)
+        open_mcp_app(
+            &mut self.app,
+            &self.config,
+            &self.harness_roots,
+            &self.policy_inputs,
+        )
+    }
+}
+
+fn mcp_tool_operation(tool_name: &str) -> crate::search_scope::SearchOperation {
+    use crate::search_scope::SearchOperation;
+    match tool_name {
+        "run_skill_capability" => SearchOperation::Analyze,
+        "get_resume_command" => SearchOperation::Resume,
+        "get_index_status" => SearchOperation::AdminMetadata,
+        "query_session_index" => SearchOperation::Schema,
+        _ => SearchOperation::Read,
     }
 }
 
@@ -1872,11 +2252,13 @@ fn open_mcp_app<'a>(
     slot: &'a mut Option<SessionSearch>,
     config: &Config,
     harness_roots: &[std::path::PathBuf],
+    policy_inputs: &crate::search_scope::TrustedPolicyInputs,
 ) -> anyhow::Result<&'a SessionSearch> {
     if slot.is_none() {
-        *slot = Some(SessionSearch::open_with_access_inputs(
+        *slot = Some(SessionSearch::open_with_policy_inputs(
             config.clone(),
             mcp_access_inputs(config, harness_roots.to_vec())?,
+            policy_inputs.clone(),
         )?);
     }
     Ok(slot.as_ref().expect("application slot initialized above"))
@@ -3036,6 +3418,7 @@ fn search_messages_output_schema() -> Value {
             // Stated once for the whole document. Every character offset in it -- view
             // boundaries, match coordinates, field totals -- is in this unit.
             "coordinate_unit": { "type": "string", "enum": ["unicode_scalar"], "description": "Unit of every character offset and count in this response." },
+            "source_completeness": { "type": "string", "enum": ["complete", "policy-restricted"], "description": "Whether policy may have hidden source rows; policy-restricted never exposes the hidden count." },
             "effective_request": {
                 "type": "object",
                 "properties": {
@@ -3179,7 +3562,7 @@ fn search_messages_output_schema() -> Value {
                 "additionalProperties": false
             }
         },
-        "required": ["response_schema_version", "coordinate_unit", "effective_request", "results", "page"],
+        "required": ["response_schema_version", "coordinate_unit", "source_completeness", "effective_request", "results", "page"],
         "additionalProperties": false
     })
 }
@@ -5371,8 +5754,8 @@ fn tool_query_session_index_cancellable(
         );
     }
     if sql.is_some() {
-        crate::search_scope::ensure_raw_sql_allowed(
-            &config.search.scope,
+        crate::search_scope::ensure_search_raw_sql_allowed(
+            &config.search,
             "query_session_index SQL",
         )
         .map_err(|error| format!("{error:#}"))?;
@@ -7140,7 +7523,8 @@ mod tests {
                 "included",
                 "page",
                 "response_schema_version",
-                "results"
+                "results",
+                "source_completeness"
             ]
         );
         assert_eq!(structured["page"]["returned"], 2);
@@ -8420,7 +8804,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{field}/{mode}: {error}")),
             );
             assert_eq!(
-                out["response_schema_version"], 1,
+                out["response_schema_version"], 2,
                 "the response-contract version must not reuse the database schema version"
             );
             assert_eq!(out["page"]["returned"], 1, "{field}/{mode}: {out}");
@@ -9646,6 +10030,87 @@ mod tests {
     }
 
     #[test]
+    fn official_rmcp_without_elicitation_creates_a_bounded_external_request() {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("blocked-workspace");
+        let state_path = dir.path().join("permissions.sqlite");
+        let mut config = config_for_fixture(&dir);
+        let permissions_config: Config = toml::from_str(&format!(
+            r#"
+[search.permissions]
+default_profile = "restricted"
+permission_state_database = {state_path:?}
+
+[search.permissions.profiles.restricted]
+default = "block"
+
+[search.permissions.profiles.restricted.grant_envelope]
+operation = ["read"]
+session_workspace_root = [{workspace:?}]
+max_uses = 2
+max_expires_in = "10m"
+"#,
+            state_path = state_path.to_string_lossy(),
+            workspace = workspace.to_string_lossy(),
+        ))
+        .unwrap();
+        config.search.permissions = permissions_config.search.permissions;
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let store = crate::permission_store::PermissionStore::open(&state_path).unwrap();
+        let generation = store
+            .observe_valid_policy_source(Path::new("/managed/policy.toml"), b"policy-v1")
+            .unwrap();
+        let policy_inputs = crate::search_scope::TrustedPolicyInputs {
+            policy_generation: Some(generation),
+            ..crate::search_scope::TrustedPolicyInputs::default()
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new_with_policy_inputs(config, policy_inputs).unwrap();
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let error = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({
+                            "query": "needle",
+                            "workspace_path_prefix": workspace,
+                            "index_refresh": "existing-only"
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("permission approval required"), "{error}");
+            assert!(error.contains("request_id="), "{error}");
+            assert_eq!(
+                store
+                    .status(generation, chrono::Utc::now().timestamp())
+                    .unwrap()
+                    .pending_requests,
+                1
+            );
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
     fn official_rmcp_transport_negotiates_and_serves_the_canonical_tool_catalogue() {
         use rmcp::ServiceExt as _;
 
@@ -10030,7 +10495,28 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert_eq!(requests.load(Ordering::Acquire), 1);
-            assert_eq!(state.lock().unwrap().harness_roots, [allowed]);
+            {
+                let guard = state.lock().unwrap();
+                assert_eq!(
+                    guard.harness_roots.as_slice(),
+                    std::slice::from_ref(&allowed)
+                );
+                assert_eq!(
+                    guard
+                        .policy_inputs
+                        .caller_context
+                        .live_workspace_roots
+                        .as_slice(),
+                    std::slice::from_ref(&allowed)
+                );
+                assert_eq!(
+                    guard
+                        .policy_inputs
+                        .caller_context
+                        .live_workspace_roots_origin,
+                    Some(crate::search_scope::CallerContextOrigin::McpRoots)
+                );
+            }
 
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");
