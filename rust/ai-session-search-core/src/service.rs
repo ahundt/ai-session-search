@@ -36,7 +36,9 @@ use crate::models::{
     SessionRecord,
 };
 use crate::runtime::ExecutionRuntime;
-use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
+use crate::search_scope::{
+    EffectiveAccessScope, EffectiveSearchPolicy, TrustedAccessInputs, TrustedPolicyInputs,
+};
 
 /// RAII application root shared by native frontends and language bindings.
 ///
@@ -45,6 +47,7 @@ use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
 pub struct SessionSearch {
     config: Config,
     access: EffectiveAccessScope,
+    policy: EffectiveSearchPolicy,
     db: Db,
 }
 
@@ -950,7 +953,17 @@ impl SessionSearch {
         config: Config,
         access_inputs: TrustedAccessInputs,
     ) -> Result<Self> {
-        Self::open_with_access_inputs_and_runtime(config, access_inputs, None)
+        Self::open_with_policy_inputs(config, access_inputs, TrustedPolicyInputs::default())
+    }
+
+    /// Open with explicit embedding-host caller context. Query arguments cannot construct this
+    /// value; the embedding host is part of the documented application authority boundary.
+    pub fn open_with_policy_inputs(
+        config: Config,
+        access_inputs: TrustedAccessInputs,
+        policy_inputs: TrustedPolicyInputs,
+    ) -> Result<Self> {
+        Self::open_with_access_inputs_and_runtime(config, access_inputs, policy_inputs, None)
     }
 
     /// Open an independent prepared-index reader sharing one fixed data-parallel worker budget.
@@ -958,9 +971,24 @@ impl SessionSearch {
     /// The caller must select `existing-only`; this constructor reuses all normal schema and
     /// authority validation while preventing per-reader Rayon pools. Each returned application
     /// owns one SQLite read connection, so a bounded set can read a WAL database concurrently.
+    #[cfg(test)]
     pub(crate) fn open_prepared_reader(
         config: Config,
         access_inputs: TrustedAccessInputs,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> Result<Self> {
+        Self::open_prepared_reader_with_policy_inputs(
+            config,
+            access_inputs,
+            TrustedPolicyInputs::default(),
+            runtime,
+        )
+    }
+
+    pub(crate) fn open_prepared_reader_with_policy_inputs(
+        config: Config,
+        access_inputs: TrustedAccessInputs,
+        policy_inputs: TrustedPolicyInputs,
         runtime: Arc<ExecutionRuntime>,
     ) -> Result<Self> {
         if config.index.refresh != IndexRefresh::ExistingOnly {
@@ -968,15 +996,26 @@ impl SessionSearch {
                 "prepared readers require index.refresh=existing-only after the freshness coordinator completes"
             );
         }
-        Self::open_with_access_inputs_and_runtime(config, access_inputs, Some(runtime))
+        Self::open_with_access_inputs_and_runtime(
+            config,
+            access_inputs,
+            policy_inputs,
+            Some(runtime),
+        )
     }
 
     fn open_with_access_inputs_and_runtime(
         config: Config,
         access_inputs: TrustedAccessInputs,
+        mut policy_inputs: TrustedPolicyInputs,
         runtime: Option<Arc<ExecutionRuntime>>,
     ) -> Result<Self> {
+        policy_inputs
+            .caller_context
+            .live_workspace_roots
+            .extend(access_inputs.harness_roots.iter().cloned());
         let access = EffectiveAccessScope::resolve(&config.search.scope, access_inputs)?;
+        let policy = EffectiveSearchPolicy::resolve(&config.search, policy_inputs)?;
         let schema_state = IndexCoordinator::new(&config).inspect_schema()?;
         match schema_state {
             SchemaState::Missing if config.index.refresh == IndexRefresh::ExistingOnly => {
@@ -1066,8 +1105,14 @@ impl SessionSearch {
             )?
         };
         db.set_access_scope(access.clone());
+        db.set_search_policy(policy.clone());
         db.set_implicit_index_maintenance(config.index.refresh != IndexRefresh::ExistingOnly);
-        Ok(Self { config, access, db })
+        Ok(Self {
+            config,
+            access,
+            policy,
+            db,
+        })
     }
 
     /// Open with explicit maintenance authority even when implicit refresh is configured as
@@ -1090,6 +1135,10 @@ impl SessionSearch {
     /// Immutable access authority used by every read service.
     pub const fn access_scope(&self) -> &EffectiveAccessScope {
         &self.access
+    }
+
+    pub const fn search_policy(&self) -> &EffectiveSearchPolicy {
+        &self.policy
     }
 
     /// Session catalog operations.
@@ -1735,7 +1784,9 @@ impl<'app> AnalysisService<'app> {
         filters: &crate::models::MessageFilters,
         policies: &crate::corrections::ResolvedCorrectionPolicySet,
     ) -> Result<crate::corrections::MessageClassificationReport> {
-        let matches = self.db.find_corrections(policies, filters)?;
+        let mut filters = filters.clone();
+        filters.authorization_operation = Some(crate::search_scope::SearchOperation::Analyze);
+        let matches = self.db.find_corrections(policies, &filters)?;
         Ok(crate::corrections::MessageClassificationReport {
             policies: policies.receipts(),
             matches,
@@ -1918,7 +1969,9 @@ impl<'app> AnalysisService<'app> {
     ) -> Result<Vec<crate::models::PlanningCount>> {
         let command_filters =
             crate::analytics::compile_planning_filters(self.config, command_patterns)?;
-        self.db.planning_usage(filters, &command_filters)
+        let mut filters = filters.clone();
+        filters.authorization_operation = Some(crate::search_scope::SearchOperation::Analyze);
+        self.db.planning_usage(&filters, &command_filters)
     }
 
     /// Count indexed messages by normalized role, ordered by role.
@@ -1930,9 +1983,12 @@ impl<'app> AnalysisService<'app> {
         &self,
         filters: &MessageFilters,
     ) -> Result<Vec<crate::analytics::RoleStat>> {
+        let mut authorized_filters = filters.clone();
+        authorized_filters.authorization_operation =
+            Some(crate::search_scope::SearchOperation::Analyze);
         let rows: Vec<_> = self
             .db
-            .message_role_counts(filters)?
+            .message_role_counts(&authorized_filters)?
             .into_iter()
             .map(|(role, count)| crate::analytics::RoleStat { role, count })
             .collect();
@@ -2049,7 +2105,10 @@ impl<'db> ExportService<'db> {
         id_or_prefix: &str,
         format: crate::export::ExportFormat,
     ) -> Result<crate::export::ExportDocument> {
-        let session = self.db.resolve_session(id_or_prefix)?;
+        let session = self.db.resolve_session_for_operation(
+            id_or_prefix,
+            crate::search_scope::SearchOperation::Export,
+        )?;
         crate::export::render_full(&session, format)
     }
 
@@ -2064,7 +2123,9 @@ impl<'db> ExportService<'db> {
         filters: &SearchFilters,
         plan: &crate::export::ExportPublicationPlan,
     ) -> Result<crate::export::ExportPublicationReceipt> {
-        let sessions = self.db.list_recent(filters)?;
+        let sessions = self
+            .db
+            .list_recent_for_operation(filters, crate::search_scope::SearchOperation::Export)?;
         let format = plan.format();
         let documents = sessions.into_iter().map(|session| {
             self.render_full(&session.id, format)
@@ -2831,6 +2892,13 @@ impl<'db> MessageService<'db> {
                 planner,
                 origins,
                 included,
+                source_completeness: if self.db.access_scope().is_unrestricted()
+                    && !self.db.search_policy_is_restricted()
+                {
+                    crate::message_search::SourceCompleteness::Complete
+                } else {
+                    crate::message_search::SourceCompleteness::PolicyRestricted
+                },
             })
             .with_query(response_query),
         )
@@ -3194,7 +3262,9 @@ impl<'db> FileService<'db> {
         query: &FileQuery,
         version: Option<usize>,
     ) -> Result<crate::files::ReconstructedFile> {
-        crate::files::reconstruct_query(self.db, file, query, version)
+        let mut query = query.clone();
+        query.authorization_operation = Some(crate::search_scope::SearchOperation::RestoreFiles);
+        crate::files::reconstruct_query(self.db, file, &query, version)
     }
 
     /// Lazily reconstruct every causally ordered version with a complete replay path.
@@ -3203,7 +3273,9 @@ impl<'db> FileService<'db> {
         file: &str,
         query: &FileQuery,
     ) -> Result<crate::files::ReconstructedFileVersions> {
-        crate::files::reconstruct_versions_query(self.db, file, query)
+        let mut query = query.clone();
+        query.authorization_operation = Some(crate::search_scope::SearchOperation::RestoreFiles);
+        crate::files::reconstruct_versions_query(self.db, file, &query)
     }
 
     /// Atomically publish every reconstructable version to a new non-replacing directory.

@@ -22,7 +22,7 @@ pub const DEFAULT_MATCH_EVIDENCE_MAX_CHARS: usize = 220;
 /// Version of the cross-surface structured message-search response contract.
 ///
 /// This is intentionally independent of the SQLite schema version.
-pub const MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION: u32 = 1;
+pub const MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MessageSearchError {
@@ -2166,6 +2166,13 @@ impl std::ops::Deref for MessageSearchHit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceCompleteness {
+    Complete,
+    PolicyRestricted,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageSearchResponse {
     request: ResolvedMessageSearchRequest,
@@ -2181,6 +2188,7 @@ pub struct MessageSearchResponse {
     planner: Option<crate::models::SearchExplain>,
     origins: Option<MessageSearchOrigins>,
     included: MessageSearchIncludedData,
+    source_completeness: SourceCompleteness,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2278,6 +2286,7 @@ pub(crate) struct MessageSearchResponseParts {
     pub planner: Option<crate::models::SearchExplain>,
     pub origins: Option<MessageSearchOrigins>,
     pub included: MessageSearchIncludedData,
+    pub source_completeness: SourceCompleteness,
 }
 
 impl MessageSearchResponse {
@@ -2292,6 +2301,7 @@ impl MessageSearchResponse {
             planner,
             origins,
             included,
+            source_completeness,
         } = parts;
         let (match_target, match_mode) = match match_details {
             Some((target, mode)) => (Some(target), Some(mode)),
@@ -2311,7 +2321,12 @@ impl MessageSearchResponse {
             planner,
             origins,
             included,
+            source_completeness,
         }
+    }
+
+    pub const fn source_completeness(&self) -> SourceCompleteness {
+        self.source_completeness
     }
 
     pub(crate) fn with_query(mut self, query: Option<String>) -> Self {
@@ -2556,7 +2571,7 @@ impl Serialize for MessageSearchDocument<'_> {
 
         ensure_message_search_serialization_active(self.cancellation).map_err(S::Error::custom)?;
         let receipt_level = self.response.request.receipt_level;
-        let mut entry_count = 5;
+        let mut entry_count = 6;
         if receipt_level != ReceiptLevel::None {
             entry_count += 1;
         }
@@ -2574,6 +2589,7 @@ impl Serialize for MessageSearchDocument<'_> {
         // once satisfies that and costs 34 characters instead of 34 times three times the page.
         map.serialize_entry("coordinate_unit", &CoordinateUnit::UnicodeScalar)?;
         map.serialize_entry("effective_request", &self.response.request)?;
+        map.serialize_entry("source_completeness", &self.response.source_completeness)?;
         map.serialize_entry(
             "results",
             &SemanticResults {

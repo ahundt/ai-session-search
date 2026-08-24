@@ -647,11 +647,12 @@ fn semantic_response_contract_exposes_one_hit_two_views_and_truthful_page_extent
             "effective_request",
             "page",
             "response_schema_version",
-            "results"
+            "results",
+            "source_completeness"
         ],
         "the default document has one compact semantic core and no empty receipt"
     );
-    assert_eq!(document["response_schema_version"], 1);
+    assert_eq!(document["response_schema_version"], 2);
     assert_eq!(document["effective_request"]["query"], case.query);
     assert_eq!(document["effective_request"]["query_mode"], "literal");
     assert_eq!(
@@ -894,7 +895,7 @@ fn every_advertised_include_and_context_parameter_changes_the_document() {
     );
     assert_eq!(
         document["included"]["runtime_diagnostics"]["response_schema_version"],
-        1
+        2
     );
     assert_eq!(
         document["included"]["runtime_diagnostics"]["database_schema_version"],

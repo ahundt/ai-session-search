@@ -99,6 +99,74 @@ no trusted root remains, exact hidden IDs use the normal no-match response, and 
 `aise db query` or MCP `query_session_index` SQL is disabled because it cannot enforce the shared
 predicate. Schema inspection remains available.
 
+This scope is an application-level search boundary: it prevents cooperative CLI, MCP, Rust, and
+Python reads from returning rows outside the shared predicate, but it cannot stop arbitrary code
+running as the same OS user from opening the SQLite index or source transcripts directly. Protect
+against that caller with OS/process isolation or a separately protected broker; do not describe
+`allowed-roots` as a filesystem sandbox.
+
+### Typed permission profiles
+
+`[search.permissions]` is the typed replacement for new configurations. Do not configure it beside
+`[search.scope]`; AISE rejects both panels together. The built-in `unrestricted` profile preserves
+the compatibility default. A profile may default to `allow`, grantable `block`, or non-overrideable
+`hard-block`. Rules use AND between populated fields and OR between repeated rules. `hard-block`
+wins regardless of file order.
+
+```toml
+[search.permissions]
+ceiling_profile = "unrestricted"
+default_profile = "work"
+
+[search.permissions.profiles.work]
+default = "block"
+
+[[search.permissions.profiles.work.rules]]
+rule_id = "project-read"
+effect = "allow"
+resource = "session"
+operation = ["read"]
+session_workspace_root = ["/absolute/project"]
+```
+
+Start from the current directory without writing first:
+
+```bash
+aise permissions init --preset current-directory --profile work --dry-run
+aise permissions validate --format json
+aise permissions status --effective
+```
+
+`current-directory` captures the canonical CLI cwd and generates a grantable block outside it.
+`current-directory-locked` uses `hard-block`; `current-repository` requires a Git worktree. Profile
+and rule writes show the destination and resulting panel, require terminal stdin/stdout plus fresh
+confirmation, and use a compare-before-publish text transaction. Add `--dry-run` to preview a
+mutation. Relative management paths resolve once against the CLI cwd; search `--path` remains a
+result filter.
+
+`aise integrations install --permission-profile NAME` verifies the profile and pins the absolute
+AISE config path, profile, and known client harness in generated MCP launch arguments. Search/tool
+requests cannot select a profile. Standalone CLI reads capture cwd once at startup; MCP roots are
+validated connection-local authority. Exact model rules require the version-1 native adapter API
+and fail closed without it. Transcript metadata, environment variables, request arguments, and
+model self-report are never authorization inputs.
+
+`--declare-caller-harness`, `--declare-caller-model-id`, and
+`--declare-caller-working-directory` are diagnostic, narrow-only declarations. They can trigger a
+block but cannot satisfy an allow rule or grant envelope. When authoritative context is missing,
+AISE returns `caller-context-unavailable`; inspect `aise integrations status` rather than inventing
+an identity.
+
+A wholly blocked explicit workspace selector inside `grant_envelope` creates a five-minute pending
+request without querying hidden rows. Human CLI approval uses `aise permissions grant REQUEST_ID`
+with bounded `--uses` or `--expires-in`; noninteractive terminals fail closed. MCP uses standard
+form elicitation when the client completes that verified channel, otherwise it returns the pending
+request ID for external approval. Retry with `--permission-workspace-root`, `--permission-grant`,
+and a caller-stable `--permission-operation-id`. Admission spends one use atomically before the
+query; cancellation, failure, and transport loss do not refund it. `hard-block`, ceiling profiles,
+live roots, and restrictive overlays remain non-overrideable. `aise permissions status` reports
+active durable state; terminal rows are retained for 30 days.
+
 `aise config show` prints the configured panel, `aise config origins` reports whether that panel
 came from the config file or typed default, and `aise config paths` prints the effective standalone roots,
 their canonical targets, and each contributing origin. MCP roots are connection-local and are not

@@ -340,6 +340,7 @@ pub struct Db {
     conn: Connection,
     runtime: Arc<ExecutionRuntime>,
     access_scope: crate::search_scope::EffectiveAccessScope,
+    search_policy: crate::search_scope::EffectiveSearchPolicy,
     /// Fixed corpus-size threshold used only by the pre-v4 compatibility prefilter.
     prefilter_min_corpus: i64,
     /// Fixed un-indexed delta size before the pre-v4 compatibility base is rebuilt.
@@ -622,6 +623,7 @@ impl Db {
             conn,
             runtime: Arc::new(ExecutionRuntime::new(worker_threads)),
             access_scope: crate::search_scope::EffectiveAccessScope::All,
+            search_policy: crate::search_scope::EffectiveSearchPolicy::unrestricted(),
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             implicit_index_maintenance: true,
@@ -686,6 +688,7 @@ impl Db {
             conn,
             runtime,
             access_scope: crate::search_scope::EffectiveAccessScope::All,
+            search_policy: crate::search_scope::EffectiveSearchPolicy::unrestricted(),
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             implicit_index_maintenance: false,
@@ -757,6 +760,21 @@ impl Db {
 
     pub(crate) const fn access_scope(&self) -> &crate::search_scope::EffectiveAccessScope {
         &self.access_scope
+    }
+
+    pub(crate) fn set_search_policy(
+        &mut self,
+        search_policy: crate::search_scope::EffectiveSearchPolicy,
+    ) {
+        self.search_policy = search_policy;
+    }
+
+    pub(crate) fn search_policy_is_restricted(&self) -> bool {
+        self.search_policy.is_restricted()
+    }
+
+    pub(crate) fn has_message_policy(&self) -> bool {
+        self.search_policy.has_message_rules()
     }
 
     fn validate_access_scope(&self) -> Result<()> {
@@ -2208,7 +2226,13 @@ impl Db {
 
         let mut sql = String::from("select m.role, count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         sql.push_str(" group by m.role order by m.role");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2479,7 +2503,13 @@ impl Db {
              from messages m where 1 = 1",
         );
         let mut args = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
 
         let explain = if field == SearchField::Content {
             let literal_query =
@@ -2749,7 +2779,13 @@ impl Db {
              from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         sql.push_str(if order == MessageOrder::NewestFirst {
             " order by m.session_id, m.seq desc"
         } else {
@@ -2983,7 +3019,13 @@ impl Db {
         use rusqlite::types::Value;
         let mut sql = format!("select count(*) from messages m where {base_predicate}");
         let mut args = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         sql.push_str(
             " and m.id in (
                  select rowid from messages_trigram where messages_trigram match ?
@@ -3018,7 +3060,13 @@ impl Db {
              from messages m where 1 = 1",
         );
         let mut args = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         // The dispatcher sends only fuzzy derived-field searches here. Literal and regex have one
         // owner in prepare_non_fuzzy_message_query(), including tool-argument trigram planning.
         debug_assert_eq!(filters.match_mode, MessageSearchMode::Fuzzy);
@@ -3131,7 +3179,13 @@ impl Db {
               where m.tool_name is not null",
         );
         let mut args = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         sql.push_str(" order by m.session_id, m.seq");
         let rows = self.query_message_hits(&sql, &args)?;
         let pattern = Pattern::new(
@@ -3216,7 +3270,13 @@ impl Db {
                   where m.tool_name is not null",
             );
             let mut args = vec![Value::Text(selected_names)];
-            append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+            append_message_filters(
+                &mut sql,
+                &mut args,
+                filters,
+                &self.access_scope,
+                &self.search_policy,
+            );
             Some(
                 self.conn
                     .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
@@ -3259,7 +3319,13 @@ impl Db {
                   where m.tool_name is not null",
             );
             let mut args = vec![Value::Text(selected_names)];
-            append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+            append_message_filters(
+                &mut sql,
+                &mut args,
+                filters,
+                &self.access_scope,
+                &self.search_policy,
+            );
             sql.push_str(" order by m.session_id, m.seq limit ?");
             args.push(Value::Integer(remaining as i64));
             let mut stmt = self.conn.prepare(&sql)?;
@@ -3432,6 +3498,7 @@ impl Db {
                 &mut args,
                 filters,
                 &self.access_scope,
+                &self.search_policy,
                 class,
             );
             if filters.tool.is_some() {
@@ -3516,7 +3583,13 @@ impl Db {
         anyhow::ensure!(threshold > 0, "corpus probe threshold must be positive");
         let mut inner = String::from("select 1 from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut inner, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut inner,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         inner.push_str(" limit 1 offset ?");
         args.push(Value::Integer(threshold - 1));
         let sql = format!("select exists({inner})");
@@ -3535,7 +3608,13 @@ impl Db {
         use rusqlite::types::Value;
         let mut sql = String::from("select count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         sql.push_str(" and m.id in (select id from _trigram_cand)");
         Ok(self
             .conn
@@ -3700,6 +3779,19 @@ impl Db {
             Value::Integer(seq.saturating_add(after)),
         ];
         push_access_scope(&mut sql, &mut args, "session_id", &self.access_scope);
+        push_policy_for_session_id(
+            &mut sql,
+            &mut args,
+            "session_id",
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
+        push_message_policy(
+            &mut sql,
+            &mut args,
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
         sql.push_str(" order by seq");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
@@ -3751,6 +3843,19 @@ impl Db {
         );
         let mut args = vec![Value::Text(serde_json::to_string(&bounds)?)];
         push_access_scope(&mut sql, &mut args, "m.session_id", &self.access_scope);
+        push_policy_for_session_id(
+            &mut sql,
+            &mut args,
+            "m.session_id",
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
+        push_message_policy(
+            &mut sql,
+            &mut args,
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
         sql.push_str(" order by a.ord, m.seq");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -3805,6 +3910,13 @@ impl Db {
         );
         let mut args = vec![Value::Text(serde_json::to_string(ids)?)];
         push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
+        push_policy_for_session_id(
+            &mut sql,
+            &mut args,
+            "s.id",
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((
@@ -3862,6 +3974,13 @@ impl Db {
         );
         let mut args = vec![Value::Text(serde_json::to_string(ids)?)];
         push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
+        push_policy_for_session_id(
+            &mut sql,
+            &mut args,
+            "s.id",
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -3936,7 +4055,13 @@ impl Db {
                )",
         );
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut inner, &mut args, filters, &self.access_scope);
+        append_message_filters(
+            &mut inner,
+            &mut args,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
         let mut sql = format!("select * from ({inner}) attributable where 1 = 1");
         if !query.is_empty() {
             match filters.match_mode {
@@ -4079,7 +4204,7 @@ impl Db {
             // index rows but cannot become evidence about what a person said.
             let mut sql = String::from(CORRECTION_CANDIDATES_SQL);
             let mut args: Vec<Value> = Vec::new();
-            append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
+            append_message_filters(&mut sql, &mut args, &filters, &self.access_scope, &self.search_policy);
             // Timestamp alone is not a total order: providers may omit it, and several messages
             // may share one timestamp. Stable tie-breakers make offset pages reproducible and
             // non-overlapping across the CLI, Rust, Python, and MCP adapters.
@@ -4122,6 +4247,7 @@ impl Db {
                     &mut parts_args,
                     &filters,
                     &self.access_scope,
+                    &self.search_policy,
                 );
                 parts_sql.push_str(" order by m.id, p.ordinal");
                 let mut human_parts_by_message: HashMap<i64, Vec<(usize, usize)>> = HashMap::new();
@@ -4260,7 +4386,13 @@ impl Db {
         let mut args: Vec<Value> = Vec::new();
         let mut filters = filters.clone();
         filters.role = Some(Role::Slash);
-        append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            &filters,
+            &self.access_scope,
+            &self.search_policy,
+        );
 
         let mut stmt = self.conn.prepare(&sql)?;
         let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -4328,7 +4460,13 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        push_file_filters(&mut sql, &mut args, query, &self.access_scope);
+        push_file_filters(
+            &mut sql,
+            &mut args,
+            query,
+            &self.access_scope,
+            &self.search_policy,
+        );
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path");
         let mut having: Vec<&str> = Vec::new();
@@ -4388,7 +4526,13 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        push_file_filters(&mut sql, &mut args, query, &self.access_scope);
+        push_file_filters(
+            &mut sql,
+            &mut args,
+            query,
+            &self.access_scope,
+            &self.search_policy,
+        );
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path, session_id order by file_path, edits desc");
         if query.limit > 0 || query.offset > 0 {
@@ -4481,7 +4625,13 @@ impl Db {
             Value::Text(file.to_string()),
             Value::Text(format!("%/{file}")),
         ];
-        push_file_filters(&mut sql, &mut args, query, &self.access_scope);
+        push_file_filters(
+            &mut sql,
+            &mut args,
+            query,
+            &self.access_scope,
+            &self.search_policy,
+        );
         sql.push_str(" order by session_id, seq");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -4545,7 +4695,15 @@ impl Db {
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
-        self.list_recent_page(filters, 0)
+        self.list_recent_for_operation(filters, crate::search_scope::SearchOperation::Read)
+    }
+
+    pub(crate) fn list_recent_for_operation(
+        &self,
+        filters: &SearchFilters,
+        operation: crate::search_scope::SearchOperation,
+    ) -> Result<Vec<SessionRecord>> {
+        self.list_recent_page_for_operation(filters, 0, operation)
     }
 
     pub fn list_recent_page(
@@ -4553,13 +4711,33 @@ impl Db {
         filters: &SearchFilters,
         offset: usize,
     ) -> Result<Vec<SessionRecord>> {
+        self.list_recent_page_for_operation(
+            filters,
+            offset,
+            crate::search_scope::SearchOperation::Read,
+        )
+    }
+
+    fn list_recent_page_for_operation(
+        &self,
+        filters: &SearchFilters,
+        offset: usize,
+        operation: crate::search_scope::SearchOperation,
+    ) -> Result<Vec<SessionRecord>> {
         self.validate_access_scope()?;
         let mut sql = format!(
             "select {} from sessions s where 1 = 1",
             session_record_columns!()
         );
         let mut params_vec = Vec::new();
-        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
+        push_session_filters(
+            &mut sql,
+            &mut params_vec,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+            operation,
+        );
         use std::fmt::Write as _;
         sql.push_str(" order by s.updated_at desc, s.id asc");
         if filters.limit != 0 {
@@ -4589,6 +4767,11 @@ impl Db {
         cursor: Option<&crate::models::AnalysisCursor>,
     ) -> Result<crate::models::AnalysisDocumentPage> {
         self.validate_access_scope()?;
+        if self.has_message_policy() {
+            bail!(
+                "analysis documents are unavailable while message-level policy is active until their attributable-message counts and text share the child predicate; use `aise messages search`"
+            );
+        }
         if filters.limit == 0 {
             return Err(anyhow!(
                 "analysis document page limit must be greater than zero"
@@ -4603,6 +4786,7 @@ impl Db {
             cursor,
             filters.limit,
             &self.access_scope,
+            &self.search_policy,
         )
     }
 
@@ -4625,6 +4809,11 @@ impl Db {
         ) -> Result<()>,
     ) -> Result<AnalysisTraversalReceipt> {
         self.validate_access_scope()?;
+        if self.has_message_policy() {
+            bail!(
+                "analysis is unavailable while message-level policy is active until its counts, text stream, and digest share the child predicate; use `aise messages search`"
+            );
+        }
         let transaction = self.conn.unchecked_transaction()?;
         let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
         let mut human_message_stmt =
@@ -4654,6 +4843,7 @@ impl Db {
                 cursor.as_ref(),
                 limit,
                 &self.access_scope,
+                &self.search_policy,
             )?;
             if sessions.is_empty() {
                 if next_cursor.is_some() {
@@ -4789,7 +4979,14 @@ impl Db {
             session_record_columns!()
         );
         let mut params_vec = Vec::new();
-        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
+        push_session_filters(
+            &mut sql,
+            &mut params_vec,
+            filters,
+            &self.access_scope,
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
         sql.push_str(" order by s.id asc");
         let mut stmt = self.conn.prepare(&sql)?;
         let candidates = stmt.query_map(
@@ -4829,10 +5026,24 @@ impl Db {
     }
 
     pub fn resolve_session(&self, value: &str) -> Result<SessionWithTranscript> {
+        self.resolve_session_for_operation(value, crate::search_scope::SearchOperation::Read)
+    }
+
+    pub(crate) fn resolve_session_for_operation(
+        &self,
+        value: &str,
+        operation: crate::search_scope::SearchOperation,
+    ) -> Result<SessionWithTranscript> {
+        if self.has_message_policy() {
+            bail!(
+                "full transcript rendering is unavailable while message-level policy is active because the stored transcript cannot represent hidden rows; use `aise messages get {value}` for the policy-filtered view"
+            );
+        }
         let exact = self.session_resolution_matches(
             RESOLVE_SESSION_EXACT_SQL,
             value,
             row_to_session_with_transcript,
+            operation,
         )?;
         if !exact.is_empty() {
             return unique_session_match(value, exact, |session| &session.session.id);
@@ -4842,15 +5053,25 @@ impl Db {
             RESOLVE_SESSION_PREFIX_SQL,
             &prefix,
             row_to_session_with_transcript,
+            operation,
         )?;
         unique_session_match(value, matches, |session| &session.session.id)
     }
 
     pub fn resolve_session_record(&self, value: &str) -> Result<SessionRecord> {
+        self.resolve_session_record_for_operation(value, crate::search_scope::SearchOperation::Read)
+    }
+
+    pub(crate) fn resolve_session_record_for_operation(
+        &self,
+        value: &str,
+        operation: crate::search_scope::SearchOperation,
+    ) -> Result<SessionRecord> {
         let exact = self.session_resolution_matches(
             RESOLVE_SESSION_RECORD_EXACT_SQL,
             value,
             row_to_session_record,
+            operation,
         )?;
         if !exact.is_empty() {
             return unique_session_match(value, exact, |session| &session.id);
@@ -4860,6 +5081,7 @@ impl Db {
             RESOLVE_SESSION_RECORD_PREFIX_SQL,
             &prefix,
             row_to_session_record,
+            operation,
         )?;
         unique_session_match(value, matches, |session| &session.id)
     }
@@ -4875,11 +5097,13 @@ impl Db {
         base_sql: &str,
         value: &str,
         mapper: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        operation: crate::search_scope::SearchOperation,
     ) -> Result<Vec<T>> {
         self.access_scope.validate_stable()?;
         let mut sql = base_sql.to_string();
         let mut args = vec![rusqlite::types::Value::Text(value.to_string())];
         push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
+        push_policy_for_session_id(&mut sql, &mut args, "s.id", &self.search_policy, operation);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), mapper)?;
         let mut matches = Vec::new();
@@ -4987,11 +5211,24 @@ impl Db {
         self.validate_access_scope()?;
         let mut sql = String::from(
             "with ordered as (
-                 select ts, kind, lag(ts) over (order by seq) as previous_ts
-                 from messages where session_id = ?",
+                 select m.ts, m.kind, lag(m.ts) over (order by m.seq) as previous_ts
+                 from messages m where m.session_id = ?",
         );
         let mut args = vec![Value::Text(session_id.to_string())];
-        push_access_scope(&mut sql, &mut args, "session_id", &self.access_scope);
+        push_access_scope(&mut sql, &mut args, "m.session_id", &self.access_scope);
+        push_policy_for_session_id(
+            &mut sql,
+            &mut args,
+            "m.session_id",
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
+        push_message_policy(
+            &mut sql,
+            &mut args,
+            &self.search_policy,
+            crate::search_scope::SearchOperation::Read,
+        );
         sql.push_str(
             ") select count(*), count(ts), min(ts), max(ts),
                     max(case when previous_ts is null or ts is null then null
@@ -5112,6 +5349,7 @@ fn analysis_session_page(
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
     access: &crate::search_scope::EffectiveAccessScope,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
 ) -> Result<(Vec<SessionRecord>, Option<crate::models::AnalysisCursor>)> {
     use crate::models::AnalysisCursor;
     use std::fmt::Write as _;
@@ -5127,7 +5365,14 @@ fn analysis_session_page(
         session_record_columns!()
     );
     let mut params_vec = Vec::new();
-    push_session_filters(&mut sql, &mut params_vec, filters, access);
+    push_session_filters(
+        &mut sql,
+        &mut params_vec,
+        filters,
+        access,
+        policy,
+        crate::search_scope::SearchOperation::Analyze,
+    );
     if let Some(cursor) = cursor {
         sql.push_str(" and s.id > ? ");
         params_vec.push(cursor.as_str().to_string());
@@ -5158,11 +5403,12 @@ fn analysis_document_page(
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
     access: &crate::search_scope::EffectiveAccessScope,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
 ) -> Result<crate::models::AnalysisDocumentPage> {
     use crate::models::{AnalysisDocument, AnalysisDocumentPage};
 
     let (sessions, next_cursor) =
-        analysis_session_page(transaction, filters, cursor, page_limit, access)?;
+        analysis_session_page(transaction, filters, cursor, page_limit, access, policy)?;
     let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
     let mut human_message_stmt = transaction.prepare(ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL)?;
     let mut documents = Vec::with_capacity(sessions.len());
@@ -5204,6 +5450,8 @@ fn push_session_filters(
     params_vec: &mut Vec<String>,
     filters: &SearchFilters,
     access: &crate::search_scope::EffectiveAccessScope,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
+    operation: crate::search_scope::SearchOperation,
 ) {
     if let Some(provider) = filters.provider {
         sql.push_str(" and s.provider = ? ");
@@ -5213,6 +5461,7 @@ fn push_session_filters(
         push_session_path_prefix(sql, params_vec, path_prefix);
     }
     push_session_access_scope(sql, params_vec, access);
+    push_session_policy(sql, params_vec, policy, operation);
     push_session_exclusions(sql, params_vec, filters);
     push_session_kinds(sql, filters);
     if let Some(parent_session_id) = &filters.parent_session_id {
@@ -5391,6 +5640,78 @@ fn push_session_access_scope(
     sql.push(')');
 }
 
+fn push_session_policy(
+    sql: &mut String,
+    args: &mut Vec<String>,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
+    operation: crate::search_scope::SearchOperation,
+) {
+    let predicate = policy.session_sql_predicate(operation);
+    if predicate.expression == "1" {
+        return;
+    }
+    sql.push_str(" and (");
+    sql.push_str(&predicate.expression);
+    sql.push(')');
+    args.extend(predicate.parameters);
+}
+
+fn push_policy_for_session_id(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    id_col: &str,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
+    operation: crate::search_scope::SearchOperation,
+) {
+    use rusqlite::types::Value;
+    use std::fmt::Write as _;
+
+    let predicate = policy.session_sql_predicate(operation);
+    if predicate.expression == "1" {
+        return;
+    }
+    let _ = write!(
+        sql,
+        " and {id_col} in (select s.id from sessions s where {} )",
+        predicate.expression
+    );
+    args.extend(predicate.parameters.into_iter().map(Value::Text));
+}
+
+fn push_message_policy(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
+    operation: crate::search_scope::SearchOperation,
+) {
+    push_child_policy(sql, args, policy.message_sql_predicate(operation));
+}
+
+fn push_file_edit_policy(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
+    operation: crate::search_scope::SearchOperation,
+) {
+    push_child_policy(sql, args, policy.file_edit_sql_predicate(operation));
+}
+
+fn push_child_policy(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    predicate: crate::search_scope::PolicySqlPredicate,
+) {
+    use rusqlite::types::Value;
+
+    if predicate.expression == "1" {
+        return;
+    }
+    sql.push_str(" and (");
+    sql.push_str(&predicate.expression);
+    sql.push(')');
+    args.extend(predicate.parameters.into_iter().map(Value::Text));
+}
+
 fn push_exclude_domain_path_prefixes(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -5457,8 +5778,16 @@ fn append_message_filters(
     args: &mut Vec<rusqlite::types::Value>,
     filters: &MessageFilters,
     access: &crate::search_scope::EffectiveAccessScope,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
 ) {
-    append_message_filters_with_class(sql, args, filters, access, ClassSelection::FromFilters);
+    append_message_filters_with_class(
+        sql,
+        args,
+        filters,
+        access,
+        policy,
+        ClassSelection::FromFilters,
+    );
 }
 
 fn append_message_filters_with_class(
@@ -5466,6 +5795,7 @@ fn append_message_filters_with_class(
     args: &mut Vec<rusqlite::types::Value>,
     filters: &MessageFilters,
     access: &crate::search_scope::EffectiveAccessScope,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
     class: ClassSelection<'_>,
 ) {
     use rusqlite::types::Value;
@@ -5531,6 +5861,11 @@ fn append_message_filters_with_class(
     }
     push_message_session_kinds(sql, "m.session_id", filters.session_kinds.as_ref());
     push_access_scope(sql, args, "m.session_id", access);
+    let operation = filters
+        .authorization_operation
+        .unwrap_or(crate::search_scope::SearchOperation::Read);
+    push_policy_for_session_id(sql, args, "m.session_id", policy, operation);
+    push_message_policy(sql, args, policy, operation);
     push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "m.session_id", &filters.exclude_path_prefixes);
     push_domain_path_prefix(
@@ -5716,6 +6051,7 @@ fn push_file_filters(
     args: &mut Vec<rusqlite::types::Value>,
     query: &FileQuery,
     access: &crate::search_scope::EffectiveAccessScope,
+    policy: &crate::search_scope::EffectiveSearchPolicy,
 ) {
     use rusqlite::types::Value;
     if let Some(provider) = query.provider {
@@ -5727,6 +6063,11 @@ fn push_file_filters(
         args.push(Value::Text(session_id.to_string()));
     }
     push_access_scope(sql, args, "session_id", access);
+    let operation = query
+        .authorization_operation
+        .unwrap_or(crate::search_scope::SearchOperation::Read);
+    push_policy_for_session_id(sql, args, "session_id", policy, operation);
+    push_file_edit_policy(sql, args, policy, operation);
     push_path_prefix(sql, args, "session_id", query.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "session_id", &query.exclude_path_prefixes);
     for session_id in &query.exclude_session_ids {
@@ -5735,19 +6076,8 @@ fn push_file_filters(
     }
 }
 
-fn path_prefix_parts(prefix: &str) -> (String, String) {
-    let bytes = prefix.as_bytes();
-    let windows_style = prefix.starts_with(r"\\")
-        || matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
-    let separator = if windows_style { '\\' } else { '/' };
-    let exact = prefix.trim_end_matches(separator).to_string();
-    let child = format!("{exact}{separator}");
-    (exact, child)
-}
-
 fn path_prefix_patterns(prefix: &str) -> (String, String) {
-    let (exact, child) = path_prefix_parts(prefix);
-    (exact, literal_like_prefix_pattern(&child))
+    crate::search_scope::path_prefix_patterns(prefix)
 }
 
 /// Escape a caller-authored literal for a SQLite `LIKE ... ESCAPE '\'` prefix probe.
@@ -15319,7 +15649,13 @@ mod tests {
     fn naive_corpus_count(db: &Db, filters: &MessageFilters) -> i64 {
         let mut sql = String::from("select count(*) from messages m where 1 = 1");
         let mut args = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &db.access_scope);
+        append_message_filters(
+            &mut sql,
+            &mut args,
+            filters,
+            &db.access_scope,
+            &db.search_policy,
+        );
         db.conn
             .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
                 row.get(0)

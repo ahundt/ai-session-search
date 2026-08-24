@@ -1330,7 +1330,7 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
         "claude:matrix",
         0,
     )
-    assert first_page.response_schema_version == 1
+    assert first_page.response_schema_version == 2
     assert first_page.effective_request["query"] == "tool_call"
     assert first_page.effective_request["context"] == {
         "messages_before": 1,
@@ -1460,7 +1460,7 @@ def test_native_message_search_response_exposes_only_the_canonical_version_one_d
         ),
     )
 
-    assert response.response_schema_version == 1
+    assert response.response_schema_version == 2
     assert response.coordinate_unit == "unicode_scalar"
     assert response.effective_request["query"] == "exact needle"
     assert isinstance(response.results, list)

@@ -85,6 +85,10 @@ identity and does not determine priority.
   exceptions, nullability, enums, and serialized output lossless and aligned.
 - `REQ012-reject-invalid-combinations` — Reject conflicting or unsatisfiable parameter sets with
   actionable errors instead of returning misleading empty or partial results.
+- `REQ049-enforce-search-result-authority` — Resolve one immutable typed policy below adapters;
+  classify every operation, filter before counts/ranking/paging/context, inherit session authority
+  for messages/files, preserve legacy scope semantics, and distinguish application filtering from
+  OS/process or broker isolation.
 
 ### P1 — product and integration contracts
 
