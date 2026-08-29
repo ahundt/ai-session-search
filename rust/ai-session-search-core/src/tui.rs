@@ -1343,9 +1343,7 @@ mod tests {
         }
 
         /// The row where the error line renders when an error is present. Without an error the
-        /// row belongs to the body's bottom border, so only read it while `app.error` is set —
-        /// first called by step 3's dead-worker test (E32); the allow is removed then.
-        #[allow(dead_code)]
+        /// row belongs to the body's bottom border, so only read it while `app.error` is set.
         fn error_line(&self) -> String {
             let area = self.terminal.backend().buffer().area;
             self.region_text(
@@ -1601,5 +1599,481 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "find the needle here");
         assert!(line.spans.len() >= 2);
+    }
+    fn rows(ids: &[&str]) -> Vec<SessionRecord> {
+        ids.iter().map(|id| session(id).session).collect()
+    }
+
+    /// Wait for one executor completion, failing with the reason that carries the RED signal:
+    /// the executor can only run if the UI actually sent a request (§5.3).
+    fn wait_for_executed(executed: &mpsc::Receiver<String>) -> String {
+        executed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("executor ran (it can only if the UI sent a request)")
+    }
+
+    /// Wait for one observed request shape (kind, query, selected_id).
+    fn wait_for_request(
+        requests: &mpsc::Receiver<(RequestKind, String, Option<String>)>,
+    ) -> (RequestKind, String, Option<String>) {
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a request reached the executor")
+    }
+
+    /// Release parked gates enough times for every queued request to finish, so a harness
+    /// holding a parked executor can drop without hanging on the worker join.
+    fn finish_gated(release: &mpsc::Sender<()>) {
+        for _ in 0..8 {
+            let _ = release.send(());
+        }
+    }
+
+    #[test]
+    fn echo_renders_while_the_search_executor_is_still_blocked() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
+                    gate.recv()
+                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                }
+                let response = match request.kind {
+                    // The ungated startup request answers with the seeded rows; answering
+                    // "after" here would race the !contains assertion via the stale guard
+                    // instead of excluding it (§5.3).
+                    RequestKind::Search if request.query.trim().is_empty() => {
+                        WorkerResponse::results(request, rows(&["claude:before"]))
+                    }
+                    RequestKind::Search => {
+                        WorkerResponse::results(request, rows(&["claude:after"]))
+                    }
+                    RequestKind::PreviewOnly => {
+                        WorkerResponse::preview(request, Some(String::new()))
+                    }
+                };
+                let _ = executed_tx.send(request.query.clone());
+                Ok(response)
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+
+        // G1: the character is rendered and the previous result set is intact while the
+        // search for "a" is provably still parked inside the executor.
+        assert!(
+            harness.search_box().contains('a'),
+            "typed character must render before the search completes"
+        );
+        assert!(
+            harness.session_rows().contains("before"),
+            "previous results must survive while the search is in flight"
+        );
+        assert!(!harness.session_rows().contains("after"));
+
+        release.send(()).unwrap();
+        wait_for_executed(&executed_rx);
+        harness.step();
+        assert!(harness.session_rows().contains("after"));
+        finish_gated(&release);
+    }
+
+    #[test]
+    fn backspace_echoes_while_the_executor_is_blocked() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
+                    gate.recv()
+                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                }
+                let _ = executed_tx.send(request.query.clone());
+                Ok(match request.kind {
+                    RequestKind::Search => WorkerResponse::results(request, Vec::new()),
+                    RequestKind::PreviewOnly => WorkerResponse::preview(request, None),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.script(vec![
+            key(KeyCode::Char('/')),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Backspace),
+        ]);
+        harness.step_until_script_drained();
+        // Backspace rendered immediately (query lost 'a'); a whitespace-only query counts as
+        // empty, matching refresh's trim() contract.
+        assert!(!harness.search_box().contains("a█"));
+        assert_eq!(harness.app.query, "");
+        release.send(()).unwrap();
+        wait_for_executed(&executed_rx);
+        finish_gated(&release);
+    }
+
+    #[test]
+    fn worker_serves_only_the_latest_of_a_drained_burst() {
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                let _ = executed_tx.send(request.query.clone());
+                Ok(WorkerResponse::results(request, Vec::new()))
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.script(vec![
+            key(KeyCode::Char('/')),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('b')),
+            key(KeyCode::Char('c')),
+            key(KeyCode::Char('d')),
+            key(KeyCode::Char('e')),
+        ]);
+        harness.step_until_script_drained();
+        // Collect until quiet: the worker executes in microseconds after the sends.
+        let mut executed: Vec<String> = Vec::new();
+        while let Ok(query) = executed_rx.recv_timeout(Duration::from_millis(200)) {
+            executed.push(query);
+        }
+        // The startup empty query runs, then the burst must coalesce to its latest: the
+        // five queued searches never execute as five (§2.3 drain-to-latest).
+        assert_eq!(
+            executed,
+            vec![String::new(), "e".to_string()],
+            "a drained burst must serve only the latest request"
+        );
+    }
+
+    #[test]
+    fn superseding_a_query_cancels_the_one_in_flight() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (observed_tx, observed_rx) = mpsc::channel::<Arc<QueryCancellation>>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                let _ = observed_tx.send(Arc::clone(cancellation));
+                if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
+                    gate.recv()
+                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                }
+                Ok(WorkerResponse::results(request, Vec::new()))
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        // The fake executor cloned the FIRST request's cancellation out; the test owns the
+        // only other Arc, which is what makes is_cancelled() assertable at all (C29).
+        let first = observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first search reached the executor");
+        harness.script(vec![key(KeyCode::Char('b'))]);
+        harness.step_until_script_drained();
+        assert!(
+            first.is_cancelled(),
+            "typing a newer query must cancel the superseded in-flight search"
+        );
+        finish_gated(&release);
+    }
+
+    #[test]
+    fn response_for_a_superseded_query_is_dropped() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
+                    gate.recv()
+                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                }
+                let id = format!("claude:{}", request.query);
+                let _ = executed_tx.send(request.query.clone());
+                Ok(WorkerResponse::results(request, rows(&[&id])))
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        harness.script(vec![key(KeyCode::Char('b'))]);
+        harness.step_until_script_drained();
+        // Release both: the stale "a" response must be dropped by the originating-query
+        // guard, never rendered; the fresh "b" response applies.
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx);
+        harness.step();
+        harness.step();
+        assert!(
+            !harness.session_rows().contains("claude:a"),
+            "a response for a superseded query must not mutate state"
+        );
+        assert!(harness.session_rows().contains("claude:b"));
+        finish_gated(&release);
+    }
+
+    #[test]
+    fn preview_only_response_does_not_replace_the_result_list() {
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                let _ = executed_tx.send(request.query.clone());
+                Ok(match request.kind {
+                    RequestKind::Search => WorkerResponse::results(request, rows(&["claude:keep"])),
+                    RequestKind::PreviewOnly => {
+                        WorkerResponse::preview(request, Some("preview body".to_string()))
+                    }
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        harness.step_until_script_drained();
+        harness.script(vec![key(KeyCode::Char('j'))]);
+        harness.step_until_script_drained();
+        wait_for_executed(&executed_rx);
+        harness.step();
+        assert_eq!(harness.app.selected, 1);
+        assert!(
+            harness.session_rows().contains("keep"),
+            "a preview-only response must never replace the result list (C13)"
+        );
+    }
+
+    #[test]
+    fn startup_and_every_query_change_end_with_a_preview_for_the_selected_row() {
+        let (requests_tx, requests_rx) = mpsc::channel::<(RequestKind, String, Option<String>)>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                let _ = requests_tx.send((
+                    request.kind,
+                    request.query.clone(),
+                    request.selected_id.clone(),
+                ));
+                Ok(match request.kind {
+                    RequestKind::Search if request.query.trim().is_empty() => {
+                        WorkerResponse::results(request, rows(&["claude:one", "claude:two"]))
+                    }
+                    RequestKind::Search => WorkerResponse::results(request, rows(&["claude:two"])),
+                    RequestKind::PreviewOnly => WorkerResponse::preview(
+                        request,
+                        request
+                            .selected_id
+                            .as_deref()
+                            .map(|id| format!("preview of {id}")),
+                    ),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:one", "claude:two"]);
+        // Startup: empty-query Search, then a preview for the row the UI actually selected.
+        let (kind, query, _) = wait_for_request(&requests_rx);
+        assert_eq!((kind, query.as_str()), (RequestKind::Search, ""));
+        let (kind, _, selected) = wait_for_request(&requests_rx);
+        assert_eq!(
+            (kind, selected),
+            (RequestKind::PreviewOnly, Some("claude:one".into()))
+        );
+        harness.step();
+        harness.step();
+        assert!(harness.app.preview.contains("claude:one"));
+
+        // Query change that drops the selected row: the new first row must get its preview.
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('z'))]);
+        harness.step_until_script_drained();
+        let (kind, _, selected) = wait_for_request(&requests_rx);
+        assert_eq!(
+            (kind, selected),
+            (RequestKind::PreviewOnly, Some("claude:two".into())),
+            "the preview must follow whatever row the UI actually selected (C28)"
+        );
+        harness.step();
+        harness.step();
+        assert!(harness.app.preview.contains("claude:two"));
+    }
+
+    #[test]
+    fn a_preview_overtaken_by_newer_navigation_is_discarded() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::PreviewOnly {
+                    gate.recv()
+                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                }
+                let _ = executed_tx.send(request.query.clone());
+                Ok(match request.kind {
+                    RequestKind::Search => {
+                        WorkerResponse::results(request, rows(&["claude:one", "claude:two"]))
+                    }
+                    RequestKind::PreviewOnly => WorkerResponse::preview(
+                        request,
+                        request
+                            .selected_id
+                            .as_deref()
+                            .map(|id| format!("preview of {id}")),
+                    ),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:one", "claude:two"]);
+        harness.step_until_script_drained();
+        // The startup preview (row 0) parks; j selects row 1 and queues its preview.
+        harness.script(vec![key(KeyCode::Char('j'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.selected, 1);
+        release.send(()).unwrap();
+        wait_for_executed(&executed_rx);
+        harness.step();
+        assert!(
+            !harness.app.preview.contains("claude:one"),
+            "a preview overtaken by newer navigation must be discarded, not rendered beside the wrong row"
+        );
+        // The queued row-1 preview then executes (drained burst) and applies.
+        release.send(()).unwrap();
+        wait_for_executed(&executed_rx);
+        harness.step();
+        assert!(harness.app.preview.contains("claude:two"));
+        finish_gated(&release);
+    }
+
+    #[test]
+    fn selection_and_preview_scroll_survive_a_response_that_still_contains_it() {
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                let _ = executed_tx.send(request.query.clone());
+                Ok(match request.kind {
+                    RequestKind::Search if request.query.trim().is_empty() => {
+                        WorkerResponse::results(
+                            request,
+                            rows(&["claude:one", "claude:two", "claude:three"]),
+                        )
+                    }
+                    // Same set, reordered: the selected id survives, at a new position.
+                    RequestKind::Search => WorkerResponse::results(
+                        request,
+                        rows(&["claude:three", "claude:two", "claude:one"]),
+                    ),
+                    RequestKind::PreviewOnly => WorkerResponse::preview(
+                        request,
+                        Some(
+                            (0..50)
+                                .map(|line| format!("line {line}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                    ),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&[
+            "claude:one",
+            "claude:two",
+            "claude:three",
+        ]);
+        harness.step_until_script_drained();
+        wait_for_executed(&executed_rx); // startup search
+        wait_for_executed(&executed_rx); // startup preview
+        harness.step();
+        harness.script(vec![key(KeyCode::Char('j'))]);
+        harness.step_until_script_drained();
+        wait_for_executed(&executed_rx); // row-1 preview
+        harness.step();
+        harness.script(vec![
+            key(KeyCode::Char('l')),
+            key(KeyCode::Char('l')),
+            key(KeyCode::Char('l')),
+        ]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.preview_scroll, 15);
+        assert_eq!(harness.app.selected, 1);
+
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('z'))]);
+        harness.step_until_script_drained();
+        wait_for_executed(&executed_rx); // the reordered search response
+        harness.step();
+        assert_eq!(
+            harness.app.selected, 1,
+            "a response still containing the selected session must preserve the selection (D4)"
+        );
+        assert_eq!(harness.app.preview_scroll, 15);
+    }
+
+    #[test]
+    fn navigation_moves_selection_while_a_preview_is_outstanding() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::PreviewOnly {
+                    gate.recv()
+                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                }
+                let _ = executed_tx.send(request.query.clone());
+                Ok(match request.kind {
+                    RequestKind::Search => WorkerResponse::results(
+                        request,
+                        rows(&["claude:one", "claude:two", "claude:three"]),
+                    ),
+                    RequestKind::PreviewOnly => WorkerResponse::preview(
+                        request,
+                        request
+                            .selected_id
+                            .as_deref()
+                            .map(|id| format!("preview of {id}")),
+                    ),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&[
+            "claude:one",
+            "claude:two",
+            "claude:three",
+        ]);
+        harness.step_until_script_drained();
+        // The startup preview parks (outstanding). j and k must move the selection NOW,
+        // without waiting for it (G2).
+        harness.script(vec![
+            key(KeyCode::Char('j')),
+            key(KeyCode::Char('j')),
+            key(KeyCode::Char('k')),
+        ]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.selected, 1);
+        finish_gated(&release);
+        wait_for_executed(&executed_rx);
+    }
+
+    #[test]
+    fn a_dead_worker_reports_an_error_and_leaves_the_ui_usable() {
+        let executor = Box::new(
+            move |_request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                panic!("executor exploded")
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        harness.step_until_script_drained();
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        assert!(
+            harness.app.error.is_some(),
+            "a dead worker must surface as the error line, not a hang or an exit (C14)"
+        );
+        harness.step();
+        assert!(
+            harness.error_line().contains("worker"),
+            "the error line must render the failure"
+        );
+        // The list stays navigable and q still quits.
+        harness.script(vec![key(KeyCode::Char('j'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.selected, 1);
+        harness.script(vec![key(KeyCode::Char('q'))]);
+        assert!(matches!(
+            harness.step_until_script_drained(),
+            Some(AppAction::Quit)
+        ));
     }
 }
