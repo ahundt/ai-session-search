@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
+use std::num::NonZeroUsize;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,8 +24,10 @@ use ratatui::{
 };
 
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, QueryCancellation, SCHEMA_VERSION};
 use crate::models::{Provider, SearchFilters, SessionRecord};
+use crate::search_scope::EffectiveAccessScope;
+use crate::service::CatalogService;
 use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
     resume_plan, truncate_for_display,
@@ -117,7 +122,11 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut events = CrosstermEventSource;
-    let mut app = AppState::new(config, db)?;
+    let (worker, _observed_scope) = spawn_search_worker(db_backed_executor(
+        config.clone(),
+        db.access_scope().clone(),
+    ))?;
+    let mut app = AppState::new(config, db, worker)?;
     let action = run_app(&mut terminal, &mut events, &mut app);
 
     // Restore the terminal before the resume output/prompt below runs on the normal screen.
@@ -209,12 +218,339 @@ enum AppAction {
     Resume(Box<SessionRecord>),
 }
 
+/// Which kind of work a [`WorkerRequest`] asks for. The discriminant is load-bearing: a
+/// preview-only response must never replace the result list (C13).
+///
+/// First CONSTRUCTED by step 4's request builders; present now so step 3's RED tests compile
+/// against real types (E32). The allow is removed in step 4.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Search,
+    PreviewOnly,
+}
+
+/// A unit of work for the search worker. First CONSTRUCTED by step 4's request builders;
+/// the type exists now so step 3's RED tests compile against real types and fail on behavior,
+/// not on `cannot find type` (E32) — hence the temporary allow, removed in step 4.
+#[allow(dead_code)]
+struct WorkerRequest {
+    kind: RequestKind,
+    query: String,
+    filters: SearchFilters,
+    selected_id: Option<String>,
+}
+
+/// The standing empty-state preview text; `WorkerResponse::preview` supplies it when no row is
+/// selected, exactly as the inline preview path always has.
+const NO_SESSIONS_PREVIEW: &str = "No sessions matched the current query.";
+
+/// Exactly one of `results` / `preview` is populated, and which one is decided by `RequestKind`.
+///
+/// A `Search` response carries **no** preview. It cannot: the selection-preservation rule runs
+/// on the UI thread against the new result set, so the worker does not know which row will end
+/// up selected and cannot pre-compute the right preview for it. The UI applies the results,
+/// then issues a `PreviewOnly` for whatever it actually selected — one extra round trip, off
+/// the UI thread, and it keeps up to `D_max` bytes of transcript out of the search response
+/// (C28). The originating query travels back so a superseded response is dropped without a
+/// sequence counter; `previewed_id` says which session the preview is *for*, so a preview
+/// overtaken by newer navigation is discarded rather than rendered beside the wrong row.
+///
+/// Fields are first READ by step 4's `apply_response`; present now so step 3's RED tests
+/// compile against real types (E32). The allow is removed in step 4.
+#[allow(dead_code)]
+struct WorkerResponse {
+    query: String,
+    results: Option<Vec<SessionRecord>>,
+    previewed_id: Option<String>,
+    preview: Option<String>,
+    preview_line_count: usize,
+}
+
+impl WorkerResponse {
+    /// A search response: results only, no preview.
+    fn results(request: &WorkerRequest, rows: Vec<SessionRecord>) -> Self {
+        Self {
+            query: request.query.clone(),
+            results: Some(rows),
+            previewed_id: None,
+            preview: None,
+            preview_line_count: 0,
+        }
+    }
+
+    /// A preview response. `None` text means "no selected session" and renders the standing
+    /// empty-state message, matching the inline preview path.
+    fn preview(request: &WorkerRequest, text: Option<String>) -> Self {
+        let preview = text.unwrap_or_else(|| NO_SESSIONS_PREVIEW.to_string());
+        let preview_line_count = preview.lines().count();
+        Self {
+            query: request.query.clone(),
+            results: None,
+            previewed_id: request.selected_id.clone(),
+            preview: Some(preview),
+            preview_line_count,
+        }
+    }
+}
+
+/// The cancellation is supplied by the worker, not created by the executor: one slot, one
+/// owner (§2.3). A production executor installs it on its own connection.
+///
+/// It is passed as `&Arc<_>`, not `&QueryCancellation`, for one reason: `cancel_in_flight`
+/// does `slot.take()`, so after a supersede the worker's `Arc` is the only one left and a
+/// borrow cannot outlive the call. A fake executor clones the `Arc` out to the test thread,
+/// which is the only way the supersede and quit tests can observe `is_cancelled()` at all.
+type SearchExecutor =
+    Box<dyn FnMut(&WorkerRequest, &Arc<QueryCancellation>) -> Result<WorkerResponse> + Send>;
+
+/// Runs INSIDE the worker thread. The production executor owns a `Db` that must be opened
+/// there, so it cannot be constructed on the UI thread and moved in; tests return a closure
+/// directly. Reports the observed access scope on success so the caller can assert it (P5).
+type ExecutorFactory = Box<dyn FnOnce() -> Result<(SearchExecutor, EffectiveAccessScope)> + Send>;
+
+/// RAII owner. A bare tuple has no destructor, so any `?` between spawn and join leaks a
+/// thread holding an open SQLite connection (C3).
+///
+/// Cleanup: cancels the in-flight query, drops the request sender to end the loop, and joins.
+/// Cancellation lands within at most one scoring batch (E19b), which bounds quit latency.
+struct SearchWorker {
+    requests: Option<mpsc::Sender<WorkerRequest>>,
+    responses: mpsc::Receiver<Result<WorkerResponse>>,
+    in_flight: Arc<Mutex<Option<Arc<QueryCancellation>>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl SearchWorker {
+    /// Stop whatever query is running.
+    ///
+    /// The guard is bound to a local rather than left as a temporary: the interrupt handle is
+    /// connection-scoped (E21b), so `cancel()` must not overlap the worker publishing the next
+    /// query's cancellation, or it would interrupt that one instead and the worker would
+    /// silently drop its result as an expected supersede.
+    fn cancel_in_flight(&self) {
+        let mut slot = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancellation) = slot.take() {
+            cancellation.cancel();
+        }
+    }
+
+    /// Queue a request. Never returns `Err` as control flow: a dead worker sets the error
+    /// line, it does not end the TUI (C14).
+    ///
+    /// Only a new SEARCH supersedes a running one. A `PreviewOnly` request from j/k must not
+    /// cancel an in-flight search: the worker would treat the interruption as an expected
+    /// supersede, send nothing, and then answer with `results: None`, stranding a stale list
+    /// with no error (C21). Navigation is already instant without this — the UI moves the
+    /// selection locally. First called by step 4's request builders (E32 ordering).
+    #[allow(dead_code)]
+    fn send(&self, request: WorkerRequest) -> std::result::Result<(), String> {
+        if request.kind == RequestKind::Search {
+            self.cancel_in_flight();
+        }
+        match self.requests.as_ref() {
+            Some(sender) => sender.send(request).map_err(|_| {
+                "the search worker stopped; press q to quit and rerun aise tui".to_string()
+            }),
+            None => Err("the search worker is shut down".to_string()),
+        }
+    }
+}
+
+impl Drop for SearchWorker {
+    fn drop(&mut self) {
+        self.cancel_in_flight();
+        self.requests.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Spawn the search worker. Concurrency and cleanup (REQ010): one thread, one SQLite
+/// connection, one lazy Rayon pool of `config.resolve_threads()` workers (owned by the
+/// production executor). The only shared mutable state is the in-flight cancellation slot,
+/// whose lock is held for `O(1)` and never across a query. `Drop` cancels, closes the request
+/// channel, and joins; join latency is bounded by one scoring batch (E19b), not the query.
+fn spawn_search_worker(
+    make_executor: ExecutorFactory,
+) -> Result<(SearchWorker, EffectiveAccessScope)> {
+    let (ready_tx, ready_rx) =
+        mpsc::sync_channel::<std::result::Result<EffectiveAccessScope, String>>(1);
+    let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<Result<WorkerResponse>>();
+    // The ONE cancellation slot. Both the worker thread and the returned SearchWorker hold
+    // clones of this same Arc — a second slot is what made supersede a silent no-op (C20).
+    let in_flight: Arc<Mutex<Option<Arc<QueryCancellation>>>> = Arc::new(Mutex::new(None));
+    let worker_in_flight = Arc::clone(&in_flight);
+    let handle = thread::Builder::new()
+        .name("aise-tui-search".to_string())
+        .spawn(move || {
+            let mut execute = match make_executor() {
+                Ok((executor, scope)) => {
+                    let _ = ready_tx.send(Ok(scope));
+                    executor
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("{error:#}")));
+                    return;
+                }
+            };
+            while let Ok(first) = request_rx.recv() {
+                // Drain to the latest queued request: superseded searches never execute (§2.3).
+                let request = request_rx.try_iter().last().unwrap_or(first);
+                // Publish under the same lock the UI cancels under, so a supersede either stops
+                // THIS query or arrives before it starts — never lands on its successor (E21b).
+                let cancellation = Arc::new(QueryCancellation::new());
+                {
+                    let mut slot = worker_in_flight
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(Arc::clone(&cancellation));
+                }
+                let outcome = execute(&request, &cancellation);
+                {
+                    let mut slot = worker_in_flight
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    slot.take();
+                }
+                match outcome {
+                    Ok(response) => {
+                        let _ = response_tx.send(Ok(response));
+                    }
+                    // Superseded mid-query: silent by design; the newer request owns the screen.
+                    Err(error) if is_expected_interruption(&error) => {}
+                    Err(error) => {
+                        let _ = response_tx.send(Err(error));
+                    }
+                }
+            }
+        })?;
+    // Startup handshake: block until the executor opened its connection, so a startup failure
+    // surfaces with the terminal restored rather than a TUI that silently never populates.
+    let observed = ready_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("the search worker exited during startup"))?
+        .map_err(|message| anyhow::anyhow!("the search worker failed to start: {message}"))?;
+    Ok((
+        SearchWorker {
+            requests: Some(request_tx),
+            responses: response_rx,
+            in_flight,
+            handle: Some(handle),
+        },
+        observed,
+    ))
+}
+
+/// Two lines, not `message_search_batches`'s predicate: that one is a private bare `fn` and
+/// also matches `MessageSearchCancelled` and `ReadSnapshotCleanupError`, neither of which this
+/// worker can produce (E22).
+fn is_expected_interruption(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(inner, _))
+                if inner.code == rusqlite::ErrorCode::OperationInterrupted
+        )
+    })
+}
+
+/// The production executor factory: opens the worker's OWN read-only connection — the
+/// message-search worker's recipe (read-only unconditionally, access scope set explicitly,
+/// schema version ensured, progress reporter deliberately unset so nothing writes over the
+/// alternate screen) — and routes search/list through `CatalogService` (D1), the same seam
+/// the CLI, MCP, and Python use. Preview resolution stays on `Db` because
+/// `CatalogService::resolve_session` returns no transcript (§6.4).
+///
+/// Complexity (REQ010): one connection (≤64 MiB page cache, 256 MiB virtual mmap window), one
+/// lazy Rayon pool bounded by `config.resolve_threads()`; per request the bounds are
+/// `db.search`/`list_recent`'s documented ones, plus `O(D_max)` transient transcript bytes for
+/// a preview.
+fn db_backed_executor(config: Config, access: EffectiveAccessScope) -> ExecutorFactory {
+    Box::new(move || {
+        let worker_threads = NonZeroUsize::new(config.resolve_threads())
+            .expect("Config::resolve_threads always returns at least one");
+        let mut db = Db::open_existing_read_only_with_threads(
+            &config.db_path(),
+            config.index.busy_timeout_ms,
+            worker_threads,
+        )?;
+        db.set_access_scope(access);
+        anyhow::ensure!(
+            db.schema_version()? == SCHEMA_VERSION,
+            "the TUI search worker requires database schema {SCHEMA_VERSION}; \
+             run `aise reindex --full`, then retry"
+        );
+        let observed = db.access_scope().clone();
+        let repo = current_repo(&config);
+        let scoring = config.search.scoring.clone();
+        Ok((
+            Box::new(
+                move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                    // The worker created and published this; the executor only installs it on
+                    // its own connection.
+                    db.install_query_cancellation(cancellation)?;
+                    // Constructed per call: the closure owns `db`, so it cannot also store a
+                    // CatalogService borrowing it. Copy newtype over a reference; free.
+                    let catalog = CatalogService::new(&db);
+                    match request.kind {
+                        RequestKind::Search if request.query.trim().is_empty() => {
+                            Ok(WorkerResponse::results(
+                                request,
+                                catalog.list_sessions(&request.filters)?,
+                            ))
+                        }
+                        RequestKind::Search => Ok(WorkerResponse::results(
+                            request,
+                            catalog
+                                .search_sessions(
+                                    &request.query,
+                                    &request.filters,
+                                    repo.as_deref(),
+                                    &scoring,
+                                )?
+                                .into_iter()
+                                .map(|hit| hit.session)
+                                .collect(),
+                        )),
+                        RequestKind::PreviewOnly => {
+                            // The one place the TUI still touches `Db` directly:
+                            // `CatalogService::resolve_session` returns no transcript (§6.4).
+                            // O(D_max) transient.
+                            let text = match request.selected_id.as_deref() {
+                                Some(id) => {
+                                    let resolved = db.resolve_session(id)?;
+                                    Some(build_transcript_summary(&resolved.transcript_text))
+                                }
+                                None => None,
+                            };
+                            Ok(WorkerResponse::preview(request, text))
+                        }
+                    }
+                },
+            ) as SearchExecutor,
+            observed,
+        ))
+    })
+}
+
 struct AppState<'a> {
     config: &'a Config,
     /// Temporary: the key dispatch moved onto `AppState` and still calls
     /// `refresh`/`move_selection`/`select_index`, which need the handle. Step 4 moves that
     /// work onto the worker and deletes this field.
     db: &'a Db,
+    /// The session filters the browser runs with. The state IS a `SearchFilters` value: no
+    /// parallel filter representation exists (R8/§5.5d).
+    filters: SearchFilters,
+    /// Search worker. Spawned from step 2; no key arm consults it until step 4 re-routes
+    /// refresh/navigation onto requests.
+    worker: SearchWorker,
     query: String,
     search_mode: bool,
     selected: usize,
@@ -228,10 +564,24 @@ struct AppState<'a> {
 }
 
 impl<'a> AppState<'a> {
-    fn new(config: &'a Config, db: &'a Db) -> Result<Self> {
+    fn new(config: &'a Config, db: &'a Db, worker: SearchWorker) -> Result<Self> {
         let mut state = Self {
             config,
             db,
+            filters: SearchFilters {
+                provider: None,
+                path_prefix: None,
+                exclude_path_prefixes: Vec::new(),
+                exclude_session_ids: Vec::new(),
+                // Every class, matching the CLI default: the browser shows what is indexed.
+                session_kinds: None,
+                parent_session_id: None,
+                since: None,
+                until: None,
+                limit: tui_result_limit(config.search.default_limit),
+                warnings_only: false,
+            },
+            worker,
             query: String::new(),
             search_mode: false,
             selected: 0,
@@ -332,9 +682,14 @@ impl<'a> AppState<'a> {
         }
     }
 
-    /// Absorb finished worker responses. The call site is here from step 1 so the loop's
-    /// drain-then-draw ordering is fixed; step 4 fills in the body.
-    fn drain_responses(&mut self) {}
+    /// Absorb finished worker responses. Step 4 applies them to state; until a key arm sends
+    /// a request the channel is always empty, so this stays observationally a no-op.
+    fn drain_responses(&mut self) {
+        while let Ok(response) = self.worker.responses.try_recv() {
+            // Step 4 replaces this with apply_response; nothing can send before then.
+            drop(response);
+        }
+    }
 
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let mut constraints = Vec::with_capacity(4);
@@ -479,25 +834,12 @@ impl<'a> AppState<'a> {
     }
 
     fn refresh(&mut self, db: &Db) -> Result<()> {
-        let filters = SearchFilters {
-            provider: None,
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            // Every class, matching the CLI default: the browser shows what is indexed.
-            session_kinds: None,
-            parent_session_id: None,
-            since: None,
-            until: None,
-            limit: tui_result_limit(self.config.search.default_limit),
-            warnings_only: false,
-        };
-        self.results = if self.query.trim().is_empty() {
-            db.list_recent(&filters)?
+        let results = if self.query.trim().is_empty() {
+            db.list_recent(&self.filters)?
         } else {
             db.search(
                 &self.query,
-                &filters,
+                &self.filters,
                 current_repo(self.config).as_deref(),
                 &self.config.search.scoring,
             )?
@@ -505,6 +847,7 @@ impl<'a> AppState<'a> {
             .map(|hit| hit.session)
             .collect()
         };
+        self.results = results;
         self.selected = 0;
         self.load_preview(db)?;
         Ok(())
@@ -862,15 +1205,6 @@ mod tests {
         parsed
     }
 
-    fn fixture_db(sessions: &[&str]) -> (tempfile::TempDir, Db) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
-        for id in sessions {
-            db.upsert_session(&session(id), 0, 0).unwrap();
-        }
-        (dir, db)
-    }
-
     fn screen_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         let area = buffer.area;
@@ -885,139 +1219,247 @@ mod tests {
         lines.join("\n")
     }
 
+    /// Maximum loop turns a scripted scenario may take before the harness gives up, panicking
+    /// with the rendered screen (P9).
+    const MAX_TEST_STEPS: usize = 64;
+
+    /// An executor for scenarios that never send requests (pre-step-4 key handling still runs
+    /// inline). It answers honestly if invoked, so an accidental send surfaces as a visible
+    /// state change instead of a hang.
+    fn idle_executor() -> SearchExecutor {
+        Box::new(
+            |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                Ok(match request.kind {
+                    RequestKind::Search => WorkerResponse::results(request, Vec::new()),
+                    RequestKind::PreviewOnly => WorkerResponse::preview(request, None),
+                })
+            },
+        )
+    }
+
+    /// One scripted TUI: owns the terminal, the event script, the app state, and the fixture
+    /// database. The config and Db are leaked so `AppState<'static>` can borrow them; the leak
+    /// is bounded by the number of harness instances per test process.
+    struct TuiHarness {
+        _dir: tempfile::TempDir,
+        db: &'static Db,
+        terminal: Terminal<TestBackend>,
+        events: ScriptedEventSource,
+        app: AppState<'static>,
+    }
+
+    impl TuiHarness {
+        fn with_executor(executor: SearchExecutor) -> Self {
+            Self::with_config(Config::default(), executor)
+        }
+
+        fn with_config(config: Config, executor: SearchExecutor) -> Self {
+            let config: &'static Config = Box::leak(Box::new(config));
+            let (worker, observed) =
+                spawn_search_worker(Box::new(move || Ok((executor, EffectiveAccessScope::All))))
+                    .expect("worker startup handshake");
+            assert!(matches!(observed, EffectiveAccessScope::All));
+            let dir = tempfile::tempdir().unwrap();
+            let db: &'static Db =
+                Box::leak(Box::new(Db::open(&dir.path().join("index.db")).unwrap()));
+            let app = AppState::new(config, db, worker).unwrap();
+            Self {
+                _dir: dir,
+                db,
+                terminal: Terminal::new(TestBackend::new(100, 24)).unwrap(),
+                events: ScriptedEventSource::new(Vec::new()),
+                app,
+            }
+        }
+
+        /// Install the starting rows on `AppState::results` AND in the fixture database, so an
+        /// inline refresh or a worker query sees the same corpus.
+        fn seeded(mut self, sessions: &[&str]) -> Self {
+            let mut records = Vec::new();
+            for id in sessions {
+                let parsed = session(id);
+                self.db.upsert_session(&parsed, 0, 0).unwrap();
+                records.push(parsed.session);
+            }
+            self.app.results = records;
+            self
+        }
+
+        fn script(&mut self, events: Vec<Event>) {
+            self.events = ScriptedEventSource::new(events);
+        }
+
+        fn step(&mut self) -> Option<AppAction> {
+            step(&mut self.terminal, &mut self.events, &mut self.app).unwrap()
+        }
+
+        /// Step until the script has drained, then one more turn: `step` is draw-then-drain,
+        /// so the turn that consumes the last key renders the pre-key state — without the
+        /// extra step, post-script assertions read a stale frame (C32).
+        fn step_until_script_drained(&mut self) -> Option<AppAction> {
+            let mut turns = 0;
+            let mut action = None;
+            while !self.events.events.is_empty() && action.is_none() {
+                action = self.step();
+                turns += 1;
+                assert!(
+                    turns < MAX_TEST_STEPS,
+                    "script did not drain after {MAX_TEST_STEPS} steps; screen:\n{}",
+                    self.screen()
+                );
+            }
+            action.or_else(|| self.step())
+        }
+
+        fn screen(&self) -> String {
+            screen_text(&self.terminal)
+        }
+
+        fn region_text(&self, rows: std::ops::Range<u16>) -> String {
+            let buffer = self.terminal.backend().buffer();
+            let width = buffer.area.width;
+            let mut lines = Vec::new();
+            for y in rows {
+                let mut line = String::new();
+                for x in 0..width {
+                    line.push_str(buffer[(x, y)].symbol());
+                }
+                lines.push(line.trim_end().to_string());
+            }
+            lines.join("\n")
+        }
+
+        fn search_box(&self) -> String {
+            self.region_text(0..SEARCH_BOX_ROWS)
+        }
+
+        /// The session-list region: below the search box, above the status bar and the
+        /// possible error line, at full width (containment assertions do not need the pane
+        /// split).
+        fn session_rows(&self) -> String {
+            let area = self.terminal.backend().buffer().area;
+            let bottom = area.height - STATUS_BAR_ROWS - ERROR_LINE_ROWS;
+            self.region_text(SEARCH_BOX_ROWS..bottom)
+        }
+
+        /// The row where the error line renders when an error is present. Without an error the
+        /// row belongs to the body's bottom border, so only read it while `app.error` is set —
+        /// first called by step 3's dead-worker test (E32); the allow is removed then.
+        #[allow(dead_code)]
+        fn error_line(&self) -> String {
+            let area = self.terminal.backend().buffer().area;
+            self.region_text(
+                area.height - STATUS_BAR_ROWS - ERROR_LINE_ROWS..area.height - STATUS_BAR_ROWS,
+            )
+        }
+    }
+
     #[test]
     fn event_seam_reproduces_current_keybindings() {
-        let (_dir, db) = fixture_db(&["claude:alpha", "claude:beta", "claude:gamma"]);
-        let config = Config::default();
-        let mut app = AppState::new(&config, &db).unwrap();
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-
-        // '/' enters search mode and 'a' types; one step drains both, and because step is
-        // draw-then-drain, a second step renders the post-key state.
-        let mut events =
-            ScriptedEventSource::new(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert!(app.search_mode);
-        assert_eq!(app.query, "a");
-        step(&mut terminal, &mut events, &mut app).unwrap();
-        let screen = screen_text(&terminal);
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&[
+            "claude:alpha",
+            "claude:beta",
+            "claude:gamma",
+        ]);
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        assert!(harness.step_until_script_drained().is_none());
+        assert!(harness.app.search_mode);
+        assert_eq!(harness.app.query, "a");
         assert!(
-            screen.contains("a█"),
+            harness.search_box().contains("a█"),
             "typed character renders with the visual cursor"
         );
-        assert!(screen.contains("Sessions"));
+        assert!(harness.session_rows().contains("Sessions"));
 
         // Esc in search mode returns to browse without quitting.
-        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Esc)]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert!(!app.search_mode);
+        harness.script(vec![key(KeyCode::Esc)]);
+        assert!(harness.step_until_script_drained().is_none());
+        assert!(!harness.app.search_mode);
 
         // Backspace to an empty query re-browses without panicking (search mode first:
         // browse mode has no Backspace arm — that IS the current contract).
-        let mut events =
-            ScriptedEventSource::new(vec![key(KeyCode::Char('/')), key(KeyCode::Backspace)]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert_eq!(app.query, "");
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Backspace)]);
+        assert!(harness.step_until_script_drained().is_none());
+        assert_eq!(harness.app.query, "");
 
-        // Esc returns to browse so the navigation keys below apply (the Backspace section
-        // re-entered search mode).
-        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Esc)]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert!(!app.search_mode);
+        // Esc returns to browse so the navigation keys below apply.
+        harness.script(vec![key(KeyCode::Esc)]);
+        harness.step_until_script_drained();
+        assert!(!harness.app.search_mode);
 
-        // j/k move the selection and load the preview of the new row.
-        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Char('j'))]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert_eq!(app.selected, 1);
+        // j moves the selection and loads the preview of the new row.
+        harness.script(vec![key(KeyCode::Char('j'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.selected, 1);
 
         // Ctrl-d scrolls the preview by the page step against the content-length bound.
-        app.preview_line_count = 100;
-        let mut events = ScriptedEventSource::new(vec![ctrl_key(KeyCode::Char('d'))]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert_eq!(app.preview_scroll, 15);
+        harness.app.preview_line_count = 100;
+        harness.script(vec![ctrl_key(KeyCode::Char('d'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.preview_scroll, 15);
 
-        // Enter on a selected session yields the resume action.
-        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Enter)]);
+        // Enter on a selected session yields the resume action; q quits from browse mode.
+        harness.script(vec![key(KeyCode::Enter)]);
         assert!(matches!(
-            step(&mut terminal, &mut events, &mut app).unwrap(),
+            harness.step_until_script_drained(),
             Some(AppAction::Resume(_))
         ));
-
-        // q quits from browse mode.
-        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Char('q'))]);
+        harness.script(vec![key(KeyCode::Char('q'))]);
         assert!(matches!(
-            step(&mut terminal, &mut events, &mut app).unwrap(),
+            harness.step_until_script_drained(),
             Some(AppAction::Quit)
         ));
 
         // g/G/PageDown/PageUp on an EMPTY result set must not panic.
-        let (_dir2, db2) = fixture_db(&[]);
-        let mut empty_app = AppState::new(&config, &db2).unwrap();
-        let mut terminal2 = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let mut events = ScriptedEventSource::new(vec![
+        let mut empty = TuiHarness::with_executor(idle_executor());
+        empty.script(vec![
             key(KeyCode::Char('g')),
             key(KeyCode::Char('G')),
             key(KeyCode::PageDown),
             key(KeyCode::PageUp),
         ]);
-        assert!(step(&mut terminal2, &mut events, &mut empty_app)
-            .unwrap()
-            .is_none());
+        assert!(empty.step_until_script_drained().is_none());
     }
 
     #[test]
     fn ui_interaction_fields_reach_the_loop() {
-        let (_dir, db) = fixture_db(&["claude:one", "claude:two", "claude:three", "claude:four"]);
         let mut config = Config::default();
         config.ui.event_poll_interval_ms = 7;
         config.ui.list_page_step = 2;
         config.ui.preview_scroll_step = 3;
         config.ui.preview_page_step = 4;
-        let mut app = AppState::new(&config, &db).unwrap();
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&[
+            "claude:one",
+            "claude:two",
+            "claude:three",
+            "claude:four",
+        ]);
 
         // The idle poll paces with the configured interval, observed clock-free through the
         // seam's recorded timeouts (every poll — including the one that returns false).
-        let mut events = ScriptedEventSource::new(vec![key(KeyCode::PageDown)]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
+        harness.script(vec![key(KeyCode::PageDown)]);
+        assert!(harness.step_until_script_drained().is_none());
         assert!(
-            events
+            harness
+                .events
                 .poll_timeouts
                 .iter()
                 .all(|timeout| *timeout == Duration::from_millis(7)),
             "poll timeout must follow [ui].event_poll_interval_ms, got {:?}",
-            events.poll_timeouts
+            harness.events.poll_timeouts
         );
 
         // PageDown moves by the configured list page step, not a hardcoded 10.
-        assert_eq!(app.selected, 2);
+        assert_eq!(harness.app.selected, 2);
 
         // l scrolls by the configured preview scroll step; Ctrl-d adds the page step.
-        app.preview_line_count = 100;
-        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Char('l'))]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert_eq!(app.preview_scroll, 3);
-        let mut events = ScriptedEventSource::new(vec![ctrl_key(KeyCode::Char('d'))]);
-        assert!(step(&mut terminal, &mut events, &mut app)
-            .unwrap()
-            .is_none());
-        assert_eq!(app.preview_scroll, 7);
+        harness.app.preview_line_count = 100;
+        harness.script(vec![key(KeyCode::Char('l'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.preview_scroll, 3);
+        harness.script(vec![ctrl_key(KeyCode::Char('d'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.preview_scroll, 7);
     }
 
     #[test]
