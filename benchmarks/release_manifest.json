@@ -130,6 +130,12 @@
       "argv": ["{python}", "{client_root}/tui_client.py", "--binary", "{binary}", "--fixture", "{fixture}"]
     },
     {
+      "id": "tui-typeahead-latency",
+      "tier": "subsystem",
+      "surface": "tui",
+      "argv": ["{python}", "{client_root}/tui_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--measure-latency"]
+    },
+    {
       "id": "cli-exact-tool-name",
       "tier": "subsystem",
       "surface": "cli",

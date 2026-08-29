@@ -364,6 +364,19 @@ def test_benchmark_clients_do_not_use_removed_query_mode_flags() -> None:
         assert '"--regex"' not in source, name
 
 
+def test_tui_client_latency_case_is_registered_and_opt_in() -> None:
+    """The latency measurement is a separate manifest case; the startup case stays untouched."""
+    source = (ROOT / "benchmarks" / "tui_client.py").read_text()
+    assert '"--measure-latency"' in source
+    assert '"--queries"' in source
+    assert '"--repetitions"' in source
+    assert source.count('print(\'{"preview":true,"sessions":true,"terminal_restored":true}\')') == 1
+    manifest = json.loads((ROOT / "benchmarks" / "release_manifest.json").read_text())
+    cases = {case["id"]: case for case in manifest["cases"]}
+    assert "--measure-latency" in cases["tui-typeahead-latency"]["argv"]
+    assert "--measure-latency" not in cases["tui-startup-list"]["argv"]
+
+
 def test_release_manifest_does_not_pass_search_refresh_policy_to_db_commands() -> None:
     manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
     db_cases = [case for case in manifest["cases"] if "db" in case["argv"]]
