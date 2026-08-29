@@ -409,6 +409,19 @@ pub struct IndexConfig {
 pub struct UiConfig {
     #[serde(default = "default_preview_lines")]
     pub preview_lines: usize,
+    /// Idle wake interval for the TUI event loop. Not a keystroke latency: input drains in a
+    /// burst loop, so this only paces redraws while the user is idle.
+    #[serde(default = "default_event_poll_interval_ms")]
+    pub event_poll_interval_ms: u64,
+    /// Rows the selection moves for PageDown/PageUp in the session list.
+    #[serde(default = "default_list_page_step")]
+    pub list_page_step: usize,
+    /// Lines the preview scrolls for `l`/`h` (and Left/Right).
+    #[serde(default = "default_preview_scroll_step")]
+    pub preview_scroll_step: usize,
+    /// Lines the preview scrolls for Ctrl-d/Ctrl-u.
+    #[serde(default = "default_preview_page_step")]
+    pub preview_page_step: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -932,6 +945,22 @@ fn default_preview_lines() -> usize {
     30
 }
 
+fn default_event_poll_interval_ms() -> u64 {
+    150
+}
+
+fn default_list_page_step() -> usize {
+    10
+}
+
+fn default_preview_scroll_step() -> usize {
+    5
+}
+
+fn default_preview_page_step() -> usize {
+    15
+}
+
 fn default_busy_timeout_ms() -> u64 {
     crate::db::DEFAULT_BUSY_TIMEOUT_MS
 }
@@ -1127,7 +1156,13 @@ impl Default for Config {
                 auto_reindex_busy_timeout_ms: default_auto_reindex_busy_timeout_ms(),
                 auto_reindex_interval_ms: default_auto_reindex_interval_ms(),
             },
-            ui: UiConfig { preview_lines: 30 },
+            ui: UiConfig {
+                preview_lines: 30,
+                event_poll_interval_ms: 150,
+                list_page_step: 10,
+                preview_scroll_step: 5,
+                preview_page_step: 15,
+            },
             search: SearchConfig {
                 default_limit: 50,
                 prefer_current_repo: true,

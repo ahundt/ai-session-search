@@ -230,6 +230,18 @@ repeat_min_matches = 2
 repeat_phrase_min_words = 2
 repeat_phrase_max_words = 5
 
+[ui]
+# Interactive TUI (`aise tui`) pacing and step behavior.
+# Idle wake interval for the TUI event loop, in milliseconds. Not a keystroke latency:
+# input drains in a burst loop, so this only paces redraws while the user is idle.
+event_poll_interval_ms = 150
+# Rows the selection moves for PageDown/PageUp in the session list.
+list_page_step = 10
+# Lines the preview scrolls for l/h (and Left/Right).
+preview_scroll_step = 5
+# Lines the preview scrolls for Ctrl-d/Ctrl-u.
+preview_page_step = 15
+
 # Uncomment provider tables only when you want to disable a provider or replace the platform
 # defaults with explicit paths. If `paths` is absent, aise uses built-in OS-aware defaults;
 # explicit `paths = []` means search no roots for that enabled provider.

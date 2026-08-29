@@ -19,8 +19,17 @@ compatibility baseline; tags below it do not define a compatibility contract.
   benchmark cases on a generated fixture, every required result digest matched, and peak memory
   moved between -10% and +2.6%, the largest drop being the terminal UI's startup.
 
+### Added
+
+- `[ui]` interaction keys with typed defaults: `event_poll_interval_ms` (150),
+  `list_page_step` (10), `preview_scroll_step` (5), `preview_page_step` (15) — the TUI reads
+  each one, and `config.example.toml` documents them beside their typed defaults.
+
 ### Fixed
 
+- Typing in `aise tui` no longer risks freezing the event loop on one keystroke: queued input
+  drains in one loop turn, and a database error during a keystroke shows on a dedicated error
+  line instead of exiting the TUI.
 - A tool call that cannot arm its own cancellation now says so. It previously ran uncancellable
   while the client believed its cancellation still applied.
 - A `query_session_index` call whose read-only restriction fails to install is refused rather than

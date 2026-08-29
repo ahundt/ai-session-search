@@ -253,6 +253,16 @@ than signed integers; first/last database ordering remains an internal inspectio
 Use bounded `search_messages` pages for deterministic non-overlapping detail traversal. CLI
 pipelines can request all summary evidence with `--summary-items 0 --format json`.
 
+## TUI display defaults
+
+`[ui]` configures the interactive terminal UI only. Four interaction keys ship now:
+`event_poll_interval_ms` (150) paces the idle redraw loop — it is not a keystroke latency,
+because queued input drains in one burst before the next draw; `list_page_step` (10) is the
+PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and `preview_page_step`
+(15) are the l/h and Ctrl-d/Ctrl-u scroll amounts. `[ui].preview_lines` is accepted but not
+yet read; making it live is a planned change with its own entry. Every example-file line equals
+its typed Rust default.
+
 ## Maintainer checks
 
 Configuration changes require focused tests for all four precedence levels, invalid canonical

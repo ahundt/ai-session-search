@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -38,6 +38,40 @@ const TUI_MIN_BROWSER_RESULTS: usize = 100;
 
 fn tui_result_limit(configured_default: usize) -> usize {
     configured_default.max(TUI_MIN_BROWSER_RESULTS)
+}
+
+/// Search box height including its border rows; the query line is the middle row.
+const SEARCH_BOX_ROWS: u16 = 3;
+
+/// Minimum height of the list/preview body. Below 14 total rows the vertical layout
+/// underflows (recorded as D11); the step-5 resize test pins that boundary.
+const MIN_BODY_ROWS: u16 = 10;
+
+/// Status/help bar height, shared by both modes.
+const STATUS_BAR_ROWS: u16 = 1;
+
+/// Error line height when a keystroke error is being shown. It takes its row from the body,
+/// never from the help bar, so REQ047's recovery guidance keeps its line.
+const ERROR_LINE_ROWS: u16 = 1;
+
+/// The crossterm event API is a set of free functions over a process-global source, so it
+/// cannot be substituted in a test. This is the seam: production wraps those functions, tests
+/// replay a script. Mirrors `crossterm::event::{poll, read}` (crossterm 0.29).
+trait EventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+struct CrosstermEventSource;
+
+impl EventSource for CrosstermEventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
 }
 
 /// RAII guard for the TUI's raw-mode + alternate-screen terminal session.
@@ -82,7 +116,9 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let action = run_app(&mut terminal, config, db);
+    let mut events = CrosstermEventSource;
+    let mut app = AppState::new(config, db)?;
+    let action = run_app(&mut terminal, &mut events, &mut app);
 
     // Restore the terminal before the resume output/prompt below runs on the normal screen.
     // (The guard also restores on drop at end of scope — including the error/panic paths
@@ -119,72 +155,52 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
     }
 }
 
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    config: &Config,
-    db: &Db,
-) -> Result<AppAction> {
-    let mut app = AppState::new(config, db)?;
-
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    events: &mut dyn EventSource,
+    app: &mut AppState<'_>,
+) -> Result<AppAction>
+where
+    B::Error: Send + Sync + 'static,
+{
     loop {
-        terminal.draw(|frame| app.render(frame))?;
-        if !event::poll(Duration::from_millis(150))? {
-            continue;
+        if let Some(action) = step(terminal, events, app)? {
+            return Ok(action);
         }
-        let Event::Key(key) = event::read()? else {
+    }
+}
+
+/// One loop turn: absorb finished work, draw, then drain every pending input event. Split out
+/// of `run_app` so tests can advance the loop a bounded number of turns and inspect the rendered
+/// buffer between them.
+///
+/// Complexity (REQ010): `O(1)` plus one frame render and the events already queued. It performs
+/// no database work and takes no lock. Draining in a `while` (not an `if`) means a pasted burst
+/// of input costs one poll, not one poll per event — itself a latency fix, measured in the plan's
+/// step-0 baseline.
+fn step<B: Backend>(
+    terminal: &mut Terminal<B>,
+    events: &mut dyn EventSource,
+    app: &mut AppState<'_>,
+) -> Result<Option<AppAction>>
+where
+    B::Error: Send + Sync + 'static,
+{
+    app.drain_responses();
+    terminal.draw(|frame| app.render(frame))?;
+    let poll_interval = Duration::from_millis(app.config.ui.event_poll_interval_ms);
+    while events.poll(poll_interval)? {
+        let Event::Key(key) = events.read()? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
             continue;
         }
-
-        if app.search_mode {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    app.search_mode = false;
-                }
-                KeyCode::Backspace => {
-                    app.query.pop();
-                    app.refresh(db)?;
-                }
-                KeyCode::Char(ch) => {
-                    app.query.push(ch);
-                    app.refresh(db)?;
-                }
-                _ => {}
-            }
-        } else {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(AppAction::Quit),
-                KeyCode::Char('/') => {
-                    app.search_mode = true;
-                }
-                KeyCode::Down | KeyCode::Char('j') => app.move_selection(1, db)?,
-                KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1, db)?,
-                KeyCode::PageDown => app.move_selection(10, db)?,
-                KeyCode::PageUp => app.move_selection(-10, db)?,
-                KeyCode::Char('g') => app.select_index(0, db)?,
-                KeyCode::Char('G') => {
-                    let last = app.results.len().saturating_sub(1);
-                    app.select_index(last, db)?;
-                }
-                KeyCode::Char('l') | KeyCode::Right => app.scroll_preview(5),
-                KeyCode::Char('h') | KeyCode::Left => app.scroll_preview(-5),
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.scroll_preview(15);
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.scroll_preview(-15);
-                }
-                KeyCode::Enter | KeyCode::Char('r') => {
-                    if let Some(selected) = app.selected_session() {
-                        return Ok(AppAction::Resume(Box::new(selected.clone())));
-                    }
-                }
-                _ => {}
-            }
+        if let Some(action) = app.handle_key(key) {
+            return Ok(Some(action));
         }
     }
+    Ok(None)
 }
 
 enum AppAction {
@@ -195,6 +211,10 @@ enum AppAction {
 
 struct AppState<'a> {
     config: &'a Config,
+    /// Temporary: the key dispatch moved onto `AppState` and still calls
+    /// `refresh`/`move_selection`/`select_index`, which need the handle. Step 4 moves that
+    /// work onto the worker and deletes this field.
+    db: &'a Db,
     query: String,
     search_mode: bool,
     selected: usize,
@@ -202,12 +222,16 @@ struct AppState<'a> {
     preview: String,
     preview_scroll: u16,
     preview_line_count: usize,
+    /// Last error from a keystroke-triggered operation, shown on its own line. A key press
+    /// can never abort the TUI: errors land here instead of propagating through `?`.
+    error: Option<String>,
 }
 
 impl<'a> AppState<'a> {
-    fn new(config: &'a Config, db: &Db) -> Result<Self> {
+    fn new(config: &'a Config, db: &'a Db) -> Result<Self> {
         let mut state = Self {
             config,
+            db,
             query: String::new(),
             search_mode: false,
             selected: 0,
@@ -215,19 +239,114 @@ impl<'a> AppState<'a> {
             preview: String::new(),
             preview_scroll: 0,
             preview_line_count: 0,
+            error: None,
         };
         state.refresh(db)?;
         Ok(state)
     }
 
+    /// Handle one key press. Returns `Some(action)` when the loop should stop. Never returns
+    /// `Err`: a database failure becomes `self.error` — a keystroke cannot end the TUI.
+    fn handle_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        let db = self.db;
+        if self.search_mode {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.search_mode = false;
+                }
+                KeyCode::Backspace => {
+                    self.query.pop();
+                    let outcome = self.refresh(db);
+                    self.record_error(outcome);
+                }
+                KeyCode::Char(ch) => {
+                    self.query.push(ch);
+                    let outcome = self.refresh(db);
+                    self.record_error(outcome);
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Some(AppAction::Quit),
+                KeyCode::Char('/') => {
+                    self.search_mode = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let outcome = self.move_selection(1, db);
+                    self.record_error(outcome);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let outcome = self.move_selection(-1, db);
+                    self.record_error(outcome);
+                }
+                KeyCode::PageDown => {
+                    let page = self.config.ui.list_page_step as isize;
+                    let outcome = self.move_selection(page, db);
+                    self.record_error(outcome);
+                }
+                KeyCode::PageUp => {
+                    let page = self.config.ui.list_page_step as isize;
+                    let outcome = self.move_selection(-page, db);
+                    self.record_error(outcome);
+                }
+                KeyCode::Char('g') => {
+                    let outcome = self.select_index(0, db);
+                    self.record_error(outcome);
+                }
+                KeyCode::Char('G') => {
+                    let last = self.results.len().saturating_sub(1);
+                    let outcome = self.select_index(last, db);
+                    self.record_error(outcome);
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    let step = self.config.ui.preview_scroll_step as isize;
+                    self.scroll_preview(step);
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    let step = self.config.ui.preview_scroll_step as isize;
+                    self.scroll_preview(-step);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let page = self.config.ui.preview_page_step as isize;
+                    self.scroll_preview(page);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let page = self.config.ui.preview_page_step as isize;
+                    self.scroll_preview(-page);
+                }
+                KeyCode::Enter | KeyCode::Char('r') => {
+                    if let Some(selected) = self.selected_session() {
+                        return Some(AppAction::Resume(Box::new(selected.clone())));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn record_error(&mut self, result: Result<()>) {
+        if let Err(error) = result {
+            self.error = Some(format!("{error:#}"));
+        }
+    }
+
+    /// Absorb finished worker responses. The call site is here from step 1 so the loop's
+    /// drain-then-draw ordering is fixed; step 4 fills in the body.
+    fn drain_responses(&mut self) {}
+
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let mut constraints = Vec::with_capacity(4);
+        constraints.push(Constraint::Length(SEARCH_BOX_ROWS));
+        constraints.push(Constraint::Min(MIN_BODY_ROWS));
+        if self.error.is_some() {
+            constraints.push(Constraint::Length(ERROR_LINE_ROWS));
+        }
+        constraints.push(Constraint::Length(STATUS_BAR_ROWS));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(1),
-            ])
+            .constraints(constraints)
             .split(frame.area());
 
         // Search box with visual cursor
@@ -336,6 +455,16 @@ impl<'a> AppState<'a> {
             .scroll((self.preview_scroll, 0));
         frame.render_widget(preview, middle[1]);
 
+        // Error line (own row, taken from the body when present — never the help bar).
+        let status_index = chunks.len() - 1;
+        if let Some(error) = &self.error {
+            let error_line = Paragraph::new(Span::styled(
+                error.as_str(),
+                Style::default().fg(Color::Red),
+            ));
+            frame.render_widget(error_line, chunks[status_index - 1]);
+        }
+
         // Status bar (single line, contextual)
         let help_text = if self.search_mode {
             "Type to search │ Enter/Esc: browse"
@@ -346,7 +475,7 @@ impl<'a> AppState<'a> {
             help_text,
             Style::default().fg(Color::DarkGray),
         ));
-        frame.render_widget(bottom, chunks[2]);
+        frame.render_widget(bottom, chunks[status_index]);
     }
 
     fn refresh(&mut self, db: &Db) -> Result<()> {
@@ -681,6 +810,215 @@ fn marked_spans_with_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use std::collections::VecDeque;
+
+    /// Replays a fixed event script and records every poll timeout, so tests can assert the
+    /// loop's pacing without a clock.
+    struct ScriptedEventSource {
+        events: VecDeque<Event>,
+        poll_timeouts: Vec<Duration>,
+    }
+
+    impl ScriptedEventSource {
+        fn new(events: Vec<Event>) -> Self {
+            Self {
+                events: events.into(),
+                poll_timeouts: Vec::new(),
+            }
+        }
+    }
+
+    impl EventSource for ScriptedEventSource {
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            self.poll_timeouts.push(timeout);
+            Ok(!self.events.is_empty())
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            self.events
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "script exhausted"))
+        }
+    }
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ctrl_key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
+    }
+
+    /// One seeded row: per-id path, id, provider_session_id, AND title. Every override is
+    /// load-bearing — `minimal_record` leaves `title: None` and derives the session id from the
+    /// file stem, and `upsert_session` keys on that id, so a shared path collapses rows.
+    fn session(id: &str) -> crate::models::ParsedSession {
+        let path = std::path::Path::new("/fixture").join(format!("{id}.jsonl"));
+        let mut parsed = crate::util::minimal_record(Provider::Claude, &path, String::new());
+        parsed.session.id = id.to_string();
+        parsed.session.provider_session_id = id.to_string();
+        parsed.session.title = Some(id.to_string());
+        parsed
+    }
+
+    fn fixture_db(sessions: &[&str]) -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for id in sessions {
+            db.upsert_session(&session(id), 0, 0).unwrap();
+        }
+        (dir, db)
+    }
+
+    fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut lines = Vec::new();
+        for y in area.top()..area.bottom() {
+            let mut line = String::new();
+            for x in area.left()..area.right() {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn event_seam_reproduces_current_keybindings() {
+        let (_dir, db) = fixture_db(&["claude:alpha", "claude:beta", "claude:gamma"]);
+        let config = Config::default();
+        let mut app = AppState::new(&config, &db).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        // '/' enters search mode and 'a' types; one step drains both, and because step is
+        // draw-then-drain, a second step renders the post-key state.
+        let mut events =
+            ScriptedEventSource::new(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert!(app.search_mode);
+        assert_eq!(app.query, "a");
+        step(&mut terminal, &mut events, &mut app).unwrap();
+        let screen = screen_text(&terminal);
+        assert!(
+            screen.contains("a█"),
+            "typed character renders with the visual cursor"
+        );
+        assert!(screen.contains("Sessions"));
+
+        // Esc in search mode returns to browse without quitting.
+        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Esc)]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert!(!app.search_mode);
+
+        // Backspace to an empty query re-browses without panicking (search mode first:
+        // browse mode has no Backspace arm — that IS the current contract).
+        let mut events =
+            ScriptedEventSource::new(vec![key(KeyCode::Char('/')), key(KeyCode::Backspace)]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert_eq!(app.query, "");
+
+        // Esc returns to browse so the navigation keys below apply (the Backspace section
+        // re-entered search mode).
+        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Esc)]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert!(!app.search_mode);
+
+        // j/k move the selection and load the preview of the new row.
+        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Char('j'))]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert_eq!(app.selected, 1);
+
+        // Ctrl-d scrolls the preview by the page step against the content-length bound.
+        app.preview_line_count = 100;
+        let mut events = ScriptedEventSource::new(vec![ctrl_key(KeyCode::Char('d'))]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert_eq!(app.preview_scroll, 15);
+
+        // Enter on a selected session yields the resume action.
+        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Enter)]);
+        assert!(matches!(
+            step(&mut terminal, &mut events, &mut app).unwrap(),
+            Some(AppAction::Resume(_))
+        ));
+
+        // q quits from browse mode.
+        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Char('q'))]);
+        assert!(matches!(
+            step(&mut terminal, &mut events, &mut app).unwrap(),
+            Some(AppAction::Quit)
+        ));
+
+        // g/G/PageDown/PageUp on an EMPTY result set must not panic.
+        let (_dir2, db2) = fixture_db(&[]);
+        let mut empty_app = AppState::new(&config, &db2).unwrap();
+        let mut terminal2 = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut events = ScriptedEventSource::new(vec![
+            key(KeyCode::Char('g')),
+            key(KeyCode::Char('G')),
+            key(KeyCode::PageDown),
+            key(KeyCode::PageUp),
+        ]);
+        assert!(step(&mut terminal2, &mut events, &mut empty_app)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn ui_interaction_fields_reach_the_loop() {
+        let (_dir, db) = fixture_db(&["claude:one", "claude:two", "claude:three", "claude:four"]);
+        let mut config = Config::default();
+        config.ui.event_poll_interval_ms = 7;
+        config.ui.list_page_step = 2;
+        config.ui.preview_scroll_step = 3;
+        config.ui.preview_page_step = 4;
+        let mut app = AppState::new(&config, &db).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        // The idle poll paces with the configured interval, observed clock-free through the
+        // seam's recorded timeouts (every poll — including the one that returns false).
+        let mut events = ScriptedEventSource::new(vec![key(KeyCode::PageDown)]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert!(
+            events
+                .poll_timeouts
+                .iter()
+                .all(|timeout| *timeout == Duration::from_millis(7)),
+            "poll timeout must follow [ui].event_poll_interval_ms, got {:?}",
+            events.poll_timeouts
+        );
+
+        // PageDown moves by the configured list page step, not a hardcoded 10.
+        assert_eq!(app.selected, 2);
+
+        // l scrolls by the configured preview scroll step; Ctrl-d adds the page step.
+        app.preview_line_count = 100;
+        let mut events = ScriptedEventSource::new(vec![key(KeyCode::Char('l'))]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert_eq!(app.preview_scroll, 3);
+        let mut events = ScriptedEventSource::new(vec![ctrl_key(KeyCode::Char('d'))]);
+        assert!(step(&mut terminal, &mut events, &mut app)
+            .unwrap()
+            .is_none());
+        assert_eq!(app.preview_scroll, 7);
+    }
 
     #[test]
     fn result_limit_preserves_large_config_and_fills_the_browser_for_small_config() {
