@@ -38,6 +38,10 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- TUI echo frames format only terminal-visible session rows rather than every retained result.
+  Preview bookends come from normalized message rows and retain at most four bodies instead of
+  loading the session's full joined transcript; search and preview finalization observe the same
+  typed cancellation between scoring/parsing phases.
 - The TUI worker retains at most one pending search and one pending preview instead of every
   cumulative pasted prefix; a newer search cancels the in-flight one without blocking input, and
   a failed search preserves the latest navigation preview. Its read-only SQLite connection now

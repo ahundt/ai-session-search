@@ -156,6 +156,17 @@ pub enum MessageOrder {
     NewestFirst,
 }
 
+pub(crate) struct ConversationBookend {
+    pub(crate) ordinal: usize,
+    pub(crate) role: Role,
+    pub(crate) content: String,
+}
+
+pub(crate) struct ConversationBookends {
+    pub(crate) total_turns: usize,
+    pub(crate) turns: Vec<ConversationBookend>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MessageBatchControl {
     Continue,
@@ -459,6 +470,17 @@ impl Drop for ReadSnapshotRollback<'_> {
 /// The atomic flag closes the cancel-before-statement race; `InterruptHandle` preempts an active
 /// statement without waiting for the progress callback's fixed opcode interval. Registration and
 /// cancellation are `O(1)` time and memory, and the mutex is never held while SQLite executes.
+#[derive(Debug)]
+pub(crate) struct QueryCancelled;
+
+impl std::fmt::Display for QueryCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("query cancelled")
+    }
+}
+
+impl std::error::Error for QueryCancelled {}
+
 pub(crate) struct QueryCancellation {
     cancelled: Arc<AtomicBool>,
     interrupt: Mutex<Option<rusqlite::InterruptHandle>>,
@@ -485,6 +507,13 @@ impl QueryCancellation {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_active(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(QueryCancelled.into());
+        }
+        Ok(())
     }
 
     pub(crate) fn flag(&self) -> &AtomicBool {
@@ -4769,7 +4798,32 @@ impl Db {
         current_repo: Option<&str>,
         scoring: &crate::config::ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
+        self.search_with_cancellation(query, filters, current_repo, scoring, None)
+    }
+
+    pub(crate) fn search_cancellable(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        current_repo: Option<&str>,
+        scoring: &crate::config::ScoringConfig,
+        cancellation: &QueryCancellation,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_with_cancellation(query, filters, current_repo, scoring, Some(cancellation))
+    }
+
+    fn search_with_cancellation(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        current_repo: Option<&str>,
+        scoring: &crate::config::ScoringConfig,
+        cancellation: Option<&QueryCancellation>,
+    ) -> Result<Vec<SearchHit>> {
         self.validate_access_scope()?;
+        if let Some(cancellation) = cancellation {
+            cancellation.ensure_active()?;
+        }
         let query_lower = fold_caseless(query);
         let tokens: Vec<&str> = query_lower.split_whitespace().collect();
         let query_needle = UnicodeLowerNeedle::from_lowered(&query_lower);
@@ -4807,6 +4861,9 @@ impl Db {
         let mut batch = Vec::with_capacity(SESSION_SCORE_BATCH_SIZE);
         let mut batch_bytes = 0_usize;
         for record in candidates {
+            if let Some(cancellation) = cancellation {
+                cancellation.ensure_active()?;
+            }
             let record = record?;
             batch_bytes = batch_bytes.saturating_add(session_search_record_bytes(&record));
             batch.push(record);
@@ -4814,6 +4871,9 @@ impl Db {
                 let scored = self
                     .runtime
                     .install(|| score_session_records(std::mem::take(&mut batch), &context))?;
+                if let Some(cancellation) = cancellation {
+                    cancellation.ensure_active()?;
+                }
                 batch_bytes = 0;
                 hits.extend(scored);
                 if ranked_limit > 0 && hits.len() >= top_k_compaction_threshold(ranked_limit) {
@@ -4827,11 +4887,20 @@ impl Db {
                     .install(|| score_session_records(batch, &context))?,
             );
         }
+        if let Some(cancellation) = cancellation {
+            cancellation.ensure_active()?;
+        }
 
         if ranked_limit > 0 {
             retain_top_session_hits(&mut hits, ranked_limit);
         }
+        if let Some(cancellation) = cancellation {
+            cancellation.ensure_active()?;
+        }
         hits.sort_by(compare_session_hits);
+        if let Some(cancellation) = cancellation {
+            cancellation.ensure_active()?;
+        }
         Ok(hits)
     }
 
@@ -4869,6 +4938,78 @@ impl Db {
             row_to_session_record,
         )?;
         unique_session_match(value, matches, |session| &session.id)
+    }
+
+    /// Read only the first/final user and assistant message bodies for a session preview.
+    ///
+    /// Time is `O(M)` over lightweight `(seq, role)` index entries plus at most four indexed
+    /// content lookups. Peak application memory is `O(D_4)`, the selected four bodies, rather
+    /// than `O(D_session + M)` for the joined transcript plus a turn vector.
+    pub(crate) fn conversation_bookends(
+        &self,
+        value: &str,
+        cancellation: &QueryCancellation,
+    ) -> Result<ConversationBookends> {
+        let session = self.resolve_session_record(value)?;
+        let mut statement = self.conn.prepare(
+            "select seq, role from messages \
+             where session_id = ?1 and role in ('user', 'assistant') order by seq asc",
+        )?;
+        let mut rows = statement.query([&session.id])?;
+        let mut total_turns = 0_usize;
+        let mut first_user = None;
+        let mut first_assistant = None;
+        let mut last_user = None;
+        let mut last_assistant = None;
+        while let Some(row) = rows.next()? {
+            cancellation.ensure_active()?;
+            let seq: i64 = row.get(0)?;
+            let raw_role: String = row.get(1)?;
+            let role = Role::from_db_str(&raw_role).map_err(anyhow::Error::msg)?;
+            let position = (total_turns, seq, role);
+            match role {
+                Role::User => {
+                    first_user.get_or_insert(position);
+                    last_user = Some(position);
+                }
+                Role::Assistant => {
+                    first_assistant.get_or_insert(position);
+                    last_assistant = Some(position);
+                }
+                _ => unreachable!("the SQL predicate admits only user and assistant"),
+            }
+            total_turns = total_turns.saturating_add(1);
+        }
+        drop(rows);
+        drop(statement);
+
+        let mut selected = Vec::with_capacity(4);
+        for candidate in [first_user, first_assistant, last_user, last_assistant]
+            .into_iter()
+            .flatten()
+        {
+            if !selected
+                .iter()
+                .any(|(_, seq, _): &(usize, i64, Role)| *seq == candidate.1)
+            {
+                selected.push(candidate);
+            }
+        }
+        selected.sort_by_key(|(ordinal, _, _)| *ordinal);
+        let mut content = self
+            .conn
+            .prepare("select content from messages where session_id = ?1 and seq = ?2")?;
+        let mut turns = Vec::with_capacity(selected.len());
+        for (ordinal, seq, role) in selected {
+            cancellation.ensure_active()?;
+            turns.push(ConversationBookend {
+                ordinal,
+                role,
+                content: content.query_row(params![&session.id, seq], |row| row.get(0))?,
+            });
+        }
+        cancellation.ensure_active()?;
+        Ok(ConversationBookends { total_turns, turns })
     }
 
     /// Query one exact or prefix session-resolution stage under the current access authority.

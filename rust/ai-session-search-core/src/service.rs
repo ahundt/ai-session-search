@@ -15,7 +15,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{Config, IndexRefresh, ScoringConfig};
-use crate::db::{Db, MessageBatchControl, SchemaState, MIN_READABLE_SCHEMA_VERSION};
+use crate::db::{
+    Db, MessageBatchControl, QueryCancellation, SchemaState, MIN_READABLE_SCHEMA_VERSION,
+};
 use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
 use crate::message_search::{
     apply_message_presentation_cancellable, attach_match_evidence_cancellable, ContextWindow,
@@ -2230,6 +2232,21 @@ impl<'db> CatalogService<'db> {
     ) -> Result<Vec<SearchHit>> {
         filters.validate()?;
         self.db.search(query, filters, current_repo, scoring)
+    }
+
+    /// Crate-internal session-search path with cooperative cancellation between scoring batches
+    /// and before retained-set compaction/sort. Public callers keep the stable method above.
+    pub(crate) fn search_sessions_cancellable(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        current_repo: Option<&str>,
+        scoring: &ScoringConfig,
+        cancellation: &QueryCancellation,
+    ) -> Result<Vec<SearchHit>> {
+        filters.validate()?;
+        self.db
+            .search_cancellable(query, filters, current_repo, scoring, cancellation)
     }
 
     /// Resolve one canonical session ID or unique prefix; ambiguous errors list candidates.

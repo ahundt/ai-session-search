@@ -27,8 +27,8 @@ use ratatui::{
 };
 
 use crate::config::Config;
-use crate::db::{Db, QueryCancellation, SCHEMA_VERSION};
-use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
+use crate::db::{ConversationBookends, Db, QueryCancellation, QueryCancelled, SCHEMA_VERSION};
+use crate::models::{Provider, Role, SearchFilters, SessionKind, SessionRecord};
 use crate::runtime::ExecutionRuntime;
 use crate::search_scope::EffectiveAccessScope;
 use crate::service::CatalogService;
@@ -52,6 +52,24 @@ fn tui_result_limit(configured_default: usize) -> usize {
 /// Convert a configured unsigned step without `as` wrapping values above `isize::MAX` negative.
 fn saturating_step(value: usize) -> isize {
     isize::try_from(value).unwrap_or(isize::MAX)
+}
+
+/// Absolute result range needed for one frame. Result membership stays complete in AppState;
+/// formatting/allocation is proportional only to terminal-height V, never retained K.
+fn visible_session_range(
+    total: usize,
+    selected: usize,
+    viewport_rows: usize,
+) -> std::ops::Range<usize> {
+    let visible = total.min(viewport_rows);
+    if visible == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(total - 1);
+    let start = selected
+        .saturating_sub(visible / 2)
+        .min(total.saturating_sub(visible));
+    start..start + visible
 }
 
 /// Search box height including its border rows; the query line is the middle row.
@@ -585,6 +603,9 @@ fn spawn_search_worker(
                 let result = execute(&request, &cancellation);
                 let search_succeeded = request.kind == RequestKind::Search && result.is_ok();
                 worker_mailbox.finish(&cancellation, search_succeeded);
+                if cancellation.is_cancelled() {
+                    continue;
+                }
                 match result {
                     Err(error) if is_expected_interruption(&error) => {}
                     result => {
@@ -615,26 +636,27 @@ fn spawn_search_worker(
 /// also matches `MessageSearchCancelled` and `ReadSnapshotCleanupError`, neither of which this
 /// worker can produce (E22).
 fn is_expected_interruption(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::SqliteFailure(inner, _))
-                if inner.code == rusqlite::ErrorCode::OperationInterrupted
-        )
-    })
+    error.is::<QueryCancelled>()
+        || error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(inner, _))
+                    if inner.code == rusqlite::ErrorCode::OperationInterrupted
+            )
+        })
 }
 
 /// The production executor factory: opens the worker's OWN read-only connection — the
 /// message-search worker's recipe (read-only unconditionally, access scope set explicitly,
 /// schema version ensured, progress reporter deliberately unset so nothing writes over the
 /// alternate screen) — and routes search/list through `CatalogService` (D1), the same seam
-/// the CLI, MCP, and Python use. Preview resolution stays on `Db` because
-/// `CatalogService::resolve_session` returns no transcript (§6.4).
+/// the CLI, MCP, and Python use. Preview bookends use normalized message rows directly because
+/// they are presentation-local and must not materialize one session's joined transcript.
 ///
-/// Complexity (REQ010): one connection (≤64 MiB page cache, 256 MiB virtual mmap window), one
-/// lazy Rayon pool bounded by `config.resolve_threads()`; per request the bounds are
-/// `db.search`/`list_recent`'s documented ones, plus `O(D_max)` transient transcript bytes for
-/// a preview.
+/// Complexity (REQ010): one connection (≤64 MiB page cache, 256 MiB virtual mmap window) sharing
+/// the caller's `config.resolve_threads()` Rayon pool. Search/list delegate to their documented
+/// bounds. Preview scans `O(M)` lightweight `(seq, role)` entries and retains at most four bodies
+/// `O(D_4)`, instead of `O(D_session + M)` transcript-plus-turn-vector memory.
 fn db_backed_executor(
     config: Config,
     access: EffectiveAccessScope,
@@ -678,28 +700,24 @@ fn db_backed_executor(
                         RequestKind::Search => Ok(WorkerResponse::results(
                             request,
                             catalog
-                                .search_sessions(
+                                .search_sessions_cancellable(
                                     &request.query,
                                     &request.filters,
                                     repo.as_deref(),
                                     &scoring,
+                                    cancellation,
                                 )?
                                 .into_iter()
                                 .map(|hit| hit.session)
                                 .collect(),
                         )),
                         RequestKind::PreviewOnly => {
-                            // The one place the TUI still touches `Db` directly:
-                            // `CatalogService::resolve_session` returns no transcript (§6.4).
-                            // O(D_max) transient.
+                            // Presentation-local bounded bookends: no full transcript allocation.
                             let text = match request.selected_id.as_deref() {
-                                Some(id) => {
-                                    let resolved = db.resolve_session(id)?;
-                                    Some(build_transcript_summary(
-                                        &resolved.transcript_text,
-                                        preview_budget,
-                                    ))
-                                }
+                                Some(id) => Some(build_bookend_summary(
+                                    &db.conversation_bookends(id, cancellation)?,
+                                    preview_budget,
+                                )),
                                 None => None,
                             };
                             Ok(WorkerResponse::preview(request, text))
@@ -1121,8 +1139,12 @@ impl<'a> AppState<'a> {
             // A config value cannot request an allocation wider than the actual pane. Keep the
             // structural label floor for terminals too narrow to display it in full.
             .min(list_interior_width.max(longest_label));
-        let items = self
-            .results
+        let visible_range = visible_session_range(
+            self.results.len(),
+            self.selected,
+            usize::from(middle[0].height.saturating_sub(2)),
+        );
+        let items = self.results[visible_range.clone()]
             .iter()
             .map(|session| {
                 // Title budget derived from the frame at render time (§6.3): the pane's
@@ -1183,8 +1205,8 @@ impl<'a> AppState<'a> {
                     .add_modifier(Modifier::BOLD),
             );
         let mut list_state = ListState::default();
-        if !self.results.is_empty() {
-            list_state.select(Some(self.selected));
+        if !visible_range.is_empty() {
+            list_state.select(Some(self.selected - visible_range.start));
         }
         frame.render_stateful_widget(list, middle[0], &mut list_state);
 
@@ -1277,12 +1299,14 @@ impl<'a> AppState<'a> {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnRole {
     User,
     Assistant,
 }
 
+#[cfg(test)]
 impl TurnRole {
     fn parse(line: &str) -> Option<Self> {
         let close = line.strip_prefix('[')?.find(']')?;
@@ -1296,18 +1320,31 @@ impl TurnRole {
     }
 }
 
+#[cfg(test)]
 struct Turn<'a> {
     role: TurnRole,
     body: &'a str,
 }
 
+#[cfg(test)]
 fn parse_turns(transcript: &str) -> Vec<Turn<'_>> {
-    let mut turns: Vec<Turn<'_>> = Vec::new();
+    parse_turns_inner(transcript, None).expect("an uncancelled parse cannot fail")
+}
+
+#[cfg(test)]
+fn parse_turns_inner<'a>(
+    transcript: &'a str,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<Vec<Turn<'a>>> {
+    let mut turns: Vec<Turn<'a>> = Vec::new();
     let mut current_role: Option<TurnRole> = None;
     let mut body_start: usize = 0;
 
     let mut cursor = 0usize;
     while cursor < transcript.len() {
+        if let Some(cancellation) = cancellation {
+            cancellation.ensure_active()?;
+        }
         let line_end = transcript[cursor..]
             .find('\n')
             .map(|i| cursor + i)
@@ -1331,7 +1368,10 @@ fn parse_turns(transcript: &str) -> Vec<Turn<'_>> {
         let body = transcript[body_start..].trim_matches('\n');
         turns.push(Turn { role: prev, body });
     }
-    turns
+    if let Some(cancellation) = cancellation {
+        cancellation.ensure_active()?;
+    }
+    Ok(turns)
 }
 
 fn truncate_body(body: &str, max_lines: usize) -> String {
@@ -1358,10 +1398,30 @@ const PREVIEW_WEIGHT_FIRST_REPLY: usize = 4;
 const PREVIEW_WEIGHT_FINAL_PROMPT: usize = 8;
 const PREVIEW_WEIGHT_FINAL_REPLY: usize = 14;
 
+#[cfg(test)]
 fn build_transcript_summary(transcript: &str, budget: usize) -> String {
-    let turns = parse_turns(transcript);
+    build_transcript_summary_inner(transcript, budget, None)
+        .expect("an uncancelled summary cannot fail")
+}
+
+#[cfg(test)]
+fn build_transcript_summary_cancellable(
+    transcript: &str,
+    budget: usize,
+    cancellation: &QueryCancellation,
+) -> Result<String> {
+    build_transcript_summary_inner(transcript, budget, Some(cancellation))
+}
+
+#[cfg(test)]
+fn build_transcript_summary_inner(
+    transcript: &str,
+    budget: usize,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<String> {
+    let turns = parse_turns_inner(transcript, cancellation)?;
     if turns.is_empty() {
-        return "(no transcript content)".to_string();
+        return Ok("(no transcript content)".to_string());
     }
 
     let first_user = turns.iter().position(|t| t.role == TurnRole::User);
@@ -1390,26 +1450,78 @@ fn build_transcript_summary(transcript: &str, budget: usize) -> String {
     ];
 
     let mut shown_indices: Vec<usize> = Vec::new();
-    let mut sections: Vec<(usize, &'static str, usize)> = Vec::new();
-    for (idx, label, max_lines) in candidates {
+    let mut sections: Vec<(usize, &'static str, usize, &str)> = Vec::new();
+    for (idx, label, weight) in candidates {
         let Some(idx) = idx else { continue };
         if shown_indices.contains(&idx) {
             continue;
         }
         shown_indices.push(idx);
-        sections.push((idx, label, max_lines));
+        sections.push((idx, label, weight, turns[idx].body));
     }
-    sections.sort_by_key(|(idx, _, _)| *idx);
+    sections.sort_by_key(|(idx, _, _, _)| *idx);
+    if let Some(cancellation) = cancellation {
+        cancellation.ensure_active()?;
+    }
+    Ok(render_summary_sections(&sections, turns.len(), budget))
+}
 
-    // Renormalise the budget over the sections actually emitted: a short session without
-    // an assistant turn gives that share to the rest.
-    let total_weight: usize = sections.iter().map(|(_, _, weight)| *weight).sum();
-    let total = turns.len();
-    let hidden = total.saturating_sub(shown_indices.len());
+fn build_bookend_summary(bookends: &ConversationBookends, budget: usize) -> String {
+    if bookends.turns.is_empty() {
+        return "(no transcript content)".to_string();
+    }
+    let first_user = bookends.turns.iter().find(|turn| turn.role == Role::User);
+    let first_assistant = bookends
+        .turns
+        .iter()
+        .find(|turn| turn.role == Role::Assistant);
+    let last_user = bookends.turns.iter().rfind(|turn| turn.role == Role::User);
+    let last_assistant = bookends
+        .turns
+        .iter()
+        .rfind(|turn| turn.role == Role::Assistant);
+    let candidates = [
+        (
+            first_user,
+            "── First prompt ──",
+            PREVIEW_WEIGHT_FIRST_PROMPT,
+        ),
+        (
+            first_assistant,
+            "── First reply ──",
+            PREVIEW_WEIGHT_FIRST_REPLY,
+        ),
+        (last_user, "── Final prompt ──", PREVIEW_WEIGHT_FINAL_PROMPT),
+        (
+            last_assistant,
+            "── Final reply ──",
+            PREVIEW_WEIGHT_FINAL_REPLY,
+        ),
+    ];
+    let mut shown = Vec::new();
+    let mut sections = Vec::new();
+    for (turn, label, weight) in candidates {
+        let Some(turn) = turn else { continue };
+        if shown.contains(&turn.ordinal) {
+            continue;
+        }
+        shown.push(turn.ordinal);
+        sections.push((turn.ordinal, label, weight, turn.content.as_str()));
+    }
+    sections.sort_by_key(|(ordinal, _, _, _)| *ordinal);
+    render_summary_sections(&sections, bookends.total_turns, budget)
+}
 
-    let mut parts: Vec<String> = Vec::new();
-    let mut last_emitted_idx: Option<usize> = None;
-    for (idx, label, weight) in &sections {
+fn render_summary_sections(
+    sections: &[(usize, &'static str, usize, &str)],
+    total: usize,
+    budget: usize,
+) -> String {
+    let total_weight: usize = sections.iter().map(|(_, _, weight, _)| *weight).sum();
+    let hidden = total.saturating_sub(sections.len());
+    let mut parts = Vec::new();
+    let mut last_emitted_idx = None;
+    for (idx, label, weight, body) in sections {
         if let Some(prev) = last_emitted_idx {
             if *idx > prev + 1 {
                 let gap = *idx - prev - 1;
@@ -1421,18 +1533,15 @@ fn build_transcript_summary(transcript: &str, budget: usize) -> String {
         }
         parts.push((*label).to_string());
         let max_lines = (budget.saturating_mul(*weight) / total_weight).max(1);
-        parts.push(truncate_body(turns[*idx].body, max_lines));
+        parts.push(truncate_body(body, max_lines));
         last_emitted_idx = Some(*idx);
     }
-
     if hidden > 0 && sections.len() < 2 {
-        // Single section displayed but more turns exist after it (rare edge case).
         parts.push(format!(
             "⋯ {hidden} more turn{} hidden ⋯",
             if hidden == 1 { "" } else { "s" }
         ));
     }
-
     parts.push(format!(
         "({total} turn{} total)",
         if total == 1 { "" } else { "s" }
@@ -2005,6 +2114,20 @@ mod tests {
     #[test]
     fn summary_for_empty_transcript() {
         assert_eq!(build_transcript_summary("", 30), "(no transcript content)");
+    }
+
+    #[test]
+    fn transcript_summary_observes_typed_cancellation() {
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let error = build_transcript_summary_cancellable(
+            "[2026-01-01T00:00:00Z] user\nbody\n",
+            30,
+            &cancellation,
+        )
+        .unwrap_err();
+        assert!(error.is::<QueryCancelled>());
+        assert!(is_expected_interruption(&error));
     }
 
     #[test]
@@ -3059,6 +3182,28 @@ mod tests {
     }
 
     #[test]
+    fn catalog_session_search_refuses_pre_cancelled_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(&session("claude:alpha"), 0, 0).unwrap();
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let error = CatalogService::new(&db)
+            .search_sessions_cancellable(
+                "alpha",
+                &SearchFilters {
+                    limit: 10,
+                    ..Default::default()
+                },
+                None,
+                &Config::default().search.scoring,
+                &cancellation,
+            )
+            .unwrap_err();
+        assert!(error.is::<QueryCancelled>());
+    }
+
+    #[test]
     fn tui_and_catalog_service_return_identical_ordered_results() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
@@ -3510,6 +3655,15 @@ mod tests {
     }
 
     #[test]
+    fn visible_session_rows_are_bounded_by_the_terminal_viewport() {
+        assert_eq!(visible_session_range(10_000, 0, 18), 0..18);
+        assert_eq!(visible_session_range(10_000, 5_000, 18), 4_991..5_009);
+        assert_eq!(visible_session_range(10_000, 9_999, 18), 9_982..10_000);
+        assert_eq!(visible_session_range(10_000, 4, 0), 0..0);
+        assert!(visible_session_range(10_000, 5_000, 18).len() <= 18);
+    }
+
+    #[test]
     fn provider_label_width_is_capped_to_list_interior() {
         let mut config = Config::default();
         config.ui.provider_label_width = usize::MAX;
@@ -3573,6 +3727,24 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
         let mut parsed = session("claude:long");
         parsed.transcript_text = transcript.to_string();
+        parsed.messages = parse_turns(transcript)
+            .into_iter()
+            .enumerate()
+            .map(|(seq, turn)| crate::models::Message {
+                seq: seq as i64,
+                role: match turn.role {
+                    TurnRole::User => Role::User,
+                    TurnRole::Assistant => Role::Assistant,
+                },
+                ts: None,
+                tool_name: None,
+                kind: crate::models::MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: turn.body.to_string(),
+                provenance: crate::models::MessageProvenance::default(),
+            })
+            .collect();
         db.upsert_session(&parsed, 0, 0).unwrap();
         let runtime = db.execution_runtime();
         drop(db);
@@ -3639,5 +3811,10 @@ mod tests {
         // Budget 34 reproduces the historical fixed layout (8/4/8/14 weights sum to 34).
         assert!(roomy.app.preview.contains("First prompt"));
         assert!(roomy.app.preview.contains("Final reply"));
+        assert_eq!(
+            roomy.app.preview,
+            build_transcript_summary(&transcript, 34),
+            "bounded normalized-message bookends must preserve the established preview output"
+        );
     }
 }
