@@ -693,6 +693,13 @@ impl Db {
         })
     }
 
+    /// Clone the application-owned data-parallel runtime for another read-only connection.
+    /// Sharing keeps the configured worker budget process-wide instead of multiplying it per
+    /// reader; each connection still owns independent SQLite/WAL state.
+    pub(crate) fn execution_runtime(&self) -> Arc<ExecutionRuntime> {
+        Arc::clone(&self.runtime)
+    }
+
     /// Number of data-parallel workers owned by this database lifecycle.
     pub fn worker_threads(&self) -> usize {
         self.runtime.worker_threads()

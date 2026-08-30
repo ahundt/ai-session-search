@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 
 use chrono::Utc;
 use clap::ValueEnum;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -29,6 +29,7 @@ use ratatui::{
 use crate::config::Config;
 use crate::db::{Db, QueryCancellation, SCHEMA_VERSION};
 use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
+use crate::runtime::ExecutionRuntime;
 use crate::search_scope::EffectiveAccessScope;
 use crate::service::CatalogService;
 use crate::util::{
@@ -186,6 +187,7 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
     let (worker, _observed_scope) = spawn_search_worker(db_backed_executor(
         config.clone(),
         db.access_scope().clone(),
+        db.execution_runtime(),
     ))?;
     let mut app = AppState::new(config, worker)?;
 
@@ -409,85 +411,166 @@ type SearchExecutor =
 /// directly. Reports the observed access scope on success so the caller can assert it (P5).
 type ExecutorFactory = Box<dyn FnOnce() -> Result<(SearchExecutor, EffectiveAccessScope)> + Send>;
 
-/// RAII owner. A bare tuple has no destructor, so any `?` between spawn and join leaks a
-/// thread holding an open SQLite connection (C3).
-///
-/// Cleanup: cancels the in-flight query, drops the request sender to end the loop, and joins.
-/// Cancellation lands within at most one scoring batch (E19b), which bounds quit latency.
+#[derive(Default)]
+struct PendingWork {
+    search: Option<WorkerRequest>,
+    preview: Option<WorkerRequest>,
+    in_flight: Option<Arc<QueryCancellation>>,
+    closed: bool,
+}
+
+/// Constant-capacity latest-value mailbox. At most one Search and one PreviewOnly are retained,
+/// so a Q-character paste keeps O(Q + F) bytes for the latest query/filters instead of every
+/// cumulative prefix (Theta(Q^2) query bytes in the former unbounded FIFO).
+struct WorkerMailbox {
+    state: Mutex<PendingWork>,
+    wake: Condvar,
+}
+
+impl WorkerMailbox {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PendingWork::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn send(&self, request: WorkerRequest) -> std::result::Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(
+                "the search worker stopped; press q to quit and rerun aise tui".to_string(),
+            );
+        }
+        match request.kind {
+            RequestKind::Search => {
+                // Hold the mailbox lock across cancel and replacement: the interrupt handle is
+                // connection-scoped, so cancellation must not race publication of its successor.
+                if let Some(cancellation) = state.in_flight.take() {
+                    cancellation.cancel();
+                }
+                state.search = Some(request);
+            }
+            RequestKind::PreviewOnly => state.preview = Some(request),
+        }
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn next(&self) -> Option<(WorkerRequest, Arc<QueryCancellation>)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.closed && state.search.is_none() && state.preview.is_none() {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if state.closed {
+            return None;
+        }
+        let request = state.search.take().or_else(|| state.preview.take())?;
+        let cancellation = Arc::new(QueryCancellation::new());
+        state.in_flight = Some(Arc::clone(&cancellation));
+        Some((request, cancellation))
+    }
+
+    fn finish(&self, cancellation: &Arc<QueryCancellation>, search_succeeded: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .in_flight
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, cancellation))
+        {
+            state.in_flight.take();
+        }
+        // A successful result replacement makes a queued old-list preview obsolete; AppState
+        // requests the selected new row after applying results. On failure, preserve the latest
+        // navigation preview so the old list and its selected row remain coherent.
+        if search_succeeded && state.search.is_none() {
+            state.preview.take();
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancellation) = state.in_flight.take() {
+            cancellation.cancel();
+        }
+        state.search.take();
+        state.preview.take();
+        state.closed = true;
+        self.wake.notify_all();
+    }
+
+    #[cfg(test)]
+    fn pending_counts(&self) -> (usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            usize::from(state.search.is_some()),
+            usize::from(state.preview.is_some()),
+        )
+    }
+}
+
+struct CloseMailboxOnExit(Arc<WorkerMailbox>);
+
+impl Drop for CloseMailboxOnExit {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// RAII owner for one constant-capacity mailbox, response receiver, and worker thread.
 struct SearchWorker {
-    requests: Option<mpsc::Sender<WorkerRequest>>,
+    mailbox: Arc<WorkerMailbox>,
     responses: mpsc::Receiver<WorkerOutcome>,
-    in_flight: Arc<Mutex<Option<Arc<QueryCancellation>>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl SearchWorker {
-    /// Stop whatever query is running.
-    ///
-    /// The guard is bound to a local rather than left as a temporary: the interrupt handle is
-    /// connection-scoped (E21b), so `cancel()` must not overlap the worker publishing the next
-    /// query's cancellation, or it would interrupt that one instead and the worker would
-    /// silently drop its result as an expected supersede.
-    fn cancel_in_flight(&self) {
-        let mut slot = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cancellation) = slot.take() {
-            cancellation.cancel();
-        }
-    }
-
-    /// Queue a request. Never returns `Err` as control flow: a dead worker sets the error
-    /// line, it does not end the TUI (C14).
-    ///
-    /// Only a new SEARCH supersedes a running one. A `PreviewOnly` request from j/k must not
-    /// cancel an in-flight search: the worker would treat the interruption as an expected
-    /// supersede, send nothing, and then answer with `results: None`, stranding a stale list
-    /// with no error (C21). Navigation is already instant without this — the UI moves the
-    /// selection locally.
     fn send(&self, request: WorkerRequest) -> std::result::Result<(), String> {
-        if request.kind == RequestKind::Search {
-            self.cancel_in_flight();
-        }
-        match self.requests.as_ref() {
-            Some(sender) => sender.send(request).map_err(|_| {
-                "the search worker stopped; press q to quit and rerun aise tui".to_string()
-            }),
-            None => Err("the search worker is shut down".to_string()),
-        }
+        self.mailbox.send(request)
     }
 }
 
 impl Drop for SearchWorker {
     fn drop(&mut self) {
-        self.cancel_in_flight();
-        self.requests.take();
+        self.mailbox.close();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 }
 
-/// Spawn the search worker. Concurrency and cleanup (REQ010): one thread, one SQLite
-/// connection, one lazy Rayon pool of `config.resolve_threads()` workers (owned by the
-/// production executor). The only shared mutable state is the in-flight cancellation slot,
-/// whose lock is held for `O(1)` and never across a query. `Drop` cancels, closes the request
-/// channel, and joins; join latency is bounded by one scoring batch (E19b), not the query.
+/// Spawn one search worker. Pending request count is O(1); shared mailbox locks are held only for
+/// replacement/cancellation bookkeeping and never while SQLite or scoring executes.
 fn spawn_search_worker(
     make_executor: ExecutorFactory,
 ) -> Result<(SearchWorker, EffectiveAccessScope)> {
     let (ready_tx, ready_rx) =
         mpsc::sync_channel::<std::result::Result<EffectiveAccessScope, String>>(1);
-    let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let (response_tx, response_rx) = mpsc::channel::<WorkerOutcome>();
-    // The ONE cancellation slot. Both the worker thread and the returned SearchWorker hold
-    // clones of this same Arc — a second slot is what made supersede a silent no-op (C20).
-    let in_flight: Arc<Mutex<Option<Arc<QueryCancellation>>>> = Arc::new(Mutex::new(None));
-    let worker_in_flight = Arc::clone(&in_flight);
+    let mailbox = Arc::new(WorkerMailbox::new());
+    let worker_mailbox = Arc::clone(&mailbox);
     let handle = thread::Builder::new()
         .name("aise-tui-search".to_string())
         .spawn(move || {
+            let _close_on_exit = CloseMailboxOnExit(Arc::clone(&worker_mailbox));
             let mut execute = match make_executor() {
                 Ok((executor, scope)) => {
                     let _ = ready_tx.send(Ok(scope));
@@ -498,44 +581,11 @@ fn spawn_search_worker(
                     return;
                 }
             };
-            while let Ok(first) = request_rx.recv() {
-                // Drain to the latest queued request: superseded searches never execute
-                // (§2.3). A preview queued among searches must not win the drain — it would
-                // starve the final search (apply_response re-issues the preview once the
-                // surviving search's response lands, per C28), so prefer the newest Search
-                // and otherwise the newest request.
-                let mut latest_non_search: Option<WorkerRequest> = None;
-                let mut latest_search: Option<WorkerRequest> = None;
-                for next in std::iter::once(first).chain(request_rx.try_iter()) {
-                    match next.kind {
-                        RequestKind::Search => latest_search = Some(next),
-                        RequestKind::PreviewOnly if latest_search.is_none() => {
-                            latest_non_search = Some(next);
-                        }
-                        RequestKind::PreviewOnly => {}
-                    }
-                }
-                let request = latest_search
-                    .or(latest_non_search)
-                    .expect("the iterator yields at least the first request");
-                // Publish under the same lock the UI cancels under, so a supersede either stops
-                // THIS query or arrives before it starts — never lands on its successor (E21b).
-                let cancellation = Arc::new(QueryCancellation::new());
-                {
-                    let mut slot = worker_in_flight
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *slot = Some(Arc::clone(&cancellation));
-                }
-                let outcome = execute(&request, &cancellation);
-                {
-                    let mut slot = worker_in_flight
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    slot.take();
-                }
-                match outcome {
-                    // Superseded mid-query: silent by design; the newer request owns the screen.
+            while let Some((request, cancellation)) = worker_mailbox.next() {
+                let result = execute(&request, &cancellation);
+                let search_succeeded = request.kind == RequestKind::Search && result.is_ok();
+                worker_mailbox.finish(&cancellation, search_succeeded);
+                match result {
                     Err(error) if is_expected_interruption(&error) => {}
                     result => {
                         let _ = response_tx.send(WorkerOutcome {
@@ -547,17 +597,14 @@ fn spawn_search_worker(
                 }
             }
         })?;
-    // Startup handshake: block until the executor opened its connection, so a startup failure
-    // surfaces with the terminal restored rather than a TUI that silently never populates.
     let observed = ready_rx
         .recv()
         .map_err(|_| anyhow::anyhow!("the search worker exited during startup"))?
         .map_err(|message| anyhow::anyhow!("the search worker failed to start: {message}"))?;
     Ok((
         SearchWorker {
-            requests: Some(request_tx),
+            mailbox,
             responses: response_rx,
-            in_flight,
             handle: Some(handle),
         },
         observed,
@@ -588,14 +635,19 @@ fn is_expected_interruption(error: &anyhow::Error) -> bool {
 /// lazy Rayon pool bounded by `config.resolve_threads()`; per request the bounds are
 /// `db.search`/`list_recent`'s documented ones, plus `O(D_max)` transient transcript bytes for
 /// a preview.
-fn db_backed_executor(config: Config, access: EffectiveAccessScope) -> ExecutorFactory {
+fn db_backed_executor(
+    config: Config,
+    access: EffectiveAccessScope,
+    runtime: Arc<ExecutionRuntime>,
+) -> ExecutorFactory {
     Box::new(move || {
         let worker_threads = NonZeroUsize::new(config.resolve_threads())
             .expect("Config::resolve_threads always returns at least one");
-        let mut db = Db::open_existing_read_only_with_threads(
+        debug_assert_eq!(runtime.worker_threads(), worker_threads.get());
+        let mut db = Db::open_existing_read_only_with_runtime(
             &config.db_path(),
             config.index.busy_timeout_ms,
-            worker_threads,
+            runtime,
         )?;
         db.set_access_scope(access);
         anyhow::ensure!(
@@ -2196,13 +2248,15 @@ mod tests {
         let (parked_tx, parked_rx) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
         let executor = Box::new(
-            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::Search && request.query.is_empty() {
                     // Park the STARTUP request so the burst provably queues behind it: all
                     // five searches sit in the channel before the worker takes any. Without
                     // this the worker races the UI's sends and the coalescing is untestable.
                     let _ = parked_tx.send(());
-                    park_until_released_or_cancelled(&gate, cancellation);
+                    // Ignore cancellation until explicit release so every pasted prefix is
+                    // submitted while the worker cannot consume the mailbox.
+                    let _ = gate.recv();
                 }
                 let _ = executed_tx.send(request.query.clone());
                 Ok(WorkerResponse::results(request, Vec::new()))
@@ -2221,6 +2275,11 @@ mod tests {
             key(KeyCode::Char('e')),
         ]);
         harness.step_until_script_drained();
+        assert_eq!(
+            harness.app.worker.mailbox.pending_counts(),
+            (1, 0),
+            "a pasted burst retains one latest Search, never every cumulative prefix"
+        );
         release.send(()).unwrap();
         // Collect until quiet: the worker drains the queued burst to its latest.
         let mut executed: Vec<String> = Vec::new();
@@ -2234,6 +2293,53 @@ mod tests {
             vec![String::new(), "abcde".to_string()],
             "a queued burst must serve only the latest request (§2.3 drain-to-latest)"
         );
+    }
+
+    #[test]
+    fn navigation_preview_survives_queued_search_failure() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (startup_parked_tx, startup_parked_rx) = mpsc::channel::<()>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| match request
+                .kind
+            {
+                RequestKind::Search if request.query.is_empty() => {
+                    let _ = startup_parked_tx.send(());
+                    // Hold the worker despite supersede so both pending slots are observable.
+                    let _ = gate.recv();
+                    Ok(WorkerResponse::results(
+                        request,
+                        rows(&["claude:one", "claude:two"]),
+                    ))
+                }
+                RequestKind::Search => Err(anyhow::anyhow!("search failed")),
+                RequestKind::PreviewOnly => Ok(WorkerResponse::preview(
+                    request,
+                    request
+                        .selected_id
+                        .as_deref()
+                        .map(|id| format!("preview of {id}")),
+                )),
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:one", "claude:two"]);
+        startup_parked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("startup search parked");
+        harness.script(vec![
+            key(KeyCode::Char('/')),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Esc),
+            key(KeyCode::Char('j')),
+        ]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.selected, 1);
+        assert_eq!(harness.app.worker.mailbox.pending_counts(), (1, 1));
+        release.send(()).unwrap();
+        step_until(&mut harness, |harness| {
+            harness.app.preview.contains("claude:two")
+        });
+        assert!(harness.app.preview.contains("claude:two"));
     }
 
     #[test]
@@ -2814,6 +2920,7 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let db = Db::open(&db_path).unwrap();
         db.upsert_session(&session("claude:alpha"), 0, 0).unwrap();
+        let runtime = db.execution_runtime();
         drop(db);
         // Bump the stamp through a raw connection: every in-crate writer writes the current
         // value only (the service.rs precedent for forging drift).
@@ -2823,7 +2930,7 @@ mod tests {
         drop(raw);
         let mut config = Config::default();
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
-        let factory = db_backed_executor(config, EffectiveAccessScope::All);
+        let factory = db_backed_executor(config, EffectiveAccessScope::All, runtime);
         let error = factory().err().expect("schema drift must be refused");
         assert!(
             format!("{error:#}").contains("schema"),
@@ -2849,10 +2956,10 @@ mod tests {
     #[test]
     fn navigating_during_a_search_does_not_cancel_it() {
         let (release, gate) = mpsc::channel::<()>();
-        let (observed_tx, observed_rx) = mpsc::channel::<Arc<QueryCancellation>>();
+        let (observed_tx, observed_rx) = mpsc::channel::<(String, Arc<QueryCancellation>)>();
         let executor = Box::new(
             move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
-                let _ = observed_tx.send(Arc::clone(cancellation));
+                let _ = observed_tx.send((request.query.clone(), Arc::clone(cancellation)));
                 if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
                     park_until_released_or_cancelled(&gate, cancellation);
                 }
@@ -2867,10 +2974,15 @@ mod tests {
         let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
         harness.step_until_script_drained();
-        let search = observed_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the search reached the executor");
-        harness.script(vec![key(KeyCode::Char('j'))]);
+        let search = loop {
+            let (query, cancellation) = observed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the search reached the executor");
+            if query == "a" {
+                break cancellation;
+            }
+        };
+        harness.script(vec![key(KeyCode::Esc), key(KeyCode::Char('j'))]);
         harness.step_until_script_drained();
         assert!(
             !search.is_cancelled(),
@@ -2956,7 +3068,11 @@ mod tests {
         }
         let mut config = Config::default();
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
-        let factory = db_backed_executor(config.clone(), db.access_scope().clone());
+        let factory = db_backed_executor(
+            config.clone(),
+            db.access_scope().clone(),
+            db.execution_runtime(),
+        );
         let mut harness = TuiHarness::with_factory(config.clone(), factory);
         harness.start();
         let catalog = CatalogService::new(&db);
@@ -3458,13 +3574,14 @@ mod tests {
         let mut parsed = session("claude:long");
         parsed.transcript_text = transcript.to_string();
         db.upsert_session(&parsed, 0, 0).unwrap();
+        let runtime = db.execution_runtime();
         drop(db);
         let mut config = Config::default();
         config.ui.preview_lines = budget;
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
         // The harness owns the tempdir for its whole life; forget it deliberately — the
         // factory reads the same file for the worker's own connection.
-        let factory = db_backed_executor(config.clone(), EffectiveAccessScope::All);
+        let factory = db_backed_executor(config.clone(), EffectiveAccessScope::All, runtime);
         let harness = TuiHarness::with_factory(config.clone(), factory);
         // The factory's worker opens its own connection to this file; the harness lives
         // for the whole test, so leak the directory like the harness leaks its own db —

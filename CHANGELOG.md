@@ -38,6 +38,10 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- The TUI worker retains at most one pending search and one pending preview instead of every
+  cumulative pasted prefix; a newer search cancels the in-flight one without blocking input, and
+  a failed search preserves the latest navigation preview. Its read-only SQLite connection now
+  shares the caller's Rayon runtime, keeping the configured scoring-worker budget process-wide.
 - TUI responses and errors now carry allocation-backed request generations, so an old search
   with the same query but different provider/class/window filters cannot overwrite current state.
   The list title exposes when the current generation is searching; a worker panic reports once
