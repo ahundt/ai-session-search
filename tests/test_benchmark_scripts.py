@@ -19,7 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_script(name: str) -> ModuleType:
-    path = ROOT / "scripts" / name
+    return load_python_file(ROOT / "scripts" / name)
+
+
+def load_python_file(path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -375,6 +378,319 @@ def test_tui_client_latency_case_is_registered_and_opt_in() -> None:
     cases = {case["id"]: case for case in manifest["cases"]}
     assert "--measure-latency" in cases["tui-typeahead-latency"]["argv"]
     assert "--measure-latency" not in cases["tui-startup-list"]["argv"]
+
+
+def test_tui_final_result_latency_uses_the_last_transition_before_stability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    monkeypatch.setattr(client, "SETTLE_QUIET_SECONDS", 0.001)
+
+    class Tracker:
+        state = "old"
+
+        def feed_bytes(self, chunk: bytes) -> None:
+            self.state = {b"prefix": "prefix", b"final": "final"}[chunk]
+
+        def session_list(self, _layout: object) -> str:
+            return self.state
+
+    class Tui:
+        chunks = iter([b"prefix", b"final"])
+
+        def read_chunk(self, _timeout: float) -> bytes | None:
+            return next(self.chunks, None)
+
+    tracker = Tracker()
+    result_ms, final_list, _bytes = client._await_settled_change(
+        Tui(), tracker, object(), "old", client.time.monotonic(), 0.05
+    )
+    assert result_ms is not None
+    assert final_list == "final"
+
+
+def test_tui_latency_missing_echo_or_default_result_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+
+    def incomplete_run(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "query": "SQLite 1#0",
+            "echo_ms": [0, -1],
+            "results_ms": None,
+            "transitions": 0,
+            "peak_rss_kb": 1,
+            "peak_cpu_pct": 0.0,
+            "peak_threads": 1,
+            "process_count": 1,
+            "output_bytes": 1,
+            "digest": "a" * 64,
+        }
+
+    monkeypatch.setattr(client, "_measure_once", incomplete_run)
+    with pytest.raises(SystemExit, match=r"missing.*echo|missing.*result"):
+        client.measure_latency("aise", "fixture.db", ["SQLite 1"], 1, 0.0, 0.01)
+
+
+def test_tui_latency_report_names_workload_symbols_and_throughput(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    fixture = tmp_path / "fixture.db"
+    connection = sqlite3.connect(fixture)
+    try:
+        connection.executescript(
+            """
+            create table sessions (id text primary key);
+            create table messages (session_id text);
+            create table transcripts (session_id text primary key, transcript_text text);
+            insert into sessions values ('s1');
+            insert into messages values ('s1'), ('s1');
+            insert into transcripts values ('s1', '12345');
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    def complete_run(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "query": "SQLite 1#0",
+            "echo_ms": [1],
+            "results_ms": 2,
+            "transitions": 1,
+            "peak_rss_kb": 1,
+            "peak_cpu_pct": 0.0,
+            "peak_threads": 3,
+            "process_count": 1,
+            "output_bytes": 10,
+            "digest": "a" * 64,
+            "result_count": 3,
+            "visible_rows": 19,
+            "wall_ms": 100,
+        }
+
+    monkeypatch.setattr(client, "_measure_once", complete_run)
+    report = client.measure_latency(
+        "aise", str(fixture), ["SQLite 1"], 1, 0.0, 0.01
+    )
+    assert report["workload"] == {
+        "query_characters": {"SQLite 1": 8},
+        "retained_sessions_max": 3,
+        "visible_rows": 19,
+        "transcript_bytes_max": 5,
+        "messages_per_session_max": 2,
+        "scoring_workers": 2,
+    }
+    assert report["typed_keys_per_second"] == 90
+
+
+def test_tui_latency_repetitions_require_one_digest_per_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    calls = 0
+
+    def nondeterministic_run(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {
+            "query": f"SQLite 1#{calls - 1}",
+            "echo_ms": [1],
+            "results_ms": 2,
+            "transitions": 1,
+            "peak_rss_kb": 1,
+            "peak_cpu_pct": 0.0,
+            "peak_threads": 1,
+            "process_count": 1,
+            "output_bytes": 1,
+            "digest": ("a" if calls == 1 else "b") * 64,
+        }
+
+    monkeypatch.setattr(client, "_measure_once", nondeterministic_run)
+    with pytest.raises(SystemExit, match=r"non-deterministic.*SQLite 1"):
+        client.measure_latency("aise", "fixture.db", ["SQLite 1"], 2, 0.0, 0.01)
+
+
+def test_tui_output_bytes_use_the_single_captured_pty_ledger() -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+
+    class FakeTui:
+        child = type("Child", (), {"returncode": 0, "stderr": None})()
+        terminal_attributes_restored = True
+
+        def send(self, _data: bytes) -> None:
+            pass
+
+        def wait_draining(self, _timeout: float) -> int:
+            return 0
+
+        def drain_after_exit(self) -> bytes:
+            restored = b"\x1b[?1049l\x1b[?25h"
+            return b"x" * (120 - len(restored)) + restored
+
+    sampler = type(
+        "Sampler",
+        (),
+        {
+            "peak_rss_kb": 1,
+            "peak_cpu_pct": 0.0,
+            "peak_threads": 1,
+            "process_count": 1,
+        },
+    )()
+    result = client._finish_run(
+        FakeTui(), 0.01, "q#0", [1], 2, 1, sampler, 100, "a" * 64
+    )
+    assert result["output_bytes"] == 120
+
+
+def test_tui_resource_sampler_retains_process_peak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    sampled_second = __import__("threading").Event()
+    trees = iter([[1, 2, 3], [1]])
+    sampler = client.ResourceSampler(1)
+
+    def tree() -> list[int]:
+        try:
+            pids = next(trees)
+        except StopIteration:
+            sampled_second.set()
+            return [1]
+        if pids == [1]:
+            sampled_second.set()
+        return pids
+
+    monkeypatch.setattr(sampler, "_tree", tree)
+    monkeypatch.setattr(sampler, "_threads", lambda _pid: 1)
+    monkeypatch.setattr(
+        client.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type("Result", (), {"stdout": "1 0.0"})(),
+    )
+    sampler.start()
+    assert sampled_second.wait(1), "sampler did not take two process-tree samples"
+    sampler.stop()
+    assert sampler.process_count == 3
+
+
+def test_tui_resource_sampler_stop_joins_an_in_progress_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    threading = __import__("threading")
+    entered = threading.Event()
+    release = threading.Event()
+    sampler = client.ResourceSampler(1)
+
+    def blocked_tree() -> list[int]:
+        entered.set()
+        release.wait(1)
+        return []
+
+    monkeypatch.setattr(sampler, "_tree", blocked_tree)
+    sampler.start()
+    assert entered.wait(1)
+    stopper = threading.Thread(target=sampler.stop)
+    stopper.start()
+    stopper.join(0.02)
+    assert stopper.is_alive(), "stop returned before the in-progress sample was joined"
+    release.set()
+    stopper.join(1)
+    assert not stopper.is_alive()
+
+
+def test_tui_process_uses_an_owned_hermetic_config_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    captured: dict[str, object] = {}
+    master_fd, slave_fd = __import__("os").openpty()
+
+    class FakeChild:
+        pid = 123
+        returncode = 0
+        stderr = None
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeChild:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return FakeChild()
+
+    monkeypatch.setenv("AI_SESSION_SEARCH_CONFIG", "/private/live/config.toml")
+    monkeypatch.setattr(client.pty, "openpty", lambda: (master_fd, slave_fd))
+    monkeypatch.setattr(client.fcntl, "ioctl", lambda *_args: None)
+    monkeypatch.setattr(client.subprocess, "Popen", fake_popen)
+    tui = client.TuiProcess("/fixture/aise", "/fixture/generated.db")
+    try:
+        env = captured["env"]
+        assert isinstance(env, dict)
+        assert env["AI_SESSION_SEARCH_CONFIG"] != "/private/live/config.toml"
+        assert str(env["AI_SESSION_SEARCH_CONFIG"]).startswith(str(env["HOME"]))
+        assert env["HOME"] != __import__("os").environ.get("HOME")
+        argv = captured["argv"]
+        assert isinstance(argv, list)
+        assert argv[argv.index("--threads") + 1] == "2"
+    finally:
+        tui.kill()
+
+
+def test_tui_process_closes_owned_resources_when_spawn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    os_module = __import__("os")
+    master_fd, slave_fd = os_module.openpty()
+    monkeypatch.setattr(client.pty, "openpty", lambda: (master_fd, slave_fd))
+    monkeypatch.setattr(client.fcntl, "ioctl", lambda *_args: None)
+    monkeypatch.setattr(
+        client.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+
+    with pytest.raises(OSError, match="spawn failed"):
+        client.TuiProcess("/fixture/aise", "/fixture/generated.db")
+    for descriptor in (master_fd, slave_fd):
+        with pytest.raises(OSError):
+            os_module.fstat(descriptor)
+
+
+def test_tui_startup_refuses_to_claim_unobserved_terminal_restoration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+
+    class FakeTui:
+        child = type("Child", (), {"returncode": 0, "stderr": None})()
+
+        def __init__(self, _binary: str, _fixture: str) -> None:
+            pass
+
+        def send(self, _data: bytes) -> None:
+            pass
+
+        def wait_draining(self, _timeout: float) -> int:
+            return 0
+
+        def drain_after_exit(self) -> bytes:
+            return b"Sessions Preview"
+
+        def kill(self) -> None:
+            pass
+
+    monkeypatch.setattr(client, "TuiProcess", FakeTui)
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+    with pytest.raises(SystemExit, match=r"terminal.*restore"):
+        client.run_startup_case("aise", "fixture.db", 0.0, 0.01)
+    assert "terminal_restored" not in capsys.readouterr().out
 
 
 def test_release_manifest_does_not_pass_search_refresh_policy_to_db_commands() -> None:

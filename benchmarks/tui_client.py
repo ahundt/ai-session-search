@@ -30,9 +30,12 @@ import pty
 import re
 import select
 import signal
+import sqlite3
 import struct
 import subprocess
+import tempfile
 import termios
+import threading
 import time
 
 DEFAULT_QUERIES = "SQLite 1,SQLite 15,benchmark 15,benchmark 3"
@@ -51,7 +54,16 @@ SCREEN_COLS = 100
 # A border row/divider must span at least this fraction of its axis to count as structure,
 # so session text containing a stray box-drawing glyph cannot define a region.
 BORDER_RUN_FRACTION = 0.5
-TUI_ARGS = ("--index-refresh", "existing-only", "tui")
+# Fix the scoring-worker budget so ambient CPU count cannot change baseline/candidate thread,
+# CPU, or RSS measurements. This is a benchmark protocol value, not a product default.
+BENCHMARK_THREADS = 2
+TUI_ARGS = (
+    "--threads",
+    str(BENCHMARK_THREADS),
+    "--index-refresh",
+    "existing-only",
+    "tui",
+)
 
 CSI = re.compile(r"^\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])")
 
@@ -203,6 +215,12 @@ class ScreenTracker:
             for row in layout.list_rows
         )
 
+    def session_result_count(self) -> int:
+        match = re.search(r"Sessions[^\n]*\(\d+/(\d+)\)", self.full_screen())
+        if match is None:
+            raise SystemExit("could not read the session result count from the rendered list title")
+        return int(match.group(1))
+
 
 def _claim_controlling_terminal() -> None:
     """Child-side preexec: after setsid (start_new_session), make the pty slave the controlling
@@ -215,20 +233,43 @@ class TuiProcess:
     """The TUI running under a pty whose master side the harness drives directly."""
 
     def __init__(self, binary: str, fixture: str) -> None:
+        self._sandbox = tempfile.TemporaryDirectory(prefix="aise-tui-benchmark-")
+        sandbox = self._sandbox.name
+        config_path = os.path.join(sandbox, "config.toml")
+        with open(config_path, "w", encoding="utf-8") as config_file:
+            config_file.write("")
         master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", SCREEN_ROWS, SCREEN_COLS, 0, 0))
-        self.child = subprocess.Popen(
-            [binary, "--database", fixture, *TUI_ARGS],
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=subprocess.PIPE,
-            env={**os.environ, "TERM": os.environ.get("TERM", "xterm-256color")},
-            close_fds=True,
-            start_new_session=True,
-            preexec_fn=_claim_controlling_terminal,
+        self.master_fd: int | None = master_fd
+        self.slave_fd: int | None = slave_fd
+        child_env = {
+            key: os.environ[key]
+            for key in ("LANG", "LC_ALL", "PATH", "TMPDIR")
+            if key in os.environ
+        }
+        child_env.update(
+            {
+                "HOME": sandbox,
+                "XDG_CONFIG_HOME": os.path.join(sandbox, "xdg"),
+                "AI_SESSION_SEARCH_CONFIG": config_path,
+                "TERM": os.environ.get("TERM", "xterm-256color"),
+            }
         )
-        os.close(slave_fd)
-        self.master_fd = master_fd
+        try:
+            self.child = subprocess.Popen(
+                [binary, "--database", fixture, *TUI_ARGS],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                close_fds=True,
+                start_new_session=True,
+                preexec_fn=_claim_controlling_terminal,
+            )
+        except BaseException:
+            self.close()
+            raise
+        self._close_fd("slave_fd")
         self.captured = b""
 
     def send(self, data: bytes) -> None:
@@ -236,6 +277,8 @@ class TuiProcess:
 
     def read_chunk(self, timeout: float) -> bytes | None:
         """One pty read: ``None`` = nothing ready yet, ``b""`` = EOF, else the chunk."""
+        if self.master_fd is None:
+            return b""
         ready, _, _ = select.select([self.master_fd], [], [], timeout)
         if not ready:
             return None
@@ -265,6 +308,22 @@ class TuiProcess:
             self.read_chunk(0.02)
         return None
 
+    def close(self) -> None:
+        """Idempotently release both pty descriptors and the owned config sandbox."""
+        self._close_fd("slave_fd")
+        self._close_fd("master_fd")
+        self._sandbox.cleanup()
+
+    def _close_fd(self, name: str) -> None:
+        descriptor = getattr(self, name, None)
+        if descriptor is None:
+            return
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        setattr(self, name, None)
+
     def kill(self) -> None:
         # The child is a session leader (start_new_session), so kill the whole group: a
         # lone child kill leaves the TUI spinning on a dead pty for hours if its own exit
@@ -275,10 +334,7 @@ class TuiProcess:
             except (ProcessLookupError, PermissionError):
                 self.child.kill()
             self.child.wait()
-        try:
-            os.close(self.master_fd)
-        except OSError:
-            pass
+        self.close()
 
 
 class ResourceSampler:
@@ -290,15 +346,15 @@ class ResourceSampler:
         self.peak_cpu_pct: float | None = None
         self.peak_threads: int | None = None
         self.process_count: int | None = None
-        self._stop = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        import threading
-
         def sample() -> None:
-            while not self._stop:
+            while not self._stop.is_set():
                 pids = self._tree()
-                self.process_count = len(pids)
+                count = len(pids)
+                self.process_count = count if self.process_count is None else max(self.process_count, count)
                 for pid in pids:
                     try:
                         line = subprocess.run(
@@ -318,10 +374,11 @@ class ResourceSampler:
                                 )
                     except (OSError, ValueError, subprocess.SubprocessError):
                         pass
-                time.sleep(SAMPLER_INTERVAL_SECONDS)
+                if self._stop.wait(SAMPLER_INTERVAL_SECONDS):
+                    break
 
-        thread = threading.Thread(target=sample, daemon=True)
-        thread.start()
+        self._thread = threading.Thread(target=sample, daemon=True)
+        self._thread.start()
 
     def _tree(self) -> list[int]:
         pids = [self.root_pid]
@@ -352,7 +409,10 @@ class ResourceSampler:
             return None
 
     def stop(self) -> None:
-        self._stop = True
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
 
 def drain_output(tui: TuiProcess, tracker: ScreenTracker, quiet_seconds: float) -> None:
@@ -400,8 +460,39 @@ def measure_latency(
             process_count = max(process_count, run.get("process_count") or 0)
             total_output_bytes += run["output_bytes"]
     wal_growth = max(0, _wal_size(fixture) - wal_before)
+    for run in runs:
+        if any(value < 0 for value in run["echo_ms"]):
+            raise SystemExit(f"missing typed-character echo observation for query {run['query']}")
+        if run["results_ms"] is None:
+            raise SystemExit(f"missing final-result observation for query {run['query']}")
+
+    digests_by_query: dict[str, set[str]] = {}
+    for run in runs:
+        query = run["query"].rsplit("#", 1)[0]
+        digests_by_query.setdefault(query, set()).add(run["digest"])
+    for query, digests in digests_by_query.items():
+        if len(digests) != 1:
+            raise SystemExit(
+                f"non-deterministic final session-list digest for query {query}: {sorted(digests)}"
+            )
+    stable_digests = {
+        query: next(iter(digests)) for query, digests in sorted(digests_by_query.items())
+    }
+    aggregate_digest = hashlib.sha256(
+        json.dumps(stable_digests, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     echo_samples = [value for run in runs for value in run["echo_ms"]]
-    results_samples = [run["results_ms"] for run in runs if run["results_ms"] is not None]
+    results_samples = [run["results_ms"] for run in runs]
+    fixture_workload = _fixture_workload(fixture)
+    total_seconds = sum(run["wall_ms"] for run in runs) / 1000
+    typed_keys = repetitions * sum(len(query) + 1 for query in queries)
+    workload = {
+        "query_characters": {query: len(query) for query in queries},
+        "retained_sessions_max": max(run["result_count"] for run in runs),
+        "visible_rows": max(run["visible_rows"] for run in runs),
+        **fixture_workload,
+        "scoring_workers": BENCHMARK_THREADS,
+    }
     return {
         "queries": queries,
         "repetitions": repetitions,
@@ -416,11 +507,14 @@ def measure_latency(
         "peak_threads": peak_threads,
         "process_count": process_count,
         "output_bytes": total_output_bytes,
+        "typed_keys_per_second": round(typed_keys / total_seconds) if total_seconds else None,
+        "workload": workload,
         "wal_growth_bytes": wal_growth,
-        "result_digest": runs[-1]["digest"] if runs else None,
+        "result_digest": aggregate_digest,
+        "result_digests_by_query": stable_digests,
         "per_query": [
             {
-                "query": run["query"].split("#")[0],
+                "query": run["query"].rsplit("#", 1)[0],
                 "echo_ms_p50": _percentile(run["echo_ms"], 50),
                 "echo_ms_p95": _percentile(run["echo_ms"], 95),
                 "results_ms": run["results_ms"],
@@ -432,6 +526,7 @@ def measure_latency(
 
 
 def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, timeout: float, label: str) -> dict:
+    run_started = time.monotonic()
     tui = TuiProcess(binary, fixture)
     tracker = ScreenTracker()
     sampler = ResourceSampler(tui.child.pid)
@@ -455,26 +550,41 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
             tui.send(key.encode())
             echo_found, results_found, list_before, added_bytes, changed = _await_key_effects(
                 tui, tracker, layout, prefix, list_before, sent_at, timeout,
-                need_results=key == keys[-1],
+                need_results=False,
             )
             output_bytes += added_bytes
             if changed:
                 transitions += 1
             echo_ms.append(int(echo_found) if echo_found is not None else -1)
-            if key == keys[-1] and results_found is None:
+            if key == keys[-1]:
+                before_settle = list_before
                 results_found, list_before, added_bytes = _await_settled_change(
-                    tui, tracker, layout, list_before, sent_at, FINAL_KEY_SETTLE_CAP_SECONDS
+                    tui,
+                    tracker,
+                    layout,
+                    list_before,
+                    sent_at,
+                    FINAL_KEY_SETTLE_CAP_SECONDS,
+                    initial_result_ms=results_found,
                 )
                 output_bytes += added_bytes
-                if results_found is not None:
+                if list_before != before_settle:
                     transitions += 1
             if key == keys[-1] and results_found is not None:
                 results_ms = int(results_found)
             time.sleep(KEY_INTERVAL_SECONDS)
         digest = hashlib.sha256(tracker.session_list(layout).encode()).hexdigest()
-        return _finish_run(
+        result = _finish_run(
             tui, timeout, label, echo_ms, results_ms, transitions, sampler, output_bytes, digest
         )
+        result.update(
+            {
+                "result_count": tracker.session_result_count(),
+                "visible_rows": len(layout.list_rows),
+                "wall_ms": round((time.monotonic() - run_started) * 1000),
+            }
+        )
+        return result
     finally:
         sampler.stop()
         tui.kill()
@@ -513,29 +623,52 @@ def _await_key_effects(
 
 
 def _await_settled_change(
-    tui: TuiProcess, tracker: ScreenTracker, layout: ScreenLayout, list_before: str,
-    sent_at: float, budget: float,
+    tui: TuiProcess,
+    tracker: ScreenTracker,
+    layout: ScreenLayout,
+    list_before: str,
+    sent_at: float,
+    budget: float,
+    initial_result_ms: float | None = None,
 ) -> tuple[float | None, str, int]:
-    """Wait out the final key's settle window for its list change (echo already observed)."""
+    """Return the LAST list transition before screen stability, never the first.
+
+    A prefix search may finish after the final key was sent. Treating that first transition as
+    the final result is a false-low latency sample. The candidate's rendered generation state
+    later provides positive completion proof; this stability fallback is retained for the saved
+    pre-generation baseline and records that limitation in its report.
+    """
     deadline = time.monotonic() + budget
     added_bytes = 0
-    while time.monotonic() < deadline and tracker.session_list(layout) == list_before:
+    last_result_ms = initial_result_ms
+    stable_since = time.monotonic() if initial_result_ms is not None else None
+    current_list = list_before
+    while time.monotonic() < deadline:
         chunk = tui.read_chunk(0.01)
         if chunk is None:
+            if (
+                last_result_ms is not None
+                and stable_since is not None
+                and time.monotonic() - stable_since >= SETTLE_QUIET_SECONDS
+            ):
+                return last_result_ms, current_list, added_bytes
             continue
         if chunk == b"":
             break
         added_bytes += len(chunk)
         now = time.monotonic()
         tracker.feed_bytes(chunk)
-        if tracker.session_list(layout) != list_before:
-            return (now - sent_at) * 1000, tracker.session_list(layout), added_bytes
-    return None, list_before, added_bytes
+        observed = tracker.session_list(layout)
+        if observed != current_list:
+            current_list = observed
+            last_result_ms = (now - sent_at) * 1000
+            stable_since = now
+    return last_result_ms, current_list, added_bytes
 
 
 def _finish_run(
     tui: TuiProcess, timeout: float, label: str, echo_ms: list[int], results_ms: int | None,
-    transitions: int, sampler: ResourceSampler, output_bytes: int, digest: str,
+    transitions: int, sampler: ResourceSampler, _measured_output_bytes: int, digest: str,
 ) -> dict:
     tui.send(b"\x1b")  # leave search mode so q is a quit, not a query character
     time.sleep(ESC_SETTLE_SECONDS)
@@ -543,6 +676,7 @@ def _finish_run(
     if tui.wait_draining(timeout) is None:
         raise SystemExit(f"TUI did not exit after q (query {label})") from None
     captured = tui.drain_after_exit()
+    _assert_terminal_restored(tui, captured)
     stderr = tui.child.stderr.read() if tui.child.stderr is not None else b""
     if tui.child.returncode != 0:
         raise SystemExit(
@@ -558,8 +692,28 @@ def _finish_run(
         "peak_cpu_pct": sampler.peak_cpu_pct,
         "peak_threads": sampler.peak_threads,
         "process_count": sampler.process_count,
-        "output_bytes": output_bytes + len(captured),
+        # `TuiProcess.read_chunk` appends every byte to this one authoritative ledger. The
+        # per-wait counters are diagnostic subsets, never another total (R9-F8).
+        "output_bytes": len(captured),
         "digest": digest,
+    }
+
+
+def _fixture_workload(fixture: str) -> dict[str, int]:
+    connection = sqlite3.connect(f"file:{fixture}?mode=ro", uri=True)
+    try:
+        transcript_bytes = connection.execute(
+            "select coalesce(max(length(cast(transcript_text as blob))), 0) from transcripts"
+        ).fetchone()[0]
+        messages_per_session = connection.execute(
+            "select coalesce(max(message_count), 0) from "
+            "(select count(*) as message_count from messages group by session_id)"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    return {
+        "transcript_bytes_max": int(transcript_bytes),
+        "messages_per_session_max": int(messages_per_session),
     }
 
 
@@ -578,6 +732,26 @@ def _percentile(values: list[int | float], percentile: float) -> int | None:
     return int(ordered[index])
 
 
+def _assert_terminal_restored(_tui: TuiProcess, captured: bytes) -> None:
+    """Require restoration to be the final applicable terminal-mode controls.
+
+    Substring presence is insufficient: a later enter-alternate-screen or hide-cursor control
+    would reverse an earlier restore while still satisfying a naive contains check. A direct
+    post-exit termios comparison is not portable here: after the pty's controlling session leader
+    exits, macOS returns ENOTTY for the slave before the parent can observe it. Raw-mode ownership
+    remains covered by TerminalGuard; this real-terminal oracle checks the emitted final state.
+    """
+    controls = {
+        "alternate screen": (b"\x1b[?1049h", b"\x1b[?1049l"),
+        "cursor visibility": (b"\x1b[?25l", b"\x1b[?25h"),
+    }
+    for name, (active, restored) in controls.items():
+        active_at = captured.rfind(active)
+        restored_at = captured.rfind(restored)
+        if restored_at < 0 or restored_at < active_at:
+            raise SystemExit(f"terminal restore was not observed for {name}")
+
+
 def run_startup_case(binary: str, fixture: str, startup_wait: float, timeout: float) -> None:
     tui = TuiProcess(binary, fixture)
     try:
@@ -591,6 +765,7 @@ def run_startup_case(binary: str, fixture: str, startup_wait: float, timeout: fl
             raise SystemExit(
                 f"TUI startup failed with exit {tui.child.returncode}: {stderr.decode(errors='replace')}"
             )
+        _assert_terminal_restored(tui, captured)
         print('{"preview":true,"sessions":true,"terminal_restored":true}')
     finally:
         tui.kill()
