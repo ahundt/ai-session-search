@@ -536,6 +536,7 @@ fn db_backed_executor(config: Config, access: EffectiveAccessScope) -> ExecutorF
         let observed = db.access_scope().clone();
         let repo = current_repo(&config);
         let scoring = config.search.scoring.clone();
+        let preview_budget = config.ui.preview_lines;
         Ok((
             Box::new(
                 move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
@@ -572,7 +573,10 @@ fn db_backed_executor(config: Config, access: EffectiveAccessScope) -> ExecutorF
                             let text = match request.selected_id.as_deref() {
                                 Some(id) => {
                                     let resolved = db.resolve_session(id)?;
-                                    Some(build_transcript_summary(&resolved.transcript_text))
+                                    Some(build_transcript_summary(
+                                        &resolved.transcript_text,
+                                        preview_budget,
+                                    ))
                                 }
                                 None => None,
                             };
@@ -1159,7 +1163,17 @@ fn truncate_body(body: &str, max_lines: usize) -> String {
     out
 }
 
-fn build_transcript_summary(transcript: &str) -> String {
+/// Relative weights for the preview summary's sections (Decision 2a): first prompt, first
+/// reply, final prompt, final reply. `[ui].preview_lines` is the total body budget; each
+/// emitted section gets a proportional share (floor-rounded), floored at one line so a small
+/// budget cannot erase a bookend. The historical fixed layout was these weights verbatim —
+/// a budget of 34 reproduces it exactly.
+const PREVIEW_WEIGHT_FIRST_PROMPT: usize = 8;
+const PREVIEW_WEIGHT_FIRST_REPLY: usize = 4;
+const PREVIEW_WEIGHT_FINAL_PROMPT: usize = 8;
+const PREVIEW_WEIGHT_FINAL_REPLY: usize = 14;
+
+fn build_transcript_summary(transcript: &str, budget: usize) -> String {
     let turns = parse_turns(transcript);
     if turns.is_empty() {
         return "(no transcript content)".to_string();
@@ -1170,12 +1184,24 @@ fn build_transcript_summary(transcript: &str) -> String {
     let last_user = turns.iter().rposition(|t| t.role == TurnRole::User);
     let last_assistant = turns.iter().rposition(|t| t.role == TurnRole::Assistant);
 
-    // (turn_index, label, max_lines)
+    // (turn_index, label, relative weight)
     let candidates = [
-        (first_user, "── First prompt ──", 8usize),
-        (first_assistant, "── First reply ──", 4),
-        (last_user, "── Final prompt ──", 8),
-        (last_assistant, "── Final reply ──", 14),
+        (
+            first_user,
+            "── First prompt ──",
+            PREVIEW_WEIGHT_FIRST_PROMPT,
+        ),
+        (
+            first_assistant,
+            "── First reply ──",
+            PREVIEW_WEIGHT_FIRST_REPLY,
+        ),
+        (last_user, "── Final prompt ──", PREVIEW_WEIGHT_FINAL_PROMPT),
+        (
+            last_assistant,
+            "── Final reply ──",
+            PREVIEW_WEIGHT_FINAL_REPLY,
+        ),
     ];
 
     let mut shown_indices: Vec<usize> = Vec::new();
@@ -1190,12 +1216,15 @@ fn build_transcript_summary(transcript: &str) -> String {
     }
     sections.sort_by_key(|(idx, _, _)| *idx);
 
+    // Renormalise the budget over the sections actually emitted: a short session without
+    // an assistant turn gives that share to the rest.
+    let total_weight: usize = sections.iter().map(|(_, _, weight)| *weight).sum();
     let total = turns.len();
     let hidden = total.saturating_sub(shown_indices.len());
 
     let mut parts: Vec<String> = Vec::new();
     let mut last_emitted_idx: Option<usize> = None;
-    for (idx, label, max_lines) in &sections {
+    for (idx, label, weight) in &sections {
         if let Some(prev) = last_emitted_idx {
             if *idx > prev + 1 {
                 let gap = *idx - prev - 1;
@@ -1206,7 +1235,8 @@ fn build_transcript_summary(transcript: &str) -> String {
             }
         }
         parts.push((*label).to_string());
-        parts.push(truncate_body(turns[*idx].body, *max_lines));
+        let max_lines = (budget.saturating_mul(*weight) / total_weight).max(1);
+        parts.push(truncate_body(turns[*idx].body, max_lines));
         last_emitted_idx = Some(*idx);
     }
 
@@ -1739,7 +1769,7 @@ mod tests {
             ("user", "final prompt"),
             ("assistant", "final reply"),
         ]);
-        let summary = build_transcript_summary(&raw);
+        let summary = build_transcript_summary(&raw, 34);
         assert!(summary.contains("First prompt"));
         assert!(summary.contains("first prompt"));
         assert!(summary.contains("First reply"));
@@ -1755,7 +1785,7 @@ mod tests {
     #[test]
     fn summary_handles_short_session() {
         let raw = join_turns(&[("user", "hey"), ("assistant", "yo")]);
-        let summary = build_transcript_summary(&raw);
+        let summary = build_transcript_summary(&raw, 34);
         // first==last for both roles, so we should see exactly 2 sections, no elision.
         assert!(summary.contains("First prompt"));
         assert!(summary.contains("First reply"));
@@ -1770,13 +1800,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let raw = join_turns(&[("user", &big_body), ("assistant", "ok")]);
-        let summary = build_transcript_summary(&raw);
+        let summary = build_transcript_summary(&raw, 34);
         assert!(summary.contains("[…]"));
     }
 
     #[test]
     fn summary_for_empty_transcript() {
-        assert_eq!(build_transcript_summary(""), "(no transcript content)");
+        assert_eq!(build_transcript_summary("", 30), "(no transcript content)");
     }
 
     #[test]
@@ -3110,5 +3140,79 @@ mod tests {
             })
             .max()
             .expect("the pane divider must exist")
+    }
+    // ---- step 6: [ui].preview_lines as the preview body budget (Decision 2a) ----
+
+    fn harness_with_preview_budget(budget: usize, transcript: &str) -> (TuiHarness, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let mut parsed = session("claude:long");
+        parsed.transcript_text = transcript.to_string();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        drop(db);
+        let mut config = Config::default();
+        config.ui.preview_lines = budget;
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        // The harness owns the tempdir for its whole life; forget it deliberately — the
+        // factory reads the same file for the worker's own connection.
+        let factory = db_backed_executor(config.clone(), EffectiveAccessScope::All);
+        let harness = TuiHarness::with_factory(config.clone(), factory);
+        // The factory's worker opens its own connection to this file; the harness lives
+        // for the whole test, so leak the directory like the harness leaks its own db —
+        // bounded by the number of harnesses per test process.
+        std::mem::forget(dir);
+        (harness, config)
+    }
+
+    #[test]
+    fn ui_config_field_reaches_the_rendered_preview() {
+        // Eight turns with 30-line bodies: every section truncates under any plausible
+        // budget, so the budget's effect on line counts is observable.
+        let long_body: String = (0..30)
+            .map(|line| format!("body line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transcript = join_turns(&[
+            ("user", &long_body),
+            ("assistant", &long_body),
+            ("user", &long_body),
+            ("assistant", &long_body),
+            ("user", &long_body),
+            ("assistant", &long_body),
+            ("user", &long_body),
+            ("assistant", &long_body),
+        ]);
+
+        let (mut tight, _config) = harness_with_preview_budget(1, &transcript);
+        tight.start();
+        for _ in 0..MAX_TEST_STEPS {
+            tight.step();
+            if tight.app.previewed_id.is_some() {
+                break;
+            }
+        }
+        let (mut roomy, _config) = harness_with_preview_budget(34, &transcript);
+        roomy.start();
+        for _ in 0..MAX_TEST_STEPS {
+            roomy.step();
+            if roomy.app.previewed_id.is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            tight.app.preview_line_count < roomy.app.preview_line_count,
+            "[ui].preview_lines must reach the rendered preview: budget 1 produced {} lines, budget 34 produced {} (D8)",
+            tight.app.preview_line_count,
+            roomy.app.preview_line_count
+        );
+        assert!(
+            tight.app.preview.contains("[…]"),
+            "a tight budget must truncate sections, not erase bookends"
+        );
+        // Budget 34 reproduces the historical fixed layout (8/4/8/14 weights sum to 34).
+        assert!(roomy.app.preview.contains("First prompt"));
+        assert!(roomy.app.preview.contains("Final reply"));
     }
 }

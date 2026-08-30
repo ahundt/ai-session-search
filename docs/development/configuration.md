@@ -262,9 +262,11 @@ PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and `preview
 (15) are the l/h and Ctrl-d/Ctrl-u scroll amounts; `provider_label_width` (9) is the session
 list's provider column width — the renderer clamps upward to the longest label so a smaller
 value can never truncate one — and `list_pane_percent` (45) is the body width share of the
-session-list pane, the preview pane taking the remainder. `[ui].preview_lines` is accepted but not
-yet read; making it live is a planned change with its own entry. Every example-file line equals
-its typed Rust default.
+session-list pane, the preview pane taking the remainder. `[ui].preview_lines` (30) is the
+preview's total body budget: the transcript summary's sections scale proportionally to their
+weights (8/4/8/14), renormalised over the sections actually emitted and each floored at one
+line, so 34 reproduces the previous fixed layout exactly. Every example-file line equals its
+typed Rust default.
 
 ## Maintainer checks
 

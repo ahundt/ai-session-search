@@ -15,6 +15,9 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Changed
 
+- The TUI preview honors `[ui].preview_lines` (default 30) as its total body budget: sections
+  scale proportionally to their weights with a one-line floor each, so the previous fixed
+  34-line layout is reproduced exactly at a budget of 34 and trimmed proportionally below it.
 - The TUI session list title names the active ordering (recent vs ranked), and preview
   scrolling stops when the last line reaches the pane bottom instead of continuing until
   three lines remain.
