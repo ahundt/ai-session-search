@@ -59,6 +59,10 @@ const STATUS_BAR_ROWS: u16 = 1;
 /// never from the help bar, so REQ047's recovery guidance keeps its line.
 const ERROR_LINE_ROWS: u16 = 1;
 
+/// Two border rows plus one content row: the scroll-clamp floor before the first render has
+/// recorded a viewport height (D11).
+const PREVIEW_VIEWPORT_SLACK: usize = 3;
+
 /// The crossterm event API is a set of free functions over a process-global source, so it
 /// cannot be substituted in a test. This is the seam: production wraps those functions, tests
 /// replay a script. Mirrors `crossterm::event::{poll, read}` (crossterm 0.29).
@@ -126,7 +130,7 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
         config.clone(),
         db.access_scope().clone(),
     ))?;
-    let mut app = AppState::new(config, db, worker)?;
+    let mut app = AppState::new(config, worker)?;
     let action = run_app(&mut terminal, &mut events, &mut app);
 
     // Restore the terminal before the resume output/prompt below runs on the normal screen.
@@ -220,20 +224,13 @@ enum AppAction {
 
 /// Which kind of work a [`WorkerRequest`] asks for. The discriminant is load-bearing: a
 /// preview-only response must never replace the result list (C13).
-///
-/// First CONSTRUCTED by step 4's request builders; present now so step 3's RED tests compile
-/// against real types (E32). The allow is removed in step 4.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestKind {
     Search,
     PreviewOnly,
 }
 
-/// A unit of work for the search worker. First CONSTRUCTED by step 4's request builders;
-/// the type exists now so step 3's RED tests compile against real types and fail on behavior,
-/// not on `cannot find type` (E32) — hence the temporary allow, removed in step 4.
-#[allow(dead_code)]
+/// A unit of work for the search worker.
 struct WorkerRequest {
     kind: RequestKind,
     query: String,
@@ -255,10 +252,6 @@ const NO_SESSIONS_PREVIEW: &str = "No sessions matched the current query.";
 /// (C28). The originating query travels back so a superseded response is dropped without a
 /// sequence counter; `previewed_id` says which session the preview is *for*, so a preview
 /// overtaken by newer navigation is discarded rather than rendered beside the wrong row.
-///
-/// Fields are first READ by step 4's `apply_response`; present now so step 3's RED tests
-/// compile against real types (E32). The allow is removed in step 4.
-#[allow(dead_code)]
 struct WorkerResponse {
     query: String,
     results: Option<Vec<SessionRecord>>,
@@ -345,8 +338,7 @@ impl SearchWorker {
     /// cancel an in-flight search: the worker would treat the interruption as an expected
     /// supersede, send nothing, and then answer with `results: None`, stranding a stale list
     /// with no error (C21). Navigation is already instant without this — the UI moves the
-    /// selection locally. First called by step 4's request builders (E32 ordering).
-    #[allow(dead_code)]
+    /// selection locally.
     fn send(&self, request: WorkerRequest) -> std::result::Result<(), String> {
         if request.kind == RequestKind::Search {
             self.cancel_in_flight();
@@ -541,15 +533,11 @@ fn db_backed_executor(config: Config, access: EffectiveAccessScope) -> ExecutorF
 
 struct AppState<'a> {
     config: &'a Config,
-    /// Temporary: the key dispatch moved onto `AppState` and still calls
-    /// `refresh`/`move_selection`/`select_index`, which need the handle. Step 4 moves that
-    /// work onto the worker and deletes this field.
-    db: &'a Db,
     /// The session filters the browser runs with. The state IS a `SearchFilters` value: no
     /// parallel filter representation exists (R8/§5.5d).
     filters: SearchFilters,
-    /// Search worker. Spawned from step 2; no key arm consults it until step 4 re-routes
-    /// refresh/navigation onto requests.
+    /// Search worker: owns every database query. The UI thread never blocks on it — it sends
+    /// requests and drains responses (§2.3).
     worker: SearchWorker,
     query: String,
     search_mode: bool,
@@ -558,16 +546,33 @@ struct AppState<'a> {
     preview: String,
     preview_scroll: u16,
     preview_line_count: usize,
+    /// The session whose preview is currently rendered: the skip guard for re-reading up to
+    /// `D_max` bytes per keystroke, and the match check that discards an overtaken preview.
+    previewed_id: Option<String>,
+    /// The preview pane's interior height, recorded by `render`, so scroll clamping bounds by
+    /// viewport, not just content length (D11). Zero until the first draw; the clamp's slack
+    /// floor covers that case.
+    preview_viewport_rows: u16,
     /// Last error from a keystroke-triggered operation, shown on its own line. A key press
     /// can never abort the TUI: errors land here instead of propagating through `?`.
     error: Option<String>,
 }
 
 impl<'a> AppState<'a> {
-    fn new(config: &'a Config, db: &'a Db, worker: SearchWorker) -> Result<Self> {
-        let mut state = Self {
+    fn new(config: &'a Config, worker: SearchWorker) -> Result<Self> {
+        let mut state = Self::new_quiet(config, worker);
+        // The initial empty-query search runs on the worker: the first frame draws before the
+        // first query completes, and the startup response populates the list (C28).
+        state.request_search();
+        Ok(state)
+    }
+
+    /// Construct without the startup request — the test harness path, where the first
+    /// request must wait until the fixture rows are seeded so the startup response and the
+    /// seeded state agree.
+    fn new_quiet(config: &'a Config, worker: SearchWorker) -> Self {
+        Self {
             config,
-            db,
             filters: SearchFilters {
                 provider: None,
                 path_prefix: None,
@@ -589,16 +594,15 @@ impl<'a> AppState<'a> {
             preview: String::new(),
             preview_scroll: 0,
             preview_line_count: 0,
+            previewed_id: None,
+            preview_viewport_rows: 0,
             error: None,
-        };
-        state.refresh(db)?;
-        Ok(state)
+        }
     }
 
     /// Handle one key press. Returns `Some(action)` when the loop should stop. Never returns
     /// `Err`: a database failure becomes `self.error` — a keystroke cannot end the TUI.
     fn handle_key(&mut self, key: KeyEvent) -> Option<AppAction> {
-        let db = self.db;
         if self.search_mode {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
@@ -606,13 +610,11 @@ impl<'a> AppState<'a> {
                 }
                 KeyCode::Backspace => {
                     self.query.pop();
-                    let outcome = self.refresh(db);
-                    self.record_error(outcome);
+                    self.request_search();
                 }
                 KeyCode::Char(ch) => {
                     self.query.push(ch);
-                    let outcome = self.refresh(db);
-                    self.record_error(outcome);
+                    self.request_search();
                 }
                 _ => {}
             }
@@ -622,32 +624,20 @@ impl<'a> AppState<'a> {
                 KeyCode::Char('/') => {
                     self.search_mode = true;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let outcome = self.move_selection(1, db);
-                    self.record_error(outcome);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    let outcome = self.move_selection(-1, db);
-                    self.record_error(outcome);
-                }
+                KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::PageDown => {
                     let page = self.config.ui.list_page_step as isize;
-                    let outcome = self.move_selection(page, db);
-                    self.record_error(outcome);
+                    self.move_selection(page);
                 }
                 KeyCode::PageUp => {
                     let page = self.config.ui.list_page_step as isize;
-                    let outcome = self.move_selection(-page, db);
-                    self.record_error(outcome);
+                    self.move_selection(-page);
                 }
-                KeyCode::Char('g') => {
-                    let outcome = self.select_index(0, db);
-                    self.record_error(outcome);
-                }
+                KeyCode::Char('g') => self.select_index(0),
                 KeyCode::Char('G') => {
                     let last = self.results.len().saturating_sub(1);
-                    let outcome = self.select_index(last, db);
-                    self.record_error(outcome);
+                    self.select_index(last);
                 }
                 KeyCode::Char('l') | KeyCode::Right => {
                     let step = self.config.ui.preview_scroll_step as isize;
@@ -676,18 +666,89 @@ impl<'a> AppState<'a> {
         None
     }
 
-    fn record_error(&mut self, result: Result<()>) {
-        if let Err(error) = result {
-            self.error = Some(format!("{error:#}"));
+    /// Absorb finished worker responses. Runs at the top of every loop turn, so the UI never
+    /// blocks on the worker; a response for a superseded query is dropped without touching
+    /// state (P3).
+    ///
+    /// Complexity (REQ010): `O(responses × K)` for the id lookup; no I/O, no lock held.
+    fn drain_responses(&mut self) {
+        while let Ok(response) = self.worker.responses.try_recv() {
+            match response {
+                Err(error) => {
+                    self.error = Some(format!("{error:#}"));
+                }
+                Ok(response) if response.query != self.query => {}
+                Ok(response) => self.apply_response(response),
+            }
         }
     }
 
-    /// Absorb finished worker responses. Step 4 applies them to state; until a key arm sends
-    /// a request the channel is always empty, so this stays observationally a no-op.
-    fn drain_responses(&mut self) {
-        while let Ok(response) = self.worker.responses.try_recv() {
-            // Step 4 replaces this with apply_response; nothing can send before then.
-            drop(response);
+    /// Queue a search for the current query. `send` cancels any in-flight search first —
+    /// this is what makes supersede real (D3). Never `?`: a dead worker sets the error line.
+    fn request_search(&mut self) {
+        if let Err(message) = self.worker.send(WorkerRequest {
+            kind: RequestKind::Search,
+            query: self.query.clone(),
+            filters: self.filters.clone(),
+            selected_id: self.selected_session().map(|session| session.id.clone()),
+        }) {
+            self.error = Some(message);
+        }
+    }
+
+    /// Ask the worker for the selected row's preview, unless it is already on screen.
+    ///
+    /// The skip is load-bearing, not an optimisation: every search response calls this, and
+    /// without it a preserved selection (D4) would re-read up to `D_max` bytes per keystroke.
+    /// A `PreviewOnly` never cancels (C21), so a held `j` merely queues requests the worker
+    /// drains to the latest.
+    fn request_preview(&mut self) {
+        let selected = self.selected_session().map(|session| session.id.clone());
+        if selected == self.previewed_id {
+            return;
+        }
+        if let Err(message) = self.worker.send(WorkerRequest {
+            kind: RequestKind::PreviewOnly,
+            query: self.query.clone(),
+            filters: self.filters.clone(),
+            selected_id: selected,
+        }) {
+            self.error = Some(message);
+        }
+    }
+
+    /// Apply one worker response. Search responses replace the list and preserve the user's
+    /// place; preview responses never replace the list (C13) and are discarded when overtaken
+    /// by newer navigation.
+    fn apply_response(&mut self, response: WorkerResponse) {
+        if let Some(results) = response.results {
+            // Clear the error only here: a PreviewOnly response arriving right after a failed
+            // search must not wipe the message before a frame carried it (C30).
+            self.error = None;
+            let keep = self.selected_session().map(|session| session.id.clone());
+            self.results = results;
+            // D4: keep the user's place when the same session survives into the new set.
+            self.selected = keep
+                .and_then(|id| self.results.iter().position(|session| session.id == id))
+                .unwrap_or(0);
+            // The worker could not know which row preservation would land on, so ask for its
+            // preview now — unless D4 retained the already-previewed row, which
+            // request_preview's skip guard turns into a no-op (C28).
+            self.request_preview();
+        }
+        if let Some(preview) = response.preview {
+            if response.previewed_id != self.selected_session().map(|s| s.id.clone()) {
+                return;
+            }
+            let same_session = response.previewed_id == self.previewed_id;
+            self.preview = preview;
+            self.preview_line_count = response.preview_line_count;
+            self.previewed_id = response.previewed_id;
+            if same_session {
+                self.clamp_preview_scroll();
+            } else {
+                self.preview_scroll = 0;
+            }
         }
     }
 
@@ -732,6 +793,9 @@ impl<'a> AppState<'a> {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(chunks[1]);
+        // The preview pane's interior height, minus its two border rows — recorded every draw
+        // so the scroll clamp bounds by the actual viewport (D11).
+        self.preview_viewport_rows = middle[1].height.saturating_sub(2);
 
         // Session list
         let items = self
@@ -776,8 +840,15 @@ impl<'a> AppState<'a> {
             })
             .collect::<Vec<_>>();
 
+        // D7: name the active ordering — the empty query lists `updated_at DESC`, a typed
+        // query lists score order, and the screen says which.
+        let mode = if self.query.trim().is_empty() {
+            "recent"
+        } else {
+            "ranked"
+        };
         let list_title = format!(
-            " Sessions ({}/{}) ",
+            " Sessions · {mode} ({}/{}) ",
             if self.results.is_empty() {
                 0
             } else {
@@ -833,78 +904,50 @@ impl<'a> AppState<'a> {
         frame.render_widget(bottom, chunks[status_index]);
     }
 
-    fn refresh(&mut self, db: &Db) -> Result<()> {
-        let results = if self.query.trim().is_empty() {
-            db.list_recent(&self.filters)?
-        } else {
-            db.search(
-                &self.query,
-                &self.filters,
-                current_repo(self.config).as_deref(),
-                &self.config.search.scoring,
-            )?
-            .into_iter()
-            .map(|hit| hit.session)
-            .collect()
-        };
-        self.results = results;
-        self.selected = 0;
-        self.load_preview(db)?;
-        Ok(())
-    }
-
-    fn move_selection(&mut self, delta: isize, db: &Db) -> Result<()> {
+    /// Move the selection locally — the UI never waits for the worker (G2) — and ask for the
+    /// new row's preview.
+    fn move_selection(&mut self, delta: isize) {
         if self.results.is_empty() {
-            return Ok(());
+            return;
         }
         let new =
             (self.selected as isize + delta).clamp(0, self.results.len() as isize - 1) as usize;
         if new != self.selected {
             self.selected = new;
             self.preview_scroll = 0;
-            self.load_preview(db)?;
+            self.request_preview();
         }
-        Ok(())
     }
 
-    fn select_index(&mut self, index: usize, db: &Db) -> Result<()> {
+    fn select_index(&mut self, index: usize) {
         if self.results.is_empty() {
-            return Ok(());
+            return;
         }
         let new = index.min(self.results.len() - 1);
         if new != self.selected {
             self.selected = new;
             self.preview_scroll = 0;
-            self.load_preview(db)?;
+            self.request_preview();
         }
-        Ok(())
+    }
+
+    /// The one place the scroll bound is expressed; `apply_response`'s same-session branch
+    /// reuses it so the two cannot drift (D11). Bounding by viewport stops the scroll when
+    /// the last line reaches the pane bottom — the old content-minus-3 bound let the pane
+    /// empty out as you scrolled.
+    fn clamp_preview_scroll(&mut self) {
+        let visible = usize::from(self.preview_viewport_rows).max(PREVIEW_VIEWPORT_SLACK);
+        let max = self.preview_line_count.saturating_sub(visible) as u16;
+        self.preview_scroll = self.preview_scroll.min(max);
     }
 
     fn scroll_preview(&mut self, delta: isize) {
-        let max = self.preview_line_count.saturating_sub(3) as u16;
-        self.preview_scroll = (self.preview_scroll as isize + delta).clamp(0, max as isize) as u16;
+        self.preview_scroll = (self.preview_scroll as isize + delta).max(0) as u16;
+        self.clamp_preview_scroll();
     }
 
     fn selected_session(&self) -> Option<&SessionRecord> {
         self.results.get(self.selected)
-    }
-
-    fn load_preview(&mut self, db: &Db) -> Result<()> {
-        let Some(selected) = self.selected_session() else {
-            self.preview = "No sessions matched the current query.".to_string();
-            self.preview_line_count = 1;
-            return Ok(());
-        };
-        let full = db.resolve_session(&selected.id)?;
-        let summary = build_transcript_summary(&full.transcript_text);
-        self.preview = format!(
-            "Session: {}\nCWD: {}\n\n{}",
-            selected.id,
-            selected.cwd.as_deref().unwrap_or("-"),
-            summary
-        );
-        self.preview_line_count = self.preview.lines().count();
-        Ok(())
     }
 }
 
@@ -1230,6 +1273,14 @@ mod tests {
         Box::new(
             |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
                 Ok(match request.kind {
+                    // The empty-query startup must answer with navigable rows: an empty
+                    // answer would wipe the seeded fixture on the first drain.
+                    RequestKind::Search if request.query.trim().is_empty() => {
+                        WorkerResponse::results(
+                            request,
+                            rows(&["claude:idle-one", "claude:idle-two", "claude:idle-three"]),
+                        )
+                    }
                     RequestKind::Search => WorkerResponse::results(request, Vec::new()),
                     RequestKind::PreviewOnly => WorkerResponse::preview(request, None),
                 })
@@ -1254,15 +1305,23 @@ mod tests {
         }
 
         fn with_config(config: Config, executor: SearchExecutor) -> Self {
+            Self::with_factory(
+                config,
+                Box::new(move || Ok((executor, EffectiveAccessScope::All))),
+            )
+        }
+
+        /// Like `with_config`, but the caller owns the whole factory (the digest guard passes
+        /// the production `db_backed_executor` against its own fixture).
+        fn with_factory(config: Config, factory: ExecutorFactory) -> Self {
             let config: &'static Config = Box::leak(Box::new(config));
             let (worker, observed) =
-                spawn_search_worker(Box::new(move || Ok((executor, EffectiveAccessScope::All))))
-                    .expect("worker startup handshake");
+                spawn_search_worker(factory).expect("worker startup handshake");
             assert!(matches!(observed, EffectiveAccessScope::All));
             let dir = tempfile::tempdir().unwrap();
             let db: &'static Db =
                 Box::leak(Box::new(Db::open(&dir.path().join("index.db")).unwrap()));
-            let app = AppState::new(config, db, worker).unwrap();
+            let app = AppState::new_quiet(config, worker);
             Self {
                 _dir: dir,
                 db,
@@ -1272,8 +1331,9 @@ mod tests {
             }
         }
 
-        /// Install the starting rows on `AppState::results` AND in the fixture database, so an
-        /// inline refresh or a worker query sees the same corpus.
+        /// Install the starting rows on `AppState::results` AND in the fixture database, then
+        /// send the startup request — construction is quiet, so the startup response and the
+        /// seeded rows always agree.
         fn seeded(mut self, sessions: &[&str]) -> Self {
             let mut records = Vec::new();
             for id in sessions {
@@ -1282,7 +1342,31 @@ mod tests {
                 records.push(parsed.session);
             }
             self.app.results = records;
+            self.app.request_search();
             self
+        }
+
+        /// Send the startup request for a harness that seeded nothing (the digest guard's
+        /// real-executor path, whose fixture lives in the factory's own database).
+        #[allow(dead_code)]
+        fn start(&mut self) {
+            self.app.request_search();
+        }
+
+        /// Step until the given session's preview is applied — the C28 settled point —
+        /// bounded by MAX_TEST_STEPS, panicking with the rendered screen on expiry.
+        fn wait_until_previewed(&mut self, id: &str) {
+            for _ in 0..MAX_TEST_STEPS {
+                if self.app.previewed_id.as_deref() == Some(id) {
+                    return;
+                }
+                self.step();
+            }
+            panic!(
+                "preview for {id} never applied; previewed={:?}, screen:\n{}",
+                self.app.previewed_id,
+                self.screen()
+            );
         }
 
         fn script(&mut self, events: Vec<Event>) {
@@ -1359,6 +1443,7 @@ mod tests {
             "claude:beta",
             "claude:gamma",
         ]);
+        harness.wait_until_previewed("claude:idle-one");
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
         assert!(harness.step_until_script_drained().is_none());
         assert!(harness.app.search_mode);
@@ -1389,6 +1474,9 @@ mod tests {
         harness.script(vec![key(KeyCode::Char('j'))]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.selected, 1);
+        // Settle the row-1 preview BEFORE the manual line count: a late preview response
+        // would overwrite it and clamp the scroll back to zero mid-test.
+        harness.wait_until_previewed("claude:idle-two");
 
         // Ctrl-d scrolls the preview by the page step against the content-length bound.
         harness.app.preview_line_count = 100;
@@ -1432,6 +1520,7 @@ mod tests {
             "claude:three",
             "claude:four",
         ]);
+        harness.wait_until_previewed("claude:idle-one");
 
         // The idle poll paces with the configured interval, observed clock-free through the
         // seam's recorded timeouts (every poll — including the one that returns false).
@@ -1450,7 +1539,10 @@ mod tests {
         // PageDown moves by the configured list page step, not a hardcoded 10.
         assert_eq!(harness.app.selected, 2);
 
-        // l scrolls by the configured preview scroll step; Ctrl-d adds the page step.
+        // l scrolls by the configured preview scroll step; Ctrl-d adds the page step. Settle
+        // the row-2 preview first: a late preview response would overwrite the manual line
+        // count mid-scroll.
+        harness.wait_until_previewed("claude:idle-three");
         harness.app.preview_line_count = 100;
         harness.script(vec![key(KeyCode::Char('l'))]);
         harness.step_until_script_drained();
@@ -1606,10 +1698,20 @@ mod tests {
 
     /// Wait for one executor completion, failing with the reason that carries the RED signal:
     /// the executor can only run if the UI actually sent a request (§5.3).
-    fn wait_for_executed(executed: &mpsc::Receiver<String>) -> String {
-        executed
-            .recv_timeout(Duration::from_secs(5))
-            .expect("executor ran (it can only if the UI sent a request)")
+    /// Wait for the executor to finish a request with this exact query, discarding stale
+    /// signals (the startup empty query always fires first). FIFO order makes consecutive
+    /// same-query waits consume distinct completions.
+    fn wait_for_executed(executed: &mpsc::Receiver<String>, expected: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match executed.recv_timeout(Duration::from_millis(100)) {
+                Ok(query) if query == expected => return query,
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!("executor never finished query {expected:?} (it can only run if the UI sent it)");
     }
 
     /// Wait for one observed request shape (kind, query, selected_id).
@@ -1619,6 +1721,41 @@ mod tests {
         requests
             .recv_timeout(Duration::from_secs(5))
             .expect("a request reached the executor")
+    }
+
+    /// Step until the executor finishes another request with this exact query — for
+    /// follow-ups that only issue from apply_response, where a bare wait would deadlock
+    /// (no steps run to apply the prior response).
+    fn step_until_executed(
+        harness: &mut TuiHarness,
+        executed: &mpsc::Receiver<String>,
+        expected: &str,
+    ) -> String {
+        for _ in 0..MAX_TEST_STEPS {
+            harness.step();
+            if let Ok(query) = executed.try_recv() {
+                if query == expected {
+                    return query;
+                }
+            }
+        }
+        panic!("executor never finished another {expected:?} within {MAX_TEST_STEPS} steps");
+    }
+
+    /// Step until the NEXT request reaches the executor and return it. A bare step may run
+    /// before the previous response arrives, and a follow-up request only issues from
+    /// apply_response — stepping until it appears removes that race.
+    fn step_until_next_request(
+        harness: &mut TuiHarness,
+        requests: &mpsc::Receiver<(RequestKind, String, Option<String>)>,
+    ) -> (RequestKind, String, Option<String>) {
+        for _ in 0..MAX_TEST_STEPS {
+            harness.step();
+            if let Ok(request) = requests.try_recv() {
+                return request;
+            }
+        }
+        panic!("no follow-up request arrived within {MAX_TEST_STEPS} steps");
     }
 
     /// Release parked gates enough times for every queued request to finish, so a harness
@@ -1634,10 +1771,9 @@ mod tests {
         let (release, gate) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
         let executor = Box::new(
-            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
-                    gate.recv()
-                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                    park_until_released_or_cancelled(&gate, cancellation);
                 }
                 let response = match request.kind {
                     // The ungated startup request answers with the seeded rows; answering
@@ -1674,7 +1810,7 @@ mod tests {
         assert!(!harness.session_rows().contains("after"));
 
         release.send(()).unwrap();
-        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx, "a");
         harness.step();
         assert!(harness.session_rows().contains("after"));
         finish_gated(&release);
@@ -1684,11 +1820,12 @@ mod tests {
     fn backspace_echoes_while_the_executor_is_blocked() {
         let (release, gate) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let (parked_tx, parked_rx) = mpsc::channel::<String>();
         let executor = Box::new(
-            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
-                    gate.recv()
-                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                    let _ = parked_tx.send(request.query.clone());
+                    park_until_released_or_cancelled(&gate, cancellation);
                 }
                 let _ = executed_tx.send(request.query.clone());
                 Ok(match request.kind {
@@ -1698,31 +1835,52 @@ mod tests {
             },
         );
         let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
-        harness.script(vec![
-            key(KeyCode::Char('/')),
-            key(KeyCode::Char('a')),
-            key(KeyCode::Backspace),
-        ]);
+        // '/','a' first, and wait until "a" is provably parked: with all three keys in one
+        // script the worker's drain-to-latest coalesces the queued pair and "a" never
+        // executes at all — correct worker behavior, wrong setup for this contract.
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        loop {
+            let query = parked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the 'a' search parked");
+            if query == "a" {
+                break;
+            }
+        }
+        harness.script(vec![key(KeyCode::Backspace)]);
         harness.step_until_script_drained();
         // Backspace rendered immediately (query lost 'a'); a whitespace-only query counts as
-        // empty, matching refresh's trim() contract.
+        // empty, matching refresh's trim() contract. The Backspace's supersede cancels the
+        // parked "a" — the cancel-aware fake completes it, as a real interrupted query would.
         assert!(!harness.search_box().contains("a█"));
         assert_eq!(harness.app.query, "");
-        release.send(()).unwrap();
-        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx, "a");
         finish_gated(&release);
     }
 
     #[test]
     fn worker_serves_only_the_latest_of_a_drained_burst() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
         let executor = Box::new(
-            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::Search && request.query.is_empty() {
+                    // Park the STARTUP request so the burst provably queues behind it: all
+                    // five searches sit in the channel before the worker takes any. Without
+                    // this the worker races the UI's sends and the coalescing is untestable.
+                    let _ = parked_tx.send(());
+                    park_until_released_or_cancelled(&gate, cancellation);
+                }
                 let _ = executed_tx.send(request.query.clone());
                 Ok(WorkerResponse::results(request, Vec::new()))
             },
         );
         let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        parked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("startup request parked");
         harness.script(vec![
             key(KeyCode::Char('/')),
             key(KeyCode::Char('a')),
@@ -1732,30 +1890,30 @@ mod tests {
             key(KeyCode::Char('e')),
         ]);
         harness.step_until_script_drained();
-        // Collect until quiet: the worker executes in microseconds after the sends.
+        release.send(()).unwrap();
+        // Collect until quiet: the worker drains the queued burst to its latest.
         let mut executed: Vec<String> = Vec::new();
         while let Ok(query) = executed_rx.recv_timeout(Duration::from_millis(200)) {
             executed.push(query);
         }
-        // The startup empty query runs, then the burst must coalesce to its latest: the
-        // five queued searches never execute as five (§2.3 drain-to-latest).
+        // The queries are cumulative keystrokes: the burst's latest request carries the full
+        // "abcde" — one execution for the whole queued burst is the drain-to-latest win.
         assert_eq!(
             executed,
-            vec![String::new(), "e".to_string()],
-            "a drained burst must serve only the latest request"
+            vec![String::new(), "abcde".to_string()],
+            "a queued burst must serve only the latest request (§2.3 drain-to-latest)"
         );
     }
 
     #[test]
     fn superseding_a_query_cancels_the_one_in_flight() {
         let (release, gate) = mpsc::channel::<()>();
-        let (observed_tx, observed_rx) = mpsc::channel::<Arc<QueryCancellation>>();
+        let (observed_tx, observed_rx) = mpsc::channel::<(String, Arc<QueryCancellation>)>();
         let executor = Box::new(
             move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
-                let _ = observed_tx.send(Arc::clone(cancellation));
+                let _ = observed_tx.send((request.query.clone(), Arc::clone(cancellation)));
                 if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
-                    gate.recv()
-                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                    park_until_released_or_cancelled(&gate, cancellation);
                 }
                 Ok(WorkerResponse::results(request, Vec::new()))
             },
@@ -1763,11 +1921,18 @@ mod tests {
         let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
         harness.step_until_script_drained();
-        // The fake executor cloned the FIRST request's cancellation out; the test owns the
-        // only other Arc, which is what makes is_cancelled() assertable at all (C29).
-        let first = observed_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("first search reached the executor");
+        // Wait until the "a" search is provably parked (its cancellation published), so the
+        // supersede lands on it deterministically. The fake cloned the request's Arc out;
+        // the test owns the only other one, which is what makes is_cancelled() assertable
+        // at all (C29).
+        let first = loop {
+            let (query, cancellation) = observed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a search reached the executor");
+            if query == "a" {
+                break cancellation;
+            }
+        };
         harness.script(vec![key(KeyCode::Char('b'))]);
         harness.step_until_script_drained();
         assert!(
@@ -1781,13 +1946,16 @@ mod tests {
     fn response_for_a_superseded_query_is_dropped() {
         let (release, gate) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let (parked_tx, parked_rx) = mpsc::channel::<String>();
         let executor = Box::new(
-            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
-                    gate.recv()
-                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                    let _ = parked_tx.send(request.query.clone());
+                    park_until_released_or_cancelled(&gate, cancellation);
                 }
-                let id = format!("claude:{}", request.query);
+                // Suffix the id so superseded and fresh results are not substrings of each
+                // other ("claude:a-result" vs "claude:ab-result").
+                let id = format!("claude:{}-result", request.query);
                 let _ = executed_tx.send(request.query.clone());
                 Ok(WorkerResponse::results(request, rows(&[&id])))
             },
@@ -1795,21 +1963,31 @@ mod tests {
         let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
         harness.step_until_script_drained();
+        loop {
+            let query = parked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a search parked");
+            if query == "a" {
+                break;
+            }
+        }
         harness.script(vec![key(KeyCode::Char('b'))]);
         harness.step_until_script_drained();
-        // Release both: the stale "a" response must be dropped by the originating-query
-        // guard, never rendered; the fresh "b" response applies.
+        // Typing 'b' makes the cumulative query "ab": that request cancels the in-flight
+        // "a" — the cancel-aware fake completes it, exactly as a real interrupted query
+        // would — then "ab" parks, and one release serves it. The stale "a" response must
+        // be dropped by the originating-query guard, never rendered; the fresh "ab"
+        // response applies.
         release.send(()).unwrap();
-        release.send(()).unwrap();
-        wait_for_executed(&executed_rx);
-        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx, "a");
+        wait_for_executed(&executed_rx, "ab");
         harness.step();
         harness.step();
         assert!(
-            !harness.session_rows().contains("claude:a"),
+            !harness.session_rows().contains("claude:a-result"),
             "a response for a superseded query must not mutate state"
         );
-        assert!(harness.session_rows().contains("claude:b"));
+        assert!(harness.session_rows().contains("claude:ab-result"));
         finish_gated(&release);
     }
 
@@ -1820,7 +1998,9 @@ mod tests {
             move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
                 let _ = executed_tx.send(request.query.clone());
                 Ok(match request.kind {
-                    RequestKind::Search => WorkerResponse::results(request, rows(&["claude:keep"])),
+                    RequestKind::Search => {
+                        WorkerResponse::results(request, rows(&["claude:keep", "claude:second"]))
+                    }
                     RequestKind::PreviewOnly => {
                         WorkerResponse::preview(request, Some("preview body".to_string()))
                     }
@@ -1829,9 +2009,11 @@ mod tests {
         );
         let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
         harness.step_until_script_drained();
+        wait_for_executed(&executed_rx, ""); // startup search (FIFO first)
+        harness.wait_until_previewed("claude:keep");
         harness.script(vec![key(KeyCode::Char('j'))]);
         harness.step_until_script_drained();
-        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx, ""); // the j preview, after the startup signal
         harness.step();
         assert_eq!(harness.app.selected, 1);
         assert!(
@@ -1869,7 +2051,9 @@ mod tests {
         // Startup: empty-query Search, then a preview for the row the UI actually selected.
         let (kind, query, _) = wait_for_request(&requests_rx);
         assert_eq!((kind, query.as_str()), (RequestKind::Search, ""));
-        let (kind, _, selected) = wait_for_request(&requests_rx);
+        // Apply the startup response: the preview request only issues from apply_response,
+        // which runs during a step — the signal alone does not apply it.
+        let (kind, _, selected) = step_until_next_request(&mut harness, &requests_rx);
         assert_eq!(
             (kind, selected),
             (RequestKind::PreviewOnly, Some("claude:one".into()))
@@ -1881,7 +2065,9 @@ mod tests {
         // Query change that drops the selected row: the new first row must get its preview.
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('z'))]);
         harness.step_until_script_drained();
-        let (kind, _, selected) = wait_for_request(&requests_rx);
+        let (kind, query, _) = wait_for_request(&requests_rx);
+        assert_eq!((kind, query.as_str()), (RequestKind::Search, "z"));
+        let (kind, _, selected) = step_until_next_request(&mut harness, &requests_rx);
         assert_eq!(
             (kind, selected),
             (RequestKind::PreviewOnly, Some("claude:two".into())),
@@ -1897,10 +2083,9 @@ mod tests {
         let (release, gate) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
         let executor = Box::new(
-            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::PreviewOnly {
-                    gate.recv()
-                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                    park_until_released_or_cancelled(&gate, cancellation);
                 }
                 let _ = executed_tx.send(request.query.clone());
                 Ok(match request.kind {
@@ -1924,7 +2109,8 @@ mod tests {
         harness.step_until_script_drained();
         assert_eq!(harness.app.selected, 1);
         release.send(()).unwrap();
-        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx, ""); // startup search (FIFO first)
+        wait_for_executed(&executed_rx, ""); // the overtaken row-0 preview
         harness.step();
         assert!(
             !harness.app.preview.contains("claude:one"),
@@ -1932,7 +2118,7 @@ mod tests {
         );
         // The queued row-1 preview then executes (drained burst) and applies.
         release.send(()).unwrap();
-        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx, "");
         harness.step();
         assert!(harness.app.preview.contains("claude:two"));
         finish_gated(&release);
@@ -1974,12 +2160,13 @@ mod tests {
             "claude:three",
         ]);
         harness.step_until_script_drained();
-        wait_for_executed(&executed_rx); // startup search
-        wait_for_executed(&executed_rx); // startup preview
-        harness.step();
+        wait_for_executed(&executed_rx, ""); // startup search executed
+                                             // The startup preview only issues once the search response applies — stepping
+                                             // drives apply_response, a bare wait would deadlock.
+        step_until_executed(&mut harness, &executed_rx, "");
         harness.script(vec![key(KeyCode::Char('j'))]);
         harness.step_until_script_drained();
-        wait_for_executed(&executed_rx); // row-1 preview
+        wait_for_executed(&executed_rx, ""); // row-1 preview
         harness.step();
         harness.script(vec![
             key(KeyCode::Char('l')),
@@ -1992,7 +2179,7 @@ mod tests {
 
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('z'))]);
         harness.step_until_script_drained();
-        wait_for_executed(&executed_rx); // the reordered search response
+        wait_for_executed(&executed_rx, "z"); // the reordered search response
         harness.step();
         assert_eq!(
             harness.app.selected, 1,
@@ -2006,10 +2193,9 @@ mod tests {
         let (release, gate) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
         let executor = Box::new(
-            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::PreviewOnly {
-                    gate.recv()
-                        .map_err(|_| anyhow::anyhow!("harness dropped the gate"))?;
+                    park_until_released_or_cancelled(&gate, cancellation);
                 }
                 let _ = executed_tx.send(request.query.clone());
                 Ok(match request.kind {
@@ -2043,20 +2229,36 @@ mod tests {
         harness.step_until_script_drained();
         assert_eq!(harness.app.selected, 1);
         finish_gated(&release);
-        wait_for_executed(&executed_rx);
+        wait_for_executed(&executed_rx, "");
     }
 
     #[test]
     fn a_dead_worker_reports_an_error_and_leaves_the_ui_usable() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let executor = Box::new(
             move |_request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                // Signal entry so the test knows the panic is in flight — the thread still
+                // needs a moment to unwind and close the request channel.
+                let _ = entered_tx.send(());
                 panic!("executor exploded")
             },
         );
-        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
-        harness.step_until_script_drained();
+        let mut harness =
+            TuiHarness::with_executor(executor).seeded(&["claude:keep", "claude:also"]);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the executor entered (and is now panicking)");
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
         harness.step_until_script_drained();
+        // The worker is mid-unwind when the signal fires; keep typing until a send fails —
+        // each keystroke retries, and the closed channel is what sets the error line.
+        for _ in 0..MAX_TEST_STEPS {
+            if harness.app.error.is_some() {
+                break;
+            }
+            harness.script(vec![key(KeyCode::Char('x'))]);
+            harness.step_until_script_drained();
+        }
         assert!(
             harness.app.error.is_some(),
             "a dead worker must surface as the error line, not a hang or an exit (C14)"
@@ -2066,7 +2268,10 @@ mod tests {
             harness.error_line().contains("worker"),
             "the error line must render the failure"
         );
-        // The list stays navigable and q still quits.
+        // The list stays navigable and q still quits. Esc first: 'a' left search mode,
+        // where j would type into the query instead of moving the selection.
+        harness.script(vec![key(KeyCode::Esc)]);
+        harness.step_until_script_drained();
         harness.script(vec![key(KeyCode::Char('j'))]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.selected, 1);
@@ -2075,5 +2280,243 @@ mod tests {
             harness.step_until_script_drained(),
             Some(AppAction::Quit)
         ));
+    }
+    /// Park like a real query would: until released, or until cancelled (a real SQLite query
+    /// unblocks on interrupt). A gate-only fake would hang the worker join in Drop.
+    fn park_until_released_or_cancelled(
+        gate: &mpsc::Receiver<()>,
+        cancellation: &QueryCancellation,
+    ) {
+        loop {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            match gate.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+
+    #[test]
+    fn worker_startup_failure_is_reported_not_swallowed() {
+        let factory: ExecutorFactory = Box::new(|| Err(anyhow::anyhow!("cannot open database")));
+        let error = spawn_search_worker(factory)
+            .err()
+            .expect("startup failure must surface through the handshake");
+        assert!(
+            format!("{error:#}").contains("cannot open database"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn worker_handle_carries_the_main_handles_access_scope() {
+        // The factory reports the scope its connection observed; a UI-thread test cannot call
+        // access_scope() on a Db living in another thread (P5).
+        let factory: ExecutorFactory = Box::new(|| {
+            Ok((
+                idle_executor(),
+                EffectiveAccessScope::AllowedRoots { roots: Vec::new() },
+            ))
+        });
+        let (_worker, observed) = spawn_search_worker(factory).unwrap();
+        assert!(
+            matches!(observed, EffectiveAccessScope::AllowedRoots { .. }),
+            "the observed access scope must travel back to the handle"
+        );
+    }
+
+    #[test]
+    fn worker_refuses_a_mismatched_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        db.upsert_session(&session("claude:alpha"), 0, 0).unwrap();
+        drop(db);
+        // Bump the stamp through a raw connection: every in-crate writer writes the current
+        // value only (the service.rs precedent for forging drift).
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        raw.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(raw);
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        let factory = db_backed_executor(config, EffectiveAccessScope::All);
+        let error = factory().err().expect("schema drift must be refused");
+        assert!(
+            format!("{error:#}").contains("schema"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_query_is_not_reported_as_an_error() {
+        // libsqlite3-sys's Error is a plain pub-fields struct; no constructor suits this case.
+        let interrupted = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::OperationInterrupted,
+                extended_code: rusqlite::ffi::SQLITE_INTERRUPT,
+            },
+            None,
+        );
+        assert!(is_expected_interruption(&anyhow::Error::new(interrupted)));
+        let other = anyhow::Error::new(rusqlite::Error::QueryReturnedNoRows);
+        assert!(!is_expected_interruption(&other));
+    }
+
+    #[test]
+    fn navigating_during_a_search_does_not_cancel_it() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (observed_tx, observed_rx) = mpsc::channel::<Arc<QueryCancellation>>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                let _ = observed_tx.send(Arc::clone(cancellation));
+                if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
+                    park_until_released_or_cancelled(&gate, cancellation);
+                }
+                Ok(match request.kind {
+                    RequestKind::Search => {
+                        WorkerResponse::results(request, rows(&["claude:delivered"]))
+                    }
+                    RequestKind::PreviewOnly => WorkerResponse::preview(request, None),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        let search = observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the search reached the executor");
+        harness.script(vec![key(KeyCode::Char('j'))]);
+        harness.step_until_script_drained();
+        assert!(
+            !search.is_cancelled(),
+            "navigation must not cancel an in-flight search (C21/F2)"
+        );
+        release.send(()).unwrap();
+        for _ in 0..MAX_TEST_STEPS {
+            harness.step();
+            if harness.session_rows().contains("delivered") {
+                break;
+            }
+        }
+        assert!(
+            harness.session_rows().contains("delivered"),
+            "the search must still deliver after navigation"
+        );
+    }
+
+    #[test]
+    fn quit_joins_the_worker_without_hanging() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (observed_tx, observed_rx) = mpsc::channel::<(String, Arc<QueryCancellation>)>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                let _ = observed_tx.send((request.query.clone(), Arc::clone(cancellation)));
+                if request.kind == RequestKind::Search && !request.query.trim().is_empty() {
+                    park_until_released_or_cancelled(&gate, cancellation);
+                }
+                Ok(WorkerResponse::results(request, Vec::new()))
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        // Wait for the "a" request's own cancellation (the startup "" fires first).
+        let search = loop {
+            let (query, cancellation) = observed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a search reached the executor");
+            if query == "a" {
+                break cancellation;
+            }
+        };
+        // Drop cancels the in-flight query, closes the request channel, and joins — the
+        // cancellation-aware park is what lets the join return.
+        drop(harness);
+        assert!(
+            search.is_cancelled(),
+            "Drop must cancel the in-flight query before joining"
+        );
+        let _ = release;
+    }
+
+    fn ordered_ids(results: &[SessionRecord]) -> Vec<String> {
+        results.iter().map(|session| session.id.clone()).collect()
+    }
+
+    fn id_digest(ids: &[String]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        ids.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Step until the worker's response has been applied (ids match) or steps run out.
+    fn wait_for_results(harness: &mut TuiHarness, expected: &[String]) {
+        for _ in 0..MAX_TEST_STEPS {
+            if ordered_ids(&harness.app.results) == expected {
+                return;
+            }
+            harness.step();
+        }
+    }
+
+    #[test]
+    fn tui_and_catalog_service_return_identical_ordered_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        for id in ["claude:alpha", "claude:beta", "claude:gamma"] {
+            db.upsert_session(&session(id), 0, 0).unwrap();
+        }
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        let factory = db_backed_executor(config.clone(), db.access_scope().clone());
+        let mut harness = TuiHarness::with_factory(config.clone(), factory);
+        harness.start();
+        let catalog = CatalogService::new(&db);
+
+        // Startup empty query: the worker's list path equals CatalogService's list path.
+        harness.step_until_script_drained();
+        let expected = catalog
+            .list_sessions(&harness.app.filters)
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        wait_for_results(&mut harness, &expected);
+        assert_eq!(ordered_ids(&harness.app.results), expected);
+
+        // Matching and no-match queries through the worker and the service.
+        for query in ["a", "zzz"] {
+            harness.script(vec![key(KeyCode::Char('/'))]);
+            harness.step_until_script_drained();
+            for ch in query.chars() {
+                harness.script(vec![key(KeyCode::Char(ch))]);
+                harness.step_until_script_drained();
+            }
+            let expected = catalog
+                .search_sessions(
+                    query,
+                    &harness.app.filters,
+                    current_repo(&config).as_deref(),
+                    &config.search.scoring,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.session.id)
+                .collect::<Vec<_>>();
+            wait_for_results(&mut harness, &expected);
+            let got = ordered_ids(&harness.app.results);
+            assert_eq!(
+                got, expected,
+                "TUI vs CatalogService mismatch for {query:?}"
+            );
+            assert_eq!(id_digest(&got), id_digest(&expected));
+        }
     }
 }

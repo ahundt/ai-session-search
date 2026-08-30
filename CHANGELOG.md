@@ -15,6 +15,9 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Changed
 
+- The TUI session list title names the active ordering (recent vs ranked), and preview
+  scrolling stops when the last line reaches the pane bottom instead of continuing until
+  three lines remain.
 - The bundled SQLite moves from 3.50.2 to 3.53.2, through rusqlite 0.40. Measured over 52 paired
   benchmark cases on a generated fixture, every required result digest matched, and peak memory
   moved between -10% and +2.6%, the largest drop being the terminal UI's startup.
@@ -27,6 +30,13 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- Typing in `aise tui` no longer runs the search on the input thread: each keystroke renders
+  immediately, searches run on a worker thread through the same `CatalogService` seam as the
+  CLI, MCP, and Python surfaces, and a superseded search is cancelled instead of running to
+  completion while a newer one waits. The previous results stay on screen until the new ones
+  arrive, and the preview resolves off the input thread, so navigation never blocks on it.
+- The TUI selection and preview scroll survive typing: a result set that still contains the
+  selected session keeps the user's place instead of resetting to the first row.
 - Typing in `aise tui` no longer risks freezing the event loop on one keystroke: queued input
   drains in one loop turn, and a database error during a keystroke shows on a dedicated error
   line instead of exiting the TUI.
