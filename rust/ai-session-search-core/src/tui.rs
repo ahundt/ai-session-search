@@ -5,7 +5,7 @@
 use std::io;
 use std::num::NonZeroUsize;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -105,6 +105,28 @@ const PREVIEW_VIEWPORT_SLACK: usize = 3;
 /// Worst-case rendered width of a list row's " [age]" suffix, from relative_age's output
 /// shapes: its longest form is the date branch, " [2026-01-16]".
 const AGE_SUFFIX_ALLOWANCE: usize = 13;
+
+/// The `s` binding's time windows in cycle order, as (status label, span in hours). One table,
+/// so the binding that sets `filters.since` and the status bar that names the active window
+/// cannot disagree about which one is on.
+const SINCE_WINDOWS: [(&str, i64); 3] = [("1d", 24), ("7d", 24 * 7), ("30d", 24 * 30)];
+
+/// Which entry of [`SINCE_WINDOWS`] a `since` timestamp names, recovered from the age it implies.
+///
+/// `SearchFilters::since` is an absolute instant, so the active window has to be read back rather
+/// than stored twice. A window matches while its age has not yet reached the next window's span,
+/// which leaves a day of slack: a TUI left open overnight keeps labelling its window correctly and
+/// keeps advancing the cycle in order.
+fn active_since_window(since: Option<DateTime<Utc>>) -> Option<usize> {
+    let since = since?;
+    let age_hours = (Utc::now() - since).num_hours();
+    Some(
+        SINCE_WINDOWS
+            .iter()
+            .position(|(_, span_hours)| age_hours <= span_hours + 24)
+            .unwrap_or(SINCE_WINDOWS.len() - 1),
+    )
+}
 
 /// The session list's provider labels (D6/D10): uppercase throughout — the old table's
 /// "GEMINI" and "Gemini" were near-identical, and "AI Studio" overflowed a `{:<6}` field
@@ -530,6 +552,38 @@ struct PendingWork {
     closed: bool,
 }
 
+impl PendingWork {
+    /// The one pending slot for `kind`. Constant capacity per kind is the mailbox's contract,
+    /// so the slot is named here rather than matched at each call site.
+    fn slot_mut(&mut self, kind: RequestKind) -> &mut Option<WorkerRequest> {
+        match kind {
+            RequestKind::Search => &mut self.search,
+            RequestKind::PreviewOnly => &mut self.preview,
+        }
+    }
+
+    /// Take the in-flight cancellation out of the slot before raising it. One owner, one order:
+    /// the interrupt handle is connection-scoped, so clearing and cancelling must stay atomic
+    /// under the mailbox lock or a cancel could race its successor's publication.
+    fn cancel_in_flight(&mut self) {
+        if let Some((_, cancellation)) = self.in_flight.take() {
+            cancellation.cancel();
+        }
+    }
+
+    /// Cancel the in-flight request only when it is `target`. Navigation supersedes an older
+    /// preview scan this way without ever cancelling an in-flight search (C21).
+    fn cancel_in_flight_if(&mut self, target: RequestKind) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|(kind, _)| *kind == target)
+        {
+            self.cancel_in_flight();
+        }
+    }
+}
+
 /// Constant-capacity latest-value mailbox. At most one Search and one PreviewOnly are retained,
 /// so a Q-character paste keeps O(Q + F) bytes for the latest query/filters instead of every
 /// cumulative prefix (Theta(Q^2) query bytes in the former unbounded FIFO).
@@ -556,69 +610,30 @@ impl WorkerMailbox {
                 "the search worker stopped; press q to quit and rerun aise tui".to_string(),
             );
         }
-        match request.kind {
-            RequestKind::Search => {
-                // Hold the mailbox lock across cancel and replacement: the interrupt handle is
-                // connection-scoped, so cancellation must not race publication of its successor.
-                if let Some((_, cancellation)) = state.in_flight.take() {
-                    cancellation.cancel();
-                }
-                state.search = Some(request);
-            }
-            RequestKind::PreviewOnly => {
-                // Navigation B supersedes preview A's O(M) metadata scan, but it must never cancel
-                // an in-flight Search (the result-list contract covered by C21).
-                if state
-                    .in_flight
-                    .as_ref()
-                    .is_some_and(|(kind, _)| *kind == RequestKind::PreviewOnly)
-                {
-                    if let Some((_, cancellation)) = state.in_flight.take() {
-                        cancellation.cancel();
-                    }
-                }
-                state.preview = Some(request);
-            }
+        let kind = request.kind;
+        match kind {
+            // A newer search supersedes whatever is running, search or preview: its result set
+            // replaces the list either way.
+            RequestKind::Search => state.cancel_in_flight(),
+            // Navigation B supersedes preview A's transcript scan, but it must never cancel an
+            // in-flight Search (the result-list contract covered by C21).
+            RequestKind::PreviewOnly => state.cancel_in_flight_if(RequestKind::PreviewOnly),
         }
+        *state.slot_mut(kind) = Some(request);
         self.wake.notify_one();
         Ok(())
     }
 
+    /// Drop the pending request of one kind and stop its in-flight run. Used by the two callers
+    /// that abandon work without replacing it: a rejected filter combination, and a preview whose
+    /// row is already on screen.
     fn cancel_kind(&self, target: RequestKind) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match target {
-            RequestKind::Search => state.search.take(),
-            RequestKind::PreviewOnly => state.preview.take(),
-        };
-        if state
-            .in_flight
-            .as_ref()
-            .is_some_and(|(kind, _)| *kind == target)
-        {
-            if let Some((_, cancellation)) = state.in_flight.take() {
-                cancellation.cancel();
-            }
-        }
-    }
-
-    fn cancel_preview(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.preview.take();
-        if state
-            .in_flight
-            .as_ref()
-            .is_some_and(|(kind, _)| *kind == RequestKind::PreviewOnly)
-        {
-            if let Some((_, cancellation)) = state.in_flight.take() {
-                cancellation.cancel();
-            }
-        }
+        state.slot_mut(target).take();
+        state.cancel_in_flight_if(target);
     }
 
     fn next(&self) -> Option<(WorkerRequest, Arc<QueryCancellation>)> {
@@ -666,9 +681,7 @@ impl WorkerMailbox {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, cancellation)) = state.in_flight.take() {
-            cancellation.cancel();
-        }
+        state.cancel_in_flight();
         state.search.take();
         state.preview.take();
         state.closed = true;
@@ -718,7 +731,7 @@ impl SearchWorker {
     }
 
     fn cancel_preview(&self) {
-        self.mailbox.cancel_preview();
+        self.mailbox.cancel_kind(RequestKind::PreviewOnly);
     }
 
     fn cancel_search(&self) {
@@ -1260,24 +1273,12 @@ impl AppState {
     /// Cycle the time window: unbounded → 1 day → 7 days → 30 days → unbounded. Only `since`
     /// is set; `until` stays open, so the newest sessions always qualify.
     fn cycle_since_window(&mut self) {
-        let hours = match self.filters.since {
-            None => 24,
-            Some(since) => {
-                let age = (Utc::now() - since).num_hours();
-                if age <= 24 * 2 {
-                    24 * 7
-                } else if age <= 24 * 8 {
-                    24 * 30
-                } else {
-                    0
-                }
-            }
+        let next = match active_since_window(self.filters.since) {
+            None => Some(0),
+            Some(index) => Some(index + 1).filter(|next| *next < SINCE_WINDOWS.len()),
         };
-        self.filters.since = if hours == 0 {
-            None
-        } else {
-            Some(Utc::now() - chrono::Duration::seconds(i64::from(hours) * 3600))
-        };
+        self.filters.since =
+            next.map(|index| Utc::now() - chrono::Duration::hours(SINCE_WINDOWS[index].1));
         self.apply_filter_change();
     }
 
@@ -1298,16 +1299,8 @@ impl AppState {
             Some(kinds) if *kinds == SessionKind::default_search_set() => "user+subagent",
             Some(_) => "custom",
         };
-        let window = self.filters.since.map_or("any", |since| {
-            let hours = (Utc::now() - since).num_hours();
-            if hours <= 24 * 2 {
-                "1d"
-            } else if hours <= 24 * 8 {
-                "7d"
-            } else {
-                "30d"
-            }
-        });
+        let window =
+            active_since_window(self.filters.since).map_or("any", |index| SINCE_WINDOWS[index].0);
         format!(
             "p:{provider} f:{class} s:{window} w:{}",
             if self.filters.warnings_only {
@@ -4345,6 +4338,45 @@ mod tests {
         );
         harness.app.scroll_preview(isize::MAX);
         assert!(harness.app.preview_scroll > 0);
+    }
+
+    #[test]
+    fn since_window_cycle_and_status_label_read_the_same_table() {
+        // The binding stores an absolute `since`; the status bar reads the window back out of
+        // it. Separate thresholds in the two places would let the cycle advance to the 7-day
+        // span while the bar still said 1d, so each press must both move to the next span and
+        // rename the window.
+        let (filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        wait_for_filters(&filters_rx, RequestKind::Search);
+        harness.wait_until_previewed("claude:keep");
+        assert!(harness.app.filter_status().contains("s:any"));
+
+        for (label, span_hours) in SINCE_WINDOWS {
+            harness.script(vec![key(KeyCode::Char('s'))]);
+            harness.step_until_script_drained();
+            let filters = wait_for_filters(&filters_rx, RequestKind::Search);
+            let since = filters.since.expect("the s binding sets a lower bound");
+            assert_eq!(
+                (Utc::now() - since).num_hours(),
+                span_hours,
+                "pressing s must move to the {label} span"
+            );
+            assert!(
+                harness.app.filter_status().contains(&format!("s:{label}")),
+                "the status bar must name the window the binding just set, got {}",
+                harness.app.filter_status()
+            );
+        }
+
+        harness.script(vec![key(KeyCode::Char('s'))]);
+        harness.step_until_script_drained();
+        let filters = wait_for_filters(&filters_rx, RequestKind::Search);
+        assert_eq!(
+            filters.since, None,
+            "the last window cycles back to unbounded"
+        );
+        assert!(harness.app.filter_status().contains("s:any"));
     }
 
     #[test]
