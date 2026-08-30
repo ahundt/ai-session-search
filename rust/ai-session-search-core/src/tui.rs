@@ -1745,9 +1745,10 @@ const HISTORICAL_PREVIEW_BODY_LINES: usize = PREVIEW_WEIGHT_FIRST_PROMPT
     + PREVIEW_WEIGHT_FIRST_REPLY
     + PREVIEW_WEIGHT_FINAL_PROMPT
     + PREVIEW_WEIGHT_FINAL_REPLY;
-/// Maximum transcript bytes scanned between cooperative cancellation checks. This is a work
-/// bound, not a presentation budget; 64 KiB matches the worker's bounded search-batch byte scale.
-const TRANSCRIPT_CANCELLATION_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum transcript bytes scanned between cooperative cancellation checks. Shared with the
+/// caseless matcher and whitespace compaction so all three scans answer a cancel on the same
+/// bound; see [`crate::util::CANCELLATION_CHECK_BYTES`].
+const TRANSCRIPT_CANCELLATION_CHUNK_BYTES: usize = crate::util::CANCELLATION_CHECK_BYTES;
 
 #[cfg(test)]
 fn build_transcript_summary(transcript: &str, budget: usize) -> String {

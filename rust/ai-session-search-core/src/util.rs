@@ -22,6 +22,14 @@ use crate::models::{
     ParsedSession, Provider, Role, SessionRecord,
 };
 
+/// Source bytes a cooperative scan may cross before it re-checks cancellation.
+///
+/// One value, three scans: caseless matching, whitespace compaction, and the TUI's transcript
+/// copies. It is a work bound rather than a presentation budget, sized to the same 64 KiB scale as
+/// the session-scoring batch, so a single oversized record cannot outrun a cancel by more than one
+/// chunk on any of them.
+pub(crate) const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
 /// Read a reader's lines like [`std::io::BufRead::lines`], but never fail on a line that is not
 /// valid UTF-8: each invalid byte sequence is replaced with the Unicode replacement character
 /// `U+FFFD` (via [`String::from_utf8_lossy`]) instead of returning an error.
@@ -484,7 +492,18 @@ impl UnicodeLowerNeedle {
         }
     }
 
+    /// [`Self::find_in_while`] for the tests that assert ranges without cancelling.
+    #[cfg(test)]
+    pub(crate) fn find_in(&self, haystack: &str) -> Option<Range<usize>> {
+        self.find_in_while(haystack, || true)
+            .expect("the unconditional matcher cannot cancel")
+    }
+
     /// The byte range of `haystack` holding its first Unicode-caseless occurrence of the needle.
+    ///
+    /// Every caller reaches the matcher through this one function; an uncancellable caller passes
+    /// `|| true` rather than keeping a second copy of the scan. `keep_going` is consulted at most
+    /// [`CANCELLATION_CHECK_BYTES`] apart, and [`ControlFlow::Break`] means it stopped the scan.
     ///
     /// The range names characters of the original `haystack`, so slicing it is safe and shows the
     /// text as written. It cannot be read off the folded sequence directly, because folding
@@ -506,19 +525,12 @@ impl UnicodeLowerNeedle {
     /// and 35.3 ms to 35.7 ms for one that does not, against the build immediately before this
     /// change. A single ASCII fast path would recover that, at the cost of a second matcher whose
     /// agreement with this one nothing checks.
-    pub(crate) fn find_in(&self, haystack: &str) -> Option<Range<usize>> {
-        match self.find_in_controlled(haystack, || true) {
-            ControlFlow::Continue(found) => found,
-            ControlFlow::Break(()) => unreachable!("the unconditional matcher cannot cancel"),
-        }
-    }
-
     fn find_in_controlled(
         &self,
         haystack: &str,
         mut keep_going: impl FnMut() -> bool,
     ) -> ControlFlow<(), Option<Range<usize>>> {
-        const CHECK_BYTES: usize = 64 * 1024;
+        const CHECK_BYTES: usize = CANCELLATION_CHECK_BYTES;
         if self.pattern.is_empty() {
             return ControlFlow::Continue(Some(0..0));
         }
@@ -729,18 +741,13 @@ pub fn select_transcript_lines(transcript: &str, transcript_lines: i64) -> (Stri
 }
 
 pub fn compact_whitespace(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    for (i, word) in value.split_whitespace().enumerate() {
-        if i > 0 {
-            result.push(' ');
-        }
-        result.push_str(word);
-    }
-    result
+    compact_whitespace_while(value, || true).expect("the unconditional scan cannot cancel")
 }
 
+/// Collapse every whitespace run to one space, re-checking `keep_going` at most
+/// [`CANCELLATION_CHECK_BYTES`] apart. `None` means the callback stopped the scan.
 fn compact_whitespace_while(value: &str, mut keep_going: impl FnMut() -> bool) -> Option<String> {
-    const CHECK_BYTES: usize = 64 * 1024;
+    const CHECK_BYTES: usize = CANCELLATION_CHECK_BYTES;
     let mut result = String::with_capacity(value.len());
     let mut in_word = false;
     let mut saw_word = false;
@@ -912,6 +919,13 @@ pub fn substantive_text(value: &str) -> bool {
         .any(|needle| normalized.eq_ignore_ascii_case(needle))
 }
 
+/// Center a display-bounded snippet on the query's first occurrence, re-checking `keep_going`
+/// between scans. `None` means the callback stopped one of them.
+///
+/// The locate is the same Unicode-caseless matcher the session ranking uses, so a hit it found on
+/// `CAFÉ` for `café` is a hit this can center on. Folding only ASCII here would agree with it on
+/// ASCII queries and quietly disagree on every other one, returning the head of the field as the
+/// evidence for a match that is elsewhere in the text.
 pub(crate) fn snippet_from_match_while(
     value: &str,
     query: &str,
@@ -940,27 +954,8 @@ pub(crate) fn snippet_from_match_while(
 }
 
 pub fn snippet_from_match(value: &str, query: &str, max_len: usize) -> String {
-    let compact = compact_whitespace(value);
-    if compact.is_empty() {
-        return "(no snippet available)".to_string();
-    }
-
-    // The same Unicode-caseless locate the session matcher ranks with, so a hit it found on
-    // `CAFÉ` for `café` is a hit this can center on. Folding only ASCII here would agree with it
-    // on ASCII queries and quietly disagree on every other one, returning the head of the field
-    // as the evidence for a match that is elsewhere in the text.
-    let query_lower = fold_caseless(query);
-    if let Some(found) = UnicodeLowerNeedle::from_lowered(&query_lower).find_in(&compact) {
-        return window_around_match(&compact, found, max_len);
-    }
-
-    for token in query_lower.split_whitespace() {
-        if let Some(found) = UnicodeLowerNeedle::from_lowered(token).find_in(&compact) {
-            return window_around_match(&compact, found, max_len);
-        }
-    }
-
-    truncate_for_display(&compact, max_len)
+    snippet_from_match_while(value, query, max_len, || true)
+        .expect("the unconditional scan cannot cancel")
 }
 
 /// A window of `compact` around `found`, extended by half of `max_len` on each side, with `...`
