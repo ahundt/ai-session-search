@@ -258,7 +258,8 @@ pipelines can request all summary evidence with `--summary-items 0 --format json
 `[ui]` configures the interactive terminal UI only. Four interaction keys ship now:
 `event_poll_interval_ms` (150, minimum 1) paces the idle redraw loop — it is not a keystroke
 latency, because queued input drains in one burst before the next draw; zero is rejected because
-it would return before polling any key. `list_page_step` (10) is the
+it would return before polling any key, and intervals that do not fit the platform monotonic clock
+are rejected instead of overflowing the deadline. `list_page_step` (10) is the
 PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and `preview_page_step`
 (15) are the l/h and Ctrl-d/Ctrl-u scroll amounts; `provider_label_width` (9) is the session
 list's provider column width — the renderer clamps upward to the longest label and downward to

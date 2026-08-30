@@ -397,6 +397,7 @@ def sample_process(
     normalizations: dict[bytes, bytes] | None = None,
     *,
     extract_session_ids: bool = False,
+    result_json_field: str | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter_ns()
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -421,6 +422,14 @@ def sample_process(
         normalized_stdout = normalized_stdout.replace(source, replacement)
         normalized_stderr = normalized_stderr.replace(source, replacement)
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+    semantic_result_sha256 = None
+    if result_json_field is not None and child.returncode == 0:
+        decoded_result = json.loads(normalized_stdout)
+        if not isinstance(decoded_result, dict) or result_json_field not in decoded_result:
+            raise ValueError(
+                f"benchmark output must be a JSON object containing {result_json_field!r}"
+            )
+        semantic_result_sha256 = str(decoded_result[result_json_field])
     session_ids = None
     if extract_session_ids and child.returncode == 0:
         decoded = json.loads(normalized_stdout)
@@ -439,6 +448,11 @@ def sample_process(
         "result_sha256": hashlib.sha256(normalized_stdout).hexdigest(),
         "normalized_stdout_bytes": len(normalized_stdout),
         "stderr": normalized_stderr.decode("utf-8", "replace")[-4000:],
+        **(
+            {"semantic_result_sha256": semantic_result_sha256}
+            if semantic_result_sha256 is not None
+            else {}
+        ),
         **({"session_ids": session_ids} if session_ids is not None else {}),
     }
 
@@ -643,6 +657,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                         argv,
                         path_normalizations,
                         extract_session_ids=(case.get("expected_relation") == "intentional_change_with_oracle"),
+                        result_json_field=case.get("result_json_field"),
                     )
                     after_fixture_state = sqlite_file_state(sample_fixture)
                     durable_before = durable_sqlite_state(before_fixture_state)
@@ -675,11 +690,14 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                         if label == "baseline" and case.get("baseline_allow_failure", False):
                             continue
                         raise SystemExit(f"{label}/{case['id']} failed: {sample['stderr']}")
-                    expected_digest = expected_digest or sample["result_sha256"]
-                    if sample["result_sha256"] != expected_digest:
+                    comparison_digest = sample.get(
+                        "semantic_result_sha256", sample["result_sha256"]
+                    )
+                    expected_digest = expected_digest or comparison_digest
+                    if comparison_digest != expected_digest:
                         raise SystemExit(f"non-deterministic result digest: {label}/{case['id']}")
                     prior_build_digest = expected_by_case.setdefault(case["id"], expected_digest)
-                    if case.get("require_equal", True) and sample["result_sha256"] != prior_build_digest:
+                    if case.get("require_equal", True) and comparison_digest != prior_build_digest:
                         raise SystemExit(f"baseline/candidate result mismatch: {case['id']}")
                     if label == "candidate" and case.get("read_only", True) and sample["durable_fixture_mutated"]:
                         raise SystemExit(f"candidate durably mutated read-only fixture: {case['id']}")

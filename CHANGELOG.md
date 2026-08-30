@@ -38,6 +38,10 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- TUI worker failure renders `stopped` rather than `ready`; returning to an already-rendered
+  preview invalidates errors from an overtaken preview, and new navigation cancels obsolete
+  preview scans without cancelling an in-flight search. The worker accepts every schema generation
+  the shared read contract declares readable and gives upgrade guidance for newer indexes.
 - TUI echo frames format only terminal-visible session rows rather than every retained result.
   Preview bookends come from normalized message rows and retain at most four bodies instead of
   loading the session's full joined transcript; search and preview finalization observe the same
@@ -70,6 +74,10 @@ compatibility baseline; tags below it do not define a compatibility contract.
 - Typing in `aise tui` no longer risks freezing the event loop on one keystroke: queued input
   drains in one loop turn, and a database error during a keystroke shows on a dedicated error
   line instead of exiting the TUI.
+- The registered TUI latency benchmark now compares semantic ordered-list digests instead of
+  timing noise, buffers split terminal control sequences, fails closed on stopped/incomplete
+  searches, sums process-tree resource samples, and waits for current-generation readiness plus a
+  stable frame. Baseline/candidate reports therefore remain comparable when timing values differ.
 - A tool call that cannot arm its own cancellation now says so. It previously ran uncancellable
   while the client believed its cancellation still applied.
 - A `query_session_index` call whose read-only restriction fails to install is refused rather than

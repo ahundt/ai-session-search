@@ -133,6 +133,7 @@
       "id": "tui-typeahead-latency",
       "tier": "subsystem",
       "surface": "tui",
+      "result_json_field": "result_digest",
       "argv": ["{python}", "{client_root}/tui_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--measure-latency"]
     },
     {

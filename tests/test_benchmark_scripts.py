@@ -377,7 +377,32 @@ def test_tui_client_latency_case_is_registered_and_opt_in() -> None:
     manifest = json.loads((ROOT / "benchmarks" / "release_manifest.json").read_text())
     cases = {case["id"]: case for case in manifest["cases"]}
     assert "--measure-latency" in cases["tui-typeahead-latency"]["argv"]
+    assert cases["tui-typeahead-latency"]["result_json_field"] == "result_digest"
     assert "--measure-latency" not in cases["tui-startup-list"]["argv"]
+
+
+def test_release_runner_compares_tui_semantic_digest_not_performance_noise() -> None:
+    benchmark = load_script("benchmark_release.py")
+    first = benchmark.sample_process(
+        [sys.executable, "-c", 'print(\'{"result_digest":"same","echo_ms_p50":1}\')'],
+        result_json_field="result_digest",
+    )
+    second = benchmark.sample_process(
+        [sys.executable, "-c", 'print(\'{"result_digest":"same","echo_ms_p50":99}\')'],
+        result_json_field="result_digest",
+    )
+    assert first["result_sha256"] != second["result_sha256"]
+    assert first["semantic_result_sha256"] == second["semantic_result_sha256"]
+
+
+def test_tui_screen_tracker_buffers_every_split_csi_prefix() -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    sequence = "\x1b[38;5;6;49mX"
+    for split in range(1, len(sequence)):
+        tracker = client.ScreenTracker()
+        tracker.feed(sequence[:split])
+        tracker.feed(sequence[split:])
+        assert tracker.line(0) == "X", f"CSI split at byte {split} leaked control text"
 
 
 def test_tui_final_result_latency_uses_the_last_transition_before_stability(
@@ -395,6 +420,9 @@ def test_tui_final_result_latency_uses_the_last_transition_before_stability(
         def session_list(self, _layout: object) -> str:
             return self.state
 
+        def full_screen(self) -> str:
+            return self.state
+
     class Tui:
         chunks = iter([b"prefix", b"final"])
 
@@ -407,6 +435,104 @@ def test_tui_final_result_latency_uses_the_last_transition_before_stability(
     )
     assert result_ms is not None
     assert final_list == "final"
+
+
+def test_tui_completion_signal_records_equal_final_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    monkeypatch.setattr(client, "SETTLE_QUIET_SECONDS", 0.001)
+
+    class Tracker:
+        def search_state(self) -> str:
+            return "ready"
+
+        def session_list(self, _layout: object) -> str:
+            return "unchanged rows"
+
+        def feed_bytes(self, _chunk: bytes) -> None:
+            pass
+
+    class Tui:
+        def read_chunk(self, _timeout: float) -> None:
+            return None
+
+    result_ms, final_list, _bytes = client._await_settled_change(
+        Tui(),
+        Tracker(),
+        object(),
+        "unchanged rows",
+        client.time.monotonic(),
+        0.05,
+        completion_signal=True,
+    )
+    assert result_ms is not None
+    assert final_list == "unchanged rows"
+
+
+def test_tui_stopped_worker_never_counts_as_completed_results() -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+
+    class Tracker:
+        def search_state(self) -> str:
+            return "stopped"
+
+        def session_list(self, _layout: object) -> str:
+            return "stale rows"
+
+    class Tui:
+        def read_chunk(self, _timeout: float) -> None:
+            return None
+
+    result_ms, _final_list, _bytes = client._await_settled_change(
+        Tui(),
+        Tracker(),
+        object(),
+        "stale rows",
+        client.time.monotonic(),
+        0.01,
+        completion_signal=True,
+    )
+    assert result_ms is None
+
+
+def test_tui_completion_signal_timeout_does_not_accept_a_list_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    monkeypatch.setattr(client, "SETTLE_QUIET_SECONDS", 0.001)
+
+    class Tracker:
+        state = "old"
+
+        def search_state(self) -> str:
+            return "searching"
+
+        def session_list(self, _layout: object) -> str:
+            return self.state
+
+        def full_screen(self) -> str:
+            return self.state
+
+        def feed_bytes(self, _chunk: bytes) -> None:
+            self.state = "changed but not complete"
+
+    class Tui:
+        chunks = iter([b"transition"])
+
+        def read_chunk(self, _timeout: float) -> bytes | None:
+            return next(self.chunks, None)
+
+    result_ms, _final_list, _bytes = client._await_settled_change(
+        Tui(),
+        Tracker(),
+        object(),
+        "old",
+        client.time.monotonic(),
+        0.01,
+        completion_signal=True,
+    )
+    assert result_ms is None
 
 
 def test_tui_latency_missing_echo_or_default_result_fails_closed(
@@ -575,6 +701,8 @@ def test_tui_resource_sampler_retains_process_peak(
     assert sampled_second.wait(1), "sampler did not take two process-tree samples"
     sampler.stop()
     assert sampler.process_count == 3
+    assert sampler.peak_rss_kb == 3
+    assert sampler.peak_threads == 3
 
 
 def test_tui_resource_sampler_stop_joins_an_in_progress_sample(

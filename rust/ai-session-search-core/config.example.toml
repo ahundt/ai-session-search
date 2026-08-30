@@ -238,6 +238,7 @@ repeat_phrase_max_words = 5
 preview_lines = 30
 # Idle wake interval for the TUI event loop, in milliseconds (minimum 1). Not a keystroke
 # latency: input drains in a burst loop, so this only paces redraws while the user is idle.
+# Values must fit the platform monotonic clock; unrepresentable intervals are rejected.
 event_poll_interval_ms = 150
 # Rows the selection moves for PageDown/PageUp in the session list.
 list_page_step = 10

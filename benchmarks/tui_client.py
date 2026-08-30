@@ -105,8 +105,14 @@ class ScreenTracker:
             if char == "\x1b":
                 match = CSI.match(self.pending)
                 if match is None:
-                    if len(self.pending) == 1:
-                        return  # escape sequence split across chunks
+                    # CSI may split after ESC, '[', parameters, or intermediates. Buffer every
+                    # syntactically incomplete prefix; discarding ESC early turns the remaining
+                    # style bytes into visible cells and makes screen digests chunk-dependent.
+                    if len(self.pending) == 1 or (
+                        self.pending.startswith("\x1b[")
+                        and not any("@" <= value <= "~" for value in self.pending[2:])
+                    ):
+                        return
                     self.pending = self.pending[1:]
                     continue
                 self.pending = self.pending[match.end() :]
@@ -182,8 +188,10 @@ class ScreenTracker:
         if rules[1] - rules[0] != 2:
             raise SystemExit(f"unexpected search-box geometry: rules at {rules[:2]}")
         query_row = rules[0] + 1
-        # The list pane is the box below the search box: rules[1] top border, rules[-1] bottom.
-        list_rows = range(rules[1] + 1, rules[-1])
+        # The split pane's top border is one row below the full-width search-box rule. Exclude
+        # that title border from the semantic digest: mode/activity text is presentation state,
+        # while these rows are the ordered result content being compared across builds.
+        list_rows = range(rules[1] + 2, rules[-1])
         list_cols = range(1, divider)
         if not list_rows or len(list_cols) < 10:
             raise SystemExit(f"degenerate list region: rows {list_rows}, cols {list_cols}")
@@ -214,6 +222,10 @@ class ScreenTracker:
             "".join(self.rows[row][layout.list_cols.start : layout.list_cols.stop]).rstrip()
             for row in layout.list_rows
         )
+
+    def search_state(self) -> str | None:
+        match = re.search(r"Sessions[^\n]*· (searching|ready|stopped) ", self.full_screen())
+        return match.group(1) if match is not None else None
 
     def session_result_count(self) -> int:
         match = re.search(r"Sessions[^\n]*\(\d+/(\d+)\)", self.full_screen())
@@ -355,6 +367,9 @@ class ResourceSampler:
                 pids = self._tree()
                 count = len(pids)
                 self.process_count = count if self.process_count is None else max(self.process_count, count)
+                sample_rss_kb = 0
+                sample_cpu_pct = 0.0
+                sample_threads = 0
                 for pid in pids:
                     try:
                         line = subprocess.run(
@@ -363,17 +378,28 @@ class ResourceSampler:
                         ).stdout.strip()
                         if line:
                             rss_kb, cpu_pct = line.split()
-                            rss = int(rss_kb)
-                            cpu = float(cpu_pct)
-                            self.peak_rss_kb = rss if self.peak_rss_kb is None else max(self.peak_rss_kb, rss)
-                            self.peak_cpu_pct = cpu if self.peak_cpu_pct is None else max(self.peak_cpu_pct, cpu)
+                            sample_rss_kb += int(rss_kb)
+                            sample_cpu_pct += float(cpu_pct)
                             threads = self._threads(pid)
                             if threads is not None:
-                                self.peak_threads = (
-                                    threads if self.peak_threads is None else max(self.peak_threads, threads)
-                                )
+                                sample_threads += threads
                     except (OSError, ValueError, subprocess.SubprocessError):
                         pass
+                self.peak_rss_kb = (
+                    sample_rss_kb
+                    if self.peak_rss_kb is None
+                    else max(self.peak_rss_kb, sample_rss_kb)
+                )
+                self.peak_cpu_pct = (
+                    sample_cpu_pct
+                    if self.peak_cpu_pct is None
+                    else max(self.peak_cpu_pct, sample_cpu_pct)
+                )
+                self.peak_threads = (
+                    sample_threads
+                    if self.peak_threads is None
+                    else max(self.peak_threads, sample_threads)
+                )
                 if self._stop.wait(SAMPLER_INTERVAL_SECONDS):
                     break
 
@@ -509,6 +535,9 @@ def measure_latency(
         "output_bytes": total_output_bytes,
         "typed_keys_per_second": round(typed_keys / total_seconds) if total_seconds else None,
         "workload": workload,
+        "completion_signal_observed": all(
+            bool(run.get("completion_signal")) for run in runs
+        ),
         "wal_growth_bytes": wal_growth,
         "result_digest": aggregate_digest,
         "result_digests_by_query": stable_digests,
@@ -537,6 +566,7 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
         if "Sessions" not in tracker.full_screen() or "Preview" not in tracker.full_screen():
             raise SystemExit("TUI startup did not render the expected panes")
         layout = tracker.derive_layout()
+        completion_signal = tracker.search_state() is not None
         keys = ["/", *query]
         echo_ms: list[int] = []
         results_ms: int | None = None
@@ -566,6 +596,7 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
                     sent_at,
                     FINAL_KEY_SETTLE_CAP_SECONDS,
                     initial_result_ms=results_found,
+                    completion_signal=completion_signal,
                 )
                 output_bytes += added_bytes
                 if list_before != before_settle:
@@ -582,6 +613,7 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
                 "result_count": tracker.session_result_count(),
                 "visible_rows": len(layout.list_rows),
                 "wall_ms": round((time.monotonic() - run_started) * 1000),
+                "completion_signal": completion_signal,
             }
         )
         return result
@@ -630,6 +662,7 @@ def _await_settled_change(
     sent_at: float,
     budget: float,
     initial_result_ms: float | None = None,
+    completion_signal: bool = False,
 ) -> tuple[float | None, str, int]:
     """Return the LAST list transition before screen stability, never the first.
 
@@ -642,28 +675,42 @@ def _await_settled_change(
     added_bytes = 0
     last_result_ms = initial_result_ms
     stable_since = time.monotonic() if initial_result_ms is not None else None
+    completion_seen_ms: float | None = None
     current_list = list_before
     while time.monotonic() < deadline:
+        now = time.monotonic()
+        state = tracker.search_state() if completion_signal else None
+        if state == "stopped":
+            return None, current_list, added_bytes
+        if state == "searching":
+            completion_seen_ms = None
+        elif state == "ready" and completion_seen_ms is None:
+            completion_seen_ms = (now - sent_at) * 1000
+            stable_since = now
         chunk = tui.read_chunk(0.01)
         if chunk is None:
+            observation = completion_seen_ms if completion_signal else last_result_ms
             if (
-                last_result_ms is not None
+                observation is not None
                 and stable_since is not None
                 and time.monotonic() - stable_since >= SETTLE_QUIET_SECONDS
             ):
-                return last_result_ms, current_list, added_bytes
+                return max(last_result_ms or 0.0, observation), current_list, added_bytes
             continue
         if chunk == b"":
             break
         added_bytes += len(chunk)
         now = time.monotonic()
+        screen_before = tracker.full_screen()
         tracker.feed_bytes(chunk)
+        if tracker.full_screen() != screen_before:
+            stable_since = now
         observed = tracker.session_list(layout)
         if observed != current_list:
             current_list = observed
             last_result_ms = (now - sent_at) * 1000
             stable_since = now
-    return last_result_ms, current_list, added_bytes
+    return (None if completion_signal else last_result_ms), current_list, added_bytes
 
 
 def _finish_run(

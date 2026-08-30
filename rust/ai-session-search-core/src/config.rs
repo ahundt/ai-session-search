@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1699,6 +1700,15 @@ impl Config {
         }
         if self.ui.event_poll_interval_ms == 0 {
             bail!("ui.event_poll_interval_ms must be greater than zero; {FIX}");
+        }
+        if Instant::now()
+            .checked_add(Duration::from_millis(self.ui.event_poll_interval_ms))
+            .is_none()
+        {
+            bail!(
+                "ui.event_poll_interval_ms is too large for this platform's monotonic clock; \
+                 choose a smaller millisecond interval; {FIX}"
+            );
         }
         if self.release_notifications.minimum_check_interval_hours == 0 {
             bail!(

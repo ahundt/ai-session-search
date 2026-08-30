@@ -27,7 +27,10 @@ use ratatui::{
 };
 
 use crate::config::Config;
-use crate::db::{ConversationBookends, Db, QueryCancellation, QueryCancelled, SCHEMA_VERSION};
+use crate::db::{
+    ConversationBookends, Db, QueryCancellation, QueryCancelled, MIN_READABLE_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+};
 use crate::models::{Provider, Role, SearchFilters, SessionKind, SessionRecord};
 use crate::runtime::ExecutionRuntime;
 use crate::search_scope::EffectiveAccessScope;
@@ -290,8 +293,9 @@ where
     // results p50 at the 150 ms idle interval because nothing drained until the next step.
     // Slices are capped at 10 ms so pickup latency stays far below the configured pacing,
     // and each handled key restarts the idle window, preserving burst draining.
-    let mut idle_deadline =
-        std::time::Instant::now() + Duration::from_millis(app.config.ui.event_poll_interval_ms);
+    let mut idle_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_millis(app.config.ui.event_poll_interval_ms))
+        .ok_or_else(|| anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock"))?;
     loop {
         let now = std::time::Instant::now();
         if now >= idle_deadline {
@@ -314,7 +318,10 @@ where
             app.drain_responses();
             terminal.draw(|frame| app.render(frame))?;
             idle_deadline = std::time::Instant::now()
-                + Duration::from_millis(app.config.ui.event_poll_interval_ms);
+                .checked_add(Duration::from_millis(app.config.ui.event_poll_interval_ms))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock")
+                })?;
         } else if app.drain_responses() {
             // A worker response landed mid-wait: apply it and redraw now.
             terminal.draw(|frame| app.render(frame))?;
@@ -433,7 +440,7 @@ type ExecutorFactory = Box<dyn FnOnce() -> Result<(SearchExecutor, EffectiveAcce
 struct PendingWork {
     search: Option<WorkerRequest>,
     preview: Option<WorkerRequest>,
-    in_flight: Option<Arc<QueryCancellation>>,
+    in_flight: Option<(RequestKind, Arc<QueryCancellation>)>,
     closed: bool,
 }
 
@@ -467,12 +474,25 @@ impl WorkerMailbox {
             RequestKind::Search => {
                 // Hold the mailbox lock across cancel and replacement: the interrupt handle is
                 // connection-scoped, so cancellation must not race publication of its successor.
-                if let Some(cancellation) = state.in_flight.take() {
+                if let Some((_, cancellation)) = state.in_flight.take() {
                     cancellation.cancel();
                 }
                 state.search = Some(request);
             }
-            RequestKind::PreviewOnly => state.preview = Some(request),
+            RequestKind::PreviewOnly => {
+                // Navigation B supersedes preview A's O(M) metadata scan, but it must never cancel
+                // an in-flight Search (the result-list contract covered by C21).
+                if state
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|(kind, _)| *kind == RequestKind::PreviewOnly)
+                {
+                    if let Some((_, cancellation)) = state.in_flight.take() {
+                        cancellation.cancel();
+                    }
+                }
+                state.preview = Some(request);
+            }
         }
         self.wake.notify_one();
         Ok(())
@@ -494,7 +514,7 @@ impl WorkerMailbox {
         }
         let request = state.search.take().or_else(|| state.preview.take())?;
         let cancellation = Arc::new(QueryCancellation::new());
-        state.in_flight = Some(Arc::clone(&cancellation));
+        state.in_flight = Some((request.kind, Arc::clone(&cancellation)));
         Some((request, cancellation))
     }
 
@@ -506,7 +526,7 @@ impl WorkerMailbox {
         if state
             .in_flight
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, cancellation))
+            .is_some_and(|(_, current)| Arc::ptr_eq(current, cancellation))
         {
             state.in_flight.take();
         }
@@ -523,7 +543,7 @@ impl WorkerMailbox {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cancellation) = state.in_flight.take() {
+        if let Some((_, cancellation)) = state.in_flight.take() {
             cancellation.cancel();
         }
         state.search.take();
@@ -672,9 +692,16 @@ fn db_backed_executor(
             runtime,
         )?;
         db.set_access_scope(access);
+        let schema_version = db.schema_version()?;
         anyhow::ensure!(
-            db.schema_version()? == SCHEMA_VERSION,
-            "the TUI search worker requires database schema {SCHEMA_VERSION}; \
+            schema_version <= SCHEMA_VERSION,
+            "the index uses schema generation {schema_version}, newer than this aise build \
+             supports ({SCHEMA_VERSION}); upgrade aise before opening it"
+        );
+        anyhow::ensure!(
+            schema_version >= MIN_READABLE_SCHEMA_VERSION,
+            "the TUI search worker requires readable database schema generation \
+             {MIN_READABLE_SCHEMA_VERSION} or newer, got {schema_version}; \
              run `aise reindex --full`, then retry"
         );
         let observed = db.access_scope().clone();
@@ -957,11 +984,13 @@ impl<'a> AppState<'a> {
     /// drains to the latest.
     fn request_preview(&mut self) {
         let selected = self.selected_session().map(|session| session.id.clone());
+        // Invalidate any outstanding preview success/error even when the already-rendered row is
+        // selected again and no replacement I/O is needed (A→B→A fast path).
+        let generation = RequestGeneration::new();
+        self.current_preview_generation = generation.clone();
         if selected == self.previewed_id {
             return;
         }
-        let generation = RequestGeneration::new();
-        self.current_preview_generation = generation.clone();
         if let Err(message) = self.worker.send(WorkerRequest {
             kind: RequestKind::PreviewOnly,
             generation,
@@ -1187,7 +1216,13 @@ impl<'a> AppState<'a> {
         } else {
             "ranked"
         };
-        let activity = if self.searching { " · searching" } else { "" };
+        let activity = if self.worker_disconnected_reported {
+            " · stopped"
+        } else if self.searching {
+            " · searching"
+        } else {
+            " · ready"
+        };
         let list_title = format!(
             " Sessions · {mode}{activity} ({}/{}) ",
             if self.results.is_empty() {
@@ -1216,6 +1251,12 @@ impl<'a> AppState<'a> {
             .lines()
             .map(|line| render_preview_line(line, &self.query))
             .collect::<Vec<_>>();
+        let wrap_width = usize::from(middle[1].width.saturating_sub(2)).max(1);
+        self.preview_line_count = preview_lines
+            .iter()
+            .map(|line| line.width().max(1).div_ceil(wrap_width))
+            .sum();
+        self.clamp_preview_scroll();
         let preview = Paragraph::new(preview_lines)
             .block(Block::default().borders(Borders::ALL).title(" Preview "))
             .wrap(Wrap { trim: false })
@@ -1379,11 +1420,12 @@ fn truncate_body(body: &str, max_lines: usize) -> String {
     if trimmed.is_empty() {
         return "(empty)".to_string();
     }
-    let lines: Vec<&str> = trimmed.lines().collect();
-    if lines.len() <= max_lines {
+    let mut source = trimmed.lines();
+    let lines: Vec<&str> = source.by_ref().take(max_lines).collect();
+    if source.next().is_none() {
         return trimmed.to_string();
     }
-    let mut out = lines[..max_lines].join("\n");
+    let mut out = lines.join("\n");
     out.push_str("\n  […]");
     out
 }
@@ -1955,7 +1997,10 @@ mod tests {
         harness.wait_until_previewed("claude:idle-two");
 
         // Ctrl-d scrolls the preview by the page step against the content-length bound.
-        harness.app.preview_line_count = 100;
+        harness.app.preview = (0..100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         harness.script(vec![ctrl_key(KeyCode::Char('d'))]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.preview_scroll, 15);
@@ -2020,7 +2065,10 @@ mod tests {
         // the row-2 preview first: a late preview response would overwrite the manual line
         // count mid-scroll.
         harness.wait_until_previewed("claude:idle-three");
-        harness.app.preview_line_count = 100;
+        harness.app.preview = (0..100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         harness.script(vec![key(KeyCode::Char('l'))]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.preview_scroll, 3);
@@ -2641,6 +2689,24 @@ mod tests {
     }
 
     #[test]
+    fn returning_to_rendered_preview_invalidates_outstanding_preview_error() {
+        let mut harness =
+            TuiHarness::with_executor(idle_executor()).seeded(&["claude:a", "claude:b"]);
+        harness.app.previewed_id = Some("claude:a".to_string());
+        harness.app.selected = 1;
+        harness.app.request_preview();
+        let stale_b = harness.app.current_preview_generation.clone();
+        harness.app.selected = 0;
+        harness.app.request_preview(); // fast path: A is already rendered, but B must go stale.
+        assert!(!harness.app.apply_outcome(WorkerOutcome {
+            kind: RequestKind::PreviewOnly,
+            generation: stale_b,
+            result: Err(anyhow::anyhow!("preview B failed")),
+        }));
+        assert!(harness.app.error.is_none());
+    }
+
+    #[test]
     fn preview_only_response_does_not_replace_the_result_list() {
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
         let executor = Box::new(
@@ -2733,14 +2799,15 @@ mod tests {
     fn a_preview_overtaken_by_newer_navigation_is_discarded() {
         let (release, gate) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
-        let (parking_tx, parking_rx) = mpsc::channel::<Option<String>>();
+        let (parking_tx, parking_rx) = mpsc::channel::<(Option<String>, Arc<QueryCancellation>)>();
         let executor = Box::new(
             move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::PreviewOnly {
                     // Signal WHICH preview is parking so the test can wait for the startup
                     // preview to provably start — otherwise j's request can queue alongside
                     // it and the worker's drain-to-latest legitimately drops the first.
-                    let _ = parking_tx.send(request.selected_id.clone());
+                    let _ =
+                        parking_tx.send((request.selected_id.clone(), Arc::clone(cancellation)));
                     park_until_released_or_cancelled(&gate, cancellation);
                 }
                 let _ = executed_tx.send(request.query.clone());
@@ -2766,9 +2833,11 @@ mod tests {
         // the parked request must not still be queued, or drain-to-latest may drop it
         // instead of the overtaken-render discard this test pins.
         let mut turns = 0;
-        loop {
+        let first_preview = loop {
             match parking_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(selected) if selected.as_deref() == Some("claude:one") => break,
+                Ok((selected, cancellation)) if selected.as_deref() == Some("claude:one") => {
+                    break cancellation;
+                }
                 Ok(_) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     turns += 1;
@@ -2779,11 +2848,15 @@ mod tests {
                     panic!("worker died before the startup preview parked");
                 }
             }
-        }
+        };
         // j selects row 1 and queues its preview.
         harness.script(vec![key(KeyCode::Char('j'))]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.selected, 1);
+        assert!(
+            first_preview.is_cancelled(),
+            "new navigation must cancel the obsolete O(M) preview scan"
+        );
         release.send(()).unwrap();
         wait_for_executed(&executed_rx, ""); // startup search (FIFO first)
         wait_for_executed(&executed_rx, ""); // the overtaken row-0 preview
@@ -3056,9 +3129,28 @@ mod tests {
         let factory = db_backed_executor(config, EffectiveAccessScope::All, runtime);
         let error = factory().err().expect("schema drift must be refused");
         assert!(
-            format!("{error:#}").contains("schema"),
+            format!("{error:#}").contains("upgrade aise"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn worker_accepts_every_shared_readable_schema_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        db.upsert_session(&session("claude:alpha"), 0, 0).unwrap();
+        let runtime = db.execution_runtime();
+        drop(db);
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        raw.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(raw);
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        let factory = db_backed_executor(config, EffectiveAccessScope::All, runtime);
+        let (_executor, observed) = factory().expect("shared-readable schema must open");
+        assert!(matches!(observed, EffectiveAccessScope::All));
     }
 
     #[test]
@@ -3549,6 +3641,28 @@ mod tests {
             lines.push(line.trim_end().to_string());
         }
         lines.join("\n")
+    }
+
+    #[test]
+    fn wrapped_single_line_preview_can_scroll_to_its_tail() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(30, 10);
+        harness.app.preview = "x".repeat(200);
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        assert!(
+            harness.app.preview_line_count > 1,
+            "wrapped terminal rows, not logical newline count, own the scroll bound"
+        );
+        harness.app.scroll_preview(isize::MAX);
+        assert!(
+            harness.app.preview_scroll > 0,
+            "wrapped rows={}, viewport={}",
+            harness.app.preview_line_count,
+            harness.app.preview_viewport_rows
+        );
     }
 
     #[test]
