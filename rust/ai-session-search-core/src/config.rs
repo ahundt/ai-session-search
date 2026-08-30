@@ -1177,16 +1177,16 @@ impl Default for Config {
             },
             ui: UiConfig {
                 preview_lines: default_preview_lines(),
-                event_poll_interval_ms: 150,
-                list_page_step: 10,
-                preview_scroll_step: 5,
-                preview_page_step: 15,
-                provider_label_width: 9,
-                list_pane_percent: 45,
+                event_poll_interval_ms: default_event_poll_interval_ms(),
+                list_page_step: default_list_page_step(),
+                preview_scroll_step: default_preview_scroll_step(),
+                preview_page_step: default_preview_page_step(),
+                provider_label_width: default_provider_label_width(),
+                list_pane_percent: default_list_pane_percent(),
             },
             search: SearchConfig {
-                default_limit: 50,
-                prefer_current_repo: true,
+                default_limit: default_limit(),
+                prefer_current_repo: default_true(),
                 scoring: ScoringConfig::default(),
                 message_search: MessageSearchConfig::default(),
                 budgets: SearchBudgetConfig::default(),
@@ -3024,6 +3024,48 @@ mod tests {
                 "removed prerelease correction settings must fail instead of being ignored"
             );
         }
+    }
+
+    #[test]
+    fn typed_defaults_and_serde_defaults_agree_for_every_section() {
+        // Every default has two authorities: the value `Config::default()` writes, and the
+        // `default_*` function serde calls when a present section omits the key. A file that
+        // names each section and sets nothing must therefore reproduce `Config::default()`
+        // exactly. Without this, `ui.event_poll_interval_ms = 150` in one place and
+        // `default_event_poll_interval_ms() = 200` in the other would give a user with an empty
+        // `[ui]` table different pacing than a user with no config file, and no test would fail.
+        let every_section_present = "\
+[providers]
+[index]
+[ui]
+[search]
+[analytics]
+[skills]
+[capabilities]
+[performance]
+[mcp]
+[cli]
+[db]
+[release_notifications]
+";
+        let parsed: Config = toml::from_str(every_section_present)
+            .expect("a file naming every section with no keys must parse");
+        let from_file = serde_json::to_value(&parsed).unwrap();
+        let typed = serde_json::to_value(Config::default()).unwrap();
+        // Compare section by section so a drift names the one table that disagrees instead of
+        // printing the whole resolved configuration twice.
+        for (section, typed_value) in typed.as_object().expect("Config serializes as an object") {
+            assert_eq!(
+                from_file.get(section),
+                Some(typed_value),
+                "[{section}] present with no keys must resolve to the same values as no config file"
+            );
+        }
+        assert_eq!(
+            from_file.as_object().map(|table| table.len()),
+            typed.as_object().map(|table| table.len()),
+            "every serialized section must be covered by this file"
+        );
     }
 
     #[test]
