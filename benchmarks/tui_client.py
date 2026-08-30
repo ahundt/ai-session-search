@@ -22,27 +22,35 @@ from __future__ import annotations
 
 import argparse
 import codecs
-import fcntl
 import hashlib
+import importlib
 import json
 import os
-import pty
 import re
-import select
 import signal
 import sqlite3
 import struct
 import subprocess
 import tempfile
-import termios
 import threading
 import time
+from typing import Any
 
-DEFAULT_QUERIES = "SQLite 1,SQLite 15,benchmark 15,benchmark 3"
+# The screen parser and benchmark-report tests are portable; only the real PTY driver is POSIX.
+# Importing this module on Windows must therefore work and fail only when PTY execution is asked for.
+fcntl: Any = importlib.import_module("fcntl") if os.name == "posix" else None
+pty: Any = importlib.import_module("pty") if os.name == "posix" else None
+select: Any = importlib.import_module("select") if os.name == "posix" else None
+termios: Any = importlib.import_module("termios") if os.name == "posix" else None
+PTY_SUPPORTED = all(module is not None for module in (fcntl, pty, select, termios))
+
+DEFAULT_QUERIES = "mixedscope,sessiontoken001,sessiontoken015,oversized,missing-sentinel"
 DEFAULT_REPETITIONS = 7
 SETTLE_QUIET_SECONDS = 0.3
 SAMPLER_INTERVAL_SECONDS = 0.05
-KEY_INTERVAL_SECONDS = 0.06
+# Keep the next character inside nontrivial search work so the mailbox/cancellation path is
+# exercised; echo observation itself remains the synchronization point.
+KEY_INTERVAL_SECONDS = 0.005
 # Esc and q must reach crossterm as separate reads: written back-to-back they arrive as one
 # buffer and parse as Alt+q, so the mode-exit Esc never happens and q types into the query.
 ESC_SETTLE_SECONDS = 0.08
@@ -57,6 +65,9 @@ BORDER_RUN_FRACTION = 0.5
 # Fix the scoring-worker budget so ambient CPU count cannot change baseline/candidate thread,
 # CPU, or RSS measurements. This is a benchmark protocol value, not a product default.
 BENCHMARK_THREADS = 2
+# The hermetic config uses search.default_limit=50; the TUI's documented browser floor raises it
+# to 100. A contract test pins this protocol constant to Rust's TUI_MIN_BROWSER_RESULTS.
+TUI_RESULT_LIMIT = 100
 TUI_ARGS = (
     "--threads",
     str(BENCHMARK_THREADS),
@@ -71,10 +82,13 @@ CSI = re.compile(r"^\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])")
 class ScreenLayout:
     """Pane regions derived from one rendered frame; the single source for measurement regions."""
 
-    def __init__(self, query_row: int, list_rows: range, list_cols: range) -> None:
+    def __init__(
+        self, query_row: int, list_rows: range, list_cols: range, preview_cols: range
+    ) -> None:
         self.query_row = query_row
         self.list_rows = list_rows
         self.list_cols = list_cols
+        self.preview_cols = preview_cols
 
 
 class ScreenTracker:
@@ -189,13 +203,18 @@ class ScreenTracker:
             raise SystemExit(f"unexpected search-box geometry: rules at {rules[:2]}")
         query_row = rules[0] + 1
         # The split pane's top border is one row below the full-width search-box rule. Exclude
-        # that title border from the semantic digest: mode/activity text is presentation state,
-        # while these rows are the ordered result content being compared across builds.
+        # that title border from the deterministic presentation digest: mode/activity text is
+        # transient state. Cross-build semantic equality uses complete canonical session IDs.
         list_rows = range(rules[1] + 2, rules[-1])
         list_cols = range(1, divider)
-        if not list_rows or len(list_cols) < 10:
-            raise SystemExit(f"degenerate list region: rows {list_rows}, cols {list_cols}")
-        return ScreenLayout(query_row, list_rows, list_cols)
+        # Adjacent bordered panes contribute two divider cells: the list's right border at
+        # `divider` and the preview's left border immediately after it.
+        preview_cols = range(divider + 2, SCREEN_COLS - 1)
+        if not list_rows or len(list_cols) < 10 or len(preview_cols) < 10:
+            raise SystemExit(
+                f"degenerate pane region: rows {list_rows}, list {list_cols}, preview {preview_cols}"
+            )
+        return ScreenLayout(query_row, list_rows, list_cols, preview_cols)
 
     def _divider_column(self) -> int | None:
         best_column, best_count = None, 0
@@ -227,11 +246,30 @@ class ScreenTracker:
         match = re.search(r"Sessions[^\n]*· (searching|ready|stopped) ", self.full_screen())
         return match.group(1) if match is not None else None
 
+    def session_position(self) -> int:
+        match = re.search(r"Sessions[^\n]*\((\d+)/(\d+)\)", self.full_screen())
+        if match is None:
+            raise SystemExit("could not read the selected session position")
+        return int(match.group(1))
+
+    def preview_session_id(self, layout: ScreenLayout) -> str | None:
+        preview = "\n".join(
+            "".join(self.rows[row][layout.preview_cols.start : layout.preview_cols.stop]).strip()
+            for row in layout.list_rows
+        )
+        match = re.search(r"(?:^|\n)Session: (\S+)", preview)
+        return match.group(1) if match is not None else None
+
     def session_result_count(self) -> int:
         match = re.search(r"Sessions[^\n]*\(\d+/(\d+)\)", self.full_screen())
         if match is None:
             raise SystemExit("could not read the session result count from the rendered list title")
         return int(match.group(1))
+
+
+def _require_pty_support() -> None:
+    if not PTY_SUPPORTED:
+        raise SystemExit("the TUI PTY benchmark requires a POSIX host")
 
 
 def _claim_controlling_terminal() -> None:
@@ -245,6 +283,7 @@ class TuiProcess:
     """The TUI running under a pty whose master side the harness drives directly."""
 
     def __init__(self, binary: str, fixture: str) -> None:
+        _require_pty_support()
         self._sandbox = tempfile.TemporaryDirectory(prefix="aise-tui-benchmark-")
         sandbox = self._sandbox.name
         config_path = os.path.join(sandbox, "config.toml")
@@ -349,6 +388,19 @@ class TuiProcess:
         self.close()
 
 
+def _parse_cpu_time(value: str) -> float:
+    days = 0
+    clock = value
+    if "-" in value:
+        day_text, clock = value.split("-", 1)
+        days = int(day_text)
+    parts = [float(part) for part in clock.split(":")]
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return days * 86_400 + seconds
+
+
 class ResourceSampler:
     """Peak RSS / CPU / threads / process count for the aise process tree (root is the TUI)."""
 
@@ -356,6 +408,7 @@ class ResourceSampler:
         self.root_pid = root_pid
         self.peak_rss_kb: int | None = None
         self.peak_cpu_pct: float | None = None
+        self.cpu_seconds: float | None = None
         self.peak_threads: int | None = None
         self.process_count: int | None = None
         self._stop = threading.Event()
@@ -370,16 +423,18 @@ class ResourceSampler:
                 sample_rss_kb = 0
                 sample_cpu_pct = 0.0
                 sample_threads = 0
+                sample_cpu_seconds = 0.0
                 for pid in pids:
                     try:
                         line = subprocess.run(
-                            ["ps", "-o", "rss=,pcpu=", "-p", str(pid)],
+                            ["ps", "-o", "rss=,pcpu=,time=", "-p", str(pid)],
                             capture_output=True, text=True, timeout=1,
                         ).stdout.strip()
                         if line:
-                            rss_kb, cpu_pct = line.split()
+                            rss_kb, cpu_pct, cpu_time = line.split()
                             sample_rss_kb += int(rss_kb)
                             sample_cpu_pct += float(cpu_pct)
+                            sample_cpu_seconds += _parse_cpu_time(cpu_time)
                             threads = self._threads(pid)
                             if threads is not None:
                                 sample_threads += threads
@@ -394,6 +449,11 @@ class ResourceSampler:
                     sample_cpu_pct
                     if self.peak_cpu_pct is None
                     else max(self.peak_cpu_pct, sample_cpu_pct)
+                )
+                self.cpu_seconds = (
+                    sample_cpu_seconds
+                    if self.cpu_seconds is None
+                    else max(self.cpu_seconds, sample_cpu_seconds)
                 )
                 self.peak_threads = (
                     sample_threads
@@ -464,6 +524,115 @@ def drain_output(tui: TuiProcess, tracker: ScreenTracker, quiet_seconds: float) 
             stable_since = time.monotonic()
 
 
+def _canonical_result_ids(binary: str, fixture: str, query: str, limit: int) -> list[str]:
+    """Return the complete ordered service result, independent of viewport/presentation text."""
+    with tempfile.TemporaryDirectory(prefix="aise-tui-semantics-") as sandbox:
+        config_path = os.path.join(sandbox, "config.toml")
+        with open(config_path, "w", encoding="utf-8") as config_file:
+            config_file.write("")
+        child_env = {
+            key: os.environ[key]
+            for key in ("LANG", "LC_ALL", "PATH", "TMPDIR")
+            if key in os.environ
+        }
+        child_env.update(
+            {
+                "HOME": sandbox,
+                "XDG_CONFIG_HOME": os.path.join(sandbox, "xdg"),
+                "AI_SESSION_SEARCH_CONFIG": config_path,
+            }
+        )
+        completed = subprocess.run(
+            [
+                binary,
+                "--database",
+                fixture,
+                "--threads",
+                str(BENCHMARK_THREADS),
+                "--index-refresh",
+                "existing-only",
+                "search",
+                query,
+                "--limit",
+                str(limit),
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=child_env,
+        )
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, list) or any(
+        not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in payload
+    ):
+        raise SystemExit("canonical search did not return a JSON array of session IDs")
+    ids = [row["id"] for row in payload]
+    if len(ids) != len(set(ids)):
+        raise SystemExit("canonical search returned duplicate session IDs")
+    return ids
+
+
+def _validate_run_timings(runs: list[dict]) -> None:
+    for run in runs:
+        if run["mode_entry_ms"] < 0:
+            raise SystemExit(f"missing search-mode entry observation for query {run['query']}")
+        if any(value < 0 for value in run["echo_ms"]):
+            raise SystemExit(f"missing typed-character echo observation for query {run['query']}")
+        if run["results_ms"] is None:
+            raise SystemExit(f"missing final-result observation for query {run['query']}")
+
+
+def _validate_result_counts(runs: list[dict], tui_ids: dict[str, list[str]]) -> None:
+    for run in runs:
+        query = run["query"].rsplit("#", 1)[0]
+        expected_count = len(tui_ids[query])
+        if run["result_count"] != expected_count:
+            raise SystemExit(
+                f"TUI result count for {query!r} was {run['result_count']}, canonical search returned {expected_count}"
+            )
+
+
+def _stable_result_digests(
+    runs: list[dict], tui_ids: dict[str, list[str]]
+) -> tuple[dict[str, str], dict[str, str], str]:
+    presentations: dict[str, set[str]] = {}
+    for run in runs:
+        query = run["query"].rsplit("#", 1)[0]
+        presentations.setdefault(query, set()).add(run["digest"])
+    for query, digests in presentations.items():
+        if len(digests) != 1:
+            raise SystemExit(
+                f"non-deterministic final session-list presentation for query {query}: {sorted(digests)}"
+            )
+    stable_presentations = {
+        query: next(iter(digests)) for query, digests in sorted(presentations.items())
+    }
+    semantic = {
+        query: hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode()).hexdigest()
+        for query, ids in sorted(tui_ids.items())
+    }
+    aggregate = hashlib.sha256(
+        json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return semantic, stable_presentations, aggregate
+
+
+def _probe_tui_result_ids(
+    binary: str, fixture: str, query: str, startup_wait: float, timeout: float
+) -> list[str]:
+    return _measure_once(
+        binary,
+        fixture,
+        query,
+        startup_wait,
+        timeout,
+        f"{query}#semantic-probe",
+        collect_ids=True,
+    )["tui_ids"]
+
+
 def measure_latency(
     binary: str, fixture: str, queries: list[str], repetitions: int, startup_wait: float, timeout: float
 ) -> dict:
@@ -486,32 +655,39 @@ def measure_latency(
             process_count = max(process_count, run.get("process_count") or 0)
             total_output_bytes += run["output_bytes"]
     wal_growth = max(0, _wal_size(fixture) - wal_before)
-    for run in runs:
-        if any(value < 0 for value in run["echo_ms"]):
-            raise SystemExit(f"missing typed-character echo observation for query {run['query']}")
-        if run["results_ms"] is None:
-            raise SystemExit(f"missing final-result observation for query {run['query']}")
-
-    digests_by_query: dict[str, set[str]] = {}
+    _validate_run_timings(runs)
+    observed_counts: dict[str, set[int]] = {}
     for run in runs:
         query = run["query"].rsplit("#", 1)[0]
-        digests_by_query.setdefault(query, set()).add(run["digest"])
-    for query, digests in digests_by_query.items():
-        if len(digests) != 1:
-            raise SystemExit(
-                f"non-deterministic final session-list digest for query {query}: {sorted(digests)}"
-            )
-    stable_digests = {
-        query: next(iter(digests)) for query, digests in sorted(digests_by_query.items())
+        observed_counts.setdefault(query, set()).add(run["result_count"])
+    for query, counts in observed_counts.items():
+        if len(counts) != 1:
+            raise SystemExit(f"non-deterministic TUI result count for {query}: {sorted(counts)}")
+    tui_ids = {
+        query: _probe_tui_result_ids(binary, fixture, query, startup_wait, timeout)
+        for query in queries
     }
-    aggregate_digest = hashlib.sha256(
-        json.dumps(stable_digests, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    canonical_ids = {
+        query: _canonical_result_ids(binary, fixture, query, 0)[:TUI_RESULT_LIMIT]
+        for query in queries
+    }
+    for query in queries:
+        if tui_ids[query] != canonical_ids[query]:
+            raise SystemExit(
+                f"TUI ordered session IDs differ from canonical search for {query!r}: "
+                f"tui={tui_ids[query]!r}, canonical={canonical_ids[query]!r}"
+            )
+    _validate_result_counts(runs, tui_ids)
+    stable_digests, stable_presentation_digests, aggregate_digest = _stable_result_digests(
+        runs, tui_ids
+    )
+    mode_entry_samples = [run["mode_entry_ms"] for run in runs]
     echo_samples = [value for run in runs for value in run["echo_ms"]]
     results_samples = [run["results_ms"] for run in runs]
+    cpu_seconds = sum(run.get("cpu_seconds") or 0.0 for run in runs)
     fixture_workload = _fixture_workload(fixture)
     total_seconds = sum(run["wall_ms"] for run in runs) / 1000
-    typed_keys = repetitions * sum(len(query) + 1 for query in queries)
+    typed_keys = repetitions * sum(len(query) for query in queries)
     workload = {
         "query_characters": {query: len(query) for query in queries},
         "retained_sessions_max": max(run["result_count"] for run in runs),
@@ -523,6 +699,8 @@ def measure_latency(
         "queries": queries,
         "repetitions": repetitions,
         "runs": len(runs),
+        "mode_entry_ms_p50": _percentile(mode_entry_samples, 50),
+        "mode_entry_ms_p95": _percentile(mode_entry_samples, 95),
         "echo_ms_p50": _percentile(echo_samples, 50),
         "echo_ms_p95": _percentile(echo_samples, 95),
         "results_ms_p50": _percentile(results_samples, 50),
@@ -530,10 +708,12 @@ def measure_latency(
         "list_transitions_total": sum(run["transitions"] for run in runs),
         "peak_rss_kb": peak_rss_kb,
         "peak_cpu_pct": peak_cpu_pct,
+        "cpu_seconds": cpu_seconds,
         "peak_threads": peak_threads,
         "process_count": process_count,
         "output_bytes": total_output_bytes,
         "typed_keys_per_second": round(typed_keys / total_seconds) if total_seconds else None,
+        "wall_ms": round(total_seconds * 1000),
         "workload": workload,
         "completion_signal_observed": all(
             bool(run.get("completion_signal")) for run in runs
@@ -541,6 +721,7 @@ def measure_latency(
         "wal_growth_bytes": wal_growth,
         "result_digest": aggregate_digest,
         "result_digests_by_query": stable_digests,
+        "presentation_digests_by_query": stable_presentation_digests,
         "per_query": [
             {
                 "query": run["query"].rsplit("#", 1)[0],
@@ -554,7 +735,16 @@ def measure_latency(
     }
 
 
-def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, timeout: float, label: str) -> dict:
+def _measure_once(
+    binary: str,
+    fixture: str,
+    query: str,
+    startup_wait: float,
+    timeout: float,
+    label: str,
+    *,
+    collect_ids: bool = False,
+) -> dict:
     run_started = time.monotonic()
     tui = TuiProcess(binary, fixture)
     tracker = ScreenTracker()
@@ -567,15 +757,21 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
             raise SystemExit("TUI startup did not render the expected panes")
         layout = tracker.derive_layout()
         completion_signal = tracker.search_state() is not None
-        keys = ["/", *query]
         echo_ms: list[int] = []
         results_ms: int | None = None
         transitions = 0
         prefix = ""
         list_before = tracker.session_list(layout)
         output_bytes = 0
-        for key in keys:
-            prefix = "/" if key == "/" else prefix + key
+        mode_sent_at = time.monotonic()
+        tui.send(b"/")
+        mode_entry_found, added_bytes = _await_search_mode(
+            tui, tracker, mode_sent_at, timeout
+        )
+        output_bytes += added_bytes
+        mode_entry_ms = int(mode_entry_found) if mode_entry_found is not None else -1
+        for index, key in enumerate(query):
+            prefix += key
             sent_at = time.monotonic()
             tui.send(key.encode())
             echo_found, results_found, list_before, added_bytes, changed = _await_key_effects(
@@ -586,7 +782,7 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
             if changed:
                 transitions += 1
             echo_ms.append(int(echo_found) if echo_found is not None else -1)
-            if key == keys[-1]:
+            if index == len(query) - 1:
                 before_settle = list_before
                 results_found, list_before, added_bytes = _await_settled_change(
                     tui,
@@ -601,13 +797,26 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
                 output_bytes += added_bytes
                 if list_before != before_settle:
                     transitions += 1
-            if key == keys[-1] and results_found is not None:
+            if index == len(query) - 1 and results_found is not None:
                 results_ms = int(results_found)
             time.sleep(KEY_INTERVAL_SECONDS)
         digest = hashlib.sha256(tracker.session_list(layout).encode()).hexdigest()
+        tui_ids = _collect_tui_result_ids(tui, tracker, layout, timeout) if collect_ids else None
         result = _finish_run(
-            tui, timeout, label, echo_ms, results_ms, transitions, sampler, output_bytes, digest
+            tui,
+            timeout,
+            label,
+            echo_ms,
+            results_ms,
+            transitions,
+            sampler,
+            output_bytes,
+            digest,
+            search_mode=not collect_ids,
         )
+        if tui_ids is not None:
+            result["tui_ids"] = tui_ids
+        result["mode_entry_ms"] = mode_entry_ms
         result.update(
             {
                 "result_count": tracker.session_result_count(),
@@ -620,6 +829,90 @@ def _measure_once(binary: str, fixture: str, query: str, startup_wait: float, ti
     finally:
         sampler.stop()
         tui.kill()
+
+
+def _await_tui_position_id(
+    tui: TuiProcess,
+    tracker: ScreenTracker,
+    layout: ScreenLayout,
+    position: int,
+    previous: str | None,
+    allow_same: bool,
+    timeout: float,
+) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        chunk = tui.read_chunk(0.01)
+        if chunk not in (None, b""):
+            tracker.feed_bytes(chunk)
+        selected = tracker.preview_session_id(layout)
+        if (
+            tracker.session_position() == position
+            and selected is not None
+            and (selected != previous or allow_same)
+        ):
+            return selected
+    raise SystemExit(f"could not collect TUI session ID at position {position}")
+
+
+def _collect_tui_result_ids(
+    tui: TuiProcess, tracker: ScreenTracker, layout: ScreenLayout, timeout: float
+) -> list[str]:
+    count = tracker.session_result_count()
+    tui.send(b"\x1b")
+    browse_deadline = time.monotonic() + timeout
+    while time.monotonic() < browse_deadline:
+        chunk = tui.read_chunk(0.01)
+        if chunk not in (None, b""):
+            tracker.feed_bytes(chunk)
+        if "Search (press /)" in tracker.full_screen():
+            break
+    else:
+        raise SystemExit("TUI did not leave search mode before semantic traversal")
+    if count == 0:
+        return []
+    initial_position = tracker.session_position()
+    initial_preview = tracker.preview_session_id(layout)
+    tui.send(b"g")
+    ids: list[str] = []
+    for position in range(1, count + 1):
+        if position > 1:
+            tui.send(b"j")
+        previous = ids[-1] if ids else initial_preview
+        ids.append(
+            _await_tui_position_id(
+                tui,
+                tracker,
+                layout,
+                position,
+                previous,
+                position == initial_position == 1,
+                timeout,
+            )
+        )
+    if len(ids) != len(set(ids)):
+        raise SystemExit("TUI traversal returned duplicate session IDs")
+    return ids
+
+
+def _await_search_mode(
+    tui: TuiProcess, tracker: ScreenTracker, sent_at: float, timeout: float
+) -> tuple[float | None, int]:
+    observed: float | None = None
+    added_bytes = 0
+    deadline = sent_at + timeout
+    while time.monotonic() < deadline:
+        chunk = tui.read_chunk(0.01)
+        if chunk is None:
+            continue
+        if chunk == b"":
+            break
+        added_bytes += len(chunk)
+        tracker.feed_bytes(chunk)
+        if "Enter/Esc to browse" in tracker.full_screen():
+            observed = (time.monotonic() - sent_at) * 1000
+            break
+    return observed, added_bytes
 
 
 def _await_key_effects(
@@ -716,9 +1009,11 @@ def _await_settled_change(
 def _finish_run(
     tui: TuiProcess, timeout: float, label: str, echo_ms: list[int], results_ms: int | None,
     transitions: int, sampler: ResourceSampler, _measured_output_bytes: int, digest: str,
+    *, search_mode: bool = True,
 ) -> dict:
-    tui.send(b"\x1b")  # leave search mode so q is a quit, not a query character
-    time.sleep(ESC_SETTLE_SECONDS)
+    if search_mode:
+        tui.send(b"\x1b")  # leave search mode so q is a quit, not a query character
+        time.sleep(ESC_SETTLE_SECONDS)
     tui.send(b"q")
     if tui.wait_draining(timeout) is None:
         raise SystemExit(f"TUI did not exit after q (query {label})") from None
@@ -730,6 +1025,8 @@ def _finish_run(
             f"TUI run failed (query {label}): exit {tui.child.returncode}: "
             f"{stderr.decode(errors='replace')[:ERROR_EXCERPT_CHARS]}"
         )
+    # Join any in-progress sample before copying peak fields into the report.
+    sampler.stop()
     return {
         "query": label,
         "echo_ms": echo_ms,
@@ -737,6 +1034,7 @@ def _finish_run(
         "transitions": transitions,
         "peak_rss_kb": sampler.peak_rss_kb,
         "peak_cpu_pct": sampler.peak_cpu_pct,
+        "cpu_seconds": sampler.cpu_seconds,
         "peak_threads": sampler.peak_threads,
         "process_count": sampler.process_count,
         # `TuiProcess.read_chunk` appends every byte to this one authoritative ledger. The
@@ -802,15 +1100,26 @@ def _assert_terminal_restored(_tui: TuiProcess, captured: bytes) -> None:
 def run_startup_case(binary: str, fixture: str, startup_wait: float, timeout: float) -> None:
     tui = TuiProcess(binary, fixture)
     try:
-        time.sleep(startup_wait)
+        tracker = ScreenTracker()
+        required = ("Sessions", "Preview", "Session:", "CWD:")
+        startup_deadline = time.monotonic() + startup_wait + timeout
+        while time.monotonic() < startup_deadline:
+            chunk = tui.read_chunk(0.02)
+            if chunk in (None, b""):
+                continue
+            tracker.feed_bytes(chunk)
+            if all(marker in tracker.full_screen() for marker in required):
+                break
+        startup_ready = all(marker in tracker.full_screen() for marker in required)
         tui.send(b"q")
         if tui.wait_draining(timeout) is None:
             raise SystemExit("TUI did not exit after documented q key") from None
         captured = tui.drain_after_exit()
         stderr = tui.child.stderr.read() if tui.child.stderr is not None else b""
-        if tui.child.returncode != 0 or b"Sessions" not in captured or b"Preview" not in captured:
+        if tui.child.returncode != 0 or not startup_ready:
             raise SystemExit(
-                f"TUI startup failed with exit {tui.child.returncode}: {stderr.decode(errors='replace')}"
+                f"TUI startup failed with exit {tui.child.returncode}; missing final pane/preview content: "
+                f"{stderr.decode(errors='replace')}"
             )
         _assert_terminal_restored(tui, captured)
         print('{"preview":true,"sessions":true,"terminal_restored":true}')
@@ -829,8 +1138,11 @@ def main() -> int:
     parser.add_argument("--repetitions", type=int, default=DEFAULT_REPETITIONS)
     args = parser.parse_args()
     if args.measure_latency:
+        queries = [query.strip() for query in args.queries.split(",") if query.strip()]
+        if not queries:
+            raise SystemExit("--queries must contain at least one non-empty query")
         report = measure_latency(
-            args.binary, args.fixture, args.queries.split(","), args.repetitions,
+            args.binary, args.fixture, queries, args.repetitions,
             args.startup_wait, args.timeout,
         )
         print(json.dumps(report, separators=(",", ":")))

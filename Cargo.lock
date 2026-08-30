@@ -46,6 +46,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "unicode-segmentation",
+ "unicode-width",
  "ureq",
  "url",
  "windows-sys 0.61.2",

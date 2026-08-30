@@ -953,7 +953,7 @@ impl std::str::FromStr for SessionKind {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     pub provider: Option<Provider>,
     /// Which classes of session to return. `None` selects the default set

@@ -7,7 +7,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
@@ -456,7 +456,32 @@ impl UnicodeLowerNeedle {
     }
 
     pub(crate) fn contains(&self, haystack: &str) -> bool {
-        self.find_in(haystack).is_some()
+        match self.find_in_controlled(haystack, || true) {
+            ControlFlow::Continue(found) => found.is_some(),
+            ControlFlow::Break(()) => unreachable!("the unconditional matcher cannot cancel"),
+        }
+    }
+
+    /// Run the same caseless matcher with a bounded cancellation callback. `None` means the
+    /// callback stopped the scan; `Some(found)` is a completed match/no-match result.
+    pub(crate) fn contains_while(
+        &self,
+        haystack: &str,
+        keep_going: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        self.find_in_while(haystack, keep_going)
+            .map(|found| found.is_some())
+    }
+
+    pub(crate) fn find_in_while(
+        &self,
+        haystack: &str,
+        keep_going: impl FnMut() -> bool,
+    ) -> Option<Option<Range<usize>>> {
+        match self.find_in_controlled(haystack, keep_going) {
+            ControlFlow::Continue(found) => Some(found),
+            ControlFlow::Break(()) => None,
+        }
     }
 
     /// The byte range of `haystack` holding its first Unicode-caseless occurrence of the needle.
@@ -482,12 +507,31 @@ impl UnicodeLowerNeedle {
     /// change. A single ASCII fast path would recover that, at the cost of a second matcher whose
     /// agreement with this one nothing checks.
     pub(crate) fn find_in(&self, haystack: &str) -> Option<Range<usize>> {
+        match self.find_in_controlled(haystack, || true) {
+            ControlFlow::Continue(found) => found,
+            ControlFlow::Break(()) => unreachable!("the unconditional matcher cannot cancel"),
+        }
+    }
+
+    fn find_in_controlled(
+        &self,
+        haystack: &str,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> ControlFlow<(), Option<Range<usize>>> {
+        const CHECK_BYTES: usize = 64 * 1024;
         if self.pattern.is_empty() {
-            return Some(0..0);
+            return ControlFlow::Continue(Some(0..0));
         }
 
         let mut matched = 0_usize;
+        let mut next_check = 0_usize;
         for (offset, character) in haystack.char_indices() {
+            if offset >= next_check {
+                if !keep_going() {
+                    return ControlFlow::Break(());
+                }
+                next_check = offset.saturating_add(CHECK_BYTES);
+            }
             let character_end = offset + character.len_utf8();
             for (folded_index, lowered) in fold_caseless_char(character).enumerate() {
                 while matched > 0 && lowered != self.pattern[matched] {
@@ -507,12 +551,12 @@ impl UnicodeLowerNeedle {
                             offset,
                             self.pattern.len().saturating_sub(folded_index + 1),
                         );
-                        return Some(start..character_end);
+                        return ControlFlow::Continue(Some(start..character_end));
                     }
                 }
             }
         }
-        None
+        ControlFlow::Continue(None)
     }
 }
 
@@ -695,6 +739,33 @@ pub fn compact_whitespace(value: &str) -> String {
     result
 }
 
+fn compact_whitespace_while(value: &str, mut keep_going: impl FnMut() -> bool) -> Option<String> {
+    const CHECK_BYTES: usize = 64 * 1024;
+    let mut result = String::with_capacity(value.len());
+    let mut in_word = false;
+    let mut saw_word = false;
+    let mut next_check = 0;
+    for (offset, character) in value.char_indices() {
+        if offset >= next_check {
+            if !keep_going() {
+                return None;
+            }
+            next_check = offset.saturating_add(CHECK_BYTES);
+        }
+        if character.is_whitespace() {
+            in_word = false;
+        } else {
+            if !in_word && saw_word {
+                result.push(' ');
+            }
+            result.push(character);
+            in_word = true;
+            saw_word = true;
+        }
+    }
+    Some(result)
+}
+
 pub fn relative_age(value: Option<DateTime<Utc>>) -> String {
     let Some(value) = value else {
         return "-".to_string();
@@ -839,6 +910,33 @@ pub fn substantive_text(value: &str) -> bool {
     !ignored
         .iter()
         .any(|needle| normalized.eq_ignore_ascii_case(needle))
+}
+
+pub(crate) fn snippet_from_match_while(
+    value: &str,
+    query: &str,
+    max_len: usize,
+    mut keep_going: impl FnMut() -> bool,
+) -> Option<String> {
+    let compact = compact_whitespace_while(value, &mut keep_going)?;
+    if compact.is_empty() {
+        return Some("(no snippet available)".to_string());
+    }
+    let query_lower = fold_caseless(query);
+    let query_needle = UnicodeLowerNeedle::from_lowered(&query_lower);
+    if let Some(found) = query_needle.find_in_while(&compact, &mut keep_going)? {
+        return Some(window_around_match(&compact, found, max_len));
+    }
+    for token in query_lower.split_whitespace() {
+        let token_needle = UnicodeLowerNeedle::from_lowered(token);
+        if let Some(found) = token_needle.find_in_while(&compact, &mut keep_going)? {
+            return Some(window_around_match(&compact, found, max_len));
+        }
+    }
+    if !keep_going() {
+        return None;
+    }
+    Some(truncate_for_display(&compact, max_len))
 }
 
 pub fn snippet_from_match(value: &str, query: &str, max_len: usize) -> String {

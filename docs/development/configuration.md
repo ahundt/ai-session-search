@@ -256,20 +256,21 @@ pipelines can request all summary evidence with `--summary-items 0 --format json
 ## TUI display defaults
 
 `[ui]` configures the interactive terminal UI only. Four interaction keys ship now:
-`event_poll_interval_ms` (150, minimum 1) paces the idle redraw loop — it is not a keystroke
-latency, because queued input drains in one burst before the next draw; zero is rejected because
-it would return before polling any key, and intervals that do not fit the platform monotonic clock
-are rejected instead of overflowing the deadline. `list_page_step` (10) is the
-PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and `preview_page_step`
-(15) are the l/h and Ctrl-d/Ctrl-u scroll amounts; `provider_label_width` (9) is the session
-list's provider column width — the renderer clamps upward to the longest label and downward to
-the rendered pane interior, so neither a small value nor an extreme value can truncate a known
-label or request an unbounded formatting allocation — and `list_pane_percent` (45) is the body width share of the
-session-list pane, the preview pane taking the remainder. `[ui].preview_lines` (30) is the
-preview's total body budget: the normalized-message bookend sections scale proportionally to
-their weights (8/4/8/14), renormalised over the sections actually emitted and each floored at one
-line, so 34 reproduces the previous fixed layout exactly. Every example-file line equals its
-typed Rust default.
+`event_poll_interval_ms` (150, minimum 1) paces settled idle turns. Every queued key redraws
+immediately within the same loop turn, and active search/preview output is checked within 10 ms;
+zero is rejected because it would return before polling any key, and intervals that do not fit the
+platform monotonic clock are rejected instead of overflowing the deadline. `list_page_step` (10)
+is the PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and
+`preview_page_step` (15) are the l/h and Ctrl-d/Ctrl-u scroll amounts. These step values have
+minimum 1. `provider_label_width` (9, minimum 1) is the session
+list's provider column width — normal panes clamp upward to the longest label, while a pane too
+narrow to contain that label clamps to its actual interior and truncates rather than overflowing;
+`list_pane_percent` (45, range 10–90) is the body width share of the session-list pane, the preview
+pane taking the remainder. `[ui].preview_lines` (34) is the preview's total body budget: canonical-transcript
+bookends keep their historical 8/4/8/14 shares even when a role is absent, each floored at one
+line. The default therefore preserves the previous preview, including Session/CWD metadata, while
+avoiding a full Rust `String` clone and O(turns) vector. Every example-file line equals its typed
+Rust default.
 
 ## Maintainer checks
 

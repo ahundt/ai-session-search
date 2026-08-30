@@ -134,6 +134,13 @@
       "tier": "subsystem",
       "surface": "tui",
       "result_json_field": "result_digest",
+      "resource_json_fields": {
+        "wall_ms": "wall_ms",
+        "peak_rss_kib": "peak_rss_kb",
+        "peak_threads": "peak_threads",
+        "peak_processes": "process_count",
+        "cpu_seconds": "cpu_seconds"
+      },
       "argv": ["{python}", "{client_root}/tui_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--measure-latency"]
     },
     {

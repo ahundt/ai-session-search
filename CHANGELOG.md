@@ -15,9 +15,9 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Changed
 
-- The TUI preview honors `[ui].preview_lines` (default 30) as its total body budget: sections
-  scale proportionally to their weights with a one-line floor each, so the previous fixed
-  34-line layout is reproduced exactly at a budget of 34 and trimmed proportionally below it.
+- The TUI preview honors `[ui].preview_lines` (default 34) as its total body budget. The
+  historical 8/4/8/14 section weights remain fixed even when a role is absent, so the default
+  preserves the previous output and smaller explicit budgets trim each section proportionally.
 - The TUI session list title names the active ordering (recent vs ranked), and preview
   scrolling stops when the last line reaches the pane bottom instead of continuing until
   three lines remain.
@@ -30,22 +30,28 @@ compatibility baseline; tags below it do not define a compatibility contract.
 - `[ui]` keys with typed defaults: `event_poll_interval_ms` (150), `list_page_step` (10),
   `preview_scroll_step` (5), `preview_page_step` (15), `provider_label_width` (9, clamped up
   to the longest provider label), `list_pane_percent` (45) — the TUI reads each one, and
-  `config.example.toml` documents them beside their typed defaults.
+  `config.example.toml` documents them beside their typed defaults. This pre-1.0 additive public
+  struct change requires external Rust literals to use `UiConfig { preview_lines, ..Default::default() }`;
+  the compile-only downstream consumer pins that supported construction pattern.
 - The TUI gains session filter bindings: `p` cycles the provider, `f` the session class, `s`
   the time window (1/7/30 days), and `w` warnings-only. Every binding validates before the
-  search runs, appears in the status bar, and produces filters equal to the CLI's for
-  equivalent selections (`SearchFilters` now derives `PartialEq, Eq`).
+  search runs, appears with its active value in the status bar, and mutates the same canonical
+  `SearchFilters` type and validation rules used by CLI, MCP, and Python callers.
 
 ### Fixed
 
+- TUI preview metadata and canonical transcript are read in one SQLite snapshot; word-wrapped
+  scroll bounds use Ratatui's own line composer, wide/newline errors remain one display-width-bounded
+  row, and a current preview failure cannot leave another session's content beside the selection.
 - TUI worker failure renders `stopped` rather than `ready`; returning to an already-rendered
   preview invalidates errors from an overtaken preview, and new navigation cancels obsolete
   preview scans without cancelling an in-flight search. The worker accepts every schema generation
   the shared read contract declares readable and gives upgrade guidance for newer indexes.
 - TUI echo frames format only terminal-visible session rows rather than every retained result.
-  Preview bookends come from normalized message rows and retain at most four bodies instead of
-  loading the session's full joined transcript; search and preview finalization observe the same
-  typed cancellation between scoring/parsing phases.
+  Preview bookends now scan the canonical transcript used by CLI `show`, MCP `get_session`, and
+  export without cloning it or retaining every turn; this keeps provider harness notices and
+  generated mixed-content parts out of prompts, restores Session/CWD metadata, and preserves
+  transcript-only readable indexes. Search and preview scans observe typed cancellation.
 - The TUI worker retains at most one pending search and one pending preview instead of every
   cumulative pasted prefix; a newer search cancels the in-flight one without blocking input, and
   a failed search preserves the latest navigation preview. Its read-only SQLite connection now
@@ -55,14 +61,17 @@ compatibility baseline; tags below it do not define a compatibility contract.
   The list title exposes when the current generation is searching; a worker panic reports once
   without requiring another key. Worker/database resources are released before the resume prompt
   or resumed process, and terminal mode is entered only after worker startup succeeds.
-- `[ui].event_poll_interval_ms = 0` is rejected because it prevents input polling. Extreme page
-  and scroll steps saturate without reversing direction or overflowing, and provider-label width
-  is bounded by the rendered pane instead of allocating the configured width blindly.
+- Zero-valued `[ui]` preview/pacing/step/label settings and pane percentages outside 10–90 are rejected
+  instead of becoming silent no-ops or impossible geometry. Active worker
+  output is checked within 10 ms, while a settled TUI performs one configured idle wait instead
+  of waking 100 times per second. Extreme page/scroll steps saturate, and provider-label width is
+  bounded by the rendered pane instead of allocating the configured width blindly.
 - Typing in `aise tui` no longer runs the search on the input thread: each keystroke renders
   immediately, searches run on a worker thread through the same `CatalogService` seam as the
   CLI, MCP, and Python surfaces, and a superseded search is cancelled instead of running to
-  completion while a newer one waits. The previous results stay on screen until the new ones
-  arrive, and the preview resolves off the input thread, so navigation never blocks on it.
+  completion while a newer one waits. Caseless matching, snippet compaction, and transcript preview
+  copies check cancellation every 64 KiB, including one record above the 8 MiB batch target. The
+  previous results stay on screen until new ones arrive, and preview resolves off the input thread.
 - The TUI's provider labels no longer collide or misalign: Antigravity renders as ANTIGRAV
   and Gemini CLI as GEMINICLI (the old GEMINI/Gemini pair were near-identical, and AI Studio
   overflowed its fixed-width column), with the column width configurable and clamped up to
@@ -74,10 +83,15 @@ compatibility baseline; tags below it do not define a compatibility contract.
 - Typing in `aise tui` no longer risks freezing the event loop on one keystroke: queued input
   drains in one loop turn, and a database error during a keystroke shows on a dedicated error
   line instead of exiting the TUI.
-- The registered TUI latency benchmark now compares semantic ordered-list digests instead of
-  timing noise, buffers split terminal control sequences, fails closed on stopped/incomplete
-  searches, sums process-tree resource samples, and waits for current-generation readiness plus a
-  stable frame. Baseline/candidate reports therefore remain comparable when timing values differ.
+- The registered TUI latency benchmark now hashes every canonical ordered session ID and checks
+  the rendered total, rather than treating visible labels/ages as semantics. It imports on Windows
+  while failing PTY execution with a POSIX-specific message, handles repeated final characters,
+  measures `/` mode entry separately from typed echo, buffers split terminal controls, fails closed
+  on stopped/incomplete searches, sums process-tree resources, and requires current-generation
+  readiness plus a stable frame. Release samples promote the inner TUI-only wall/CPU/RSS/thread/
+  process measurements instead of timing semantic probes and helper processes. Its generated
+  workload has 128 sessions, selective/empty/full queries, offscreen traversal, and one transcript
+  above the 8 MiB scoring-batch target.
 - A tool call that cannot arm its own cancellation now says so. It previously ran uncancellable
   while the client believed its cancellation still applied.
 - A `query_session_index` call whose read-only restriction fails to install is refused rather than

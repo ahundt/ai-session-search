@@ -410,8 +410,8 @@ pub struct IndexConfig {
 pub struct UiConfig {
     #[serde(default = "default_preview_lines")]
     pub preview_lines: usize,
-    /// Idle wake interval for the TUI event loop. Not a keystroke latency: input drains in a
-    /// burst loop, so this only paces redraws while the user is idle.
+    /// Idle wake interval for the TUI event loop. Keys redraw immediately, and active worker
+    /// output uses a shorter bounded slice, so this paces only settled idle turns.
     #[serde(default = "default_event_poll_interval_ms")]
     pub event_poll_interval_ms: u64,
     /// Rows the selection moves for PageDown/PageUp in the session list.
@@ -423,8 +423,8 @@ pub struct UiConfig {
     /// Lines the preview scrolls for Ctrl-d/Ctrl-u.
     #[serde(default = "default_preview_page_step")]
     pub preview_page_step: usize,
-    /// Width of the provider label column in the session list. The renderer clamps upward to
-    /// the longest label, so a smaller value can never truncate one.
+    /// Width of the provider label column in the session list. Normal panes clamp upward to the
+    /// longest label; exceptionally narrow panes clamp to their interior and may truncate it.
     #[serde(default = "default_provider_label_width")]
     pub provider_label_width: usize,
     /// Percent of the body width given to the session-list pane; the preview pane gets the
@@ -951,7 +951,9 @@ fn default_limit() -> usize {
 }
 
 fn default_preview_lines() -> usize {
-    30
+    // Main's established four section caps are 8 + 4 + 8 + 14 body lines. Keeping their sum as
+    // the default makes the now-live setting preserve the pre-worker preview byte-for-byte.
+    34
 }
 
 fn default_event_poll_interval_ms() -> u64 {
@@ -1174,7 +1176,7 @@ impl Default for Config {
                 auto_reindex_interval_ms: default_auto_reindex_interval_ms(),
             },
             ui: UiConfig {
-                preview_lines: 30,
+                preview_lines: default_preview_lines(),
                 event_poll_interval_ms: 150,
                 list_page_step: 10,
                 preview_scroll_step: 5,
@@ -1698,8 +1700,26 @@ impl Config {
         if self.search.default_limit == 0 {
             bail!("search.default_limit must be greater than zero; {FIX}");
         }
+        if self.ui.preview_lines == 0 {
+            bail!("ui.preview_lines must be greater than zero; {FIX}");
+        }
         if self.ui.event_poll_interval_ms == 0 {
             bail!("ui.event_poll_interval_ms must be greater than zero; {FIX}");
+        }
+        if self.ui.list_page_step == 0 {
+            bail!("ui.list_page_step must be greater than zero; {FIX}");
+        }
+        if self.ui.preview_scroll_step == 0 {
+            bail!("ui.preview_scroll_step must be greater than zero; {FIX}");
+        }
+        if self.ui.preview_page_step == 0 {
+            bail!("ui.preview_page_step must be greater than zero; {FIX}");
+        }
+        if self.ui.provider_label_width == 0 {
+            bail!("ui.provider_label_width must be greater than zero; {FIX}");
+        }
+        if !(10..=90).contains(&self.ui.list_pane_percent) {
+            bail!("ui.list_pane_percent must be between 10 and 90 inclusive; {FIX}");
         }
         if Instant::now()
             .checked_add(Duration::from_millis(self.ui.event_poll_interval_ms))
@@ -2244,8 +2264,32 @@ mod tests {
                 "search.default_limit must be greater than zero",
             ),
             (
+                |c| c.ui.preview_lines = 0,
+                "ui.preview_lines must be greater than zero",
+            ),
+            (
                 |c| c.ui.event_poll_interval_ms = 0,
                 "ui.event_poll_interval_ms must be greater than zero",
+            ),
+            (
+                |c| c.ui.list_page_step = 0,
+                "ui.list_page_step must be greater than zero",
+            ),
+            (
+                |c| c.ui.preview_scroll_step = 0,
+                "ui.preview_scroll_step must be greater than zero",
+            ),
+            (
+                |c| c.ui.preview_page_step = 0,
+                "ui.preview_page_step must be greater than zero",
+            ),
+            (
+                |c| c.ui.provider_label_width = 0,
+                "ui.provider_label_width must be greater than zero",
+            ),
+            (
+                |c| c.ui.list_pane_percent = 100,
+                "ui.list_pane_percent must be between 10 and 90 inclusive",
             ),
             (
                 |c| c.mcp.search_messages_limit = 0,

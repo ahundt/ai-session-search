@@ -437,26 +437,26 @@ enum SessionInclude {
 }
 
 #[derive(Debug, Args, Clone)]
-pub(crate) struct SessionFilterArgs {
+struct SessionFilterArgs {
     /// Restrict to one indexed session source; omit to include all nine.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
-    pub(crate) provider: Option<Provider>,
+    provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
     /// (a component boundary: `project` matches `project/src`, never `project-other`).
     /// Omit to search every allowed root.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
-    pub(crate) path: Option<String>,
+    path: Option<String>,
     /// Exclude sessions whose cwd, repo root, or transcript path is this directory or a
     /// descendant of it (component boundary). Repeat to exclude multiple noisy worktrees or
     /// transcript roots. Omit to exclude none.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-path")]
-    pub(crate) exclude_paths: Vec<String>,
+    exclude_paths: Vec<String>,
     /// Exclude one exact session id. Repeat to exclude multiple sessions. Omit to exclude none.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-session")]
-    pub(crate) exclude_sessions: Vec<String>,
+    exclude_sessions: Vec<String>,
     /// Restrict to one session class; one-value alias for --session-kinds. Omit for both classes.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "session-kind", value_enum)]
-    pub(crate) session_kind: Option<SessionKind>,
+    session_kind: Option<SessionKind>,
     /// Session classes to return: user for sessions you started, subagent for runs those
     /// sessions spawned. Omit for both. With --parent-session, use subagent or omit this option;
     /// user cannot match a spawned run.
@@ -468,16 +468,16 @@ pub(crate) struct SessionFilterArgs {
         value_delimiter = ',',
         conflicts_with = "session_kind"
     )]
-    pub(crate) session_kinds: Vec<SessionKind>,
+    session_kinds: Vec<SessionKind>,
     /// Restrict to runs spawned by this exact session id. Omit to include root and spawned runs
     /// alike. If a session class is also supplied, it must include subagent.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "parent-session")]
-    pub(crate) parent_session: Option<String>,
+    parent_session: Option<String>,
     #[command(flatten)]
-    pub(crate) dates: DateRange,
+    dates: DateRange,
     /// Show only sessions that produced a parse warning.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
-    pub(crate) warnings_only: bool,
+    warnings_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -1339,7 +1339,18 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Doctor(args) => print_doctor(&config, db, args.format, args.explain_unindexed)?,
         Commands::Tui => {
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
-            tui::run(&config, db)?
+            let selected = tui::select_session(&config, db)?;
+            // Release the CLI-owned SQLite connection and Rayon pool before an interactive prompt
+            // or a resumed process that may run for hours.
+            drop(app);
+            if let Some(session) = selected {
+                tui::execute_resume(&session)?;
+            }
+            crate::update::notify_if_new_stable_release_available_after_cli_output(
+                &config,
+                skip_release_notification,
+            );
+            return Ok(());
         }
         Commands::Mcp(_) => unreachable!("MCP serving returns before opening the DB"),
         Commands::Integrations(_) => {
@@ -1892,7 +1903,7 @@ fn export_filters_are_empty(filters: &SearchFilters) -> bool {
         && !filters.warnings_only
 }
 
-pub(crate) fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
+fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
     let (since, until) = args.dates.resolve_now()?;
     let filters = SearchFilters {
         provider: args.provider,

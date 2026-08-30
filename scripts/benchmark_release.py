@@ -24,6 +24,9 @@ from typing import Any, ClassVar, TypedDict
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "benchmarks" / "release_manifest.json"
 TIER_ORDER = {"smoke": 0, "subsystem": 1, "release": 2}
+# One canonical transcript exceeds the session-search batch-byte target, forcing cancellation and
+# bounded preview parsing through the oversized-record path without changing visible output size.
+OVERSIZED_TRANSCRIPT_BYTES = 8 * 1024 * 1024 + 1
 
 
 class Build(TypedDict):
@@ -211,6 +214,13 @@ def generate_fixture(
                 created_at = (
                     (datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")) - datetime.timedelta(days=35)).isoformat().replace("+00:00", "Z")
                 )
+            scope_marker = "mixedscop" if session_number == sessions - 1 else "mixedscope"
+            title_markers = [scope_marker] if session_number % 2 == 0 or session_number == sessions - 1 else []
+            if session_number == 0:
+                title_markers.append("oversize")
+            if session_number == 1:
+                title_markers.append("missing-sentine")
+            title = " ".join([f"SQLite benchmark {session_number}", *title_markers])
             connection.execute(
                 "insert into sessions (id, provider, provider_session_id, title, cwd, repo_root, "
                 "created_at, updated_at, last_message_at, preview_text, source_path, message_count, "
@@ -219,7 +229,7 @@ def generate_fixture(
                 (
                     session_id,
                     session_id.removeprefix("codex:"),
-                    f"SQLite benchmark {session_number}",
+                    title,
                     created_at,
                     timestamp,
                     timestamp,
@@ -228,17 +238,32 @@ def generate_fixture(
                     messages_per_session,
                 ),
             )
+            transcript_lines: list[str] = []
             for sequence in range(messages_per_session):
                 role = ("user", "assistant", "tool")[sequence % 3]
                 kind = "tool_call" if role == "tool" else "conversation"
                 tool_name = "exec_command" if role == "tool" else None
-                content = f"database sqlite migration lock benchmark session {session_number} sequence {sequence} deterministic payload"
+                content = (
+                    f"database sqlite migration lock benchmark {scope_marker} sessiontoken{session_number:03} "
+                    f"sequence {sequence} deterministic payload"
+                )
                 if role == "tool":
                     content = json.dumps({"tool_name": tool_name, "args": {"cmd": content}})
                 connection.execute(
                     "insert into messages (session_id, provider, seq, role, ts, tool_name, kind, content) values (?, 'codex', ?, ?, ?, ?, ?, ?)",
                     (session_id, sequence, role, timestamp, tool_name, kind, content),
                 )
+                if role in {"user", "assistant"}:
+                    transcript_lines.append(f"[{timestamp}] {role}\n{content}")
+            if session_number == sessions - 1 and transcript_lines:
+                filler_line = "oversized cancellation sentinel filler\n"
+                repeats = OVERSIZED_TRANSCRIPT_BYTES // len(filler_line) + 1
+                filler = (filler_line * repeats)[:OVERSIZED_TRANSCRIPT_BYTES]
+                transcript_lines[0] += f"\n{filler}"
+            connection.execute(
+                "insert into transcripts (session_id, transcript_text) values (?, ?)",
+                (session_id, "\n\n".join(transcript_lines)),
+            )
             connection.execute(
                 "insert into file_edits (session_id, provider, seq, ts, tool, file_path, file_name, new_content) values (?, 'codex', 31, ?, 'Edit', ?, ?, ?)",
                 (session_id, timestamp, f"src/file_{session_number:02d}.rs", f"file_{session_number:02d}.rs", f"// deterministic edit {session_number}\n"),
@@ -392,12 +417,34 @@ def process_tree_resources(root_pid: int) -> tuple[int, int, float, int]:
     return ps_process_tree_resources(root_pid)
 
 
+def extract_resource_overrides(
+    decoded_result: object, resource_json_fields: dict[str, str] | None
+) -> dict[str, int | float]:
+    if not resource_json_fields:
+        return {}
+    if not isinstance(decoded_result, dict):
+        raise ValueError("benchmark resource output must be a JSON object")
+    allowed = {"wall_ms", "peak_rss_kib", "peak_threads", "peak_processes", "cpu_seconds"}
+    overrides: dict[str, int | float] = {}
+    for sample_field, report_field in resource_json_fields.items():
+        if sample_field not in allowed:
+            raise ValueError(f"unsupported benchmark resource field {sample_field!r}")
+        value = decoded_result.get(report_field)
+        if not isinstance(value, (int, float)):
+            raise ValueError(
+                f"benchmark output field {report_field!r} must be numeric for {sample_field!r}"
+            )
+        overrides[sample_field] = value
+    return overrides
+
+
 def sample_process(
     argv: list[str],
     normalizations: dict[bytes, bytes] | None = None,
     *,
     extract_session_ids: bool = False,
     result_json_field: str | None = None,
+    resource_json_fields: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter_ns()
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -405,12 +452,14 @@ def sample_process(
     peak_threads = 0
     peak_processes = 0
     cpu_seconds = 0.0
+    previous_tree_cpu: float | None = None
     while child.poll() is None:
         rss_kib, threads, cpu, processes = process_tree_resources(child.pid)
         peak_rss_kib = max(peak_rss_kib, rss_kib)
         peak_threads = max(peak_threads, threads)
         peak_processes = max(peak_processes, processes)
-        cpu_seconds = max(cpu_seconds, cpu)
+        cpu_seconds += cpu if previous_tree_cpu is None else max(0.0, cpu - previous_tree_cpu)
+        previous_tree_cpu = cpu
         # libproc is an in-process syscall wrapper on macOS; sample continuously so sub-10 ms CLI
         # calls cannot finish between a fixed polling interval and silently under-report peak RSS.
         if sys.platform != "darwin":
@@ -423,13 +472,18 @@ def sample_process(
         normalized_stderr = normalized_stderr.replace(source, replacement)
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
     semantic_result_sha256 = None
-    if result_json_field is not None and child.returncode == 0:
+    resource_overrides: dict[str, int | float] = {}
+    decoded_result = None
+    if (result_json_field is not None or resource_json_fields) and child.returncode == 0:
         decoded_result = json.loads(normalized_stdout)
+    if result_json_field is not None and child.returncode == 0:
         if not isinstance(decoded_result, dict) or result_json_field not in decoded_result:
             raise ValueError(
                 f"benchmark output must be a JSON object containing {result_json_field!r}"
             )
         semantic_result_sha256 = str(decoded_result[result_json_field])
+    if resource_json_fields and child.returncode == 0:
+        resource_overrides = extract_resource_overrides(decoded_result, resource_json_fields)
     session_ids = None
     if extract_session_ids and child.returncode == 0:
         decoded = json.loads(normalized_stdout)
@@ -443,6 +497,7 @@ def sample_process(
         "peak_threads": peak_threads,
         "peak_processes": peak_processes,
         "cpu_seconds": cpu_seconds,
+        **resource_overrides,
         "stdout_bytes": len(stdout),
         "stderr_bytes": len(stderr),
         "result_sha256": hashlib.sha256(normalized_stdout).hexdigest(),
@@ -533,7 +588,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Permit a local DB for smoke/subsystem profiling; artifacts are private and never release evidence",
     )
-    parser.add_argument("--fixture-sessions", type=int, default=16)
+    parser.add_argument("--fixture-sessions", type=int, default=128)
     parser.add_argument("--fixture-messages", type=int, default=32)
     parser.add_argument("--fixture-scale", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--artifact-dir", required=True)
@@ -658,6 +713,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                         path_normalizations,
                         extract_session_ids=(case.get("expected_relation") == "intentional_change_with_oracle"),
                         result_json_field=case.get("result_json_field"),
+                        resource_json_fields=case.get("resource_json_fields"),
                     )
                     after_fixture_state = sqlite_file_state(sample_fixture)
                     durable_before = durable_sqlite_state(before_fixture_state)

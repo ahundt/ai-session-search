@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 
 use chrono::Utc;
 use clap::ValueEnum;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -17,6 +18,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -28,10 +32,11 @@ use ratatui::{
 
 use crate::config::Config;
 use crate::db::{
-    ConversationBookends, Db, QueryCancellation, QueryCancelled, MIN_READABLE_SCHEMA_VERSION,
-    SCHEMA_VERSION,
+    Db, QueryCancellation, QueryCancelled, MIN_READABLE_SCHEMA_VERSION, SCHEMA_VERSION,
 };
-use crate::models::{Provider, Role, SearchFilters, SessionKind, SessionRecord};
+#[cfg(test)]
+use crate::models::Role;
+use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
 use crate::runtime::ExecutionRuntime;
 use crate::search_scope::EffectiveAccessScope;
 use crate::service::CatalogService;
@@ -85,6 +90,10 @@ const MIN_BODY_ROWS: u16 = 10;
 /// Status/help bar height, shared by both modes.
 const STATUS_BAR_ROWS: u16 = 1;
 
+/// Maximum delay before the UI observes current worker output. Idle turns use the configured
+/// event interval directly; the 10 ms latency slice is paid only while search/preview work is live.
+const ACTIVE_WORKER_POLL_SLICE: Duration = Duration::from_millis(10);
+
 /// Error line height when a keystroke error is being shown. It takes its row from the body,
 /// never from the help bar, so REQ047's recovery guidance keeps its line.
 const ERROR_LINE_ROWS: u16 = 1;
@@ -124,13 +133,22 @@ fn longest_provider_label() -> usize {
         .unwrap_or(0)
 }
 
-/// Middle-elide `text` to `width` columns, keeping the tail intact: an anyhow chain ends
-/// with its recovery guidance, and REQ047 forbids losing it to a clipped line. Char-count
-/// approximation — the TUI's own strings are ASCII with one │ separator.
+/// Middle-elide `text` to terminal columns, keeping the tail intact: an anyhow chain ends with
+/// recovery guidance, and REQ047 forbids losing it to clipping. Newlines are flattened because
+/// the destination is exactly one row; grapheme display width handles CJK and emoji correctly.
 fn elide_middle(text: &str, width: usize) -> String {
-    let total = text.chars().count();
-    if total <= width {
-        return text.to_string();
+    let sanitized = text
+        .chars()
+        .map(|character| {
+            if matches!(character, '\r' | '\n') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if UnicodeWidthStr::width(sanitized.as_str()) <= width {
+        return sanitized;
     }
     if width == 0 {
         return String::new();
@@ -138,11 +156,30 @@ fn elide_middle(text: &str, width: usize) -> String {
     if width == 1 {
         return "…".to_string();
     }
-    let head = width.saturating_sub(2) / 2;
-    let tail = width - head - 1;
-    let head_chars: String = text.chars().take(head).collect();
-    let tail_chars: String = text.chars().skip(total - tail).collect();
-    format!("{head_chars}…{tail_chars}")
+    let head_budget = width.saturating_sub(1) / 2;
+    let tail_budget = width - head_budget - 1;
+    let mut head = String::new();
+    let mut used = 0;
+    for grapheme in sanitized.graphemes(true) {
+        let columns = UnicodeWidthStr::width(grapheme);
+        if used + columns > head_budget {
+            break;
+        }
+        head.push_str(grapheme);
+        used += columns;
+    }
+    let mut tail_graphemes = Vec::new();
+    used = 0;
+    for grapheme in sanitized.graphemes(true).rev() {
+        let columns = UnicodeWidthStr::width(grapheme);
+        if used + columns > tail_budget {
+            break;
+        }
+        tail_graphemes.push(grapheme);
+        used += columns;
+    }
+    let tail = tail_graphemes.into_iter().rev().collect::<String>();
+    format!("{head}…{tail}")
 }
 
 /// The crossterm event API is a set of free functions over a process-global source, so it
@@ -202,7 +239,9 @@ impl Drop for TerminalGuard {
 /// This TUI does not expose message-field exact/regex/fuzzy modes. Use `aise messages search` or
 /// MCP `search_messages` for content, canonical tool-name, and tool-argument search; keeping that
 /// boundary explicit avoids a second interactive message-search contract.
-pub fn run(config: &Config, db: &Db) -> Result<()> {
+/// Run only the terminal selection lifecycle so the CLI can drop its owning SessionSearch
+/// (SQLite connections and Rayon runtime) before prompting or starting a resumed process.
+pub(crate) fn select_session(config: &Config, db: &Db) -> Result<Option<SessionRecord>> {
     // Open and validate the worker before entering raw/alternate-screen mode: a slow or failed
     // startup must leave the user's ordinary terminal visible.
     let (worker, _observed_scope) = spawn_search_worker(db_backed_executor(
@@ -210,11 +249,11 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
         db.access_scope().clone(),
         db.execution_runtime(),
     ))?;
-    let mut app = AppState::new(config, worker)?;
+    let mut app = AppState::new(config.clone(), worker)?;
 
     // `app` is declared before the guard, so panic unwinding restores the terminal before
-    // SearchWorker::drop can wait for cancellation. The explicit normal-path drops preserve the
-    // same order and release the Db/runtime before any resume prompt or child process.
+    // SearchWorker::drop can wait for cancellation. The explicit normal-path drop preserves that
+    // order before returning a selection to the caller.
     let terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -224,39 +263,41 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
     drop(app);
 
     match action? {
-        AppAction::Quit => Ok(()),
-        AppAction::Resume(session) => {
-            let (command, cwd) = resume_plan(&session)?;
-            println!(
-                "POSIX shell resume command: {}",
-                render_posix_shell_command(&command)?
-            );
-            println!("{}", crate::util::RESUME_COMMAND_POLICY_NOTE);
-            if let Some(cwd) = &cwd {
-                println!("cwd: {cwd}");
-            }
-            if !prompt_confirm("Execute resume command?")? {
-                println!("resume cancelled");
-                return Ok(());
-            }
-            let mut process = std::process::Command::new(&command[0]);
-            process.args(&command[1..]);
-            if let Some(cwd) = cwd {
-                process.current_dir(cwd);
-            }
-            let status = process.status()?;
-            if !status.success() {
-                anyhow::bail!("resume command failed with status {status}");
-            }
-            Ok(())
-        }
+        AppAction::Quit => Ok(None),
+        AppAction::Resume(session) => Ok(Some(*session)),
     }
+}
+
+pub(crate) fn execute_resume(session: &SessionRecord) -> Result<()> {
+    let (command, cwd) = resume_plan(session)?;
+    println!(
+        "POSIX shell resume command: {}",
+        render_posix_shell_command(&command)?
+    );
+    println!("{}", crate::util::RESUME_COMMAND_POLICY_NOTE);
+    if let Some(cwd) = &cwd {
+        println!("cwd: {cwd}");
+    }
+    if !prompt_confirm("Execute resume command?")? {
+        println!("resume cancelled");
+        return Ok(());
+    }
+    let mut process = std::process::Command::new(&command[0]);
+    process.args(&command[1..]);
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    let status = process.status()?;
+    if !status.success() {
+        anyhow::bail!("resume command failed with status {status}");
+    }
+    Ok(())
 }
 
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     events: &mut dyn EventSource,
-    app: &mut AppState<'_>,
+    app: &mut AppState,
 ) -> Result<AppAction>
 where
     B::Error: Send + Sync + 'static,
@@ -279,7 +320,7 @@ where
 fn step<B: Backend>(
     terminal: &mut Terminal<B>,
     events: &mut dyn EventSource,
-    app: &mut AppState<'_>,
+    app: &mut AppState,
 ) -> Result<Option<AppAction>>
 where
     B::Error: Send + Sync + 'static,
@@ -291,8 +332,9 @@ where
     // must render immediately — not after the interval expires — and a worker response
     // arriving mid-wait must be applied the same way; the first post-fix measurement pinned
     // results p50 at the 150 ms idle interval because nothing drained until the next step.
-    // Slices are capped at 10 ms so pickup latency stays far below the configured pacing,
-    // and each handled key restarts the idle window, preserving burst draining.
+    // While current worker work is live, slices are capped at 10 ms so pickup latency stays far
+    // below configured pacing. Fully idle turns perform one configured wait rather than waking
+    // 100 times/second; each handled key restarts the idle window.
     let mut idle_deadline = std::time::Instant::now()
         .checked_add(Duration::from_millis(app.config.ui.event_poll_interval_ms))
         .ok_or_else(|| anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock"))?;
@@ -301,11 +343,23 @@ where
         if now >= idle_deadline {
             return Ok(None);
         }
-        let slice = idle_deadline
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(10));
+        let remaining = idle_deadline.saturating_duration_since(now);
+        let slice = if app.searching || app.preview_loading || app.worker.has_work() {
+            remaining.min(ACTIVE_WORKER_POLL_SLICE)
+        } else {
+            remaining
+        };
         if events.poll(slice)? {
-            let Event::Key(key) = events.read()? else {
+            let event = events.read()?;
+            let Event::Key(key) = event else {
+                if matches!(event, Event::Resize(_, _)) {
+                    terminal.draw(|frame| app.render(frame))?;
+                    idle_deadline = std::time::Instant::now()
+                        .checked_add(Duration::from_millis(app.config.ui.event_poll_interval_ms))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock")
+                        })?;
+                }
                 continue;
             };
             if key.kind != KeyEventKind::Press {
@@ -385,7 +439,7 @@ const NO_SESSIONS_PREVIEW: &str = "No sessions matched the current query.";
 /// on the UI thread against the new result set, so the worker does not know which row will end
 /// up selected and cannot pre-compute the right preview for it. The UI applies the results,
 /// then issues a `PreviewOnly` for whatever it actually selected — one extra round trip, off
-/// the UI thread, and it keeps up to `D_max` bytes of transcript out of the search response
+/// the UI thread, and it keeps preview scan/output work out of the search response
 /// (C28). The originating query travels back so a superseded response is dropped without a
 /// sequence counter; `previewed_id` says which session the preview is *for*, so a preview
 /// overtaken by newer navigation is discarded rather than rendered beside the wrong row.
@@ -498,6 +552,43 @@ impl WorkerMailbox {
         Ok(())
     }
 
+    fn cancel_kind(&self, target: RequestKind) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match target {
+            RequestKind::Search => state.search.take(),
+            RequestKind::PreviewOnly => state.preview.take(),
+        };
+        if state
+            .in_flight
+            .as_ref()
+            .is_some_and(|(kind, _)| *kind == target)
+        {
+            if let Some((_, cancellation)) = state.in_flight.take() {
+                cancellation.cancel();
+            }
+        }
+    }
+
+    fn cancel_preview(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.preview.take();
+        if state
+            .in_flight
+            .as_ref()
+            .is_some_and(|(kind, _)| *kind == RequestKind::PreviewOnly)
+        {
+            if let Some((_, cancellation)) = state.in_flight.take() {
+                cancellation.cancel();
+            }
+        }
+    }
+
     fn next(&self) -> Option<(WorkerRequest, Arc<QueryCancellation>)> {
         let mut state = self
             .state
@@ -552,6 +643,14 @@ impl WorkerMailbox {
         self.wake.notify_all();
     }
 
+    fn has_work(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.search.is_some() || state.preview.is_some() || state.in_flight.is_some()
+    }
+
     #[cfg(test)]
     fn pending_counts(&self) -> (usize, usize) {
         let state = self
@@ -577,12 +676,29 @@ impl Drop for CloseMailboxOnExit {
 struct SearchWorker {
     mailbox: Arc<WorkerMailbox>,
     responses: mpsc::Receiver<WorkerOutcome>,
+    pending_outcomes: Arc<AtomicUsize>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl SearchWorker {
     fn send(&self, request: WorkerRequest) -> std::result::Result<(), String> {
         self.mailbox.send(request)
+    }
+
+    fn cancel_preview(&self) {
+        self.mailbox.cancel_preview();
+    }
+
+    fn cancel_search(&self) {
+        self.mailbox.cancel_kind(RequestKind::Search);
+    }
+
+    fn has_work(&self) -> bool {
+        self.pending_outcomes.load(Ordering::Acquire) > 0 || self.mailbox.has_work()
+    }
+
+    fn acknowledge_outcome(&self) {
+        self.pending_outcomes.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -603,6 +719,8 @@ fn spawn_search_worker(
     let (ready_tx, ready_rx) =
         mpsc::sync_channel::<std::result::Result<EffectiveAccessScope, String>>(1);
     let (response_tx, response_rx) = mpsc::channel::<WorkerOutcome>();
+    let pending_outcomes = Arc::new(AtomicUsize::new(0));
+    let worker_pending_outcomes = Arc::clone(&pending_outcomes);
     let mailbox = Arc::new(WorkerMailbox::new());
     let worker_mailbox = Arc::clone(&mailbox);
     let handle = thread::Builder::new()
@@ -622,19 +740,29 @@ fn spawn_search_worker(
             while let Some((request, cancellation)) = worker_mailbox.next() {
                 let result = execute(&request, &cancellation);
                 let search_succeeded = request.kind == RequestKind::Search && result.is_ok();
+                let publishable = !cancellation.is_cancelled()
+                    && !matches!(&result, Err(error) if is_expected_interruption(error));
+                // Publish pending state before clearing mailbox in-flight state so the UI never
+                // mistakes the handoff gap for a fully idle worker.
+                if publishable {
+                    worker_pending_outcomes.fetch_add(1, Ordering::Release);
+                }
                 worker_mailbox.finish(&cancellation, search_succeeded);
-                if cancellation.is_cancelled() {
+                if !publishable || cancellation.is_cancelled() {
+                    if publishable {
+                        worker_pending_outcomes.fetch_sub(1, Ordering::AcqRel);
+                    }
                     continue;
                 }
-                match result {
-                    Err(error) if is_expected_interruption(&error) => {}
-                    result => {
-                        let _ = response_tx.send(WorkerOutcome {
-                            kind: request.kind,
-                            generation: request.generation,
-                            result,
-                        });
-                    }
+                if response_tx
+                    .send(WorkerOutcome {
+                        kind: request.kind,
+                        generation: request.generation,
+                        result,
+                    })
+                    .is_err()
+                {
+                    worker_pending_outcomes.fetch_sub(1, Ordering::AcqRel);
                 }
             }
         })?;
@@ -646,6 +774,7 @@ fn spawn_search_worker(
         SearchWorker {
             mailbox,
             responses: response_rx,
+            pending_outcomes,
             handle: Some(handle),
         },
         observed,
@@ -670,13 +799,16 @@ fn is_expected_interruption(error: &anyhow::Error) -> bool {
 /// message-search worker's recipe (read-only unconditionally, access scope set explicitly,
 /// schema version ensured, progress reporter deliberately unset so nothing writes over the
 /// alternate screen) — and routes search/list through `CatalogService` (D1), the same seam
-/// the CLI, MCP, and Python use. Preview bookends use normalized message rows directly because
-/// they are presentation-local and must not materialize one session's joined transcript.
+/// the CLI, MCP, and Python use. Preview bookends use the canonical transcript projection shared
+/// by CLI, MCP, Python/export, and session search; normalized message rows are not substituted
+/// because they can contain harness notices or
+/// generated mixed-content parts intentionally excluded from that projection.
 ///
-/// Complexity (REQ010): one connection (≤64 MiB page cache, 256 MiB virtual mmap window) sharing
-/// the caller's `config.resolve_threads()` Rayon pool. Search/list delegate to their documented
-/// bounds. Preview scans `O(M)` lightweight `(seq, role)` entries and retains at most four bodies
-/// `O(D_4)`, instead of `O(D_session + M)` transcript-plus-turn-vector memory.
+/// Complexity (REQ010): one worker connection (≤64 MiB page-cache ceiling, 256 MiB virtual mmap
+/// window) in addition to the caller's idle connection, sharing one `config.resolve_threads()`
+/// Rayon pool process-wide. Search/list delegate to their documented
+/// bounds. Preview scans canonical transcript bytes once and retains only four borrowed bookend
+/// spans plus rendered output, instead of cloning the transcript and collecting every turn.
 fn db_backed_executor(
     config: Config,
     access: EffectiveAccessScope,
@@ -739,12 +871,24 @@ fn db_backed_executor(
                                 .collect(),
                         )),
                         RequestKind::PreviewOnly => {
-                            // Presentation-local bounded bookends: no full transcript allocation.
                             let text = match request.selected_id.as_deref() {
-                                Some(id) => Some(build_bookend_summary(
-                                    &db.conversation_bookends(id, cancellation)?,
-                                    preview_budget,
-                                )),
+                                Some(id) => Some(db.inspect_session_transcript(
+                                    id,
+                                    cancellation,
+                                    |session, transcript| {
+                                        let summary = build_transcript_summary_cancellable(
+                                            transcript,
+                                            preview_budget,
+                                            cancellation,
+                                        )?;
+                                        Ok(format!(
+                                            "Session: {}\nCWD: {}\n\n{}",
+                                            session.id,
+                                            session.cwd.as_deref().unwrap_or("-"),
+                                            summary
+                                        ))
+                                    },
+                                )?),
                                 None => None,
                             };
                             Ok(WorkerResponse::preview(request, text))
@@ -757,8 +901,8 @@ fn db_backed_executor(
     })
 }
 
-struct AppState<'a> {
-    config: &'a Config,
+struct AppState {
+    config: Config,
     /// The session filters the browser runs with. The state IS a `SearchFilters` value: no
     /// parallel filter representation exists (R8/§5.5d).
     filters: SearchFilters,
@@ -772,13 +916,14 @@ struct AppState<'a> {
     /// True from request submission until the matching search success/error is applied. Rendered
     /// in the list title so the real-terminal benchmark can observe final-generation completion.
     searching: bool,
+    preview_loading: bool,
     selected: usize,
     results: Vec<SessionRecord>,
     preview: String,
     preview_scroll: u16,
     preview_line_count: usize,
-    /// The session whose preview is currently rendered: the skip guard for re-reading up to
-    /// `D_max` bytes per keystroke, and the match check that discards an overtaken preview.
+    /// The session whose preview is currently rendered: the skip guard for rescanning the
+    /// canonical transcript per keystroke, and the match check that discards overtaken output.
     previewed_id: Option<String>,
     /// The preview pane's interior height, recorded by `render`, so scroll clamping bounds by
     /// viewport, not just content length (D11). Zero until the first draw; the clamp's slack
@@ -787,13 +932,16 @@ struct AppState<'a> {
     /// Last error from a keystroke-triggered operation, shown on its own line. A key press
     /// can never abort the TUI: errors land here instead of propagating through `?`.
     error: Option<String>,
+    /// Operation that owns `error`; worker/lifecycle failures use `None`. Search and preview
+    /// successes clear only their own failure, so one operation cannot erase another's evidence.
+    error_owner: Option<RequestKind>,
     /// A disconnected response producer is terminal for this worker. Remember reporting it so
-    /// every 10 ms idle drain does not redraw the same error forever.
+    /// later active/idle drains do not redraw the same error forever.
     worker_disconnected_reported: bool,
 }
 
-impl<'a> AppState<'a> {
-    fn new(config: &'a Config, worker: SearchWorker) -> Result<Self> {
+impl AppState {
+    fn new(config: Config, worker: SearchWorker) -> Result<Self> {
         let mut state = Self::new_quiet(config, worker);
         // The initial empty-query search runs on the worker: the first frame draws before the
         // first query completes, and the startup response populates the list (C28).
@@ -804,7 +952,8 @@ impl<'a> AppState<'a> {
     /// Construct without the startup request — the test harness path, where the first
     /// request must wait until the fixture rows are seeded so the startup response and the
     /// seeded state agree.
-    fn new_quiet(config: &'a Config, worker: SearchWorker) -> Self {
+    fn new_quiet(config: Config, worker: SearchWorker) -> Self {
+        let result_limit = tui_result_limit(config.search.default_limit);
         Self {
             config,
             filters: SearchFilters {
@@ -817,7 +966,7 @@ impl<'a> AppState<'a> {
                 parent_session_id: None,
                 since: None,
                 until: None,
-                limit: tui_result_limit(config.search.default_limit),
+                limit: result_limit,
                 warnings_only: false,
             },
             worker,
@@ -826,6 +975,7 @@ impl<'a> AppState<'a> {
             current_search_generation: RequestGeneration::new(),
             current_preview_generation: RequestGeneration::new(),
             searching: false,
+            preview_loading: false,
             selected: 0,
             results: Vec::new(),
             preview: String::new(),
@@ -834,6 +984,7 @@ impl<'a> AppState<'a> {
             previewed_id: None,
             preview_viewport_rows: 0,
             error: None,
+            error_owner: None,
             worker_disconnected_reported: false,
         }
     }
@@ -917,16 +1068,21 @@ impl<'a> AppState<'a> {
         let mut applied = false;
         loop {
             match self.worker.responses.try_recv() {
-                Ok(outcome) => applied |= self.apply_outcome(outcome),
+                Ok(outcome) => {
+                    self.worker.acknowledge_outcome();
+                    applied |= self.apply_outcome(outcome);
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if !self.worker_disconnected_reported {
                         self.worker_disconnected_reported = true;
                         self.searching = false;
+                        self.preview_loading = false;
                         self.error = Some(
                             "the search worker stopped; press q to quit and rerun aise tui"
                                 .to_string(),
                         );
+                        self.error_owner = None;
                         applied = true;
                     }
                     break;
@@ -950,10 +1106,24 @@ impl<'a> AppState<'a> {
         }
         if outcome.kind == RequestKind::Search {
             self.searching = false;
+        } else {
+            self.preview_loading = false;
         }
         match outcome.result {
             Ok(response) => self.apply_response(response),
-            Err(error) => self.error = Some(format!("{error:#}")),
+            Err(error) => {
+                if outcome.kind == RequestKind::PreviewOnly {
+                    let selected = self.selected_session().map(|session| session.id.clone());
+                    self.preview = match selected.as_deref() {
+                        Some(id) => format!("Preview unavailable for {id}."),
+                        None => NO_SESSIONS_PREVIEW.to_string(),
+                    };
+                    self.previewed_id = selected;
+                    self.preview_scroll = 0;
+                }
+                self.error = Some(format!("{error:#}"));
+                self.error_owner = Some(outcome.kind);
+            }
         }
         true
     }
@@ -964,6 +1134,7 @@ impl<'a> AppState<'a> {
         let generation = RequestGeneration::new();
         self.current_search_generation = generation.clone();
         self.searching = true;
+        self.preview_loading = false;
         if let Err(message) = self.worker.send(WorkerRequest {
             kind: RequestKind::Search,
             generation,
@@ -973,24 +1144,28 @@ impl<'a> AppState<'a> {
         }) {
             self.searching = false;
             self.error = Some(message);
+            self.error_owner = Some(RequestKind::Search);
         }
     }
 
     /// Ask the worker for the selected row's preview, unless it is already on screen.
     ///
     /// The skip is load-bearing, not an optimisation: every search response calls this, and
-    /// without it a preserved selection (D4) would re-read up to `D_max` bytes per keystroke.
-    /// A `PreviewOnly` never cancels (C21), so a held `j` merely queues requests the worker
-    /// drains to the latest.
+    /// without it a preserved selection (D4) would rescan the transcript per keystroke.
+    /// A replacement preview cancels only an older preview, never a Search (C21), so held
+    /// navigation remains latest-value bounded without invalidating the result list.
     fn request_preview(&mut self) {
         let selected = self.selected_session().map(|session| session.id.clone());
         // Invalidate any outstanding preview success/error even when the already-rendered row is
         // selected again and no replacement I/O is needed (A→B→A fast path).
         let generation = RequestGeneration::new();
         self.current_preview_generation = generation.clone();
-        if selected == self.previewed_id {
+        if selected == self.previewed_id && self.error_owner != Some(RequestKind::PreviewOnly) {
+            self.worker.cancel_preview();
+            self.preview_loading = false;
             return;
         }
+        self.preview_loading = true;
         if let Err(message) = self.worker.send(WorkerRequest {
             kind: RequestKind::PreviewOnly,
             generation,
@@ -998,7 +1173,9 @@ impl<'a> AppState<'a> {
             filters: self.filters.clone(),
             selected_id: selected,
         }) {
+            self.preview_loading = false;
             self.error = Some(message);
+            self.error_owner = Some(RequestKind::PreviewOnly);
         }
     }
 
@@ -1006,7 +1183,11 @@ impl<'a> AppState<'a> {
     /// rendered on the error line, never sent — the request would be unsatisfiable.
     fn apply_filter_change(&mut self) {
         if let Err(error) = self.filters.validate() {
+            self.current_search_generation = RequestGeneration::new();
+            self.worker.cancel_search();
+            self.searching = false;
             self.error = Some(format!("{error:#}"));
+            self.error_owner = Some(RequestKind::Search);
             return;
         }
         self.request_search();
@@ -1070,14 +1251,49 @@ impl<'a> AppState<'a> {
         self.apply_filter_change();
     }
 
+    fn filter_status(&self) -> String {
+        let provider = self
+            .filters
+            .provider
+            .map_or("any", |provider| provider.as_str());
+        let class = match self.filters.session_kinds.as_deref() {
+            None => "any",
+            Some([SessionKind::User]) => "user",
+            Some([SessionKind::Subagent]) => "subagent",
+            Some(kinds) if *kinds == SessionKind::default_search_set() => "user+subagent",
+            Some(_) => "custom",
+        };
+        let window = self.filters.since.map_or("any", |since| {
+            let hours = (Utc::now() - since).num_hours();
+            if hours <= 24 * 2 {
+                "1d"
+            } else if hours <= 24 * 8 {
+                "7d"
+            } else {
+                "30d"
+            }
+        });
+        format!(
+            "p:{provider} f:{class} s:{window} w:{}",
+            if self.filters.warnings_only {
+                "on"
+            } else {
+                "off"
+            }
+        )
+    }
+
     /// Apply one worker response. Search responses replace the list and preserve the user's
     /// place; preview responses never replace the list (C13) and are discarded when overtaken
     /// by newer navigation.
     fn apply_response(&mut self, response: WorkerResponse) {
         if let Some(results) = response.results {
-            // Clear the error only here: a PreviewOnly response arriving right after a failed
-            // search must not wipe the message before a frame carried it (C30).
-            self.error = None;
+            // Search and preview failures are independent. A success clears only its own error,
+            // so a preview completion cannot hide a failed search (or vice versa).
+            if self.error_owner == Some(RequestKind::Search) {
+                self.error = None;
+                self.error_owner = None;
+            }
             let keep = self.selected_session().map(|session| session.id.clone());
             self.results = results;
             // D4: keep the user's place when the same session survives into the new set.
@@ -1092,6 +1308,10 @@ impl<'a> AppState<'a> {
         if let Some(preview) = response.preview {
             if response.previewed_id != self.selected_session().map(|s| s.id.clone()) {
                 return;
+            }
+            if self.error_owner == Some(RequestKind::PreviewOnly) {
+                self.error = None;
+                self.error_owner = None;
             }
             let same_session = response.previewed_id == self.previewed_id;
             self.preview = preview;
@@ -1156,8 +1376,9 @@ impl<'a> AppState<'a> {
         // so the scroll clamp bounds by the actual viewport (D11).
         self.preview_viewport_rows = middle[1].height.saturating_sub(2);
 
-        // Session list. The label column is the configured width clamped up to the longest
-        // label, so a smaller value pads but can never truncate (D10 stays fixed).
+        // Session list. Normal panes clamp the configured width up to the longest label; an
+        // exceptionally narrow pane clamps to its actual interior because geometry must win when
+        // the two requirements cannot both fit.
         let longest_label = longest_provider_label();
         let list_interior_width = usize::from(middle[0].width.saturating_sub(2));
         let label_width = self
@@ -1165,9 +1386,8 @@ impl<'a> AppState<'a> {
             .ui
             .provider_label_width
             .max(longest_label)
-            // A config value cannot request an allocation wider than the actual pane. Keep the
-            // structural label floor for terminals too narrow to display it in full.
-            .min(list_interior_width.max(longest_label));
+            // A config value cannot request an allocation wider than the actual pane.
+            .min(list_interior_width);
         let visible_range = visible_session_range(
             self.results.len(),
             self.selected,
@@ -1188,6 +1408,7 @@ impl<'a> AppState<'a> {
                     .unwrap_or_else(|| session.preview_text.clone());
                 let age = relative_age(session.updated_at);
                 let (provider_name, provider_color) = provider_label(session.provider);
+                let provider_name = truncate_for_display(provider_name, label_width);
                 let mut spans = vec![Span::styled(
                     format!("[{provider_name:<label_width$}] "),
                     Style::default()
@@ -1251,16 +1472,14 @@ impl<'a> AppState<'a> {
             .lines()
             .map(|line| render_preview_line(line, &self.query))
             .collect::<Vec<_>>();
-        let wrap_width = usize::from(middle[1].width.saturating_sub(2)).max(1);
-        self.preview_line_count = preview_lines
-            .iter()
-            .map(|line| line.width().max(1).div_ceil(wrap_width))
-            .sum();
-        self.clamp_preview_scroll();
         let preview = Paragraph::new(preview_lines)
             .block(Block::default().borders(Borders::ALL).title(" Preview "))
-            .wrap(Wrap { trim: false })
-            .scroll((self.preview_scroll, 0));
+            .wrap(Wrap { trim: false });
+        // Use the renderer's own WordWrapper rather than width arithmetic: wrapping at word
+        // boundaries can produce more rows than ceil(display_width / pane_width).
+        self.preview_line_count = preview.line_count(middle[1].width);
+        self.clamp_preview_scroll();
+        let preview = preview.scroll((self.preview_scroll, 0));
         frame.render_widget(preview, middle[1]);
 
         // Error line (own row, taken from the body when present — never the help bar),
@@ -1278,9 +1497,15 @@ impl<'a> AppState<'a> {
         // Status bar (single line, contextual) — also middle-elided to the frame, so the
         // navigation hints at the head and "q: quit" at the tail both survive a narrow frame.
         let help_text = if self.search_mode {
-            "Type to search │ Enter/Esc: browse".to_string()
+            format!(
+                "{} │ Type to search │ Enter/Esc: browse",
+                self.filter_status()
+            )
         } else {
-            "j/k: move │ PgUp/PgDn: page │ g/G: top/bottom │ h/l: scroll │ p: provider │ f: class │ s: window │ w: warnings │ /: search │ Enter: resume │ q: quit".to_string()
+            format!(
+                "{} │ j/k: move │ PgUp/PgDn: page │ g/G: top/bottom │ h/l: scroll │ p/f/s/w: filters │ /: search │ Enter: resume │ q: quit",
+                self.filter_status()
+            )
         };
         let bottom = Paragraph::new(Span::styled(
             elide_middle(&help_text, frame_width),
@@ -1340,14 +1565,12 @@ impl<'a> AppState<'a> {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnRole {
     User,
     Assistant,
 }
 
-#[cfg(test)]
 impl TurnRole {
     fn parse(line: &str) -> Option<Self> {
         let close = line.strip_prefix('[')?.find(']')?;
@@ -1361,14 +1584,20 @@ impl TurnRole {
     }
 }
 
-#[cfg(test)]
+#[derive(Clone, Copy)]
 struct Turn<'a> {
+    ordinal: usize,
+    body: &'a str,
+}
+
+#[cfg(test)]
+struct ParsedTurn<'a> {
     role: TurnRole,
     body: &'a str,
 }
 
 #[cfg(test)]
-fn parse_turns(transcript: &str) -> Vec<Turn<'_>> {
+fn parse_turns(transcript: &str) -> Vec<ParsedTurn<'_>> {
     parse_turns_inner(transcript, None).expect("an uncancelled parse cannot fail")
 }
 
@@ -1376,8 +1605,8 @@ fn parse_turns(transcript: &str) -> Vec<Turn<'_>> {
 fn parse_turns_inner<'a>(
     transcript: &'a str,
     cancellation: Option<&QueryCancellation>,
-) -> Result<Vec<Turn<'a>>> {
-    let mut turns: Vec<Turn<'a>> = Vec::new();
+) -> Result<Vec<ParsedTurn<'a>>> {
+    let mut turns: Vec<ParsedTurn<'a>> = Vec::new();
     let mut current_role: Option<TurnRole> = None;
     let mut body_start: usize = 0;
 
@@ -1394,7 +1623,7 @@ fn parse_turns_inner<'a>(
         if let Some(role) = TurnRole::parse(line) {
             if let Some(prev) = current_role.take() {
                 let body = transcript[body_start..cursor].trim_matches('\n');
-                turns.push(Turn { role: prev, body });
+                turns.push(ParsedTurn { role: prev, body });
             }
             current_role = Some(role);
             body_start = (line_end + 1).min(transcript.len());
@@ -1407,7 +1636,7 @@ fn parse_turns_inner<'a>(
     }
     if let Some(prev) = current_role {
         let body = transcript[body_start..].trim_matches('\n');
-        turns.push(Turn { role: prev, body });
+        turns.push(ParsedTurn { role: prev, body });
     }
     if let Some(cancellation) = cancellation {
         cancellation.ensure_active()?;
@@ -1415,19 +1644,92 @@ fn parse_turns_inner<'a>(
     Ok(turns)
 }
 
+#[cfg(test)]
 fn truncate_body(body: &str, max_lines: usize) -> String {
-    let trimmed = body.trim_end();
+    truncate_body_inner(body, max_lines, None).expect("an uncancelled copy cannot fail")
+}
+
+fn push_cancellable(
+    output: &mut String,
+    text: &str,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<()> {
+    let mut start = 0;
+    while start < text.len() {
+        if let Some(cancellation) = cancellation {
+            cancellation.ensure_active()?;
+        }
+        let mut end = start
+            .saturating_add(TRANSCRIPT_CANCELLATION_CHUNK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    Ok(())
+}
+
+fn trim_end_cancellable<'a>(
+    body: &'a str,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<&'a str> {
+    let mut end = body.len();
+    let mut checked_at = end;
+    for (index, character) in body.char_indices().rev() {
+        if checked_at.saturating_sub(index) >= TRANSCRIPT_CANCELLATION_CHUNK_BYTES {
+            if let Some(cancellation) = cancellation {
+                cancellation.ensure_active()?;
+            }
+            checked_at = index;
+        }
+        if character.is_whitespace() {
+            end = index;
+        } else {
+            break;
+        }
+    }
+    Ok(&body[..end])
+}
+
+fn truncate_body_inner(
+    body: &str,
+    max_lines: usize,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<String> {
+    let trimmed = trim_end_cancellable(body, cancellation)?;
     if trimmed.is_empty() {
-        return "(empty)".to_string();
+        return Ok("(empty)".to_string());
     }
-    let mut source = trimmed.lines();
-    let lines: Vec<&str> = source.by_ref().take(max_lines).collect();
-    if source.next().is_none() {
-        return trimmed.to_string();
+    let mut lines = Vec::with_capacity(max_lines.min(64));
+    let mut cursor = 0;
+    while cursor < trimmed.len() && lines.len() < max_lines {
+        let line_end = next_transcript_line_end(trimmed, cursor, cancellation)?;
+        lines.push(&trimmed[cursor..line_end]);
+        cursor = if line_end == trimmed.len() {
+            trimmed.len()
+        } else {
+            line_end + 1
+        };
     }
-    let mut out = lines.join("\n");
-    out.push_str("\n  […]");
-    out
+    if cursor == trimmed.len() {
+        let mut output = String::with_capacity(trimmed.len());
+        push_cancellable(&mut output, trimmed, cancellation)?;
+        return Ok(output);
+    }
+    let selected_bytes = lines.iter().fold(0_usize, |bytes, line| {
+        bytes.saturating_add(line.len()).saturating_add(1)
+    });
+    let mut output = String::with_capacity(selected_bytes);
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        push_cancellable(&mut output, line, cancellation)?;
+    }
+    output.push_str("\n  […]");
+    Ok(output)
 }
 
 /// Relative weights for the preview summary's sections (Decision 2a): first prompt, first
@@ -1439,6 +1741,13 @@ const PREVIEW_WEIGHT_FIRST_PROMPT: usize = 8;
 const PREVIEW_WEIGHT_FIRST_REPLY: usize = 4;
 const PREVIEW_WEIGHT_FINAL_PROMPT: usize = 8;
 const PREVIEW_WEIGHT_FINAL_REPLY: usize = 14;
+const HISTORICAL_PREVIEW_BODY_LINES: usize = PREVIEW_WEIGHT_FIRST_PROMPT
+    + PREVIEW_WEIGHT_FIRST_REPLY
+    + PREVIEW_WEIGHT_FINAL_PROMPT
+    + PREVIEW_WEIGHT_FINAL_REPLY;
+/// Maximum transcript bytes scanned between cooperative cancellation checks. This is a work
+/// bound, not a presentation budget; 64 KiB matches the worker's bounded search-batch byte scale.
+const TRANSCRIPT_CANCELLATION_CHUNK_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 fn build_transcript_summary(transcript: &str, budget: usize) -> String {
@@ -1446,7 +1755,6 @@ fn build_transcript_summary(transcript: &str, budget: usize) -> String {
         .expect("an uncancelled summary cannot fail")
 }
 
-#[cfg(test)]
 fn build_transcript_summary_cancellable(
     transcript: &str,
     budget: usize,
@@ -1455,111 +1763,182 @@ fn build_transcript_summary_cancellable(
     build_transcript_summary_inner(transcript, budget, Some(cancellation))
 }
 
-#[cfg(test)]
+#[derive(Default)]
+struct TranscriptBookends<'a> {
+    total: usize,
+    first_user: Option<Turn<'a>>,
+    first_assistant: Option<Turn<'a>>,
+    last_user: Option<Turn<'a>>,
+    last_assistant: Option<Turn<'a>>,
+}
+
+fn remember_transcript_turn<'a>(
+    bookends: &mut TranscriptBookends<'a>,
+    role: TurnRole,
+    body: &'a str,
+) {
+    let turn = Turn {
+        ordinal: bookends.total,
+        body,
+    };
+    match role {
+        TurnRole::User => {
+            bookends.first_user.get_or_insert(turn);
+            bookends.last_user = Some(turn);
+        }
+        TurnRole::Assistant => {
+            bookends.first_assistant.get_or_insert(turn);
+            bookends.last_assistant = Some(turn);
+        }
+    }
+    bookends.total = bookends.total.saturating_add(1);
+}
+
+fn next_transcript_line_end(
+    transcript: &str,
+    cursor: usize,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<usize> {
+    let bytes = transcript.as_bytes();
+    let mut chunk_start = cursor;
+    while chunk_start < bytes.len() {
+        if let Some(cancellation) = cancellation {
+            cancellation.ensure_active()?;
+        }
+        let mut chunk_end = chunk_start
+            .saturating_add(TRANSCRIPT_CANCELLATION_CHUNK_BYTES)
+            .min(bytes.len());
+        while chunk_end < bytes.len() && !transcript.is_char_boundary(chunk_end) {
+            chunk_end -= 1;
+        }
+        if let Some(relative) = transcript[chunk_start..chunk_end].find('\n') {
+            return Ok(chunk_start + relative);
+        }
+        chunk_start = chunk_end;
+    }
+    Ok(bytes.len())
+}
+
+fn trim_newlines_cancellable<'a>(
+    text: &'a str,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<&'a str> {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut next_check = 0;
+    while start < bytes.len() && bytes[start] == b'\n' {
+        if start == next_check {
+            if let Some(cancellation) = cancellation {
+                cancellation.ensure_active()?;
+            }
+            next_check = next_check.saturating_add(TRANSCRIPT_CANCELLATION_CHUNK_BYTES);
+        }
+        start += 1;
+    }
+    let mut end = bytes.len();
+    let mut scanned = 0;
+    next_check = 0;
+    while end > start && bytes[end - 1] == b'\n' {
+        if scanned == next_check {
+            if let Some(cancellation) = cancellation {
+                cancellation.ensure_active()?;
+            }
+            next_check = next_check.saturating_add(TRANSCRIPT_CANCELLATION_CHUNK_BYTES);
+        }
+        end -= 1;
+        scanned += 1;
+    }
+    Ok(&text[start..end])
+}
+
+fn transcript_bookends<'a>(
+    transcript: &'a str,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<TranscriptBookends<'a>> {
+    let mut bookends = TranscriptBookends::default();
+    let mut current_role = None;
+    let mut body_start = 0;
+    let mut cursor = 0;
+    while cursor < transcript.len() {
+        let line_end = next_transcript_line_end(transcript, cursor, cancellation)?;
+        let line = &transcript[cursor..line_end];
+        if let Some(role) = TurnRole::parse(line) {
+            if let Some(previous) = current_role.take() {
+                let body =
+                    trim_newlines_cancellable(&transcript[body_start..cursor], cancellation)?;
+                remember_transcript_turn(&mut bookends, previous, body);
+            }
+            current_role = Some(role);
+            body_start = (line_end + 1).min(transcript.len());
+        }
+        cursor = if line_end == transcript.len() {
+            transcript.len()
+        } else {
+            line_end + 1
+        };
+    }
+    if let Some(role) = current_role {
+        let body = trim_newlines_cancellable(&transcript[body_start..], cancellation)?;
+        remember_transcript_turn(&mut bookends, role, body);
+    }
+    if let Some(cancellation) = cancellation {
+        cancellation.ensure_active()?;
+    }
+    Ok(bookends)
+}
+
 fn build_transcript_summary_inner(
     transcript: &str,
     budget: usize,
     cancellation: Option<&QueryCancellation>,
 ) -> Result<String> {
-    let turns = parse_turns_inner(transcript, cancellation)?;
-    if turns.is_empty() {
+    let bookends = transcript_bookends(transcript, cancellation)?;
+    if bookends.total == 0 {
         return Ok("(no transcript content)".to_string());
     }
 
-    let first_user = turns.iter().position(|t| t.role == TurnRole::User);
-    let first_assistant = turns.iter().position(|t| t.role == TurnRole::Assistant);
-    let last_user = turns.iter().rposition(|t| t.role == TurnRole::User);
-    let last_assistant = turns.iter().rposition(|t| t.role == TurnRole::Assistant);
-
-    // (turn_index, label, relative weight)
     let candidates = [
         (
-            first_user,
+            bookends.first_user,
             "── First prompt ──",
             PREVIEW_WEIGHT_FIRST_PROMPT,
         ),
         (
-            first_assistant,
+            bookends.first_assistant,
             "── First reply ──",
             PREVIEW_WEIGHT_FIRST_REPLY,
         ),
-        (last_user, "── Final prompt ──", PREVIEW_WEIGHT_FINAL_PROMPT),
         (
-            last_assistant,
+            bookends.last_user,
+            "── Final prompt ──",
+            PREVIEW_WEIGHT_FINAL_PROMPT,
+        ),
+        (
+            bookends.last_assistant,
             "── Final reply ──",
             PREVIEW_WEIGHT_FINAL_REPLY,
         ),
     ];
-
-    let mut shown_indices: Vec<usize> = Vec::new();
-    let mut sections: Vec<(usize, &'static str, usize, &str)> = Vec::new();
-    for (idx, label, weight) in candidates {
-        let Some(idx) = idx else { continue };
-        if shown_indices.contains(&idx) {
-            continue;
-        }
-        shown_indices.push(idx);
-        sections.push((idx, label, weight, turns[idx].body));
-    }
-    sections.sort_by_key(|(idx, _, _, _)| *idx);
-    if let Some(cancellation) = cancellation {
-        cancellation.ensure_active()?;
-    }
-    Ok(render_summary_sections(&sections, turns.len(), budget))
-}
-
-fn build_bookend_summary(bookends: &ConversationBookends, budget: usize) -> String {
-    if bookends.turns.is_empty() {
-        return "(no transcript content)".to_string();
-    }
-    let first_user = bookends.turns.iter().find(|turn| turn.role == Role::User);
-    let first_assistant = bookends
-        .turns
-        .iter()
-        .find(|turn| turn.role == Role::Assistant);
-    let last_user = bookends.turns.iter().rfind(|turn| turn.role == Role::User);
-    let last_assistant = bookends
-        .turns
-        .iter()
-        .rfind(|turn| turn.role == Role::Assistant);
-    let candidates = [
-        (
-            first_user,
-            "── First prompt ──",
-            PREVIEW_WEIGHT_FIRST_PROMPT,
-        ),
-        (
-            first_assistant,
-            "── First reply ──",
-            PREVIEW_WEIGHT_FIRST_REPLY,
-        ),
-        (last_user, "── Final prompt ──", PREVIEW_WEIGHT_FINAL_PROMPT),
-        (
-            last_assistant,
-            "── Final reply ──",
-            PREVIEW_WEIGHT_FINAL_REPLY,
-        ),
-    ];
-    let mut shown = Vec::new();
-    let mut sections = Vec::new();
+    let mut shown_ordinals = Vec::with_capacity(4);
+    let mut sections = Vec::with_capacity(4);
     for (turn, label, weight) in candidates {
         let Some(turn) = turn else { continue };
-        if shown.contains(&turn.ordinal) {
+        if shown_ordinals.contains(&turn.ordinal) {
             continue;
         }
-        shown.push(turn.ordinal);
-        sections.push((turn.ordinal, label, weight, turn.content.as_str()));
+        shown_ordinals.push(turn.ordinal);
+        sections.push((turn.ordinal, label, weight, turn.body));
     }
-    sections.sort_by_key(|(ordinal, _, _, _)| *ordinal);
-    render_summary_sections(&sections, bookends.total_turns, budget)
+    sections.sort_by_key(|(index, _, _, _)| *index);
+    render_summary_sections(&sections, bookends.total, budget, cancellation)
 }
 
 fn render_summary_sections(
     sections: &[(usize, &'static str, usize, &str)],
     total: usize,
     budget: usize,
-) -> String {
-    let total_weight: usize = sections.iter().map(|(_, _, weight, _)| *weight).sum();
+    cancellation: Option<&QueryCancellation>,
+) -> Result<String> {
     let hidden = total.saturating_sub(sections.len());
     let mut parts = Vec::new();
     let mut last_emitted_idx = None;
@@ -1574,8 +1953,8 @@ fn render_summary_sections(
             }
         }
         parts.push((*label).to_string());
-        let max_lines = (budget.saturating_mul(*weight) / total_weight).max(1);
-        parts.push(truncate_body(body, max_lines));
+        let max_lines = (budget.saturating_mul(*weight) / HISTORICAL_PREVIEW_BODY_LINES).max(1);
+        parts.push(truncate_body_inner(body, max_lines, cancellation)?);
         last_emitted_idx = Some(*idx);
     }
     if hidden > 0 && sections.len() < 2 {
@@ -1588,7 +1967,7 @@ fn render_summary_sections(
         "({total} turn{} total)",
         if total == 1 { "" } else { "s" }
     ));
-    parts.join("\n\n")
+    Ok(parts.join("\n\n"))
 }
 
 fn render_preview_line(line: &str, query: &str) -> Line<'static> {
@@ -1797,15 +2176,17 @@ mod tests {
         )
     }
 
-    /// One scripted TUI: owns the terminal, the event script, the app state, and the fixture
-    /// database. The config and Db are leaked so `AppState<'static>` can borrow them; the leak
-    /// is bounded by the number of harness instances per test process.
+    /// One scripted TUI: owns the terminal, event script, app state, and fixture databases.
+    /// No `'static` test leaks: production-executor fixtures attach their TempDir here.
     struct TuiHarness {
-        _dir: tempfile::TempDir,
-        db: &'static Db,
+        // Field order is drop order: stop/join the worker, close the fixture Db, then remove
+        // directories. This matters on Windows, where an open SQLite file cannot be unlinked.
+        app: AppState,
+        db: Db,
         terminal: Terminal<TestBackend>,
         events: ScriptedEventSource,
-        app: AppState<'static>,
+        external_fixture: Option<tempfile::TempDir>,
+        _dir: tempfile::TempDir,
     }
 
     impl TuiHarness {
@@ -1829,21 +2210,25 @@ mod tests {
             if config.ui.event_poll_interval_ms == 150 {
                 config.ui.event_poll_interval_ms = 1;
             }
-            let config: &'static Config = Box::leak(Box::new(config));
             let (worker, observed) =
                 spawn_search_worker(factory).expect("worker startup handshake");
             assert!(matches!(observed, EffectiveAccessScope::All));
             let dir = tempfile::tempdir().unwrap();
-            let db: &'static Db =
-                Box::leak(Box::new(Db::open(&dir.path().join("index.db")).unwrap()));
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
             let app = AppState::new_quiet(config, worker);
             Self {
                 _dir: dir,
+                external_fixture: None,
                 db,
                 terminal: Terminal::new(TestBackend::new(100, 24)).unwrap(),
                 events: ScriptedEventSource::new(Vec::new()),
                 app,
             }
+        }
+
+        fn own_external_fixture(mut self, fixture: tempfile::TempDir) -> Self {
+            self.external_fixture = Some(fixture);
+            self
         }
 
         /// Install the starting rows on `AppState::results` AND in the fixture database, then
@@ -1948,6 +2333,11 @@ mod tests {
             self.region_text(
                 area.height - STATUS_BAR_ROWS - ERROR_LINE_ROWS..area.height - STATUS_BAR_ROWS,
             )
+        }
+
+        fn status_line(&self) -> String {
+            let area = self.terminal.backend().buffer().area;
+            self.region_text(area.height - STATUS_BAR_ROWS..area.height)
         }
     }
 
@@ -2078,6 +2468,56 @@ mod tests {
     }
 
     #[test]
+    fn settled_idle_turn_uses_one_configured_poll_instead_of_ten_ms_wakeups() {
+        let mut config = Config::default();
+        config.ui.event_poll_interval_ms = 25;
+        let mut harness = TuiHarness::with_config(config, idle_executor());
+        harness.step();
+        assert_eq!(harness.events.poll_timeouts.len(), 1);
+        assert!(
+            harness.events.poll_timeouts[0] >= Duration::from_millis(23),
+            "idle poll should use the configured interval: {:?}",
+            harness.events.poll_timeouts
+        );
+    }
+
+    #[test]
+    fn mailbox_work_keeps_short_polling_even_when_visible_flags_are_clear() {
+        let (release, gate) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                let _ = entered_tx.send(());
+                park_until_released_or_cancelled(&gate, cancellation);
+                Ok(WorkerResponse::preview(request, None))
+            },
+        );
+        let mut config = Config::default();
+        config.ui.event_poll_interval_ms = 25;
+        let mut harness = TuiHarness::with_config(config, executor);
+        harness
+            .app
+            .worker
+            .send(WorkerRequest {
+                kind: RequestKind::PreviewOnly,
+                generation: harness.app.current_preview_generation.clone(),
+                query: String::new(),
+                filters: harness.app.filters.clone(),
+                selected_id: None,
+            })
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        harness.app.searching = false;
+        harness.app.preview_loading = false;
+        harness.step();
+        assert!(
+            harness.events.poll_timeouts[0] <= ACTIVE_WORKER_POLL_SLICE,
+            "mailbox in-flight work must not use the settled idle interval"
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
     fn result_limit_preserves_large_config_and_fills_the_browser_for_small_config() {
         assert_eq!(tui_result_limit(25), 100);
         assert_eq!(tui_result_limit(100), 100);
@@ -2110,6 +2550,103 @@ mod tests {
         assert_eq!(turns[1].role, TurnRole::Assistant);
         assert_eq!(turns[1].body, "hi there\nmulti-line");
         assert_eq!(turns[2].body, "bye");
+    }
+
+    fn historical_summary_reference(transcript: &str) -> String {
+        let turns = parse_turns(transcript);
+        if turns.is_empty() {
+            return "(no transcript content)".to_string();
+        }
+        let candidates = [
+            (
+                turns.iter().position(|turn| turn.role == TurnRole::User),
+                "── First prompt ──",
+                8,
+            ),
+            (
+                turns
+                    .iter()
+                    .position(|turn| turn.role == TurnRole::Assistant),
+                "── First reply ──",
+                4,
+            ),
+            (
+                turns.iter().rposition(|turn| turn.role == TurnRole::User),
+                "── Final prompt ──",
+                8,
+            ),
+            (
+                turns
+                    .iter()
+                    .rposition(|turn| turn.role == TurnRole::Assistant),
+                "── Final reply ──",
+                14,
+            ),
+        ];
+        let mut shown = Vec::new();
+        let mut sections = Vec::new();
+        for (ordinal, label, max_lines) in candidates {
+            let Some(ordinal) = ordinal else { continue };
+            if shown.contains(&ordinal) {
+                continue;
+            }
+            shown.push(ordinal);
+            sections.push((ordinal, label, max_lines, turns[ordinal].body));
+        }
+        sections.sort_by_key(|(ordinal, _, _, _)| *ordinal);
+        let hidden = turns.len().saturating_sub(sections.len());
+        let mut parts = Vec::new();
+        let mut previous = None;
+        for (ordinal, label, max_lines, body) in sections {
+            if previous.is_some_and(|prior| ordinal > prior + 1) {
+                let gap = ordinal - previous.unwrap() - 1;
+                parts.push(format!(
+                    "⋯ {gap} more turn{} hidden ⋯",
+                    if gap == 1 { "" } else { "s" }
+                ));
+            }
+            parts.push(label.to_string());
+            parts.push(truncate_body(body, max_lines));
+            previous = Some(ordinal);
+        }
+        if hidden > 0 && shown.len() < 2 {
+            parts.push(format!(
+                "⋯ {hidden} more turn{} hidden ⋯",
+                if hidden == 1 { "" } else { "s" }
+            ));
+        }
+        parts.push(format!(
+            "({} turn{} total)",
+            turns.len(),
+            if turns.len() == 1 { "" } else { "s" }
+        ));
+        parts.join("\n\n")
+    }
+
+    #[test]
+    fn borrowed_transcript_scan_matches_main_preview_semantics() {
+        let long = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cases = [
+            String::new(),
+            join_turns(&[("user", &long)]),
+            join_turns(&[("assistant", &long)]),
+            join_turns(&[("user", &long), ("assistant", &long)]),
+            join_turns(&[
+                ("user", "first"),
+                ("assistant", "reply"),
+                ("user", "middle"),
+                ("assistant", "last"),
+            ]),
+        ];
+        for transcript in cases {
+            assert_eq!(
+                build_transcript_summary(&transcript, HISTORICAL_PREVIEW_BODY_LINES),
+                historical_summary_reference(&transcript)
+            );
+        }
     }
 
     #[test]
@@ -2176,6 +2713,14 @@ mod tests {
         .unwrap_err();
         assert!(error.is::<QueryCancelled>());
         assert!(is_expected_interruption(&error));
+    }
+
+    #[test]
+    fn error_elision_bounds_terminal_columns_and_flattens_newlines() {
+        let rendered = elide_middle("漢字🙂 prefix\npress q and rerun", 16);
+        assert!(UnicodeWidthStr::width(rendered.as_str()) <= 16);
+        assert!(!rendered.contains(['\r', '\n']));
+        assert!(rendered.ends_with("rerun"));
     }
 
     #[test]
@@ -2703,6 +3248,44 @@ mod tests {
             generation: stale_b,
             result: Err(anyhow::anyhow!("preview B failed")),
         }));
+        assert!(harness.app.error.is_none());
+    }
+
+    #[test]
+    fn current_preview_error_replaces_stale_content_and_success_recovers() {
+        let mut harness =
+            TuiHarness::with_executor(idle_executor()).seeded(&["claude:a", "claude:b"]);
+        harness.app.preview = "preview of claude:a".to_string();
+        harness.app.previewed_id = Some("claude:a".to_string());
+        harness.app.selected = 1;
+        harness.app.request_preview();
+        let generation = harness.app.current_preview_generation.clone();
+
+        assert!(harness.app.apply_outcome(WorkerOutcome {
+            kind: RequestKind::PreviewOnly,
+            generation: generation.clone(),
+            result: Err(anyhow::anyhow!("selected row disappeared")),
+        }));
+        assert!(!harness.app.preview.contains("claude:a"));
+        assert!(harness.app.preview.contains("claude:b"));
+        assert!(harness.app.preview.contains("unavailable"));
+
+        let request = WorkerRequest {
+            kind: RequestKind::PreviewOnly,
+            generation: generation.clone(),
+            query: harness.app.query.clone(),
+            filters: harness.app.filters.clone(),
+            selected_id: Some("claude:b".to_string()),
+        };
+        assert!(harness.app.apply_outcome(WorkerOutcome {
+            kind: RequestKind::PreviewOnly,
+            generation,
+            result: Ok(WorkerResponse::preview(
+                &request,
+                Some("preview of claude:b".to_string()),
+            )),
+        }));
+        assert_eq!(harness.app.preview, "preview of claude:b");
         assert!(harness.app.error.is_none());
     }
 
@@ -3296,12 +3879,51 @@ mod tests {
     }
 
     #[test]
+    fn oversized_real_transcript_scoring_observes_mid_scan_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = session("claude:oversized");
+        parsed.transcript_text = "x".repeat(16 * 1024 * 1024);
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let cancellation = Arc::new(QueryCancellation::new());
+        db.install_query_cancellation(&cancellation).unwrap();
+        let cancel_from_thread = Arc::clone(&cancellation);
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            cancel_from_thread.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = CatalogService::new(&db)
+            .search_sessions_cancellable(
+                "not-present-anywhere",
+                &SearchFilters {
+                    limit: 10,
+                    ..Default::default()
+                },
+                None,
+                &Config::default().search.scoring,
+                &cancellation,
+            )
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert!(
+            is_expected_interruption(&error),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "oversized-record cancellation exceeded the bounded scan deadline"
+        );
+    }
+
+    #[test]
     fn tui_and_catalog_service_return_identical_ordered_results() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
         let db = Db::open(&db_path).unwrap();
-        for id in ["claude:alpha", "claude:beta", "claude:gamma"] {
-            db.upsert_session(&session(id), 0, 0).unwrap();
+        for index in 0..40 {
+            let id = format!("claude:alpha-{index:02}");
+            db.upsert_session(&session(&id), 0, 0).unwrap();
         }
         let mut config = Config::default();
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
@@ -3324,11 +3946,22 @@ mod tests {
             .collect::<Vec<_>>();
         wait_for_results(&mut harness, &expected);
         assert_eq!(ordered_ids(&harness.app.results), expected);
+        assert!(
+            expected.len() > 22,
+            "parity must cover results beyond the terminal viewport"
+        );
 
         // Matching and no-match queries through the worker and the service.
-        for query in ["a", "zzz"] {
-            harness.script(vec![key(KeyCode::Char('/'))]);
-            harness.step_until_script_drained();
+        for (iteration, query) in ["alpha", "zzz"].into_iter().enumerate() {
+            if iteration == 0 {
+                harness.script(vec![key(KeyCode::Char('/'))]);
+                harness.step_until_script_drained();
+            } else {
+                for _ in 0.."alpha".len() {
+                    harness.script(vec![key(KeyCode::Backspace)]);
+                    harness.step_until_script_drained();
+                }
+            }
             for ch in query.chars() {
                 harness.script(vec![key(KeyCode::Char(ch))]);
                 harness.step_until_script_drained();
@@ -3385,6 +4018,20 @@ mod tests {
             }
         }
         panic!("no {kind:?} request arrived");
+    }
+
+    #[test]
+    fn status_bar_names_every_active_filter_value() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        assert_eq!(harness.app.filter_status(), "p:any f:any s:any w:off");
+        harness.app.filters.provider = Some(Provider::Codex);
+        harness.app.filters.session_kinds = Some(vec![SessionKind::User]);
+        harness.app.filters.since = Some(Utc::now() - chrono::Duration::days(7));
+        harness.app.filters.warnings_only = true;
+        harness.step();
+        assert_eq!(harness.app.filter_status(), "p:codex f:user s:7d w:on");
+        assert!(harness.status_line().contains("p:codex"));
+        assert!(harness.status_line().contains("w:on"));
     }
 
     #[test]
@@ -3509,51 +4156,6 @@ mod tests {
     }
 
     #[test]
-    fn tui_filters_match_build_filters_for_equivalent_selections() {
-        let (filters_rx, executor) = recording_executor();
-        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
-        wait_for_filters(&filters_rx, RequestKind::Search);
-        harness.wait_until_previewed("claude:keep");
-
-        // Drive to provider=codex, both classes, warnings-only.
-        let variants = Provider::value_variants().to_vec();
-        let presses = variants
-            .iter()
-            .position(|provider| *provider == Provider::Codex)
-            .expect("codex is a provider variant")
-            + 1;
-        for _ in 0..presses {
-            harness.script(vec![key(KeyCode::Char('p'))]);
-            harness.step_until_script_drained();
-            wait_for_filters(&filters_rx, RequestKind::Search);
-        }
-        harness.script(vec![key(KeyCode::Char('f'))]);
-        harness.step_until_script_drained();
-        wait_for_filters(&filters_rx, RequestKind::Search);
-        harness.script(vec![key(KeyCode::Char('w'))]);
-        harness.step_until_script_drained();
-        let tui = wait_for_filters(&filters_rx, RequestKind::Search);
-
-        let args = crate::cli::SessionFilterArgs {
-            provider: Some(Provider::Codex),
-            path: None,
-            exclude_paths: Vec::new(),
-            exclude_sessions: Vec::new(),
-            session_kind: None,
-            session_kinds: vec![SessionKind::User, SessionKind::Subagent],
-            parent_session: None,
-            dates: crate::dates::DateRange {
-                since: None,
-                until: None,
-                when: None,
-            },
-            warnings_only: true,
-        };
-        let expected = crate::cli::build_filters(&args, tui_result_limit(50)).unwrap();
-        assert_eq!(tui, expected, "TUI selections must equal the CLI's filters");
-    }
-
-    #[test]
     fn provider_labels_are_case_folded_distinct_and_fit_the_width() {
         let labels: Vec<&str> = Provider::value_variants()
             .iter()
@@ -3577,6 +4179,14 @@ mod tests {
         }
         // A configured width below the floor clamps up, never truncating.
         assert!(longest_provider_label() >= "GEMINICLI".len());
+    }
+
+    #[test]
+    fn exceptionally_narrow_terminal_clamps_provider_column_without_panicking() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:keep"]);
+        harness.terminal.backend_mut().resize(12, 14);
+        harness.step();
+        assert_eq!(harness.terminal.backend().buffer().area.width, 12);
     }
 
     #[test]
@@ -3663,6 +4273,32 @@ mod tests {
             harness.app.preview_line_count,
             harness.app.preview_viewport_rows
         );
+    }
+
+    #[test]
+    fn multiword_preview_uses_actual_word_wrapped_row_count() {
+        let mut harness = TuiHarness::with_executor(idle_executor());
+        harness.app.preview = std::iter::repeat_n("abcdefghij", 20)
+            .collect::<Vec<_>>()
+            .join(" ");
+        harness.terminal.backend_mut().resize(30, 10);
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let pane_interior_width = 15_usize;
+        let arithmetic_count = harness
+            .app
+            .preview
+            .chars()
+            .count()
+            .div_ceil(pane_interior_width);
+        assert!(
+            harness.app.preview_line_count > arithmetic_count,
+            "word-boundary wrapping must use Ratatui's actual line composer"
+        );
+        harness.app.scroll_preview(isize::MAX);
+        assert!(harness.app.preview_scroll > 0);
     }
 
     #[test]
@@ -3835,45 +4471,149 @@ mod tests {
     }
     // ---- step 6: [ui].preview_lines as the preview body budget (Decision 2a) ----
 
-    fn harness_with_preview_budget(budget: usize, transcript: &str) -> (TuiHarness, Config) {
+    fn harness_with_preview_source(
+        budget: usize,
+        transcript: &str,
+        normalized_message_source: Option<&str>,
+    ) -> (TuiHarness, Config) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
         let db = Db::open(&db_path).unwrap();
         let mut parsed = session("claude:long");
+        parsed.session.cwd = Some("/fixture/project".to_string());
         parsed.transcript_text = transcript.to_string();
-        parsed.messages = parse_turns(transcript)
-            .into_iter()
-            .enumerate()
-            .map(|(seq, turn)| crate::models::Message {
-                seq: seq as i64,
-                role: match turn.role {
-                    TurnRole::User => Role::User,
-                    TurnRole::Assistant => Role::Assistant,
-                },
-                ts: None,
-                tool_name: None,
-                kind: crate::models::MessageKind::Conversation,
-                tool_call_id: None,
-                is_compaction: false,
-                content: turn.body.to_string(),
-                provenance: crate::models::MessageProvenance::default(),
-            })
-            .collect();
+        if let Some(message_source) = normalized_message_source {
+            parsed.messages = parse_turns(message_source)
+                .into_iter()
+                .enumerate()
+                .map(|(seq, turn)| crate::models::Message {
+                    seq: seq as i64,
+                    role: match turn.role {
+                        TurnRole::User => Role::User,
+                        TurnRole::Assistant => Role::Assistant,
+                    },
+                    ts: None,
+                    tool_name: None,
+                    kind: crate::models::MessageKind::Conversation,
+                    tool_call_id: None,
+                    is_compaction: false,
+                    content: turn.body.to_string(),
+                    provenance: crate::models::MessageProvenance::default(),
+                })
+                .collect();
+        }
         db.upsert_session(&parsed, 0, 0).unwrap();
         let runtime = db.execution_runtime();
         drop(db);
         let mut config = Config::default();
         config.ui.preview_lines = budget;
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
-        // The harness owns the tempdir for its whole life; forget it deliberately — the
-        // factory reads the same file for the worker's own connection.
         let factory = db_backed_executor(config.clone(), EffectiveAccessScope::All, runtime);
-        let harness = TuiHarness::with_factory(config.clone(), factory);
-        // The factory's worker opens its own connection to this file; the harness lives
-        // for the whole test, so leak the directory like the harness leaks its own db —
-        // bounded by the number of harnesses per test process.
-        std::mem::forget(dir);
+        let harness = TuiHarness::with_factory(config.clone(), factory).own_external_fixture(dir);
         (harness, config)
+    }
+
+    fn harness_with_preview_budget(budget: usize, transcript: &str) -> (TuiHarness, Config) {
+        harness_with_preview_source(budget, transcript, Some(transcript))
+    }
+
+    #[test]
+    fn harness_drop_closes_databases_before_removing_owned_directories() {
+        let internal;
+        let external;
+        {
+            let (harness, _config) = harness_with_preview_budget(
+                HISTORICAL_PREVIEW_BODY_LINES,
+                &join_turns(&[("user", "hello")]),
+            );
+            internal = harness._dir.path().to_path_buf();
+            external = harness
+                .external_fixture
+                .as_ref()
+                .expect("production fixture is owned")
+                .path()
+                .to_path_buf();
+        }
+        assert!(!internal.exists());
+        assert!(!external.exists());
+    }
+
+    #[test]
+    fn default_preview_preserves_historical_single_section_limit() {
+        let body = (0..40)
+            .map(|line| format!("body line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transcript = join_turns(&[("user", &body)]);
+        let summary = build_transcript_summary(&transcript, Config::default().ui.preview_lines);
+
+        assert!(summary.contains("body line 7"));
+        assert!(
+            !summary.contains("body line 8"),
+            "the default preview must preserve main's eight-line first-prompt limit: {summary}"
+        );
+    }
+
+    #[test]
+    fn transcript_preview_falls_back_when_normalized_messages_are_absent() {
+        let transcript = join_turns(&[
+            ("user", "first prompt"),
+            ("assistant", "first reply"),
+            ("user", "final prompt"),
+            ("assistant", "final reply"),
+        ]);
+        let budget = Config::default().ui.preview_lines;
+        let (mut harness, _config) = harness_with_preview_source(budget, &transcript, None);
+        harness.start();
+        for _ in 0..MAX_TEST_STEPS {
+            harness.step();
+            if harness.app.previewed_id.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            harness.app.preview,
+            format!(
+                "Session: claude:long\nCWD: /fixture/project\n\n{}",
+                build_transcript_summary(&transcript, budget)
+            ),
+            "readable indexes with transcript rows but no normalized messages must retain the established preview"
+        );
+    }
+
+    #[test]
+    fn transcript_preview_excludes_noncanonical_normalized_message_content() {
+        let transcript = join_turns(&[("user", "direct prompt"), ("assistant", "direct reply")]);
+        let normalized = join_turns(&[
+            (
+                "user",
+                "generated tool output that is absent from transcript",
+            ),
+            ("user", "direct prompt"),
+            ("assistant", "direct reply"),
+            (
+                "user",
+                "injected harness notice that is absent from transcript",
+            ),
+        ]);
+        let budget = Config::default().ui.preview_lines;
+        let (mut harness, _config) =
+            harness_with_preview_source(budget, &transcript, Some(&normalized));
+        harness.start();
+        for _ in 0..MAX_TEST_STEPS {
+            harness.step();
+            if harness.app.previewed_id.is_some() {
+                break;
+            }
+        }
+
+        assert!(harness.app.preview.contains("Session: claude:long"));
+        assert!(harness.app.preview.contains("CWD: /fixture/project"));
+        assert!(harness.app.preview.contains("direct prompt"));
+        assert!(harness.app.preview.contains("direct reply"));
+        assert!(!harness.app.preview.contains("generated tool output"));
+        assert!(!harness.app.preview.contains("injected harness notice"));
     }
 
     #[test]
@@ -3927,8 +4667,11 @@ mod tests {
         assert!(roomy.app.preview.contains("Final reply"));
         assert_eq!(
             roomy.app.preview,
-            build_transcript_summary(&transcript, 34),
-            "bounded normalized-message bookends must preserve the established preview output"
+            format!(
+                "Session: claude:long\nCWD: /fixture/project\n\n{}",
+                build_transcript_summary(&transcript, 34)
+            ),
+            "the borrowed canonical-transcript scan must preserve the established complete preview output"
         );
     }
 }

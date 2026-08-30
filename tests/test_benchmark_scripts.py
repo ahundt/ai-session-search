@@ -337,6 +337,14 @@ def test_generated_fixture_reindex_cannot_reach_the_running_user_s_transcripts()
     assert "fixture_dir" in reindex
 
 
+def test_generated_fixture_populates_canonical_tui_preview_transcripts() -> None:
+    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    generator = source.split("def generate_fixture(", 1)[1].split("def metadata(", 1)[0]
+    assert "insert into transcripts" in generator
+    assert "transcript_lines" in generator
+    assert "role in" in generator
+
+
 def test_benchmark_help_does_not_claim_an_obsolete_fixture_schema() -> None:
     source = (ROOT / "scripts/benchmark_release.py").read_text()
 
@@ -367,6 +375,17 @@ def test_benchmark_clients_do_not_use_removed_query_mode_flags() -> None:
         assert '"--regex"' not in source, name
 
 
+def test_tui_client_imports_without_unix_only_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    os_module = __import__("os")
+    monkeypatch.setattr(os_module, "name", "nt")
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    assert not client.PTY_SUPPORTED
+    with pytest.raises(SystemExit, match="POSIX"):
+        client._require_pty_support()
+
+
 def test_tui_client_latency_case_is_registered_and_opt_in() -> None:
     """The latency measurement is a separate manifest case; the startup case stays untouched."""
     source = (ROOT / "benchmarks" / "tui_client.py").read_text()
@@ -378,6 +397,13 @@ def test_tui_client_latency_case_is_registered_and_opt_in() -> None:
     cases = {case["id"]: case for case in manifest["cases"]}
     assert "--measure-latency" in cases["tui-typeahead-latency"]["argv"]
     assert cases["tui-typeahead-latency"]["result_json_field"] == "result_digest"
+    assert cases["tui-typeahead-latency"]["resource_json_fields"] == {
+        "wall_ms": "wall_ms",
+        "peak_rss_kib": "peak_rss_kb",
+        "peak_threads": "peak_threads",
+        "peak_processes": "process_count",
+        "cpu_seconds": "cpu_seconds",
+    }
     assert "--measure-latency" not in cases["tui-startup-list"]["argv"]
 
 
@@ -393,6 +419,67 @@ def test_release_runner_compares_tui_semantic_digest_not_performance_noise() -> 
     )
     assert first["result_sha256"] != second["result_sha256"]
     assert first["semantic_result_sha256"] == second["semantic_result_sha256"]
+
+
+def test_release_runner_accumulates_cpu_across_tree_total_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = load_script("benchmark_release.py")
+    polls = iter([None, None, None, None, 0])
+    resources = iter(
+        [
+            (1, 1, 1.0, 1),
+            (1, 1, 3.0, 2),
+            (1, 1, 1.0, 1),
+            (1, 1, 4.0, 2),
+        ]
+    )
+
+    class Child:
+        pid = 123
+        returncode = 0
+
+        @staticmethod
+        def poll() -> int | None:
+            return next(polls)
+
+        @staticmethod
+        def communicate() -> tuple[bytes, bytes]:
+            return b"", b""
+
+    monkeypatch.setattr(benchmark.subprocess, "Popen", lambda *_args, **_kwargs: Child())
+    monkeypatch.setattr(benchmark, "process_tree_resources", lambda _pid: next(resources))
+    monkeypatch.setattr(benchmark.time, "sleep", lambda _seconds: None)
+    sample = benchmark.sample_process(["ignored"])
+    assert sample["cpu_seconds"] == 6.0
+
+
+def test_release_runner_promotes_inner_tui_resource_measurements() -> None:
+    benchmark = load_script("benchmark_release.py")
+    report = {
+        "result_digest": "same",
+        "wall_ms": 123,
+        "peak_rss_kb": 456,
+        "peak_threads": 4,
+        "process_count": 1,
+        "cpu_seconds": 0.75,
+    }
+    sample = benchmark.sample_process(
+        [sys.executable, "-c", f"print({json.dumps(json.dumps(report))})"],
+        result_json_field="result_digest",
+        resource_json_fields={
+            "wall_ms": "wall_ms",
+            "peak_rss_kib": "peak_rss_kb",
+            "peak_threads": "peak_threads",
+            "peak_processes": "process_count",
+            "cpu_seconds": "cpu_seconds",
+        },
+    )
+    assert sample["wall_ms"] == 123
+    assert sample["peak_rss_kib"] == 456
+    assert sample["peak_threads"] == 4
+    assert sample["peak_processes"] == 1
+    assert sample["cpu_seconds"] == 0.75
 
 
 def test_tui_screen_tracker_buffers_every_split_csi_prefix() -> None:
@@ -535,6 +622,97 @@ def test_tui_completion_signal_timeout_does_not_accept_a_list_transition(
     assert result_ms is None
 
 
+def test_tui_repeated_final_character_settles_once_and_slash_is_not_echo(  # noqa: C901
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    sent: list[bytes] = []
+    settled = 0
+
+    class FakeTui:
+        child = type("Child", (), {"pid": 1})()
+
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def send(self, data: bytes) -> None:
+            sent.append(data)
+
+        def kill(self) -> None:
+            pass
+
+    class FakeTracker:
+        def full_screen(self) -> str:
+            return "Sessions Preview Enter/Esc to browse"
+
+        def derive_layout(self) -> object:
+            return type("Layout", (), {"list_rows": range(3)})()
+
+        def search_state(self) -> str:
+            return "ready"
+
+        def session_list(self, _layout: object) -> str:
+            return "rows"
+
+        def session_result_count(self) -> int:
+            return 1
+
+    class FakeSampler:
+        def __init__(self, _pid: int) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    def key_effects(
+        _tui: object,
+        _tracker: object,
+        _layout: object,
+        _prefix: str,
+        list_before: str,
+        _sent_at: float,
+        _timeout: float,
+        need_results: bool,
+    ) -> tuple[int, None, str, int, bool]:
+        assert not need_results
+        return 1, None, list_before, 1, False
+
+    def settle(*_args: object, **_kwargs: object) -> tuple[int, str, int]:
+        nonlocal settled
+        settled += 1
+        return 2, "rows", 1
+
+    monkeypatch.setattr(client, "TuiProcess", FakeTui)
+    monkeypatch.setattr(client, "ScreenTracker", FakeTracker)
+    monkeypatch.setattr(client, "ResourceSampler", FakeSampler)
+    monkeypatch.setattr(client, "drain_output", lambda *_args: None)
+    monkeypatch.setattr(client, "_await_search_mode", lambda *_args: (1, 1))
+    monkeypatch.setattr(client, "_await_key_effects", key_effects)
+    monkeypatch.setattr(client, "_await_settled_change", settle)
+    monkeypatch.setattr(
+        client,
+        "_finish_run",
+        lambda _tui, _timeout, label, echo, results, transitions, _sampler, output, digest, **_kwargs: {
+            "query": label,
+            "echo_ms": echo,
+            "results_ms": results,
+            "transitions": transitions,
+            "output_bytes": output,
+            "digest": digest,
+        },
+    )
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+
+    run = client._measure_once("aise", "fixture.db", "aba", 0.0, 0.01, "aba#0")
+    assert sent == [b"/", b"a", b"b", b"a"]
+    assert settled == 1
+    assert run["echo_ms"] == [1, 1, 1]
+    assert run["mode_entry_ms"] == 1
+
+
 def test_tui_latency_missing_echo_or_default_result_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -543,6 +721,7 @@ def test_tui_latency_missing_echo_or_default_result_fails_closed(
     def incomplete_run(*_args: object, **_kwargs: object) -> dict[str, object]:
         return {
             "query": "SQLite 1#0",
+            "mode_entry_ms": 1,
             "echo_ms": [0, -1],
             "results_ms": None,
             "transitions": 0,
@@ -554,6 +733,7 @@ def test_tui_latency_missing_echo_or_default_result_fails_closed(
             "digest": "a" * 64,
         }
 
+    monkeypatch.setattr(client, "_canonical_result_ids", lambda *_args: [])
     monkeypatch.setattr(client, "_measure_once", incomplete_run)
     with pytest.raises(SystemExit, match=r"missing.*echo|missing.*result"):
         client.measure_latency("aise", "fixture.db", ["SQLite 1"], 1, 0.0, 0.01)
@@ -583,6 +763,7 @@ def test_tui_latency_report_names_workload_symbols_and_throughput(
     def complete_run(*_args: object, **_kwargs: object) -> dict[str, object]:
         return {
             "query": "SQLite 1#0",
+            "mode_entry_ms": 1,
             "echo_ms": [1],
             "results_ms": 2,
             "transitions": 1,
@@ -597,6 +778,8 @@ def test_tui_latency_report_names_workload_symbols_and_throughput(
             "wall_ms": 100,
         }
 
+    monkeypatch.setattr(client, "_canonical_result_ids", lambda *_args: ["s1", "s2", "s3"])
+    monkeypatch.setattr(client, "_probe_tui_result_ids", lambda *_args: ["s1", "s2", "s3"])
     monkeypatch.setattr(client, "_measure_once", complete_run)
     report = client.measure_latency(
         "aise", str(fixture), ["SQLite 1"], 1, 0.0, 0.01
@@ -609,7 +792,53 @@ def test_tui_latency_report_names_workload_symbols_and_throughput(
         "messages_per_session_max": 2,
         "scoring_workers": 2,
     }
-    assert report["typed_keys_per_second"] == 90
+    assert report["typed_keys_per_second"] == 80
+    expected_query_digest = client.hashlib.sha256(b'["s1","s2","s3"]').hexdigest()
+    assert report["result_digests_by_query"] == {"SQLite 1": expected_query_digest}
+
+
+def test_tui_semantic_probe_rejects_equal_count_wrong_membership(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    fixture = tmp_path / "fixture.db"
+    connection = sqlite3.connect(fixture)
+    connection.executescript(
+        "create table messages(session_id text); create table transcripts(session_id text, transcript_text text);"
+    )
+    connection.close()
+
+    def complete_run(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "query": "q#0",
+            "mode_entry_ms": 1,
+            "echo_ms": [1],
+            "results_ms": 2,
+            "transitions": 1,
+            "peak_rss_kb": 1,
+            "peak_cpu_pct": 0.0,
+            "peak_threads": 1,
+            "process_count": 1,
+            "output_bytes": 1,
+            "digest": "a" * 64,
+            "result_count": 2,
+            "visible_rows": 2,
+            "wall_ms": 100,
+        }
+
+    monkeypatch.setattr(client, "_measure_once", complete_run)
+    monkeypatch.setattr(client, "_probe_tui_result_ids", lambda *_args: ["wrong", "s2"])
+    monkeypatch.setattr(client, "_canonical_result_ids", lambda *_args: ["s1", "s2"])
+    with pytest.raises(SystemExit, match="ordered session IDs differ"):
+        client.measure_latency("aise", str(fixture), ["q"], 1, 0.0, 0.01)
+
+
+def test_tui_result_limit_protocol_matches_rust_browser_floor() -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    source = (ROOT / "rust/ai-session-search-core/src/tui.rs").read_text()
+    match = re.search(r"const TUI_MIN_BROWSER_RESULTS: usize = (\d+);", source)
+    assert match is not None
+    assert client.TUI_RESULT_LIMIT == int(match.group(1))
 
 
 def test_tui_latency_repetitions_require_one_digest_per_query(
@@ -623,6 +852,7 @@ def test_tui_latency_repetitions_require_one_digest_per_query(
         calls += 1
         return {
             "query": f"SQLite 1#{calls - 1}",
+            "mode_entry_ms": 1,
             "echo_ms": [1],
             "results_ms": 2,
             "transitions": 1,
@@ -632,8 +862,13 @@ def test_tui_latency_repetitions_require_one_digest_per_query(
             "process_count": 1,
             "output_bytes": 1,
             "digest": ("a" if calls == 1 else "b") * 64,
+            "result_count": 1,
+            "visible_rows": 19,
+            "wall_ms": 100,
         }
 
+    monkeypatch.setattr(client, "_canonical_result_ids", lambda *_args: ["s1"])
+    monkeypatch.setattr(client, "_probe_tui_result_ids", lambda *_args: ["s1"])
     monkeypatch.setattr(client, "_measure_once", nondeterministic_run)
     with pytest.raises(SystemExit, match=r"non-deterministic.*SQLite 1"):
         client.measure_latency("aise", "fixture.db", ["SQLite 1"], 2, 0.0, 0.01)
@@ -662,14 +897,17 @@ def test_tui_output_bytes_use_the_single_captured_pty_ledger() -> None:
         {
             "peak_rss_kb": 1,
             "peak_cpu_pct": 0.0,
+            "cpu_seconds": 1.0,
             "peak_threads": 1,
             "process_count": 1,
+            "stop": lambda self: setattr(self, "peak_rss_kb", 9),
         },
     )()
     result = client._finish_run(
         FakeTui(), 0.01, "q#0", [1], 2, 1, sampler, 100, "a" * 64
     )
     assert result["output_bytes"] == 120
+    assert result["peak_rss_kb"] == 9, "report must copy peaks after sampler.stop() joins"
 
 
 def test_tui_resource_sampler_retains_process_peak(
@@ -695,7 +933,7 @@ def test_tui_resource_sampler_retains_process_peak(
     monkeypatch.setattr(
         client.subprocess,
         "run",
-        lambda *_args, **_kwargs: type("Result", (), {"stdout": "1 0.0"})(),
+        lambda *_args, **_kwargs: type("Result", (), {"stdout": "1 0.0 00:01"})(),
     )
     sampler.start()
     assert sampled_second.wait(1), "sampler did not take two process-tree samples"
@@ -731,6 +969,7 @@ def test_tui_resource_sampler_stop_joins_an_in_progress_sample(
     assert not stopper.is_alive()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="real PTY ownership is POSIX-only")
 def test_tui_process_uses_an_owned_hermetic_config_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -770,6 +1009,7 @@ def test_tui_process_uses_an_owned_hermetic_config_environment(
         tui.kill()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="real PTY ownership is POSIX-only")
 def test_tui_process_closes_owned_resources_when_spawn_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -805,11 +1045,14 @@ def test_tui_startup_refuses_to_claim_unobserved_terminal_restoration(
         def send(self, _data: bytes) -> None:
             pass
 
+        def read_chunk(self, _timeout: float) -> bytes:
+            return b"Sessions Preview Session: claude:s1 CWD: /fixture"
+
         def wait_draining(self, _timeout: float) -> int:
             return 0
 
         def drain_after_exit(self) -> bytes:
-            return b"Sessions Preview"
+            return b"Sessions Preview Session: claude:s1 CWD: /fixture"
 
         def kill(self) -> None:
             pass
