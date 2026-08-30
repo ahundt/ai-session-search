@@ -48,6 +48,11 @@ fn tui_result_limit(configured_default: usize) -> usize {
     configured_default.max(TUI_MIN_BROWSER_RESULTS)
 }
 
+/// Convert a configured unsigned step without `as` wrapping values above `isize::MAX` negative.
+fn saturating_step(value: usize) -> isize {
+    isize::try_from(value).unwrap_or(isize::MAX)
+}
+
 /// Search box height including its border rows; the query line is the middle row.
 const SEARCH_BOX_ROWS: u16 = 3;
 
@@ -176,22 +181,24 @@ impl Drop for TerminalGuard {
 /// MCP `search_messages` for content, canonical tool-name, and tool-argument search; keeping that
 /// boundary explicit avoids a second interactive message-search contract.
 pub fn run(config: &Config, db: &Db) -> Result<()> {
-    let _terminal_guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut events = CrosstermEventSource;
+    // Open and validate the worker before entering raw/alternate-screen mode: a slow or failed
+    // startup must leave the user's ordinary terminal visible.
     let (worker, _observed_scope) = spawn_search_worker(db_backed_executor(
         config.clone(),
         db.access_scope().clone(),
     ))?;
     let mut app = AppState::new(config, worker)?;
-    let action = run_app(&mut terminal, &mut events, &mut app);
 
-    // Restore the terminal before the resume output/prompt below runs on the normal screen.
-    // (The guard also restores on drop at end of scope — including the error/panic paths
-    // above; this just sequences restoration ahead of the interactive resume.)
-    drop(_terminal_guard);
+    // `app` is declared before the guard, so panic unwinding restores the terminal before
+    // SearchWorker::drop can wait for cancellation. The explicit normal-path drops preserve the
+    // same order and release the Db/runtime before any resume prompt or child process.
+    let terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let mut events = CrosstermEventSource;
+    let action = run_app(&mut terminal, &mut events, &mut app);
+    drop(terminal_guard);
+    drop(app);
 
     match action? {
         AppAction::Quit => Ok(()),
@@ -309,12 +316,36 @@ enum RequestKind {
     PreviewOnly,
 }
 
+/// Request identity is an allocation token rather than an integer, so it cannot wrap and make
+/// an ancient response current again (the same generation-token pattern used by MCP refresh).
+#[derive(Clone)]
+struct RequestGeneration(Arc<()>);
+
+impl RequestGeneration {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// A unit of work for the search worker.
 struct WorkerRequest {
     kind: RequestKind,
+    generation: RequestGeneration,
     query: String,
     filters: SearchFilters,
     selected_id: Option<String>,
+}
+
+/// Typed response envelope: successes and errors carry the same operation identity, so a late
+/// failure cannot overwrite the current screen any more than late rows can.
+struct WorkerOutcome {
+    kind: RequestKind,
+    generation: RequestGeneration,
+    result: Result<WorkerResponse>,
 }
 
 /// The standing empty-state preview text; `WorkerResponse::preview` supplies it when no row is
@@ -332,7 +363,6 @@ const NO_SESSIONS_PREVIEW: &str = "No sessions matched the current query.";
 /// sequence counter; `previewed_id` says which session the preview is *for*, so a preview
 /// overtaken by newer navigation is discarded rather than rendered beside the wrong row.
 struct WorkerResponse {
-    query: String,
     results: Option<Vec<SessionRecord>>,
     previewed_id: Option<String>,
     preview: Option<String>,
@@ -341,9 +371,8 @@ struct WorkerResponse {
 
 impl WorkerResponse {
     /// A search response: results only, no preview.
-    fn results(request: &WorkerRequest, rows: Vec<SessionRecord>) -> Self {
+    fn results(_request: &WorkerRequest, rows: Vec<SessionRecord>) -> Self {
         Self {
-            query: request.query.clone(),
             results: Some(rows),
             previewed_id: None,
             preview: None,
@@ -357,7 +386,6 @@ impl WorkerResponse {
         let preview = text.unwrap_or_else(|| NO_SESSIONS_PREVIEW.to_string());
         let preview_line_count = preview.lines().count();
         Self {
-            query: request.query.clone(),
             results: None,
             previewed_id: request.selected_id.clone(),
             preview: Some(preview),
@@ -388,7 +416,7 @@ type ExecutorFactory = Box<dyn FnOnce() -> Result<(SearchExecutor, EffectiveAcce
 /// Cancellation lands within at most one scoring batch (E19b), which bounds quit latency.
 struct SearchWorker {
     requests: Option<mpsc::Sender<WorkerRequest>>,
-    responses: mpsc::Receiver<Result<WorkerResponse>>,
+    responses: mpsc::Receiver<WorkerOutcome>,
     in_flight: Arc<Mutex<Option<Arc<QueryCancellation>>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -452,7 +480,7 @@ fn spawn_search_worker(
     let (ready_tx, ready_rx) =
         mpsc::sync_channel::<std::result::Result<EffectiveAccessScope, String>>(1);
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
-    let (response_tx, response_rx) = mpsc::channel::<Result<WorkerResponse>>();
+    let (response_tx, response_rx) = mpsc::channel::<WorkerOutcome>();
     // The ONE cancellation slot. Both the worker thread and the returned SearchWorker hold
     // clones of this same Arc — a second slot is what made supersede a silent no-op (C20).
     let in_flight: Arc<Mutex<Option<Arc<QueryCancellation>>>> = Arc::new(Mutex::new(None));
@@ -507,13 +535,14 @@ fn spawn_search_worker(
                     slot.take();
                 }
                 match outcome {
-                    Ok(response) => {
-                        let _ = response_tx.send(Ok(response));
-                    }
                     // Superseded mid-query: silent by design; the newer request owns the screen.
                     Err(error) if is_expected_interruption(&error) => {}
-                    Err(error) => {
-                        let _ = response_tx.send(Err(error));
+                    result => {
+                        let _ = response_tx.send(WorkerOutcome {
+                            kind: request.kind,
+                            generation: request.generation,
+                            result,
+                        });
                     }
                 }
             }
@@ -641,6 +670,11 @@ struct AppState<'a> {
     worker: SearchWorker,
     query: String,
     search_mode: bool,
+    current_search_generation: RequestGeneration,
+    current_preview_generation: RequestGeneration,
+    /// True from request submission until the matching search success/error is applied. Rendered
+    /// in the list title so the real-terminal benchmark can observe final-generation completion.
+    searching: bool,
     selected: usize,
     results: Vec<SessionRecord>,
     preview: String,
@@ -656,6 +690,9 @@ struct AppState<'a> {
     /// Last error from a keystroke-triggered operation, shown on its own line. A key press
     /// can never abort the TUI: errors land here instead of propagating through `?`.
     error: Option<String>,
+    /// A disconnected response producer is terminal for this worker. Remember reporting it so
+    /// every 10 ms idle drain does not redraw the same error forever.
+    worker_disconnected_reported: bool,
 }
 
 impl<'a> AppState<'a> {
@@ -689,6 +726,9 @@ impl<'a> AppState<'a> {
             worker,
             query: String::new(),
             search_mode: false,
+            current_search_generation: RequestGeneration::new(),
+            current_preview_generation: RequestGeneration::new(),
+            searching: false,
             selected: 0,
             results: Vec::new(),
             preview: String::new(),
@@ -697,6 +737,7 @@ impl<'a> AppState<'a> {
             previewed_id: None,
             preview_viewport_rows: 0,
             error: None,
+            worker_disconnected_reported: false,
         }
     }
 
@@ -727,11 +768,11 @@ impl<'a> AppState<'a> {
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::PageDown => {
-                    let page = self.config.ui.list_page_step as isize;
+                    let page = saturating_step(self.config.ui.list_page_step);
                     self.move_selection(page);
                 }
                 KeyCode::PageUp => {
-                    let page = self.config.ui.list_page_step as isize;
+                    let page = saturating_step(self.config.ui.list_page_step);
                     self.move_selection(-page);
                 }
                 KeyCode::Char('g') => self.select_index(0),
@@ -744,19 +785,19 @@ impl<'a> AppState<'a> {
                 KeyCode::Char('s') => self.cycle_since_window(),
                 KeyCode::Char('w') => self.toggle_warnings_only(),
                 KeyCode::Char('l') | KeyCode::Right => {
-                    let step = self.config.ui.preview_scroll_step as isize;
+                    let step = saturating_step(self.config.ui.preview_scroll_step);
                     self.scroll_preview(step);
                 }
                 KeyCode::Char('h') | KeyCode::Left => {
-                    let step = self.config.ui.preview_scroll_step as isize;
+                    let step = saturating_step(self.config.ui.preview_scroll_step);
                     self.scroll_preview(-step);
                 }
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let page = self.config.ui.preview_page_step as isize;
+                    let page = saturating_step(self.config.ui.preview_page_step);
                     self.scroll_preview(page);
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let page = self.config.ui.preview_page_step as isize;
+                    let page = saturating_step(self.config.ui.preview_page_step);
                     self.scroll_preview(-page);
                 }
                 KeyCode::Enter | KeyCode::Char('r') => {
@@ -777,28 +818,63 @@ impl<'a> AppState<'a> {
     /// Complexity (REQ010): `O(responses × K)` for the id lookup; no I/O, no lock held.
     fn drain_responses(&mut self) -> bool {
         let mut applied = false;
-        while let Ok(response) = self.worker.responses.try_recv() {
-            applied = true;
-            match response {
-                Err(error) => {
-                    self.error = Some(format!("{error:#}"));
+        loop {
+            match self.worker.responses.try_recv() {
+                Ok(outcome) => applied |= self.apply_outcome(outcome),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if !self.worker_disconnected_reported {
+                        self.worker_disconnected_reported = true;
+                        self.searching = false;
+                        self.error = Some(
+                            "the search worker stopped; press q to quit and rerun aise tui"
+                                .to_string(),
+                        );
+                        applied = true;
+                    }
+                    break;
                 }
-                Ok(response) if response.query != self.query => {}
-                Ok(response) => self.apply_response(response),
             }
         }
         applied
     }
 
+    /// Apply only the current operation generation. Query equality remains useful presentation
+    /// context, but it is not request identity: filter-only changes keep the same query (R9-F1).
+    fn apply_outcome(&mut self, outcome: WorkerOutcome) -> bool {
+        let current = match outcome.kind {
+            RequestKind::Search => outcome.generation.same_as(&self.current_search_generation),
+            RequestKind::PreviewOnly => {
+                outcome.generation.same_as(&self.current_preview_generation)
+            }
+        };
+        if !current {
+            return false;
+        }
+        if outcome.kind == RequestKind::Search {
+            self.searching = false;
+        }
+        match outcome.result {
+            Ok(response) => self.apply_response(response),
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+        true
+    }
+
     /// Queue a search for the current query. `send` cancels any in-flight search first —
     /// this is what makes supersede real (D3). Never `?`: a dead worker sets the error line.
     fn request_search(&mut self) {
+        let generation = RequestGeneration::new();
+        self.current_search_generation = generation.clone();
+        self.searching = true;
         if let Err(message) = self.worker.send(WorkerRequest {
             kind: RequestKind::Search,
+            generation,
             query: self.query.clone(),
             filters: self.filters.clone(),
             selected_id: self.selected_session().map(|session| session.id.clone()),
         }) {
+            self.searching = false;
             self.error = Some(message);
         }
     }
@@ -814,8 +890,11 @@ impl<'a> AppState<'a> {
         if selected == self.previewed_id {
             return;
         }
+        let generation = RequestGeneration::new();
+        self.current_preview_generation = generation.clone();
         if let Err(message) = self.worker.send(WorkerRequest {
             kind: RequestKind::PreviewOnly,
+            generation,
             query: self.query.clone(),
             filters: self.filters.clone(),
             selected_id: selected,
@@ -980,11 +1059,16 @@ impl<'a> AppState<'a> {
 
         // Session list. The label column is the configured width clamped up to the longest
         // label, so a smaller value pads but can never truncate (D10 stays fixed).
+        let longest_label = longest_provider_label();
+        let list_interior_width = usize::from(middle[0].width.saturating_sub(2));
         let label_width = self
             .config
             .ui
             .provider_label_width
-            .max(longest_provider_label());
+            .max(longest_label)
+            // A config value cannot request an allocation wider than the actual pane. Keep the
+            // structural label floor for terminals too narrow to display it in full.
+            .min(list_interior_width.max(longest_label));
         let items = self
             .results
             .iter()
@@ -1029,8 +1113,9 @@ impl<'a> AppState<'a> {
         } else {
             "ranked"
         };
+        let activity = if self.searching { " · searching" } else { "" };
         let list_title = format!(
-            " Sessions · {mode} ({}/{}) ",
+            " Sessions · {mode}{activity} ({}/{}) ",
             if self.results.is_empty() {
                 0
             } else {
@@ -1095,8 +1180,9 @@ impl<'a> AppState<'a> {
         if self.results.is_empty() {
             return;
         }
-        let new =
-            (self.selected as isize + delta).clamp(0, self.results.len() as isize - 1) as usize;
+        let new = (self.selected as isize)
+            .saturating_add(delta)
+            .clamp(0, self.results.len() as isize - 1) as usize;
         if new != self.selected {
             self.selected = new;
             self.preview_scroll = 0;
@@ -1122,12 +1208,15 @@ impl<'a> AppState<'a> {
     /// empty out as you scrolled.
     fn clamp_preview_scroll(&mut self) {
         let visible = usize::from(self.preview_viewport_rows).max(PREVIEW_VIEWPORT_SLACK);
-        let max = self.preview_line_count.saturating_sub(visible) as u16;
+        let max =
+            u16::try_from(self.preview_line_count.saturating_sub(visible)).unwrap_or(u16::MAX);
         self.preview_scroll = self.preview_scroll.min(max);
     }
 
     fn scroll_preview(&mut self, delta: isize) {
-        self.preview_scroll = (self.preview_scroll as isize + delta).max(0) as u16;
+        self.preview_scroll =
+            u16::try_from((self.preview_scroll as isize).saturating_add(delta).max(0))
+                .unwrap_or(u16::MAX);
         self.clamp_preview_scroll();
     }
 
@@ -2235,6 +2324,94 @@ mod tests {
     }
 
     #[test]
+    fn same_query_response_from_superseded_filters_is_dropped() {
+        let (release, gate) = mpsc::channel::<()>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::Search && request.filters.provider.is_some() {
+                    park_until_released_or_cancelled(&gate, cancellation);
+                }
+                Ok(match request.kind {
+                    RequestKind::Search => {
+                        WorkerResponse::results(request, rows(&["claude:current-filter-result"]))
+                    }
+                    RequestKind::PreviewOnly => WorkerResponse::preview(request, None),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        let old_request = WorkerRequest {
+            kind: RequestKind::Search,
+            generation: harness.app.current_search_generation.clone(),
+            query: harness.app.query.clone(),
+            filters: harness.app.filters.clone(),
+            selected_id: harness
+                .app
+                .selected_session()
+                .map(|session| session.id.clone()),
+        };
+
+        // Provider changes the request semantics without changing the query. Its successor is
+        // parked, so an already-queued old response cannot be rescued by a later correct one.
+        harness.app.cycle_provider();
+        assert_eq!(harness.app.query, old_request.query);
+        assert!(!harness.app.apply_outcome(WorkerOutcome {
+            kind: RequestKind::Search,
+            generation: old_request.generation.clone(),
+            result: Ok(WorkerResponse::results(
+                &old_request,
+                rows(&["claude:stale-unfiltered"]),
+            )),
+        }));
+        assert!(
+            !harness
+                .app
+                .results
+                .iter()
+                .any(|row| row.id == "claude:stale-unfiltered"),
+            "response identity must include the filter generation, not only equal query text"
+        );
+        finish_gated(&release);
+    }
+
+    #[test]
+    fn error_from_superseded_search_is_dropped() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:keep"]);
+        let stale = harness.app.current_search_generation.clone();
+        harness.app.request_search();
+        assert!(!harness.app.apply_outcome(WorkerOutcome {
+            kind: RequestKind::Search,
+            generation: stale,
+            result: Err(anyhow::anyhow!("stale failure")),
+        }));
+        assert!(
+            harness.app.error.is_none(),
+            "a stale error must not replace the current operation state"
+        );
+    }
+
+    #[test]
+    fn list_title_exposes_current_search_completion() {
+        let (release, gate) = mpsc::channel::<()>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::Search {
+                    park_until_released_or_cancelled(&gate, cancellation);
+                }
+                Ok(WorkerResponse::results(request, rows(&["claude:done"])))
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:before"]);
+        harness.step();
+        assert!(screen_text(&harness.terminal).contains("searching"));
+        release.send(()).unwrap();
+        step_until(&mut harness, |harness| !harness.app.searching);
+        harness.step();
+        assert!(!screen_text(&harness.terminal).contains("searching"));
+        finish_gated(&release);
+    }
+
+    #[test]
     fn preview_only_response_does_not_replace_the_result_list() {
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
         let executor = Box::new(
@@ -2506,6 +2683,34 @@ mod tests {
         assert_eq!(harness.app.selected, 1);
         finish_gated(&release);
         wait_for_executed(&executed_rx, "");
+    }
+
+    #[test]
+    fn worker_disconnect_is_reported_once_without_another_key() {
+        let executor = Box::new(
+            move |_request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                panic!("startup executor exploded")
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        for _ in 0..MAX_TEST_STEPS {
+            harness.step();
+            if harness.app.error.is_some() {
+                break;
+            }
+        }
+        assert!(
+            harness
+                .app
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("worker stopped")),
+            "response-channel disconnect must surface without requiring another key"
+        );
+        assert!(
+            !harness.app.drain_responses(),
+            "disconnect is reported once"
+        );
     }
 
     #[test]
@@ -3153,6 +3358,52 @@ mod tests {
         assert!(
             harness.session_rows().contains("ranked"),
             "a typed query names its ordering"
+        );
+    }
+
+    #[test]
+    fn extreme_configured_steps_preserve_navigation_direction() {
+        let mut config = Config::default();
+        config.ui.list_page_step = usize::MAX;
+        config.ui.preview_page_step = usize::MAX;
+        let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&[
+            "claude:one",
+            "claude:two",
+            "claude:three",
+        ]);
+        harness.app.selected = 1;
+        harness.app.preview_line_count = usize::from(u16::MAX) + 100;
+        harness.app.preview_viewport_rows = 10;
+        harness.app.preview_scroll = 1;
+
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            harness.app.selected, 2,
+            "PageDown must never wrap into an upward move"
+        );
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(
+            harness.app.preview_scroll,
+            u16::MAX,
+            "a huge forward preview step must saturate, never wrap backward"
+        );
+    }
+
+    #[test]
+    fn provider_label_width_is_capped_to_list_interior() {
+        let mut config = Config::default();
+        config.ui.provider_label_width = usize::MAX;
+        let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
+        harness.step();
+        assert!(
+            screen_text(&harness.terminal)
+                .lines()
+                .all(|line| line.chars().count() <= 100),
+            "configured formatting width must remain bounded by the rendered pane"
         );
     }
 

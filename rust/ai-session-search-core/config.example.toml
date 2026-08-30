@@ -236,8 +236,8 @@ repeat_phrase_max_words = 5
 # their weights (first prompt, first reply, final prompt, final reply), each floored at one
 # line so a small budget cannot erase a bookend.
 preview_lines = 30
-# Idle wake interval for the TUI event loop, in milliseconds. Not a keystroke latency:
-# input drains in a burst loop, so this only paces redraws while the user is idle.
+# Idle wake interval for the TUI event loop, in milliseconds (minimum 1). Not a keystroke
+# latency: input drains in a burst loop, so this only paces redraws while the user is idle.
 event_poll_interval_ms = 150
 # Rows the selection moves for PageDown/PageUp in the session list.
 list_page_step = 10
@@ -245,8 +245,8 @@ list_page_step = 10
 preview_scroll_step = 5
 # Lines the preview scrolls for Ctrl-d/Ctrl-u.
 preview_page_step = 15
-# Provider label column width in the session list. The renderer clamps upward to the longest
-# label, so a smaller value can never truncate one.
+# Provider label column width in the session list. The renderer clamps to the longest label
+# and the actual pane interior, preventing truncation and unbounded formatting allocations.
 provider_label_width = 9
 # Percent of the body width for the session-list pane; the preview pane gets the remainder.
 list_pane_percent = 45

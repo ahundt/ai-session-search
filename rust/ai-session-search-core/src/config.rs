@@ -1697,6 +1697,9 @@ impl Config {
         if self.search.default_limit == 0 {
             bail!("search.default_limit must be greater than zero; {FIX}");
         }
+        if self.ui.event_poll_interval_ms == 0 {
+            bail!("ui.event_poll_interval_ms must be greater than zero; {FIX}");
+        }
         if self.release_notifications.minimum_check_interval_hours == 0 {
             bail!(
                 "release_notifications.minimum_check_interval_hours must be 1 or greater, got 0; \
@@ -2229,6 +2232,10 @@ mod tests {
             (
                 |c| c.search.default_limit = 0,
                 "search.default_limit must be greater than zero",
+            ),
+            (
+                |c| c.ui.event_poll_interval_ms = 0,
+                "ui.event_poll_interval_ms must be greater than zero",
             ),
             (
                 |c| c.mcp.search_messages_limit = 0,

@@ -38,6 +38,14 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- TUI responses and errors now carry allocation-backed request generations, so an old search
+  with the same query but different provider/class/window filters cannot overwrite current state.
+  The list title exposes when the current generation is searching; a worker panic reports once
+  without requiring another key. Worker/database resources are released before the resume prompt
+  or resumed process, and terminal mode is entered only after worker startup succeeds.
+- `[ui].event_poll_interval_ms = 0` is rejected because it prevents input polling. Extreme page
+  and scroll steps saturate without reversing direction or overflowing, and provider-label width
+  is bounded by the rendered pane instead of allocating the configured width blindly.
 - Typing in `aise tui` no longer runs the search on the input thread: each keystroke renders
   immediately, searches run on a worker thread through the same `CatalogService` seam as the
   CLI, MCP, and Python surfaces, and a superseded search is cancelled instead of running to

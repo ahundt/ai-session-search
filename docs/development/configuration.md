@@ -256,12 +256,14 @@ pipelines can request all summary evidence with `--summary-items 0 --format json
 ## TUI display defaults
 
 `[ui]` configures the interactive terminal UI only. Four interaction keys ship now:
-`event_poll_interval_ms` (150) paces the idle redraw loop — it is not a keystroke latency,
-because queued input drains in one burst before the next draw; `list_page_step` (10) is the
+`event_poll_interval_ms` (150, minimum 1) paces the idle redraw loop — it is not a keystroke
+latency, because queued input drains in one burst before the next draw; zero is rejected because
+it would return before polling any key. `list_page_step` (10) is the
 PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and `preview_page_step`
 (15) are the l/h and Ctrl-d/Ctrl-u scroll amounts; `provider_label_width` (9) is the session
-list's provider column width — the renderer clamps upward to the longest label so a smaller
-value can never truncate one — and `list_pane_percent` (45) is the body width share of the
+list's provider column width — the renderer clamps upward to the longest label and downward to
+the rendered pane interior, so neither a small value nor an extreme value can truncate a known
+label or request an unbounded formatting allocation — and `list_pane_percent` (45) is the body width share of the
 session-list pane, the preview pane taking the remainder. `[ui].preview_lines` (30) is the
 preview's total body budget: the transcript summary's sections scale proportionally to their
 weights (8/4/8/14), renormalised over the sections actually emitted and each floored at one
