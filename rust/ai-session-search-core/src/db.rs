@@ -6312,7 +6312,7 @@ fn score_session_records(
         cancellation,
         now,
     } = context;
-    let scored = records
+    records
         .into_par_iter()
         .map(|record| -> Result<Option<SearchHit>> {
             if let Some(cancellation) = cancellation {
@@ -6404,8 +6404,12 @@ fn score_session_records(
                 match_snippet: best_snippet,
             }))
         })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(scored.into_iter().flatten().collect())
+        // Transpose before collecting so non-matching rows are dropped inside the parallel
+        // fold. Collecting `Vec<Option<SearchHit>>` first and flattening afterwards would size
+        // the intermediate by batch rows `N_b` rather than by matches `M_b`, and move every
+        // surviving hit a second time.
+        .filter_map(|scored| scored.transpose())
+        .collect::<Result<Vec<_>>>()
 }
 
 fn compare_session_hits(left: &SearchHit, right: &SearchHit) -> std::cmp::Ordering {
