@@ -182,6 +182,39 @@ fn elide_middle(text: &str, width: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// Separator between status-bar hints.
+const STATUS_HINT_SEPARATOR: &str = " │ ";
+
+/// Fit status-bar hints into `width` display columns by dropping whole hints instead of eliding
+/// characters out of the middle of the joined line.
+///
+/// Middle-eliding a help bar is the wrong shape for it: at 80 columns it cut the line to
+/// `p:any … │ j/k: move │ P…rs │ /: search`, which names no binding the reader can act on. A hint
+/// is only worth its columns while it is readable, so the lowest-priority hints leave first and
+/// the rest stay whole. `priority` is drop order, 0 last; ties drop the hint further right, so the
+/// ones a reader scans first survive longest. The final hint is always kept, and the caller still
+/// elides it for a frame too narrow even for that.
+fn fit_status_hints(hints: &[(u8, &str)], width: usize) -> String {
+    let mut kept: Vec<usize> = (0..hints.len()).collect();
+    loop {
+        let text = kept
+            .iter()
+            .map(|index| hints[*index].1)
+            .collect::<Vec<_>>()
+            .join(STATUS_HINT_SEPARATOR);
+        if kept.len() == 1 || UnicodeWidthStr::width(text.as_str()) <= width {
+            return text;
+        }
+        let victim = kept
+            .iter()
+            .enumerate()
+            .max_by_key(|(position, index)| (hints[**index].0, *position))
+            .map(|(position, _)| position)
+            .expect("kept is never empty");
+        kept.remove(victim);
+    }
+}
+
 /// The crossterm event API is a set of free functions over a process-global source, so it
 /// cannot be substituted in a test. This is the seam: production wraps those functions, tests
 /// replay a script. Mirrors `crossterm::event::{poll, read}` (crossterm 0.29).
@@ -1498,17 +1531,27 @@ impl AppState {
 
         // Status bar (single line, contextual) — also middle-elided to the frame, so the
         // navigation hints at the head and "q: quit" at the tail both survive a narrow frame.
-        let help_text = if self.search_mode {
-            format!(
-                "{} │ Type to search │ Enter/Esc: browse",
-                self.filter_status()
-            )
+        let filters = self.filter_status();
+        let hints: &[(u8, &str)] = if self.search_mode {
+            &[
+                (1, &filters),
+                (1, "Type to search"),
+                (0, "Enter/Esc: browse"),
+            ]
         } else {
-            format!(
-                "{} │ j/k: move │ PgUp/PgDn: page │ g/G: top/bottom │ h/l: scroll │ p/f/s/w: filters │ /: search │ Enter: resume │ q: quit",
-                self.filter_status()
-            )
+            &[
+                (1, &filters),
+                (1, "j/k: move"),
+                (4, "PgUp/PgDn: page"),
+                (4, "g/G: top/bottom"),
+                (3, "h/l: scroll"),
+                (2, "p/f/s/w: filters"),
+                (1, "/: search"),
+                (2, "Enter: resume"),
+                (0, "q: quit"),
+            ]
         };
+        let help_text = fit_status_hints(hints, frame_width);
         let bottom = Paragraph::new(Span::styled(
             elide_middle(&help_text, frame_width),
             Style::default().fg(Color::DarkGray),
@@ -4302,6 +4345,57 @@ mod tests {
         );
         harness.app.scroll_preview(isize::MAX);
         assert!(harness.app.preview_scroll > 0);
+    }
+
+    #[test]
+    fn status_bar_drops_whole_hints_instead_of_eliding_them() {
+        // Middle-eliding the joined help line rendered `p:any … │ j/k: move │ P…rs │ /: search`
+        // at 80 columns: no binding the reader can act on, and the new p/f/s/w filter keys were
+        // the first casualty. Whatever fits must fit whole, and `q: quit` must survive every
+        // width a terminal is likely to have.
+        for (width, required) in [
+            (
+                120_u16,
+                &[
+                    "j/k: move",
+                    "h/l: scroll",
+                    "p/f/s/w: filters",
+                    "/: search",
+                    "q: quit",
+                ][..],
+            ),
+            (
+                100,
+                &["j/k: move", "p/f/s/w: filters", "/: search", "q: quit"][..],
+            ),
+            (
+                80,
+                &["j/k: move", "p/f/s/w: filters", "/: search", "q: quit"][..],
+            ),
+            (60, &["j/k: move", "/: search", "q: quit"][..]),
+        ] {
+            let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+            harness.terminal.backend_mut().resize(width, 24);
+            harness
+                .terminal
+                .draw(|frame| harness.app.render(frame))
+                .unwrap();
+            let status = harness.status_line();
+            assert!(
+                !status.contains('…'),
+                "width {width} cut a hint mid-word: {status:?}"
+            );
+            for hint in required {
+                assert!(
+                    status.contains(hint),
+                    "width {width} dropped {hint:?}: {status:?}"
+                );
+            }
+            assert!(
+                UnicodeWidthStr::width(status.as_str()) <= usize::from(width),
+                "width {width} overflowed the frame: {status:?}"
+            );
+        }
     }
 
     #[test]

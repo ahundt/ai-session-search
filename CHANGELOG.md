@@ -40,6 +40,10 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- The TUI status bar sheds whole hints on a narrow frame instead of eliding characters out of
+  the middle of the joined line. At 80 columns it rendered `P…rs` where `p/f/s/w: filters`
+  belonged; it now keeps `j/k: move`, `p/f/s/w: filters`, `/: search`, and `q: quit` readable,
+  dropping the paging and scroll hints first.
 - A TUI preview re-applied for the row already on screen keeps the reader's scroll position.
   The worker counts logical lines, so clamping against its count pulled a reader out of a
   word-wrapped tail that only the renderer's row count can measure.
