@@ -447,7 +447,6 @@ struct WorkerResponse {
     results: Option<Vec<SessionRecord>>,
     previewed_id: Option<String>,
     preview: Option<String>,
-    preview_line_count: usize,
 }
 
 impl WorkerResponse {
@@ -457,20 +456,20 @@ impl WorkerResponse {
             results: Some(rows),
             previewed_id: None,
             preview: None,
-            preview_line_count: 0,
         }
     }
 
     /// A preview response. `None` text means "no selected session" and renders the standing
     /// empty-state message, matching the inline preview path.
+    ///
+    /// It deliberately carries no line count. The worker can only count logical lines, and the
+    /// scroll bound is in terminal rows after word wrapping, which only the renderer knows; a
+    /// second count here would clamp a reader out of the wrapped tail.
     fn preview(request: &WorkerRequest, text: Option<String>) -> Self {
-        let preview = text.unwrap_or_else(|| NO_SESSIONS_PREVIEW.to_string());
-        let preview_line_count = preview.lines().count();
         Self {
             results: None,
             previewed_id: request.selected_id.clone(),
-            preview: Some(preview),
-            preview_line_count,
+            preview: Some(text.unwrap_or_else(|| NO_SESSIONS_PREVIEW.to_string())),
         }
     }
 }
@@ -921,6 +920,9 @@ struct AppState {
     results: Vec<SessionRecord>,
     preview: String,
     preview_scroll: u16,
+    /// The preview's height in terminal rows after word wrapping, recorded by `render`. The
+    /// worker cannot supply it: wrapping depends on the pane width, so this is the only count
+    /// the scroll bound may use.
     preview_line_count: usize,
     /// The session whose preview is currently rendered: the skip guard for rescanning the
     /// canonical transcript per keystroke, and the match check that discards overtaken output.
@@ -1315,11 +1317,11 @@ impl AppState {
             }
             let same_session = response.previewed_id == self.previewed_id;
             self.preview = preview;
-            self.preview_line_count = response.preview_line_count;
             self.previewed_id = response.previewed_id;
-            if same_session {
-                self.clamp_preview_scroll();
-            } else {
+            // A new row starts at the top. The same row keeps its place: the next draw
+            // recomputes the wrapped row count and clamps against it, and every path that
+            // applies a response draws before the next key is handled.
+            if !same_session {
                 self.preview_scroll = 0;
             }
         }
@@ -4300,6 +4302,48 @@ mod tests {
         );
         harness.app.scroll_preview(isize::MAX);
         assert!(harness.app.preview_scroll > 0);
+    }
+
+    #[test]
+    fn reapplying_the_same_preview_keeps_the_wrapped_scroll_position() {
+        // Two authorities counted preview length: the worker's logical `lines().count()` and the
+        // renderer's word-wrapped row count. Clamping on re-apply against the smaller logical
+        // count dragged a reader who had scrolled into the wrapped tail back to the top. A
+        // preview re-arrives for the row already on screen whenever an earlier preview failure
+        // is retried, so the rendered count has to own the bound.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(30, 10);
+        harness.app.previewed_id = Some("claude:one".to_string());
+        harness.app.preview = std::iter::repeat_n("abcdefghij", 20)
+            .collect::<Vec<_>>()
+            .join(" ");
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        harness.app.scroll_preview(isize::MAX);
+        let scrolled = harness.app.preview_scroll;
+        assert!(
+            scrolled > 0,
+            "the fixture must wrap past its viewport for this to mean anything"
+        );
+
+        let request = WorkerRequest {
+            kind: RequestKind::PreviewOnly,
+            generation: harness.app.current_preview_generation.clone(),
+            query: String::new(),
+            filters: harness.app.filters.clone(),
+            selected_id: Some("claude:one".to_string()),
+        };
+        let same_text = harness.app.preview.clone();
+        harness
+            .app
+            .apply_response(WorkerResponse::preview(&request, Some(same_text)));
+
+        assert_eq!(
+            harness.app.preview_scroll, scrolled,
+            "re-applying the identical preview must not move the reader's position"
+        );
     }
 
     #[test]

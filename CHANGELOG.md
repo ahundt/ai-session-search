@@ -40,6 +40,9 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- A TUI preview re-applied for the row already on screen keeps the reader's scroll position.
+  The worker counts logical lines, so clamping against its count pulled a reader out of a
+  word-wrapped tail that only the renderer's row count can measure.
 - TUI preview metadata and canonical transcript are read in one SQLite snapshot; word-wrapped
   scroll bounds use Ratatui's own line composer, wide/newline errors remain one display-width-bounded
   row, and a current preview failure cannot leave another session's content beside the selection.
