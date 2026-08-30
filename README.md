@@ -376,7 +376,7 @@ tradeoff is worth it.
 | `aise package status\|check\|update` | Package ownership, release checks, and manager-driven updates |
 | `aise integrations install\|status\|uninstall\|recover`, `aise mcp serve` | Aliases, MCP registrations, owned instructions and skills, and the MCP transport |
 | `aise db` | Expert read-only SQL; `aise db query --help` lists the tables and the column values a predicate misreads |
-| `aise tui` | Interactive session browser; message-field modes stay in `aise messages search` |
+| `aise tui` | Interactive session browser with live typeahead search, preview scroll, and session filter bindings (p provider, f class, s window, w warnings); message-field modes stay in `aise messages search` |
 | `aise dates` | Every accepted date and duration form |
 
 ## Architecture

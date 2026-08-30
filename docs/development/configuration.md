@@ -259,7 +259,10 @@ pipelines can request all summary evidence with `--summary-items 0 --format json
 `event_poll_interval_ms` (150) paces the idle redraw loop — it is not a keystroke latency,
 because queued input drains in one burst before the next draw; `list_page_step` (10) is the
 PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and `preview_page_step`
-(15) are the l/h and Ctrl-d/Ctrl-u scroll amounts. `[ui].preview_lines` is accepted but not
+(15) are the l/h and Ctrl-d/Ctrl-u scroll amounts; `provider_label_width` (9) is the session
+list's provider column width — the renderer clamps upward to the longest label so a smaller
+value can never truncate one — and `list_pane_percent` (45) is the body width share of the
+session-list pane, the preview pane taking the remainder. `[ui].preview_lines` is accepted but not
 yet read; making it live is a planned change with its own entry. Every example-file line equals
 its typed Rust default.
 

@@ -241,6 +241,11 @@ list_page_step = 10
 preview_scroll_step = 5
 # Lines the preview scrolls for Ctrl-d/Ctrl-u.
 preview_page_step = 15
+# Provider label column width in the session list. The renderer clamps upward to the longest
+# label, so a smaller value can never truncate one.
+provider_label_width = 9
+# Percent of the body width for the session-list pane; the preview pane gets the remainder.
+list_pane_percent = 45
 
 # Uncomment provider tables only when you want to disable a provider or replace the platform
 # defaults with explicit paths. If `paths` is absent, aise uses built-in OS-aware defaults;

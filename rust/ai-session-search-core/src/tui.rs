@@ -4,6 +4,9 @@
 
 use std::io;
 use std::num::NonZeroUsize;
+
+use chrono::Utc;
+use clap::ValueEnum;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -25,7 +28,7 @@ use ratatui::{
 
 use crate::config::Config;
 use crate::db::{Db, QueryCancellation, SCHEMA_VERSION};
-use crate::models::{Provider, SearchFilters, SessionRecord};
+use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
 use crate::search_scope::EffectiveAccessScope;
 use crate::service::CatalogService;
 use crate::util::{
@@ -62,6 +65,58 @@ const ERROR_LINE_ROWS: u16 = 1;
 /// Two border rows plus one content row: the scroll-clamp floor before the first render has
 /// recorded a viewport height (D11).
 const PREVIEW_VIEWPORT_SLACK: usize = 3;
+
+/// Worst-case rendered width of a list row's " [age]" suffix, from relative_age's output
+/// shapes: its longest form is the date branch, " [2026-01-16]".
+const AGE_SUFFIX_ALLOWANCE: usize = 13;
+
+/// The session list's provider labels (D6/D10): uppercase throughout — the old table's
+/// "GEMINI" and "Gemini" were near-identical, and "AI Studio" overflowed a `{:<6}` field
+/// that pads but never truncates.
+fn provider_label(provider: Provider) -> (&'static str, Color) {
+    match provider {
+        Provider::Claude => ("CLAUDE", Color::Green),
+        Provider::ClaudeDesktop => ("CL-DESK", Color::Green),
+        Provider::Codex => ("CODEX", Color::Cyan),
+        Provider::Cursor => ("CURSOR", Color::Magenta),
+        Provider::Antigravity => ("ANTIGRAV", Color::Yellow),
+        Provider::Pi => ("PI", Color::Green),
+        Provider::PrimeAgent => ("PRIME", Color::LightGreen),
+        Provider::AiStudio => ("AISTUDIO", Color::Cyan),
+        Provider::GeminiCli => ("GEMINICLI", Color::Blue),
+    }
+}
+
+/// The label-column floor, derived from the table so adding a provider can never produce a
+/// truncating width.
+fn longest_provider_label() -> usize {
+    Provider::value_variants()
+        .iter()
+        .map(|provider| provider_label(*provider).0.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Middle-elide `text` to `width` columns, keeping the tail intact: an anyhow chain ends
+/// with its recovery guidance, and REQ047 forbids losing it to a clipped line. Char-count
+/// approximation — the TUI's own strings are ASCII with one │ separator.
+fn elide_middle(text: &str, width: usize) -> String {
+    let total = text.chars().count();
+    if total <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let head = width.saturating_sub(2) / 2;
+    let tail = width - head - 1;
+    let head_chars: String = text.chars().take(head).collect();
+    let tail_chars: String = text.chars().skip(total - tail).collect();
+    format!("{head_chars}…{tail_chars}")
+}
 
 /// The crossterm event API is a set of free functions over a process-global source, so it
 /// cannot be substituted in a test. This is the seam: production wraps those functions, tests
@@ -639,6 +694,10 @@ impl<'a> AppState<'a> {
                     let last = self.results.len().saturating_sub(1);
                     self.select_index(last);
                 }
+                KeyCode::Char('p') => self.cycle_provider(),
+                KeyCode::Char('f') => self.cycle_session_kinds(),
+                KeyCode::Char('s') => self.cycle_since_window(),
+                KeyCode::Char('w') => self.toggle_warnings_only(),
                 KeyCode::Char('l') | KeyCode::Right => {
                     let step = self.config.ui.preview_scroll_step as isize;
                     self.scroll_preview(step);
@@ -717,6 +776,74 @@ impl<'a> AppState<'a> {
         }
     }
 
+    /// Revalidate after a filter binding and re-run the search. A rejected combination is
+    /// rendered on the error line, never sent — the request would be unsatisfiable.
+    fn apply_filter_change(&mut self) {
+        if let Err(error) = self.filters.validate() {
+            self.error = Some(format!("{error:#}"));
+            return;
+        }
+        self.request_search();
+    }
+
+    /// Cycle the provider filter through `value_variants()` and back to unbounded.
+    fn cycle_provider(&mut self) {
+        let variants = Provider::value_variants();
+        self.filters.provider = match self.filters.provider {
+            None => Some(variants[0]),
+            Some(current) => variants
+                .iter()
+                .position(|provider| *provider == current)
+                .and_then(|index| variants.get(index + 1).copied()),
+        };
+        self.apply_filter_change();
+    }
+
+    /// Cycle the session-class filter: unbounded → both classes (the default search set) →
+    /// user → subagent → unbounded. A kind set, never per-class booleans (the field's doc
+    /// contract in models.rs).
+    fn cycle_session_kinds(&mut self) {
+        let both = SessionKind::default_search_set();
+        self.filters.session_kinds = match &self.filters.session_kinds {
+            None => Some(both),
+            Some(kinds) if *kinds == both => Some(vec![SessionKind::User]),
+            Some(kinds) if kinds.as_slice() == [SessionKind::User] => {
+                Some(vec![SessionKind::Subagent])
+            }
+            _ => None,
+        };
+        self.apply_filter_change();
+    }
+
+    /// Cycle the time window: unbounded → 1 day → 7 days → 30 days → unbounded. Only `since`
+    /// is set; `until` stays open, so the newest sessions always qualify.
+    fn cycle_since_window(&mut self) {
+        let hours = match self.filters.since {
+            None => 24,
+            Some(since) => {
+                let age = (Utc::now() - since).num_hours();
+                if age <= 24 * 2 {
+                    24 * 7
+                } else if age <= 24 * 8 {
+                    24 * 30
+                } else {
+                    0
+                }
+            }
+        };
+        self.filters.since = if hours == 0 {
+            None
+        } else {
+            Some(Utc::now() - chrono::Duration::seconds(i64::from(hours) * 3600))
+        };
+        self.apply_filter_change();
+    }
+
+    fn toggle_warnings_only(&mut self) {
+        self.filters.warnings_only = !self.filters.warnings_only;
+        self.apply_filter_change();
+    }
+
     /// Apply one worker response. Search responses replace the list and preserve the user's
     /// place; preview responses never replace the list (C13) and are discarded when overtaken
     /// by newer navigation.
@@ -789,38 +916,45 @@ impl<'a> AppState<'a> {
         );
         frame.render_widget(top, chunks[0]);
 
+        // The list pane's share comes from [ui].list_pane_percent; the structural clamp keeps
+        // both panes alive for out-of-range values instead of panicking on 100 - percent.
+        let list_percent = self.config.ui.list_pane_percent.clamp(10, 90);
         let middle = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .constraints([
+                Constraint::Percentage(list_percent),
+                Constraint::Percentage(100 - list_percent),
+            ])
             .split(chunks[1]);
         // The preview pane's interior height, minus its two border rows — recorded every draw
         // so the scroll clamp bounds by the actual viewport (D11).
         self.preview_viewport_rows = middle[1].height.saturating_sub(2);
 
-        // Session list
+        // Session list. The label column is the configured width clamped up to the longest
+        // label, so a smaller value pads but can never truncate (D10 stays fixed).
+        let label_width = self
+            .config
+            .ui
+            .provider_label_width
+            .max(longest_provider_label());
         let items = self
             .results
             .iter()
             .map(|session| {
+                // Title budget derived from the frame at render time (§6.3): the pane's
+                // interior minus the label field and the age suffix — no fixed 74.
+                let title_budget = (middle[0].width.saturating_sub(2) as usize)
+                    .saturating_sub(label_width + 3)
+                    .saturating_sub(AGE_SUFFIX_ALLOWANCE);
                 let title = session
                     .title
                     .as_deref()
-                    .map(|value| truncate_for_display(value, 74))
+                    .map(|value| truncate_for_display(value, title_budget))
                     .unwrap_or_else(|| session.preview_text.clone());
                 let age = relative_age(session.updated_at);
-                let (provider_label, provider_color) = match session.provider {
-                    Provider::Claude => ("CLAUDE", Color::Green),
-                    Provider::ClaudeDesktop => ("CL-DESK", Color::Green),
-                    Provider::Codex => ("CODEX", Color::Cyan),
-                    Provider::Cursor => ("CURSOR", Color::Magenta),
-                    Provider::Antigravity => ("GEMINI", Color::Yellow),
-                    Provider::Pi => ("PI", Color::Green),
-                    Provider::PrimeAgent => ("PRIME", Color::LightGreen),
-                    Provider::AiStudio => ("AI Studio", Color::Cyan),
-                    Provider::GeminiCli => ("Gemini", Color::Blue),
-                };
+                let (provider_name, provider_color) = provider_label(session.provider);
                 let mut spans = vec![Span::styled(
-                    format!("[{provider_label:<6}] "),
+                    format!("[{provider_name:<label_width$}] "),
                     Style::default()
                         .fg(provider_color)
                         .add_modifier(Modifier::BOLD),
@@ -881,24 +1015,27 @@ impl<'a> AppState<'a> {
             .scroll((self.preview_scroll, 0));
         frame.render_widget(preview, middle[1]);
 
-        // Error line (own row, taken from the body when present — never the help bar).
+        // Error line (own row, taken from the body when present — never the help bar),
+        // middle-elided to the frame so the final recovery clause always survives (D9/REQ047).
         let status_index = chunks.len() - 1;
+        let frame_width = frame.area().width as usize;
         if let Some(error) = &self.error {
             let error_line = Paragraph::new(Span::styled(
-                error.as_str(),
+                elide_middle(error.as_str(), frame_width),
                 Style::default().fg(Color::Red),
             ));
             frame.render_widget(error_line, chunks[status_index - 1]);
         }
 
-        // Status bar (single line, contextual)
+        // Status bar (single line, contextual) — also middle-elided to the frame, so the
+        // navigation hints at the head and "q: quit" at the tail both survive a narrow frame.
         let help_text = if self.search_mode {
-            "Type to search │ Enter/Esc: browse"
+            "Type to search │ Enter/Esc: browse".to_string()
         } else {
-            "j/k: move │ PgUp/PgDn: page │ g/G: top/bottom │ h/l: scroll preview │ /: search │ Enter: resume │ q: quit"
+            "j/k: move │ PgUp/PgDn: page │ g/G: top/bottom │ h/l: scroll │ p: provider │ f: class │ s: window │ w: warnings │ /: search │ Enter: resume │ q: quit".to_string()
         };
         let bottom = Paragraph::new(Span::styled(
-            help_text,
+            elide_middle(&help_text, frame_width),
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(bottom, chunks[status_index]);
@@ -1464,6 +1601,9 @@ mod tests {
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Backspace)]);
         assert!(harness.step_until_script_drained().is_none());
         assert_eq!(harness.app.query, "");
+        // Settle the re-browse response before navigating: the empty-query response must
+        // re-apply the idle rows, or j runs against the 'a' section's empty result set.
+        harness.wait_until_previewed("claude:idle-one");
 
         // Esc returns to browse so the navigation keys below apply.
         harness.script(vec![key(KeyCode::Esc)]);
@@ -1742,6 +1882,19 @@ mod tests {
         panic!("executor never finished another {expected:?} within {MAX_TEST_STEPS} steps");
     }
 
+    /// Step until `condition` holds, bounded by MAX_TEST_STEPS. Needed wherever a test
+    /// waits on an executor completion signal: the signal fires inside the executor, BEFORE
+    /// the worker sends the response, so a single drain step after the wait can miss it.
+    fn step_until<F: Fn(&TuiHarness) -> bool>(harness: &mut TuiHarness, condition: F) {
+        for _ in 0..MAX_TEST_STEPS {
+            if condition(harness) {
+                return;
+            }
+            harness.step();
+        }
+        panic!("condition never held within {MAX_TEST_STEPS} steps");
+    }
+
     /// Step until the NEXT request reaches the executor and return it. A bare step may run
     /// before the previous response arrives, and a follow-up request only issues from
     /// apply_response — stepping until it appears removes that race.
@@ -1811,7 +1964,9 @@ mod tests {
 
         release.send(()).unwrap();
         wait_for_executed(&executed_rx, "a");
-        harness.step();
+        step_until(&mut harness, |harness| {
+            harness.session_rows().contains("after")
+        });
         assert!(harness.session_rows().contains("after"));
         finish_gated(&release);
     }
@@ -1981,8 +2136,9 @@ mod tests {
         release.send(()).unwrap();
         wait_for_executed(&executed_rx, "a");
         wait_for_executed(&executed_rx, "ab");
-        harness.step();
-        harness.step();
+        step_until(&mut harness, |harness| {
+            harness.session_rows().contains("claude:ab-result")
+        });
         assert!(
             !harness.session_rows().contains("claude:a-result"),
             "a response for a superseded query must not mutate state"
@@ -2058,8 +2214,9 @@ mod tests {
             (kind, selected),
             (RequestKind::PreviewOnly, Some("claude:one".into()))
         );
-        harness.step();
-        harness.step();
+        step_until(&mut harness, |harness| {
+            harness.app.preview.contains("claude:one")
+        });
         assert!(harness.app.preview.contains("claude:one"));
 
         // Query change that drops the selected row: the new first row must get its preview.
@@ -2073,8 +2230,9 @@ mod tests {
             (RequestKind::PreviewOnly, Some("claude:two".into())),
             "the preview must follow whatever row the UI actually selected (C28)"
         );
-        harness.step();
-        harness.step();
+        step_until(&mut harness, |harness| {
+            harness.app.preview.contains("claude:two")
+        });
         assert!(harness.app.preview.contains("claude:two"));
     }
 
@@ -2082,9 +2240,14 @@ mod tests {
     fn a_preview_overtaken_by_newer_navigation_is_discarded() {
         let (release, gate) = mpsc::channel::<()>();
         let (executed_tx, executed_rx) = mpsc::channel::<String>();
+        let (parking_tx, parking_rx) = mpsc::channel::<Option<String>>();
         let executor = Box::new(
             move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
                 if request.kind == RequestKind::PreviewOnly {
+                    // Signal WHICH preview is parking so the test can wait for the startup
+                    // preview to provably start — otherwise j's request can queue alongside
+                    // it and the worker's drain-to-latest legitimately drops the first.
+                    let _ = parking_tx.send(request.selected_id.clone());
                     park_until_released_or_cancelled(&gate, cancellation);
                 }
                 let _ = executed_tx.send(request.query.clone());
@@ -2104,7 +2267,27 @@ mod tests {
         );
         let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:one", "claude:two"]);
         harness.step_until_script_drained();
-        // The startup preview (row 0) parks; j selects row 1 and queues its preview.
+        // Wait until the startup preview (row 0) is provably parked, stepping to drive
+        // apply_response — the preview request only issues once the search response lands,
+        // and a bare wait would deadlock if that single step ran too early. THEN navigate:
+        // the parked request must not still be queued, or drain-to-latest may drop it
+        // instead of the overtaken-render discard this test pins.
+        let mut turns = 0;
+        loop {
+            match parking_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(selected) if selected.as_deref() == Some("claude:one") => break,
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    turns += 1;
+                    assert!(turns < MAX_TEST_STEPS, "startup preview never parked");
+                    harness.step();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("worker died before the startup preview parked");
+                }
+            }
+        }
+        // j selects row 1 and queues its preview.
         harness.script(vec![key(KeyCode::Char('j'))]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.selected, 1);
@@ -2119,7 +2302,9 @@ mod tests {
         // The queued row-1 preview then executes (drained burst) and applies.
         release.send(()).unwrap();
         wait_for_executed(&executed_rx, "");
-        harness.step();
+        step_until(&mut harness, |harness| {
+            harness.app.preview.contains("claude:two")
+        });
         assert!(harness.app.preview.contains("claude:two"));
         finish_gated(&release);
     }
@@ -2180,7 +2365,11 @@ mod tests {
         harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('z'))]);
         harness.step_until_script_drained();
         wait_for_executed(&executed_rx, "z"); // the reordered search response
-        harness.step();
+                                              // Wait for the response to APPLY (its first row becomes claude:three), then assert
+                                              // preservation — asserting on the pre-response state would prove nothing.
+        step_until(&mut harness, |harness| {
+            harness.app.results.first().map(|s| s.id.as_str()) == Some("claude:three")
+        });
         assert_eq!(
             harness.app.selected, 1,
             "a response still containing the selected session must preserve the selection (D4)"
@@ -2518,5 +2707,408 @@ mod tests {
             );
             assert_eq!(id_digest(&got), id_digest(&expected));
         }
+    }
+    // ---- step 5: filter bindings, layout config, parity, presentation ----
+
+    fn recording_executor() -> (mpsc::Receiver<(RequestKind, SearchFilters)>, SearchExecutor) {
+        let (tx, rx) = mpsc::channel::<(RequestKind, SearchFilters)>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
+                let _ = tx.send((request.kind, request.filters.clone()));
+                Ok(match request.kind {
+                    RequestKind::Search => {
+                        WorkerResponse::results(request, rows(&["claude:keep", "claude:also"]))
+                    }
+                    RequestKind::PreviewOnly => WorkerResponse::preview(request, None),
+                })
+            },
+        );
+        (rx, executor)
+    }
+
+    fn wait_for_filters(
+        rx: &mpsc::Receiver<(RequestKind, SearchFilters)>,
+        kind: RequestKind,
+    ) -> SearchFilters {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok((seen, filters)) if seen == kind => return filters,
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!("no {kind:?} request arrived");
+    }
+
+    #[test]
+    fn provider_cycle_key_issues_the_expected_filters() {
+        let (filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        let startup = wait_for_filters(&filters_rx, RequestKind::Search);
+        assert_eq!(startup.provider, None);
+        harness.wait_until_previewed("claude:keep");
+
+        // Every press issues one Search with the next provider, cycling through
+        // value_variants() and back to None.
+        let variants = Provider::value_variants().to_vec();
+        let mut expected: Vec<Option<Provider>> = variants.iter().copied().map(Some).collect();
+        expected.push(None);
+        for want in expected {
+            harness.script(vec![key(KeyCode::Char('p'))]);
+            harness.step_until_script_drained();
+            let filters = wait_for_filters(&filters_rx, RequestKind::Search);
+            assert_eq!(
+                filters.provider, want,
+                "provider cycle must follow value_variants"
+            );
+        }
+    }
+
+    #[test]
+    fn session_kind_key_issues_the_expected_filters() {
+        let (filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        let startup = wait_for_filters(&filters_rx, RequestKind::Search);
+        assert_eq!(startup.session_kinds, None);
+        harness.wait_until_previewed("claude:keep");
+
+        // None -> both classes (the default search set) -> user only -> subagent only -> None.
+        let cycle: [Option<Vec<SessionKind>>; 4] = [
+            Some(SessionKind::default_search_set()),
+            Some(vec![SessionKind::User]),
+            Some(vec![SessionKind::Subagent]),
+            None,
+        ];
+        for want in cycle {
+            harness.script(vec![key(KeyCode::Char('f'))]);
+            harness.step_until_script_drained();
+            let filters = wait_for_filters(&filters_rx, RequestKind::Search);
+            assert_eq!(
+                filters.session_kinds, want,
+                "class cycle must visit both, each, none"
+            );
+        }
+    }
+
+    #[test]
+    fn since_window_key_issues_the_expected_filters() {
+        let (filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        wait_for_filters(&filters_rx, RequestKind::Search);
+        harness.wait_until_previewed("claude:keep");
+
+        // 1 day -> 7 days -> 30 days -> off; until stays unset and the bound ages correctly.
+        let windows = [24, 24 * 7, 24 * 30];
+        for hours in windows {
+            harness.script(vec![key(KeyCode::Char('s'))]);
+            harness.step_until_script_drained();
+            let filters = wait_for_filters(&filters_rx, RequestKind::Search);
+            let since = filters.since.expect("window must set since");
+            assert_eq!(filters.until, None, "the TUI window cycle sets only since");
+            let age_hours = (chrono::Utc::now() - since).num_hours();
+            assert!(
+                (age_hours - hours).abs() <= 1,
+                "since must be ~{hours}h old, got {age_hours}h"
+            );
+        }
+        harness.script(vec![key(KeyCode::Char('s'))]);
+        harness.step_until_script_drained();
+        let filters = wait_for_filters(&filters_rx, RequestKind::Search);
+        assert_eq!(filters.since, None, "the cycle must return to unbounded");
+    }
+
+    #[test]
+    fn warnings_only_key_issues_the_expected_filters() {
+        let (filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        let startup = wait_for_filters(&filters_rx, RequestKind::Search);
+        assert!(!startup.warnings_only);
+        harness.wait_until_previewed("claude:keep");
+
+        harness.script(vec![key(KeyCode::Char('w'))]);
+        harness.step_until_script_drained();
+        assert!(wait_for_filters(&filters_rx, RequestKind::Search).warnings_only);
+        harness.script(vec![key(KeyCode::Char('w'))]);
+        harness.step_until_script_drained();
+        assert!(!wait_for_filters(&filters_rx, RequestKind::Search).warnings_only);
+    }
+
+    #[test]
+    fn filter_validation_failure_renders_error_and_sends_nothing() {
+        let (filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        wait_for_filters(&filters_rx, RequestKind::Search);
+        harness.wait_until_previewed("claude:keep");
+
+        // The one validation rule: parent + user-only kinds. The TUI has no parent binding,
+        // so drive the state directly — the binding path must still refuse to send.
+        harness.app.filters.parent_session_id = Some("claude:parent".to_string());
+        harness.app.filters.session_kinds = Some(vec![SessionKind::User]);
+        // Drain records already delivered (the startup preview) so the no-send assertion
+        // below observes only requests issued after the invalid combination exists.
+        while filters_rx.try_recv().is_ok() {}
+        harness.script(vec![key(KeyCode::Char('w'))]);
+        harness.step_until_script_drained();
+        assert!(
+            harness.app.error.is_some(),
+            "a rejected filter combination must render the error line"
+        );
+        harness.step();
+        assert!(harness.error_line().contains("session_kinds"));
+        assert!(
+            filters_rx.try_recv().is_err(),
+            "no request may be sent for an invalid combination"
+        );
+    }
+
+    #[test]
+    fn tui_filters_match_build_filters_for_equivalent_selections() {
+        let (filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        wait_for_filters(&filters_rx, RequestKind::Search);
+        harness.wait_until_previewed("claude:keep");
+
+        // Drive to provider=codex, both classes, warnings-only.
+        let variants = Provider::value_variants().to_vec();
+        let presses = variants
+            .iter()
+            .position(|provider| *provider == Provider::Codex)
+            .expect("codex is a provider variant")
+            + 1;
+        for _ in 0..presses {
+            harness.script(vec![key(KeyCode::Char('p'))]);
+            harness.step_until_script_drained();
+            wait_for_filters(&filters_rx, RequestKind::Search);
+        }
+        harness.script(vec![key(KeyCode::Char('f'))]);
+        harness.step_until_script_drained();
+        wait_for_filters(&filters_rx, RequestKind::Search);
+        harness.script(vec![key(KeyCode::Char('w'))]);
+        harness.step_until_script_drained();
+        let tui = wait_for_filters(&filters_rx, RequestKind::Search);
+
+        let args = crate::cli::SessionFilterArgs {
+            provider: Some(Provider::Codex),
+            path: None,
+            exclude_paths: Vec::new(),
+            exclude_sessions: Vec::new(),
+            session_kind: None,
+            session_kinds: vec![SessionKind::User, SessionKind::Subagent],
+            parent_session: None,
+            dates: crate::dates::DateRange {
+                since: None,
+                until: None,
+                when: None,
+            },
+            warnings_only: true,
+        };
+        let expected = crate::cli::build_filters(&args, tui_result_limit(50)).unwrap();
+        assert_eq!(tui, expected, "TUI selections must equal the CLI's filters");
+    }
+
+    #[test]
+    fn provider_labels_are_case_folded_distinct_and_fit_the_width() {
+        let labels: Vec<&str> = Provider::value_variants()
+            .iter()
+            .map(|provider| provider_label(*provider).0)
+            .collect();
+        assert_eq!(labels.len(), 9, "all nine providers must carry labels");
+        let folded: Vec<String> = labels.iter().map(|l| l.to_lowercase()).collect();
+        let mut sorted = folded.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            folded.len(),
+            sorted.len(),
+            "labels must be case-folded distinct"
+        );
+        for label in &labels {
+            assert!(
+                label.len() <= longest_provider_label(),
+                "{label} must fit the label column floor"
+            );
+        }
+        // A configured width below the floor clamps up, never truncating.
+        assert!(longest_provider_label() >= "GEMINICLI".len());
+    }
+
+    #[test]
+    fn status_bar_and_error_line_fit_an_eighty_column_frame() {
+        let (_filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        harness.wait_until_previewed("claude:keep");
+
+        for width in [80u16, 100] {
+            let mut narrow = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            step(
+                &mut narrow,
+                &mut ScriptedEventSource::new(Vec::new()),
+                &mut harness.app,
+            )
+            .unwrap();
+            let status = screen_rows_text(&narrow, 23..24, width);
+            assert!(
+                status.chars().count() <= width as usize,
+                "status bar must fit {width} columns: {status:?}"
+            );
+
+            harness.app.error = Some(
+                "search failed: database busy: run `aise reindex --full`, then retry aise tui"
+                    .to_string(),
+            );
+            step(
+                &mut narrow,
+                &mut ScriptedEventSource::new(Vec::new()),
+                &mut harness.app,
+            )
+            .unwrap();
+            let error_row = screen_rows_text(&narrow, 22..23, width);
+            assert!(
+                error_row.chars().count() <= width as usize,
+                "error line must fit {width} columns: {error_row:?}"
+            );
+            assert!(
+                error_row.contains("reindex"),
+                "the final recovery clause must survive elision (REQ047)"
+            );
+            harness.app.error = None;
+        }
+    }
+
+    fn screen_rows_text(
+        terminal: &Terminal<TestBackend>,
+        rows: std::ops::Range<u16>,
+        _width: u16,
+    ) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut lines = Vec::new();
+        for y in rows {
+            if y >= area.bottom() {
+                continue;
+            }
+            let mut line = String::new();
+            for x in area.left()..area.right() {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn resize_to_a_short_terminal_keeps_the_last_preview_line_visible() {
+        let (release, gate) = mpsc::channel::<()>();
+        let executor = Box::new(
+            move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
+                if request.kind == RequestKind::PreviewOnly {
+                    park_until_released_or_cancelled(&gate, cancellation);
+                }
+                Ok(match request.kind {
+                    RequestKind::Search => WorkerResponse::results(request, rows(&["claude:one"])),
+                    RequestKind::PreviewOnly => WorkerResponse::preview(
+                        request,
+                        Some(
+                            (0..50)
+                                .map(|line| format!("line {line}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                    ),
+                })
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:one"]);
+        // Release the parked startup preview and settle it.
+        let _ = release.send(());
+        for _ in 0..MAX_TEST_STEPS {
+            harness.step();
+            if harness.app.previewed_id.is_some() {
+                break;
+            }
+        }
+        // Shrink to 14 rows, then scroll to the NEW maximum: the final content line must be
+        // visible there (D11's strong form — an in-range bound is weaker than the property;
+        // the viewport bound makes the last line land at the pane bottom).
+        harness.terminal.backend_mut().resize(100, 14);
+        harness.step(); // render records the new viewport height
+        for _ in 0..64 {
+            harness.script(vec![ctrl_key(KeyCode::Char('d'))]);
+            harness.step_until_script_drained();
+        }
+        let text = screen_rows_text(&harness.terminal, 4..12, 100);
+        assert!(
+            text.contains("line 49"),
+            "the last content line must be visible at maximum scroll after shrinking: {text:?}"
+        );
+        let _ = release;
+    }
+
+    #[test]
+    fn list_title_names_the_active_mode() {
+        let (_filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_executor(executor).seeded(&["claude:keep"]);
+        harness.wait_until_previewed("claude:keep");
+        let rows = harness.session_rows();
+        assert!(
+            rows.contains("Sessions"),
+            "the registered benchmark title survives"
+        );
+        assert!(
+            rows.contains("recent"),
+            "the empty query names its ordering"
+        );
+
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('k'))]);
+        harness.step_until_script_drained();
+        assert!(
+            harness.session_rows().contains("ranked"),
+            "a typed query names its ordering"
+        );
+    }
+
+    #[test]
+    fn ui_layout_fields_reach_the_render() {
+        // A configured list-pane share of 70% moves the divider right of the default 45%,
+        // and a provider-label width below the floor still renders every label whole.
+        let mut config = Config::default();
+        config.ui.list_pane_percent = 70;
+        config.ui.provider_label_width = 2;
+        let (_filters_rx, executor) = recording_executor();
+        let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
+        harness.wait_until_previewed("claude:keep");
+        let rows = harness.session_rows();
+        assert!(
+            rows.contains("CLAUDE"),
+            "the label renders whole despite the configured width of 2 (upward clamp)"
+        );
+
+        let divider = divider_column(&harness);
+        let default_harness_divider = {
+            let (_rx2, executor2) = recording_executor();
+            let mut h2 = TuiHarness::with_executor(executor2).seeded(&["claude:keep"]);
+            h2.wait_until_previewed("claude:keep");
+            divider_column(&h2)
+        };
+        assert!(
+            divider > default_harness_divider,
+            "list_pane_percent=70 must widen the list pane (divider {divider} vs default {default_harness_divider})"
+        );
+    }
+
+    fn divider_column(harness: &TuiHarness) -> u16 {
+        let buffer = harness.terminal.backend().buffer();
+        let area = buffer.area;
+        (1..area.width - 1)
+            .filter(|&x| {
+                (4..area.height - 2)
+                    .filter(|y| *y < area.height)
+                    .filter(|y| *y < area.height)
+                    .all(|y| buffer[(x, y)].symbol() == "│")
+            })
+            .max()
+            .expect("the pane divider must exist")
     }
 }

@@ -24,9 +24,14 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Added
 
-- `[ui]` interaction keys with typed defaults: `event_poll_interval_ms` (150),
-  `list_page_step` (10), `preview_scroll_step` (5), `preview_page_step` (15) — the TUI reads
-  each one, and `config.example.toml` documents them beside their typed defaults.
+- `[ui]` keys with typed defaults: `event_poll_interval_ms` (150), `list_page_step` (10),
+  `preview_scroll_step` (5), `preview_page_step` (15), `provider_label_width` (9, clamped up
+  to the longest provider label), `list_pane_percent` (45) — the TUI reads each one, and
+  `config.example.toml` documents them beside their typed defaults.
+- The TUI gains session filter bindings: `p` cycles the provider, `f` the session class, `s`
+  the time window (1/7/30 days), and `w` warnings-only. Every binding validates before the
+  search runs, appears in the status bar, and produces filters equal to the CLI's for
+  equivalent selections (`SearchFilters` now derives `PartialEq, Eq`).
 
 ### Fixed
 
@@ -35,6 +40,12 @@ compatibility baseline; tags below it do not define a compatibility contract.
   CLI, MCP, and Python surfaces, and a superseded search is cancelled instead of running to
   completion while a newer one waits. The previous results stay on screen until the new ones
   arrive, and the preview resolves off the input thread, so navigation never blocks on it.
+- The TUI's provider labels no longer collide or misalign: Antigravity renders as ANTIGRAV
+  and Gemini CLI as GEMINICLI (the old GEMINI/Gemini pair were near-identical, and AI Studio
+  overflowed its fixed-width column), with the column width configurable and clamped up to
+  the longest label. The help and error lines middle-elide to the frame width, so the
+  recovery guidance at the end of an error always survives, and the session list title names
+  the active ordering (recent vs ranked).
 - The TUI selection and preview scroll survive typing: a result set that still contains the
   selected session keeps the user's place instead of resetting to the first row.
 - Typing in `aise tui` no longer risks freezing the event loop on one keystroke: queued input

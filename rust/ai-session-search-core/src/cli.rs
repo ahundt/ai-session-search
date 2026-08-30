@@ -437,26 +437,26 @@ enum SessionInclude {
 }
 
 #[derive(Debug, Args, Clone)]
-struct SessionFilterArgs {
+pub(crate) struct SessionFilterArgs {
     /// Restrict to one indexed session source; omit to include all nine.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
-    provider: Option<Provider>,
+    pub(crate) provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
     /// (a component boundary: `project` matches `project/src`, never `project-other`).
     /// Omit to search every allowed root.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
-    path: Option<String>,
+    pub(crate) path: Option<String>,
     /// Exclude sessions whose cwd, repo root, or transcript path is this directory or a
     /// descendant of it (component boundary). Repeat to exclude multiple noisy worktrees or
     /// transcript roots. Omit to exclude none.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-path")]
-    exclude_paths: Vec<String>,
+    pub(crate) exclude_paths: Vec<String>,
     /// Exclude one exact session id. Repeat to exclude multiple sessions. Omit to exclude none.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-session")]
-    exclude_sessions: Vec<String>,
+    pub(crate) exclude_sessions: Vec<String>,
     /// Restrict to one session class; one-value alias for --session-kinds. Omit for both classes.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "session-kind", value_enum)]
-    session_kind: Option<SessionKind>,
+    pub(crate) session_kind: Option<SessionKind>,
     /// Session classes to return: user for sessions you started, subagent for runs those
     /// sessions spawned. Omit for both. With --parent-session, use subagent or omit this option;
     /// user cannot match a spawned run.
@@ -468,16 +468,16 @@ struct SessionFilterArgs {
         value_delimiter = ',',
         conflicts_with = "session_kind"
     )]
-    session_kinds: Vec<SessionKind>,
+    pub(crate) session_kinds: Vec<SessionKind>,
     /// Restrict to runs spawned by this exact session id. Omit to include root and spawned runs
     /// alike. If a session class is also supplied, it must include subagent.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "parent-session")]
-    parent_session: Option<String>,
+    pub(crate) parent_session: Option<String>,
     #[command(flatten)]
-    dates: DateRange,
+    pub(crate) dates: DateRange,
     /// Show only sessions that produced a parse warning.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
-    warnings_only: bool,
+    pub(crate) warnings_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -1892,7 +1892,7 @@ fn export_filters_are_empty(filters: &SearchFilters) -> bool {
         && !filters.warnings_only
 }
 
-fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
+pub(crate) fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
     let (since, until) = args.dates.resolve_now()?;
     let filters = SearchFilters {
         provider: args.provider,

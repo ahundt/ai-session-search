@@ -422,6 +422,14 @@ pub struct UiConfig {
     /// Lines the preview scrolls for Ctrl-d/Ctrl-u.
     #[serde(default = "default_preview_page_step")]
     pub preview_page_step: usize,
+    /// Width of the provider label column in the session list. The renderer clamps upward to
+    /// the longest label, so a smaller value can never truncate one.
+    #[serde(default = "default_provider_label_width")]
+    pub provider_label_width: usize,
+    /// Percent of the body width given to the session-list pane; the preview pane gets the
+    /// remainder — one number, not two that must sum to 100.
+    #[serde(default = "default_list_pane_percent")]
+    pub list_pane_percent: u16,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -961,6 +969,14 @@ fn default_preview_page_step() -> usize {
     15
 }
 
+fn default_provider_label_width() -> usize {
+    9
+}
+
+fn default_list_pane_percent() -> u16 {
+    45
+}
+
 fn default_busy_timeout_ms() -> u64 {
     crate::db::DEFAULT_BUSY_TIMEOUT_MS
 }
@@ -1162,6 +1178,8 @@ impl Default for Config {
                 list_page_step: 10,
                 preview_scroll_step: 5,
                 preview_page_step: 15,
+                provider_label_width: 9,
+                list_pane_percent: 45,
             },
             search: SearchConfig {
                 default_limit: 50,
