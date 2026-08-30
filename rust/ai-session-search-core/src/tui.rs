@@ -256,19 +256,43 @@ where
 {
     app.drain_responses();
     terminal.draw(|frame| app.render(frame))?;
-    let poll_interval = Duration::from_millis(app.config.ui.event_poll_interval_ms);
-    while events.poll(poll_interval)? {
-        let Event::Key(key) = events.read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
+    // Wait for input in slices no longer than the configured interval, absorbing worker
+    // responses between slices. Two measured defects forced this shape (§12): a key's echo
+    // must render immediately — not after the interval expires — and a worker response
+    // arriving mid-wait must be applied the same way; the first post-fix measurement pinned
+    // results p50 at the 150 ms idle interval because nothing drained until the next step.
+    // Slices are capped at 10 ms so pickup latency stays far below the configured pacing,
+    // and each handled key restarts the idle window, preserving burst draining.
+    let mut idle_deadline =
+        std::time::Instant::now() + Duration::from_millis(app.config.ui.event_poll_interval_ms);
+    loop {
+        let now = std::time::Instant::now();
+        if now >= idle_deadline {
+            return Ok(None);
         }
-        if let Some(action) = app.handle_key(key) {
-            return Ok(Some(action));
+        let slice = idle_deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10));
+        if events.poll(slice)? {
+            let Event::Key(key) = events.read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(action) = app.handle_key(key) {
+                return Ok(Some(action));
+            }
+            // Redraw right after handling a key so its echo never waits out a poll slice.
+            app.drain_responses();
+            terminal.draw(|frame| app.render(frame))?;
+            idle_deadline = std::time::Instant::now()
+                + Duration::from_millis(app.config.ui.event_poll_interval_ms);
+        } else if app.drain_responses() {
+            // A worker response landed mid-wait: apply it and redraw now.
+            terminal.draw(|frame| app.render(frame))?;
         }
     }
-    Ok(None)
 }
 
 enum AppAction {
@@ -447,8 +471,25 @@ fn spawn_search_worker(
                 }
             };
             while let Ok(first) = request_rx.recv() {
-                // Drain to the latest queued request: superseded searches never execute (§2.3).
-                let request = request_rx.try_iter().last().unwrap_or(first);
+                // Drain to the latest queued request: superseded searches never execute
+                // (§2.3). A preview queued among searches must not win the drain — it would
+                // starve the final search (apply_response re-issues the preview once the
+                // surviving search's response lands, per C28), so prefer the newest Search
+                // and otherwise the newest request.
+                let mut latest_non_search: Option<WorkerRequest> = None;
+                let mut latest_search: Option<WorkerRequest> = None;
+                for next in std::iter::once(first).chain(request_rx.try_iter()) {
+                    match next.kind {
+                        RequestKind::Search => latest_search = Some(next),
+                        RequestKind::PreviewOnly if latest_search.is_none() => {
+                            latest_non_search = Some(next);
+                        }
+                        RequestKind::PreviewOnly => {}
+                    }
+                }
+                let request = latest_search
+                    .or(latest_non_search)
+                    .expect("the iterator yields at least the first request");
                 // Publish under the same lock the UI cancels under, so a supersede either stops
                 // THIS query or arrives before it starts — never lands on its successor (E21b).
                 let cancellation = Arc::new(QueryCancellation::new());
@@ -734,8 +775,10 @@ impl<'a> AppState<'a> {
     /// state (P3).
     ///
     /// Complexity (REQ010): `O(responses × K)` for the id lookup; no I/O, no lock held.
-    fn drain_responses(&mut self) {
+    fn drain_responses(&mut self) -> bool {
+        let mut applied = false;
         while let Ok(response) = self.worker.responses.try_recv() {
+            applied = true;
             match response {
                 Err(error) => {
                     self.error = Some(format!("{error:#}"));
@@ -744,6 +787,7 @@ impl<'a> AppState<'a> {
                 Ok(response) => self.apply_response(response),
             }
         }
+        applied
     }
 
     /// Queue a search for the current query. `send` cancels any in-flight search first —
@@ -1385,7 +1429,13 @@ mod tests {
     impl EventSource for ScriptedEventSource {
         fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
             self.poll_timeouts.push(timeout);
-            Ok(!self.events.is_empty())
+            if !self.events.is_empty() {
+                return Ok(true);
+            }
+            // Mirror the real source: reporting no input waits out the requested timeout.
+            // The sliced wait in step() would otherwise busy-spin through the idle window.
+            std::thread::sleep(timeout);
+            Ok(false)
         }
 
         fn read(&mut self) -> io::Result<Event> {
@@ -1480,7 +1530,13 @@ mod tests {
 
         /// Like `with_config`, but the caller owns the whole factory (the digest guard passes
         /// the production `db_backed_executor` against its own fixture).
-        fn with_factory(config: Config, factory: ExecutorFactory) -> Self {
+        fn with_factory(mut config: Config, factory: ExecutorFactory) -> Self {
+            // The real 150 ms idle pacing makes every step wait it out against the
+            // sleeping scripted source; shrink the default so steps complete fast. A test
+            // that sets the field explicitly keeps its value.
+            if config.ui.event_poll_interval_ms == 150 {
+                config.ui.event_poll_interval_ms = 1;
+            }
             let config: &'static Config = Box::leak(Box::new(config));
             let (worker, observed) =
                 spawn_search_worker(factory).expect("worker startup handshake");
@@ -1696,13 +1752,14 @@ mod tests {
         // seam's recorded timeouts (every poll — including the one that returns false).
         harness.script(vec![key(KeyCode::PageDown)]);
         assert!(harness.step_until_script_drained().is_none());
+        // The idle wait is sliced (worker responses are picked up between slices), so each
+        // recorded poll is the deadline-derived remainder: bounded by the configured
+        // interval, never exceeding it, and never a stale default.
         assert!(
-            harness
-                .events
-                .poll_timeouts
-                .iter()
-                .all(|timeout| *timeout == Duration::from_millis(7)),
-            "poll timeout must follow [ui].event_poll_interval_ms, got {:?}",
+            harness.events.poll_timeouts.iter().all(|timeout| {
+                *timeout <= Duration::from_millis(7) && *timeout >= Duration::from_millis(5)
+            }),
+            "poll slices must stay within [ui].event_poll_interval_ms, got {:?}",
             harness.events.poll_timeouts
         );
 

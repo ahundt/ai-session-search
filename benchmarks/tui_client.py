@@ -29,6 +29,7 @@ import os
 import pty
 import re
 import select
+import signal
 import struct
 import subprocess
 import termios
@@ -265,8 +266,14 @@ class TuiProcess:
         return None
 
     def kill(self) -> None:
+        # The child is a session leader (start_new_session), so kill the whole group: a
+        # lone child kill leaves the TUI spinning on a dead pty for hours if its own exit
+        # path never fires — measured as stray 30-80% CPU orphans after harness crashes.
         if self.child.poll() is None:
-            self.child.kill()
+            try:
+                os.killpg(self.child.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                self.child.kill()
             self.child.wait()
         try:
             os.close(self.master_fd)
