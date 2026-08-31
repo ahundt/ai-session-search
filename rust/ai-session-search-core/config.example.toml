@@ -259,6 +259,41 @@ provider_label_width = 9
 # Percent of the body width for the session-list pane; the preview pane gets the remainder.
 list_pane_percent = 45
 
+# What each key press means. Name only the actions you want to change: the rest keep the
+# defaults shown here, the same way a [providers.<name>] table overrides only the fields it
+# names. An action set to [] is deliberately unbound, and the status bar stops advertising it.
+#
+# A binding is a single character, or one of enter, esc, tab, backtab, backspace, delete,
+# insert, space, up, down, left, right, home, end, pageup, pagedown, f1, f2, f3, f4 — with any
+# of ctrl, alt, shift, super joined to it by +. Shift is not written for a capital letter:
+# "G" is the binding, because a terminal may or may not report the shift flag beside it.
+#
+# `interrupt` is answered in both modes and takes two presses: the first says so in the status
+# bar and the second quits. It exists because a full-screen terminal application turns off the
+# terminal's own interrupt character, so nothing else would stop it. Binding both `quit` and
+# `interrupt` to nothing is refused, because it would leave no way out.
+#
+# [ui.keys]
+# interrupt = ["ctrl+c"]
+# quit = ["q", "esc"]
+# enter_search = ["/"]
+# leave_search = ["enter", "esc"]
+# move_down = ["j", "down"]
+# move_up = ["k", "up"]
+# page_down = ["pagedown"]
+# page_up = ["pageup"]
+# top = ["g"]
+# bottom = ["G"]
+# cycle_provider = ["p"]
+# cycle_session_kind = ["f"]
+# cycle_time_window = ["s"]
+# toggle_warnings_only = ["w"]
+# preview_scroll_down = ["l", "right"]
+# preview_scroll_up = ["h", "left"]
+# preview_page_down = ["ctrl+d"]
+# preview_page_up = ["ctrl+u"]
+# resume = ["enter", "r"]
+
 # Uncomment provider tables only when you want to disable a provider or replace the platform
 # defaults with explicit paths. If `paths` is absent, aise uses built-in OS-aware defaults;
 # explicit `paths = []` means search no roots for that enabled provider.

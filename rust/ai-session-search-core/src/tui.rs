@@ -34,6 +34,7 @@ use crate::config::Config;
 use crate::db::{
     Db, QueryCancellation, QueryCancelled, MIN_READABLE_SCHEMA_VERSION, SCHEMA_VERSION,
 };
+use crate::keymap::{ActionMode, TuiAction};
 #[cfg(test)]
 use crate::models::Role;
 use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
@@ -216,12 +217,12 @@ const STATUS_HINT_SEPARATOR: &str = " │ ";
 /// the rest stay whole. `priority` is drop order, 0 last; ties drop the hint further right, so the
 /// ones a reader scans first survive longest. The final hint is always kept, and the caller still
 /// elides it for a frame too narrow even for that.
-fn fit_status_hints(hints: &[(u8, &str)], width: usize) -> String {
+fn fit_status_hints(hints: &[(u8, String)], width: usize) -> String {
     let mut kept: Vec<usize> = (0..hints.len()).collect();
     loop {
         let text = kept
             .iter()
-            .map(|index| hints[*index].1)
+            .map(|index| hints[*index].1.as_str())
             .collect::<Vec<_>>()
             .join(STATUS_HINT_SEPARATOR);
         if kept.len() == 1 || UnicodeWidthStr::width(text.as_str()) <= width {
@@ -1002,6 +1003,9 @@ struct AppState {
     /// A disconnected response producer is terminal for this worker. Remember reporting it so
     /// later active/idle drains do not redraw the same error forever.
     worker_disconnected_reported: bool,
+    /// True after one interrupt, cleared by any other key. The next one quits. It is a field
+    /// rather than a timer so the state is exactly what the status bar shows.
+    interrupt_armed: bool,
 }
 
 impl AppState {
@@ -1051,78 +1055,113 @@ impl AppState {
             error: None,
             error_owner: None,
             worker_disconnected_reported: false,
+            interrupt_armed: false,
         }
     }
 
     /// Handle one key press. Returns `Some(action)` when the loop should stop. Never returns
     /// `Err`: a database failure becomes `self.error` — a keystroke cannot end the TUI.
+    ///
+    /// What each key means comes from `[ui.keys]`, so the modifiers are part of the match. They
+    /// were not: every arm matched a bare character, and Ctrl+Q quit, Ctrl+S moved the time
+    /// window, Ctrl+P changed the provider, and Ctrl+H — ASCII backspace on many terminals —
+    /// scrolled the preview.
     fn handle_key(&mut self, key: KeyEvent) -> Option<AppAction> {
-        if self.search_mode {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.search_mode = false;
-                    // Leaving the box searches whatever is in it now. Waiting out the delay
-                    // after an explicit Enter is the one case where the reader has already said
-                    // they are done typing.
-                    self.flush_edited_query();
-                }
-                KeyCode::Backspace => {
-                    self.query.pop();
-                    self.note_query_edit();
-                }
-                KeyCode::Char(ch) => {
-                    self.query.push(ch);
-                    self.note_query_edit();
-                }
-                _ => {}
-            }
+        let mode = if self.search_mode {
+            ActionMode::Search
         } else {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Some(AppAction::Quit),
-                KeyCode::Char('/') => {
-                    self.search_mode = true;
+            ActionMode::Browse
+        };
+        let action = self.config.ui.keys.action_for(&key, mode);
+
+        // The interrupt is answered before anything else and in both modes. Raw mode turns off
+        // the terminal's own interrupt character, so Ctrl+C arrives as an ordinary key event and
+        // no SIGINT is ever raised: before this, browse mode ignored it and the search box typed
+        // a literal `c` into the query, leaving `q` and Esc as the only ways out of a
+        // full-screen application. One press arms and says so in the status bar; the next one
+        // quits, and any other key disarms, so a stray Ctrl+C cannot end a session by itself.
+        if action == Some(TuiAction::Interrupt) {
+            if self.interrupt_armed {
+                return Some(AppAction::Quit);
+            }
+            self.interrupt_armed = true;
+            return None;
+        }
+        self.interrupt_armed = false;
+
+        match action {
+            Some(TuiAction::Interrupt) => unreachable!("answered above"),
+            Some(TuiAction::Quit) => return Some(AppAction::Quit),
+            Some(TuiAction::EnterSearch) => self.search_mode = true,
+            Some(TuiAction::LeaveSearch) => {
+                self.search_mode = false;
+                // Leaving the box searches whatever is in it now. Waiting out the delay after
+                // an explicit Enter is the one case where the reader has already said they are
+                // done typing.
+                self.flush_edited_query();
+            }
+            Some(TuiAction::MoveDown) => self.move_selection(1),
+            Some(TuiAction::MoveUp) => self.move_selection(-1),
+            Some(TuiAction::PageDown) => {
+                let page = saturating_step(self.config.ui.list_page_step);
+                self.move_selection(page);
+            }
+            Some(TuiAction::PageUp) => {
+                let page = saturating_step(self.config.ui.list_page_step);
+                self.move_selection(-page);
+            }
+            Some(TuiAction::Top) => self.select_index(0),
+            Some(TuiAction::Bottom) => {
+                let last = self.results.len().saturating_sub(1);
+                self.select_index(last);
+            }
+            Some(TuiAction::CycleProvider) => self.cycle_provider(),
+            Some(TuiAction::CycleSessionKind) => self.cycle_session_kinds(),
+            Some(TuiAction::CycleTimeWindow) => self.cycle_since_window(),
+            Some(TuiAction::ToggleWarningsOnly) => self.toggle_warnings_only(),
+            Some(TuiAction::PreviewScrollDown) => {
+                let step = saturating_step(self.config.ui.preview_scroll_step);
+                self.scroll_preview(step);
+            }
+            Some(TuiAction::PreviewScrollUp) => {
+                let step = saturating_step(self.config.ui.preview_scroll_step);
+                self.scroll_preview(-step);
+            }
+            Some(TuiAction::PreviewPageDown) => {
+                let page = saturating_step(self.config.ui.preview_page_step);
+                self.scroll_preview(page);
+            }
+            Some(TuiAction::PreviewPageUp) => {
+                let page = saturating_step(self.config.ui.preview_page_step);
+                self.scroll_preview(-page);
+            }
+            Some(TuiAction::Resume) => {
+                if let Some(selected) = self.selected_session() {
+                    return Some(AppAction::Resume(Box::new(selected.clone())));
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                KeyCode::PageDown => {
-                    let page = saturating_step(self.config.ui.list_page_step);
-                    self.move_selection(page);
-                }
-                KeyCode::PageUp => {
-                    let page = saturating_step(self.config.ui.list_page_step);
-                    self.move_selection(-page);
-                }
-                KeyCode::Char('g') => self.select_index(0),
-                KeyCode::Char('G') => {
-                    let last = self.results.len().saturating_sub(1);
-                    self.select_index(last);
-                }
-                KeyCode::Char('p') => self.cycle_provider(),
-                KeyCode::Char('f') => self.cycle_session_kinds(),
-                KeyCode::Char('s') => self.cycle_since_window(),
-                KeyCode::Char('w') => self.toggle_warnings_only(),
-                KeyCode::Char('l') | KeyCode::Right => {
-                    let step = saturating_step(self.config.ui.preview_scroll_step);
-                    self.scroll_preview(step);
-                }
-                KeyCode::Char('h') | KeyCode::Left => {
-                    let step = saturating_step(self.config.ui.preview_scroll_step);
-                    self.scroll_preview(-step);
-                }
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let page = saturating_step(self.config.ui.preview_page_step);
-                    self.scroll_preview(page);
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let page = saturating_step(self.config.ui.preview_page_step);
-                    self.scroll_preview(-page);
-                }
-                KeyCode::Enter | KeyCode::Char('r') => {
-                    if let Some(selected) = self.selected_session() {
-                        return Some(AppAction::Resume(Box::new(selected.clone())));
+            }
+            // Not a binding in this mode. In the search box the key is text; anywhere else it
+            // is nothing. Backspace edits rather than commands, so it is structural rather than
+            // rebindable, and a chorded character is a chord that happens to be unbound — not
+            // something to type.
+            None => {
+                if self.search_mode {
+                    match key.code {
+                        KeyCode::Backspace => {
+                            self.query.pop();
+                            self.note_query_edit();
+                        }
+                        KeyCode::Char(character)
+                            if !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            ) =>
+                        {
+                            self.query.push(character);
+                            self.note_query_edit();
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
         None
@@ -1364,6 +1403,19 @@ impl AppState {
         )
     }
 
+    /// `"j/k: move"`, built from the keys bound to `actions` rather than written out, so the
+    /// bar teaches whatever `[ui.keys]` says. Only each action's first chord is named: the bar
+    /// is one row, and `j` teaches the binding as well as `j/down` does. An action nobody bound
+    /// is not advertised.
+    fn key_hint(&self, label: &str, actions: &[TuiAction]) -> Option<String> {
+        let keys = actions
+            .iter()
+            .filter_map(|action| self.config.ui.keys.chords(*action).first())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        (!keys.is_empty()).then(|| format!("{}: {label}", keys.join("/")))
+    }
+
     /// Apply one worker response. Search responses replace the list and preserve the user's
     /// place; preview responses never replace the list (C13) and are discarded when overtaken
     /// by newer navigation.
@@ -1577,27 +1629,52 @@ impl AppState {
 
         // Status bar (single line, contextual) — also middle-elided to the frame, so the
         // navigation hints at the head and "q: quit" at the tail both survive a narrow frame.
-        let filters = self.filter_status();
-        let hints: &[(u8, &str)] = if self.search_mode {
+        // Each hint names the keys actually bound to it. Written out, the bar kept teaching the
+        // defaults after `[ui.keys]` changed them, which is worse than no bar: a reader presses
+        // what it says and nothing happens.
+        let mut hints: Vec<(u8, String)> = vec![(1, self.filter_status())];
+        let labelled: &[(u8, &str, &[TuiAction])] = if self.search_mode {
             &[
-                (1, &filters),
-                (1, "Type to search"),
-                (0, "Enter/Esc: browse"),
+                (1, "type to search", &[]),
+                (0, "browse", &[TuiAction::LeaveSearch]),
             ]
         } else {
             &[
-                (1, &filters),
-                (1, "j/k: move"),
-                (4, "PgUp/PgDn: page"),
-                (4, "g/G: top/bottom"),
-                (3, "h/l: scroll"),
-                (2, "p/f/s/w: filters"),
-                (1, "/: search"),
-                (2, "Enter: resume"),
-                (0, "q: quit"),
+                (1, "move", &[TuiAction::MoveDown, TuiAction::MoveUp]),
+                (4, "page", &[TuiAction::PageDown, TuiAction::PageUp]),
+                (4, "top/bottom", &[TuiAction::Top, TuiAction::Bottom]),
+                (
+                    3,
+                    "scroll",
+                    &[TuiAction::PreviewScrollUp, TuiAction::PreviewScrollDown],
+                ),
+                (
+                    2,
+                    "filters",
+                    &[
+                        TuiAction::CycleProvider,
+                        TuiAction::CycleSessionKind,
+                        TuiAction::CycleTimeWindow,
+                        TuiAction::ToggleWarningsOnly,
+                    ],
+                ),
+                (1, "search", &[TuiAction::EnterSearch]),
+                (2, "resume", &[TuiAction::Resume]),
+                (0, "quit", &[TuiAction::Quit]),
             ]
         };
-        let help_text = fit_status_hints(hints, frame_width);
+        for (priority, label, actions) in labelled {
+            if actions.is_empty() {
+                hints.push((*priority, (*label).to_string()));
+            } else if let Some(text) = self.key_hint(label, actions) {
+                hints.push((*priority, text));
+            }
+        }
+        // Priority 0 and first, so the one hint that says how to leave cannot be shed to fit.
+        if self.interrupt_armed {
+            hints.insert(0, (0, "press the interrupt again to quit".to_string()));
+        }
+        let help_text = fit_status_hints(&hints, frame_width);
         let bottom = Paragraph::new(Span::styled(
             elide_middle(&help_text, frame_width),
             Style::default().fg(Color::DarkGray),
@@ -4428,6 +4505,108 @@ mod tests {
     }
 
     #[test]
+    fn one_interrupt_arms_and_says_so_and_the_next_one_quits() {
+        // Raw mode turns off the terminal's interrupt character, so Ctrl+C is an ordinary key
+        // event and nothing raises SIGINT. Browse mode ignored it outright, which left `q` and
+        // Esc as the only exits from a full-screen application.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.script(vec![ctrl_key(KeyCode::Char('c'))]);
+        assert!(
+            harness.step_until_script_drained().is_none(),
+            "one interrupt must not quit on its own"
+        );
+        assert!(
+            harness.status_line().contains("interrupt again"),
+            "the armed state must be visible, got {:?}",
+            harness.status_line()
+        );
+
+        harness.script(vec![ctrl_key(KeyCode::Char('c'))]);
+        assert!(matches!(
+            harness.step_until_script_drained(),
+            Some(AppAction::Quit)
+        ));
+    }
+
+    #[test]
+    fn any_other_key_disarms_the_interrupt() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.script(vec![ctrl_key(KeyCode::Char('c')), key(KeyCode::Char('j'))]);
+        assert!(harness.step_until_script_drained().is_none());
+        assert!(
+            !harness.status_line().contains("interrupt again"),
+            "a key press between the two must clear the armed state"
+        );
+        harness.script(vec![ctrl_key(KeyCode::Char('c'))]);
+        assert!(
+            harness.step_until_script_drained().is_none(),
+            "the count restarts, so this is the first interrupt again"
+        );
+    }
+
+    #[test]
+    fn the_interrupt_in_the_search_box_does_not_type_a_c() {
+        // The search box appended whatever character arrived, modifiers and all, so the one key
+        // a reader reaches for to escape put a `c` in their query instead.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.script(vec![
+            key(KeyCode::Char('/')),
+            key(KeyCode::Char('a')),
+            ctrl_key(KeyCode::Char('c')),
+        ]);
+        assert!(harness.step_until_script_drained().is_none());
+        assert_eq!(harness.app.query, "a", "the interrupt is not text");
+
+        harness.script(vec![ctrl_key(KeyCode::Char('c'))]);
+        assert!(matches!(
+            harness.step_until_script_drained(),
+            Some(AppAction::Quit)
+        ));
+    }
+
+    #[test]
+    fn a_chorded_letter_does_not_fire_its_browse_binding() {
+        // Each arm matched a bare character, so Ctrl+Q quit, Ctrl+S moved the time window, and
+        // Ctrl+H — ASCII backspace on many terminals — scrolled the preview.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.script(vec![
+            ctrl_key(KeyCode::Char('q')),
+            ctrl_key(KeyCode::Char('s')),
+            ctrl_key(KeyCode::Char('p')),
+        ]);
+        assert!(
+            harness.step_until_script_drained().is_none(),
+            "Ctrl+Q is not the quit binding"
+        );
+        assert_eq!(
+            harness.app.filter_status(),
+            "p:any f:any s:any w:off",
+            "Ctrl+S and Ctrl+P are not filter bindings"
+        );
+    }
+
+    #[test]
+    fn a_rebound_key_drives_the_tui_and_the_default_it_replaced_does_not() {
+        // The point of the table: a key named in `[ui.keys]` reaches the loop, and the key it
+        // replaced stops meaning what it did.
+        let mut config = Config::default();
+        config.ui.keys = toml::from_str("quit = [\"x\"]").expect("a partial table parses");
+        config.validate().expect("rebinding quit alone is valid");
+        let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
+
+        harness.script(vec![key(KeyCode::Char('q'))]);
+        assert!(
+            harness.step_until_script_drained().is_none(),
+            "q was rebound away from quit"
+        );
+        harness.script(vec![key(KeyCode::Char('x'))]);
+        assert!(matches!(
+            harness.step_until_script_drained(),
+            Some(AppAction::Quit)
+        ));
+    }
+
+    #[test]
     fn a_typed_burst_becomes_one_search_after_the_configured_quiet_period() {
         // Every keystroke used to start a search that the next keystroke cancelled, so typing a
         // five-letter word began five corpus scans to answer one question. On a 36.5 GB index a
@@ -4544,6 +4723,23 @@ mod tests {
             "the last window cycles back to unbounded"
         );
         assert!(harness.app.filter_status().contains("s:any"));
+    }
+
+    #[test]
+    fn the_status_bar_teaches_the_rebound_key_rather_than_the_default() {
+        // A help bar that names keys the configuration replaced is worse than none: the reader
+        // presses what it says and nothing happens.
+        let mut config = Config::default();
+        config.ui.keys = toml::from_str("quit = [\"x\"]").unwrap();
+        config.validate().unwrap();
+        let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let status = harness.status_line();
+        assert!(status.contains("x: quit"), "{status:?}");
+        assert!(!status.contains("q: quit"), "{status:?}");
     }
 
     #[test]

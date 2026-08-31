@@ -274,7 +274,24 @@ values have minimum 1. `provider_label_width` (9, minimum 1) is the session
 list's provider column width — normal panes clamp upward to the longest label, while a pane too
 narrow to contain that label clamps to its actual interior and truncates rather than overflowing;
 `list_pane_percent` (45, range 10–90) is the body width share of the session-list pane, the preview
-pane taking the remainder. `[ui].preview_lines` (34) is the preview's total body budget: canonical-transcript
+pane taking the remainder.
+
+`[ui.keys]` maps each command to the key presses that reach it, and `crate::keymap` owns that
+vocabulary: `config` stores a `KeyBindings` and validates it with everything else, `tui` asks it
+what a key event means and never parses a key name, and the status bar names whatever is bound
+rather than the defaults. A table names only the actions it changes and the rest keep theirs,
+the same merge `[providers.<name>]` already uses, because replacing the whole table on a partial
+override would unbind eighteen commands to change one. `[]` unbinds an action deliberately.
+A binding is a single character or a named key, optionally chorded with `ctrl`, `alt`, `shift`,
+or `super`; a capital letter is written as itself rather than `shift+`, because whether a
+terminal reports the shift flag beside the character is a property of its keyboard protocol.
+Two rules are checked at load: one chord may not mean two things reachable from the same mode
+(which is why Esc can both leave the search box and quit the browser, and Enter can both leave
+it and resume), and `quit` and `interrupt` may not both be unbound. `interrupt` answers in both
+modes and takes two presses, because raw mode turns off the terminal's own interrupt character —
+without it a full-screen application has no interrupt at all.
+
+`[ui].preview_lines` (34) is the preview's total body budget: canonical-transcript
 bookends keep their historical 8/4/8/14 shares even when a role is absent, each floored at one
 line. The default therefore preserves the previous preview, including Session/CWD metadata, while
 avoiding a full Rust `String` clone and O(turns) vector. Every example-file line equals its typed

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::keymap::KeyBindings;
 use crate::util::expand_tilde;
 
 pub const CONFIG_EXAMPLE_TOML: &str = include_str!("../config.example.toml");
@@ -437,6 +438,10 @@ pub struct UiConfig {
     /// remainder — one number, not two that must sum to 100.
     #[serde(default = "default_list_pane_percent")]
     pub list_pane_percent: u16,
+    /// What each key press means. A `[ui.keys]` table names only the actions it changes; the
+    /// rest keep their defaults. `crate::keymap` owns the vocabulary and the parsing.
+    #[serde(default)]
+    pub keys: KeyBindings,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1199,6 +1204,7 @@ impl Default for Config {
                 preview_page_step: default_preview_page_step(),
                 provider_label_width: default_provider_label_width(),
                 list_pane_percent: default_list_pane_percent(),
+                keys: KeyBindings::default(),
             },
             search: SearchConfig {
                 default_limit: default_limit(),
@@ -1734,6 +1740,9 @@ impl Config {
         if self.ui.provider_label_width == 0 {
             bail!("ui.provider_label_width must be greater than zero; {FIX}");
         }
+        // The vocabulary's own rules: one chord meaning two things in a mode, and a table
+        // with no way out. Parsing already refused an unknown spelling.
+        self.ui.keys.validate()?;
         if !(10..=90).contains(&self.ui.list_pane_percent) {
             bail!("ui.list_pane_percent must be between 10 and 90 inclusive; {FIX}");
         }

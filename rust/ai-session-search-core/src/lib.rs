@@ -22,6 +22,7 @@ pub mod hashing;
 pub mod indexer;
 pub mod inspect;
 pub(crate) mod integrations;
+pub mod keymap;
 pub mod mcp_schema_budget;
 pub mod mcp_server;
 pub(crate) mod message_classification;

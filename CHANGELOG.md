@@ -27,6 +27,15 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Added
 
+- `[ui.keys]` binds each TUI command to the key presses that reach it: `interrupt`, `quit`,
+  `enter_search`, `leave_search`, `move_down`, `move_up`, `page_down`, `page_up`, `top`,
+  `bottom`, `cycle_provider`, `cycle_session_kind`, `cycle_time_window`,
+  `toggle_warnings_only`, `preview_scroll_down`, `preview_scroll_up`, `preview_page_down`,
+  `preview_page_up`, and `resume`. A table names only the actions it changes and the rest keep
+  their defaults; `[]` unbinds one. A binding is a character or a named key, optionally chorded
+  with `ctrl`, `alt`, `shift`, or `super`. One chord may not mean two things reachable from the
+  same mode, and `quit` and `interrupt` may not both be unbound. The status bar names whatever
+  is bound rather than the shipped defaults.
 - `[ui].search_debounce_ms` (150): how long an edited TUI query must stay unchanged before it
   becomes a search. Typing never waits on it — the keystroke echoes on its own loop turn and the
   search runs off the input thread either way — so this only decides how many searches a typed
@@ -47,6 +56,14 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- Ctrl+C exits `aise tui`. A full-screen terminal application turns off the terminal's own
+  interrupt character, so Ctrl+C arrived as an ordinary key press and nothing handled it: the
+  browser ignored it and the search box typed a literal `c` into the query, leaving `q` and Esc
+  as the only ways out. The first press arms and says so in the status bar, the second quits,
+  and any other key disarms.
+- A chorded key no longer fires the binding for its bare letter in `aise tui`. Every command
+  matched the character alone, so Ctrl+Q quit, Ctrl+S moved the time window, Ctrl+P changed the
+  provider, and Ctrl+H — ASCII backspace on many terminals — scrolled the preview.
 - The TUI status bar sheds whole hints on a narrow frame instead of eliding characters out of
   the middle of the joined line. At 80 columns it rendered `P…rs` where `p/f/s/w: filters`
   belonged; it now keeps `j/k: move`, `p/f/s/w: filters`, `/: search`, and `q: quit` readable,
