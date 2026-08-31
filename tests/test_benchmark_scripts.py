@@ -492,6 +492,49 @@ def test_tui_screen_tracker_buffers_every_split_csi_prefix() -> None:
         assert tracker.line(0) == "X", f"CSI split at byte {split} leaked control text"
 
 
+def test_tui_screen_tracker_rejoins_a_session_id_wrapped_across_preview_rows() -> None:
+    """A subagent id is 67 characters and wraps in the preview pane at 100 columns.
+
+    Reading only the row that carries the `Session: ` label returned the first fragment, which
+    never equalled the canonical id, so the semantic traversal waited out its timeout and
+    reported `could not collect TUI session ID at position 13` — a parser limit stated as a TUI
+    failure. Measured against the maintainer's own index, position 13 of a `rust worker` search
+    was exactly such a row.
+    """
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    identifier = "claude:08a88453-1d07-48fd-8166-a00f1ca70115/agent-a2b498896d3f06295"
+    pane_width = 44
+    # Two renderings of the same header. The first is what a mid-value wrap looks like; the
+    # second is what the pane actually produced, because an id longer than the pane does not fit
+    # after its label at all, so the wrapper puts `Session:` on a row by itself. The second form
+    # is the one the maintainer's own index hit, and matching `"Session: "` returned None for it.
+    split_after_label = [
+        client.SESSION_FIELD_LABEL,
+        *[identifier[start : start + pane_width] for start in range(0, len(identifier), pane_width)],
+    ]
+    body = f"{client.SESSION_FIELD_LABEL} {identifier}"
+    split_mid_value = [body[start : start + pane_width] for start in range(0, len(body), pane_width)]
+
+    for wrapped in (split_mid_value, split_after_label):
+        assert len(wrapped) > 1, "the fixture must actually wrap for this to prove anything"
+        rendered = [
+            *wrapped,
+            f"{client.CWD_FIELD_LABEL} /tmp/example",
+            "",
+            "── First prompt ──",
+        ]
+        tracker = client.ScreenTracker()
+        for row, text in enumerate(rendered):
+            for column, character in enumerate(text):
+                tracker.rows[row][column] = character
+
+        class Layout:
+            list_rows = range(len(rendered))
+            preview_cols = range(0, pane_width)
+
+        assert tracker.preview_session_id(Layout()) == identifier, f"failed on {wrapped!r}"
+
+
 def test_tui_final_result_latency_uses_the_last_transition_before_stability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

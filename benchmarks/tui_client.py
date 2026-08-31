@@ -55,6 +55,9 @@ KEY_INTERVAL_SECONDS = 0.005
 # buffer and parse as Alt+q, so the mode-exit Esc never happens and q types into the query.
 ESC_SETTLE_SECONDS = 0.08
 READ_CHUNK_BYTES = 65536
+# How long the last keystroke's results may take to settle. Ten seconds covers the generated
+# fixture with room to spare; a maintainer's own multi-gigabyte index needs more, and
+# --final-settle-seconds raises it without editing this file.
 FINAL_KEY_SETTLE_CAP_SECONDS = 10.0
 ERROR_EXCERPT_CHARS = 400
 SCREEN_ROWS = 24
@@ -77,6 +80,13 @@ TUI_ARGS = (
 )
 
 CSI = re.compile(r"^\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])")
+
+# The preview header's two labelled fields, as tui.rs writes them, without the space that follows
+# each label: word wrapping breaks between the label and a value too long to fit, leaving `Session:`
+# alone on its row. Matching `"Session: "` missed exactly that row. The second label bounds where a
+# wrapped session id can still be continuing.
+SESSION_FIELD_LABEL = "Session:"
+CWD_FIELD_LABEL = "CWD:"
 
 
 class ScreenLayout:
@@ -253,12 +263,27 @@ class ScreenTracker:
         return int(match.group(1))
 
     def preview_session_id(self, layout: ScreenLayout) -> str | None:
-        preview = "\n".join(
+        rows = [
             "".join(self.rows[row][layout.preview_cols.start : layout.preview_cols.stop]).strip()
             for row in layout.list_rows
-        )
-        match = re.search(r"(?:^|\n)Session: (\S+)", preview)
-        return match.group(1) if match is not None else None
+        ]
+        for index, row in enumerate(rows):
+            if not row.startswith(SESSION_FIELD_LABEL):
+                continue
+            # An id wider than the preview pane wraps, and a subagent id
+            # (`claude:<uuid>/agent-<hash>`, 67 characters) does at 100 columns against a real
+            # index: the wrapper leaves `Session:` alone on its row and breaks the id itself
+            # across the next ones. Rejoin them — the pane inserts nothing when it breaks a run
+            # with no spaces, so concatenating the stripped rows reproduces the id exactly.
+            # Reading one row returned a truncated id that could never match the canonical one,
+            # and the traversal reported it as a TUI that never showed the row.
+            identifier = row[len(SESSION_FIELD_LABEL) :].lstrip()
+            for continuation in rows[index + 1 :]:
+                if not continuation or continuation.startswith(CWD_FIELD_LABEL):
+                    break
+                identifier += continuation
+            return identifier or None
+        return None
 
     def session_result_count(self) -> int:
         match = re.search(r"Sessions[^\n]*\(\d+/(\d+)\)", self.full_screen())
@@ -581,7 +606,11 @@ def _validate_run_timings(runs: list[dict]) -> None:
         if any(value < 0 for value in run["echo_ms"]):
             raise SystemExit(f"missing typed-character echo observation for query {run['query']}")
         if run["results_ms"] is None:
-            raise SystemExit(f"missing final-result observation for query {run['query']}")
+            raise SystemExit(
+                f"missing final-result observation for query {run['query']}: the last keystroke's "
+                "results did not settle within --final-settle-seconds. A larger index needs a "
+                "larger value; a stuck search needs investigating."
+            )
 
 
 def _validate_result_counts(runs: list[dict], tui_ids: dict[str, list[str]]) -> None:
@@ -620,7 +649,12 @@ def _stable_result_digests(
 
 
 def _probe_tui_result_ids(
-    binary: str, fixture: str, query: str, startup_wait: float, timeout: float
+    binary: str,
+    fixture: str,
+    query: str,
+    startup_wait: float,
+    timeout: float,
+    final_settle_seconds: float,
 ) -> list[str]:
     return _measure_once(
         binary,
@@ -630,11 +664,18 @@ def _probe_tui_result_ids(
         timeout,
         f"{query}#semantic-probe",
         collect_ids=True,
+        final_settle_seconds=final_settle_seconds,
     )["tui_ids"]
 
 
 def measure_latency(
-    binary: str, fixture: str, queries: list[str], repetitions: int, startup_wait: float, timeout: float
+    binary: str,
+    fixture: str,
+    queries: list[str],
+    repetitions: int,
+    startup_wait: float,
+    timeout: float,
+    final_settle_seconds: float = FINAL_KEY_SETTLE_CAP_SECONDS,
 ) -> dict:
     runs = []
     peak_rss_kb = peak_threads = None
@@ -647,6 +688,7 @@ def measure_latency(
             run = _measure_once(
                 binary, fixture, query, startup_wait, timeout,
                 f"{query}#{repetition}",
+                final_settle_seconds=final_settle_seconds,
             )
             runs.append(run)
             peak_rss_kb = run["peak_rss_kb"] if peak_rss_kb is None else max(peak_rss_kb, run["peak_rss_kb"])
@@ -664,7 +706,9 @@ def measure_latency(
         if len(counts) != 1:
             raise SystemExit(f"non-deterministic TUI result count for {query}: {sorted(counts)}")
     tui_ids = {
-        query: _probe_tui_result_ids(binary, fixture, query, startup_wait, timeout)
+        query: _probe_tui_result_ids(
+            binary, fixture, query, startup_wait, timeout, final_settle_seconds
+        )
         for query in queries
     }
     canonical_ids = {
@@ -744,6 +788,7 @@ def _measure_once(
     label: str,
     *,
     collect_ids: bool = False,
+    final_settle_seconds: float = FINAL_KEY_SETTLE_CAP_SECONDS,
 ) -> dict:
     run_started = time.monotonic()
     tui = TuiProcess(binary, fixture)
@@ -790,7 +835,7 @@ def _measure_once(
                     layout,
                     list_before,
                     sent_at,
-                    FINAL_KEY_SETTLE_CAP_SECONDS,
+                    final_settle_seconds,
                     initial_result_ms=results_found,
                     completion_signal=completion_signal,
                 )
@@ -852,7 +897,19 @@ def _await_tui_position_id(
             and (selected != previous or allow_same)
         ):
             return selected
-    raise SystemExit(f"could not collect TUI session ID at position {position}")
+    # Say which of the three conditions did not hold. The bare message named a position and
+    # nothing else, so a preview that failed to load, a selection that never moved, and a parser
+    # that could not read the id were indistinguishable, and each one reads as a broken TUI.
+    header = [
+        "".join(tracker.rows[row][layout.preview_cols.start : layout.preview_cols.stop]).strip()
+        for row in layout.list_rows
+    ][:3]
+    raise SystemExit(
+        f"could not collect TUI session ID at position {position} within {timeout}s: "
+        f"selection reached position {tracker.session_position()}, "
+        f"preview parsed as {tracker.preview_session_id(layout)!r} "
+        f"(previous {previous!r}), preview header {header!r}"
+    )
 
 
 def _collect_tui_result_ids(
@@ -1136,14 +1193,25 @@ def main() -> int:
     parser.add_argument("--measure-latency", action="store_true")
     parser.add_argument("--queries", default=DEFAULT_QUERIES)
     parser.add_argument("--repetitions", type=int, default=DEFAULT_REPETITIONS)
+    parser.add_argument(
+        "--final-settle-seconds",
+        type=float,
+        default=FINAL_KEY_SETTLE_CAP_SECONDS,
+        help=(
+            "how long the last keystroke's results may take to settle. The default fits the "
+            "generated fixture; point this at a multi-gigabyte index and raise it."
+        ),
+    )
     args = parser.parse_args()
     if args.measure_latency:
         queries = [query.strip() for query in args.queries.split(",") if query.strip()]
         if not queries:
             raise SystemExit("--queries must contain at least one non-empty query")
+        if args.final_settle_seconds <= 0:
+            raise SystemExit("--final-settle-seconds must be greater than zero")
         report = measure_latency(
             args.binary, args.fixture, queries, args.repetitions,
-            args.startup_wait, args.timeout,
+            args.startup_wait, args.timeout, args.final_settle_seconds,
         )
         print(json.dumps(report, separators=(",", ":")))
         return 0
