@@ -311,9 +311,15 @@ what a key event means and never parses a key name, and the status bar names wha
 rather than the defaults. A table names only the actions it changes and the rest keep theirs,
 the same merge `[providers.<name>]` already uses, because replacing the whole table on a partial
 override would unbind eighteen commands to change one. `[]` unbinds an action deliberately.
-A binding is a single character or a named key, optionally chorded with `ctrl`, `alt`, `shift`,
-or `super`; a capital letter is written as itself rather than `shift+`, because whether a
-terminal reports the shift flag beside the character is a property of its keyboard protocol.
+A binding is a single character, `f1` through `f35`, or a named key, optionally chorded with
+`ctrl`, `alt`, `shift`, or `super`; a capital letter is written as itself rather than `shift+`,
+because whether a terminal reports the shift flag beside the character is a property of its
+keyboard protocol. A chorded letter goes further and ignores its case, making `ctrl+c` and
+`ctrl+C` one binding: crossterm substitutes the shifted character and clears the shift flag when
+the terminal reports kitty alternate keys, so keeping the case significant would answer Ctrl+Shift+C
+on one terminal and not another.
+A command may be reached by as many keys as the table lists, so a reader adding their own keeps
+the shipped one; a key an action already lists is a repeat and is kept once.
 Two rules are checked at load: one chord may not mean two things reachable from the same mode
 (which is why Esc can both leave the search box and quit the browser, and Enter can both leave
 it and resume), and `quit` and `interrupt` may not both be unbound. `interrupt` answers in both

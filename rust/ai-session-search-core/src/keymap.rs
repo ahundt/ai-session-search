@@ -159,7 +159,11 @@ impl fmt::Display for TuiAction {
 
 /// The named keys `[ui.keys]` accepts beside a single character, paired with the crossterm code
 /// they select. One table serves parsing, rendering, and the error message that lists them.
-const NAMED_KEYS: [(&str, KeyCode); 20] = [
+///
+/// Function keys are deliberately absent: they are a numbered range, and listing four of them
+/// here made `f7` a key this module would print but refuse to read back. [`function_key`] owns
+/// the whole range for both directions instead.
+const NAMED_KEYS: [(&str, KeyCode); 16] = [
     ("enter", KeyCode::Enter),
     ("esc", KeyCode::Esc),
     ("tab", KeyCode::Tab),
@@ -176,11 +180,20 @@ const NAMED_KEYS: [(&str, KeyCode); 20] = [
     ("end", KeyCode::End),
     ("pageup", KeyCode::PageUp),
     ("pagedown", KeyCode::PageDown),
-    ("f1", KeyCode::F(1)),
-    ("f2", KeyCode::F(2)),
-    ("f3", KeyCode::F(3)),
-    ("f4", KeyCode::F(4)),
 ];
+
+/// The highest function key a terminal reports. Twelve is what a keyboard carries; the kitty
+/// keyboard protocol numbers them to thirty-five, so accepting the whole range costs nothing and
+/// keeps a chord this module prints readable back in.
+const HIGHEST_FUNCTION_KEY: u8 = 35;
+
+/// `f7` as [`KeyCode::F`], for the range [`fmt::Display`] writes out.
+fn function_key(name: &str) -> Option<KeyCode> {
+    let number = name.strip_prefix('f')?.parse::<u8>().ok()?;
+    (1..=HIGHEST_FUNCTION_KEY)
+        .contains(&number)
+        .then_some(KeyCode::F(number))
+}
 
 /// The modifiers a chord may name, in the order [`KeyChord`] writes them back out.
 const NAMED_MODIFIERS: [(&str, KeyModifiers); 4] = [
@@ -196,6 +209,14 @@ const NAMED_MODIFIERS: [(&str, KeyModifiers); 4] = [
 /// character `G`, with or without a shift flag depending on its keyboard protocol, so requiring
 /// the flag would make `bottom = ["G"]` work on one terminal and not another. For a named key
 /// there is no character to carry the distinction, so shift stays significant there.
+///
+/// Once another modifier is present the character's *case* becomes the same kind of protocol
+/// difference. crossterm swaps in the shifted character and clears the shift flag when the
+/// terminal reports kitty alternate keys, so Ctrl+Shift+C arrives as `Char('C')` with Control
+/// there and as `Char('c')` with Control and Shift on a legacy terminal. A chorded letter is
+/// therefore folded to lower case, which makes `ctrl+c` and `ctrl+C` one binding that answers on
+/// both. A bare letter keeps its case, because there the case is the whole of what distinguishes
+/// the shipped `g` from `G`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyChord {
     code: KeyCode,
@@ -204,25 +225,36 @@ pub struct KeyChord {
 
 impl KeyChord {
     pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        Self {
-            code,
-            modifiers: Self::significant(code, modifiers),
-        }
+        let (code, modifiers) = Self::significant(code, modifiers);
+        Self { code, modifiers }
     }
 
-    /// The modifiers that decide whether two chords are the same key press.
-    fn significant(code: KeyCode, modifiers: KeyModifiers) -> KeyModifiers {
-        let kept = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER;
-        if matches!(code, KeyCode::Char(_)) {
-            modifiers & kept
-        } else {
-            modifiers & (kept | KeyModifiers::SHIFT)
+    /// The key code and modifiers that decide whether two presses are the same chord.
+    fn significant(code: KeyCode, modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+        let chorded = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER;
+        let KeyCode::Char(character) = code else {
+            return (code, modifiers & (chorded | KeyModifiers::SHIFT));
+        };
+        let kept = modifiers & chorded;
+        if kept.is_empty() {
+            return (code, kept);
         }
+        (KeyCode::Char(fold_case(character)), kept)
     }
 
     /// True when `event` is this chord. Key repeat and release events are the caller's business.
     pub fn matches(&self, event: &KeyEvent) -> bool {
-        self.code == event.code && self.modifiers == Self::significant(event.code, event.modifiers)
+        (self.code, self.modifiers) == Self::significant(event.code, event.modifiers)
+    }
+}
+
+/// `character` in lower case, when lowering it yields one character. `İ` lowers to two, and a
+/// chord is one key press, so such a character is left as the reader wrote it.
+fn fold_case(character: char) -> char {
+    let mut lowered = character.to_lowercase();
+    match (lowered.next(), lowered.next()) {
+        (Some(single), None) => single,
+        _ => character,
     }
 }
 
@@ -251,7 +283,7 @@ fn accepted_key_names() -> String {
         .map(|(name, _)| *name)
         .collect::<Vec<_>>()
         .join(", ");
-    format!("a single character, or one of: {named}")
+    format!("a single character, f1 through f{HIGHEST_FUNCTION_KEY}, or one of: {named}")
 }
 
 impl FromStr for KeyChord {
@@ -293,6 +325,9 @@ impl FromStr for KeyChord {
         {
             return Ok(Self::new(*code, modifiers));
         }
+        if let Some(code) = function_key(&lowered) {
+            return Ok(Self::new(code, modifiers));
+        }
         let mut characters = rest.chars();
         match (characters.next(), characters.next()) {
             (Some(character), None) => Ok(Self::new(KeyCode::Char(character), modifiers)),
@@ -330,6 +365,22 @@ impl KeyBindings {
     /// The chords bound to `action`.
     pub fn chords(&self, action: TuiAction) -> &[KeyChord] {
         self.0.get(&action).map_or(&[], Vec::as_slice)
+    }
+
+    /// Bind `chords` to `action`, keeping the first spelling of a chord the action already lists.
+    ///
+    /// Every binding is stored through here, so [`Self::validate`]'s conflict check only ever
+    /// sees one chord per action and its message always names two different commands. Naming a
+    /// key twice for one command is a repeat, not a conflict — it still means one thing — and it
+    /// happens the moment two spellings fold together, as `ctrl+c` and `ctrl+C` now do.
+    fn bind(&mut self, action: TuiAction, chords: impl IntoIterator<Item = KeyChord>) {
+        let mut kept: Vec<KeyChord> = Vec::new();
+        for chord in chords {
+            if !kept.contains(&chord) {
+                kept.push(chord);
+            }
+        }
+        self.0.insert(action, kept);
     }
 
     /// The action `event` selects in `mode`, if any.
@@ -382,9 +433,9 @@ fn reachable(action: ActionMode, mode: ActionMode) -> bool {
 impl Default for KeyBindings {
     fn default() -> Self {
         let chord = |text: &str| text.parse::<KeyChord>().expect("a shipped default parses");
-        let mut bindings = BTreeMap::new();
+        let mut bindings = Self(BTreeMap::new());
         let mut bind = |action: TuiAction, keys: &[&str]| {
-            bindings.insert(action, keys.iter().map(|key| chord(key)).collect());
+            bindings.bind(action, keys.iter().map(|key| chord(key)));
         };
         bind(TuiAction::Interrupt, &["ctrl+c"]);
         bind(TuiAction::Quit, &["q", "esc"]);
@@ -414,7 +465,7 @@ impl Default for KeyBindings {
         bind(TuiAction::CursorRight, &["right"]);
         bind(TuiAction::CursorStart, &["home", "ctrl+a"]);
         bind(TuiAction::CursorEnd, &["end", "ctrl+e"]);
-        Self(bindings)
+        bindings
     }
 }
 
@@ -426,7 +477,7 @@ impl<'de> Deserialize<'de> for KeyBindings {
         let overrides = BTreeMap::<TuiAction, Vec<KeyChord>>::deserialize(deserializer)?;
         let mut bindings = Self::default();
         for (action, chords) in overrides {
-            bindings.0.insert(action, chords);
+            bindings.bind(action, chords);
         }
         Ok(bindings)
     }
@@ -527,6 +578,24 @@ mod tests {
     }
 
     #[test]
+    fn every_function_key_reads_back_the_way_it_is_written() {
+        // Four of them used to be listed by name while `Display` wrote out the whole range, so
+        // `f7` was a chord this module printed and then refused to parse.
+        for number in 1..=HIGHEST_FUNCTION_KEY {
+            let written = format!("f{number}");
+            let chord: KeyChord = written.parse().unwrap_or_else(|error| {
+                panic!("{written} did not parse: {error}");
+            });
+            assert!(chord.matches(&KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE)));
+            assert_eq!(chord.to_string(), written);
+        }
+        assert!("f0".parse::<KeyChord>().is_err());
+        assert!(format!("f{}", u16::from(HIGHEST_FUNCTION_KEY) + 1)
+            .parse::<KeyChord>()
+            .is_err());
+    }
+
+    #[test]
     fn an_unknown_key_name_says_what_to_write_instead() {
         let error = "ctrl+nope".parse::<KeyChord>().unwrap_err().to_string();
         assert!(error.contains("unknown key"), "{error}");
@@ -549,9 +618,7 @@ mod tests {
     #[test]
     fn one_chord_bound_to_two_actions_in_one_mode_is_refused() {
         let mut bindings = KeyBindings::default();
-        bindings
-            .0
-            .insert(TuiAction::Top, vec!["q".parse().unwrap()]);
+        bindings.bind(TuiAction::Top, ["q".parse().unwrap()]);
         let error = bindings.validate().unwrap_err().to_string();
         assert!(error.contains("ui.keys binds q"), "{error}");
         assert!(error.contains("quit"), "{error}");
@@ -561,8 +628,8 @@ mod tests {
     #[test]
     fn a_table_with_no_way_out_is_refused() {
         let mut bindings = KeyBindings::default();
-        bindings.0.insert(TuiAction::Quit, Vec::new());
-        bindings.0.insert(TuiAction::Interrupt, Vec::new());
+        bindings.bind(TuiAction::Quit, []);
+        bindings.bind(TuiAction::Interrupt, []);
         let error = bindings.validate().unwrap_err().to_string();
         assert!(error.contains("could not be exited"), "{error}");
     }
@@ -588,6 +655,71 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("teleport"), "{error}");
+    }
+
+    #[test]
+    fn an_action_may_be_reached_by_as_many_keys_as_the_reader_writes() {
+        // The point of a list per action: a reader who wants their own key does not have to give
+        // up the shipped one, and several aliases for one command are ordinary rather than a
+        // conflict. Only two chords per action ship, so without this nothing tested more.
+        let bindings: KeyBindings =
+            toml::from_str("quit = [\"q\", \"esc\", \"ctrl+q\", \"f1\", \"x\"]").unwrap();
+        bindings.validate().expect("aliases are not a conflict");
+        for (code, modifiers) in [
+            (KeyCode::Char('q'), KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+            (KeyCode::F(1), KeyModifiers::NONE),
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+        ] {
+            assert_eq!(
+                bindings.action_for(&KeyEvent::new(code, modifiers), ActionMode::Browse),
+                Some(TuiAction::Quit),
+                "{code:?} with {modifiers:?} did not reach quit"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_one_key_twice_for_one_action_is_kept_once_rather_than_refused() {
+        // Listing a key an action already has is a duplicate, not a conflict: it still means one
+        // thing. The check reported `binds q to both quit and quit`, naming one action twice and
+        // asking the reader to give one of them another key.
+        let bindings: KeyBindings = toml::from_str("quit = [\"q\", \"esc\", \"q\"]").unwrap();
+        bindings
+            .validate()
+            .expect("one action listing a key twice still means one thing");
+        assert_eq!(
+            bindings.chords(TuiAction::Quit),
+            &[
+                "q".parse::<KeyChord>().unwrap(),
+                "esc".parse::<KeyChord>().unwrap()
+            ],
+            "the repeat should be dropped, so the help does not print `q, esc, q`"
+        );
+    }
+
+    #[test]
+    fn a_modified_letter_is_the_same_chord_whichever_case_the_terminal_reports() {
+        // crossterm replaces the key code with the shifted character and clears SHIFT when the
+        // terminal reports kitty alternate keys (crossterm 0.29 parse.rs:598-606), so Ctrl+Shift+C
+        // arrives as Char('C')+CONTROL there and as Char('c')+CONTROL|SHIFT on a legacy terminal.
+        // Keeping the case significant would make one binding work on one terminal only, which is
+        // the failure the shift rule above already refuses for a bare character.
+        let lower: KeyChord = "ctrl+c".parse().unwrap();
+        let upper: KeyChord = "ctrl+C".parse().unwrap();
+        assert_eq!(lower, upper, "ctrl+c and ctrl+C name one key press");
+        for chord in [lower, upper] {
+            assert!(chord.matches(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+            assert!(chord.matches(&KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )));
+            assert!(chord.matches(&KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL)));
+        }
+        // Unmodified letters keep their case: `g` and `G` are the shipped top and bottom keys.
+        let top: KeyChord = "g".parse().unwrap();
+        assert!(!top.matches(&KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE)));
     }
 
     #[test]

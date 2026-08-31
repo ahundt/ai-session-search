@@ -272,10 +272,15 @@ color = "auto"
 # defaults shown here, the same way a [providers.<name>] table overrides only the fields it
 # names. An action set to [] is deliberately unbound, and the status bar stops advertising it.
 #
-# A binding is a single character, or one of enter, esc, tab, backtab, backspace, delete,
-# insert, space, up, down, left, right, home, end, pageup, pagedown, f1, f2, f3, f4 — with any
-# of ctrl, alt, shift, super joined to it by +. Shift is not written for a capital letter:
-# "G" is the binding, because a terminal may or may not report the shift flag beside it.
+# A binding is a single character, f1 through f35, or one of enter, esc, tab, backtab,
+# backspace, delete, insert, space, up, down, left, right, home, end, pageup, pagedown — with
+# any of ctrl, alt, shift, super joined to it by +. Shift is not written for a capital letter:
+# "G" is the binding, because a terminal may or may not report the shift flag beside it. For the
+# same reason a chorded letter ignores its case, so "ctrl+c" and "ctrl+C" are one binding.
+#
+# A command may be reached by as many keys as you list, so adding your own keeps the shipped
+# one. Listing a key an action already has is a repeat and is kept once; the same key on two
+# commands reachable from one mode is a conflict and is refused.
 #
 # `interrupt` is answered in both modes and takes two presses: the first says so in the status
 # bar and the second quits. It exists because a full-screen terminal application turns off the

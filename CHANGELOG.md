@@ -49,9 +49,14 @@ compatibility baseline; tags below it do not define a compatibility contract.
   `bottom`, `cycle_provider`, `cycle_session_kind`, `cycle_time_window`,
   `toggle_warnings_only`, `preview_scroll_down`, `preview_scroll_up`, `preview_page_down`,
   `preview_page_up`, and `resume`. A table names only the actions it changes and the rest keep
-  their defaults; `[]` unbinds one. A binding is a character or a named key, optionally chorded
-  with `ctrl`, `alt`, `shift`, or `super`. One chord may not mean two things reachable from the
-  same mode, and `quit` and `interrupt` may not both be unbound. The status bar names whatever
+  their defaults; `[]` unbinds one. A binding is a character, `f1` through `f35`, or a named key,
+  optionally chorded with `ctrl`, `alt`, `shift`, or `super`. A command takes as many keys as the
+  table lists, so a reader adding their own keeps the shipped one, and a key that action already
+  lists is kept once rather than reported as a conflict with itself. A chorded letter ignores its
+  case, so `ctrl+c` and `ctrl+C` are one binding: crossterm substitutes the shifted character and
+  clears the shift flag under the kitty keyboard protocol, so a case-significant chord would answer
+  Ctrl+Shift+C on one terminal and not another. One chord may not mean two things reachable from
+  the same mode, and `quit` and `interrupt` may not both be unbound. The status bar names whatever
   is bound rather than the shipped defaults.
 - `[ui].search_debounce_ms` (150): how long an edited TUI query must stay unchanged before it
   becomes a search. Typing never waits on it — the keystroke echoes on its own loop turn and the
