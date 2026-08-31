@@ -395,15 +395,27 @@ where
         .ok_or_else(|| anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock"))?;
     loop {
         let now = std::time::Instant::now();
+        // A query edited and then left alone becomes a search here, so the wait below is what
+        // separates typing from searching. The slice is shortened to the remaining delay so the
+        // search starts on time rather than at the next idle turn.
+        let mut pending_search_delay = app.edited_query_delay(now);
+        if pending_search_delay == Some(Duration::ZERO) {
+            app.flush_edited_query();
+            terminal.draw(|frame| app.render(frame))?;
+            pending_search_delay = None;
+        }
         if now >= idle_deadline {
             return Ok(None);
         }
         let remaining = idle_deadline.saturating_duration_since(now);
-        let slice = if app.searching || app.preview_loading || app.worker.has_work() {
+        let mut slice = if app.searching || app.preview_loading || app.worker.has_work() {
             remaining.min(ACTIVE_WORKER_POLL_SLICE)
         } else {
             remaining
         };
+        if let Some(delay) = pending_search_delay {
+            slice = slice.min(delay);
+        }
         if events.poll(slice)? {
             let event = events.read()?;
             let Event::Key(key) = event else {
@@ -958,6 +970,10 @@ struct AppState {
     search_mode: bool,
     current_search_generation: RequestGeneration,
     current_preview_generation: RequestGeneration,
+    /// When the query was last edited with no search issued for it yet. `step` turns it into one
+    /// request once typing has been quiet for `[ui].search_debounce_ms`, so a typed burst costs
+    /// one search instead of one cancelled scan per character. `None` means nothing is pending.
+    query_edited_at: Option<std::time::Instant>,
     /// True from request submission until the matching search success/error is applied. Rendered
     /// in the list title so the real-terminal benchmark can observe final-generation completion.
     searching: bool,
@@ -1022,6 +1038,7 @@ impl AppState {
             search_mode: false,
             current_search_generation: RequestGeneration::new(),
             current_preview_generation: RequestGeneration::new(),
+            query_edited_at: None,
             searching: false,
             preview_loading: false,
             selected: 0,
@@ -1044,14 +1061,18 @@ impl AppState {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.search_mode = false;
+                    // Leaving the box searches whatever is in it now. Waiting out the delay
+                    // after an explicit Enter is the one case where the reader has already said
+                    // they are done typing.
+                    self.flush_edited_query();
                 }
                 KeyCode::Backspace => {
                     self.query.pop();
-                    self.request_search();
+                    self.note_query_edit();
                 }
                 KeyCode::Char(ch) => {
                     self.query.push(ch);
-                    self.request_search();
+                    self.note_query_edit();
                 }
                 _ => {}
             }
@@ -1174,6 +1195,38 @@ impl AppState {
             }
         }
         true
+    }
+
+    /// Record that the query changed. The search itself waits for `[ui].search_debounce_ms` of
+    /// quiet, so a typed word costs one search rather than one per character; the keystroke
+    /// still echoes on this turn either way.
+    ///
+    /// `searching` goes true here rather than at submission, because from the reader's side the
+    /// search has begun: the list title says so, and the loop starts taking its short wait
+    /// slices so the result is picked up as soon as it lands.
+    fn note_query_edit(&mut self) {
+        self.query_edited_at = Some(std::time::Instant::now());
+        self.searching = true;
+        if self.config.ui.search_debounce_ms == 0 {
+            self.flush_edited_query();
+        }
+    }
+
+    /// Issue the pending query's search now, if one is pending.
+    fn flush_edited_query(&mut self) {
+        if self.query_edited_at.take().is_some() {
+            self.request_search();
+        }
+    }
+
+    /// How long until the pending query is due to be searched for, if one is pending. `None`
+    /// means nothing is waiting; `Some(ZERO)` means it is due now.
+    fn edited_query_delay(&self, now: std::time::Instant) -> Option<Duration> {
+        let edited = self.query_edited_at?;
+        Some(
+            Duration::from_millis(self.config.ui.search_debounce_ms)
+                .saturating_sub(now.saturating_duration_since(edited)),
+        )
     }
 
     /// Queue a search for the current query. `send` cancels any in-flight search first —
@@ -2246,8 +2299,18 @@ mod tests {
             // The real 150 ms idle pacing makes every step wait it out against the
             // sleeping scripted source; shrink the default so steps complete fast. A test
             // that sets the field explicitly keeps its value.
-            if config.ui.event_poll_interval_ms == 150 {
+            // Compared against the shipped default rather than a literal: a literal that stops
+            // matching would silently hand every scripted test the real timings and hang them.
+            let shipped = Config::default().ui;
+            if config.ui.event_poll_interval_ms == shipped.event_poll_interval_ms {
                 config.ui.event_poll_interval_ms = 1;
+            }
+            // Same reason for the typing delay: a scripted test presses a key and then asserts
+            // on what the search did, with no wall clock advancing in between. Zero is the
+            // documented "search on every keystroke" setting, so those tests read as they did
+            // before the delay existed. The three tests that are about the delay set their own.
+            if config.ui.search_debounce_ms == shipped.search_debounce_ms {
+                config.ui.search_debounce_ms = 0;
             }
             let (worker, observed) =
                 spawn_search_worker(factory).expect("worker startup handshake");
@@ -4027,11 +4090,14 @@ mod tests {
     }
     // ---- step 5: filter bindings, layout config, parity, presentation ----
 
-    fn recording_executor() -> (mpsc::Receiver<(RequestKind, SearchFilters)>, SearchExecutor) {
-        let (tx, rx) = mpsc::channel::<(RequestKind, SearchFilters)>();
+    fn recording_executor() -> (
+        mpsc::Receiver<(RequestKind, SearchFilters, String)>,
+        SearchExecutor,
+    ) {
+        let (tx, rx) = mpsc::channel::<(RequestKind, SearchFilters, String)>();
         let executor = Box::new(
             move |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| {
-                let _ = tx.send((request.kind, request.filters.clone()));
+                let _ = tx.send((request.kind, request.filters.clone(), request.query.clone()));
                 Ok(match request.kind {
                     RequestKind::Search => {
                         WorkerResponse::results(request, rows(&["claude:keep", "claude:also"]))
@@ -4044,13 +4110,20 @@ mod tests {
     }
 
     fn wait_for_filters(
-        rx: &mpsc::Receiver<(RequestKind, SearchFilters)>,
+        rx: &mpsc::Receiver<(RequestKind, SearchFilters, String)>,
         kind: RequestKind,
     ) -> SearchFilters {
+        wait_for_recorded_request(rx, kind).0
+    }
+
+    fn wait_for_recorded_request(
+        rx: &mpsc::Receiver<(RequestKind, SearchFilters, String)>,
+        kind: RequestKind,
+    ) -> (SearchFilters, String) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((seen, filters)) if seen == kind => return filters,
+                Ok((seen, filters, query)) if seen == kind => return (filters, query),
                 Ok(_) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -4338,6 +4411,100 @@ mod tests {
         );
         harness.app.scroll_preview(isize::MAX);
         assert!(harness.app.preview_scroll > 0);
+    }
+
+    /// Every non-empty `Search` query the executor was asked for, in order, drained after the
+    /// script settles. The startup request carries an empty query and is excluded.
+    fn typed_search_queries(
+        rx: &mpsc::Receiver<(RequestKind, SearchFilters, String)>,
+    ) -> Vec<String> {
+        let mut queries = Vec::new();
+        while let Ok((kind, _, query)) = rx.recv_timeout(Duration::from_millis(200)) {
+            if kind == RequestKind::Search && !query.is_empty() {
+                queries.push(query);
+            }
+        }
+        queries
+    }
+
+    #[test]
+    fn a_typed_burst_becomes_one_search_after_the_configured_quiet_period() {
+        // Every keystroke used to start a search that the next keystroke cancelled, so typing a
+        // five-letter word began five corpus scans to answer one question. On a 36.5 GB index a
+        // session search costs 2.3 to 3.6 s, which is what the reader waits for either way, but
+        // the four abandoned scans are work nobody asked for.
+        let mut config = Config::default();
+        config.ui.search_debounce_ms = 40;
+        config.ui.event_poll_interval_ms = 1;
+        let (requests, executor) = recording_executor();
+        let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
+        wait_for_recorded_request(&requests, RequestKind::Search);
+
+        harness.script(vec![
+            key(KeyCode::Char('/')),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('b')),
+            key(KeyCode::Char('c')),
+        ]);
+        harness.step_until_script_drained();
+        step_until(&mut harness, |harness| !harness.app.searching);
+
+        assert_eq!(
+            typed_search_queries(&requests),
+            vec!["abc".to_string()],
+            "a burst inside the quiet period must ask one question, and it must be the whole one"
+        );
+    }
+
+    #[test]
+    fn enter_searches_the_typed_query_without_waiting_out_the_quiet_period() {
+        // Leaving the search box is the reader saying they are done typing, so the delay has
+        // nothing left to wait for. Without this, a long configured delay would look exactly
+        // like a TUI that ignores Enter.
+        let mut config = Config::default();
+        config.ui.search_debounce_ms = 600_000;
+        config.ui.event_poll_interval_ms = 1;
+        let (requests, executor) = recording_executor();
+        let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
+        wait_for_recorded_request(&requests, RequestKind::Search);
+
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        assert!(
+            typed_search_queries(&requests).is_empty(),
+            "the ten-minute delay must still be holding the search"
+        );
+
+        harness.script(vec![key(KeyCode::Enter)]);
+        harness.step_until_script_drained();
+        let (_, query) = wait_for_recorded_request(&requests, RequestKind::Search);
+        assert_eq!(query, "a", "Enter searches what is in the box");
+        assert!(!harness.app.search_mode, "Enter also leaves the search box");
+    }
+
+    #[test]
+    fn a_zero_quiet_period_searches_on_every_keystroke() {
+        // 0 names the behavior this had before the setting existed, so it has to keep meaning
+        // that rather than becoming an accidental synonym for the default.
+        let mut config = Config::default();
+        config.ui.search_debounce_ms = 0;
+        config.ui.event_poll_interval_ms = 1;
+        let (requests, executor) = recording_executor();
+        let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
+        wait_for_recorded_request(&requests, RequestKind::Search);
+
+        harness.script(vec![
+            key(KeyCode::Char('/')),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('b')),
+        ]);
+        harness.step_until_script_drained();
+        step_until(&mut harness, |harness| !harness.app.searching);
+
+        assert_eq!(
+            typed_search_queries(&requests),
+            vec!["a".to_string(), "ab".to_string()]
+        );
     }
 
     #[test]

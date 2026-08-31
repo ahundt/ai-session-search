@@ -240,11 +240,18 @@ preview_lines = 34
 # immediately; this value paces settled idle turns, while active worker output is checked sooner.
 # Values must fit the platform monotonic clock; unrepresentable intervals are rejected.
 event_poll_interval_ms = 150
+# Milliseconds an edited query must stay unchanged before it becomes a search. Typing never
+# waits on this: every keystroke echoes immediately and the search runs off the input thread.
+# 0 searches on every keystroke, and Enter searches the current query at once whatever the
+# value. Raise it on a large index, where one search costs seconds and a typed burst would
+# otherwise start a scan per character that the next keystroke cancels.
+search_debounce_ms = 150
 # Rows the selection moves for PageDown/PageUp in the session list.
 list_page_step = 10
-# Lines the preview scrolls for l/h (and Left/Right).
+# Rendered rows the preview scrolls for l/h (and Left/Right). Rows, not transcript lines: a
+# long line occupies several rows once the pane wraps it.
 preview_scroll_step = 5
-# Lines the preview scrolls for Ctrl-d/Ctrl-u.
+# Rendered rows the preview scrolls for Ctrl-d/Ctrl-u.
 preview_page_step = 15
 # Provider label column width in the session list. Normal panes clamp to the longest label;
 # exceptionally narrow panes clamp to their actual interior and may truncate labels.

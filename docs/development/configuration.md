@@ -259,10 +259,18 @@ pipelines can request all summary evidence with `--summary-items 0 --format json
 `event_poll_interval_ms` (150, minimum 1) paces settled idle turns. Every queued key redraws
 immediately within the same loop turn, and active search/preview output is checked within 10 ms;
 zero is rejected because it would return before polling any key, and intervals that do not fit the
-platform monotonic clock are rejected instead of overflowing the deadline. `list_page_step` (10)
+platform monotonic clock are rejected instead of overflowing the deadline.
+`search_debounce_ms` (150) is how long an edited query must stay unchanged before it becomes a
+search. Typing never waits on it: the keystroke echoes on its own loop turn and the search runs
+off the input thread either way. `0` searches on every keystroke, which is what this did before
+the setting existed, and Enter searches the current query at once whatever the value — so this is
+the one `[ui]` key where zero names a behavior rather than an impossible one, and the only one
+that accepts it. Raise it on a large index, where one search costs seconds and a typed burst
+would otherwise start a scan per character that the next keystroke cancels. `list_page_step` (10)
 is the PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and
-`preview_page_step` (15) are the l/h and Ctrl-d/Ctrl-u scroll amounts. These step values have
-minimum 1. `provider_label_width` (9, minimum 1) is the session
+`preview_page_step` (15) are the l/h and Ctrl-d/Ctrl-u scroll amounts, counted in rendered rows
+rather than transcript lines, because the scroll offset indexes the wrapped pane. These step
+values have minimum 1. `provider_label_width` (9, minimum 1) is the session
 list's provider column width — normal panes clamp upward to the longest label, while a pane too
 narrow to contain that label clamps to its actual interior and truncates rather than overflowing;
 `list_pane_percent` (45, range 10–90) is the body width share of the session-list pane, the preview

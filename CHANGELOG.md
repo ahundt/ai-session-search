@@ -27,6 +27,13 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Added
 
+- `[ui].search_debounce_ms` (150): how long an edited TUI query must stay unchanged before it
+  becomes a search. Typing never waits on it — the keystroke echoes on its own loop turn and the
+  search runs off the input thread either way — so this only decides how many searches a typed
+  word starts. Previously every keystroke began a corpus scan that the next keystroke cancelled;
+  on a 36.5 GB index, where one session search costs 2.3 to 3.6 seconds, typing a five-letter
+  word began five. `0` restores the per-keystroke behavior, and Enter searches the current query
+  at once whatever the value.
 - `[ui]` keys with typed defaults: `event_poll_interval_ms` (150), `list_page_step` (10),
   `preview_scroll_step` (5), `preview_page_step` (15), `provider_label_width` (9, clamped up
   to the longest provider label), `list_pane_percent` (45) — the TUI reads each one, and

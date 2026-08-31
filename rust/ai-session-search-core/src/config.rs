@@ -414,13 +414,19 @@ pub struct UiConfig {
     /// output uses a shorter bounded slice, so this paces only settled idle turns.
     #[serde(default = "default_event_poll_interval_ms")]
     pub event_poll_interval_ms: u64,
+    /// Milliseconds an edited TUI query must stay unchanged before it becomes a search. Typing
+    /// never waits on it — only the search does. `0` searches on every keystroke, and Enter
+    /// searches the current query immediately at any value.
+    #[serde(default = "default_search_debounce_ms")]
+    pub search_debounce_ms: u64,
     /// Rows the selection moves for PageDown/PageUp in the session list.
     #[serde(default = "default_list_page_step")]
     pub list_page_step: usize,
-    /// Lines the preview scrolls for `l`/`h` (and Left/Right).
+    /// Rendered rows the preview scrolls for `l`/`h` (and Left/Right). Rows, not transcript
+    /// lines: the scroll offset indexes the wrapped pane, where one long line occupies several.
     #[serde(default = "default_preview_scroll_step")]
     pub preview_scroll_step: usize,
-    /// Lines the preview scrolls for Ctrl-d/Ctrl-u.
+    /// Rendered rows the preview scrolls for Ctrl-d/Ctrl-u.
     #[serde(default = "default_preview_page_step")]
     pub preview_page_step: usize,
     /// Width of the provider label column in the session list. Normal panes clamp upward to the
@@ -960,6 +966,15 @@ fn default_event_poll_interval_ms() -> u64 {
     150
 }
 
+fn default_search_debounce_ms() -> u64 {
+    // Longer than the gap between keystrokes at a fast typing speed, so a burst becomes one
+    // search rather than one cancelled scan per character, and short enough that the wait after
+    // the last key is not the thing a reader notices. Measured on a 36.5 GB index, the search
+    // itself takes 2.3 to 3.6 s, so this is a rounding error there; on a small index it is the
+    // whole wait, which is why it is not larger.
+    150
+}
+
 fn default_list_page_step() -> usize {
     10
 }
@@ -1178,6 +1193,7 @@ impl Default for Config {
             ui: UiConfig {
                 preview_lines: default_preview_lines(),
                 event_poll_interval_ms: default_event_poll_interval_ms(),
+                search_debounce_ms: default_search_debounce_ms(),
                 list_page_step: default_list_page_step(),
                 preview_scroll_step: default_preview_scroll_step(),
                 preview_page_step: default_preview_page_step(),
@@ -1728,6 +1744,18 @@ impl Config {
             bail!(
                 "ui.event_poll_interval_ms is too large for this platform's monotonic clock; \
                  choose a smaller millisecond interval; {FIX}"
+            );
+        }
+        // No lower bound: unlike the pacing and step settings, 0 names a behavior here rather
+        // than an impossible one — search on every keystroke, which is what this did before the
+        // setting existed.
+        if Instant::now()
+            .checked_add(Duration::from_millis(self.ui.search_debounce_ms))
+            .is_none()
+        {
+            bail!(
+                "ui.search_debounce_ms is too large for this platform's monotonic clock; \
+                 choose a smaller millisecond delay, or 0 to search on every keystroke; {FIX}"
             );
         }
         if self.release_notifications.minimum_check_interval_hours == 0 {
