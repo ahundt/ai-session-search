@@ -1647,6 +1647,113 @@ fn one_two_four_and_eight_cli_readers_return_identical_json_pages() {
     }
 }
 
+/// A reader must answer while another process is holding the index writer lock.
+///
+/// The readers-only test above shows several readers agreeing with each other; this one is the
+/// interleaving people actually live with — a search run while something else is reindexing. It
+/// was covered only in-process, by a unit test on the helper that decides what to do about
+/// contention. The helper being right is not the same claim as the program not waiting: a read
+/// path that took the writer lock would pass that unit test and hang here.
+///
+/// `flock` is held per open file description, so the guard this test holds genuinely excludes the
+/// child process, and the child is given a deadline rather than being waited on, because the
+/// failure this is written against is a reader that never returns.
+#[cfg(unix)]
+#[test]
+fn a_reader_answers_while_another_process_holds_the_index_writer_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+    assert!(Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let db_path = root.path().join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "insert into sessions (
+             id, provider, provider_session_id, preview_text, source_path,
+             parse_version, discovery_source
+         ) values ('claude:contended', 'claude', 'contended', '', '/contended.jsonl', 'test', 'fixture');
+         insert into messages (session_id, provider, seq, role, kind, content)
+         values ('claude:contended', 'claude', 0, 'user', 'conversation', 'writer contention sentinel');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let lock_path = ai_session_search::indexer::index_update_lock_path(&db_path);
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let held = lock
+        .write()
+        .expect("nothing else holds the writer lock yet");
+
+    let mut reader = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "messages",
+            "search",
+            "writer contention sentinel",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match reader.try_wait().unwrap() {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = reader.kill();
+                let _ = reader.wait();
+                drop(held);
+                panic!(
+                    "the reader was still running after 20 s while another process held the \
+                     writer lock; reads must not wait on a reindex"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    let mut stdout = String::new();
+    reader
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    reader
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    drop(held);
+
+    assert!(status.success(), "reader failed under contention: {stderr}");
+    assert!(
+        stdout.contains("writer contention sentinel"),
+        "the reader returned without its own row under contention: {stdout}"
+    );
+}
+
 #[test]
 fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     let root = tempfile::tempdir().unwrap();
