@@ -44,6 +44,16 @@ pub enum TuiAction {
     PreviewPageDown,
     PreviewPageUp,
     Resume,
+    // The search box's own editing. These are commands a reader presses, so they are bound here
+    // rather than hard-coded; typing a character is not, because it is the text itself.
+    ClearQuery,
+    DeleteBackward,
+    DeleteForward,
+    DeleteWordBackward,
+    CursorLeft,
+    CursorRight,
+    CursorStart,
+    CursorEnd,
 }
 
 /// Which mode an action is reachable from. Two actions may share a chord when their modes do
@@ -57,7 +67,7 @@ pub enum ActionMode {
 
 impl TuiAction {
     /// Every action, in the order `[ui.keys]` and the defaults list them.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 27] = [
         Self::Interrupt,
         Self::Quit,
         Self::EnterSearch,
@@ -77,12 +87,28 @@ impl TuiAction {
         Self::PreviewPageDown,
         Self::PreviewPageUp,
         Self::Resume,
+        Self::ClearQuery,
+        Self::DeleteBackward,
+        Self::DeleteForward,
+        Self::DeleteWordBackward,
+        Self::CursorLeft,
+        Self::CursorRight,
+        Self::CursorStart,
+        Self::CursorEnd,
     ];
 
     pub fn mode(self) -> ActionMode {
         match self {
             Self::Interrupt => ActionMode::Both,
-            Self::LeaveSearch => ActionMode::Search,
+            Self::LeaveSearch
+            | Self::ClearQuery
+            | Self::DeleteBackward
+            | Self::DeleteForward
+            | Self::DeleteWordBackward
+            | Self::CursorLeft
+            | Self::CursorRight
+            | Self::CursorStart
+            | Self::CursorEnd => ActionMode::Search,
             _ => ActionMode::Browse,
         }
     }
@@ -109,6 +135,14 @@ impl TuiAction {
             Self::PreviewPageDown => "preview_page_down",
             Self::PreviewPageUp => "preview_page_up",
             Self::Resume => "resume",
+            Self::ClearQuery => "clear_query",
+            Self::DeleteBackward => "delete_backward",
+            Self::DeleteForward => "delete_forward",
+            Self::DeleteWordBackward => "delete_word_backward",
+            Self::CursorLeft => "cursor_left",
+            Self::CursorRight => "cursor_right",
+            Self::CursorStart => "cursor_start",
+            Self::CursorEnd => "cursor_end",
         }
     }
 }
@@ -367,6 +401,14 @@ impl Default for KeyBindings {
         bind(TuiAction::PreviewPageDown, &["ctrl+d"]);
         bind(TuiAction::PreviewPageUp, &["ctrl+u"]);
         bind(TuiAction::Resume, &["enter", "r"]);
+        bind(TuiAction::ClearQuery, &["ctrl+u"]);
+        bind(TuiAction::DeleteBackward, &["backspace"]);
+        bind(TuiAction::DeleteForward, &["delete"]);
+        bind(TuiAction::DeleteWordBackward, &["ctrl+w"]);
+        bind(TuiAction::CursorLeft, &["left"]);
+        bind(TuiAction::CursorRight, &["right"]);
+        bind(TuiAction::CursorStart, &["home", "ctrl+a"]);
+        bind(TuiAction::CursorEnd, &["end", "ctrl+e"]);
         Self(bindings)
     }
 }

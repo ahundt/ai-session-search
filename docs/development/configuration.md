@@ -288,6 +288,16 @@ hold the line: one asserts no cell outside ASCII anywhere in a frame that has bo
 error, section rules, and an elision marker; the other asserts no coloured cell while bold
 survives, because emphasis a monochrome terminal can show is what replaces the colour.
 
+The search box is a text field: the caret moves with `cursor_left`, `cursor_right`,
+`cursor_start`, and `cursor_end`, text is removed with `delete_backward`, `delete_forward`,
+`delete_word_backward`, and `clear_query`, and a character with no modifier is inserted where the
+caret sits. Those eight are bound in `[ui.keys]` like every other command; typing a character is
+not, because it is the text rather than a command. The caret is the terminal's own, placed with
+`Frame::set_cursor_position`, so it needs no glyph, appears on a terminal whose encoding has
+none, and takes its shape and blink from the reader's settings; a query wider than the box
+scrolls under it so the caret stays in view. Moving the caret is not an edit and does not start
+a search.
+
 `[ui.keys]` maps each command to the key presses that reach it, and `crate::keymap` owns that
 vocabulary: `config` stores a `KeyBindings` and validates it with everything else, `tui` asks it
 what a key event means and never parses a key name, and the status bar names whatever is bound

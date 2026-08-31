@@ -975,6 +975,9 @@ struct AppState {
     /// requests and drains responses (§2.3).
     worker: SearchWorker,
     query: String,
+    /// Where the next typed character goes, as a byte index into `query` on a character
+    /// boundary. The box was append-only, so a typo in the middle meant deleting back to it.
+    query_cursor: usize,
     search_mode: bool,
     current_search_generation: RequestGeneration,
     current_preview_generation: RequestGeneration,
@@ -1050,6 +1053,7 @@ impl AppState {
             },
             worker,
             query: String::new(),
+            query_cursor: 0,
             search_mode: false,
             current_search_generation: RequestGeneration::new(),
             current_preview_generation: RequestGeneration::new(),
@@ -1104,7 +1108,12 @@ impl AppState {
         match action {
             Some(TuiAction::Interrupt) => unreachable!("answered above"),
             Some(TuiAction::Quit) => return Some(AppAction::Quit),
-            Some(TuiAction::EnterSearch) => self.search_mode = true,
+            Some(TuiAction::EnterSearch) => {
+                self.search_mode = true;
+                // Resuming an existing query puts the caret where a reader would expect to
+                // continue typing it.
+                self.query_cursor = self.query.len();
+            }
             Some(TuiAction::LeaveSearch) => {
                 self.search_mode = false;
                 // Leaving the box searches whatever is in it now. Waiting out the delay after
@@ -1152,26 +1161,33 @@ impl AppState {
                     return Some(AppAction::Resume(Box::new(selected.clone())));
                 }
             }
-            // Not a binding in this mode. In the search box the key is text; anywhere else it
-            // is nothing. Backspace edits rather than commands, so it is structural rather than
-            // rebindable, and a chorded character is a chord that happens to be unbound — not
-            // something to type.
+            Some(TuiAction::ClearQuery) => self.clear_query(),
+            Some(TuiAction::DeleteBackward) => self.delete_backward(),
+            Some(TuiAction::DeleteForward) => self.delete_forward(),
+            Some(TuiAction::DeleteWordBackward) => self.delete_word_backward(),
+            Some(TuiAction::CursorLeft) => {
+                let to = Self::boundary_before(&self.query, self.query_cursor);
+                self.move_cursor(to);
+            }
+            Some(TuiAction::CursorRight) => {
+                let to = Self::boundary_after(&self.query, self.query_cursor);
+                self.move_cursor(to);
+            }
+            Some(TuiAction::CursorStart) => self.move_cursor(0),
+            Some(TuiAction::CursorEnd) => {
+                let to = self.query.len();
+                self.move_cursor(to);
+            }
+            // Not a binding in this mode. In the search box an unmodified character is text;
+            // anywhere else, and for a chord that happens to be unbound, it is nothing.
             None => {
                 if self.search_mode {
-                    match key.code {
-                        KeyCode::Backspace => {
-                            self.query.pop();
-                            self.note_query_edit();
+                    if let KeyCode::Char(character) = key.code {
+                        if !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) {
+                            self.insert_character(character);
                         }
-                        KeyCode::Char(character)
-                            if !key.modifiers.intersects(
-                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                            ) =>
-                        {
-                            self.query.push(character);
-                            self.note_query_edit();
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -1246,6 +1262,93 @@ impl AppState {
             }
         }
         true
+    }
+
+    /// The character boundary before `at`, or `at` when it is already the start.
+    fn boundary_before(text: &str, at: usize) -> usize {
+        text[..at]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index)
+    }
+
+    /// The character boundary after `at`, or the end of `text`.
+    fn boundary_after(text: &str, at: usize) -> usize {
+        text[at..]
+            .char_indices()
+            .nth(1)
+            .map_or(text.len(), |(offset, _)| at + offset)
+    }
+
+    /// The start of the run of non-space characters that ends at `at`, skipping any spaces
+    /// immediately before it, so a second press deletes the word rather than the gap.
+    fn word_start_before(text: &str, at: usize) -> usize {
+        let mut cursor = at;
+        while cursor > 0 {
+            let previous = Self::boundary_before(text, cursor);
+            if !text[previous..cursor].chars().all(char::is_whitespace) {
+                break;
+            }
+            cursor = previous;
+        }
+        while cursor > 0 {
+            let previous = Self::boundary_before(text, cursor);
+            if text[previous..cursor].chars().all(char::is_whitespace) {
+                break;
+            }
+            cursor = previous;
+        }
+        cursor
+    }
+
+    fn insert_character(&mut self, character: char) {
+        self.query.insert(self.query_cursor, character);
+        self.query_cursor += character.len_utf8();
+        self.note_query_edit();
+    }
+
+    fn delete_backward(&mut self) {
+        if self.query_cursor == 0 {
+            return;
+        }
+        let start = Self::boundary_before(&self.query, self.query_cursor);
+        self.query.replace_range(start..self.query_cursor, "");
+        self.query_cursor = start;
+        self.note_query_edit();
+    }
+
+    fn delete_forward(&mut self) {
+        if self.query_cursor >= self.query.len() {
+            return;
+        }
+        let end = Self::boundary_after(&self.query, self.query_cursor);
+        self.query.replace_range(self.query_cursor..end, "");
+        self.note_query_edit();
+    }
+
+    fn delete_word_backward(&mut self) {
+        let start = Self::word_start_before(&self.query, self.query_cursor);
+        if start == self.query_cursor {
+            return;
+        }
+        self.query.replace_range(start..self.query_cursor, "");
+        self.query_cursor = start;
+        self.note_query_edit();
+    }
+
+    fn clear_query(&mut self) {
+        if self.query.is_empty() {
+            return;
+        }
+        self.query.clear();
+        self.query_cursor = 0;
+        self.note_query_edit();
+    }
+
+    /// Moving the cursor is not an edit: it changes nothing to search for, so it must not start
+    /// a search or the delay would restart on every arrow key.
+    fn move_cursor(&mut self, to: usize) {
+        self.query_cursor = to.min(self.query.len());
     }
 
     /// Record that the query changed. The search itself waits for `[ui].search_debounce_ms` of
@@ -1505,12 +1608,10 @@ impl AppState {
             .constraints(constraints)
             .split(frame.area());
 
-        // Search box with visual cursor
-        let search_display = if self.search_mode {
-            format!("{}█", self.query)
-        } else {
-            self.query.clone()
-        };
+        // The search box draws the terminal's own cursor rather than a block character. Ratatui
+        // shows it wherever a frame asks and hides it otherwise, so this needs no glyph, works
+        // on a terminal whose encoding has none, and blinks and takes its shape from the
+        // reader's own settings.
         let search_title = if self.search_mode {
             " Search (Enter/Esc to browse) "
         } else {
@@ -1521,14 +1622,29 @@ impl AppState {
         } else {
             Style::default()
         };
-        let top = Paragraph::new(search_display).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_set(self.style.border_set())
-                .border_style(search_border_style)
-                .title(search_title),
-        );
+        // A query wider than the box scrolls under it so the caret stays in view. Without this
+        // the text a reader is typing disappears past the right border, cursor and all.
+        let search_interior = chunks[0].width.saturating_sub(2);
+        let before_cursor = u16::try_from(UnicodeWidthStr::width(&self.query[..self.query_cursor]))
+            .unwrap_or(u16::MAX);
+        let horizontal_scroll =
+            before_cursor.saturating_sub(search_interior.saturating_sub(1).max(1));
+        let top = Paragraph::new(self.query.clone())
+            .scroll((0, horizontal_scroll))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(self.style.border_set())
+                    .border_style(search_border_style)
+                    .title(search_title),
+            );
         frame.render_widget(top, chunks[0]);
+        if self.search_mode && search_interior > 0 {
+            frame.set_cursor_position((
+                chunks[0].x + 1 + before_cursor.saturating_sub(horizontal_scroll),
+                chunks[0].y + 1,
+            ));
+        }
 
         // The list pane's share comes from [ui].list_pane_percent; the structural clamp keeps
         // both panes alive for out-of-range values instead of panicking on 100 - percent.
@@ -2617,8 +2733,14 @@ mod tests {
         assert!(harness.app.search_mode);
         assert_eq!(harness.app.query, "a");
         assert!(
-            harness.search_box().contains("a█"),
-            "typed character renders with the visual cursor"
+            harness.search_box().contains('a'),
+            "typed character renders in the box"
+        );
+        // The caret is the terminal's own, placed by the frame, so it is not a character in the
+        // buffer: after `a` it sits one column past it.
+        assert_eq!(
+            harness.terminal.get_cursor_position().unwrap().x,
+            harness.terminal.get_frame().area().x + 2
         );
         assert!(harness.session_rows().contains("Sessions"));
 
@@ -4928,6 +5050,161 @@ mod tests {
             .draw(|frame| harness.app.render(frame))
             .unwrap();
         assert_eq!(harness.app.preview_title(), " Preview ");
+    }
+
+    /// Type `text` into the search box, entering it first.
+    fn type_query(harness: &mut TuiHarness, text: &str) {
+        let mut script = vec![key(KeyCode::Char('/'))];
+        script.extend(text.chars().map(|character| key(KeyCode::Char(character))));
+        harness.script(script);
+        harness.step_until_script_drained();
+    }
+
+    #[test]
+    fn the_caret_moves_and_typing_inserts_where_it_sits() {
+        // The box only ever appended, so fixing a typo in the middle of a query meant deleting
+        // back to it and retyping the rest, and Left, Right, Home, End, and Delete did nothing
+        // at all — keys a reader presses in any other text field.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        type_query(&mut harness, "rust wrker");
+
+        // Left four times puts the caret between `w` and `r`.
+        harness.script(vec![key(KeyCode::Left); 4]);
+        harness.step_until_script_drained();
+        harness.script(vec![key(KeyCode::Char('o'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "rust worker");
+
+        harness.script(vec![key(KeyCode::Home), key(KeyCode::Char('!'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "!rust worker");
+
+        harness.script(vec![key(KeyCode::End), key(KeyCode::Char('?'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "!rust worker?");
+
+        harness.script(vec![key(KeyCode::Home), key(KeyCode::Delete)]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "rust worker?");
+    }
+
+    #[test]
+    fn backspace_deletes_before_the_caret_rather_than_at_the_end() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        type_query(&mut harness, "abcd");
+        harness.script(vec![
+            key(KeyCode::Left),
+            key(KeyCode::Left),
+            key(KeyCode::Backspace),
+        ]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "acd", "backspace follows the caret");
+    }
+
+    #[test]
+    fn clearing_and_deleting_a_word_are_bound_and_leave_the_caret_where_they_cut() {
+        // Backspace was the only way to shorten a query, so clearing a long one meant holding
+        // it down.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        type_query(&mut harness, "rust worker thread");
+        harness.script(vec![ctrl_key(KeyCode::Char('w'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "rust worker ");
+
+        // A second press takes the word and the space that preceded it, not just the space.
+        harness.script(vec![ctrl_key(KeyCode::Char('w'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "rust ");
+
+        harness.script(vec![ctrl_key(KeyCode::Char('u'))]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "");
+        assert_eq!(harness.app.query_cursor, 0);
+    }
+
+    #[test]
+    fn the_caret_stays_on_a_character_boundary_in_a_multi_byte_query() {
+        // A byte index into a `String` that lands mid-character panics on the next slice, and a
+        // query is whatever the reader typed.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        type_query(&mut harness, "café漢字");
+        for _ in 0..3 {
+            harness.script(vec![key(KeyCode::Left)]);
+            harness.step_until_script_drained();
+            assert!(
+                harness.app.query.is_char_boundary(harness.app.query_cursor),
+                "cursor {} is inside a character of {:?}",
+                harness.app.query_cursor,
+                harness.app.query
+            );
+        }
+        // Three Lefts from the end put the caret between `f` and `é`, so backspace takes the
+        // `f`. Each of those characters is a different width in bytes, which is the point.
+        harness.script(vec![key(KeyCode::Backspace)]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query, "caé漢字");
+
+        harness.script(vec![key(KeyCode::End)]);
+        harness.step_until_script_drained();
+        assert_eq!(harness.app.query_cursor, harness.app.query.len());
+    }
+
+    #[test]
+    fn moving_the_caret_does_not_start_a_search() {
+        // An arrow key changes nothing to search for, so restarting the delay on one would keep
+        // a reader who is repositioning from ever seeing a result.
+        let mut config = Config::default();
+        config.ui.search_debounce_ms = 600_000;
+        config.ui.event_poll_interval_ms = 1;
+        let (requests, executor) = recording_executor();
+        let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
+        wait_for_recorded_request(&requests, RequestKind::Search);
+        type_query(&mut harness, "ab");
+        harness.app.flush_edited_query();
+        step_until(&mut harness, |harness| !harness.app.searching);
+        assert_eq!(
+            typed_search_queries(&requests).last().map(String::as_str),
+            Some("ab")
+        );
+
+        harness.script(vec![
+            key(KeyCode::Left),
+            key(KeyCode::Right),
+            key(KeyCode::Home),
+        ]);
+        harness.step_until_script_drained();
+        assert!(
+            harness.app.query_edited_at.is_none(),
+            "a caret move is not an edit"
+        );
+        assert!(typed_search_queries(&requests).is_empty());
+    }
+
+    #[test]
+    fn a_query_wider_than_the_box_scrolls_under_the_caret() {
+        // Without this the text a reader is typing runs past the right border and the caret
+        // goes with it, so the box looks like it stopped accepting input.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(24, 14);
+        type_query(&mut harness, "0123456789abcdefghijklmnop");
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let area = harness.terminal.get_frame().area();
+        let cursor = harness.terminal.get_cursor_position().unwrap();
+        assert!(
+            cursor.x > area.x && cursor.x < area.x + area.width - 1,
+            "caret at {} is outside the box {}..{}",
+            cursor.x,
+            area.x,
+            area.x + area.width
+        );
+        assert!(
+            harness.search_box().contains('p'),
+            "the tail being typed must be the part on screen: {:?}",
+            harness.search_box()
+        );
     }
 
     #[test]

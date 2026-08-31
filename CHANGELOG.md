@@ -27,6 +27,13 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Added
 
+- The TUI search box is a text field rather than an append-only line. `cursor_left`,
+  `cursor_right`, `cursor_start` (Home, Ctrl+A), and `cursor_end` (End, Ctrl+E) move the caret,
+  `delete_backward`, `delete_forward`, `delete_word_backward` (Ctrl+W), and `clear_query`
+  (Ctrl+U) remove text, and a typed character is inserted where the caret sits. Before this,
+  Left, Right, Home, End, and Delete did nothing, and fixing a typo mid-query meant deleting
+  back to it. The caret is the terminal's own rather than a drawn block, and a query wider than
+  the box scrolls under it.
 - `[ui].unicode` and `[ui].color` (`auto`, `on`, `off`) decide whether the TUI draws characters
   outside ASCII and whether it colours anything. `auto` falls back to ASCII borders, `...`, and
   `--` section rules only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding that cannot
