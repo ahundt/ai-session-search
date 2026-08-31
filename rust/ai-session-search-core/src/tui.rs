@@ -4986,6 +4986,63 @@ mod tests {
     }
 
     #[test]
+    fn the_quiet_period_is_honored_however_it_compares_to_the_idle_interval() {
+        // Two independent millisecond knobs, and every other test pins the interval at 1, so only
+        // "quiet period longer than the interval" was ever exercised. The shorter case is the one
+        // `slice.min(delay)` in `step` exists for: without it the wait runs to the end of the idle
+        // interval and a 5 ms quiet period costs the reader 500 ms. The search still has to carry
+        // the whole typed word in every case, so a delay that fires early is a failure too.
+        // The wait is sliced, so `interval` shorter than `debounce` takes several turns to reach
+        // it and the pairs are chosen to stay well inside MAX_TEST_STEPS.
+        for (debounce_ms, interval_ms) in [(5, 500), (40, 40), (20, 5), (0, 500)] {
+            let mut config = Config::default();
+            config.ui.search_debounce_ms = debounce_ms;
+            config.ui.event_poll_interval_ms = interval_ms;
+            let (requests, executor) = recording_executor();
+            let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
+            wait_for_recorded_request(&requests, RequestKind::Search);
+
+            let typed = vec![
+                key(KeyCode::Char('/')),
+                key(KeyCode::Char('a')),
+                key(KeyCode::Char('b')),
+                key(KeyCode::Char('c')),
+            ];
+            // One poll per event read, so the poll after the last key is the first that sleeps.
+            let first_sleeping_wait = harness.events.poll_timeouts.len() + typed.len();
+            harness.script(typed);
+            harness.step_until_script_drained();
+            // `flush_edited_query` clears the edit stamp, so this asks "has the search been
+            // issued yet" without touching the recorded requests. Waiting on `typed_search_queries`
+            // instead would consume the very request the assertion is about.
+            step_until(&mut harness, |harness| {
+                harness.app.query_edited_at.is_none()
+            });
+
+            // Correctness alone does not pin the timing down: drop the shortening and the search
+            // still happens, one whole idle interval late — half a second of silence for a five
+            // millisecond quiet period. A zero quiet period is exempt because the keystroke has
+            // already searched, leaving no pending delay for the wait to be shortened to.
+            if debounce_ms > 0 {
+                let wait = harness.events.poll_timeouts[first_sleeping_wait];
+                assert!(
+                    wait <= Duration::from_millis(debounce_ms),
+                    "a {debounce_ms} ms quiet period with a {interval_ms} ms idle interval waited \
+                     {wait:?} before looking at the edited query again"
+                );
+            }
+
+            let queries = typed_search_queries(&requests);
+            assert_eq!(
+                queries.last().map(String::as_str),
+                Some("abc"),
+                "a {debounce_ms} ms quiet period with a {interval_ms} ms idle interval searched \
+                 {queries:?}"
+            );
+        }
+    }
+
+    #[test]
     fn enter_searches_the_typed_query_without_waiting_out_the_quiet_period() {
         // Leaving the search box is the reader saying they are done typing, so the delay has
         // nothing left to wait for. Without this, a long configured delay would look exactly
@@ -5226,6 +5283,40 @@ mod tests {
         assert!(
             !listed.contains("cycle_provider"),
             "an unbound command must not claim to exist:\n{listed}"
+        );
+    }
+
+    #[test]
+    fn every_key_bound_to_one_command_reaches_it_through_the_loop() {
+        // `action_for` resolving all three is not the same claim as the browser answering all
+        // three: the loop is what a reader presses. Aliases are the reason the list is a list —
+        // a reader adding their own key keeps the shipped one.
+        let mut config = Config::default();
+        config.ui.keys =
+            toml::from_str("quit = [\"x\", \"ctrl+q\", \"f5\"]").expect("aliases parse");
+        config
+            .validate()
+            .expect("several keys for one command is not a conflict");
+
+        for press in [
+            key(KeyCode::Char('x')),
+            ctrl_key(KeyCode::Char('q')),
+            key(KeyCode::F(5)),
+        ] {
+            let mut harness =
+                TuiHarness::with_config(config.clone(), idle_executor()).seeded(&["claude:one"]);
+            harness.script(vec![press.clone()]);
+            assert!(
+                matches!(harness.step_until_script_drained(), Some(AppAction::Quit)),
+                "{press:?} is bound to quit but did not quit"
+            );
+        }
+
+        let harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
+        let listed = harness.app.help_lines().join("\n");
+        assert!(
+            listed.contains("x, ctrl+q, f5"),
+            "the key list has to name every alias, not just the first:\n{listed}"
         );
     }
 
