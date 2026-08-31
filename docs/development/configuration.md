@@ -276,6 +276,18 @@ narrow to contain that label clamps to its actual interior and truncates rather 
 `list_pane_percent` (45, range 10–90) is the body width share of the session-list pane, the preview
 pane taking the remainder.
 
+`[ui].unicode` and `[ui].color` (`auto`, `on`, `off`) say what the terminal on the other end can
+draw, and `crate::terminal_style` resolves them once when the TUI starts — configuration states
+the intent, so nothing about a terminal is decided while a configuration file is parsed. `auto`
+falls back to ASCII only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding that cannot carry
+box drawing, because an unset locale is not evidence of anything, and it drops colour under
+`NO_COLOR` (set and non-empty, whatever the value) or `TERM=dumb`. Every symbol the browser emits
+comes from that one table, and colour is cleared from the finished frame rather than at each
+span, so a widget added later cannot reintroduce either by forgetting to ask. Two render tests
+hold the line: one asserts no cell outside ASCII anywhere in a frame that has borders, an elided
+error, section rules, and an elision marker; the other asserts no coloured cell while bold
+survives, because emphasis a monochrome terminal can show is what replaces the colour.
+
 `[ui.keys]` maps each command to the key presses that reach it, and `crate::keymap` owns that
 vocabulary: `config` stores a `KeyBindings` and validates it with everything else, `tui` asks it
 what a key event means and never parses a key name, and the status bar names whatever is bound

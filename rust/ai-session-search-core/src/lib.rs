@@ -31,6 +31,7 @@ mod message_search_batches;
 pub mod messages;
 pub mod migration;
 pub mod models;
+pub mod terminal_style;
 mod text_file_transaction;
 // Safety guard (plan H8): the provider parse path must never `.unwrap()` on
 // non-test code — a single malformed session file would abort the whole reindex.

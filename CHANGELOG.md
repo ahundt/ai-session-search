@@ -27,6 +27,11 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Added
 
+- `[ui].unicode` and `[ui].color` (`auto`, `on`, `off`) decide whether the TUI draws characters
+  outside ASCII and whether it colours anything. `auto` falls back to ASCII borders, `...`, and
+  `--` section rules only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding that cannot
+  carry the originals, and drops colour under `NO_COLOR` or `TERM=dumb`. The selected row now
+  carries a marker rather than relying on colour, so it stays visible either way.
 - `[ui.keys]` binds each TUI command to the key presses that reach it: `interrupt`, `quit`,
   `enter_search`, `leave_search`, `move_down`, `move_up`, `page_down`, `page_up`, `top`,
   `bottom`, `cycle_provider`, `cycle_session_kind`, `cycle_time_window`,

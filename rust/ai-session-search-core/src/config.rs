@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::keymap::KeyBindings;
+use crate::terminal_style::CapabilityMode;
 use crate::util::expand_tilde;
 
 pub const CONFIG_EXAMPLE_TOML: &str = include_str!("../config.example.toml");
@@ -438,6 +439,15 @@ pub struct UiConfig {
     /// remainder — one number, not two that must sum to 100.
     #[serde(default = "default_list_pane_percent")]
     pub list_pane_percent: u16,
+    /// Whether the TUI draws characters outside ASCII: box borders, the ellipsis, the preview's
+    /// section rules and elision markers. `auto` reads the locale and falls back only when it
+    /// names an encoding that cannot carry them. `crate::terminal_style` owns the resolution.
+    #[serde(default)]
+    pub unicode: CapabilityMode,
+    /// Whether the TUI colours anything. `auto` honours `NO_COLOR` and `TERM=dumb`. Emphasis
+    /// that does not need colour — bold, the selection symbol — is drawn either way.
+    #[serde(default)]
+    pub color: CapabilityMode,
     /// What each key press means. A `[ui.keys]` table names only the actions it changes; the
     /// rest keep their defaults. `crate::keymap` owns the vocabulary and the parsing.
     #[serde(default)]
@@ -1204,6 +1214,8 @@ impl Default for Config {
                 preview_page_step: default_preview_page_step(),
                 provider_label_width: default_provider_label_width(),
                 list_pane_percent: default_list_pane_percent(),
+                unicode: CapabilityMode::default(),
+                color: CapabilityMode::default(),
                 keys: KeyBindings::default(),
             },
             search: SearchConfig {

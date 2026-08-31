@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 
@@ -41,6 +41,7 @@ use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
 use crate::runtime::ExecutionRuntime;
 use crate::search_scope::EffectiveAccessScope;
 use crate::service::CatalogService;
+use crate::terminal_style::TerminalStyle;
 use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
     resume_plan, truncate_for_display,
@@ -159,7 +160,7 @@ fn longest_provider_label() -> usize {
 /// Middle-elide `text` to terminal columns, keeping the tail intact: an anyhow chain ends with
 /// recovery guidance, and REQ047 forbids losing it to clipping. Newlines are flattened because
 /// the destination is exactly one row; grapheme display width handles CJK and emoji correctly.
-fn elide_middle(text: &str, width: usize) -> String {
+fn elide_middle(text: &str, width: usize, ellipsis: &str) -> String {
     let sanitized = text
         .chars()
         .map(|character| {
@@ -176,11 +177,13 @@ fn elide_middle(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if width == 1 {
-        return "…".to_string();
+    let marker_width = UnicodeWidthStr::width(ellipsis);
+    if width <= marker_width {
+        // No room for both a marker and text: the marker alone at least says text was cut.
+        return ellipsis.chars().take(width).collect();
     }
-    let head_budget = width.saturating_sub(1) / 2;
-    let tail_budget = width - head_budget - 1;
+    let head_budget = width.saturating_sub(marker_width) / 2;
+    let tail_budget = width - head_budget - marker_width;
     let mut head = String::new();
     let mut used = 0;
     for grapheme in sanitized.graphemes(true) {
@@ -202,12 +205,10 @@ fn elide_middle(text: &str, width: usize) -> String {
         used += columns;
     }
     let tail = tail_graphemes.into_iter().rev().collect::<String>();
-    format!("{head}…{tail}")
+    format!("{head}{ellipsis}{tail}")
 }
 
 /// Separator between status-bar hints.
-const STATUS_HINT_SEPARATOR: &str = " │ ";
-
 /// Fit status-bar hints into `width` display columns by dropping whole hints instead of eliding
 /// characters out of the middle of the joined line.
 ///
@@ -217,14 +218,14 @@ const STATUS_HINT_SEPARATOR: &str = " │ ";
 /// the rest stay whole. `priority` is drop order, 0 last; ties drop the hint further right, so the
 /// ones a reader scans first survive longest. The final hint is always kept, and the caller still
 /// elides it for a frame too narrow even for that.
-fn fit_status_hints(hints: &[(u8, String)], width: usize) -> String {
+fn fit_status_hints(hints: &[(u8, String)], width: usize, separator: &str) -> String {
     let mut kept: Vec<usize> = (0..hints.len()).collect();
     loop {
         let text = kept
             .iter()
             .map(|index| hints[*index].1.as_str())
             .collect::<Vec<_>>()
-            .join(STATUS_HINT_SEPARATOR);
+            .join(separator);
         if kept.len() == 1 || UnicodeWidthStr::width(text.as_str()) <= width {
             return text;
         }
@@ -300,10 +301,14 @@ impl Drop for TerminalGuard {
 pub(crate) fn select_session(config: &Config, db: &Db) -> Result<Option<SessionRecord>> {
     // Open and validate the worker before entering raw/alternate-screen mode: a slow or failed
     // startup must leave the user's ordinary terminal visible.
+    // One resolution for the run: the worker builds preview text out of these symbols and the
+    // renderer matches on them, so a second resolution could disagree with the first.
+    let style = TerminalStyle::resolve(config.ui.unicode, config.ui.color);
     let (worker, _observed_scope) = spawn_search_worker(db_backed_executor(
         config.clone(),
         db.access_scope().clone(),
         db.execution_runtime(),
+        style,
     ))?;
     let mut app = AppState::new(config.clone(), worker)?;
 
@@ -871,6 +876,7 @@ fn db_backed_executor(
     config: Config,
     access: EffectiveAccessScope,
     runtime: Arc<ExecutionRuntime>,
+    style: TerminalStyle,
 ) -> ExecutorFactory {
     Box::new(move || {
         let worker_threads = NonZeroUsize::new(config.resolve_threads())
@@ -937,6 +943,7 @@ fn db_backed_executor(
                                         let summary = build_transcript_summary_cancellable(
                                             transcript,
                                             preview_budget,
+                                            style,
                                             cancellation,
                                         )?;
                                         Ok(format!(
@@ -1006,6 +1013,9 @@ struct AppState {
     /// True after one interrupt, cleared by any other key. The next one quits. It is a field
     /// rather than a timer so the state is exactly what the status bar shows.
     interrupt_armed: bool,
+    /// What this terminal can draw, resolved once at startup from `[ui].unicode`, `[ui].color`,
+    /// and the environment. Every symbol and colour the browser emits comes from here.
+    style: TerminalStyle,
 }
 
 impl AppState {
@@ -1022,6 +1032,7 @@ impl AppState {
     /// seeded state agree.
     fn new_quiet(config: Config, worker: SearchWorker) -> Self {
         let result_limit = tui_result_limit(config.search.default_limit);
+        let style = TerminalStyle::resolve(config.ui.unicode, config.ui.color);
         Self {
             config,
             filters: SearchFilters {
@@ -1056,6 +1067,7 @@ impl AppState {
             error_owner: None,
             worker_disconnected_reported: false,
             interrupt_armed: false,
+            style,
         }
     }
 
@@ -1490,6 +1502,7 @@ impl AppState {
         let top = Paragraph::new(search_display).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_set(self.style.border_set())
                 .border_style(search_border_style)
                 .title(search_title),
         );
@@ -1521,6 +1534,10 @@ impl AppState {
             .max(longest_label)
             // A config value cannot request an allocation wider than the actual pane.
             .min(list_interior_width);
+        // The marker is drawn on every row's worth of width whether or not that row is the
+        // selected one, so that moving the selection does not shift the text sideways.
+        let selection_symbol = self.style.selection_symbol();
+        let selection_width = UnicodeWidthStr::width(selection_symbol);
         let visible_range = visible_session_range(
             self.results.len(),
             self.selected,
@@ -1533,7 +1550,10 @@ impl AppState {
                 // interior minus the label field and the age suffix — no fixed 74.
                 let title_budget = (middle[0].width.saturating_sub(2) as usize)
                     .saturating_sub(label_width + 3)
-                    .saturating_sub(AGE_SUFFIX_ALLOWANCE);
+                    .saturating_sub(AGE_SUFFIX_ALLOWANCE)
+                    // The marker column is reserved on every row, selected or not, so the row
+                    // has that much less width for its title.
+                    .saturating_sub(selection_width);
                 let title = session
                     .title
                     .as_deref()
@@ -1571,14 +1591,15 @@ impl AppState {
             "ranked"
         };
         let activity = if self.worker_disconnected_reported {
-            " · stopped"
+            "stopped"
         } else if self.searching {
-            " · searching"
+            "searching"
         } else {
-            " · ready"
+            "ready"
         };
+        let dot = self.style.title_separator();
         let list_title = format!(
-            " Sessions · {mode}{activity} ({}/{}) ",
+            " Sessions {dot} {mode} {dot} {activity} ({}/{}) ",
             if self.results.is_empty() {
                 0
             } else {
@@ -1587,12 +1608,22 @@ impl AppState {
             self.results.len()
         );
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(list_title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(self.style.border_set())
+                    .title(list_title),
+            )
             .highlight_style(
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
-            );
+            )
+            // A marker as well as the colour: a monochrome terminal, a colour-blind reader, and
+            // a captured log all lose the highlight, and the selected row is the one Enter
+            // resumes. `Always` reserves the column so the rows do not shift as it moves.
+            .highlight_symbol(selection_symbol)
+            .highlight_spacing(HighlightSpacing::Always);
         let mut list_state = ListState::default();
         if !visible_range.is_empty() {
             list_state.select(Some(self.selected - visible_range.start));
@@ -1603,10 +1634,15 @@ impl AppState {
         let preview_lines = self
             .preview
             .lines()
-            .map(|line| render_preview_line(line, &self.query))
+            .map(|line| render_preview_line(line, &self.query, self.style))
             .collect::<Vec<_>>();
         let preview = Paragraph::new(preview_lines)
-            .block(Block::default().borders(Borders::ALL).title(" Preview "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(self.style.border_set())
+                    .title(" Preview "),
+            )
             .wrap(Wrap { trim: false });
         // Use the renderer's own WordWrapper rather than width arithmetic: wrapping at word
         // boundaries can produce more rows than ceil(display_width / pane_width).
@@ -1621,7 +1657,7 @@ impl AppState {
         let frame_width = frame.area().width as usize;
         if let Some(error) = &self.error {
             let error_line = Paragraph::new(Span::styled(
-                elide_middle(error.as_str(), frame_width),
+                elide_middle(error.as_str(), frame_width, self.style.ellipsis()),
                 Style::default().fg(Color::Red),
             ));
             frame.render_widget(error_line, chunks[status_index - 1]);
@@ -1674,12 +1710,23 @@ impl AppState {
         if self.interrupt_armed {
             hints.insert(0, (0, "press the interrupt again to quit".to_string()));
         }
-        let help_text = fit_status_hints(&hints, frame_width);
+        let help_text = fit_status_hints(&hints, frame_width, self.style.hint_separator());
         let bottom = Paragraph::new(Span::styled(
-            elide_middle(&help_text, frame_width),
+            elide_middle(&help_text, frame_width, self.style.ellipsis()),
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(bottom, chunks[status_index]);
+
+        // One choke point rather than a colour decision at every span. Twenty call sites each
+        // remembering to ask would be twenty chances to forget, and the next widget somebody
+        // adds would forget by default; clearing the finished frame cannot be bypassed. The
+        // attributes stay, so bold and italic still carry the emphasis the colour did.
+        if !self.style.color() {
+            for cell in frame.buffer_mut().content.iter_mut() {
+                cell.set_fg(Color::Reset);
+                cell.set_bg(Color::Reset);
+            }
+        }
     }
 
     /// Move the selection locally — the UI never waits for the worker (G2) — and ask for the
@@ -1905,6 +1952,11 @@ fn truncate_body_inner(
 /// emitted section gets a proportional share (floor-rounded), floored at one line so a small
 /// budget cannot erase a bookend. The historical fixed layout was these weights verbatim —
 /// a budget of 34 reproduces it exactly.
+/// The preview's section headings, without the rule that surrounds them: the rule is a symbol
+/// the terminal may not carry, so it is supplied at build time and matched on at render time.
+const PREVIEW_SECTION_LABELS: [&str; 4] =
+    ["First prompt", "First reply", "Final prompt", "Final reply"];
+
 const PREVIEW_WEIGHT_FIRST_PROMPT: usize = 8;
 const PREVIEW_WEIGHT_FIRST_REPLY: usize = 4;
 const PREVIEW_WEIGHT_FINAL_PROMPT: usize = 8;
@@ -1920,16 +1972,17 @@ const TRANSCRIPT_CANCELLATION_CHUNK_BYTES: usize = crate::util::CANCELLATION_CHE
 
 #[cfg(test)]
 fn build_transcript_summary(transcript: &str, budget: usize) -> String {
-    build_transcript_summary_inner(transcript, budget, None)
+    build_transcript_summary_inner(transcript, budget, TerminalStyle::default(), None)
         .expect("an uncancelled summary cannot fail")
 }
 
 fn build_transcript_summary_cancellable(
     transcript: &str,
     budget: usize,
+    style: TerminalStyle,
     cancellation: &QueryCancellation,
 ) -> Result<String> {
-    build_transcript_summary_inner(transcript, budget, Some(cancellation))
+    build_transcript_summary_inner(transcript, budget, style, Some(cancellation))
 }
 
 #[derive(Default)]
@@ -2059,6 +2112,7 @@ fn transcript_bookends<'a>(
 fn build_transcript_summary_inner(
     transcript: &str,
     budget: usize,
+    style: TerminalStyle,
     cancellation: Option<&QueryCancellation>,
 ) -> Result<String> {
     let bookends = transcript_bookends(transcript, cancellation)?;
@@ -2066,25 +2120,19 @@ fn build_transcript_summary_inner(
         return Ok("(no transcript content)".to_string());
     }
 
+    let rule = style.section_rule();
+    let heading = |index: usize| format!("{rule} {} {rule}", PREVIEW_SECTION_LABELS[index]);
     let candidates = [
-        (
-            bookends.first_user,
-            "── First prompt ──",
-            PREVIEW_WEIGHT_FIRST_PROMPT,
-        ),
+        (bookends.first_user, heading(0), PREVIEW_WEIGHT_FIRST_PROMPT),
         (
             bookends.first_assistant,
-            "── First reply ──",
+            heading(1),
             PREVIEW_WEIGHT_FIRST_REPLY,
         ),
-        (
-            bookends.last_user,
-            "── Final prompt ──",
-            PREVIEW_WEIGHT_FINAL_PROMPT,
-        ),
+        (bookends.last_user, heading(2), PREVIEW_WEIGHT_FINAL_PROMPT),
         (
             bookends.last_assistant,
-            "── Final reply ──",
+            heading(3),
             PREVIEW_WEIGHT_FINAL_REPLY,
         ),
     ];
@@ -2099,13 +2147,14 @@ fn build_transcript_summary_inner(
         sections.push((turn.ordinal, label, weight, turn.body));
     }
     sections.sort_by_key(|(index, _, _, _)| *index);
-    render_summary_sections(&sections, bookends.total, budget, cancellation)
+    render_summary_sections(&sections, bookends.total, budget, style, cancellation)
 }
 
 fn render_summary_sections(
-    sections: &[(usize, &'static str, usize, &str)],
+    sections: &[(usize, String, usize, &str)],
     total: usize,
     budget: usize,
+    style: TerminalStyle,
     cancellation: Option<&QueryCancellation>,
 ) -> Result<String> {
     let hidden = total.saturating_sub(sections.len());
@@ -2115,20 +2164,22 @@ fn render_summary_sections(
         if let Some(prev) = last_emitted_idx {
             if *idx > prev + 1 {
                 let gap = *idx - prev - 1;
+                let marker = style.elision_marker();
                 parts.push(format!(
-                    "⋯ {gap} more turn{} hidden ⋯",
+                    "{marker} {gap} more turn{} hidden {marker}",
                     if gap == 1 { "" } else { "s" }
                 ));
             }
         }
-        parts.push((*label).to_string());
+        parts.push(label.clone());
         let max_lines = (budget.saturating_mul(*weight) / HISTORICAL_PREVIEW_BODY_LINES).max(1);
         parts.push(truncate_body_inner(body, max_lines, cancellation)?);
         last_emitted_idx = Some(*idx);
     }
     if hidden > 0 && sections.len() < 2 {
+        let marker = style.elision_marker();
         parts.push(format!(
-            "⋯ {hidden} more turn{} hidden ⋯",
+            "{marker} {hidden} more turn{} hidden {marker}",
             if hidden == 1 { "" } else { "s" }
         ));
     }
@@ -2139,7 +2190,7 @@ fn render_summary_sections(
     Ok(parts.join("\n\n"))
 }
 
-fn render_preview_line(line: &str, query: &str) -> Line<'static> {
+fn render_preview_line(line: &str, query: &str, style: TerminalStyle) -> Line<'static> {
     if let Some(session_id) = line.strip_prefix("Session: ") {
         let mut spans = vec![Span::styled(
             "Session: ",
@@ -2176,7 +2227,7 @@ fn render_preview_line(line: &str, query: &str) -> Line<'static> {
         return Line::from(spans);
     }
 
-    if line.starts_with("── ") {
+    if line.starts_with(&format!("{} ", style.section_rule())) {
         let style = if line.contains("prompt") {
             Style::default()
                 .fg(Color::Green)
@@ -2189,7 +2240,9 @@ fn render_preview_line(line: &str, query: &str) -> Line<'static> {
         return Line::from(Span::styled(line.to_string(), style));
     }
 
-    if line.starts_with("⋯ ") || line.starts_with('(') && line.ends_with(" total)") {
+    if line.starts_with(&format!("{} ", style.elision_marker()))
+        || line.starts_with('(') && line.ends_with(" total)")
+    {
         return Line::from(Span::styled(
             line.to_string(),
             Style::default()
@@ -2247,6 +2300,7 @@ fn marked_spans_with_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_style::CapabilityMode;
     use ratatui::backend::TestBackend;
     use std::collections::VecDeque;
 
@@ -2887,6 +2941,7 @@ mod tests {
         let error = build_transcript_summary_cancellable(
             "[2026-01-01T00:00:00Z] user\nbody\n",
             30,
+            TerminalStyle::default(),
             &cancellation,
         )
         .unwrap_err();
@@ -2896,7 +2951,7 @@ mod tests {
 
     #[test]
     fn error_elision_bounds_terminal_columns_and_flattens_newlines() {
-        let rendered = elide_middle("漢字🙂 prefix\npress q and rerun", 16);
+        let rendered = elide_middle("漢字🙂 prefix\npress q and rerun", 16, "…");
         assert!(UnicodeWidthStr::width(rendered.as_str()) <= 16);
         assert!(!rendered.contains(['\r', '\n']));
         assert!(rendered.ends_with("rerun"));
@@ -2939,18 +2994,18 @@ mod tests {
     #[test]
     fn render_preview_line_styles_known_prefixes_and_highlights_queries() {
         // A Session: line keeps the label span then the id, text preserved.
-        let line = render_preview_line("Session: claude:s1", "");
+        let line = render_preview_line("Session: claude:s1", "", TerminalStyle::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "Session: claude:s1");
         assert!(line.spans.len() >= 2);
 
         // A section header renders as a single styled span.
-        let line = render_preview_line("── user prompt ──", "");
+        let line = render_preview_line("── user prompt ──", "", TerminalStyle::default());
         assert_eq!(line.spans.len(), 1);
 
         // A plain line with a query splits the matched term into its own span
         // while preserving the full text.
-        let line = render_preview_line("find the needle here", "needle");
+        let line = render_preview_line("find the needle here", "needle", TerminalStyle::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "find the needle here");
         assert!(line.spans.len() >= 2);
@@ -3888,7 +3943,12 @@ mod tests {
         drop(raw);
         let mut config = Config::default();
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
-        let factory = db_backed_executor(config, EffectiveAccessScope::All, runtime);
+        let factory = db_backed_executor(
+            config,
+            EffectiveAccessScope::All,
+            runtime,
+            TerminalStyle::default(),
+        );
         let error = factory().err().expect("schema drift must be refused");
         assert!(
             format!("{error:#}").contains("upgrade aise"),
@@ -3910,7 +3970,12 @@ mod tests {
         drop(raw);
         let mut config = Config::default();
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
-        let factory = db_backed_executor(config, EffectiveAccessScope::All, runtime);
+        let factory = db_backed_executor(
+            config,
+            EffectiveAccessScope::All,
+            runtime,
+            TerminalStyle::default(),
+        );
         let (_executor, observed) = factory().expect("shared-readable schema must open");
         assert!(matches!(observed, EffectiveAccessScope::All));
     }
@@ -4110,6 +4175,7 @@ mod tests {
             config.clone(),
             db.access_scope().clone(),
             db.execution_runtime(),
+            TerminalStyle::default(),
         );
         let mut harness = TuiHarness::with_factory(config.clone(), factory);
         harness.start();
@@ -4665,6 +4731,13 @@ mod tests {
     fn a_zero_quiet_period_searches_on_every_keystroke() {
         // 0 names the behavior this had before the setting existed, so it has to keep meaning
         // that rather than becoming an accidental synonym for the default.
+        //
+        // The assertion is on the state a keystroke leaves behind, not on the sequence the
+        // executor observes. The mailbox keeps one pending search, so whether it sees "a" before
+        // "ab" replaces it depends on which thread runs next — an earlier version of this test
+        // asserted `["a", "ab"]` and passed only while the worker happened to win that race.
+        // What distinguishes zero from a delay is whether the request was issued on the key or
+        // held, and `query_edited_at` says so deterministically.
         let mut config = Config::default();
         config.ui.search_debounce_ms = 0;
         config.ui.event_poll_interval_ms = 1;
@@ -4672,18 +4745,47 @@ mod tests {
         let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
         wait_for_recorded_request(&requests, RequestKind::Search);
 
-        harness.script(vec![
-            key(KeyCode::Char('/')),
-            key(KeyCode::Char('a')),
-            key(KeyCode::Char('b')),
-        ]);
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
         harness.step_until_script_drained();
+        assert!(
+            harness.app.query_edited_at.is_none(),
+            "zero issues the search on the keystroke rather than holding it"
+        );
+        // `searching` is not asserted here: a fake executor can answer within the same drained
+        // steps, so whether the flag is still up is another race between the two threads.
+
+        harness.script(vec![key(KeyCode::Char('b'))]);
+        harness.step_until_script_drained();
+        assert!(harness.app.query_edited_at.is_none());
         step_until(&mut harness, |harness| !harness.app.searching);
 
+        // Whatever the executor coalesced, the last question asked is the whole query.
+        let observed = typed_search_queries(&requests);
         assert_eq!(
-            typed_search_queries(&requests),
-            vec!["a".to_string(), "ab".to_string()]
+            observed.last().map(String::as_str),
+            Some("ab"),
+            "observed {observed:?}"
         );
+    }
+
+    #[test]
+    fn a_configured_quiet_period_holds_the_keystroke_rather_than_issuing_it() {
+        // The mirror of the test above, and the reason `query_edited_at` is the honest signal:
+        // with a delay the key leaves a pending edit rather than a request.
+        let mut config = Config::default();
+        config.ui.search_debounce_ms = 600_000;
+        config.ui.event_poll_interval_ms = 1;
+        let (requests, executor) = recording_executor();
+        let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
+        wait_for_recorded_request(&requests, RequestKind::Search);
+
+        harness.script(vec![key(KeyCode::Char('/')), key(KeyCode::Char('a'))]);
+        harness.step_until_script_drained();
+        assert!(
+            harness.app.query_edited_at.is_some(),
+            "a delay holds the edit until typing goes quiet"
+        );
+        assert!(typed_search_queries(&requests).is_empty());
     }
 
     #[test]
@@ -4740,6 +4842,124 @@ mod tests {
         let status = harness.status_line();
         assert!(status.contains("x: quit"), "{status:?}");
         assert!(!status.contains("q: quit"), "{status:?}");
+    }
+
+    /// A transcript with four bookends and a gap, so the preview carries section rules and an
+    /// elision marker as well as body text.
+    fn bookended_transcript() -> String {
+        join_turns(&[
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "middle question"),
+            ("assistant", "middle answer"),
+            ("user", "final question"),
+            ("assistant", "final answer"),
+        ])
+    }
+
+    #[test]
+    fn the_selected_row_is_marked_and_the_marker_does_not_move_the_others() {
+        // Colour and bold were the only things saying which row Enter would resume, and both are
+        // lost on a monochrome terminal, to a colour-blind reader, and in a captured log.
+        let mut harness =
+            TuiHarness::with_executor(idle_executor()).seeded(&["claude:one", "claude:two"]);
+        harness.app.selected = 1;
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let rows: Vec<String> = harness
+            .session_rows()
+            .lines()
+            .filter(|line| line.contains('['))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // The rendered rows still carry the pane border, so this looks for the marker inside
+        // the row rather than at its start.
+        let marker = TerminalStyle::default().selection_symbol().trim_end();
+        assert!(rows[1].contains(marker), "{rows:?}");
+        assert!(!rows[0].contains(marker), "{rows:?}");
+        // The unselected row keeps the marker's column, so moving the selection does not slide
+        // every other row sideways.
+        // Display columns, not byte offsets: the marker is multi-byte, so `find` would report
+        // two aligned rows as misaligned.
+        let column = |row: &str| {
+            let at = row.find('[').expect("every row shows a provider label");
+            UnicodeWidthStr::width(&row[..at])
+        };
+        assert_eq!(column(&rows[0]), column(&rows[1]), "{rows:?}");
+    }
+
+    #[test]
+    fn an_ascii_terminal_renders_nothing_outside_ascii() {
+        // `LANG=C` over ssh is a real terminal, and every box border, ellipsis, status separator,
+        // section rule, and elision marker the browser drew was outside ASCII. One assertion over
+        // the finished frame is the only check that cannot be passed by fixing four of five.
+        let mut config = Config::default();
+        config.ui.unicode = CapabilityMode::Off;
+        let ascii = TerminalStyle::resolve(CapabilityMode::Off, CapabilityMode::Auto);
+        let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
+        harness.app.preview =
+            build_transcript_summary_inner(&bookended_transcript(), 34, ascii, None).unwrap();
+        harness.app.error = Some(
+            "a failure long enough that the error line has to cut something out of its middle"
+                .to_string(),
+        );
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+
+        let buffer = harness.terminal.backend().buffer();
+        let area = buffer.area;
+        let mut offenders = Vec::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let symbol = buffer[(x, y)].symbol().to_string();
+                if !symbol.is_ascii() {
+                    offenders.push(symbol);
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "these are not ASCII: {offenders:?}\n{}",
+            harness.screen()
+        );
+        // And the frame still drew a border and a cut marker, so the check is not passing on an
+        // empty screen.
+        let screen = harness.screen();
+        assert!(screen.contains('+') && screen.contains('|'), "{screen}");
+        assert!(screen.contains("..."), "{screen}");
+    }
+
+    #[test]
+    fn a_monochrome_terminal_drops_the_colour_and_keeps_the_emphasis() {
+        // Under NO_COLOR or TERM=dumb the selected row was distinguished by colour alone.
+        let mut config = Config::default();
+        config.ui.color = CapabilityMode::Off;
+        let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
+        harness.app.error = Some("a failure".to_string());
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+
+        let buffer = harness.terminal.backend().buffer();
+        let area = buffer.area;
+        let mut bold = false;
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, Color::Reset, "coloured cell at {x},{y}");
+                assert_eq!(cell.bg, Color::Reset, "coloured cell at {x},{y}");
+                bold |= cell.modifier.contains(Modifier::BOLD);
+            }
+        }
+        assert!(bold, "emphasis must survive when the colour does not");
     }
 
     #[test]
@@ -5042,7 +5262,12 @@ mod tests {
         let mut config = Config::default();
         config.ui.preview_lines = budget;
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
-        let factory = db_backed_executor(config.clone(), EffectiveAccessScope::All, runtime);
+        let factory = db_backed_executor(
+            config.clone(),
+            EffectiveAccessScope::All,
+            runtime,
+            TerminalStyle::default(),
+        );
         let harness = TuiHarness::with_factory(config.clone(), factory).own_external_fixture(dir);
         (harness, config)
     }

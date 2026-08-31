@@ -258,6 +258,15 @@ preview_page_step = 15
 provider_label_width = 9
 # Percent of the body width for the session-list pane; the preview pane gets the remainder.
 list_pane_percent = 45
+# Whether the TUI draws characters outside ASCII: box borders, the ellipsis, and the preview's
+# section rules and elision markers. "auto" reads LC_ALL, LC_CTYPE, then LANG and falls back to
+# ASCII only when one of them names an encoding that cannot carry them (C, POSIX, or a charset
+# that is not UTF-8); an unset locale keeps the box drawing. "on" and "off" decide it outright.
+unicode = "auto"
+# Whether the TUI colours anything. "auto" honours NO_COLOR (set and non-empty, whatever the
+# value) and TERM=dumb. Emphasis that does not need colour is drawn either way: the selected row
+# carries a marker, and bold survives.
+color = "auto"
 
 # What each key press means. Name only the actions you want to change: the rest keep the
 # defaults shown here, the same way a [providers.<name>] table overrides only the fields it
