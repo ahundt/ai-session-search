@@ -191,19 +191,22 @@ impl<'a> IndexCoordinator<'a> {
     ) -> Result<Option<T>> {
         let lock_path = index_update_lock_path(&self.config.db_path());
         let mut lock = open_index_update_lock(&lock_path)?;
-        let guard = match lock.try_write() {
-            Ok(guard) => guard,
-            Err(error)
-                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
-            {
-                return Ok(None);
-            }
-            Err(source) => {
-                return Err(IndexUpdateLockError {
-                    path: lock_path,
-                    source,
+        // `WouldBlock` is the whole of "another process owns it". A signal is not: it says
+        // nothing about who holds the lock, so retrying is what answers the question, exactly as
+        // the blocking sibling above does. Treating the two alike reported contention that had
+        // not happened and skipped the refresh on the strength of it.
+        let guard = loop {
+            match lock.try_write() {
+                Ok(guard) => break guard,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(source) => {
+                    return Err(IndexUpdateLockError {
+                        path: lock_path,
+                        source,
+                    }
+                    .into());
                 }
-                .into());
             }
         };
         let permit = MaintenancePermit { _guard: &guard };
