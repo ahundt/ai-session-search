@@ -437,8 +437,13 @@ build_and_verify_release_executable() {
     # wrote it, with the truncation marker sitting where a property name belonged. Reading it back
     # with a parser is the only thing that distinguishes those two, and a nine-stage assertion is
     # what catches a document that lost its tail and still looks plausible.
+    # `uv run --no-project python`, not a bare `python3`: the interpreter this gate is entitled to
+    # is the one uv resolves, and every other Python step already goes through it. A bare `python3`
+    # is a system dependency the Setup section never declared, and a Linux container that has uv
+    # and no system interpreter failed here with `python3: command not found` while every other
+    # Python step passed.
     "$executable" mcp schema-budget --ledger \
-        | python3 -c '
+        | uv run --no-project python -c '
 import json, sys
 ledger = json.load(sys.stdin)
 stages = ledger["stages"]
