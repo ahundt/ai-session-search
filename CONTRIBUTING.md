@@ -80,11 +80,27 @@ exact wheel and source distribution install pathways, and workflow syntax when
 `actionlint` is installed.
 
 The hosted operating-system and Python matrices stay CI-owned: CI additionally
-runs the Rust portability suite on macOS and Windows, the MSRV check, the Cargo
+runs the Rust portability suite on macOS and Windows, the Cargo
 registry/path/Git install pathways, `cargo deny check advisories licenses
 sources bans`, and an offline `zizmor` workflow-security audit. CI also runs
 `actionlint` at a pinned version, so a workflow syntax error blocks the merge
 even when the local run skipped it.
+
+If you develop on macOS or Windows, you can run the same gate against Linux, and
+the MSRV check at its pinned toolchain, without waiting for CI:
+
+```bash
+./scripts/linux_container_gate.sh                     # ./run_ci_local.sh on Linux
+./scripts/linux_container_gate.sh --rust 1.88.0 msrv  # the commands the msrv job runs
+```
+
+It needs Docker or Podman with at least 8 GiB of memory, and adds no checks of
+its own: the same scripts run inside `docker/linux-gate.Dockerfile`. Your
+checkout is never mounted — a source snapshot of `HEAD` is streamed in
+(`--dirty` includes uncommitted work) and the Linux build artifacts stay on
+container volumes, so they cannot collide with the `target/` and `.venv` your
+host toolchain uses. Run `./scripts/linux_container_gate.sh --help` for the
+other modes and for what a green run does and does not cover.
 
 ## What a good change looks like
 

@@ -27,10 +27,37 @@ uv run ruff check . && uv run mypy ai_session_search tests
 ```
 
 The gate reproduces the required Rust, Python, license, and workflow-security commands that use the
-current host and toolchain. The required CI matrix still owns the MSRV build, macOS/Windows/Linux and
-CPython 3.12–3.14 coverage, and registry, path, and Git install pathways. That matrix has caught what
-a green local gate could not: a test building a `file://` URL by string interpolation passed where
-paths start with a separator and failed on Windows, where the drive letter parses as the URL host.
+current host and toolchain. The required CI matrix still owns macOS/Windows and CPython 3.12–3.14
+coverage, and registry, path, and Git install pathways. That matrix has caught what a green local
+gate could not: a test building a `file://` URL by string interpolation passed where paths start
+with a separator and failed on Windows, where the drive letter parses as the URL host.
+
+Linux and the MSRV build are reachable locally without waiting for CI, on any host that runs
+containers:
+
+```bash
+./scripts/linux_container_gate.sh                        # ./run_ci_local.sh on Linux
+./scripts/linux_container_gate.sh --rust 1.88.0 msrv     # the two commands the msrv job runs
+./scripts/linux_container_gate.sh bench-tui              # registered TUI cases on Linux
+./scripts/linux_container_gate.sh --platform linux/amd64 # emulated; the default is the host arch
+```
+
+It adds no checks — it runs the ones above inside `docker/linux-gate.Dockerfile`, so a check never
+exists in two places. Read a green run for what it covers: Linux build, tests, packaging, and
+install pathways at the host architecture. It omits `cargo-deny`, `actionlint`, and `zizmor`, which
+inspect the dependency graph and workflow files and do not vary by host, and on Apple Silicon it
+covers linux/arm64 unless `--platform` says otherwise. The host checkout is never mounted: a source
+snapshot is streamed in and Cargo, uv, and the virtual environment write to container volumes, so a
+Linux `target/` cannot collide with the host toolchain's and a Linux `.venv` cannot replace the
+host interpreter's.
+
+Give the engine 8 GiB or more. Linking this crate's test binaries takes gigabytes each, and the
+first run at the engine's default job count had the OOM killer take `rustc` and `ld` with signal
+9 in a 7.75 GiB VM — which reads as three failed gate steps that never mention memory. The wrapper
+now derives `CARGO_BUILD_JOBS` from engine memory and the image lowers debug info to line tables.
+It also runs as an unprivileged user, because root passes tests that assert a permission denial:
+`discovery_keeps_readable_sources_and_reports_denied_subtrees` makes a directory mode `0o000` and
+expects the traverse warning that root never triggers.
 
 Keep this command map accurate when a required job changes. A missing local command makes a green
 run mean less than it reads as: `cargo doc` was absent once, and a public item linking a private one
