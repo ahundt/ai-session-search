@@ -61,6 +61,9 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- The TUI preview pane's title names the visible rows and the total when the transcript is
+  longer than the pane, so a reader can tell that scrolling would do something. Content that
+  fits keeps the plain title.
 - Ctrl+C exits `aise tui`. A full-screen terminal application turns off the terminal's own
   interrupt character, so Ctrl+C arrived as an ordinary key press and nothing handled it: the
   browser ignored it and the search box typed a literal `c` into the query, leaving `q` and Esc

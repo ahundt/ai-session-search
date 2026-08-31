@@ -1415,6 +1415,28 @@ impl AppState {
         )
     }
 
+    /// The preview pane's title, naming the visible rows when there are more than fit.
+    ///
+    /// Without it the pane gives no sign that the transcript continues below the fold: a reader
+    /// who does not already know the scroll keys has no reason to look for them, and one who
+    /// does cannot tell whether scrolling would do anything.
+    fn preview_title(&self) -> String {
+        let viewport = usize::from(self.preview_viewport_rows);
+        if viewport == 0 || self.preview_line_count <= viewport {
+            return " Preview ".to_string();
+        }
+        let first = usize::from(self.preview_scroll).saturating_add(1);
+        let last = first
+            .saturating_add(viewport)
+            .saturating_sub(1)
+            .min(self.preview_line_count);
+        format!(
+            " Preview {} {first}-{last}/{} ",
+            self.style.title_separator(),
+            self.preview_line_count
+        )
+    }
+
     /// `"j/k: move"`, built from the keys bound to `actions` rather than written out, so the
     /// bar teaches whatever `[ui.keys]` says. Only each action's first chord is named: the bar
     /// is one row, and `j` teaches the binding as well as `j/down` does. An action nobody bound
@@ -1640,15 +1662,23 @@ impl AppState {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_set(self.style.border_set())
-                    .title(" Preview "),
+                    .border_set(self.style.border_set()),
             )
             .wrap(Wrap { trim: false });
         // Use the renderer's own WordWrapper rather than width arithmetic: wrapping at word
-        // boundaries can produce more rows than ceil(display_width / pane_width).
+        // boundaries can produce more rows than ceil(display_width / pane_width). The count has
+        // to exist before the title that reports it, and re-attaching a block does not re-wrap:
+        // both blocks have the same borders, and a title does not change the interior width.
         self.preview_line_count = preview.line_count(middle[1].width);
         self.clamp_preview_scroll();
-        let preview = preview.scroll((self.preview_scroll, 0));
+        let preview = preview
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(self.style.border_set())
+                    .title(self.preview_title()),
+            )
+            .scroll((self.preview_scroll, 0));
         frame.render_widget(preview, middle[1]);
 
         // Error line (own row, taken from the body when present — never the help bar),
@@ -4855,6 +4885,49 @@ mod tests {
             ("user", "final question"),
             ("assistant", "final answer"),
         ])
+    }
+
+    #[test]
+    fn the_preview_title_reports_the_visible_rows_only_when_some_are_hidden() {
+        // A pane that shows two thirds of a transcript looked exactly like one showing all of
+        // it, so a reader had no reason to reach for the scroll keys and no way to tell whether
+        // pressing them had done anything.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(60, 14);
+        harness.app.preview = (0..60)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let title = harness.app.preview_title();
+        assert!(title.contains("1-"), "{title:?}");
+        assert!(
+            title.contains(&format!("/{}", harness.app.preview_line_count)),
+            "{title:?}"
+        );
+
+        harness.app.scroll_preview(5);
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        assert!(
+            harness.app.preview_title().contains("6-"),
+            "scrolling must move the reported window, got {:?}",
+            harness.app.preview_title()
+        );
+
+        // Content that fits gets no counter: a number that never changes is noise.
+        harness.app.preview = "one short line".to_string();
+        harness.app.preview_scroll = 0;
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        assert_eq!(harness.app.preview_title(), " Preview ");
     }
 
     #[test]
