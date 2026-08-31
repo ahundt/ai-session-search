@@ -288,6 +288,13 @@ hold the line: one asserts no cell outside ASCII anywhere in a frame that has bo
 error, section rules, and an elision marker; the other asserts no coloured cell while bold
 survives, because emphasis a monochrome terminal can show is what replaces the colour.
 
+`help` (`?`) covers the screen with every bound command and the keys that reach it, built from
+the same table the loop dispatches through, so a rebinding changes the help and an unbound
+command is not listed. The status bar is one row and sheds most hints on an eighty-column frame;
+before the list existed, paging, scrolling, top and bottom, and resume had nowhere else to be
+named. The list scrolls with the preview scroll keys and any other key closes it, so nothing has
+to be bound to leave it.
+
 The search box is a text field: the caret moves with `cursor_left`, `cursor_right`,
 `cursor_start`, and `cursor_end`, text is removed with `delete_backward`, `delete_forward`,
 `delete_word_backward`, and `clear_query`, and a character with no modifier is inserted where the

@@ -44,6 +44,8 @@ pub enum TuiAction {
     PreviewPageDown,
     PreviewPageUp,
     Resume,
+    /// Show every command and the keys bound to it.
+    Help,
     // The search box's own editing. These are commands a reader presses, so they are bound here
     // rather than hard-coded; typing a character is not, because it is the text itself.
     ClearQuery,
@@ -67,7 +69,7 @@ pub enum ActionMode {
 
 impl TuiAction {
     /// Every action, in the order `[ui.keys]` and the defaults list them.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Interrupt,
         Self::Quit,
         Self::EnterSearch,
@@ -87,6 +89,7 @@ impl TuiAction {
         Self::PreviewPageDown,
         Self::PreviewPageUp,
         Self::Resume,
+        Self::Help,
         Self::ClearQuery,
         Self::DeleteBackward,
         Self::DeleteForward,
@@ -135,6 +138,7 @@ impl TuiAction {
             Self::PreviewPageDown => "preview_page_down",
             Self::PreviewPageUp => "preview_page_up",
             Self::Resume => "resume",
+            Self::Help => "help",
             Self::ClearQuery => "clear_query",
             Self::DeleteBackward => "delete_backward",
             Self::DeleteForward => "delete_forward",
@@ -401,6 +405,7 @@ impl Default for KeyBindings {
         bind(TuiAction::PreviewPageDown, &["ctrl+d"]);
         bind(TuiAction::PreviewPageUp, &["ctrl+u"]);
         bind(TuiAction::Resume, &["enter", "r"]);
+        bind(TuiAction::Help, &["?"]);
         bind(TuiAction::ClearQuery, &["ctrl+u"]);
         bind(TuiAction::DeleteBackward, &["backspace"]);
         bind(TuiAction::DeleteForward, &["delete"]);

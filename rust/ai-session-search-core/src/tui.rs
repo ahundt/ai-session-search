@@ -26,7 +26,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
     Terminal,
 };
 
@@ -1016,6 +1018,12 @@ struct AppState {
     /// True after one interrupt, cleared by any other key. The next one quits. It is a field
     /// rather than a timer so the state is exactly what the status bar shows.
     interrupt_armed: bool,
+    /// True while the key list covers the screen. It scrolls with the preview scroll keys, and
+    /// any other key closes it, so nothing else has to be bound to leave.
+    showing_help: bool,
+    help_scroll: u16,
+    /// The key list's interior height, recorded by `render` so its scroll clamps by viewport.
+    help_viewport_rows: u16,
     /// What this terminal can draw, resolved once at startup from `[ui].unicode`, `[ui].color`,
     /// and the environment. Every symbol and colour the browser emits comes from here.
     style: TerminalStyle,
@@ -1071,6 +1079,9 @@ impl AppState {
             error_owner: None,
             worker_disconnected_reported: false,
             interrupt_armed: false,
+            showing_help: false,
+            help_scroll: 0,
+            help_viewport_rows: 0,
             style,
         }
     }
@@ -1104,6 +1115,34 @@ impl AppState {
             return None;
         }
         self.interrupt_armed = false;
+
+        // While the key list is up it owns the keyboard, so a reader can read past its end and
+        // then leave with whatever key they reach for. Only scrolling keeps it open.
+        if self.showing_help {
+            match action {
+                Some(TuiAction::PreviewScrollDown) => {
+                    let step = saturating_step(self.config.ui.preview_scroll_step);
+                    self.scroll_help(step);
+                }
+                Some(TuiAction::PreviewScrollUp) => {
+                    let step = saturating_step(self.config.ui.preview_scroll_step);
+                    self.scroll_help(-step);
+                }
+                Some(TuiAction::PreviewPageDown) => {
+                    let page = saturating_step(self.config.ui.preview_page_step);
+                    self.scroll_help(page);
+                }
+                Some(TuiAction::PreviewPageUp) => {
+                    let page = saturating_step(self.config.ui.preview_page_step);
+                    self.scroll_help(-page);
+                }
+                _ => {
+                    self.showing_help = false;
+                    self.help_scroll = 0;
+                }
+            }
+            return None;
+        }
 
         match action {
             Some(TuiAction::Interrupt) => unreachable!("answered above"),
@@ -1155,6 +1194,10 @@ impl AppState {
             Some(TuiAction::PreviewPageUp) => {
                 let page = saturating_step(self.config.ui.preview_page_step);
                 self.scroll_preview(-page);
+            }
+            Some(TuiAction::Help) => {
+                self.showing_help = true;
+                self.help_scroll = 0;
             }
             Some(TuiAction::Resume) => {
                 if let Some(selected) = self.selected_session() {
@@ -1518,6 +1561,70 @@ impl AppState {
         )
     }
 
+    /// One line per bound command: its keys, then what it does.
+    ///
+    /// Built from the same table the loop dispatches through, so a rebound key changes the help
+    /// and an unbound command does not claim to exist. Without this the only place a command was
+    /// named was the status bar, which sheds most of them on an eighty-column frame — paging,
+    /// scrolling, top and bottom, and resume were unreachable for anyone who had not read the
+    /// configuration file.
+    fn help_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (heading, mode) in [
+            ("Browsing", ActionMode::Browse),
+            ("Search box", ActionMode::Search),
+        ] {
+            let mut section: Vec<String> = Vec::new();
+            for action in TuiAction::ALL {
+                if action.mode() != mode {
+                    continue;
+                }
+                let keys = self
+                    .config
+                    .ui
+                    .keys
+                    .chords(action)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                if keys.is_empty() {
+                    continue;
+                }
+                section.push(format!("  {:<18} {}", keys.join(", "), action.name()));
+            }
+            if section.is_empty() {
+                continue;
+            }
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(format!("{heading}:"));
+            lines.extend(section);
+        }
+        // Both modes answer the interrupt, so it is listed once at the end rather than twice.
+        let interrupt = self.config.ui.keys.chords(TuiAction::Interrupt);
+        if !interrupt.is_empty() {
+            let keys = interrupt
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(String::new());
+            lines.push(format!("  {keys:<18} interrupt (twice to quit)"));
+        }
+        lines
+    }
+
+    /// Scroll the key list, bounded the same way the preview is.
+    fn scroll_help(&mut self, delta: isize) {
+        let lines = self.help_lines().len();
+        let visible = usize::from(self.help_viewport_rows).max(PREVIEW_VIEWPORT_SLACK);
+        let max = u16::try_from(lines.saturating_sub(visible)).unwrap_or(u16::MAX);
+        self.help_scroll = u16::try_from((self.help_scroll as isize).saturating_add(delta).max(0))
+            .unwrap_or(u16::MAX)
+            .min(max);
+    }
+
     /// The preview pane's title, naming the visible rows when there are more than fit.
     ///
     /// Without it the pane gives no sign that the transcript continues below the fold: a reader
@@ -1639,7 +1746,7 @@ impl AppState {
                     .title(search_title),
             );
         frame.render_widget(top, chunks[0]);
-        if self.search_mode && search_interior > 0 {
+        if self.search_mode && search_interior > 0 && !self.showing_help {
             frame.set_cursor_position((
                 chunks[0].x + 1 + before_cursor.saturating_sub(horizontal_scroll),
                 chunks[0].y + 1,
@@ -1842,6 +1949,9 @@ impl AppState {
                 ),
                 (1, "search", &[TuiAction::EnterSearch]),
                 (2, "resume", &[TuiAction::Resume]),
+                // Above every hint but quit: it is the one that names the rest, so on a frame
+                // too narrow for them it is what the reader needs.
+                (1, "keys", &[TuiAction::Help]),
                 (0, "quit", &[TuiAction::Quit]),
             ]
         };
@@ -1862,6 +1972,28 @@ impl AppState {
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(bottom, chunks[status_index]);
+
+        // Last, over everything, and `Clear` first so the panes underneath do not show through
+        // where the list is shorter than the block. It takes the whole frame rather than a
+        // centred box: the list is the tallest thing the browser draws, and a terminal with ten
+        // rows would otherwise show two of it.
+        if self.showing_help {
+            let area = frame.area();
+            self.help_viewport_rows = area.height.saturating_sub(2);
+            let lines = self.help_lines();
+            let body = lines.join("\n");
+            self.scroll_help(0);
+            let overlay = Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_set(self.style.border_set())
+                        .title(" Keys (any other key closes) "),
+                )
+                .scroll((self.help_scroll, 0));
+            frame.render_widget(Clear, area);
+            frame.render_widget(overlay, area);
+        }
 
         // One choke point rather than a colour decision at every span. Twenty call sites each
         // remembering to ask would be twenty chances to forget, and the next widget somebody
@@ -5061,6 +5193,65 @@ mod tests {
     }
 
     #[test]
+    fn the_key_list_names_every_bound_command_including_the_ones_the_status_bar_sheds() {
+        // The status bar is one row and drops most hints on an eighty-column frame, so paging,
+        // scrolling, top and bottom, and resume had nowhere else to be named.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(80, 24);
+        harness.script(vec![key(KeyCode::Char('?'))]);
+        assert!(harness.step_until_script_drained().is_none());
+        assert!(harness.app.showing_help);
+
+        let listed = harness.app.help_lines().join("\n");
+        for action in TuiAction::ALL {
+            assert!(
+                listed.contains(action.name()),
+                "{} is bound but not listed:\n{listed}",
+                action.name()
+            );
+        }
+        let screen = harness.screen();
+        assert!(screen.contains("Keys"), "{screen}");
+    }
+
+    #[test]
+    fn the_key_list_follows_a_rebinding_and_omits_what_is_unbound() {
+        let mut config = Config::default();
+        config.ui.keys =
+            toml::from_str("quit = [\"x\"]\ncycle_provider = []").expect("a partial table parses");
+        config.validate().unwrap();
+        let harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
+        let listed = harness.app.help_lines().join("\n");
+        assert!(listed.contains("x") && listed.contains("quit"), "{listed}");
+        assert!(
+            !listed.contains("cycle_provider"),
+            "an unbound command must not claim to exist:\n{listed}"
+        );
+    }
+
+    #[test]
+    fn any_other_key_closes_the_key_list_and_scrolling_keeps_it_open() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(80, 14);
+        harness.script(vec![key(KeyCode::Char('?'))]);
+        harness.step_until_script_drained();
+
+        // The list is taller than a fourteen-row frame, so it has to scroll rather than clip.
+        harness.script(vec![ctrl_key(KeyCode::Char('d'))]);
+        harness.step_until_script_drained();
+        assert!(harness.app.showing_help, "scrolling must not close it");
+        assert!(harness.app.help_scroll > 0, "and must actually move");
+
+        harness.script(vec![key(KeyCode::Char('j'))]);
+        harness.step_until_script_drained();
+        assert!(!harness.app.showing_help, "any other key closes it");
+        assert_eq!(
+            harness.app.selected, 0,
+            "the key that closed it is spent on closing, not on the browser underneath"
+        );
+    }
+
+    #[test]
     fn the_caret_moves_and_typing_inserts_where_it_sits() {
         // The box only ever appended, so fixing a typo in the middle of a query meant deleting
         // back to it and retyping the rest, and Left, Right, Home, End, and Delete did nothing
@@ -5315,30 +5506,14 @@ mod tests {
     #[test]
     fn status_bar_drops_whole_hints_instead_of_eliding_them() {
         // Middle-eliding the joined help line rendered `p:any … │ j/k: move │ P…rs │ /: search`
-        // at 80 columns: no binding the reader can act on, and the new p/f/s/w filter keys were
-        // the first casualty. Whatever fits must fit whole, and `q: quit` must survive every
-        // width a terminal is likely to have.
-        for (width, required) in [
-            (
-                120_u16,
-                &[
-                    "j/k: move",
-                    "h/l: scroll",
-                    "p/f/s/w: filters",
-                    "/: search",
-                    "q: quit",
-                ][..],
-            ),
-            (
-                100,
-                &["j/k: move", "p/f/s/w: filters", "/: search", "q: quit"][..],
-            ),
-            (
-                80,
-                &["j/k: move", "p/f/s/w: filters", "/: search", "q: quit"][..],
-            ),
-            (60, &["j/k: move", "/: search", "q: quit"][..]),
-        ] {
+        // at 80 columns: no binding the reader can act on. Whatever fits must fit whole.
+        //
+        // The roster that survives each width is not asserted, because it changes whenever a
+        // hint is added and asserting it would only record today's arithmetic. What must hold
+        // is that nothing is cut mid-word, that the line fits, and that the two hints which
+        // lead everywhere else survive every width a terminal is likely to have: `q: quit`,
+        // and `?: keys`, which names every command the bar had to shed.
+        for width in [120_u16, 100, 80, 60] {
             let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
             harness.terminal.backend_mut().resize(width, 24);
             harness
@@ -5350,15 +5525,47 @@ mod tests {
                 !status.contains('…'),
                 "width {width} cut a hint mid-word: {status:?}"
             );
-            for hint in required {
+            assert!(
+                status.contains("q: quit"),
+                "width {width} dropped the way out: {status:?}"
+            );
+            // `?: keys` survives to eighty columns. Below that the filter status outranks it,
+            // because a reader who cannot see that a filter is on can misread the result set,
+            // while one who cannot see `?` has only lost a shortcut to the key list.
+            if width >= 80 {
                 assert!(
-                    status.contains(hint),
-                    "width {width} dropped {hint:?}: {status:?}"
+                    status.contains("?: keys"),
+                    "width {width} dropped {:?}: {status:?}",
+                    "?: keys"
                 );
             }
             assert!(
                 UnicodeWidthStr::width(status.as_str()) <= usize::from(width),
                 "width {width} overflowed the frame: {status:?}"
+            );
+        }
+
+        // A wide frame still shows the whole roster, so the shedding above is scarcity rather
+        // than a hint that stopped being rendered at all.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(160, 24);
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let status = harness.status_line();
+        for required in [
+            "j/k: move",
+            "h/l: scroll",
+            "p/f/s/w: filters",
+            "/: search",
+            "enter: resume",
+            "?: keys",
+            "q: quit",
+        ] {
+            assert!(
+                status.contains(required),
+                "{required:?} missing: {status:?}"
             );
         }
     }

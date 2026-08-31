@@ -302,6 +302,7 @@ color = "auto"
 # preview_page_down = ["ctrl+d"]
 # preview_page_up = ["ctrl+u"]
 # resume = ["enter", "r"]
+# help = ["?"]
 #
 # The search box's own editing. Typing a character is not bound here, because it is the text
 # itself; everything a reader presses to change the text or move the caret is.
