@@ -1855,7 +1855,7 @@ pub fn which(binary: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn executable_candidates(binary: &str) -> Vec<PathBuf> {
-    let Some(paths) = env::var_os("PATH") else {
+    let Some(paths) = search_path() else {
         return Vec::new();
     };
     executable_candidates_from(
@@ -1864,6 +1864,23 @@ pub(crate) fn executable_candidates(binary: &str) -> Vec<PathBuf> {
         env::var_os("PATHEXT").as_deref(),
         cfg!(windows),
     )
+}
+
+/// The `PATH` to search: the process environment, or a test's stub directory ahead of it.
+///
+/// Tests install the override rather than writing the real variable. `std::env::set_var` races
+/// every concurrent read of the environment in the process — which is why it is unsafe — and a
+/// spawning `std::process::Command` reads the whole environment block. Two tests in this crate
+/// re-run the test binary as a child process, so the write and the read genuinely overlap on
+/// `cargo test`'s worker threads, and on glibc `setenv` may reallocate the block the spawn is
+/// reading. Substituting the value here keeps every line below this one under test while leaving
+/// the process environment alone.
+fn search_path() -> Option<OsString> {
+    #[cfg(test)]
+    if let Some(path) = tests::path_override() {
+        return Some(path);
+    }
+    env::var_os("PATH")
 }
 
 fn executable_candidates_from(
@@ -1936,18 +1953,35 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Serializes tests that mutate the process `PATH` so they never race the same env var
-    /// across `cargo test`'s parallel test threads. Every test in this crate that touches the
-    /// real `PATH` goes through [`with_stub_binary_on_path`], so this mutex is the only
-    /// coordination required.
-    static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that install a stub search path, so a second install never replaces a
+    /// first one that is still in use and the first's cleanup never clears the second's.
+    /// Separate from [`PATH_OVERRIDE`] because it is held across the closure, and the closure
+    /// reads the override.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Prepends a directory containing one fake, always-findable `name` executable to `PATH`,
-    /// runs `f`, then restores the original `PATH` even if `f` panics. Lets a test exercise the
-    /// real [`resume_plan`]/[`which`] resolution without depending on `claude`, `codex`, `pi`,
-    /// or `prime-agent` actually being installed on the host or CI runner.
+    /// The search path [`super::search_path`] uses while a stub is installed.
+    static PATH_OVERRIDE: std::sync::Mutex<Option<OsString>> = std::sync::Mutex::new(None);
+
+    fn path_override_slot() -> std::sync::MutexGuard<'static, Option<OsString>> {
+        PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The installed stub path, if a test is inside [`with_stub_binary_on_path`].
+    pub(super) fn path_override() -> Option<OsString> {
+        path_override_slot().clone()
+    }
+
+    /// Runs `f` with a directory containing one fake, always-findable `name` executable ahead of
+    /// the real `PATH`, then removes it even if `f` panics. Lets a test exercise the real
+    /// [`resume_plan`]/[`which`] resolution without depending on `claude`, `codex`, `pi`, or
+    /// `prime-agent` being installed on the host or CI runner.
+    ///
+    /// The process environment is deliberately left alone; see [`super::search_path`] for why
+    /// writing it would be a data race rather than merely an untidy one.
     pub(crate) fn with_stub_binary_on_path<T>(name: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = PATH_MUTEX
+        let _serialized = PATH_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stub_dir = tempfile::tempdir().unwrap();
@@ -1959,32 +1993,23 @@ pub(crate) mod tests {
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let original_path = std::env::var_os("PATH");
         let mut search_dirs = vec![stub_dir.path().to_path_buf()];
-        if let Some(existing) = &original_path {
-            search_dirs.extend(std::env::split_paths(existing));
+        if let Some(existing) = std::env::var_os("PATH") {
+            search_dirs.extend(std::env::split_paths(&existing));
         }
-        let new_path = std::env::join_paths(search_dirs).unwrap();
-        // SAFETY: serialized by PATH_MUTEX above, and no other test in this crate reads or
-        // writes the real PATH env var, so no concurrent access races this mutation.
-        unsafe {
-            std::env::set_var("PATH", &new_path);
-        }
+        let installed = std::env::join_paths(search_dirs).unwrap();
 
-        struct RestorePath(Option<std::ffi::OsString>);
-        impl Drop for RestorePath {
+        /// Clears the override on the way out, including on unwind, so a panic in `f` never
+        /// leaves a later test resolving against a deleted temporary directory.
+        struct ClearOverrideOnExit;
+        impl Drop for ClearOverrideOnExit {
             fn drop(&mut self) {
-                // SAFETY: see above; runs on unwind too, so a panic in `f` never leaves PATH
-                // mutated for later tests.
-                unsafe {
-                    match self.0.take() {
-                        Some(value) => std::env::set_var("PATH", value),
-                        None => std::env::remove_var("PATH"),
-                    }
-                }
+                *path_override_slot() = None;
             }
         }
-        let _restore = RestorePath(original_path);
+
+        *path_override_slot() = Some(installed);
+        let _clear = ClearOverrideOnExit;
 
         f()
     }

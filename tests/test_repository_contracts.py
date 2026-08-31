@@ -1287,6 +1287,29 @@ def test_documentation_has_conventional_names_and_task_navigation() -> None:
         assert f"]({path})" in index
 
 
+def test_no_rust_source_writes_the_process_environment() -> None:
+    """A write to the environment races every concurrent read of it in the same process.
+
+    That is why `std::env::set_var` is unsafe. The reads are not all ours to see: spawning a
+    `std::process::Command` copies the whole environment block, and this crate re-runs its own
+    test binary as a child from `fts.rs` and `text_file_transaction.rs`, on `cargo test`'s
+    worker threads, beside whatever else is running. A test that needs a different `PATH`
+    installs `util::tests::with_stub_binary_on_path`; a child that needs a different variable
+    gets it from `Command::env`, which leaves this process alone.
+    """
+    offenders = []
+    for path in sorted((ROOT / "rust").rglob("*.rs")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            # Comments are skipped so the rule can name the call it forbids.
+            if line.lstrip().startswith("//"):
+                continue
+            if re.search(r"\benv::(set_var|remove_var)\b", line):
+                offenders.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()}")
+    assert not offenders, "process-environment writes race concurrent reads:\n" + "\n".join(
+        offenders
+    )
+
+
 def test_ci_runs_one_pinned_offline_workflow_security_audit() -> None:
     from pathlib import Path
 
