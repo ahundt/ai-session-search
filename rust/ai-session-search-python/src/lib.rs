@@ -3796,7 +3796,15 @@ impl NativeMessageSearchCompletion {
 /// searches where bounded internal retention matters. Each `next()` releases the GIL while waiting
 /// for one Rust-owned batch. `close()` is idempotent, interrupts unread SQLite work, and joins the
 /// producer without draining remaining results; `with` calls it automatically on every exit path.
-#[pyclass(name = "MessageSearchBatches", module = "ai_session_search._native")]
+///
+/// `frozen` for the reason [`SessionSearch`] is: the `Mutex` already serializes the producer, so
+/// the `RefCell` PyO3 would otherwise add buys nothing and would start raising
+/// `RuntimeError: Already borrowed` the day a method wanted `&mut self`.
+#[pyclass(
+    name = "MessageSearchBatches",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeMessageSearchBatches {
     inner: Mutex<CoreMessageSearchBatches>,
     request: ai_session_search::message_search::ResolvedMessageSearchRequest,
@@ -4272,7 +4280,14 @@ impl From<CompactOutcome> for NativeCompactOutcome {
 ///
 /// Methods accepting `session_id` accept a canonical provider-qualified ID or a unique ID prefix.
 /// Ambiguous prefixes fail with the matching canonical IDs instead of selecting one.
-#[pyclass(module = "ai_session_search._native")]
+///
+/// `frozen` because every method takes `&self` and the state is already behind a `Mutex`.
+/// Without it PyO3 wraps the object in a `RefCell`, and concurrent Python threads are safe only
+/// for as long as nobody adds a `&mut self` method — at which point overlapping calls start
+/// raising `RuntimeError: Already borrowed` at run time, on whichever thread loses. Frozen turns
+/// that into a compile error and removes the interior mutability there was nothing to contend
+/// for.
+#[pyclass(module = "ai_session_search._native", frozen)]
 struct SessionSearch {
     inner: Mutex<CoreSessionSearch>,
 }

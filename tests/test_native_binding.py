@@ -382,7 +382,10 @@ def test_native_recent_directory_listing_and_session_span_filtering(tmp_path: Pa
     assert [session.id for session in search.list_sessions(native.SessionQuery(path_prefix="/work/project", limit=0))] == ["claude:long", "claude:february"]
 
 
-def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
+def test_native_session_search_surface_is_typed_and_callable_from_threads(tmp_path: Path) -> None:
+    # Named for what it checks. The two submitted calls search an empty index for a word that is
+    # not in it, so `[[], []]` holds whether or not they ever overlapped. Serving concurrent
+    # readers is the separate claim below, which arranges the overlap and then checks the answers.
     search = native.SessionSearch(tmp_path / "index.db")
     session_query = native.SessionQuery(limit=3)
     message_query = native.MessageSearchRequest(limit=4)
@@ -413,6 +416,70 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
         5,
         2,
     )
+
+
+def test_native_session_search_serves_concurrent_readers_from_several_threads(
+    tmp_path: Path,
+) -> None:
+    """One `SessionSearch` answers several Python threads at once, with real rows to find.
+
+    A barrier releases every thread into its call together, so the calls start simultaneously
+    rather than possibly. That is what a barrier can promise; it cannot promise two threads are
+    inside SQLite at the same instant, so the rounds repeat and the methods differ to widen the
+    interleavings a scheduler can produce. Each thread checks its own answer, because a
+    concurrency test whose only assertion is "nothing raised" passes when the calls serialize and
+    passes when they return the wrong rows.
+
+    `SessionSearch` is declared `frozen`, so every method takes `&self` and PyO3 hands out shared
+    access with no interior mutability to contend for. Were one method to take `&mut self`, this
+    is where it would surface, as `RuntimeError: Already borrowed`.
+    """
+    import threading
+
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executemany(
+            "insert into sessions (id, provider, provider_session_id, title, cwd, created_at, updated_at, preview_text, source_path, parse_version, discovery_source) values (?, 'claude', ?, 'shared needle', '/work/project', '2026-01-10T00:00:00+00:00', '2026-01-11T00:00:00+00:00', 'shared needle', ?, 'test', 'fixture')",
+            [(f"claude:s{index}", f"s{index}", f"/s{index}.jsonl") for index in range(12)],
+        )
+        connection.executemany(
+            "insert into transcripts (session_id, transcript_text) values (?, 'shared needle')",
+            [(f"claude:s{index}",) for index in range(12)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    expected_ids = sorted(f"claude:s{index}" for index in range(12))
+
+    def list_all() -> None:
+        barrier.wait()
+        found = search.list_sessions(native.SessionQuery(limit=0))
+        assert sorted(session.id for session in found) == expected_ids
+
+    def search_all() -> None:
+        barrier.wait()
+        found = search.search_sessions("needle", native.SessionQuery(limit=0))
+        assert sorted(hit.session.id for hit in found) == expected_ids
+
+    def read_path() -> None:
+        barrier.wait()
+        assert search.db_path == database
+
+    workers = [list_all, search_all, read_path] * 2
+    # Every party gets its own pool thread, so the barrier cannot wait on a task the pool has not
+    # started yet; the timeout turns a future mistake there into a failure rather than a hang.
+    barrier = threading.Barrier(len(workers), timeout=60)
+    for _ in range(8):
+        barrier.reset()
+        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+            futures = [executor.submit(worker) for worker in workers]
+        # `.result()` re-raises, so a failed assertion in a worker fails this test rather than
+        # being swallowed by the pool.
+        for future in futures:
+            future.result()
 
 
 def test_query_exclusions_are_explicit_and_shared() -> None:
