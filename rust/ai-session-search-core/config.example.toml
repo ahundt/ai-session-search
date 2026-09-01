@@ -293,7 +293,8 @@ event_poll_interval_ms = 150
 search_debounce_ms = 150
 # Rows the selection moves for PageDown/PageUp in the session list.
 list_page_step = 10
-# Rendered rows the preview scrolls for l/h (and Left/Right). Rows, not transcript lines: a
+# Rendered rows the preview scrolls for K/J (and Shift+Up/Shift+Down). Rows, not transcript
+# lines: a
 # long line occupies several rows once the pane wraps it.
 preview_scroll_step = 5
 # Rendered rows the preview scrolls for Ctrl-d/Ctrl-u.
@@ -347,8 +348,8 @@ color = "auto"
 # cycle_session_kind = ["f"]
 # cycle_time_window = ["s"]
 # toggle_warnings_only = ["w"]
-# preview_scroll_down = ["l", "right"]
-# preview_scroll_up = ["h", "left"]
+# preview_scroll_down = ["J", "shift+down"]
+# preview_scroll_up = ["K", "shift+up"]
 # preview_page_down = ["ctrl+d"]
 # preview_page_up = ["ctrl+u"]
 # resume = ["enter", "r"]

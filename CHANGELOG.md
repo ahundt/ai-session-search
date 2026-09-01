@@ -15,6 +15,16 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Changed
 
+- The TUI preview scrolls with `K`/`J` and Shift+Up/Shift+Down instead of `h`/`l` and
+  Left/Right. `l` means "right" everywhere else and was scrolling a pane downwards; in the
+  two-pane browsers `h`/`l` came from they walk the hierarchy (ranger's manual: "h, j, k, l —
+  Move left, down, up or right"), and in vim they are horizontal cursor motion. fzf, the closest
+  analogue to this screen, binds `preview-down`/`preview-up` to shift-down/shift-up, so a shifted
+  vertical key is the established way to say "the preview, not the list". The letters carry that
+  where the arrows cannot: macOS Terminal.app sends no parameterized shift+arrow sequence and
+  ignores `modifyOtherKeys`, so shift+arrow alone would leave the preview unscrollable there.
+  `h`, `l`, Left, and Right are now unbound in browse mode; rebind them through `[ui.keys]` if
+  you want them back.
 - The TUI preview honors `[ui].preview_lines` (default 34) as its total body budget. The
   historical 8/4/8/14 section weights remain fixed even when a role is absent, so the default
   preserves the previous output and smaller explicit budgets trim each section proportionally.

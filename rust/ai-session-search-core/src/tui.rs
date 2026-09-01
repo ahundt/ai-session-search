@@ -2973,7 +2973,7 @@ mod tests {
         // PageDown moves by the configured list page step, not a hardcoded 10.
         assert_eq!(harness.app.selected, 2);
 
-        // l scrolls by the configured preview scroll step; Ctrl-d adds the page step. Settle
+        // J scrolls by the configured preview scroll step; Ctrl-d adds the page step. Settle
         // the row-2 preview first: a late preview response would overwrite the manual line
         // count mid-scroll.
         harness.wait_until_previewed("claude:idle-three");
@@ -2981,7 +2981,7 @@ mod tests {
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        harness.script(vec![key(KeyCode::Char('l'))]);
+        harness.script(vec![key(KeyCode::Char('J'))]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.preview_scroll, 3);
         harness.script(vec![ctrl_key(KeyCode::Char('d'))]);
@@ -4026,9 +4026,9 @@ mod tests {
         wait_for_executed(&executed_rx, ""); // row-1 preview
         harness.step();
         harness.script(vec![
-            key(KeyCode::Char('l')),
-            key(KeyCode::Char('l')),
-            key(KeyCode::Char('l')),
+            key(KeyCode::Char('J')),
+            key(KeyCode::Char('J')),
+            key(KeyCode::Char('J')),
         ]);
         harness.step_until_script_drained();
         assert_eq!(harness.app.preview_scroll, 15);
@@ -5652,7 +5652,7 @@ mod tests {
         let status = harness.status_line();
         for required in [
             "j/k: move",
-            "h/l: scroll",
+            "K/J: scroll",
             "p/f/s/w: filters",
             "/: search",
             "enter: resume",

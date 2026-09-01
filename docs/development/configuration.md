@@ -268,7 +268,7 @@ the one `[ui]` key where zero names a behavior rather than an impossible one, an
 that accepts it. Raise it on a large index, where one search costs seconds and a typed burst
 would otherwise start a scan per character that the next keystroke cancels. `list_page_step` (10)
 is the PageDown/PageUp jump in the session list; `preview_scroll_step` (5) and
-`preview_page_step` (15) are the l/h and Ctrl-d/Ctrl-u scroll amounts, counted in rendered rows
+`preview_page_step` (15) are the K/J and Ctrl-d/Ctrl-u scroll amounts, counted in rendered rows
 rather than transcript lines, because the scroll offset indexes the wrapped pane. These step
 values have minimum 1. `provider_label_width` (9, minimum 1) is the session
 list's provider column width — normal panes clamp upward to the longest label, while a pane too

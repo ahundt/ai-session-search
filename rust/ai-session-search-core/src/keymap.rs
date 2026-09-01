@@ -488,8 +488,12 @@ impl Default for KeyBindings {
         bind(TuiAction::CycleSessionKind, &["f"]);
         bind(TuiAction::CycleTimeWindow, &["s"]);
         bind(TuiAction::ToggleWarningsOnly, &["w"]);
-        bind(TuiAction::PreviewScrollDown, &["l", "right"]);
-        bind(TuiAction::PreviewScrollUp, &["h", "left"]);
+        // Shifted vertical keys, not h/l: the preview is scrolled on the same axis as the list,
+        // with shift saying "the preview rather than the list". `J`/`K` first because the status
+        // bar shows an action's first chord and because shift+arrow does not survive every
+        // terminal; see `the_preview_scrolls_on_the_vertical_axis_rather_than_on_h_and_l`.
+        bind(TuiAction::PreviewScrollDown, &["J", "shift+down"]);
+        bind(TuiAction::PreviewScrollUp, &["K", "shift+up"]);
         bind(TuiAction::PreviewPageDown, &["ctrl+d"]);
         bind(TuiAction::PreviewPageUp, &["ctrl+u"]);
         bind(TuiAction::Resume, &["enter", "r"]);
@@ -562,6 +566,70 @@ mod tests {
         let tab: KeyChord = "shift+tab".parse().unwrap();
         assert!(tab.matches(&KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
         assert!(!tab.matches(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn the_preview_scrolls_on_the_vertical_axis_rather_than_on_h_and_l() {
+        // `l` scrolled the preview down and `h` scrolled it up, so the key that means "right"
+        // everywhere else moved a pane downwards. Two conventions say otherwise: in the
+        // two-pane browsers h and l came from, they walk the hierarchy -- ranger.1 defines
+        // "h, j, k, l  Move left, down, up or right" -- and in vim they are horizontal cursor
+        // motion. fzf, the closest analogue to this screen, binds `preview-down` to shift-down
+        // and `preview-up` to shift-up (fzf.1), so a shifted vertical key is the established
+        // idiom for "the preview, not the list".
+        //
+        // The letters carry that idiom where the arrows cannot. macOS Terminal.app emits no
+        // parameterized `CSI 1;2A` for shift+arrow and ignores `modifyOtherKeys`, so shift+up
+        // alone would leave the preview unscrollable there; `J` and `K` are ordinary printable
+        // characters every terminal transmits. They are also the same width in the status bar
+        // as the pair they replace, which is one row and sheds hints at eighty columns.
+        let bindings = KeyBindings::default();
+        let press = |code, modifiers| {
+            bindings.action_for(&KeyEvent::new(code, modifiers), ActionMode::Browse)
+        };
+
+        assert_eq!(
+            press(KeyCode::Char('J'), KeyModifiers::NONE),
+            Some(TuiAction::PreviewScrollDown)
+        );
+        assert_eq!(
+            press(KeyCode::Char('K'), KeyModifiers::NONE),
+            Some(TuiAction::PreviewScrollUp)
+        );
+        assert_eq!(
+            press(KeyCode::Down, KeyModifiers::SHIFT),
+            Some(TuiAction::PreviewScrollDown)
+        );
+        assert_eq!(
+            press(KeyCode::Up, KeyModifiers::SHIFT),
+            Some(TuiAction::PreviewScrollUp)
+        );
+
+        // The unshifted letters still move the list, so the capitals are a second binding rather
+        // than a collision. A terminal reports a capital as the shifted character itself, which
+        // is what makes this safe -- the same property `bottom = ["G"]` already relies on.
+        assert_eq!(
+            press(KeyCode::Char('j'), KeyModifiers::NONE),
+            Some(TuiAction::MoveDown)
+        );
+        assert_eq!(
+            press(KeyCode::Char('k'), KeyModifiers::NONE),
+            Some(TuiAction::MoveUp)
+        );
+
+        // And the horizontal keys no longer move anything vertically.
+        for code in [
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+            KeyCode::Left,
+            KeyCode::Right,
+        ] {
+            assert_eq!(
+                press(code, KeyModifiers::NONE),
+                None,
+                "{code:?} still reaches a command in browse mode"
+            );
+        }
     }
 
     #[test]
