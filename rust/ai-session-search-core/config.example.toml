@@ -280,11 +280,11 @@ repeat_phrase_max_words = 5
 # Total preview body budget: the transcript summary's sections scale proportionally to
 # their weights (first prompt, first reply, final prompt, final reply), each floored at one
 # line so a small budget cannot erase a bookend.
-preview_lines = 34
+preview_body_lines = 34
 # Idle wake interval for the TUI event loop, in milliseconds (minimum 1). Every key redraws
 # immediately; this value paces settled idle turns, while active worker output is checked sooner.
 # Values must fit the platform monotonic clock; unrepresentable intervals are rejected.
-event_poll_interval_ms = 150
+idle_poll_interval_ms = 150
 # Milliseconds an edited query must stay unchanged before it becomes a search. Typing never
 # waits on this: every keystroke echoes immediately and the search runs off the input thread.
 # 0 searches on every keystroke, and Enter searches the current query at once whatever the
@@ -292,13 +292,13 @@ event_poll_interval_ms = 150
 # otherwise start a scan per character that the next keystroke cancels.
 search_debounce_ms = 150
 # Rows the selection moves for PageDown/PageUp in the session list.
-list_page_step = 10
+list_page_rows = 10
 # Rendered rows the preview scrolls for K/J (and Shift+Up/Shift+Down). Rows, not transcript
 # lines: a
 # long line occupies several rows once the pane wraps it.
-preview_scroll_step = 5
+preview_scroll_rows = 5
 # Rendered rows the preview scrolls for Ctrl-d/Ctrl-u.
-preview_page_step = 15
+preview_page_rows = 15
 # Provider label column width in the session list. Normal panes clamp to the longest label;
 # exceptionally narrow panes clamp to their actual interior and may truncate labels.
 provider_label_width = 9

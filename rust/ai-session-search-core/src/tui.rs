@@ -399,8 +399,8 @@ where
     // below configured pacing. Fully idle turns perform one configured wait rather than waking
     // 100 times/second; each handled key restarts the idle window.
     let mut idle_deadline = std::time::Instant::now()
-        .checked_add(Duration::from_millis(app.config.ui.event_poll_interval_ms))
-        .ok_or_else(|| anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock"))?;
+        .checked_add(Duration::from_millis(app.config.ui.idle_poll_interval_ms))
+        .ok_or_else(|| anyhow::anyhow!("ui.idle_poll_interval_ms exceeds the monotonic clock"))?;
     loop {
         let now = std::time::Instant::now();
         // A query edited and then left alone becomes a search here, so the wait below is what
@@ -430,9 +430,9 @@ where
                 if matches!(event, Event::Resize(_, _)) {
                     terminal.draw(|frame| app.render(frame))?;
                     idle_deadline = std::time::Instant::now()
-                        .checked_add(Duration::from_millis(app.config.ui.event_poll_interval_ms))
+                        .checked_add(Duration::from_millis(app.config.ui.idle_poll_interval_ms))
                         .ok_or_else(|| {
-                            anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock")
+                            anyhow::anyhow!("ui.idle_poll_interval_ms exceeds the monotonic clock")
                         })?;
                 }
                 continue;
@@ -447,9 +447,9 @@ where
             app.drain_responses();
             terminal.draw(|frame| app.render(frame))?;
             idle_deadline = std::time::Instant::now()
-                .checked_add(Duration::from_millis(app.config.ui.event_poll_interval_ms))
+                .checked_add(Duration::from_millis(app.config.ui.idle_poll_interval_ms))
                 .ok_or_else(|| {
-                    anyhow::anyhow!("ui.event_poll_interval_ms exceeds the monotonic clock")
+                    anyhow::anyhow!("ui.idle_poll_interval_ms exceeds the monotonic clock")
                 })?;
         } else if app.drain_responses() {
             // A worker response landed mid-wait: apply it and redraw now.
@@ -905,7 +905,7 @@ fn db_backed_executor(
         let observed = db.access_scope().clone();
         let repo = current_repo(&config);
         let scoring = config.search.scoring.clone();
-        let preview_budget = config.ui.preview_lines;
+        let preview_budget = config.ui.preview_body_lines;
         Ok((
             Box::new(
                 move |request: &WorkerRequest, cancellation: &Arc<QueryCancellation>| {
@@ -1121,19 +1121,19 @@ impl AppState {
         if self.showing_help {
             match action {
                 Some(TuiAction::PreviewScrollDown) => {
-                    let step = saturating_step(self.config.ui.preview_scroll_step);
+                    let step = saturating_step(self.config.ui.preview_scroll_rows);
                     self.scroll_help(step);
                 }
                 Some(TuiAction::PreviewScrollUp) => {
-                    let step = saturating_step(self.config.ui.preview_scroll_step);
+                    let step = saturating_step(self.config.ui.preview_scroll_rows);
                     self.scroll_help(-step);
                 }
                 Some(TuiAction::PreviewPageDown) => {
-                    let page = saturating_step(self.config.ui.preview_page_step);
+                    let page = saturating_step(self.config.ui.preview_page_rows);
                     self.scroll_help(page);
                 }
                 Some(TuiAction::PreviewPageUp) => {
-                    let page = saturating_step(self.config.ui.preview_page_step);
+                    let page = saturating_step(self.config.ui.preview_page_rows);
                     self.scroll_help(-page);
                 }
                 _ => {
@@ -1163,11 +1163,11 @@ impl AppState {
             Some(TuiAction::MoveDown) => self.move_selection(1),
             Some(TuiAction::MoveUp) => self.move_selection(-1),
             Some(TuiAction::PageDown) => {
-                let page = saturating_step(self.config.ui.list_page_step);
+                let page = saturating_step(self.config.ui.list_page_rows);
                 self.move_selection(page);
             }
             Some(TuiAction::PageUp) => {
-                let page = saturating_step(self.config.ui.list_page_step);
+                let page = saturating_step(self.config.ui.list_page_rows);
                 self.move_selection(-page);
             }
             Some(TuiAction::Top) => self.select_index(0),
@@ -1180,19 +1180,19 @@ impl AppState {
             Some(TuiAction::CycleTimeWindow) => self.cycle_since_window(),
             Some(TuiAction::ToggleWarningsOnly) => self.toggle_warnings_only(),
             Some(TuiAction::PreviewScrollDown) => {
-                let step = saturating_step(self.config.ui.preview_scroll_step);
+                let step = saturating_step(self.config.ui.preview_scroll_rows);
                 self.scroll_preview(step);
             }
             Some(TuiAction::PreviewScrollUp) => {
-                let step = saturating_step(self.config.ui.preview_scroll_step);
+                let step = saturating_step(self.config.ui.preview_scroll_rows);
                 self.scroll_preview(-step);
             }
             Some(TuiAction::PreviewPageDown) => {
-                let page = saturating_step(self.config.ui.preview_page_step);
+                let page = saturating_step(self.config.ui.preview_page_rows);
                 self.scroll_preview(page);
             }
             Some(TuiAction::PreviewPageUp) => {
-                let page = saturating_step(self.config.ui.preview_page_step);
+                let page = saturating_step(self.config.ui.preview_page_rows);
                 self.scroll_preview(-page);
             }
             Some(TuiAction::Help) => {
@@ -1937,11 +1937,11 @@ impl AppState {
         } else {
             &self.preview
         };
-        let preview_lines = preview_body
+        let preview_body_lines = preview_body
             .lines()
             .map(|line| render_preview_line(line, &self.query, self.style))
             .collect::<Vec<_>>();
-        let preview = Paragraph::new(preview_lines)
+        let preview = Paragraph::new(preview_body_lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -2304,7 +2304,7 @@ fn truncate_body_inner(
 }
 
 /// Relative weights for the preview summary's sections (Decision 2a): first prompt, first
-/// reply, final prompt, final reply. `[ui].preview_lines` is the total body budget; each
+/// reply, final prompt, final reply. `[ui].preview_body_lines` is the total body budget; each
 /// emitted section gets a proportional share (floor-rounded), floored at one line so a small
 /// budget cannot erase a bookend. The historical fixed layout was these weights verbatim —
 /// a budget of 34 reproduces it exactly.
@@ -2789,8 +2789,8 @@ mod tests {
             // Compared against the shipped default rather than a literal: a literal that stops
             // matching would silently hand every scripted test the real timings and hang them.
             let shipped = Config::default().ui;
-            if config.ui.event_poll_interval_ms == shipped.event_poll_interval_ms {
-                config.ui.event_poll_interval_ms = 1;
+            if config.ui.idle_poll_interval_ms == shipped.idle_poll_interval_ms {
+                config.ui.idle_poll_interval_ms = 1;
             }
             // Same reason for the typing delay: a scripted test presses a key and then asserts
             // on what the search did, with no wall clock advancing in between. Zero is the
@@ -3016,10 +3016,10 @@ mod tests {
     #[test]
     fn ui_interaction_fields_reach_the_loop() {
         let mut config = Config::default();
-        config.ui.event_poll_interval_ms = 7;
-        config.ui.list_page_step = 2;
-        config.ui.preview_scroll_step = 3;
-        config.ui.preview_page_step = 4;
+        config.ui.idle_poll_interval_ms = 7;
+        config.ui.list_page_rows = 2;
+        config.ui.preview_scroll_rows = 3;
+        config.ui.preview_page_rows = 4;
         let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&[
             "claude:one",
             "claude:two",
@@ -3039,7 +3039,7 @@ mod tests {
             harness.events.poll_timeouts.iter().all(|timeout| {
                 *timeout <= Duration::from_millis(7) && *timeout >= Duration::from_millis(5)
             }),
-            "poll slices must stay within [ui].event_poll_interval_ms, got {:?}",
+            "poll slices must stay within [ui].idle_poll_interval_ms, got {:?}",
             harness.events.poll_timeouts
         );
 
@@ -3065,7 +3065,7 @@ mod tests {
     #[test]
     fn settled_idle_turn_uses_one_configured_poll_instead_of_ten_ms_wakeups() {
         let mut config = Config::default();
-        config.ui.event_poll_interval_ms = 25;
+        config.ui.idle_poll_interval_ms = 25;
         let mut harness = TuiHarness::with_config(config, idle_executor());
         harness.step();
         assert_eq!(harness.events.poll_timeouts.len(), 1);
@@ -3088,7 +3088,7 @@ mod tests {
             },
         );
         let mut config = Config::default();
-        config.ui.event_poll_interval_ms = 25;
+        config.ui.idle_poll_interval_ms = 25;
         let mut harness = TuiHarness::with_config(config, executor);
         harness
             .app
@@ -5044,7 +5044,7 @@ mod tests {
         // the four abandoned scans are work nobody asked for.
         let mut config = Config::default();
         config.ui.search_debounce_ms = 40;
-        config.ui.event_poll_interval_ms = 1;
+        config.ui.idle_poll_interval_ms = 1;
         let (requests, executor) = recording_executor();
         let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
         wait_for_recorded_request(&requests, RequestKind::Search);
@@ -5077,7 +5077,7 @@ mod tests {
         for (debounce_ms, interval_ms) in [(5, 500), (40, 40), (20, 5), (0, 500)] {
             let mut config = Config::default();
             config.ui.search_debounce_ms = debounce_ms;
-            config.ui.event_poll_interval_ms = interval_ms;
+            config.ui.idle_poll_interval_ms = interval_ms;
             let (requests, executor) = recording_executor();
             let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
             wait_for_recorded_request(&requests, RequestKind::Search);
@@ -5129,7 +5129,7 @@ mod tests {
         // like a TUI that ignores Enter.
         let mut config = Config::default();
         config.ui.search_debounce_ms = 600_000;
-        config.ui.event_poll_interval_ms = 1;
+        config.ui.idle_poll_interval_ms = 1;
         let (requests, executor) = recording_executor();
         let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
         wait_for_recorded_request(&requests, RequestKind::Search);
@@ -5161,7 +5161,7 @@ mod tests {
         // held, and `query_edited_at` says so deterministically.
         let mut config = Config::default();
         config.ui.search_debounce_ms = 0;
-        config.ui.event_poll_interval_ms = 1;
+        config.ui.idle_poll_interval_ms = 1;
         let (requests, executor) = recording_executor();
         let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
         wait_for_recorded_request(&requests, RequestKind::Search);
@@ -5195,7 +5195,7 @@ mod tests {
         // with a delay the key leaves a pending edit rather than a request.
         let mut config = Config::default();
         config.ui.search_debounce_ms = 600_000;
-        config.ui.event_poll_interval_ms = 1;
+        config.ui.idle_poll_interval_ms = 1;
         let (requests, executor) = recording_executor();
         let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
         wait_for_recorded_request(&requests, RequestKind::Search);
@@ -5517,7 +5517,7 @@ mod tests {
         // a reader who is repositioning from ever seeing a result.
         let mut config = Config::default();
         config.ui.search_debounce_ms = 600_000;
-        config.ui.event_poll_interval_ms = 1;
+        config.ui.idle_poll_interval_ms = 1;
         let (requests, executor) = recording_executor();
         let mut harness = TuiHarness::with_config(config, executor).seeded(&["claude:keep"]);
         wait_for_recorded_request(&requests, RequestKind::Search);
@@ -5965,8 +5965,8 @@ mod tests {
     #[test]
     fn extreme_configured_steps_preserve_navigation_direction() {
         let mut config = Config::default();
-        config.ui.list_page_step = usize::MAX;
-        config.ui.preview_page_step = usize::MAX;
+        config.ui.list_page_rows = usize::MAX;
+        config.ui.preview_page_rows = usize::MAX;
         let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&[
             "claude:one",
             "claude:two",
@@ -6059,7 +6059,7 @@ mod tests {
             .max()
             .expect("the pane divider must exist")
     }
-    // ---- step 6: [ui].preview_lines as the preview body budget (Decision 2a) ----
+    // ---- step 6: [ui].preview_body_lines as the preview body budget (Decision 2a) ----
 
     fn harness_with_preview_source(
         budget: usize,
@@ -6096,7 +6096,7 @@ mod tests {
         let runtime = db.execution_runtime();
         drop(db);
         let mut config = Config::default();
-        config.ui.preview_lines = budget;
+        config.ui.preview_body_lines = budget;
         config.index.db_path = Some(db_path.to_string_lossy().into_owned());
         let factory = db_backed_executor(
             config.clone(),
@@ -6140,7 +6140,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let transcript = join_turns(&[("user", &body)]);
-        let summary = build_transcript_summary(&transcript, Config::default().ui.preview_lines);
+        let summary =
+            build_transcript_summary(&transcript, Config::default().ui.preview_body_lines);
 
         assert!(summary.contains("body line 7"));
         assert!(
@@ -6157,7 +6158,7 @@ mod tests {
             ("user", "final prompt"),
             ("assistant", "final reply"),
         ]);
-        let budget = Config::default().ui.preview_lines;
+        let budget = Config::default().ui.preview_body_lines;
         let (mut harness, _config) = harness_with_preview_source(budget, &transcript, None);
         harness.start();
         for _ in 0..MAX_TEST_STEPS {
@@ -6192,7 +6193,7 @@ mod tests {
                 "injected harness notice that is absent from transcript",
             ),
         ]);
-        let budget = Config::default().ui.preview_lines;
+        let budget = Config::default().ui.preview_body_lines;
         let (mut harness, _config) =
             harness_with_preview_source(budget, &transcript, Some(&normalized));
         harness.start();
@@ -6249,7 +6250,7 @@ mod tests {
 
         assert!(
             tight.app.preview_line_count < roomy.app.preview_line_count,
-            "[ui].preview_lines must reach the rendered preview: budget 1 produced {} lines, budget 34 produced {} (D8)",
+            "[ui].preview_body_lines must reach the rendered preview: budget 1 produced {} lines, budget 34 produced {} (D8)",
             tight.app.preview_line_count,
             roomy.app.preview_line_count
         );

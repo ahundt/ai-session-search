@@ -410,27 +410,27 @@ pub struct IndexConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
-    #[serde(default = "default_preview_lines")]
-    pub preview_lines: usize,
+    #[serde(default = "default_preview_body_lines")]
+    pub preview_body_lines: usize,
     /// Idle wake interval for the TUI event loop. Keys redraw immediately, and active worker
     /// output uses a shorter bounded slice, so this paces only settled idle turns.
-    #[serde(default = "default_event_poll_interval_ms")]
-    pub event_poll_interval_ms: u64,
+    #[serde(default = "default_idle_poll_interval_ms")]
+    pub idle_poll_interval_ms: u64,
     /// Milliseconds an edited TUI query must stay unchanged before it becomes a search. Typing
     /// never waits on it — only the search does. `0` searches on every keystroke, and Enter
     /// searches the current query immediately at any value.
     #[serde(default = "default_search_debounce_ms")]
     pub search_debounce_ms: u64,
     /// Rows the selection moves for PageDown/PageUp in the session list.
-    #[serde(default = "default_list_page_step")]
-    pub list_page_step: usize,
+    #[serde(default = "default_list_page_rows")]
+    pub list_page_rows: usize,
     /// Rendered rows the preview scrolls for `l`/`h` (and Left/Right). Rows, not transcript
     /// lines: the scroll offset indexes the wrapped pane, where one long line occupies several.
-    #[serde(default = "default_preview_scroll_step")]
-    pub preview_scroll_step: usize,
+    #[serde(default = "default_preview_scroll_rows")]
+    pub preview_scroll_rows: usize,
     /// Rendered rows the preview scrolls for Ctrl-d/Ctrl-u.
-    #[serde(default = "default_preview_page_step")]
-    pub preview_page_step: usize,
+    #[serde(default = "default_preview_page_rows")]
+    pub preview_page_rows: usize,
     /// Width of the provider label column in the session list. Normal panes clamp upward to the
     /// longest label; exceptionally narrow panes clamp to their interior and may truncate it.
     #[serde(default = "default_provider_label_width")]
@@ -971,13 +971,13 @@ fn default_limit() -> usize {
     50
 }
 
-fn default_preview_lines() -> usize {
+fn default_preview_body_lines() -> usize {
     // Main's established four section caps are 8 + 4 + 8 + 14 body lines. Keeping their sum as
     // the default makes the now-live setting preserve the pre-worker preview byte-for-byte.
     34
 }
 
-fn default_event_poll_interval_ms() -> u64 {
+fn default_idle_poll_interval_ms() -> u64 {
     150
 }
 
@@ -990,15 +990,15 @@ fn default_search_debounce_ms() -> u64 {
     150
 }
 
-fn default_list_page_step() -> usize {
+fn default_list_page_rows() -> usize {
     10
 }
 
-fn default_preview_scroll_step() -> usize {
+fn default_preview_scroll_rows() -> usize {
     5
 }
 
-fn default_preview_page_step() -> usize {
+fn default_preview_page_rows() -> usize {
     15
 }
 
@@ -1206,12 +1206,12 @@ impl Default for Config {
                 auto_reindex_interval_ms: default_auto_reindex_interval_ms(),
             },
             ui: UiConfig {
-                preview_lines: default_preview_lines(),
-                event_poll_interval_ms: default_event_poll_interval_ms(),
+                preview_body_lines: default_preview_body_lines(),
+                idle_poll_interval_ms: default_idle_poll_interval_ms(),
                 search_debounce_ms: default_search_debounce_ms(),
-                list_page_step: default_list_page_step(),
-                preview_scroll_step: default_preview_scroll_step(),
-                preview_page_step: default_preview_page_step(),
+                list_page_rows: default_list_page_rows(),
+                preview_scroll_rows: default_preview_scroll_rows(),
+                preview_page_rows: default_preview_page_rows(),
                 provider_label_width: default_provider_label_width(),
                 list_pane_percent: default_list_pane_percent(),
                 unicode: CapabilityMode::default(),
@@ -1734,20 +1734,20 @@ impl Config {
         if self.search.default_limit == 0 {
             bail!("search.default_limit must be greater than zero; {FIX}");
         }
-        if self.ui.preview_lines == 0 {
-            bail!("ui.preview_lines must be greater than zero; {FIX}");
+        if self.ui.preview_body_lines == 0 {
+            bail!("ui.preview_body_lines must be greater than zero; {FIX}");
         }
-        if self.ui.event_poll_interval_ms == 0 {
-            bail!("ui.event_poll_interval_ms must be greater than zero; {FIX}");
+        if self.ui.idle_poll_interval_ms == 0 {
+            bail!("ui.idle_poll_interval_ms must be greater than zero; {FIX}");
         }
-        if self.ui.list_page_step == 0 {
-            bail!("ui.list_page_step must be greater than zero; {FIX}");
+        if self.ui.list_page_rows == 0 {
+            bail!("ui.list_page_rows must be greater than zero; {FIX}");
         }
-        if self.ui.preview_scroll_step == 0 {
-            bail!("ui.preview_scroll_step must be greater than zero; {FIX}");
+        if self.ui.preview_scroll_rows == 0 {
+            bail!("ui.preview_scroll_rows must be greater than zero; {FIX}");
         }
-        if self.ui.preview_page_step == 0 {
-            bail!("ui.preview_page_step must be greater than zero; {FIX}");
+        if self.ui.preview_page_rows == 0 {
+            bail!("ui.preview_page_rows must be greater than zero; {FIX}");
         }
         if self.ui.provider_label_width == 0 {
             bail!("ui.provider_label_width must be greater than zero; {FIX}");
@@ -1759,11 +1759,11 @@ impl Config {
             bail!("ui.list_pane_percent must be between 10 and 90 inclusive; {FIX}");
         }
         if Instant::now()
-            .checked_add(Duration::from_millis(self.ui.event_poll_interval_ms))
+            .checked_add(Duration::from_millis(self.ui.idle_poll_interval_ms))
             .is_none()
         {
             bail!(
-                "ui.event_poll_interval_ms is too large for this platform's monotonic clock; \
+                "ui.idle_poll_interval_ms is too large for this platform's monotonic clock; \
                  choose a smaller millisecond interval; {FIX}"
             );
         }
@@ -2313,24 +2313,24 @@ mod tests {
                 "search.default_limit must be greater than zero",
             ),
             (
-                |c| c.ui.preview_lines = 0,
-                "ui.preview_lines must be greater than zero",
+                |c| c.ui.preview_body_lines = 0,
+                "ui.preview_body_lines must be greater than zero",
             ),
             (
-                |c| c.ui.event_poll_interval_ms = 0,
-                "ui.event_poll_interval_ms must be greater than zero",
+                |c| c.ui.idle_poll_interval_ms = 0,
+                "ui.idle_poll_interval_ms must be greater than zero",
             ),
             (
-                |c| c.ui.list_page_step = 0,
-                "ui.list_page_step must be greater than zero",
+                |c| c.ui.list_page_rows = 0,
+                "ui.list_page_rows must be greater than zero",
             ),
             (
-                |c| c.ui.preview_scroll_step = 0,
-                "ui.preview_scroll_step must be greater than zero",
+                |c| c.ui.preview_scroll_rows = 0,
+                "ui.preview_scroll_rows must be greater than zero",
             ),
             (
-                |c| c.ui.preview_page_step = 0,
-                "ui.preview_page_step must be greater than zero",
+                |c| c.ui.preview_page_rows = 0,
+                "ui.preview_page_rows must be greater than zero",
             ),
             (
                 |c| c.ui.provider_label_width = 0,
@@ -3080,8 +3080,8 @@ mod tests {
         // Every default has two authorities: the value `Config::default()` writes, and the
         // `default_*` function serde calls when a present section omits the key. A file that
         // names each section and sets nothing must therefore reproduce `Config::default()`
-        // exactly. Without this, `ui.event_poll_interval_ms = 150` in one place and
-        // `default_event_poll_interval_ms() = 200` in the other would give a user with an empty
+        // exactly. Without this, `ui.idle_poll_interval_ms = 150` in one place and
+        // `default_idle_poll_interval_ms() = 200` in the other would give a user with an empty
         // `[ui]` table different pacing than a user with no config file, and no test would fail.
         let every_section_present = "\
 [providers]

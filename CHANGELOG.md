@@ -25,7 +25,15 @@ compatibility baseline; tags below it do not define a compatibility contract.
   ignores `modifyOtherKeys`, so shift+arrow alone would leave the preview unscrollable there.
   `h`, `l`, Left, and Right are now unbound in browse mode; rebind them through `[ui.keys]` if
   you want them back.
-- The TUI preview honors `[ui].preview_lines` (default 34) as its total body budget. The
+- `[ui].preview_lines` is now `[ui].preview_body_lines`. The value has always been the preview's
+  *body* budget: the pane also carries a `Session:`/`CWD:` header, so `34` renders 37 lines. This
+  is the one `[ui]` key that shipped in 1.0.0rc2, and renaming it before 1.0.0 is the last chance
+  to make the name true. A configuration still setting the old name fails to load rather than
+  being ignored, and the error lists every accepted key with the new name among them:
+  ``unknown field `preview_lines`, expected one of `preview_body_lines`, …``. The other `[ui]`
+  keys renamed here — `idle_poll_interval_ms`, `list_page_rows`, `preview_scroll_rows`,
+  `preview_page_rows` — never shipped under any name.
+- The TUI preview honors `[ui].preview_body_lines` (default 34) as its total body budget. The
   historical 8/4/8/14 section weights remain fixed even when a role is absent, so the default
   preserves the previous output and smaller explicit budgets trim each section proportionally.
 - The TUI session list title names the active ordering (recent vs ranked), and preview
@@ -89,11 +97,11 @@ compatibility baseline; tags below it do not define a compatibility contract.
   on a 36.5 GB index, where one session search costs 2.3 to 3.6 seconds, typing a five-letter
   word began five. `0` restores the per-keystroke behavior, and Enter searches the current query
   at once whatever the value.
-- `[ui]` keys with typed defaults: `event_poll_interval_ms` (150), `list_page_step` (10),
-  `preview_scroll_step` (5), `preview_page_step` (15), `provider_label_width` (9, clamped up
+- `[ui]` keys with typed defaults: `idle_poll_interval_ms` (150), `list_page_rows` (10),
+  `preview_scroll_rows` (5), `preview_page_rows` (15), `provider_label_width` (9, clamped up
   to the longest provider label), `list_pane_percent` (45) — the TUI reads each one, and
   `config.example.toml` documents them beside their typed defaults. This pre-1.0 additive public
-  struct change requires external Rust literals to use `UiConfig { preview_lines, ..Default::default() }`;
+  struct change requires external Rust literals to use `UiConfig { preview_body_lines, ..Default::default() }`;
   the compile-only downstream consumer pins that supported construction pattern.
 - The TUI gains session filter bindings: `p` cycles the provider, `f` the session class, `s`
   the time window (1/7/30 days), and `w` warnings-only. Every binding validates before the

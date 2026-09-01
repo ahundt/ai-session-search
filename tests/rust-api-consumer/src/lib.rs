@@ -19,7 +19,7 @@ const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
 /// Compile the supported additive construction pattern for pre-1.0 public configuration structs.
 pub fn tui_config_with_one_override() -> ai_session_search::config::UiConfig {
     ai_session_search::config::UiConfig {
-        preview_lines: 20,
+        preview_body_lines: 20,
         ..Default::default()
     }
 }
