@@ -295,6 +295,16 @@ before the list existed, paging, scrolling, top and bottom, and resume had nowhe
 named. The list scrolls with the preview scroll keys and any other key closes it, so nothing has
 to be bound to leave it.
 
+Three places name keys, and all three read them from the bindings rather than from the shipped
+defaults, so rebinding one changes every place that teaches it. The status bar is contextual: in
+the search box it names that box's own commands — `clear_query`, `delete_word_backward`,
+`cursor_start`/`cursor_end`, and the way out — because `?` cannot open the key list from inside a
+text field, where it is a character in the query. `delete_backward`, `delete_forward`, and the
+caret arrows stay unnamed there; the row is one line and they are what a text field does
+everywhere. An empty session list carries the third: a query or filter that excluded everything
+gets the keys that change them, while an index with nothing in it says so and names
+`aise reindex`, since no key in the browser fills an empty index.
+
 The search box is a text field: the caret moves with `cursor_left`, `cursor_right`,
 `cursor_start`, and `cursor_end`, text is removed with `delete_backward`, `delete_forward`,
 `delete_word_backward`, and `clear_query`, and a character with no modifier is inserted where the

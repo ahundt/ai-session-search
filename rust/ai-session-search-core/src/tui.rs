@@ -1537,6 +1537,59 @@ impl AppState {
         self.apply_filter_change();
     }
 
+    /// True while nothing has been asked for: no query and every filter at its opening value.
+    /// An empty list then means an empty index, which no key in here can fix.
+    fn nothing_has_been_narrowed(&self) -> bool {
+        self.query.is_empty()
+            && self.filters.provider.is_none()
+            && self.filters.session_kinds.is_none()
+            && self.filters.since.is_none()
+            && !self.filters.warnings_only
+    }
+
+    /// What to press when the list is empty.
+    ///
+    /// The keys are read from the bindings for the same reason the status bar reads them: a
+    /// message that names `/` after a reader has rebound it sends them to press something that
+    /// does nothing, which is worse than saying nothing. An empty index is a separate case and
+    /// gets the command that fills it, because no key in the browser will.
+    fn empty_state_guidance(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        if self.nothing_has_been_narrowed() {
+            lines.push("No sessions are indexed yet.".to_string());
+            lines.push(String::new());
+            lines.push("Nothing here was filtered out — the index is empty. Leave the".to_string());
+            lines.push("browser and run `aise reindex`, then start it again.".to_string());
+        } else {
+            lines.push("No sessions matched.".to_string());
+            lines.push(String::new());
+            lines.push("The query and filters in use are shown in the status bar.".to_string());
+            lines.push(String::new());
+            let narrowing: [(&str, &[TuiAction]); 2] = [
+                ("edit the query", &[TuiAction::EnterSearch]),
+                (
+                    "change filters",
+                    &[
+                        TuiAction::CycleProvider,
+                        TuiAction::CycleSessionKind,
+                        TuiAction::CycleTimeWindow,
+                        TuiAction::ToggleWarningsOnly,
+                    ],
+                ),
+            ];
+            for (label, actions) in narrowing {
+                if let Some(hint) = self.key_hint(label, actions) {
+                    lines.push(format!("  {hint}"));
+                }
+            }
+        }
+        if let Some(hint) = self.key_hint("every key", &[TuiAction::Help]) {
+            lines.push(String::new());
+            lines.push(format!("  {hint}"));
+        }
+        lines.join("\n")
+    }
+
     fn filter_status(&self) -> String {
         let provider = self
             .filters
@@ -1875,9 +1928,16 @@ impl AppState {
         }
         frame.render_stateful_widget(list, middle[0], &mut list_state);
 
-        // Preview with scroll
-        let preview_lines = self
-            .preview
+        // Preview with scroll. With nothing in the list there is no session to preview, so the
+        // pane carries the way out of the empty state instead of a sentence about it.
+        let empty_state;
+        let preview_body: &str = if self.results.is_empty() {
+            empty_state = self.empty_state_guidance();
+            &empty_state
+        } else {
+            &self.preview
+        };
+        let preview_lines = preview_body
             .lines()
             .map(|line| render_preview_line(line, &self.query, self.style))
             .collect::<Vec<_>>();
@@ -1928,9 +1988,22 @@ impl AppState {
         // what it says and nothing happens.
         let mut hints: Vec<(u8, String)> = vec![(1, self.filter_status())];
         let labelled: &[(u8, &str, &[TuiAction])] = if self.search_mode {
+            // The box binds eight editing commands and named none of them, so the three a
+            // reader is least likely to guess were reachable only by leaving and pressing `?`.
+            // Backspace, Delete, and the arrows are left out: they are what a text field does
+            // everywhere, and the row is one line. The way out stays priority 0, because a
+            // reader who cannot leave the box cannot reach anything else — including `?`,
+            // which is a literal `?` in a query and so belongs to browse mode.
             &[
                 (1, "type to search", &[]),
                 (0, "browse", &[TuiAction::LeaveSearch]),
+                (2, "clear", &[TuiAction::ClearQuery]),
+                (3, "delete word", &[TuiAction::DeleteWordBackward]),
+                (
+                    4,
+                    "line start/end",
+                    &[TuiAction::CursorStart, TuiAction::CursorEnd],
+                ),
             ]
         } else {
             &[
@@ -4821,7 +4894,9 @@ mod tests {
 
     #[test]
     fn multiword_preview_uses_actual_word_wrapped_row_count() {
-        let mut harness = TuiHarness::with_executor(idle_executor());
+        // Seeded, because the pane shows the empty-state guidance when the list is empty and
+        // this measures the wrapping of a real preview.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
         harness.app.preview = std::iter::repeat_n("abcdefghij", 20)
             .collect::<Vec<_>>()
             .join(" ");
@@ -5597,6 +5672,114 @@ mod tests {
             }
         }
         assert!(bold, "emphasis must survive when the colour does not");
+    }
+
+    #[test]
+    fn an_empty_result_set_names_the_keys_that_change_it() {
+        // "No sessions matched the current query." stated the outcome and offered no way out of
+        // it, and it said "query" even when there was none. An empty state that names the next
+        // action is the difference between a dead end and a step; the keys come from the
+        // bindings, because a message naming `/` after a reader has rebound it is worse than
+        // no message.
+        //
+        // Nothing indexed and nothing asked for is a different problem from a query that
+        // excluded everything, and only one of them is fixed with a key.
+        let mut empty = TuiHarness::with_executor(idle_executor());
+        empty.terminal.backend_mut().resize(120, 24);
+        for _ in 0..8 {
+            empty.step();
+        }
+        empty
+            .terminal
+            .draw(|frame| empty.app.render(frame))
+            .unwrap();
+        let screen = empty.region_text(0..24);
+        assert!(
+            screen.contains("No sessions are indexed yet"),
+            "an empty index blamed the query: {screen}"
+        );
+        assert!(
+            screen.contains("aise reindex"),
+            "an empty index named no way to fill it: {screen}"
+        );
+
+        // A query that matched nothing: the keys that change the query and the filters.
+        let mut filtered = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        filtered.terminal.backend_mut().resize(120, 24);
+        filtered.app.query = "matches-nothing".to_string();
+        filtered.app.results.clear();
+        filtered
+            .terminal
+            .draw(|frame| filtered.app.render(frame))
+            .unwrap();
+        let screen = filtered.region_text(0..24);
+        for required in ["No sessions matched", "/: edit the query", "?: every key"] {
+            assert!(
+                screen.contains(required),
+                "{required:?} missing from the empty state: {screen}"
+            );
+        }
+        assert!(
+            screen.contains("p/f/s/w: change filters"),
+            "the empty state named no filter keys: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_search_box_names_its_own_commands_instead_of_leaving_them_to_be_guessed() {
+        // The search box binds eight editing commands and the status bar named none of them:
+        // it read `type to search │ enter: browse`, so Ctrl+U, Ctrl+W, Home and End were
+        // reachable only by pressing Esc first and then `?`. A focused input naming its own
+        // keys is what lazygit's prompt footer and fzf's header do, and the roster here is
+        // built from the bindings, so rebinding one changes what the bar teaches.
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        harness.terminal.backend_mut().resize(160, 24);
+        harness.script(vec![key(KeyCode::Char('/'))]);
+        harness.step_until_script_drained();
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let status = harness.status_line();
+        assert!(harness.app.search_mode, "the script did not enter the box");
+        for required in [
+            "type to search",
+            "enter: browse",
+            "ctrl+u: clear",
+            "ctrl+w: delete word",
+            "home/end: line start/end",
+        ] {
+            assert!(
+                status.contains(required),
+                "{required:?} missing from the search box status: {status:?}"
+            );
+        }
+
+        // Narrow frames shed, but the way out of the box is priority 0 and cannot be shed --
+        // a reader who cannot leave the search box cannot reach anything else.
+        for width in [120_u16, 100, 80, 60] {
+            let mut narrow = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+            narrow.terminal.backend_mut().resize(width, 24);
+            narrow.script(vec![key(KeyCode::Char('/'))]);
+            narrow.step_until_script_drained();
+            narrow
+                .terminal
+                .draw(|frame| narrow.app.render(frame))
+                .unwrap();
+            let status = narrow.status_line();
+            assert!(
+                status.contains("enter: browse"),
+                "width {width} dropped the way out of the box: {status:?}"
+            );
+            assert!(
+                !status.contains('…'),
+                "width {width} cut a hint mid-word: {status:?}"
+            );
+            assert!(
+                UnicodeWidthStr::width(status.as_str()) <= usize::from(width),
+                "width {width} overflowed the frame: {status:?}"
+            );
+        }
     }
 
     #[test]

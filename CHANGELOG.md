@@ -37,6 +37,18 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Added
 
+- The TUI search box names its own commands while it has focus: `ctrl+u: clear`,
+  `ctrl+w: delete word`, and `home/end: line start/end` join `enter: browse` in the status bar.
+  It previously read `type to search │ enter: browse`, so the eight editing commands bound in
+  the box were reachable only by leaving it and pressing `?` — and `?` cannot open the key list
+  from inside a text field, because there it is a character in the query. Backspace, Delete, and
+  the arrows stay unnamed: the row is one line, and they are what a text field does everywhere.
+- An empty session list says what to press instead of only that it is empty. A query or filter
+  that excluded everything names the keys that change them and `?`; an index with nothing in it
+  says so plainly and gives `aise reindex`, because no key in the browser fills an empty index.
+  Both are built from the bindings, so a rebinding changes what they teach. The previous text
+  was "No sessions matched the current query.", which offered no next step and blamed a query
+  that a first run does not have.
 - `?` shows every TUI command and the keys bound to it, built from the same table the key
   handler dispatches through, so a rebinding changes what it teaches and an unbound command is
   not listed. The status bar is one row and sheds most hints at eighty columns, which left
