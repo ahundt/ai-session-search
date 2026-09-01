@@ -84,6 +84,12 @@ test_results*.xml
 # Project
 target/
 
+# `run_ci_local.sh` preserves a concurrently modified native module beside the one it builds,
+# as `_native.abi3.so.local-ci-conflict.<pid>`. `*.so` above does not match it, because `.so` is
+# not the last extension, so every gate run that hit that path left an untracked file behind --
+# in a tree RELEASING.md requires to be clean before tagging.
+*.local-ci-conflict.*
+
 # Repository-local git worktrees. Tooling puts a second checkout under `.worktrees/<name>`, which
 # left untracked makes `git status --short` report it — the condition RELEASING.md requires to be
 # clean before tagging. `run_ci_local.sh` already bounds its workflow scan away from this path.
