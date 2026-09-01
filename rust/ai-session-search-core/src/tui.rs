@@ -1956,9 +1956,13 @@ impl AppState {
         frame.render_stateful_widget(list, middle[0], &mut list_state);
 
         // Preview with scroll. With nothing in the list there is no session to preview, so the
-        // pane carries the way out of the empty state instead of a sentence about it.
+        // pane carries the way out of the empty state instead of a sentence about it — but only
+        // once the search that would fill the list has finished. `AppState::new` issues one and
+        // sets `searching`, so an empty list is the ordinary state of the first seconds, and on
+        // a large index that is seconds: telling a reader their index is empty while the search
+        // that disproves it is still running would send them to rebuild it for nothing.
         let empty_state;
-        let preview_body: &str = if self.results.is_empty() {
+        let preview_body: &str = if self.results.is_empty() && !self.searching {
             empty_state = self.empty_state_guidance();
             &empty_state
         } else {
@@ -5743,6 +5747,45 @@ mod tests {
     }
 
     #[test]
+    fn a_search_still_running_is_not_reported_as_an_empty_index() {
+        // `AppState::new` issues the startup search and sets `searching`, so the list is empty
+        // until the first response lands. On a large index that is seconds: measured at 2.3 to
+        // 3.6 s on a 36.5 GB one. Answering an in-flight search with "No sessions are indexed
+        // yet. … run `aise reindex`" would send a reader to rebuild an index that is about to
+        // return their sessions. The list title already says a search is running; the pane says
+        // nothing until there is something to say.
+        let mut harness = TuiHarness::with_executor(idle_executor());
+        harness.terminal.backend_mut().resize(120, 24);
+        harness.app.searching = true;
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let screen = harness.region_text(0..24);
+        assert!(
+            !screen.contains("No sessions are indexed yet"),
+            "a running search was reported as an empty index: {screen}"
+        );
+        assert!(
+            !screen.contains("No sessions matched"),
+            "a running search was reported as no match: {screen}"
+        );
+
+        // Once it settles with nothing, the guidance is right and appears.
+        harness.app.searching = false;
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        assert!(
+            harness
+                .region_text(0..24)
+                .contains("No sessions are indexed yet"),
+            "a settled empty index said nothing"
+        );
+    }
+
+    #[test]
     fn an_empty_result_set_names_the_keys_that_change_it() {
         // "No sessions matched the current query." stated the outcome and offered no way out of
         // it, and it said "query" even when there was none. An empty state that names the next
@@ -5776,6 +5819,9 @@ mod tests {
         filtered.terminal.backend_mut().resize(120, 24);
         filtered.app.query = "matches-nothing".to_string();
         filtered.app.results.clear();
+        // A search that has finished and matched nothing, not one still running: the pane says
+        // nothing while the search that would fill it is in flight.
+        filtered.app.searching = false;
         filtered
             .terminal
             .draw(|frame| filtered.app.render(frame))
