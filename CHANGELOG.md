@@ -44,11 +44,13 @@ compatibility baseline; tags below it do not define a compatibility contract.
   `--` section rules only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding that cannot
   carry the originals, and drops colour under `NO_COLOR` or `TERM=dumb`. The selected row now
   carries a marker rather than relying on colour, so it stays visible either way.
-- `[ui.keys]` binds each TUI command to the key presses that reach it: `interrupt`, `quit`,
-  `enter_search`, `leave_search`, `move_down`, `move_up`, `page_down`, `page_up`, `top`,
-  `bottom`, `cycle_provider`, `cycle_session_kind`, `cycle_time_window`,
+- `[ui.keys]` binds each of the twenty-eight TUI commands to the key presses that reach it:
+  `interrupt`, `quit`, `enter_search`, `leave_search`, `move_down`, `move_up`, `page_down`,
+  `page_up`, `top`, `bottom`, `cycle_provider`, `cycle_session_kind`, `cycle_time_window`,
   `toggle_warnings_only`, `preview_scroll_down`, `preview_scroll_up`, `preview_page_down`,
-  `preview_page_up`, and `resume`. A table names only the actions it changes and the rest keep
+  `preview_page_up`, `resume`, `help`, and the search box's own `clear_query`,
+  `delete_backward`, `delete_forward`, `delete_word_backward`, `cursor_left`, `cursor_right`,
+  `cursor_start`, and `cursor_end`. A table names only the actions it changes and the rest keep
   their defaults; `[]` unbinds one. A binding is a character, `f1` through `f35`, or a named key,
   optionally chorded with `ctrl`, `alt`, `shift`, or `super`. A command takes as many keys as the
   table lists, so a reader adding their own keeps the shipped one, and a key that action already

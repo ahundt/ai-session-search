@@ -255,7 +255,7 @@ pipelines can request all summary evidence with `--summary-items 0 --format json
 
 ## TUI display defaults
 
-`[ui]` configures the interactive terminal UI only. Four interaction keys ship now:
+`[ui]` configures the interactive terminal UI only. Seven interaction keys ship now:
 `event_poll_interval_ms` (150, minimum 1) paces settled idle turns. Every queued key redraws
 immediately within the same loop turn, and active search/preview output is checked within 10 ms;
 zero is rejected because it would return before polling any key, and intervals that do not fit the
