@@ -1678,6 +1678,33 @@ impl AppState {
             .min(max);
     }
 
+    /// The key list's title, which is the only chrome it has.
+    ///
+    /// The overlay takes the whole frame, so it covers the status bar that would otherwise name
+    /// the scroll keys — and the list is longer than a twenty-four-row terminal, so a reader met
+    /// a list cut off at `cursor_left` with nothing saying more existed or how to reach it. The
+    /// row count and the keys appear only when the list actually overflows, and the keys are read
+    /// from the bindings like everywhere else.
+    fn help_title(&self, lines: usize) -> String {
+        let viewport = usize::from(self.help_viewport_rows);
+        if viewport == 0 || lines <= viewport {
+            return " Keys (any other key closes) ".to_string();
+        }
+        let first = usize::from(self.help_scroll).saturating_add(1);
+        let last = first.saturating_add(viewport).saturating_sub(1).min(lines);
+        let separator = self.style.title_separator();
+        let scroll = self
+            .key_hint(
+                "scroll",
+                &[TuiAction::PreviewScrollUp, TuiAction::PreviewScrollDown],
+            )
+            .map(|hint| format!("{hint} {separator} "))
+            .unwrap_or_default();
+        format!(
+            " Keys {separator} {first}-{last}/{lines} {separator} {scroll}any other key closes "
+        )
+    }
+
     /// The preview pane's title, naming the visible rows when there are more than fit.
     ///
     /// Without it the pane gives no sign that the transcript continues below the fold: a reader
@@ -2061,12 +2088,15 @@ impl AppState {
             let lines = self.help_lines();
             let body = lines.join("\n");
             self.scroll_help(0);
+            // The overlay is not wrapped, so ratatui truncates a long row rather than folding it:
+            // one entry is one rendered row and the title can count them directly.
+            let title = self.help_title(lines.len());
             let overlay = Paragraph::new(body)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_set(self.style.border_set())
-                        .title(" Keys (any other key closes) "),
+                        .title(title),
                 )
                 .scroll((self.help_scroll, 0));
             frame.render_widget(Clear, area);
@@ -5672,6 +5702,44 @@ mod tests {
             }
         }
         assert!(bold, "emphasis must survive when the colour does not");
+    }
+
+    #[test]
+    fn the_key_list_says_when_it_continues_below_the_fold_and_how_to_get_there() {
+        // The overlay covers the whole frame, status bar included, so its title is the only
+        // chrome it has. Twenty-eight commands plus headings do not fit a twenty-four-row
+        // terminal: the list stopped mid-way with nothing saying more existed, and the keys
+        // that scroll it were behind the bar it had just covered.
+        let mut short = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        short.terminal.backend_mut().resize(100, 24);
+        short.script(vec![key(KeyCode::Char('?'))]);
+        short.step_until_script_drained();
+        short
+            .terminal
+            .draw(|frame| short.app.render(frame))
+            .unwrap();
+        assert!(short.app.showing_help, "the script did not open the list");
+        let title = short.region_text(0..1);
+        assert!(
+            title.contains("/32"),
+            "the key list hid its length: {title:?}"
+        );
+        assert!(
+            title.contains("K/J: scroll"),
+            "the key list named no way to reach the rest: {title:?}"
+        );
+
+        // A frame tall enough for every command says none of that, because none of it applies.
+        let mut tall = TuiHarness::with_executor(idle_executor()).seeded(&["claude:one"]);
+        tall.terminal.backend_mut().resize(100, 60);
+        tall.script(vec![key(KeyCode::Char('?'))]);
+        tall.step_until_script_drained();
+        tall.terminal.draw(|frame| tall.app.render(frame)).unwrap();
+        let title = tall.region_text(0..1);
+        assert!(
+            title.contains("Keys (any other key closes)"),
+            "a list that fits gained a scroll hint: {title:?}"
+        );
     }
 
     #[test]

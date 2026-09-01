@@ -71,7 +71,11 @@ compatibility baseline; tags below it do not define a compatibility contract.
   handler dispatches through, so a rebinding changes what it teaches and an unbound command is
   not listed. The status bar is one row and sheds most hints at eighty columns, which left
   paging, scrolling, top and bottom, and resume named nowhere. The list scrolls with the preview
-  scroll keys; any other key closes it.
+  scroll keys; any other key closes it. Because the overlay covers the whole frame, including the
+  status bar that would name those keys, its title carries them along with the visible rows and
+  the total — ` Keys · 1-22/32 · K/J: scroll · any other key closes ` — whenever the list is
+  longer than the terminal, which twenty-eight commands are on a twenty-four-row one. A frame
+  tall enough for all of them keeps the plain title.
 - The TUI search box is a text field rather than an append-only line. `cursor_left`,
   `cursor_right`, `cursor_start` (Home, Ctrl+A), and `cursor_end` (End, Ctrl+E) move the caret,
   `delete_backward`, `delete_forward`, `delete_word_backward` (Ctrl+W), and `clear_query`
