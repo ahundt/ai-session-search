@@ -3198,7 +3198,10 @@ mod tests {
         let mut lines = CONFIG_EXAMPLE_TOML
             .lines()
             .skip_while(|line| line.trim() != "# [ui.keys]");
-        assert!(lines.next().is_some(), "config.example.toml lost # [ui.keys]");
+        assert!(
+            lines.next().is_some(),
+            "config.example.toml lost # [ui.keys]"
+        );
         for line in lines {
             // Every line of the block is commented, the bare `#` separating its two halves
             // included, so the first uncommented line is the end of it. Reading past that point

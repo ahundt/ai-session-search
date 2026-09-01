@@ -10,11 +10,14 @@
 //!
 //! [`KeyBindings`] is the only public item here, because it is the type of a `[ui]` field and a
 //! caller therefore has to be able to name it. Everything else is crate-internal on purpose:
-//! [`KeyChord`] and [`KeyBindings::action_for`] speak in `crossterm`'s key types, which this crate
+//! `KeyChord` and `KeyBindings::action_for` speak in `crossterm`'s key types, which this crate
 //! does not re-export, so an outside caller could not construct an argument or read a result — and
 //! could not run the browser either, since `tui` is a private module. Publishing them would make a
 //! `crossterm` major bump a breaking change to *this* crate's public API in exchange for nothing.
 //! Widening any of this later is not a breaking change; narrowing it after 1.0.0 would be.
+//!
+//! Those two are written in plain backticks rather than as doc links, because a public module's
+//! documentation linking a private item is what `cargo doc -D warnings` refuses.
 
 use std::collections::BTreeMap;
 use std::fmt;
