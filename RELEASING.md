@@ -88,6 +88,15 @@ Do not create a tag until these are also true of the specific release:
 - The exact release commit passes the local gate and package preparation below.
 - Every declaration in the identity table is the new version, and the metadata gate passes
   against the tag you are about to create.
+- If the new version is a final `X.Y.Z` and every published version so far was a candidate, the
+  install documentation no longer says otherwise. `README.md` states "No stable version is
+  published yet" and `docs/development/installation.md` that crates.io "carries only release
+  candidates"; the release that makes those false is the release that publishes them. The
+  `--version '^1.0.0-rc'` command itself stays, per
+  [Pre-release semantics](#pre-release-semantics). `verify_release_metadata` cannot see this --
+  a claim about the registries is not a version declaration -- so
+  `test_the_documentation_stops_claiming_no_stable_release_once_one_is_declared` fails the local
+  gate as soon as `pyproject.toml` drops its `rcN`.
 - The message-search response shape is the one you intend to publish. Once any version is on a
   registry, removing a field, renaming one, changing a type, or changing what a value means
   requires incrementing `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION` across the serializer, the

@@ -165,6 +165,43 @@ def test_every_rust_toolchain_step_names_the_toolchain_it_installs() -> None:
     )
 
 
+# Sentences that are true only while every published version is a release candidate. Each is a
+# flat assertion about the registries rather than a scoped "while only candidates are published",
+# which is why `docs/development/releasing.md` is not among them.
+_PRE_RELEASE_ONLY_CLAIMS = {
+    "README.md": "No stable version is published yet",
+    "docs/development/installation.md": "carries only release candidates",
+}
+
+
+def test_the_documentation_stops_claiming_no_stable_release_once_one_is_declared() -> None:
+    """`RELEASING.md` records that the documented `cargo install ... --version '^1.0.0-rc'`
+    survives the 1.0.0 release unedited, verified against `clap`, whose `^4.0.0-rc` requirement
+    resolves to a `4.x` stable. The prose around that command does not survive it.
+
+    Nothing else would report this. The identity table in RELEASING.md names eight version
+    declarations and `verify_release_metadata` enforces every one, but the README paragraph is not
+    a version declaration -- it is a claim about what the registries hold, and the release that
+    makes it false is the release that publishes it.
+    """
+    from scripts.release_versions import PYTHON_RELEASE_VERSION
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = str(project["project"]["version"])
+    match = PYTHON_RELEASE_VERSION.fullmatch(version)
+    assert match is not None, f"pyproject.toml declares an unparseable version {version!r}"
+    still_a_candidate = match.group("phase") is not None
+
+    for relative, claim in _PRE_RELEASE_ONLY_CLAIMS.items():
+        present = claim in (ROOT / relative).read_text(encoding="utf-8")
+        assert present == still_a_candidate, (
+            f"{relative} {'still says' if present else 'no longer says'} {claim!r} while "
+            f"pyproject.toml declares {version!r}. Rewrite the paragraph for what the registries "
+            "will hold after this release; the `--version '^1.0.0-rc'` command itself stays, "
+            "because that range also matches every later stable."
+        )
+
+
 def test_the_release_check_runs_the_cargo_command_the_readme_gives() -> None:
     """The post-publish check is the only gate that can catch a broken registry install.
 
