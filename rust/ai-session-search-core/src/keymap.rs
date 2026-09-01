@@ -113,6 +113,10 @@ impl TuiAction {
         Self::CursorEnd,
     ];
 
+    /// Every arm is named rather than falling through a wildcard. A `_ => Browse` here read as a
+    /// sensible default and behaved as a trap: an editing command added later would compile,
+    /// become browse-only, and be unreachable from the search box it was written for, with
+    /// nothing failing. Spelling the browse list out makes the compiler ask.
     pub(crate) fn mode(self) -> ActionMode {
         match self {
             Self::Interrupt => ActionMode::Both,
@@ -125,7 +129,24 @@ impl TuiAction {
             | Self::CursorRight
             | Self::CursorStart
             | Self::CursorEnd => ActionMode::Search,
-            _ => ActionMode::Browse,
+            Self::Quit
+            | Self::EnterSearch
+            | Self::MoveDown
+            | Self::MoveUp
+            | Self::PageDown
+            | Self::PageUp
+            | Self::Top
+            | Self::Bottom
+            | Self::CycleProvider
+            | Self::CycleSessionKind
+            | Self::CycleTimeWindow
+            | Self::ToggleWarningsOnly
+            | Self::PreviewScrollDown
+            | Self::PreviewScrollUp
+            | Self::PreviewPageDown
+            | Self::PreviewPageUp
+            | Self::Resume
+            | Self::Help => ActionMode::Browse,
         }
     }
 
