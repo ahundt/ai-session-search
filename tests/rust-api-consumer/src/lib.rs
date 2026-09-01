@@ -16,12 +16,16 @@ use ai_session_search::{
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
 
-/// Compile the supported additive construction pattern for pre-1.0 public configuration structs.
+/// Compile the supported construction pattern for public configuration structs.
+///
+/// They are `#[non_exhaustive]`, so a downstream crate starts from the shipped defaults and sets
+/// what it wants rather than writing a struct literal. That is what makes a new setting a minor
+/// release instead of a breaking one -- `[ui]` alone gained ten fields in the cycle before 1.0.0.
+/// A struct expression here fails to compile with E0639, which is this file's job to prove.
 pub fn tui_config_with_one_override() -> ai_session_search::config::UiConfig {
-    ai_session_search::config::UiConfig {
-        preview_body_lines: 20,
-        ..Default::default()
-    }
+    let mut ui = ai_session_search::config::UiConfig::default();
+    ui.preview_body_lines = 20;
+    ui
 }
 
 /// Compile representative service composition as an external Rust consumer.

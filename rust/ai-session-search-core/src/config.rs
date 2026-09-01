@@ -90,6 +90,7 @@ pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MIN_WORDS: usize = 2;
 pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MAX_WORDS: usize = 5;
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Config {
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -331,6 +332,7 @@ impl<'de> Deserialize<'de> for Config {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProvidersConfig {
     #[serde(default)]
     pub claude: ProviderConfig,
@@ -354,6 +356,7 @@ pub struct ProvidersConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProviderConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -387,6 +390,7 @@ impl std::str::FromStr for IndexRefresh {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct IndexConfig {
     pub db_path: Option<String>,
     pub cache_dir: Option<String>,
@@ -409,6 +413,7 @@ pub struct IndexConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct UiConfig {
     #[serde(default = "default_preview_body_lines")]
     pub preview_body_lines: usize,
@@ -456,6 +461,7 @@ pub struct UiConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SearchConfig {
     #[serde(default = "default_limit")]
     pub default_limit: usize,
@@ -480,6 +486,7 @@ pub struct SearchConfig {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageSearchConfig {
     /// Optional shared positive page size. `None` preserves current CLI, MCP, Python, and Rust
     /// surface defaults; requesting every result remains an explicit per-call decision.
@@ -493,6 +500,7 @@ pub struct MessageSearchConfig {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageContextDefaults {
     pub context_before: Option<usize>,
     pub context_after: Option<usize>,
@@ -500,6 +508,7 @@ pub struct MessageContextDefaults {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SearchBudgetConfig {
     /// Maximum hits in a finite message-search page.
     ///
@@ -520,6 +529,7 @@ pub enum SearchScopeMode {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SearchScopeConfig {
     pub mode: SearchScopeMode,
     pub roots: Vec<String>,
@@ -544,6 +554,7 @@ pub enum SearchOperation {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PurposeDefinition {
     pub version: NonZeroU32,
     pub operation: SearchOperation,
@@ -553,6 +564,7 @@ pub struct PurposeDefinition {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessagePurposePreferences {
     pub default_limit: Option<NonZeroUsize>,
     pub context_before: Option<usize>,
@@ -573,6 +585,7 @@ pub struct MessagePurposePreferences {
 /// added when a session's repo matches the current one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScoringConfig {
     #[serde(default = "default_title_score")]
     pub title_score: i64,
@@ -601,6 +614,7 @@ pub struct ScoringConfig {
 /// Analytics defaults and overrides (`[analytics]` in config.toml).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AnalyticsConfig {
     /// `planning`: when non-empty, restricts the count to slash commands whose token
     /// matches one of these (case-insensitive) regexes. Empty = count every slash command.
@@ -635,6 +649,7 @@ pub struct AnalyticsConfig {
 /// adjacent, strictly parsed metadata; `aise` does not execute instructions from `SKILL.md`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillsConfig {
     /// Directories to scan for skills, each either a skill directory or a directory containing
     /// skill directories. `~` is expanded. Empty = only capabilities embedded in the executable.
@@ -654,12 +669,14 @@ pub struct SkillsConfig {
 /// Defaults for typed deterministic capabilities.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CapabilitiesConfig {
     pub message_classification: MessageClassificationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageClassificationConfig {
     /// Default native CLI and Python result count. `0` means every match.
     #[serde(default = "default_message_classification_limit")]
@@ -672,6 +689,7 @@ pub struct MessageClassificationConfig {
 /// machine with no configuration. See [`Config::resolve_threads`] for the override chain.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PerformanceConfig {
     /// Worker threads for parallel scans. `0` = auto (all available cores); `1` = sequential.
     #[serde(default)]
@@ -793,6 +811,7 @@ impl<'de> Deserialize<'de> for McpReadConcurrency {
 /// matter because MCP responses are usually copied straight into an agent's context window.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct McpConfig {
     /// Maximum tool calls per MCP server process that may hold independent read-only SQLite
     /// connections simultaneously. Additional calls wait without opening a connection. This
@@ -887,6 +906,7 @@ pub struct McpConfig {
 /// concise while still giving agents enough live schema context to form valid SQL.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct McpInternalConfig {
     /// Number of schema objects shown in the `query_session_index` tool description.
     #[serde(default = "default_mcp_internal_schema_summary_tables")]
@@ -899,6 +919,7 @@ pub struct McpInternalConfig {
 /// CLI defaults (`[cli]`). These affect command-line behavior only when the flag is omitted.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CliConfig {
     /// Default `aise show --transcript-lines`: positive=head, negative=tail, 0=entire transcript.
     /// A bounded default keeps long sessions skimmable; pass `--transcript-lines 0` explicitly
@@ -928,6 +949,7 @@ pub struct CliConfig {
 /// distinct. Neither configuration affects indexed search APIs such as `search_messages`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct DbConfig {
     /// Default maximum rows for read-only SQL. `0` means unlimited and can produce huge output.
     #[serde(default = "default_db_query_limit")]
@@ -944,6 +966,7 @@ pub const DEFAULT_RELEASE_NOTIFICATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
 /// Explicit `aise package check|update` requests remain available when notifications are disabled.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ReleaseNotificationConfig {
     /// Check for an applicable release after ordinary interactive CLI output.
     pub enabled: bool,

@@ -25,6 +25,14 @@ compatibility baseline; tags below it do not define a compatibility contract.
   ignores `modifyOtherKeys`, so shift+arrow alone would leave the preview unscrollable there.
   `h`, `l`, Left, and Right are now unbound in browse mode; rebind them through `[ui.keys]` if
   you want them back.
+- Every configuration struct read from `config.toml` is `#[non_exhaustive]`, so a downstream Rust
+  crate constructs one from `Default::default()` and sets what it wants rather than writing a
+  struct literal. Adding a setting is then a minor release instead of a breaking one, which
+  matters because `[ui]` alone gained ten fields in this cycle. `ConfigOverrides`, the documented
+  embedder entry point into `Config::resolve`, is deliberately not among them: it carries CLI and
+  API overrides rather than file contents, and a literal is how embedders build it. The
+  compile-only downstream consumer proves the boundary — a struct expression there fails with
+  `error[E0639]: cannot create non-exhaustive struct using struct expression`.
 - `[ui].preview_lines` is now `[ui].preview_body_lines`. The value has always been the preview's
   *body* budget: the pane also carries a `Session:`/`CWD:` header, so `34` renders 37 lines. This
   is the one `[ui]` key that shipped in 1.0.0rc2, and renaming it before 1.0.0 is the last chance
@@ -100,9 +108,7 @@ compatibility baseline; tags below it do not define a compatibility contract.
 - `[ui]` keys with typed defaults: `idle_poll_interval_ms` (150), `list_page_rows` (10),
   `preview_scroll_rows` (5), `preview_page_rows` (15), `provider_label_width` (9, clamped up
   to the longest provider label), `list_pane_percent` (45) — the TUI reads each one, and
-  `config.example.toml` documents them beside their typed defaults. This pre-1.0 additive public
-  struct change requires external Rust literals to use `UiConfig { preview_body_lines, ..Default::default() }`;
-  the compile-only downstream consumer pins that supported construction pattern.
+  `config.example.toml` documents them beside their typed defaults.
 - The TUI gains session filter bindings: `p` cycles the provider, `f` the session class, `s`
   the time window (1/7/30 days), and `w` warnings-only. Every binding validates before the
   search runs, appears with its active value in the status bar, and mutates the same canonical

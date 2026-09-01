@@ -127,6 +127,15 @@ causes the next `auto` read to retry in the background.
 
 ## Rust, Python, and MCP
 
+Every struct read from `config.toml` — `Config` and each panel under it — is `#[non_exhaustive]`.
+A downstream crate therefore starts from `Default::default()` and assigns the fields it wants
+instead of writing a struct literal, which is what makes a new setting a minor release rather
+than a breaking one; `[ui]` alone gained ten fields in the cycle before 1.0.0. `ConfigOverrides`
+is deliberately not among them, because it carries CLI and API overrides rather than file
+contents and a literal is how an embedder builds one. `tests/rust-api-consumer` compiles the
+supported pattern from outside the crate, where a struct expression fails with
+`error[E0639]: cannot create non-exhaustive struct using struct expression`.
+
 Rust embedders should construct `ConfigOverrides` and call `Config::resolve`, then retain the
 returned `ResolvedConfig` for diagnostics and provenance. `SessionSearch::open` and
 `OfficialMcpServer::new` accept the resolved typed configuration without rereading process state.
