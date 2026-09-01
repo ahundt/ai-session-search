@@ -38,6 +38,15 @@ ignore = "0.4"
 interim = { version = "0.2.1", features = ["chrono_0_4"] }
 linkify = "0.11"
 nucleo-matcher = "0.3.1"
+# `unstable-rendered-line-info` gates `Paragraph::line_count`, which the preview uses to bound
+# scrolling by the rows the renderer actually produced. Upstream marks it
+# `#[instability::unstable(feature = "rendered-line-info", issue = ".../ratatui/issues/293")]`
+# and notes "The design for text wrapping is not stable and might affect this API", so it sits
+# outside ratatui's semver guarantee and a 0.30.x release could move it. Taken knowingly: the
+# alternative is counting wrapped rows ourselves, and clamping against a count the renderer did
+# not produce is the defect this replaced -- it pulled a reader out of a word-wrapped tail.
+# Failure would be a build error, not wrong output, and Cargo.lock plus `--locked` keeps our own
+# builds and published artifacts on the resolved 0.30.2.
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rayon = "1.11"
 regex = "1.12"

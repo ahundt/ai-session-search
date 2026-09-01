@@ -1892,6 +1892,11 @@ impl AppState {
         // boundaries can produce more rows than ceil(display_width / pane_width). The count has
         // to exist before the title that reports it, and re-attaching a block does not re-wrap:
         // both blocks have the same borders, and a title does not change the interior width.
+        //
+        // `line_count` is behind ratatui's `unstable-rendered-line-info`, outside its semver
+        // guarantee; Cargo.toml records why that is taken knowingly. If a future ratatui drops
+        // it, this line is where the build stops, and the replacement has to measure what the
+        // renderer produced rather than what the text implies.
         self.preview_line_count = preview.line_count(middle[1].width);
         self.clamp_preview_scroll();
         let preview = preview
