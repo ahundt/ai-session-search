@@ -50,6 +50,35 @@ default_limit = 50
 # Prefer sessions from the current repository when ranking session-level search.
 prefer_current_repo = true
 
+[search.scoring]
+# Ranking weights for session-level search (`aise search`, `aise tui`, MCP `search_sessions`).
+# They do not decide which sessions match, only the order the matches come back in: a session
+# is a hit if any haystack contains the whole query, contains one of its tokens, or fuzzy-matches
+# it. Message search does not use these.
+#
+# Six haystacks are scored per session: title, summary, cwd, repo root, preview, transcript.
+# A caseless substring hit on the whole query adds that haystack's weight.
+title_score = 600
+summary_score = 450
+# cwd and repo root share this one.
+path_score = 350
+preview_score = 250
+# The transcript body, and any haystack not named above.
+other_score = 100
+# Added once per query token found in a haystack, so a two-token query matching both in the
+# title adds it twice there.
+token_bonus = 40
+# Added once when a query has more than one token and every token matched somewhere.
+all_tokens_bonus = 150
+# Recency adds `(recency_max_days - age_in_days) * recency_weight`, with the age clamped to the
+# range, so a session touched today gets the full 180 and one older than the window gets 0.
+# A session with no recorded update time gets nothing either way.
+recency_weight = 2
+recency_max_days = 90
+# Added when the session's repo root equals the invoking repository, and only while
+# [search].prefer_current_repo is true.
+current_repo_bonus = 200
+
 [search.message-search]
 # Optional shared page size for message search. Omission preserves each surface's
 # contract: Rust, CLI, and Python return all literal/regex/no-text matches when no
@@ -166,6 +195,19 @@ query_timeout_ms = 0
 # giving agents enough live schema context to form valid SQL.
 schema_summary_tables = 4
 schema_summary_columns = 12
+
+# What each MCP client accepts before it truncates or drops what the server sends. Every row
+# ships with the value measured from that client's own source at a pinned version, recorded in
+# docs/development/mcp-client-limits-and-measured-evidence.md, so this table is only for a client
+# that has since moved. Set a row by the name `aise mcp schema-budget` reports; an unknown name
+# is rejected rather than ignored, so a typo cannot leave the shipped budget quietly in force.
+#
+# A config file is per machine while these numbers are per client, so an MCP registration can
+# instead set its own in its `env` block:
+# AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES=6000
+#
+# [mcp.client_limits]
+# codex-input-schema-bytes = 6000
 
 [cli]
 # Default transcript lines for `aise show` when `--transcript-lines` is omitted:

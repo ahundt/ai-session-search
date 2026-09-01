@@ -3142,6 +3142,52 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_names_every_configuration_key() {
+        // Comparing values cannot see a key the example never mentions: it parses to its typed
+        // default and compares equal. Deleting `list_pane_percent = 45` leaves
+        // `the_shipped_example_sets_every_value_to_the_shipped_default` green, so that test alone
+        // would let a new setting ship with nothing documenting that it exists.
+        fn leaf_keys(value: &serde_json::Value, into: &mut Vec<String>) {
+            if let Some(table) = value.as_object() {
+                for (key, nested) in table {
+                    match nested.as_object() {
+                        // An empty table has no leaves of its own, so the table name is what the
+                        // example has to carry; `[search.purposes]` is the case that matters.
+                        Some(inner) if !inner.is_empty() => leaf_keys(nested, into),
+                        _ => into.push(key.clone()),
+                    }
+                }
+            }
+        }
+        let mut keys = Vec::new();
+        leaf_keys(&serde_json::to_value(Config::default()).unwrap(), &mut keys);
+        assert!(keys.len() > 40, "the walk found only {} keys", keys.len());
+
+        let missing: Vec<&String> = keys
+            .iter()
+            .filter(|key| {
+                !CONFIG_EXAMPLE_TOML.lines().any(|line| {
+                    let body = line.trim_start().trim_start_matches('#').trim_start();
+                    // A table whose own contents are a user's choice of names, such as
+                    // `[search.purposes.<name>]`, is documented by its header rather than by an
+                    // assignment.
+                    if let Some(header) = body.strip_prefix('[').and_then(|r| r.split(']').next()) {
+                        return header.split('.').any(|segment| segment == key.as_str());
+                    }
+                    // Live or commented: many optional keys are documented as `# key = <type>`.
+                    body.strip_prefix(key.as_str())
+                        .is_some_and(|rest| rest.trim_start().starts_with('='))
+                })
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "config.example.toml never names these settings, so `aise config example` does not \
+             tell a reader they exist: {missing:?}"
+        );
+    }
+
+    #[test]
     fn the_example_key_table_lists_every_action_with_its_shipped_chords() {
         // The `[ui.keys]` block is commented out, so `toml::from_str` above never reads it and
         // the test that does read the example cannot see it drift. It is also the block a reader
