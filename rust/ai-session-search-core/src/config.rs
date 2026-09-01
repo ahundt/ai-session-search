@@ -3118,6 +3118,85 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_sets_every_value_to_the_shipped_default() {
+        // `aise config init` writes this file, so what it names is what a reader believes the
+        // program does before they change anything. Every value in it is a literal duplicate of
+        // a `default_*` function, and nothing had been comparing the two: the seven spot-checks
+        // in `embedded_example_config_stays_parseable` below pass on a file whose other keys
+        // have drifted, which is how ten new `[ui]` keys could arrive with their defaults
+        // written out twice and no test looking at either copy.
+        let from_example = serde_json::to_value(
+            toml::from_str::<Config>(CONFIG_EXAMPLE_TOML).expect("the shipped example parses"),
+        )
+        .unwrap();
+        let typed = serde_json::to_value(Config::default()).unwrap();
+        // Section by section, so a drift names the one table that disagrees rather than
+        // printing the whole resolved configuration twice.
+        for (section, typed_value) in typed.as_object().expect("Config serializes as an object") {
+            assert_eq!(
+                from_example.get(section),
+                Some(typed_value),
+                "[{section}] in config.example.toml no longer matches its typed default"
+            );
+        }
+    }
+
+    #[test]
+    fn the_example_key_table_lists_every_action_with_its_shipped_chords() {
+        // The `[ui.keys]` block is commented out, so `toml::from_str` above never reads it and
+        // the test that does read the example cannot see it drift. It is also the block a reader
+        // copies to rebind a key, so a stale line there is a wrong instruction rather than an
+        // unused one. Uncomment it here and compare against the shipped bindings.
+        let mut listed: BTreeMap<crate::keymap::TuiAction, Vec<crate::keymap::KeyChord>> =
+            BTreeMap::new();
+        let mut lines = CONFIG_EXAMPLE_TOML
+            .lines()
+            .skip_while(|line| line.trim() != "# [ui.keys]");
+        assert!(lines.next().is_some(), "config.example.toml lost # [ui.keys]");
+        for line in lines {
+            // Every line of the block is commented, the bare `#` separating its two halves
+            // included, so the first uncommented line is the end of it. Reading past that point
+            // reaches the provider prose, where "explicit `paths = []` means search no roots"
+            // parses as an assignment if the scan is any looser than this.
+            let Some(body) = line.strip_prefix('#') else {
+                break;
+            };
+            let body = body.trim_start();
+            // The next commented table header would also end it.
+            if body.starts_with('[') {
+                break;
+            }
+            let Some((name, chords)) = body.split_once(" = ") else {
+                continue;
+            };
+            // An action name, not prose that happens to contain ` = `.
+            if !name
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '_')
+                || !chords.starts_with('[')
+            {
+                continue;
+            }
+            let entry: BTreeMap<crate::keymap::TuiAction, Vec<crate::keymap::KeyChord>> =
+                toml::from_str(&format!("{name} = {chords}")).unwrap_or_else(|error| {
+                    panic!("config.example.toml documents an unusable binding {body:?}: {error}")
+                });
+            listed.extend(entry);
+        }
+
+        let shipped = KeyBindings::default();
+        let expected: BTreeMap<crate::keymap::TuiAction, Vec<crate::keymap::KeyChord>> =
+            crate::keymap::TuiAction::ALL
+                .into_iter()
+                .map(|action| (action, shipped.chords(action).to_vec()))
+                .collect();
+        assert_eq!(
+            listed, expected,
+            "the commented [ui.keys] block must name every action with the keys it actually ships"
+        );
+    }
+
+    #[test]
     fn embedded_example_config_stays_parseable() {
         let cfg: Config = toml::from_str(CONFIG_EXAMPLE_TOML).unwrap();
         assert_eq!(

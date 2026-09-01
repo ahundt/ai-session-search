@@ -62,9 +62,12 @@ prefer_current_repo = true
 # match_evidence_max_chars = 220
 
 [search.message-search.context]
-# Default neighboring messages added after hit selection. Per-call values win.
-context_before = 0
-context_after = 0
+# Default neighboring messages added after hit selection. A per-call value wins, and a purpose
+# bundle outranks this. Commented out like every other optional key in this file: omitting them
+# and writing an explicit 0 resolve to the same window and differ only in the origin
+# `aise config origins` reports, so the file no longer records a choice the reader did not make.
+# context_before = 0
+# context_after = 0
 
 [search.budgets]
 # Optional hard ceilings. Omission preserves current runtime behavior and does not
