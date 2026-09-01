@@ -1310,6 +1310,50 @@ def test_no_rust_source_writes_the_process_environment() -> None:
     )
 
 
+# Each public module of the TUI vocabulary, and the only name in it a caller outside the crate
+# has any way to use: the type of a `[ui]` configuration field.
+TUI_VOCABULARY_MODULES = {
+    "rust/ai-session-search-core/src/keymap.rs": {"KeyBindings"},
+    "rust/ai-session-search-core/src/terminal_style.rs": {"CapabilityMode"},
+}
+# `pub fn`, `pub struct`, `pub const`, a `pub` field — anything but `pub(crate)`, which this
+# deliberately does not match.
+_PUBLISHED_ITEM = re.compile(
+    r"^\s*pub\s+(?:fn|struct|enum|const|static|type|trait|mod)\s+(\w+)"
+    r"|^\s*pub\s+(\w+)\s*:"
+)
+
+
+def test_the_tui_vocabulary_publishes_only_the_two_config_field_types() -> None:
+    """These two modules are public only because `UiConfig` names two of their types.
+
+    Everything else in them speaks `crossterm` and `ratatui`, which this crate does not
+    re-export, so a caller outside it cannot construct an argument or name a result: an
+    external consumer compiling `KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE)`
+    fails with "cannot find module or crate `crossterm`", and `tui` is a private module so
+    nothing out there can draw a frame either. Publishing any of it would make a `crossterm`
+    or `ratatui` major bump a breaking change to *this* crate's 1.0.0 API in exchange for an
+    audience that has no use for it.
+
+    Widening one of these later is not a breaking change. Narrowing it after 1.0.0 is, which
+    is why the check is here rather than in a note.
+    """
+    offenders = []
+    for relative, allowed in TUI_VOCABULARY_MODULES.items():
+        for number, line in enumerate(
+            (ROOT / relative).read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if line.lstrip().startswith("//"):
+                continue
+            found = _PUBLISHED_ITEM.match(line)
+            if found and (found.group(1) or found.group(2)) not in allowed:
+                offenders.append(f"{relative}:{number}: {line.strip()}")
+    assert not offenders, (
+        "these items would ship in the 1.0.0 public API built on foreign 0.x types; make them "
+        "`pub(crate)` unless an external caller can genuinely use them:\n" + "\n".join(offenders)
+    )
+
+
 def test_ci_runs_one_pinned_offline_workflow_security_audit() -> None:
     from pathlib import Path
 

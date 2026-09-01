@@ -45,8 +45,14 @@ const ASCII_BORDER: border::Set<'static> = border::Set {
 };
 
 /// The symbols and styling the browser draws with, resolved for one run.
+///
+/// Crate-internal, and deliberately so: [`Self::border_set`] returns a `ratatui` type this crate
+/// does not re-export, so a caller outside it could not name the result. Nothing outside can draw
+/// a frame either — `tui` is a private module — which leaves this useful only in here. Publishing
+/// it would make a `ratatui` major bump a breaking change to *this* crate's public API for an
+/// audience that has no use for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TerminalStyle {
+pub(crate) struct TerminalStyle {
     unicode: bool,
     color: bool,
 }
@@ -62,7 +68,7 @@ impl Default for TerminalStyle {
 
 impl TerminalStyle {
     /// Resolve both capabilities from the configured intent and this process's environment.
-    pub fn resolve(unicode: CapabilityMode, color: CapabilityMode) -> Self {
+    pub(crate) fn resolve(unicode: CapabilityMode, color: CapabilityMode) -> Self {
         Self {
             unicode: match unicode {
                 CapabilityMode::On => true,
@@ -77,16 +83,15 @@ impl TerminalStyle {
         }
     }
 
-    pub fn unicode(&self) -> bool {
-        self.unicode
-    }
-
-    pub fn color(&self) -> bool {
+    /// There is deliberately no `unicode()` beside this. Colour is asked about once, to clear it
+    /// from the finished frame; every unicode decision is a symbol, so the renderer asks for the
+    /// symbol and cannot forget the fallback by branching on a boolean of its own.
+    pub(crate) fn color(&self) -> bool {
         self.color
     }
 
     /// The border a pane is drawn with.
-    pub fn border_set(&self) -> border::Set<'static> {
+    pub(crate) fn border_set(&self) -> border::Set<'static> {
         if self.unicode {
             border::PLAIN
         } else {
@@ -95,7 +100,7 @@ impl TerminalStyle {
     }
 
     /// Marks text cut out of the middle of a line.
-    pub fn ellipsis(&self) -> &'static str {
+    pub(crate) fn ellipsis(&self) -> &'static str {
         if self.unicode {
             "…"
         } else {
@@ -104,7 +109,7 @@ impl TerminalStyle {
     }
 
     /// Separates the status bar's hints.
-    pub fn hint_separator(&self) -> &'static str {
+    pub(crate) fn hint_separator(&self) -> &'static str {
         if self.unicode {
             " │ "
         } else {
@@ -113,7 +118,7 @@ impl TerminalStyle {
     }
 
     /// Opens a preview section heading.
-    pub fn section_rule(&self) -> &'static str {
+    pub(crate) fn section_rule(&self) -> &'static str {
         if self.unicode {
             "──"
         } else {
@@ -122,7 +127,7 @@ impl TerminalStyle {
     }
 
     /// Opens the preview's "N more turns hidden" line.
-    pub fn elision_marker(&self) -> &'static str {
+    pub(crate) fn elision_marker(&self) -> &'static str {
         if self.unicode {
             "⋯"
         } else {
@@ -131,7 +136,7 @@ impl TerminalStyle {
     }
 
     /// Separates the parts of a pane title.
-    pub fn title_separator(&self) -> &'static str {
+    pub(crate) fn title_separator(&self) -> &'static str {
         if self.unicode {
             "·"
         } else {
@@ -141,7 +146,7 @@ impl TerminalStyle {
 
     /// Marks the selected row. It is drawn whatever the colour support, because a reader who
     /// cannot see the highlight colour still has to know which row Enter would resume.
-    pub fn selection_symbol(&self) -> &'static str {
+    pub(crate) fn selection_symbol(&self) -> &'static str {
         if self.unicode {
             "❯ "
         } else {
@@ -265,9 +270,9 @@ mod tests {
     #[test]
     fn an_explicit_setting_outranks_the_environment() {
         let forced = TerminalStyle::resolve(CapabilityMode::On, CapabilityMode::On);
-        assert!(forced.unicode() && forced.color());
+        assert!(forced.unicode && forced.color());
         let refused = TerminalStyle::resolve(CapabilityMode::Off, CapabilityMode::Off);
-        assert!(!refused.unicode() && !refused.color());
+        assert!(!refused.unicode && !refused.color());
     }
 
     #[test]

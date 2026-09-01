@@ -7,6 +7,14 @@
 //! validates it with everything else; `tui` asks it what a [`KeyEvent`] means and never parses a
 //! key name. Keeping the parsing here is what lets the configuration file, the rendered help, and
 //! the error messages all be derived from one table instead of three lists that drift.
+//!
+//! [`KeyBindings`] is the only public item here, because it is the type of a `[ui]` field and a
+//! caller therefore has to be able to name it. Everything else is crate-internal on purpose:
+//! [`KeyChord`] and [`KeyBindings::action_for`] speak in `crossterm`'s key types, which this crate
+//! does not re-export, so an outside caller could not construct an argument or read a result — and
+//! could not run the browser either, since `tui` is a private module. Publishing them would make a
+//! `crossterm` major bump a breaking change to *this* crate's public API in exchange for nothing.
+//! Widening any of this later is not a breaking change; narrowing it after 1.0.0 would be.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -22,7 +30,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// check, and the rendered help, so adding a command means adding it here once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TuiAction {
+pub(crate) enum TuiAction {
     /// Ask to leave. The first press arms, the second quits — see [`TuiAction::Interrupt`].
     Interrupt,
     Quit,
@@ -61,7 +69,7 @@ pub enum TuiAction {
 /// Which mode an action is reachable from. Two actions may share a chord when their modes do
 /// not overlap, which is why Esc can both leave the search box and quit the browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionMode {
+pub(crate) enum ActionMode {
     Browse,
     Search,
     Both,
@@ -69,7 +77,12 @@ pub enum ActionMode {
 
 impl TuiAction {
     /// Every action, in the order `[ui.keys]` and the defaults list them.
-    pub const ALL: [Self; 28] = [
+    ///
+    /// A plain constant, so unlike [`Self::mode`] and [`Self::name`] the compiler cannot ask for
+    /// an entry when a variant is added. An action left out of it has no help entry and no
+    /// shipped binding, and no test can discover that, because every way of enumerating the
+    /// variants is this list. Add the action here first.
+    pub(crate) const ALL: [Self; 28] = [
         Self::Interrupt,
         Self::Quit,
         Self::EnterSearch,
@@ -100,7 +113,7 @@ impl TuiAction {
         Self::CursorEnd,
     ];
 
-    pub fn mode(self) -> ActionMode {
+    pub(crate) fn mode(self) -> ActionMode {
         match self {
             Self::Interrupt => ActionMode::Both,
             Self::LeaveSearch
@@ -117,7 +130,7 @@ impl TuiAction {
     }
 
     /// The `[ui.keys]` name, from the same serde renaming the file is parsed with.
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Interrupt => "interrupt",
             Self::Quit => "quit",
@@ -218,13 +231,13 @@ const NAMED_MODIFIERS: [(&str, KeyModifiers); 4] = [
 /// both. A bare letter keeps its case, because there the case is the whole of what distinguishes
 /// the shipped `g` from `G`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyChord {
+pub(crate) struct KeyChord {
     code: KeyCode,
     modifiers: KeyModifiers,
 }
 
 impl KeyChord {
-    pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+    pub(crate) fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
         let (code, modifiers) = Self::significant(code, modifiers);
         Self { code, modifiers }
     }
@@ -243,7 +256,7 @@ impl KeyChord {
     }
 
     /// True when `event` is this chord. Key repeat and release events are the caller's business.
-    pub fn matches(&self, event: &KeyEvent) -> bool {
+    pub(crate) fn matches(&self, event: &KeyEvent) -> bool {
         (self.code, self.modifiers) == Self::significant(event.code, event.modifiers)
     }
 }
@@ -363,7 +376,7 @@ pub struct KeyBindings(BTreeMap<TuiAction, Vec<KeyChord>>);
 
 impl KeyBindings {
     /// The chords bound to `action`.
-    pub fn chords(&self, action: TuiAction) -> &[KeyChord] {
+    pub(crate) fn chords(&self, action: TuiAction) -> &[KeyChord] {
         self.0.get(&action).map_or(&[], Vec::as_slice)
     }
 
@@ -384,7 +397,7 @@ impl KeyBindings {
     }
 
     /// The action `event` selects in `mode`, if any.
-    pub fn action_for(&self, event: &KeyEvent, mode: ActionMode) -> Option<TuiAction> {
+    pub(crate) fn action_for(&self, event: &KeyEvent, mode: ActionMode) -> Option<TuiAction> {
         self.0
             .iter()
             .filter(|(action, _)| reachable(action.mode(), mode))
@@ -394,7 +407,7 @@ impl KeyBindings {
 
     /// Reject a table that cannot be operated: an unknown spelling is already refused while
     /// parsing, so what is left is one chord meaning two things in one mode, and no way out.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         // A list rather than a map: crossterm's key types are not ordered, the table holds
         // tens of chords, and the scan keeps the message deterministic in action order.
         for mode in [ActionMode::Browse, ActionMode::Search] {
