@@ -124,6 +124,15 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### Fixed
 
+- Benchmark reports compare a case's registered semantic digest instead of hashing timing and
+  resource noise. Run records declare their selected cases and repetition count, and the renderer
+  refuses missing or duplicate samples before issuing a `GO` decision. Linux TUI sampling reads
+  each process's `NLWP` count instead of using macOS `ps -M` semantics.
+- The local release gate installs and smoke-tests the exact source distribution after structural
+  verification, matching the hosted release job before a tag reaches an immutable registry.
+- ASCII TUI rendering now covers transcript truncation and empty-index guidance. A failed initial
+  search keeps its error without also telling the reader that the index is empty and needs a
+  rebuild.
 - The TUI preview pane's title names the visible rows and the total when the transcript is
   longer than the pane, so a reader can tell that scrolling would do something. Content that
   fits keeps the plain title.
