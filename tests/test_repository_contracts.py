@@ -1171,6 +1171,26 @@ def test_manual_package_preparation_defaults_to_all_without_publish_credentials(
     assert "gh-action-pypi-publish" not in workflow
 
 
+def test_local_gate_smoke_tests_the_exact_source_distribution() -> None:
+    local_gate = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+    artifact_step = local_gate.split("build_and_verify_python_artifacts() {", 1)[1].split(
+        "\nbuild_current_python_extension() {", 1
+    )[0]
+    assert "*.tar.gz" in artifact_step
+    assert 'uv run --isolated --no-project --with "$sdist"' in artifact_step
+    assert "scripts/verify_installed_distribution.py" in artifact_step
+
+
+def test_linux_gate_describes_the_scanner_it_actually_runs() -> None:
+    local_gate = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+    assert 'step "Workflow security scan" scan_workflow_security' in local_gate
+    wrapper = (ROOT / "scripts/linux_container_gate.sh").read_text(encoding="utf-8")
+    image = (ROOT / "docker/linux-gate.Dockerfile").read_text(encoding="utf-8")
+    for source in (wrapper, image):
+        normalized = " ".join(source.replace("#", "").split())
+        assert "zizmor is resolved by run_ci_local.sh through pinned uv tool" in normalized
+
+
 def test_every_workflow_file_is_syntax_checked_by_a_blocking_ci_job() -> None:
     # actionlint with no file arguments checks every file under .github/workflows, so a workflow
     # added later cannot escape the check by not appearing in an argument list.

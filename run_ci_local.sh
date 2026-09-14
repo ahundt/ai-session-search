@@ -307,12 +307,18 @@ build_and_verify_python_artifacts() {
     # this checkout, and verify_release_artifacts rejects a wheel that still does.
     uv run python scripts/sanitize_sboms.py --root "$SCRIPT_DIR" "$output"/*.whl || return
     uv run python -m scripts.verify_release_artifacts "$output"/* || return
-    local wheel
+    local wheel sdist
     wheel="$(find "$output" -maxdepth 1 -name '*.whl' -print -quit)"
+    sdist="$(find "$output" -maxdepth 1 -name '*.tar.gz' -print -quit)"
     local python
     python="$(python_for_rust_host)" || return
     uv run python scripts/verify_python_install_methods.py \
-        --artifact "$wheel" --source-root "$SCRIPT_DIR" --python "$python"
+        --artifact "$wheel" --source-root "$SCRIPT_DIR" --python "$python" || return
+    # A structurally valid sdist can still fail its PEP 517 build or omit runtime files. Match the
+    # publish workflow's exact-artifact smoke test here so the local release precondition proves
+    # both distributions before a tag reaches any immutable registry.
+    uv run --isolated --no-project --with "$sdist" \
+        python scripts/verify_installed_distribution.py --source-root "$SCRIPT_DIR"
 }
 
 build_current_python_extension() {

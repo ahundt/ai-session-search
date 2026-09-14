@@ -56,9 +56,10 @@ binaries takes gigabytes each, and the default job count exhausted a 7.75 GiB VM
 killer took `rustc` and `ld` with signal 9. Set AI_SESSION_SEARCH_CONTAINER_JOBS to override.
 Give the engine 8 GiB or more.
 
-The image omits cargo-deny, actionlint, and zizmor: they inspect the dependency graph and the
-workflow files, which do not vary by host. `gate` reports each as a named skip, so a green run
-proves the Linux build, tests, packaging, and install pathways rather than those three checks.
+The image omits cargo-deny and actionlint: they inspect inputs that do not vary by host, and
+`gate` reports each as a named skip. zizmor is resolved by run_ci_local.sh through pinned uv tool
+and scans the streamed checkout offline. A green run therefore includes workflow-security evidence
+alongside the Linux build, tests, packaging, and install pathways.
 USAGE
 }
 

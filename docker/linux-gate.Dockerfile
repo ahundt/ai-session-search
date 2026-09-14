@@ -9,10 +9,11 @@
 # waiting for hosted CI. This image supplies that and nothing else, so a check only ever exists
 # in one place.
 #
-# Not installed: cargo-deny, actionlint, and zizmor. Those three inspect the dependency graph and
-# the workflow files, which do not vary by host, and `run_ci_local.sh` already reports each as a
-# named skip with its exact pinned install command. A green container run therefore proves the
-# Linux build, test, packaging, and install pathways, not the dependency-advisory gate.
+# Not installed: cargo-deny and actionlint. They inspect inputs that do not vary by host, and
+# `run_ci_local.sh` reports each as a named skip with its exact pinned install command. zizmor is
+# resolved by run_ci_local.sh through pinned uv tool and scans the streamed checkout offline. A
+# green container run therefore proves workflow security plus the Linux build, test, packaging,
+# and install pathways, but not the dependency-advisory gate.
 FROM ubuntu:24.04
 
 # `stable` matches the `rust`, `rust-portability`, and `rust-install` CI jobs. Pass 1.88.0 to
