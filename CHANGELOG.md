@@ -126,8 +126,10 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 - Benchmark reports compare a case's registered semantic digest instead of hashing timing and
   resource noise. Run records declare their selected cases and repetition count, and the renderer
-  refuses missing or duplicate samples before issuing a `GO` decision. Linux TUI sampling reads
-  each process's `NLWP` count instead of using macOS `ps -M` semantics.
+  refuses missing or duplicate samples before issuing a `GO` decision. Paired measurements
+  alternate which build runs first on each repetition, and the TUI client waits for rendered
+  browse mode before sending `q`. Linux TUI sampling reads each process's `NLWP` count instead
+  of using macOS `ps -M` semantics.
 - The local release gate installs and smoke-tests the exact source distribution after structural
   verification, matching the hosted release job before a tag reaches an immutable registry.
 - ASCII TUI rendering now covers transcript truncation and empty-index guidance. A failed initial

@@ -959,6 +959,23 @@ def test_tui_latency_repetitions_require_one_digest_per_query(
         client.measure_latency("aise", "fixture.db", ["SQLite 1"], 2, 0.0, 0.01)
 
 
+def test_benchmark_build_order_balances_first_run_bias() -> None:
+    benchmark = load_python_file(ROOT / "scripts" / "benchmark_release.py")
+    builds = [{"label": "baseline"}, {"label": "candidate"}]
+
+    observed = [
+        [build["label"] for build in benchmark.balanced_build_order(builds, repetition)]
+        for repetition in range(4)
+    ]
+
+    assert observed == [
+        ["baseline", "candidate"],
+        ["candidate", "baseline"],
+        ["baseline", "candidate"],
+        ["candidate", "baseline"],
+    ]
+
+
 def test_tui_output_bytes_use_the_single_captured_pty_ledger() -> None:
     client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
 

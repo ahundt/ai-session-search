@@ -37,6 +37,12 @@ class Build(TypedDict):
     repository: Path
 
 
+def balanced_build_order(builds: list[Build], repetition: int) -> tuple[Build, ...]:
+    """Alternate first-run ownership so time and thermal drift do not favor one build."""
+    ordered = builds if repetition % 2 == 0 else reversed(builds)
+    return tuple(ordered)
+
+
 class MacProcessTaskInfo(ctypes.Structure):
     _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("virtual_size", ctypes.c_uint64),
@@ -656,22 +662,23 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
             first_binary,
         )
         fixtures = {str(build["label"]): fixture for build in builds}
-    expected_by_case: dict[str, str] = {}
+    contracts = {
+        case["id"]: {"require_equal": case.get("require_equal", True)}
+        for case in manifest["cases"]
+    }
     for build in builds:
         label = build["label"]
         binary = build["binary"]
-        fixture = fixtures[str(label)]
+        fixture = fixtures[label]
         if not binary.is_file():
             raise SystemExit(f"missing {label} binary: {binary}")
-        run_metadata = metadata(binary, manifest_path, build["repository"])
         with results_path.open("a", encoding="utf-8") as output:
-            contracts = {case["id"]: {"require_equal": case.get("require_equal", True)} for case in manifest["cases"]}
             output.write(
                 json.dumps(
                     {
                         "kind": "run",
                         "build": label,
-                        "metadata": run_metadata,
+                        "metadata": metadata(binary, manifest_path, build["repository"]),
                         "fixture": public_fixture_metadata(fixture),
                         "contracts": contracts,
                         "selected_cases": [case["id"] for case in selected],
@@ -682,85 +689,126 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                 )
                 + "\n"
             )
-            for case in selected:
-                expected_digest = None
-                for repetition in range(repetitions):
-                    sample_fixture = artifact_dir / "sample-fixtures" / str(label) / case["id"] / f"{repetition}.db"
-                    clone_fixture(Path(fixture["path"]), sample_fixture)
-                    before_fixture_state = sqlite_file_state(sample_fixture)
-                    argv = [
-                        part.format(
-                            binary=binary,
-                            python=build["python"],
-                            core=build["core"],
-                            client_root=ROOT / "benchmarks",
-                            fixture=sample_fixture,
+
+    expected_by_case: dict[str, str] = {}
+    expected_by_build_case: dict[tuple[str, str], str] = {}
+    for case in selected:
+        for repetition in range(repetitions):
+            for build in balanced_build_order(builds, repetition):
+                label = build["label"]
+                binary = build["binary"]
+                fixture = fixtures[label]
+                sample_fixture = (
+                    artifact_dir
+                    / "sample-fixtures"
+                    / label
+                    / case["id"]
+                    / f"{repetition}.db"
+                )
+                clone_fixture(Path(fixture["path"]), sample_fixture)
+                before_fixture_state = sqlite_file_state(sample_fixture)
+                argv = [
+                    part.format(
+                        binary=binary,
+                        python=build["python"],
+                        core=build["core"],
+                        client_root=ROOT / "benchmarks",
+                        fixture=sample_fixture,
+                    )
+                    for part in case["argv"]
+                ]
+                if argv[0] == str(build["python"]):
+                    argv.insert(1, "-I")
+                path_normalizations = {
+                    str(sample_fixture).encode(): b"{fixture}",
+                    str(artifact_dir).encode(): b"{artifact_dir}",
+                    str(build["python"]).encode(): b"{python}",
+                    str(build["core"]).encode(): b"{core}",
+                    str(binary).encode(): b"{binary}",
+                    str(ROOT / "benchmarks").encode(): b"{client_root}",
+                    str(ROOT).encode(): b"{repository}",
+                    str(Path.home()).encode(): b"{home}",
+                }
+                sample = sample_process(
+                    argv,
+                    path_normalizations,
+                    extract_session_ids=(
+                        case.get("expected_relation") == "intentional_change_with_oracle"
+                    ),
+                    result_json_field=case.get("result_json_field"),
+                    resource_json_fields=case.get("resource_json_fields"),
+                )
+                after_fixture_state = sqlite_file_state(sample_fixture)
+                durable_before = durable_sqlite_state(before_fixture_state)
+                durable_after = durable_sqlite_state(after_fixture_state)
+                sample.update(case_measurement_metadata(case))
+                oracle = temporal_overlap_oracle(sample_fixture, case)
+                if oracle is not None:
+                    sample["temporal_oracle"] = oracle
+                    sample["temporal_oracle_match"] = (
+                        sample.get("session_ids") == oracle["eligible_ids"]
+                    )
+                    if label == "candidate" and not sample["temporal_oracle_match"]:
+                        raise SystemExit(
+                            f"{label}/{case['id']} differs from temporal overlap oracle: "
+                            f"observed={sample.get('session_ids')!r}, "
+                            f"expected={oracle['eligible_ids']!r}"
                         )
-                        for part in case["argv"]
-                    ]
-                    if argv[0] == str(build["python"]):
-                        argv.insert(1, "-I")
-                    path_normalizations = {
-                        str(sample_fixture).encode(): b"{fixture}",
-                        str(artifact_dir).encode(): b"{artifact_dir}",
-                        str(build["python"]).encode(): b"{python}",
-                        str(build["core"]).encode(): b"{core}",
-                        str(binary).encode(): b"{binary}",
-                        str(ROOT / "benchmarks").encode(): b"{client_root}",
-                        str(ROOT).encode(): b"{repository}",
-                        str(Path.home()).encode(): b"{home}",
-                    }
-                    sample = sample_process(
-                        argv,
-                        path_normalizations,
-                        extract_session_ids=(case.get("expected_relation") == "intentional_change_with_oracle"),
-                        result_json_field=case.get("result_json_field"),
-                        resource_json_fields=case.get("resource_json_fields"),
-                    )
-                    after_fixture_state = sqlite_file_state(sample_fixture)
-                    durable_before = durable_sqlite_state(before_fixture_state)
-                    durable_after = durable_sqlite_state(after_fixture_state)
-                    sample.update(case_measurement_metadata(case))
-                    oracle = temporal_overlap_oracle(sample_fixture, case)
-                    if oracle is not None:
-                        sample["temporal_oracle"] = oracle
-                        sample["temporal_oracle_match"] = sample.get("session_ids") == oracle["eligible_ids"]
-                        if label == "candidate" and not sample["temporal_oracle_match"]:
-                            raise SystemExit(
-                                f"{label}/{case['id']} differs from temporal overlap oracle: "
-                                f"observed={sample.get('session_ids')!r}, "
-                                f"expected={oracle['eligible_ids']!r}"
-                            )
-                    sample.update(
-                        kind="sample",
-                        build=label,
-                        case=case["id"],
-                        surface=case["surface"],
-                        repetition=repetition,
-                        fixture_state_before=before_fixture_state,
-                        fixture_state_after=after_fixture_state,
-                        fixture_files_changed=before_fixture_state != after_fixture_state,
-                        durable_fixture_mutated=durable_before != durable_after,
-                    )
+                sample.update(
+                    kind="sample",
+                    build=label,
+                    case=case["id"],
+                    surface=case["surface"],
+                    repetition=repetition,
+                    fixture_state_before=before_fixture_state,
+                    fixture_state_after=after_fixture_state,
+                    fixture_files_changed=before_fixture_state != after_fixture_state,
+                    durable_fixture_mutated=durable_before != durable_after,
+                )
+                with results_path.open("a", encoding="utf-8") as output:
                     if sample["exit_code"] != 0:
                         output.write(json.dumps(sample, sort_keys=True) + "\n")
                         output.flush()
-                        if label == "baseline" and case.get("baseline_allow_failure", False):
+                        if label == "baseline" and case.get(
+                            "baseline_allow_failure", False
+                        ):
                             continue
                         raise SystemExit(f"{label}/{case['id']} failed: {sample['stderr']}")
                     comparison_digest = sample.get(
                         "semantic_result_sha256", sample["result_sha256"]
                     )
-                    expected_digest = expected_digest or comparison_digest
+                    digest_key = (label, case["id"])
+                    expected_digest = expected_by_build_case.setdefault(
+                        digest_key, comparison_digest
+                    )
                     if comparison_digest != expected_digest:
-                        raise SystemExit(f"non-deterministic result digest: {label}/{case['id']}")
-                    prior_build_digest = expected_by_case.setdefault(case["id"], expected_digest)
-                    if case.get("require_equal", True) and comparison_digest != prior_build_digest:
-                        raise SystemExit(f"baseline/candidate result mismatch: {case['id']}")
-                    if label == "candidate" and case.get("read_only", True) and sample["durable_fixture_mutated"]:
-                        raise SystemExit(f"candidate durably mutated read-only fixture: {case['id']}")
+                        raise SystemExit(
+                            f"non-deterministic result digest: {label}/{case['id']}"
+                        )
+                    prior_build_digest = expected_by_case.setdefault(
+                        case["id"], comparison_digest
+                    )
+                    if (
+                        case.get("require_equal", True)
+                        and comparison_digest != prior_build_digest
+                    ):
+                        raise SystemExit(
+                            f"baseline/candidate result mismatch: {case['id']}"
+                        )
+                    if (
+                        label == "candidate"
+                        and case.get("read_only", True)
+                        and sample["durable_fixture_mutated"]
+                    ):
+                        raise SystemExit(
+                            f"candidate durably mutated read-only fixture: {case['id']}"
+                        )
                     output.write(json.dumps(sample, sort_keys=True) + "\n")
                     output.flush()
+
+    for build in builds:
+        label = build["label"]
+        fixture = fixtures[label]
         if sha256(Path(fixture["path"])) != fixture["sha256"]:
             raise SystemExit(f"source fixture mutated during {label} benchmark")
     print(results_path)
