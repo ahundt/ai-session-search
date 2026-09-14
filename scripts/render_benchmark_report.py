@@ -401,7 +401,7 @@ def render(
         f"- Baseline-only cases: {', '.join(f'`{case}`' for case in sorted(set(baseline_rows) - set(candidate_rows))) or 'none'}.",
         "", "## Regressions and limitations", "",
         *(regressions or ["- No automatic digest mismatch or >10% median-latency regression in this sample set."]),
-        "- The nine-repetition release table is a regression signal, not proof for unmeasured "
+        "- The measured benchmark table is a regression signal, not proof for unmeasured "
         "hardware, corpora, or workloads; the scale, concurrency, relevance, storage, and lifecycle "
         "gates below bound the claims made here.",
         "- Peak values are maxima of sampled process-tree observations; wall and CPU figures include "

@@ -1374,6 +1374,8 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
 
     assert "**NO-GO" in report
     assert "publishable generated fixture: no" in report
+    assert "nine-repetition" not in report
+    assert "The measured benchmark table is a regression signal" in report
     assert "private_local_fixture" in report
 
 
