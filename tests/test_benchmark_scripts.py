@@ -1322,6 +1322,12 @@ def test_renderer_loads_structured_relevance_result(tmp_path: Path) -> None:
         renderer.load_relevance(log)
 
 
+def test_renderer_missing_relevance_evidence_fails_closed() -> None:
+    renderer = load_script("render_benchmark_report.py")
+
+    assert renderer.relevance_gate(None) is False
+
+
 def test_renderer_emits_scale_table_without_relevance_log(tmp_path: Path) -> None:
     renderer = load_script("render_benchmark_report.py")
     raw = tmp_path / "scale.jsonl"
@@ -1456,6 +1462,7 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
     assert "--baseline BASELINE_BINARY" in report
     assert "--baseline-repository BASELINE_REPOSITORY" in report
     assert "--candidate CANDIDATE_BINARY" in report
+    assert "--relevance-log RELEVANCE_LOG" in report
     assert "nine-repetition" not in report
     assert "The measured benchmark table is a regression signal" in report
     assert "private_local_fixture" in report

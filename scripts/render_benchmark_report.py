@@ -218,7 +218,7 @@ def relevance_lines(path: Path) -> list[str]:
 
 def relevance_gate(path: Path | None) -> bool:
     if path is None:
-        return True
+        return False
     relevance = load_relevance(path)
     return (
         float(relevance["recall_at_10"]) == 1.0 and float(relevance["mrr"]) >= 0.5
@@ -426,8 +426,8 @@ def render(
         "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY --dry-run",
         "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY",
         "uv run python scripts/benchmark_release.py --tier release --fixture generated --artifact-dir /private/tmp/aise-benchmark-release --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY",
-        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --output notes/aise-report.md",
-        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --output notes/aise-report.md --check",
+        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output notes/aise-report.md",
+        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output notes/aise-report.md --check",
         "```",
         "",
         "This report's exact renderer command is:",

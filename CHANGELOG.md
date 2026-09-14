@@ -127,7 +127,8 @@ compatibility baseline; tags below it do not define a compatibility contract.
 - Benchmark reports compare a case's registered semantic digest instead of hashing timing and
   resource noise. Run records declare their selected cases and repetition count, and the renderer
   refuses missing or duplicate samples before issuing a `GO` decision. Reports label omitted
-  relevance evidence as not supplied and print runnable paired reproduction commands. Paired
+  relevance evidence as not supplied, fail closed without it, and print runnable paired
+  reproduction commands. Paired
   measurements alternate which build runs first on each repetition. The TUI client parses both
   ASCII and Unicode frames and waits for a post-Esc browse title before sending `q`. Linux TUI
   sampling reads each process's `NLWP` count instead of using macOS `ps -M` semantics.
