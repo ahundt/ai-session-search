@@ -1558,7 +1558,7 @@ impl AppState {
         if self.nothing_has_been_narrowed() {
             lines.push("No sessions are indexed yet.".to_string());
             lines.push(String::new());
-            lines.push("Nothing here was filtered out — the index is empty. Leave the".to_string());
+            lines.push("Nothing here was filtered out; the index is empty. Leave the".to_string());
             lines.push("browser and run `aise reindex`, then start it again.".to_string());
         } else {
             lines.push("No sessions matched.".to_string());
@@ -1962,7 +1962,11 @@ impl AppState {
         // a large index that is seconds: telling a reader their index is empty while the search
         // that disproves it is still running would send them to rebuild it for nothing.
         let empty_state;
-        let preview_body: &str = if self.results.is_empty() && !self.searching {
+        let preview_body: &str = if self.results.is_empty()
+            && !self.searching
+            && self.error_owner != Some(RequestKind::Search)
+            && !self.worker_disconnected_reported
+        {
             empty_state = self.empty_state_guidance();
             &empty_state
         } else {
@@ -2251,7 +2255,8 @@ fn parse_turns_inner<'a>(
 
 #[cfg(test)]
 fn truncate_body(body: &str, max_lines: usize) -> String {
-    truncate_body_inner(body, max_lines, None).expect("an uncancelled copy cannot fail")
+    truncate_body_inner(body, max_lines, TerminalStyle::default().ellipsis(), None)
+        .expect("an uncancelled copy cannot fail")
 }
 
 fn push_cancellable(
@@ -2301,6 +2306,7 @@ fn trim_end_cancellable<'a>(
 fn truncate_body_inner(
     body: &str,
     max_lines: usize,
+    ellipsis: &str,
     cancellation: Option<&QueryCancellation>,
 ) -> Result<String> {
     let trimmed = trim_end_cancellable(body, cancellation)?;
@@ -2333,7 +2339,9 @@ fn truncate_body_inner(
         }
         push_cancellable(&mut output, line, cancellation)?;
     }
-    output.push_str("\n  […]");
+    output.push_str("\n  [");
+    output.push_str(ellipsis);
+    output.push(']');
     Ok(output)
 }
 
@@ -2563,7 +2571,12 @@ fn render_summary_sections(
         }
         parts.push(label.clone());
         let max_lines = (budget.saturating_mul(*weight) / HISTORICAL_PREVIEW_BODY_LINES).max(1);
-        parts.push(truncate_body_inner(body, max_lines, cancellation)?);
+        parts.push(truncate_body_inner(
+            body,
+            max_lines,
+            style.ellipsis(),
+            cancellation,
+        )?);
         last_emitted_idx = Some(*idx);
     }
     if hidden > 0 && sections.len() < 2 {
@@ -5299,19 +5312,6 @@ mod tests {
         assert!(!status.contains("q: quit"), "{status:?}");
     }
 
-    /// A transcript with four bookends and a gap, so the preview carries section rules and an
-    /// elision marker as well as body text.
-    fn bookended_transcript() -> String {
-        join_turns(&[
-            ("user", "first question"),
-            ("assistant", "first answer"),
-            ("user", "middle question"),
-            ("assistant", "middle answer"),
-            ("user", "final question"),
-            ("assistant", "final answer"),
-        ])
-    }
-
     #[test]
     fn the_preview_title_reports_the_visible_rows_only_when_some_are_hidden() {
         // A pane that shows two thirds of a transcript looked exactly like one showing all of
@@ -5639,15 +5639,36 @@ mod tests {
 
     #[test]
     fn an_ascii_terminal_renders_nothing_outside_ascii() {
-        // `LANG=C` over ssh is a real terminal, and every box border, ellipsis, status separator,
-        // section rule, and elision marker the browser drew was outside ASCII. One assertion over
-        // the finished frame is the only check that cannot be passed by fixing four of five.
+        // `LANG=C` over ssh is a real terminal. Check complete rendered frames rather than only
+        // TerminalStyle's own symbols: transcript truncation and empty-state prose are separate
+        // producers and previously bypassed the style.
+        fn non_ascii_symbols(terminal: &Terminal<TestBackend>) -> Vec<String> {
+            let buffer = terminal.backend().buffer();
+            let area = buffer.area;
+            let mut offenders = Vec::new();
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    let symbol = buffer[(x, y)].symbol().to_string();
+                    if !symbol.is_ascii() {
+                        offenders.push(symbol);
+                    }
+                }
+            }
+            offenders.sort();
+            offenders.dedup();
+            offenders
+        }
+
         let mut config = Config::default();
         config.ui.unicode = CapabilityMode::Off;
         let ascii = TerminalStyle::resolve(CapabilityMode::Off, CapabilityMode::Auto);
         let mut harness = TuiHarness::with_config(config, idle_executor()).seeded(&["claude:one"]);
-        harness.app.preview =
-            build_transcript_summary_inner(&bookended_transcript(), 34, ascii, None).unwrap();
+        let long_body = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transcript = join_turns(&[("user", long_body.as_str())]);
+        harness.app.preview = build_transcript_summary_inner(&transcript, 34, ascii, None).unwrap();
         harness.app.error = Some(
             "a failure long enough that the error line has to cut something out of its middle"
                 .to_string(),
@@ -5657,29 +5678,30 @@ mod tests {
             .draw(|frame| harness.app.render(frame))
             .unwrap();
 
-        let buffer = harness.terminal.backend().buffer();
-        let area = buffer.area;
-        let mut offenders = Vec::new();
-        for y in area.top()..area.bottom() {
-            for x in area.left()..area.right() {
-                let symbol = buffer[(x, y)].symbol().to_string();
-                if !symbol.is_ascii() {
-                    offenders.push(symbol);
-                }
-            }
-        }
-        offenders.sort();
-        offenders.dedup();
+        let offenders = non_ascii_symbols(&harness.terminal);
         assert!(
             offenders.is_empty(),
             "these are not ASCII: {offenders:?}\n{}",
             harness.screen()
         );
-        // And the frame still drew a border and a cut marker, so the check is not passing on an
-        // empty screen.
         let screen = harness.screen();
         assert!(screen.contains('+') && screen.contains('|'), "{screen}");
-        assert!(screen.contains("..."), "{screen}");
+        assert!(screen.contains("[...]"), "{screen}");
+
+        // The empty-index guidance is another complete frame and must obey the same contract.
+        harness.app.results.clear();
+        harness.app.searching = false;
+        harness.app.error = None;
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let offenders = non_ascii_symbols(&harness.terminal);
+        assert!(
+            offenders.is_empty(),
+            "empty-state frame is not ASCII: {offenders:?}\n{}",
+            harness.screen()
+        );
     }
 
     #[test]
@@ -5782,6 +5804,35 @@ mod tests {
                 .region_text(0..24)
                 .contains("No sessions are indexed yet"),
             "a settled empty index said nothing"
+        );
+    }
+
+    #[test]
+    fn a_failed_initial_search_is_not_reported_as_an_empty_index() {
+        let executor = Box::new(
+            |request: &WorkerRequest, _cancellation: &Arc<QueryCancellation>| match request.kind {
+                RequestKind::Search => Err(anyhow::anyhow!("search failed")),
+                RequestKind::PreviewOnly => Ok(WorkerResponse::preview(request, None)),
+            },
+        );
+        let mut harness = TuiHarness::with_executor(executor);
+        harness.terminal.backend_mut().resize(120, 24);
+        harness.start();
+        step_until(&mut harness, |harness| {
+            harness.app.error_owner == Some(RequestKind::Search) && !harness.app.searching
+        });
+        harness
+            .terminal
+            .draw(|frame| harness.app.render(frame))
+            .unwrap();
+        let screen = harness.region_text(0..24);
+        assert!(
+            screen.contains("search failed"),
+            "the operation error disappeared: {screen}"
+        );
+        assert!(
+            !screen.contains("No sessions are indexed yet") && !screen.contains("aise reindex"),
+            "a failed search was misreported as an empty index: {screen}"
         );
     }
 
