@@ -311,6 +311,11 @@ def render(
         for row in rows
     )
     relevance_passed = relevance_gate(relevance_path)
+    relevance_status = (
+        "not supplied"
+        if relevance_path is None
+        else ("pass" if relevance_passed else "fail")
+    )
     publishable = bool(candidate_run.get("artifact_privacy", {}).get("publishable"))
     decision = (
         "GO" if publishable and not semantic_mismatches and candidate_durable_mutations == 0
@@ -337,8 +342,8 @@ def render(
         f"**{decision} for the measured search/runtime consolidation gates.** Semantic digest "
         f"mismatches: {len(semantic_mismatches)}; candidate durable read mutations: "
         f"{candidate_durable_mutations}; candidate process failures: {candidate_failures}; paired "
-        f"release cases: {len(shared)}; held-out relevance gate: "
-        f"{'pass' if relevance_passed else 'fail'}; publishable generated fixture: "
+        f"release cases: {len(shared)}; held-out relevance gate: {relevance_status}; "
+        f"publishable generated fixture: "
         f"{'yes' if publishable else 'no'}.",
         "",
         "## Reproducibility metadata",
@@ -418,9 +423,9 @@ def render(
         "live database. Replace the artifact paths with a new empty directory:",
         "",
         "```sh",
-        "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke --dry-run",
-        "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke",
-        "uv run python scripts/benchmark_release.py --tier release --fixture generated --artifact-dir /private/tmp/aise-benchmark-release",
+        "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY --dry-run",
+        "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY",
+        "uv run python scripts/benchmark_release.py --tier release --fixture generated --artifact-dir /private/tmp/aise-benchmark-release --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY",
         "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --output notes/aise-report.md",
         "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --output notes/aise-report.md --check",
         "```",

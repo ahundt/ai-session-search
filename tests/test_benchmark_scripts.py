@@ -534,6 +534,74 @@ def test_tui_screen_tracker_buffers_every_split_csi_prefix() -> None:
         assert tracker.line(0) == "X", f"CSI split at byte {split} leaked control text"
 
 
+def test_tui_screen_tracker_derives_ascii_layout_and_search_state() -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    tracker = client.ScreenTracker()
+    for row in (0, 2, 22):
+        tracker.rows[row] = list("-" * client.SCREEN_COLS)
+    tracker.rows[0][:20] = list("+ Search (press /) -")
+    tracker.rows[3][:35] = list("+ Sessions - recent - ready (1/100)")
+    for row in range(3, 23):
+        tracker.rows[row][44] = "|"
+
+    layout = tracker.derive_layout()
+
+    assert layout.query_row == 1
+    assert layout.list_cols.stop == 44
+    assert tracker.search_state(layout) == "ready"
+    assert "Search (press /)" in tracker.search_title(layout)
+
+
+def test_tui_browse_wait_requires_a_post_escape_title_frame() -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    layout = client.ScreenLayout(1, range(4, 22), range(1, 44), range(46, 99))
+
+    class Tracker:
+        def full_screen(self) -> str:
+            return "preview transcript says Search (press /)"
+
+        def search_title(self, _layout: object) -> str:
+            return "+ Search (press /) "
+
+        def feed_bytes(self, _chunk: bytes) -> None:
+            raise AssertionError("no post-Esc frame was emitted")
+
+    class Tui:
+        def read_chunk(self, _timeout: float) -> None:
+            return None
+
+    with pytest.raises(SystemExit, match="did not leave search mode"):
+        client._await_browse_mode(
+            Tui(), Tracker(), layout, 0.001, "before quit (query test#0)"
+        )
+
+
+def test_tui_browse_wait_ignores_preview_content_that_looks_like_the_title() -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    layout = client.ScreenLayout(1, range(4, 22), range(1, 44), range(46, 99))
+
+    class Tracker:
+        def full_screen(self) -> str:
+            return "preview transcript says Search (press /)"
+
+        def search_title(self, _layout: object) -> str:
+            return "+ Search: still-active - Enter/Esc to browse "
+
+        def feed_bytes(self, _chunk: bytes) -> None:
+            pass
+
+    class Tui:
+        chunks = iter([b"post-Esc frame"])
+
+        def read_chunk(self, _timeout: float) -> bytes | None:
+            return next(self.chunks, None)
+
+    with pytest.raises(SystemExit, match="did not leave search mode"):
+        client._await_browse_mode(
+            Tui(), Tracker(), layout, 0.001, "before quit (query test#0)"
+        )
+
+
 def test_tui_screen_tracker_rejoins_a_session_id_wrapped_across_preview_rows() -> None:
     """A subagent id is 67 characters and wraps in the preview pane at 100 columns.
 
@@ -616,7 +684,7 @@ def test_tui_completion_signal_records_equal_final_rows(
     monkeypatch.setattr(client, "SETTLE_QUIET_SECONDS", 0.001)
 
     class Tracker:
-        def search_state(self) -> str:
+        def search_state(self, _layout: object) -> str:
             return "ready"
 
         def session_list(self, _layout: object) -> str:
@@ -646,7 +714,7 @@ def test_tui_stopped_worker_never_counts_as_completed_results() -> None:
     client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
 
     class Tracker:
-        def search_state(self) -> str:
+        def search_state(self, _layout: object) -> str:
             return "stopped"
 
         def session_list(self, _layout: object) -> str:
@@ -677,7 +745,7 @@ def test_tui_completion_signal_timeout_does_not_accept_a_list_transition(
     class Tracker:
         state = "old"
 
-        def search_state(self) -> str:
+        def search_state(self, _layout: object) -> str:
             return "searching"
 
         def session_list(self, _layout: object) -> str:
@@ -733,7 +801,7 @@ def test_tui_repeated_final_character_settles_once_and_slash_is_not_echo(  # noq
         def derive_layout(self) -> object:
             return type("Layout", (), {"list_rows": range(3)})()
 
-        def search_state(self) -> str:
+        def search_state(self, _layout: object) -> str:
             return "ready"
 
         def session_list(self, _layout: object) -> str:
@@ -780,7 +848,7 @@ def test_tui_repeated_final_character_settles_once_and_slash_is_not_echo(  # noq
     monkeypatch.setattr(
         client,
         "_finish_run",
-        lambda _tui, _tracker, _timeout, label, echo, results, transitions, _sampler, output, digest, **_kwargs: {
+        lambda _tui, _tracker, _layout, _timeout, label, echo, results, transitions, _sampler, output, digest, **_kwargs: {
             "query": label,
             "echo_ms": echo,
             "results_ms": results,
@@ -1017,7 +1085,17 @@ def test_tui_output_bytes_use_the_single_captured_pty_ledger() -> None:
     )()
     tui = FakeTui()
     result = client._finish_run(
-        tui, client.ScreenTracker(), 0.01, "q#0", [1], 2, 1, sampler, 100, "a" * 64
+        tui,
+        client.ScreenTracker(),
+        client.ScreenLayout(1, range(4, 22), range(1, 44), range(46, 99)),
+        0.01,
+        "q#0",
+        [1],
+        2,
+        1,
+        sampler,
+        100,
+        "a" * 64,
     )
     assert tui.sent == [b"\x1b", b"q"]
     assert result["output_bytes"] == 120
@@ -1374,6 +1452,10 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
 
     assert "**NO-GO" in report
     assert "publishable generated fixture: no" in report
+    assert "held-out relevance gate: not supplied" in report
+    assert "--baseline BASELINE_BINARY" in report
+    assert "--baseline-repository BASELINE_REPOSITORY" in report
+    assert "--candidate CANDIDATE_BINARY" in report
     assert "nine-repetition" not in report
     assert "The measured benchmark table is a regression signal" in report
     assert "private_local_fixture" in report

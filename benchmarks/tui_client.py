@@ -198,7 +198,11 @@ class ScreenTracker:
         rules = [
             row
             for row in range(SCREEN_ROWS)
-            if self._run_length(self.rows[row], "─") >= BORDER_RUN_FRACTION * SCREEN_COLS
+            if any(
+                self._run_length(self.rows[row], glyph)
+                >= BORDER_RUN_FRACTION * SCREEN_COLS
+                for glyph in ("─", "-")
+            )
         ]
         divider = self._divider_column()
         if len(rules) < 3 or divider is None:
@@ -228,7 +232,11 @@ class ScreenTracker:
         best_column, best_count = None, 0
         threshold = BORDER_RUN_FRACTION * (SCREEN_ROWS - 4)
         for column in range(1, SCREEN_COLS - 1):
-            count = sum(1 for row in range(2, SCREEN_ROWS - 2) if self.rows[row][column] == "│")
+            count = sum(
+                1
+                for row in range(2, SCREEN_ROWS - 2)
+                if self.rows[row][column] in {"│", "|"}
+            )
             if count >= threshold and count > best_count:
                 best_column, best_count = column, count
         return best_column
@@ -250,8 +258,17 @@ class ScreenTracker:
             for row in layout.list_rows
         )
 
-    def search_state(self) -> str | None:
-        match = re.search(r"Sessions[^\n]*· (searching|ready|stopped) ", self.full_screen())
+    def search_title(self, layout: ScreenLayout) -> str:
+        return "".join(self.rows[layout.query_row - 1]).strip()
+
+    def sessions_title(self, layout: ScreenLayout) -> str:
+        return "".join(self.rows[layout.list_rows.start - 1]).strip()
+
+    def search_state(self, layout: ScreenLayout) -> str | None:
+        match = re.search(
+            r"Sessions[^\n]*(?:·|-) (searching|ready|stopped) ",
+            self.sessions_title(layout),
+        )
         return match.group(1) if match is not None else None
 
     def session_position(self) -> int:
@@ -807,7 +824,7 @@ def _measure_once(
         if "Sessions" not in tracker.full_screen() or "Preview" not in tracker.full_screen():
             raise SystemExit("TUI startup did not render the expected panes")
         layout = tracker.derive_layout()
-        completion_signal = tracker.search_state() is not None
+        completion_signal = tracker.search_state(layout) is not None
         echo_ms: list[int] = []
         results_ms: int | None = None
         transitions = 0
@@ -817,7 +834,7 @@ def _measure_once(
         mode_sent_at = time.monotonic()
         tui.send(b"/")
         mode_entry_found, added_bytes = _await_search_mode(
-            tui, tracker, mode_sent_at, timeout
+            tui, tracker, layout, mode_sent_at, timeout
         )
         output_bytes += added_bytes
         mode_entry_ms = int(mode_entry_found) if mode_entry_found is not None else -1
@@ -856,6 +873,7 @@ def _measure_once(
         result = _finish_run(
             tui,
             tracker,
+            layout,
             timeout,
             label,
             echo_ms,
@@ -920,16 +938,21 @@ def _await_tui_position_id(
 
 
 def _await_browse_mode(
-    tui: TuiProcess, tracker: ScreenTracker, timeout: float, context: str
+    tui: TuiProcess,
+    tracker: ScreenTracker,
+    layout: ScreenLayout,
+    timeout: float,
+    context: str,
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         chunk = tui.read_chunk(0.01)
         if chunk == b"":
             break
-        if chunk is not None:
-            tracker.feed_bytes(chunk)
-        if "Search (press /)" in tracker.full_screen():
+        if chunk is None:
+            continue
+        tracker.feed_bytes(chunk)
+        if "Search (press /)" in tracker.search_title(layout):
             return
     raise SystemExit(f"TUI did not leave search mode {context}")
 
@@ -939,7 +962,7 @@ def _collect_tui_result_ids(
 ) -> list[str]:
     count = tracker.session_result_count()
     tui.send(b"\x1b")
-    _await_browse_mode(tui, tracker, timeout, "before semantic traversal")
+    _await_browse_mode(tui, tracker, layout, timeout, "before semantic traversal")
     if count == 0:
         return []
     initial_position = tracker.session_position()
@@ -967,7 +990,11 @@ def _collect_tui_result_ids(
 
 
 def _await_search_mode(
-    tui: TuiProcess, tracker: ScreenTracker, sent_at: float, timeout: float
+    tui: TuiProcess,
+    tracker: ScreenTracker,
+    layout: ScreenLayout,
+    sent_at: float,
+    timeout: float,
 ) -> tuple[float | None, int]:
     observed: float | None = None
     added_bytes = 0
@@ -980,7 +1007,7 @@ def _await_search_mode(
             break
         added_bytes += len(chunk)
         tracker.feed_bytes(chunk)
-        if "Enter/Esc to browse" in tracker.full_screen():
+        if "Enter/Esc to browse" in tracker.search_title(layout):
             observed = (time.monotonic() - sent_at) * 1000
             break
     return observed, added_bytes
@@ -1043,7 +1070,7 @@ def _await_settled_change(
     current_list = list_before
     while time.monotonic() < deadline:
         now = time.monotonic()
-        state = tracker.search_state() if completion_signal else None
+        state = tracker.search_state(layout) if completion_signal else None
         if state == "stopped":
             return None, current_list, added_bytes
         if state == "searching":
@@ -1078,14 +1105,20 @@ def _await_settled_change(
 
 
 def _finish_run(
-    tui: TuiProcess, tracker: ScreenTracker, timeout: float, label: str,
+    tui: TuiProcess,
+    tracker: ScreenTracker,
+    layout: ScreenLayout,
+    timeout: float,
+    label: str,
     echo_ms: list[int], results_ms: int | None,
     transitions: int, sampler: ResourceSampler, _measured_output_bytes: int, digest: str,
     *, search_mode: bool = True,
 ) -> dict:
     if search_mode:
         tui.send(b"\x1b")  # leave search mode so q is a quit, not a query character
-        _await_browse_mode(tui, tracker, timeout, f"before quit (query {label})")
+        _await_browse_mode(
+            tui, tracker, layout, timeout, f"before quit (query {label})"
+        )
     tui.send(b"q")
     if tui.wait_draining(timeout) is None:
         raise SystemExit(f"TUI did not exit after q (query {label})") from None
