@@ -1403,6 +1403,11 @@ impl AppState {
     /// slices so the result is picked up as soon as it lands.
     fn note_query_edit(&mut self) {
         self.query_edited_at = Some(std::time::Instant::now());
+        // The edited query owns the UI immediately, before its debounce expires. Invalidate and
+        // cancel the previous request now so a response arriving during the quiet period cannot
+        // replace the list and falsely mark the still-pending query ready.
+        self.current_search_generation = RequestGeneration::new();
+        self.worker.cancel_search();
         self.searching = true;
         if self.config.ui.search_debounce_ms == 0 {
             self.flush_edited_query();
@@ -3837,6 +3842,37 @@ mod tests {
             "response identity must include the filter generation, not only equal query text"
         );
         finish_gated(&release);
+    }
+
+    #[test]
+    fn query_edit_invalidates_an_in_flight_response_before_debounce() {
+        let mut harness = TuiHarness::with_executor(idle_executor()).seeded(&["claude:keep"]);
+        harness.app.config.ui.search_debounce_ms = 50;
+        let stale = harness.app.current_search_generation.clone();
+
+        harness.app.insert_character('x');
+
+        assert!(harness.app.searching);
+        assert!(!stale.same_as(&harness.app.current_search_generation));
+        assert!(!harness.app.apply_outcome(WorkerOutcome {
+            kind: RequestKind::Search,
+            generation: stale,
+            result: Ok(WorkerResponse::results(
+                &WorkerRequest {
+                    kind: RequestKind::Search,
+                    generation: RequestGeneration::new(),
+                    query: String::new(),
+                    filters: SearchFilters::default(),
+                    selected_id: None,
+                },
+                rows(&["claude:stale"]),
+            )),
+        }));
+        assert!(
+            harness.app.searching,
+            "a stale response during debounce must not mark the edited query ready"
+        );
+        assert_eq!(harness.app.results[0].id, "claude:keep");
     }
 
     #[test]

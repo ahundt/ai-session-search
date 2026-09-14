@@ -182,8 +182,8 @@ compatibility baseline; tags below it do not define a compatibility contract.
   bounded by the rendered pane instead of allocating the configured width blindly.
 - Typing in `aise tui` no longer runs the search on the input thread: each keystroke renders
   immediately, searches run on a worker thread through the same `CatalogService` seam as the
-  CLI, MCP, and Python surfaces, and a superseded search is cancelled instead of running to
-  completion while a newer one waits. Caseless matching, snippet compaction, and transcript preview
+  CLI, MCP, and Python surfaces, and a superseded search is cancelled as soon as the query changes,
+  before the newer query's debounce expires. Caseless matching, snippet compaction, and transcript preview
   copies check cancellation every 64 KiB, including one record above the 8 MiB batch target. The
   previous results stay on screen until new ones arrive, and preview resolves off the input thread.
 - The TUI's provider labels no longer collide or misalign: Antigravity renders as ANTIGRAV
