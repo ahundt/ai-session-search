@@ -780,7 +780,7 @@ def test_tui_repeated_final_character_settles_once_and_slash_is_not_echo(  # noq
     monkeypatch.setattr(
         client,
         "_finish_run",
-        lambda _tui, _timeout, label, echo, results, transitions, _sampler, output, digest, **_kwargs: {
+        lambda _tui, _tracker, _timeout, label, echo, results, transitions, _sampler, output, digest, **_kwargs: {
             "query": label,
             "echo_ms": echo,
             "results_ms": results,
@@ -966,8 +966,18 @@ def test_tui_output_bytes_use_the_single_captured_pty_ledger() -> None:
         child = type("Child", (), {"returncode": 0, "stderr": None})()
         terminal_attributes_restored = True
 
-        def send(self, _data: bytes) -> None:
-            pass
+        def __init__(self) -> None:
+            self.browse_observed = False
+            self.sent: list[bytes] = []
+
+        def send(self, data: bytes) -> None:
+            if data == b"q":
+                assert self.browse_observed, "q was sent before Esc rendered browse mode"
+            self.sent.append(data)
+
+        def read_chunk(self, _timeout: float) -> bytes:
+            self.browse_observed = True
+            return b"Search (press /)"
 
         def wait_draining(self, _timeout: float) -> int:
             return 0
@@ -988,9 +998,11 @@ def test_tui_output_bytes_use_the_single_captured_pty_ledger() -> None:
             "stop": lambda self: setattr(self, "peak_rss_kb", 9),
         },
     )()
+    tui = FakeTui()
     result = client._finish_run(
-        FakeTui(), 0.01, "q#0", [1], 2, 1, sampler, 100, "a" * 64
+        tui, client.ScreenTracker(), 0.01, "q#0", [1], 2, 1, sampler, 100, "a" * 64
     )
+    assert tui.sent == [b"\x1b", b"q"]
     assert result["output_bytes"] == 120
     assert result["peak_rss_kb"] == 9, "report must copy peaks after sampler.stop() joins"
 

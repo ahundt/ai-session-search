@@ -52,9 +52,6 @@ SAMPLER_INTERVAL_SECONDS = 0.05
 # Keep the next character inside nontrivial search work so the mailbox/cancellation path is
 # exercised; echo observation itself remains the synchronization point.
 KEY_INTERVAL_SECONDS = 0.005
-# Esc and q must reach crossterm as separate reads: written back-to-back they arrive as one
-# buffer and parse as Alt+q, so the mode-exit Esc never happens and q types into the query.
-ESC_SETTLE_SECONDS = 0.08
 READ_CHUNK_BYTES = 65536
 # How long the last keystroke's results may take to settle. Ten seconds covers the generated
 # fixture with room to spare; a maintainer's own multi-gigabyte index needs more, and
@@ -858,6 +855,7 @@ def _measure_once(
         tui_ids = _collect_tui_result_ids(tui, tracker, layout, timeout) if collect_ids else None
         result = _finish_run(
             tui,
+            tracker,
             timeout,
             label,
             echo_ms,
@@ -921,20 +919,27 @@ def _await_tui_position_id(
     )
 
 
+def _await_browse_mode(
+    tui: TuiProcess, tracker: ScreenTracker, timeout: float, context: str
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        chunk = tui.read_chunk(0.01)
+        if chunk == b"":
+            break
+        if chunk is not None:
+            tracker.feed_bytes(chunk)
+        if "Search (press /)" in tracker.full_screen():
+            return
+    raise SystemExit(f"TUI did not leave search mode {context}")
+
+
 def _collect_tui_result_ids(
     tui: TuiProcess, tracker: ScreenTracker, layout: ScreenLayout, timeout: float
 ) -> list[str]:
     count = tracker.session_result_count()
     tui.send(b"\x1b")
-    browse_deadline = time.monotonic() + timeout
-    while time.monotonic() < browse_deadline:
-        chunk = tui.read_chunk(0.01)
-        if chunk not in (None, b""):
-            tracker.feed_bytes(chunk)
-        if "Search (press /)" in tracker.full_screen():
-            break
-    else:
-        raise SystemExit("TUI did not leave search mode before semantic traversal")
+    _await_browse_mode(tui, tracker, timeout, "before semantic traversal")
     if count == 0:
         return []
     initial_position = tracker.session_position()
@@ -1073,13 +1078,14 @@ def _await_settled_change(
 
 
 def _finish_run(
-    tui: TuiProcess, timeout: float, label: str, echo_ms: list[int], results_ms: int | None,
+    tui: TuiProcess, tracker: ScreenTracker, timeout: float, label: str,
+    echo_ms: list[int], results_ms: int | None,
     transitions: int, sampler: ResourceSampler, _measured_output_bytes: int, digest: str,
     *, search_mode: bool = True,
 ) -> dict:
     if search_mode:
         tui.send(b"\x1b")  # leave search mode so q is a quit, not a query character
-        time.sleep(ESC_SETTLE_SECONDS)
+        _await_browse_mode(tui, tracker, timeout, f"before quit (query {label})")
     tui.send(b"q")
     if tui.wait_draining(timeout) is None:
         raise SystemExit(f"TUI did not exit after q (query {label})") from None
