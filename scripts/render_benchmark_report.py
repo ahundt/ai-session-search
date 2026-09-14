@@ -49,7 +49,51 @@ def load(
             raise ValueError(f"{path}:{line_number}: unknown record kind")
     if run is None or not samples:
         raise ValueError(f"{path}: requires one {build!r} run and at least one sample")
-    return run, dict(samples)
+    loaded_samples = dict(samples)
+    validate_sample_set(run, loaded_samples)
+    return run, loaded_samples
+
+
+def validate_sample_set(
+    run: dict[str, Any], samples: dict[str, list[dict[str, Any]]]
+) -> None:
+    """Reject evidence that does not contain every declared sample exactly once."""
+    selected_cases = run.get("selected_cases")
+    repetitions = run.get("repetitions")
+    if (
+        not isinstance(selected_cases, list)
+        or not selected_cases
+        or any(not isinstance(case, str) or not case for case in selected_cases)
+        or len(selected_cases) != len(set(selected_cases))
+    ):
+        raise ValueError("run record requires unique, non-empty selected_cases")
+    if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions <= 0:
+        raise ValueError("run record requires a positive integer repetitions count")
+    expected_cases = set(selected_cases)
+    actual_cases = set(samples)
+    if actual_cases != expected_cases:
+        raise ValueError(
+            "sample cases differ from the run contract: "
+            f"missing={sorted(expected_cases - actual_cases)}, "
+            f"unexpected={sorted(actual_cases - expected_cases)}"
+        )
+    expected_indexes = list(range(repetitions))
+    for case in selected_cases:
+        rows = samples[case]
+        observed_indexes = [row.get("repetition") for row in rows]
+        if any(
+            not isinstance(index, int) or isinstance(index, bool)
+            for index in observed_indexes
+        ):
+            raise ValueError(
+                f"case {case!r} has invalid repetition indexes: {observed_indexes}"
+            )
+        indexes = sorted(observed_indexes)
+        if indexes != expected_indexes:
+            raise ValueError(
+                f"case {case!r} has {len(rows)} repetitions, expected {repetitions} "
+                f"with indexes {expected_indexes}; observed {indexes}"
+            )
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -60,7 +104,9 @@ def percentile(values: list[float], quantile: float) -> float:
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     successful = [row for row in rows if int(row.get("exit_code", 0)) == 0]
-    digests = {row["result_sha256"] for row in successful}
+    digests = {
+        row.get("semantic_result_sha256", row["result_sha256"]) for row in successful
+    }
     if len(digests) != 1:
         if digests:
             raise ValueError("case has non-deterministic successful result digests")

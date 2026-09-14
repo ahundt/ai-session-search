@@ -26,6 +26,7 @@ import hashlib
 import importlib
 import json
 import os
+import platform
 import re
 import signal
 import sqlite3
@@ -512,11 +513,19 @@ class ResourceSampler:
     @staticmethod
     def _threads(pid: int) -> int | None:
         try:
+            if platform.system() == "Darwin":
+                listing = subprocess.run(
+                    ["ps", "-M", str(pid)], capture_output=True, text=True, timeout=1
+                ).stdout.strip()
+                return max(0, len(listing.splitlines()) - 1) if listing else None
             listing = subprocess.run(
-                ["ps", "-M", str(pid)], capture_output=True, text=True, timeout=1
+                ["ps", "-o", "nlwp=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=1,
             ).stdout.strip()
-            return max(0, len(listing.splitlines()) - 1) if listing else None
-        except (OSError, subprocess.SubprocessError):
+            return int(listing) if listing else None
+        except (OSError, ValueError, subprocess.SubprocessError):
             return None
 
     def stop(self) -> None:

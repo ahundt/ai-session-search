@@ -420,6 +420,48 @@ def test_release_runner_compares_tui_semantic_digest_not_performance_noise() -> 
     assert first["result_sha256"] != second["result_sha256"]
     assert first["semantic_result_sha256"] == second["semantic_result_sha256"]
 
+    renderer = load_script("render_benchmark_report.py")
+    rows = [
+        {
+            **sample,
+            "wall_ms": wall_ms,
+            "cpu_seconds": 0,
+            "peak_rss_kib": 1,
+            "peak_threads": 1,
+            "peak_processes": 1,
+        }
+        for sample, wall_ms in ((first, 1), (second, 99))
+    ]
+    assert renderer.summarize(rows)["digest"] == first["semantic_result_sha256"]
+
+
+def test_linux_tui_sampler_reads_the_process_thread_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    monkeypatch.setattr(client.platform, "system", lambda: "Linux")
+
+    def run(command: list[str], **_kwargs: Any) -> Any:
+        stdout = "7\n" if command == ["ps", "-o", "nlwp=", "-p", "123"] else "LABEL PID\nlabel 123\n"
+        return type("Completed", (), {"stdout": stdout})()
+
+    monkeypatch.setattr(client.subprocess, "run", run)
+    assert client.ResourceSampler._threads(123) == 7
+
+
+def test_macos_tui_sampler_counts_thread_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
+    monkeypatch.setattr(client.platform, "system", lambda: "Darwin")
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> Any:
+        commands.append(command)
+        return type("Completed", (), {"stdout": "PID TT\n123 ??\n123 ??\n123 ??\n"})()
+
+    monkeypatch.setattr(client.subprocess, "run", run)
+    assert client.ResourceSampler._threads(123) == 3
+    assert commands == [["ps", "-M", "123"]]
+
 
 def test_release_runner_accumulates_cpu_across_tree_total_resets(
     monkeypatch: pytest.MonkeyPatch,
@@ -1141,6 +1183,23 @@ def test_renderer_rejects_nondeterministic_case_digests() -> None:
         renderer.summarize(rows)
 
 
+def test_renderer_rejects_missing_or_duplicate_repetitions(tmp_path: Path) -> None:
+    renderer = load_script("render_benchmark_report.py")
+    run = {"kind": "run", "build": "candidate", "selected_cases": ["case"], "repetitions": 2}
+    one_sample = {"case": [{"kind": "sample", "build": "candidate", "case": "case", "repetition": 0}]}
+    with pytest.raises(ValueError, match=r"case.*repetitions.*expected 2"):
+        renderer.validate_sample_set(run, one_sample)
+
+    evidence = tmp_path / "truncated.jsonl"
+    evidence.write_text("".join(json.dumps(row) + "\n" for row in [run, *one_sample["case"]]))
+    with pytest.raises(ValueError, match=r"case.*repetitions.*expected 2"):
+        renderer.load(evidence, "candidate")
+
+    duplicate = {"case": [{"repetition": 0}, {"repetition": 0}]}
+    with pytest.raises(ValueError, match=r"case.*repetitions.*expected.*0, 1"):
+        renderer.validate_sample_set(run, duplicate)
+
+
 def test_renderer_loads_structured_relevance_result(tmp_path: Path) -> None:
     renderer = load_script("render_benchmark_report.py")
     log = tmp_path / "relevance.log"
@@ -1161,7 +1220,19 @@ def test_renderer_emits_scale_table_without_relevance_log(tmp_path: Path) -> Non
     raw = tmp_path / "scale.jsonl"
     rows: list[dict[str, Any]] = []
     for build in ("baseline", "candidate"):
-        rows.append({"kind": "run", "build": build, "fixture": {"counts": {"messages": 64}}})
+        rows.append(
+            {
+                "kind": "run",
+                "build": build,
+                "fixture": {"counts": {"messages": 64}},
+                "selected_cases": [
+                    "cli-exact-content",
+                    "cli-regex-content",
+                    "cli-fuzzy-content",
+                ],
+                "repetitions": 1,
+            }
+        )
         for case in ("cli-exact-content", "cli-regex-content", "cli-fuzzy-content"):
             rows.append(
                 {
@@ -1174,6 +1245,7 @@ def test_renderer_emits_scale_table_without_relevance_log(tmp_path: Path) -> Non
                     "peak_rss_kib": 2,
                     "peak_threads": 1,
                     "peak_processes": 1,
+                    "repetition": 0,
                 }
             )
     raw.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -1234,6 +1306,7 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
         "peak_rss_kib": 1,
         "peak_threads": 1,
         "peak_processes": 1,
+        "repetition": 0,
     }
     rows = []
     for build in ("baseline", "candidate"):
@@ -1245,6 +1318,8 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
                     "metadata": metadata,
                     "fixture": fixture,
                     "contracts": {"portable-case": {"require_equal": True}},
+                    "selected_cases": ["portable-case"],
+                    "repetitions": 1,
                     "artifact_privacy": {
                         "classification": "private_local_fixture",
                         "publishable": False,

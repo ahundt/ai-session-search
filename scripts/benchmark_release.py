@@ -674,6 +674,8 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                         "metadata": run_metadata,
                         "fixture": public_fixture_metadata(fixture),
                         "contracts": contracts,
+                        "selected_cases": [case["id"] for case in selected],
+                        "repetitions": repetitions,
                         "artifact_privacy": artifact_privacy(args.fixture),
                     },
                     sort_keys=True,
