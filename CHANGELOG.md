@@ -212,6 +212,18 @@ compatibility baseline; tags below it do not define a compatibility contract.
 - A `query_session_index` call whose read-only restriction fails to install is refused rather than
   run without it.
 
+### Security
+
+- Update `rustls` 0.23.43 to 0.23.45 for RUSTSEC-2026-0285. Rustls accepted TLS 1.3 handshake
+  messages sent at the wrong encryption level when they followed a key-changing message in the
+  same record, which RFC 8446 section 5.1 requires a peer to reject with `unexpected_message`.
+  The transcript stays authenticated, so this does not let an attacker alter or complete a
+  handshake; a peer could send in plaintext what should have been encrypted. `rustls` reaches
+  this workspace only through `ureq`, which fetches release metadata.
+- Stop ignoring RUSTSEC-2024-0436 in `deny.toml`. The entry suppressed an unmaintained notice for
+  `paste`, which ratatui 0.29 pinned; ratatui 0.30.2 drops it and the crate is no longer in
+  `Cargo.lock`, so the advisory list is now empty and nothing is suppressed.
+
 ## [1.0.0rc2] - 2026-08-22
 
 ### Upgrading and breaking changes
