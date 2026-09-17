@@ -5171,8 +5171,11 @@ mod tests {
                 key(KeyCode::Char('b')),
                 key(KeyCode::Char('c')),
             ];
-            // One poll per event read, so the poll after the last key is the first that sleeps.
-            let first_sleeping_wait = harness.events.poll_timeouts.len() + typed.len();
+            // Watch every wait the loop asks for from here on, rather than counting polls to a
+            // chosen one. The old form indexed by "one poll per key", a turn count the loop does
+            // not promise: the index drifted onto a wait taken after the search had already
+            // fired, which passed here and failed on a loaded runner.
+            let waits_before = harness.events.poll_timeouts.len();
             harness.script(typed);
             harness.step_until_script_drained();
             // `flush_edited_query` clears the edit stamp, so this asks "has the search been
@@ -5187,11 +5190,17 @@ mod tests {
             // millisecond quiet period. A zero quiet period is exempt because the keystroke has
             // already searched, leaving no pending delay for the wait to be shortened to.
             if debounce_ms > 0 {
-                let wait = harness.events.poll_timeouts[first_sleeping_wait];
+                // Shortening means some wait taken with the edit outstanding is bounded by the
+                // quiet period. Drop `slice.min(delay)` and every wait in this window is an idle
+                // interval or an active-worker slice instead, so none is left under the bound --
+                // which is the regression, stated as the exact thing its absence would produce.
+                let waits = &harness.events.poll_timeouts[waits_before..];
+                let shortest = waits.iter().min().copied().unwrap_or(Duration::MAX);
                 assert!(
-                    wait <= Duration::from_millis(debounce_ms),
-                    "a {debounce_ms} ms quiet period with a {interval_ms} ms idle interval waited \
-                     {wait:?} before looking at the edited query again"
+                    shortest <= Duration::from_millis(debounce_ms),
+                    "a {debounce_ms} ms quiet period with a {interval_ms} ms idle interval never \
+                     waited less than {shortest:?} before looking at the edited query again; the \
+                     waits it asked for were {waits:?}"
                 );
             }
 
