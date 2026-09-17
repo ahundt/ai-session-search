@@ -13,7 +13,7 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
-## [1.0.0rc3] - 2026-09-01
+## [1.0.0rc3] - 2026-09-16
 
 ### Changed
 
