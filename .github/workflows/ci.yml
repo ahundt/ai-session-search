@@ -65,7 +65,7 @@ jobs:
       - name: Select the PyO3 build interpreter explicitly
         shell: bash
         run: echo "PYO3_PYTHON=$(uv python find 3.12)" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; no semver tags, and upstream requires a master-history SHA
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; no semver tags, and upstream requires a master-history SHA
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; no semver tags, and upstream requires a master-history SHA
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; no semver tags, and upstream requires a master-history SHA
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -107,7 +107,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; no semver tags, and upstream requires a master-history SHA
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; no semver tags, and upstream requires a master-history SHA
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -130,7 +130,7 @@ jobs:
           python-version: '3.12'
           # enable-cache stays at its default: it caches on a branch push and a pull
           # request, and skips the cache on the release tag push publish.yml starts.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; no semver tags, and upstream requires a master-history SHA
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; no semver tags, and upstream requires a master-history SHA
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; no semver tags, and upstream requires a master-history SHA
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; no semver tags, and upstream requires a master-history SHA
         with:
           toolchain: stable
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -254,7 +254,7 @@ jobs:
           python-version: '3.12'
           # enable-cache stays at its default: it caches on a branch push and a pull
           # request, and skips the cache on the release tag push publish.yml starts.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; no semver tags, and upstream requires a master-history SHA
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; no semver tags, and upstream requires a master-history SHA
         with:
           toolchain: stable
       - run: uv sync --locked --no-dev
