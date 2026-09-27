@@ -217,7 +217,7 @@ def release_body(root: pathlib.Path, version: str) -> str:
         f"python -m pip install ai-session-search=={version}\n"
         f"cargo install ai-session-search --locked --version {cargo_version}\n"
         "```\n\n"
-        "Then run `aise integrations install` once to connect your AI tools.\n\n"
+        "After a first install, run `aise integrations install` once to connect your AI tools.\n\n"
         "| To get | Download |\n"
         "| --- | --- |\n"
         f"| The `aise` executable alone | `ai-session-search-{version}-<target>.tar.gz`, or `.zip` "

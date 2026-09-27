@@ -273,6 +273,7 @@ def test_release_body_appends_install_guidance_for_the_exact_version(tmp_path: P
     assert "uv tool install ai-session-search==1.0.0rc2" in body
     assert "cargo install ai-session-search --locked --version 1.0.0-rc.2" in body
     assert "https://github.com/example/aise/compare/v0.9.0...v1.0.0rc2" in body
+    assert "After a first install, run `aise integrations install`" in body
 
 
 def test_notes_only_renders_a_published_tag_without_the_version_checks(tmp_path: Path) -> None:
