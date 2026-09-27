@@ -46,6 +46,19 @@ refresh policy, and search scope.
 Unknown TOML keys and invalid bounded values fail during resolution rather than being silently
 ignored or normalized later.
 
+## Installed integrations after an upgrade
+
+The `[integrations]` panel controls the one-time refresh that the first command after a version
+change performs. It rewrites installed aise-owned skill files that nobody has edited, leaves edited
+ones alone, and reports what it did on stderr:
+
+```toml
+[integrations]
+refresh_after_upgrade = true
+```
+
+Set it to `false` to leave installed skills until `aise skills update` or `aise package update`.
+
 ## Stable-release notifications
 
 The `[release_notifications]` panel controls only the optional check after ordinary
@@ -329,7 +342,7 @@ vocabulary: `config` stores a `KeyBindings` and validates it with everything els
 what a key event means and never parses a key name, and the status bar names whatever is bound
 rather than the defaults. A table names only the actions it changes and the rest keep theirs,
 the same merge `[providers.<name>]` already uses, because replacing the whole table on a partial
-override would unbind eighteen commands to change one. `[]` unbinds an action deliberately.
+override would unbind every other command to change one. `[]` unbinds an action deliberately.
 A binding is a single character, `f1` through `f35`, or a named key, optionally chorded with
 `ctrl`, `alt`, `shift`, or `super`; a capital letter is written as itself rather than `shift+`,
 because whether a terminal reports the shift flag beside the character is a property of its
