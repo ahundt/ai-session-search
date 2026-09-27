@@ -10,8 +10,11 @@ import pytest
 from scripts.release_versions import cargo_version_for_python
 from scripts.verify_release_metadata import (
     ReleaseMetadataError,
+    check_notes_shape,
+    main,
     previous_release,
     reconcile_registry_artifacts,
+    release_body,
     release_notes,
     verify_release_metadata,
 )
@@ -22,7 +25,7 @@ def _write_changelog(
     version: str,
     *,
     heading_suffix: str = " - 2026-01-02",
-    body: str = "### Fixed\n\n- A concrete change.\n",
+    body: str = "One concrete fix.\n\n### Fixed\n\n1. A concrete change.\n",
 ) -> None:
     (root / "CHANGELOG.md").write_text(
         "# Changelog\n\n"
@@ -53,7 +56,9 @@ def _write_manifests(
         encoding="utf-8",
     )
     (root / "pyproject.toml").write_text(
-        f'[project]\nname = "ai-session-search"\nversion = "{python_version}"\n', encoding="utf-8"
+        f'[project]\nname = "ai-session-search"\nversion = "{python_version}"\n'
+        '[project.urls]\nRepository = "https://github.com/example/aise"\n',
+        encoding="utf-8",
     )
     (root / "rust/ai-session-search-core/Cargo.toml").write_text(
         f'[package]\nname = "ai-session-search"\nversion = "{cargo_version}"\n', encoding="utf-8"
@@ -239,12 +244,54 @@ def test_previous_release_is_the_dated_section_below_the_version(tmp_path: Path)
     assert previous_release(tmp_path, "2.0.0") is None
 
 
+@pytest.mark.parametrize(
+    ("notes", "complaint"),
+    [
+        ("### Fixed\n\n1. A fix.\n", "must open with a short summary"),
+        ("Summary.\n\n### Upgrading from 1.0.0rc1\n\n1. Rename a key.\n", "no upgrade section"),
+        ("Summary.\n\n### Fixed\n\n1. A.\n\n### Added\n\n1. B.\n", "in the order"),
+        ("Summary.\n\n### Fixed\n\n- A fix.\n", "number the items"),
+    ],
+)
+def test_release_notes_shape_is_enforced(notes: str, complaint: str) -> None:
+    # 1.0.0rc3's notes opened with design rationale, buried six upgrade steps across sections,
+    # and put build internals under Fixed. The shape is what a reader deciding to upgrade needs.
+    with pytest.raises(ReleaseMetadataError, match=complaint):
+        check_notes_shape(notes, "1.0.0rc2")
+
+
+def test_release_notes_shape_ignores_fenced_code() -> None:
+    check_notes_shape("Summary.\n\n### Changed\n\n1. Now:\n\n```toml\n- not a list\n```\n", "1.0.0")
+
+
+def test_release_body_appends_install_guidance_for_the_exact_version(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+
+    body = release_body(tmp_path, "1.0.0rc2")
+
+    assert body.startswith(release_notes(tmp_path, "1.0.0rc2"))
+    assert "uv tool install ai-session-search==1.0.0rc2" in body
+    assert "cargo install ai-session-search --locked --version 1.0.0-rc.2" in body
+    assert "https://github.com/example/aise/compare/v0.9.0...v1.0.0rc2" in body
+
+
+def test_notes_only_renders_a_published_tag_without_the_version_checks(tmp_path: Path) -> None:
+    # Revising an earlier release's body happens after the manifests moved to the next version,
+    # which the full gate would reject.
+    _write_manifests(tmp_path, "1.0.0rc3", "1.0.0-rc.3")
+    _write_changelog(tmp_path, "1.0.0rc2")
+    out = tmp_path / "notes.md"
+
+    assert main(["--root", str(tmp_path), "--tag", "v1.0.0rc2", "--notes-only", "--notes-out", str(out)]) == 0
+    assert out.read_text(encoding="utf-8") == release_body(tmp_path, "1.0.0rc2")
+
+
 def test_release_notes_return_one_version_section(tmp_path: Path) -> None:
     _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
 
     notes = release_notes(tmp_path, "1.0.0rc2")
 
-    assert notes == "### Fixed\n\n- A concrete change.\n"
+    assert notes == "One concrete fix.\n\n### Fixed\n\n1. A concrete change.\n"
     assert "Unreleased" not in notes
     assert "First release." not in notes
 
