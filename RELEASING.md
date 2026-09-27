@@ -19,8 +19,9 @@ One release has one identity, spelled the way each ecosystem requires:
 | Final X.Y.Z (including patch releases) | `X.Y.Z`, tag `vX.Y.Z` | `X.Y.Z` |
 
 `scripts/release_versions.py` is the sole mapping between the two spellings. Preparing a
-release means setting all eight declarations to the new version in one commit and tagging that
-commit. The consumer crate stays unpublished at `0.0.0`; only its requirement on the released
+release means setting all eight declarations to the new version, then running
+`cargo update --workspace` and `uv lock` so both lockfiles record it (the gate's lockfile checks
+fail otherwise), in one commit, and tagging that commit. The consumer crate stays unpublished at `0.0.0`; only its requirement on the released
 core crate carries the release version:
 
 | Location | Field |
