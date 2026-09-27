@@ -1571,26 +1571,42 @@ fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
     Ok(())
 }
 
+/// What `aise config init` writes: the example with every setting commented out, the convention
+/// OpenSSH's shipped `sshd_config` follows. A live line would freeze that release's default in the
+/// user's file, so a default changed by a later release would never reach them and nothing would
+/// show which values they chose. Only the database and cache paths are written live, recording
+/// where the index is.
+fn initial_config_text() -> String {
+    let defaults = Config::default();
+    let db_path =
+        toml::Value::String(defaults.db_path().to_string_lossy().into_owned()).to_string();
+    let cache_dir =
+        toml::Value::String(defaults.cache_dir().to_string_lossy().into_owned()).to_string();
+    let mut text = String::with_capacity(crate::config::CONFIG_EXAMPLE_TOML.len() + 256);
+    for line in crate::config::CONFIG_EXAMPLE_TOML.lines() {
+        if line == "# db_path = \"/absolute/path/to/index.db\"" {
+            text.push_str(&format!("db_path = {db_path}"));
+        } else if line == "# cache_dir = \"/absolute/path/to/cache\"" {
+            text.push_str(&format!("cache_dir = {cache_dir}"));
+        } else if line.starts_with(|first: char| first.is_ascii_lowercase()) && line.contains(" = ")
+        {
+            text.push_str("# ");
+            text.push_str(line);
+        } else {
+            text.push_str(line);
+        }
+        text.push('\n');
+    }
+    text
+}
+
 fn write_config_example(path: &std::path::Path, force: bool) -> Result<()> {
     let mode = if force {
         AtomicWriteMode::Replace
     } else {
         AtomicWriteMode::CreateNew
     };
-    let defaults = Config::default();
-    let db_path =
-        toml::Value::String(defaults.db_path().to_string_lossy().into_owned()).to_string();
-    let cache_dir =
-        toml::Value::String(defaults.cache_dir().to_string_lossy().into_owned()).to_string();
-    let initialized = crate::config::CONFIG_EXAMPLE_TOML
-        .replace(
-            "# db_path = \"/absolute/path/to/index.db\"",
-            &format!("db_path = {db_path}"),
-        )
-        .replace(
-            "# cache_dir = \"/absolute/path/to/cache\"",
-            &format!("cache_dir = {cache_dir}"),
-        );
+    let initialized = initial_config_text();
     atomic_write_file(path, initialized.as_bytes(), mode).with_context(
         || {
             if force {
@@ -3600,6 +3616,30 @@ mod tests {
         ]);
         assert_rejects(["aise", "mcp", "recover"]);
         assert_parses(["aise", "mcp", "serve"]);
+    }
+
+    #[test]
+    fn config_init_leaves_every_setting_but_the_state_paths_commented() {
+        // A file with live defaults froze them: 1.0.0rc2's printed `preview_lines = 30` kept
+        // applying after the built-in default moved on. Only what a user uncomments may override.
+        let initialized = initial_config_text();
+        let live: Vec<&str> = initialized
+            .lines()
+            .filter(|line| line.starts_with(|first: char| first.is_ascii_lowercase()))
+            .collect();
+        assert_eq!(live.len(), 2, "{live:?}");
+        assert!(live[0].starts_with("db_path = ") && live[1].starts_with("cache_dir = "));
+
+        let parsed: crate::config::Config = toml::from_str(&initialized).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(crate::config::Config::default()).unwrap(),
+            "the initialized file must resolve to exactly the built-in defaults"
+        );
+        assert!(
+            initialized.contains("\n# preview_body_lines = 34\n"),
+            "a setting stays in place, one `# ` away from taking effect"
+        );
     }
 
     #[test]

@@ -20,6 +20,9 @@ compatibility baseline; tags below it do not define a compatibility contract.
    installed `ai-session-search` skill once and prints one line saying so. Skill files you edited
    are left alone and reported once. Set `[integrations] refresh_after_upgrade = false` to turn
    this off.
+2. `aise config init` writes every setting commented out except the database and cache paths.
+   Uncommenting a line changes that setting; everything else follows the built-in defaults,
+   including ones a later release changes. Existing config files are not touched.
 
 ### Fixed
 
