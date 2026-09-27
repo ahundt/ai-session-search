@@ -251,6 +251,9 @@ def test_previous_release_is_the_dated_section_below_the_version(tmp_path: Path)
         ("Summary.\n\n### Upgrading from 1.0.0rc1\n\n1. Rename a key.\n", "no upgrade section"),
         ("Summary.\n\n### Fixed\n\n1. A.\n\n### Added\n\n1. B.\n", "in the order"),
         ("Summary.\n\n### Fixed\n\n- A fix.\n", "number the items"),
+        ("Summary.\n\n### Fixed\n\n1. A fix:\n   + nested.\n", "number the items"),
+        ("2) Starts with a list.\n", "must open with a short summary"),
+        ("Summary.\n\n```toml\nx = 1\n\n### Bogus\n\n- hidden\n", "never closes"),
     ],
 )
 def test_release_notes_shape_is_enforced(notes: str, complaint: str) -> None:
@@ -262,6 +265,7 @@ def test_release_notes_shape_is_enforced(notes: str, complaint: str) -> None:
 
 def test_release_notes_shape_ignores_fenced_code() -> None:
     check_notes_shape("Summary.\n\n### Changed\n\n1. Now:\n\n```toml\n- not a list\n```\n", "1.0.0")
+    check_notes_shape("Summary.\n\n### Changed\n\n1. Now:\n\n   ~~~\n   - not a list\n   ~~~\n", "1.0.0")
 
 
 def test_release_body_appends_install_guidance_for_the_exact_version(tmp_path: Path) -> None:
