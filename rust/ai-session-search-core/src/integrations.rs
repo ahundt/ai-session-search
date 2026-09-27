@@ -3027,7 +3027,10 @@ fn refresh_owned_skills_for_version(receipt_path: &Path, version: &str) -> Resul
     let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
     let refreshed = crate::skill_manifest::load_manifest(&manifest_path)
         .and_then(|manifest| manifest_recorded_skill_roots(&manifest))
-        .and_then(|roots| {
+        .and_then(|mut roots| {
+            // A recorded root whose directory is gone was removed by the user; an upgrade must
+            // not put it back. `aise integrations install` restores it on request.
+            roots.retain(|root| root.is_dir());
             if roots.is_empty() {
                 return Ok(None);
             }
@@ -3039,16 +3042,12 @@ fn refresh_owned_skills_for_version(receipt_path: &Path, version: &str) -> Resul
         other => other,
     };
     // Recorded whether or not the refresh succeeded: a failure is reported once per version, and
-    // `aise integrations status` keeps describing it, rather than repeating on every command.
-    let recorded = fs::write(&marker, format!("{version}\n")).with_context(|| {
-        format!(
-            "failed to record the refreshed version in {}",
-            marker.display()
-        )
-    });
-    let outcomes = outcomes?;
-    recorded?;
-    Ok(UpgradeRefresh::Checked(outcomes.unwrap_or_default()))
+    // `aise integrations status` keeps describing it, rather than repeating on every command. The
+    // marker only saves repeating a check that is safe to repeat, so a config directory that
+    // cannot hold it is not an error: printing one on every command would be noise, and the
+    // skill itself is what `aise integrations status` reports.
+    let _ = fs::write(&marker, format!("{version}\n"));
+    Ok(UpgradeRefresh::Checked(outcomes?.unwrap_or_default()))
 }
 
 /// Whether a transaction failed only because another process holds the integration lock.
@@ -6127,6 +6126,21 @@ mod tests {
             crate::hashing::sha256(CLI_INSTRUCTIONS_LINE.as_bytes()),
             "a7bfbb5efc4fd40b0268ce38c0091e17844e2edddd9b8cdfbf7be91588c54442"
         );
+    }
+
+    #[test]
+    fn an_upgrade_does_not_restore_a_skill_the_user_deleted() {
+        let dir = tempdir().unwrap();
+        let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
+        let root = dir.path().join("skills/ai-session-search");
+        install_skill_as_an_older_release(&receipt, &root);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(matches!(
+            refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap(),
+            UpgradeRefresh::NotNeeded
+        ));
+        assert!(!root.exists(), "a deleted skill must stay deleted");
     }
 
     #[test]
