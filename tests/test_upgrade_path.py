@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pytest import MonkeyPatch
 
@@ -51,7 +53,9 @@ def test_upgrade_check_fails_when_it_cannot_learn_what_to_upgrade_from(monkeypat
 
     monkeypatch.setattr(verify_upgrade_path, "_published", unreachable)
 
-    assert verify_upgrade_path.main(["--executable", "aise"]) == 2
+    # _versions_to_check rather than main(): main() returns 2 on Windows before reaching this, so
+    # asserting its exit code there would pass without testing anything.
+    assert verify_upgrade_path._versions_to_check(None, "1.0.0rc2") is None
 
 
 def test_since_checks_every_published_release_from_the_floor(monkeypatch: MonkeyPatch) -> None:
@@ -79,6 +83,7 @@ def test_a_release_that_cannot_be_downloaded_is_not_reported_as_an_upgrade_failu
 
     monkeypatch.setattr(verify_upgrade_path, "check_upgrade", unreachable)
 
-    assert verify_upgrade_path.main(["--executable", "aise", "--from", "1.0.0rc2"]) == 2
+    # _check_all rather than main(): main() refuses to run at all on Windows, before this code.
+    assert verify_upgrade_path._check_all(["1.0.0rc2"], Path("aise")) == 2
     error = capsys.readouterr().err
     assert "not an upgrade failure" in error and "needs a manual step" not in error

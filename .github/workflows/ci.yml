@@ -148,8 +148,12 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-install-target
         run: |
-          package_dir=$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'ai-session-search-*' -print -quit)
-          test -n "$package_dir"
+          # Name the directory `cargo package` just wrote. rust-cache restores target/ from earlier
+          # runs, so after a version bump an older ai-session-search-* directory survives beside
+          # it, and taking whichever `find` lists first installed a stale, incomplete package.
+          version=$(cargo pkgid -p ai-session-search | sed 's/.*@//')
+          package_dir="target/package/ai-session-search-$version"
+          test -f "$package_dir/Cargo.toml"
 
           cargo install --path "$package_dir" \
             --root '${{ runner.temp }}/cargo-package-install' --locked --offline
