@@ -31,11 +31,12 @@ Upgrading from 1.0.0rc3 needs no action.
 1. Upgrading no longer needs `aise integrations install`. After `uv tool upgrade`, pip, Cargo,
    or a native archive replaces `aise`, the first command or MCP server start updates, once, the
    installed `ai-session-search` skill and the aise instruction block in each harness's
-   CLAUDE.md, AGENTS.md, or GEMINI.md, and prints a line for each file it updates. A block keeps
-   its place in the file. Anything you edited is left alone and reported once, and a skill
-   directory you deleted stays deleted; `aise integrations install` restores it.
-   `aise package update` does this before it finishes. Set
-   `[integrations] refresh_after_upgrade = false` to turn this off.
+   CLAUDE.md, AGENTS.md, or GEMINI.md, and prints a line for each skill and file it updates. A
+   block keeps its place in the file. Anything you edited is left alone and reported once, and a
+   skill directory you deleted stays deleted; `aise integrations install` restores it.
+   `aise skills update`, which `aise package update` runs, does this first. Commands that install
+   or remove integrations skip it. Set `[integrations] refresh_after_upgrade = false` to turn this
+   off.
 2. `aise config init` writes every setting commented out except the database and cache paths.
    Uncommenting a line changes that setting; everything else follows the built-in defaults,
    including ones a later release changes. Existing config files are not touched, so a file
@@ -46,6 +47,10 @@ Upgrading from 1.0.0rc3 needs no action.
 1. A `config.toml` that sets `[ui].preview_lines`, the 1.0.0rc2 name for
    `[ui].preview_body_lines`, loads again. 1.0.0rc3 refused it with
    ``unknown field `preview_lines` ``. A file that sets both uses `preview_body_lines`.
+2. With a config file outside the default location, set by `AI_SESSION_SEARCH_CONFIG` or
+   `--config`, `aise skills update` failed with ``selected as both app and custom`` after a
+   successful `aise integrations install`, and so did the skill update at the end of
+   `aise package update`. It now updates the skill.
 
 ### For contributors
 
