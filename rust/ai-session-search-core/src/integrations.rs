@@ -2952,6 +2952,10 @@ pub(crate) fn write_owned_skills(
     } else {
         Vec::new()
     };
+    // Move the discovered roots beside the config file before comparing them with the recorded
+    // ones, which install wrote there: with a config outside the default location, comparing the
+    // unmoved roots added the recorded app root a second time, as custom, and the command refused.
+    rebase_automatic_skill_roots(&mut targets, receipt_path);
     if explicit_roots.is_empty() {
         let discovered_roots = targets
             .iter()
@@ -2965,7 +2969,6 @@ pub(crate) fn write_owned_skills(
     } else {
         targets.extend(custom_skill_targets(explicit_roots)?);
     }
-    rebase_automatic_skill_roots(&mut targets, receipt_path);
     dedupe_skill_targets(&mut targets)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());

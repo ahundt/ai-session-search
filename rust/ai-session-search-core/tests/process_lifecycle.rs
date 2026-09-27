@@ -2657,3 +2657,52 @@ fn skill_run_json_names_selector_resolution_and_output_even_when_matches_are_emp
         "the digest is what makes a run reproducible; a name and version alone are not"
     );
 }
+
+/// `aise package update` runs `aise skills update` with the new executable. With a config file
+/// outside the default location, that command refused its own install ("selected as both app and
+/// custom"), because the recorded skill root was compared with the client roots before they were
+/// moved beside the config file. HOME redirects the client roots only on Unix.
+#[cfg(unix)]
+#[test]
+fn skills_update_works_with_a_config_outside_the_default_location() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    let config = root.path().join("elsewhere/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "").unwrap();
+    let run = |args: &[&str]| {
+        aise()
+            .env("HOME", &home)
+            .env("AI_SESSION_SEARCH_CONFIG", &config)
+            .env("AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION", "1")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let installed = run(&[
+        "integrations",
+        "install",
+        "--client",
+        "codex",
+        "--no-aliases",
+        "--binary",
+        env!("CARGO_BIN_EXE_aise"),
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    for args in [
+        &["skills", "update", "--dry-run"][..],
+        &["skills", "update"],
+    ] {
+        let updated = run(args);
+        assert!(
+            updated.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&updated.stderr)
+        );
+    }
+}
