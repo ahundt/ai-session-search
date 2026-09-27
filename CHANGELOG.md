@@ -27,216 +27,139 @@ compatibility baseline; tags below it do not define a compatibility contract.
    `[ui].preview_body_lines`, loads again. 1.0.0rc3 refused it with
    ``unknown field `preview_lines` ``.
 
+### For contributors
+
+1. The publish workflow fails a release when upgrading from the previous release would need a
+   manual step: it installs that release's integrations and printed config from PyPI, runs one
+   command with the new executable, and requires every integration to report `configured`.
+2. The metadata gate checks the released changelog section's shape (summary first, known headings
+   in order, numbered items) and appends a generated footer with the upgrade and install commands,
+   download guide, and diff link. `--notes-only` renders the body for an already published tag.
+
 ## [1.0.0rc3] - 2026-09-16
 
-### Changed
+This release reworks the terminal browser, `aise tui`: typing no longer waits for a search, and you
+can filter sessions, edit the query in place, rebind any key, and press `?` to list them. Three
+changes can affect you: a `config.toml` that sets `[ui].preview_lines` fails to load until you
+rename it (Changed, item 1); the preview now scrolls with `K`/`J` instead of `h`/`l` (item 2); and
+Rust code that builds config structs with a struct literal must start from `Default::default()`
+(item 3). The index format is unchanged, so no reindex is needed. A `rustls` security update is
+included.
 
-- The TUI preview scrolls with `K`/`J` and Shift+Up/Shift+Down instead of `h`/`l` and
-  Left/Right. `l` means "right" everywhere else and was scrolling a pane downwards; in the
-  two-pane browsers `h`/`l` came from they walk the hierarchy (ranger's manual: "h, j, k, l —
-  Move left, down, up or right"), and in vim they are horizontal cursor motion. fzf, the closest
-  analogue to this screen, binds `preview-down`/`preview-up` to shift-down/shift-up, so a shifted
-  vertical key is the established way to say "the preview, not the list". The letters carry that
-  where the arrows cannot: macOS Terminal.app sends no parameterized shift+arrow sequence and
-  ignores `modifyOtherKeys`, so shift+arrow alone would leave the preview unscrollable there.
-  `h`, `l`, Left, and Right are now unbound in browse mode; rebind them through `[ui.keys]` if
-  you want them back.
-- Every configuration struct read from `config.toml` is `#[non_exhaustive]`, so a downstream Rust
-  crate constructs one from `Default::default()` and sets what it wants rather than writing a
-  struct literal. Adding a setting is then a minor release instead of a breaking one, which
-  matters because `[ui]` alone gained ten fields in this cycle. `ConfigOverrides`, the documented
-  embedder entry point into `Config::resolve`, is deliberately not among them: it carries CLI and
-  API overrides rather than file contents, and a literal is how embedders build it. The
-  compile-only downstream consumer proves the boundary — a struct expression there fails with
-  `error[E0639]: cannot create non-exhaustive struct using struct expression`.
-- `[ui].preview_lines` is now `[ui].preview_body_lines`. The value has always been the preview's
-  *body* budget: the pane also carries a `Session:`/`CWD:` header, so `34` renders 37 lines. This
-  is the one `[ui]` key that shipped in 1.0.0rc2, and renaming it before 1.0.0 is the last chance
-  to make the name true. A configuration still setting the old name fails to load rather than
-  being ignored, and the error lists every accepted key with the new name among them:
-  ``unknown field `preview_lines`, expected one of `preview_body_lines`, …``. The other `[ui]`
-  keys renamed here — `idle_poll_interval_ms`, `list_page_rows`, `preview_scroll_rows`,
-  `preview_page_rows` — never shipped under any name.
-- The TUI preview honors `[ui].preview_body_lines` (default 34) as its total body budget. The
-  historical 8/4/8/14 section weights remain fixed even when a role is absent, so the default
-  preserves the previous output and smaller explicit budgets trim each section proportionally.
-- The TUI session list title names the active ordering (recent vs ranked), and preview
-  scrolling stops when the last line reaches the pane bottom instead of continuing until
-  three lines remain.
-- The bundled SQLite moves from 3.50.2 to 3.53.2, through rusqlite 0.40. Measured over 52 paired
-  benchmark cases on a generated fixture, every required result digest matched, and peak memory
-  moved between -10% and +2.6%, the largest drop being the terminal UI's startup.
+### Highlights
+
+1. Typing responds immediately. Searches run on a background thread, a new keystroke cancels the
+   search in progress, and the previous results stay on screen until new ones arrive. The TUI
+   searches once the query has been still for `[ui].search_debounce_ms` (150 ms by default), so on
+   a 36.5 GB index a five-letter word starts one search instead of five. Enter searches right away,
+   and setting it to `0` searches on every keystroke.
+2. Filter keys: `p` cycles the provider, `f` the session kind, `s` the time window (1, 7, or 30
+   days), and `w` shows only sessions with warnings. The status bar shows which filters are on.
+   They are the same filters the CLI, MCP server, and Python API accept.
+3. `?` lists every command and the keys bound to it, built from your current bindings. The preview
+   scroll and page keys scroll the list when it is taller than the terminal; any other key closes
+   it.
+4. The search box edits like a text field. Left and Right move the cursor, Home/Ctrl+A and
+   End/Ctrl+E jump to the ends, Delete removes forward, Ctrl+W deletes a word, and Ctrl+U clears the
+   query. The status bar names Ctrl+U, Ctrl+W, and Home/End while the box has focus.
+5. `[ui.keys]` rebinds any of the 28 TUI commands: list the keys a command answers to, or `[]` to
+   unbind it. A configuration that gives one key two meanings in the same mode, or unbinds both
+   `quit` and `interrupt`, is rejected. `config.example.toml` lists the command names.
+6. Ctrl+C quits: the first press warns in the status bar, the second exits, and any other key
+   cancels. It used to type a `c` into the search box.
+7. `[ui].unicode` and `[ui].color` (`auto`, `on`, or `off`) control box-drawing characters and
+   colour. `auto` falls back to ASCII when the locale cannot display Unicode and drops colour under
+   `NO_COLOR` or `TERM=dumb`. The selected row carries a marker, so it stays visible without colour.
+8. An empty session list says what to press next: the filter keys when a filter hid everything, or
+   `aise reindex` when the index has no sessions.
+9. When a transcript is longer than the preview pane, the pane title shows the visible rows and the
+   total.
 
 ### Added
 
-- The TUI search box names its own commands while it has focus: `ctrl+u: clear`,
-  `ctrl+w: delete word`, and `home/end: line start/end` join `enter: browse` in the status bar.
-  It previously read `type to search │ enter: browse`, so the eight editing commands bound in
-  the box were reachable only by leaving it and pressing `?` — and `?` cannot open the key list
-  from inside a text field, because there it is a character in the query. Backspace, Delete, and
-  the arrows stay unnamed: the row is one line, and they are what a text field does everywhere.
-- An empty session list says what to press instead of only that it is empty, once the search
-  that would fill it has finished. A query or filter that excluded everything names the keys that
-  change them and `?`; an index with nothing in it says so plainly and gives `aise reindex`,
-  because no key in the browser fills an empty index. Both are built from the bindings, so a
-  rebinding changes what they teach, and neither appears while a search is still running — the
-  list is empty for the first seconds of every run, and on a 36.5 GB index that is seconds. The
-  previous text was "No sessions matched the current query.", which offered no next step and
-  blamed a query that a first run does not have.
-- `?` shows every TUI command and the keys bound to it, built from the same table the key
-  handler dispatches through, so a rebinding changes what it teaches and an unbound command is
-  not listed. The status bar is one row and sheds most hints at eighty columns, which left
-  paging, scrolling, top and bottom, and resume named nowhere. The list scrolls with the preview
-  scroll keys; any other key closes it. Because the overlay covers the whole frame, including the
-  status bar that would name those keys, its title carries them along with the visible rows and
-  the total — ` Keys · 1-22/32 · K/J: scroll · any other key closes ` — whenever the list is
-  longer than the terminal, which twenty-eight commands are on a twenty-four-row one. A frame
-  tall enough for all of them keeps the plain title.
-- The TUI search box is a text field rather than an append-only line. `cursor_left`,
-  `cursor_right`, `cursor_start` (Home, Ctrl+A), and `cursor_end` (End, Ctrl+E) move the caret,
-  `delete_backward`, `delete_forward`, `delete_word_backward` (Ctrl+W), and `clear_query`
-  (Ctrl+U) remove text, and a typed character is inserted where the caret sits. Before this,
-  Left, Right, Home, End, and Delete did nothing, and fixing a typo mid-query meant deleting
-  back to it. The caret is the terminal's own rather than a drawn block, and a query wider than
-  the box scrolls under it.
-- `[ui].unicode` and `[ui].color` (`auto`, `on`, `off`) decide whether the TUI draws characters
-  outside ASCII and whether it colours anything. `auto` falls back to ASCII borders, `...`, and
-  `--` section rules only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding that cannot
-  carry the originals, and drops colour under `NO_COLOR` or `TERM=dumb`. The selected row now
-  carries a marker rather than relying on colour, so it stays visible either way.
-- `[ui.keys]` binds each of the twenty-eight TUI commands to the key presses that reach it:
-  `interrupt`, `quit`, `enter_search`, `leave_search`, `move_down`, `move_up`, `page_down`,
-  `page_up`, `top`, `bottom`, `cycle_provider`, `cycle_session_kind`, `cycle_time_window`,
-  `toggle_warnings_only`, `preview_scroll_down`, `preview_scroll_up`, `preview_page_down`,
-  `preview_page_up`, `resume`, `help`, and the search box's own `clear_query`,
-  `delete_backward`, `delete_forward`, `delete_word_backward`, `cursor_left`, `cursor_right`,
-  `cursor_start`, and `cursor_end`. A table names only the actions it changes and the rest keep
-  their defaults; `[]` unbinds one. A binding is a character, `f1` through `f35`, or a named key,
-  optionally chorded with `ctrl`, `alt`, `shift`, or `super`. A command takes as many keys as the
-  table lists, so a reader adding their own keeps the shipped one, and a key that action already
-  lists is kept once rather than reported as a conflict with itself. A chorded letter ignores its
-  case, so `ctrl+c` and `ctrl+C` are one binding: crossterm substitutes the shifted character and
-  clears the shift flag under the kitty keyboard protocol, so a case-significant chord would answer
-  Ctrl+Shift+C on one terminal and not another. One chord may not mean two things reachable from
-  the same mode, and `quit` and `interrupt` may not both be unbound. The status bar names whatever
-  is bound rather than the shipped defaults.
-- `[ui].search_debounce_ms` (150): how long an edited TUI query must stay unchanged before it
-  becomes a search. Typing never waits on it — the keystroke echoes on its own loop turn and the
-  search runs off the input thread either way — so this only decides how many searches a typed
-  word starts. Previously every keystroke began a corpus scan that the next keystroke cancelled;
-  on a 36.5 GB index, where one session search costs 2.3 to 3.6 seconds, typing a five-letter
-  word began five. `0` restores the per-keystroke behavior, and Enter searches the current query
-  at once whatever the value.
-- `[ui]` keys with typed defaults: `idle_poll_interval_ms` (150), `list_page_rows` (10),
-  `preview_scroll_rows` (5), `preview_page_rows` (15), `provider_label_width` (9, clamped up
-  to the longest provider label), `list_pane_percent` (45) — the TUI reads each one, and
-  `config.example.toml` documents them beside their typed defaults.
-- The TUI gains session filter bindings: `p` cycles the provider, `f` the session class, `s`
-  the time window (1/7/30 days), and `w` warnings-only. Every binding validates before the
-  search runs, appears with its active value in the status bar, and mutates the same canonical
-  `SearchFilters` type and validation rules used by CLI, MCP, and Python callers.
+New and renamed `[ui]` settings, each documented in `config.example.toml`:
+
+| Setting | Default | Controls |
+| --- | --- | --- |
+| `preview_body_lines` | 34 | Transcript lines in the preview (the rc2 name was `preview_lines`) |
+| `search_debounce_ms` | 150 | Quiet time before a typed query is searched |
+| `idle_poll_interval_ms` | 150 | How often an idle TUI checks for work |
+| `list_page_rows` | 10 | Rows moved by Page Up/Page Down in the session list |
+| `preview_scroll_rows` | 5 | Rows moved by one preview scroll |
+| `preview_page_rows` | 15 | Rows moved by one preview page |
+| `provider_label_width` | 9 | Provider column width, widened to fit the longest label |
+| `list_pane_percent` | 45 | Share of the width given to the session list, 10 to 90 |
+| `unicode`, `color` | `auto` | Box-drawing characters and colour |
+| `[ui.keys]` | shipped keys | Key bindings for the 28 TUI commands |
+
+### Changed
+
+1. `[ui].preview_lines` is now `[ui].preview_body_lines`, and it takes effect: 1.0.0rc2 accepted
+   `preview_lines` but never read it. 1.0.0rc3 fails to load a `config.toml` that still sets the
+   old name, with ``unknown field `preview_lines` ``, so rename it:
+
+   ```toml
+   [ui]
+   preview_body_lines = 34
+   ```
+
+   The next release accepts both names.
+2. The preview scrolls with `K`/`J` and Shift+Up/Shift+Down. `h`, `l`, Left, and Right no longer
+   scroll it. To keep them as well:
+
+   ```toml
+   [ui.keys]
+   preview_scroll_up = ["K", "shift+up", "h", "left"]
+   preview_scroll_down = ["J", "shift+down", "l", "right"]
+   ```
+
+3. Rust API: configuration structs read from `config.toml` are `#[non_exhaustive]`, so a struct
+   literal no longer compiles. Start from `Default::default()` and assign the fields you need.
+   `ConfigOverrides` is unchanged. Adding a setting is now a minor release rather than a breaking
+   one.
+4. A zero preview, pacing, step, or label-width setting, or a pane percentage outside 10 to 90, is
+   rejected when the configuration loads instead of silently doing nothing.
+5. The TUI labels Antigravity `ANTIGRAV` and Gemini CLI `GEMINICLI`; the old `GEMINI` and `Gemini`
+   labels were easy to confuse.
+6. The session list title shows whether results are ordered by recency or by rank.
+7. Preview scrolling stops when the last line reaches the bottom of the pane.
+8. The bundled SQLite is 3.53.2, up from 3.50.2. Across 52 paired benchmark cases the results were
+   identical and peak memory changed by between −10% and +2.6%.
 
 ### Fixed
 
-- Benchmark reports compare a case's registered semantic digest instead of hashing timing and
-  resource noise. Run records declare their selected cases and repetition count, and the renderer
-  refuses missing or duplicate samples before issuing a `GO` decision. Reports label omitted
-  relevance evidence as not supplied, fail closed without it, and print runnable paired
-  reproduction commands. Paired
-  measurements alternate which build runs first on each repetition. The TUI client parses both
-  ASCII and Unicode frames and waits for a post-Esc browse title before sending `q`. Linux TUI
-  sampling reads each process's `NLWP` count instead of using macOS `ps -M` semantics.
-- The local release gate installs and smoke-tests the exact source distribution after structural
-  verification, matching the hosted release job before a tag reaches an immutable registry.
-- ASCII TUI rendering now covers transcript truncation and empty-index guidance. A failed initial
-  search keeps its error without also telling the reader that the index is empty and needs a
-  rebuild.
-- The TUI preview pane's title names the visible rows and the total when the transcript is
-  longer than the pane, so a reader can tell that scrolling would do something. Content that
-  fits keeps the plain title.
-- Ctrl+C exits `aise tui`. A full-screen terminal application turns off the terminal's own
-  interrupt character, so Ctrl+C arrived as an ordinary key press and nothing handled it: the
-  browser ignored it and the search box typed a literal `c` into the query, leaving `q` and Esc
-  as the only ways out. The first press arms and says so in the status bar, the second quits,
-  and any other key disarms.
-- A chorded key no longer fires the binding for its bare letter in `aise tui`. Every command
-  matched the character alone, so Ctrl+Q quit, Ctrl+S moved the time window, Ctrl+P changed the
-  provider, and Ctrl+H — ASCII backspace on many terminals — scrolled the preview.
-- The TUI status bar sheds whole hints on a narrow frame instead of eliding characters out of
-  the middle of the joined line. At 80 columns it rendered `P…rs` where `p/f/s/w: filters`
-  belonged; it now keeps `j/k: move`, `p/f/s/w: filters`, `/: search`, and `q: quit` readable,
-  dropping the paging and scroll hints first.
-- A TUI preview re-applied for the row already on screen keeps the reader's scroll position.
-  The worker counts logical lines, so clamping against its count pulled a reader out of a
-  word-wrapped tail that only the renderer's row count can measure.
-- TUI preview metadata and canonical transcript are read in one SQLite snapshot; word-wrapped
-  scroll bounds use Ratatui's own line composer, wide/newline errors remain one display-width-bounded
-  row, and a current preview failure cannot leave another session's content beside the selection.
-- TUI worker failure renders `stopped` rather than `ready`; returning to an already-rendered
-  preview invalidates errors from an overtaken preview, and new navigation cancels obsolete
-  preview scans without cancelling an in-flight search. The worker accepts every schema generation
-  the shared read contract declares readable and gives upgrade guidance for newer indexes.
-- TUI echo frames format only terminal-visible session rows rather than every retained result.
-  Preview bookends now scan the canonical transcript used by CLI `show`, MCP `get_session`, and
-  export without cloning it or retaining every turn; this keeps provider harness notices and
-  generated mixed-content parts out of prompts, restores Session/CWD metadata, and preserves
-  transcript-only readable indexes. Search and preview scans observe typed cancellation.
-- The TUI worker retains at most one pending search and one pending preview instead of every
-  cumulative pasted prefix; a newer search cancels the in-flight one without blocking input, and
-  a failed search preserves the latest navigation preview. Its read-only SQLite connection now
-  shares the caller's Rayon runtime, keeping the configured scoring-worker budget process-wide.
-- TUI responses and errors now carry allocation-backed request generations, so an old search
-  with the same query but different provider/class/window filters cannot overwrite current state.
-  The list title exposes when the current generation is searching; a worker panic reports once
-  without requiring another key. Worker/database resources are released before the resume prompt
-  or resumed process, and terminal mode is entered only after worker startup succeeds.
-- Zero-valued `[ui]` preview/pacing/step/label settings and pane percentages outside 10–90 are rejected
-  instead of becoming silent no-ops or impossible geometry. Active worker
-  output is checked within 10 ms, while a settled TUI performs one configured idle wait instead
-  of waking 100 times per second. Extreme page/scroll steps saturate, and provider-label width is
-  bounded by the rendered pane instead of allocating the configured width blindly.
-- Typing in `aise tui` no longer runs the search on the input thread: each keystroke renders
-  immediately, searches run on a worker thread through the same `CatalogService` seam as the
-  CLI, MCP, and Python surfaces, and a superseded search is cancelled as soon as the query changes,
-  before the newer query's debounce expires. Caseless matching, snippet compaction, and transcript preview
-  copies check cancellation every 64 KiB, including one record above the 8 MiB batch target. The
-  previous results stay on screen until new ones arrive, and preview resolves off the input thread.
-- The TUI's provider labels no longer collide or misalign: Antigravity renders as ANTIGRAV
-  and Gemini CLI as GEMINICLI (the old GEMINI/Gemini pair were near-identical, and AI Studio
-  overflowed its fixed-width column), with the column width configurable and clamped up to
-  the longest label. The help and error lines middle-elide to the frame width, so the
-  recovery guidance at the end of an error always survives, and the session list title names
-  the active ordering (recent vs ranked).
-- The TUI selection and preview scroll survive typing: a result set that still contains the
-  selected session keeps the user's place instead of resetting to the first row.
-- Typing in `aise tui` no longer risks freezing the event loop on one keystroke: queued input
-  drains in one loop turn, and a database error during a keystroke shows on a dedicated error
-  line instead of exiting the TUI.
-- The registered TUI latency benchmark now hashes every canonical ordered session ID and checks
-  the rendered total, rather than treating visible labels/ages as semantics. It imports on Windows
-  while failing PTY execution with a POSIX-specific message, handles repeated final characters,
-  measures `/` mode entry separately from typed echo, buffers split terminal controls, fails closed
-  on stopped/incomplete searches, sums process-tree resources, and requires current-generation
-  readiness plus a stable frame. Release samples promote the inner TUI-only wall/CPU/RSS/thread/
-  process measurements instead of timing semantic probes and helper processes. Its generated
-  workload has 128 sessions, selective/empty/full queries, offscreen traversal, and one transcript
-  above the 8 MiB scoring-batch target.
-- A tool call that cannot arm its own cancellation now says so. It previously ran uncancellable
-  while the client believed its cancellation still applied.
-- A `query_session_index` call whose read-only restriction fails to install is refused rather than
-  run without it.
+1. Chorded keys ran the command bound to their plain letter: Ctrl+Q quit, and Ctrl+H, which many
+   terminals send for Backspace, scrolled the preview. A chord now matches only its own binding.
+2. Typing moved the selection back to the first row. The selection and preview scroll now stay put
+   when the new results still contain the selected session.
+3. A database error while typing closed the TUI. The error now shows on its own line, shortened in
+   the middle so the suggested fix at its end stays visible.
 
 ### Security
 
-- Update `rustls` 0.23.43 to 0.23.45 for RUSTSEC-2026-0285. Rustls accepted TLS 1.3 handshake
-  messages sent at the wrong encryption level when they followed a key-changing message in the
-  same record, which RFC 8446 section 5.1 requires a peer to reject with `unexpected_message`.
-  The transcript stays authenticated, so this does not let an attacker alter or complete a
-  handshake; a peer could send in plaintext what should have been encrypted. `rustls` reaches
-  this workspace only through `ureq`, which fetches release metadata.
-- Stop ignoring RUSTSEC-2024-0436 in `deny.toml`. The entry suppressed an unmaintained notice for
-  `paste`, which ratatui 0.29 pinned; ratatui 0.30.2 drops it and the crate is no longer in
-  `Cargo.lock`, so the advisory list is now empty and nothing is suppressed.
+1. `rustls` 0.23.45 fixes
+   [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): a TLS 1.3 peer could send
+   in plaintext handshake messages that should have been encrypted. It could not alter or complete
+   a handshake. `aise` uses TLS only to fetch release metadata.
+
+### For contributors
+
+1. Benchmark reports compare each case's registered result digest rather than hashing timing noise.
+   The renderer rejects missing or duplicate samples, refuses a `GO` decision without relevance
+   evidence, prints commands that reproduce a paired run, and alternates which build runs first.
+2. The TUI latency benchmark checks the ordered session IDs and the rendered total over a
+   128-session workload that includes one transcript larger than the 8 MiB scoring batch. Release
+   samples measure the TUI process tree alone.
+3. The local release gate installs and smoke-tests the exact sdist before a tag is pushed.
+4. The TUI worker holds at most one pending search and one pending preview, and request
+   generations keep a stale response from replacing current results. Cancellation is checked every
+   64 KiB, the preview reads one SQLite snapshot, scoring shares the process's Rayon pool, and a
+   settled TUI waits once per `idle_poll_interval_ms` instead of waking 100 times a second.
+5. With rusqlite 0.40, installing a SQLite progress handler or authorizer can fail. An MCP tool call
+   now reports when it could not arm cancellation, and `query_session_index` is refused when its
+   read-only restriction cannot be installed, rather than running without it.
+6. `deny.toml` no longer ignores any advisory. Its one exception, for the unmaintained `paste`
+   crate, went away when ratatui 0.30.2 stopped depending on it.
 
 ## [1.0.0rc2] - 2026-08-22
 
