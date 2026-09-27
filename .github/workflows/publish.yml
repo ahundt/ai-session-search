@@ -330,8 +330,38 @@ jobs:
           path: sbom/*.cdx.json
           if-no-files-found: error
 
+  # An upgrade must need nothing beyond replacing the executable. 1.0.0rc3 renamed a setting
+  # 1.0.0rc2 shipped, and every config that set it stopped loading. This installs the previous
+  # release's integrations and config from PyPI, runs one command with the Linux executable built
+  # above, and fails if anything would have needed a manual step. It runs code downloaded from
+  # PyPI, so it gets its own job with the workflow's read-only token rather than running inside
+  # `verify`, which can sign attestations; `verify` waits for it.
+  upgrade:
+    needs: [metadata, native]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: 'native-*'
+          path: dist
+          merge-multiple: true
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Upgrading from the previous release needs no manual step
+        shell: bash
+        run: |
+          mkdir upgrade
+          tar -xzf "dist/ai-session-search-${GITHUB_REF_NAME#v}-x86_64-unknown-linux-gnu.tar.gz" -C upgrade
+          python -m scripts.verify_upgrade_path --executable upgrade/*/aise
+
   verify:
-    needs: [wheels, native, sdist, crate, sbom]
+    needs: [wheels, native, sdist, crate, sbom, upgrade]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -373,20 +403,6 @@ jobs:
         run: >-
           python -m scripts.verify_release_artifacts
           --release-set --version "${GITHUB_REF_NAME#v}" dist/*
-      # An upgrade must need nothing beyond replacing the executable. 1.0.0rc3 renamed a setting
-      # 1.0.0rc2 shipped, and every config that set it stopped loading; this installs the
-      # previous release's integrations and config from PyPI, runs one command with the Linux
-      # executable built above, and fails if anything would have needed a manual step.
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: false
-      - name: Upgrading from the previous release needs no manual step
-        shell: bash
-        run: |
-          mkdir upgrade
-          tar -xzf "dist/ai-session-search-${GITHUB_REF_NAME#v}-x86_64-unknown-linux-gnu.tar.gz" -C upgrade
-          python -m scripts.verify_upgrade_path --executable upgrade/*/aise
       - run: (cd dist && sha256sum -- * > SHA256SUMS)
       # A real release only. This action has no dry-run — every invocation persists an
       # attestation in the repository's list, and there is no API to remove one — so a

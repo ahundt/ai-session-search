@@ -13,8 +13,9 @@ For each earlier release, in an empty home directory:
    pip, Cargo, or a native archive does;
 4. require every integration the earlier release installed to report `configured`.
 
-A failure names the release and what would have needed a manual step. The `verify` job of
-publish.yml runs this against the Linux native executable before anything is published. It
+A failure names the release and what would have needed a manual step. The `upgrade` job of
+publish.yml runs this against the Linux native executable, and `verify` waits for it, so nothing
+is attested or published after a failure. It
 downloads the earlier release with `uvx`, so it needs network access. Without `--from` it checks
 the release below the current version's dated section in CHANGELOG.md, which exists only once the
 release is prepared; before that, name the latest published release:
