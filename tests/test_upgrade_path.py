@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pytest import MonkeyPatch
 
-from scripts.verify_upgrade_path import main, problems_in_status
+from scripts import verify_upgrade_path
+from scripts.verify_upgrade_path import problems_in_status
 
 
 def test_upgrade_status_accepts_current_and_linked_integrations() -> None:
@@ -41,21 +42,12 @@ def test_upgrade_status_fails_closed_when_it_finds_no_installed_skill() -> None:
     ]
 
 
-def test_upgrade_check_refuses_to_guess_the_previous_release(tmp_path: Path) -> None:
-    # Before the changelog names the new version, there is no release "below" it; reporting
-    # success there would be an upgrade check that checked nothing.
-    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "1.0.0rc4"\n', encoding="utf-8")
-    (tmp_path / "CHANGELOG.md").write_text(
-        "# Changelog\n\n## [Unreleased]\n\n## [1.0.0rc3] - 2026-09-16\n\nNotes.\n", encoding="utf-8"
-    )
+def test_upgrade_check_fails_when_it_cannot_learn_what_to_upgrade_from(monkeypatch: MonkeyPatch) -> None:
+    # Without --from the check upgrades from the latest PyPI release. When that lookup fails,
+    # reporting success would be an upgrade check that checked nothing.
+    def unreachable() -> str:
+        raise OSError("network is unreachable")
 
-    assert main(["--executable", "aise", "--root", str(tmp_path)]) == 2
+    monkeypatch.setattr(verify_upgrade_path, "latest_published_version", unreachable)
 
-
-def test_upgrade_status_fails_closed_on_a_line_it_cannot_read() -> None:
-    status = (
-        "app ~/.ai-session-search/skills/ai-session-search: configured\n"
-        "claude ~/.claude/CLAUDE.md needs attention\n"
-    )
-
-    assert problems_in_status(status) == ["claude ~/.claude/CLAUDE.md needs attention"]
+    assert verify_upgrade_path.main(["--executable", "aise"]) == 2

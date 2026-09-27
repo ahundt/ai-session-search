@@ -32,10 +32,11 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ### For contributors
 
-1. The publish workflow fails a release when upgrading from the previous release would need a
-   manual step: it installs that release's integrations and printed config from PyPI, runs one
-   command with the new executable, and fails unless the old config loads and the Claude Code,
-   Codex, and Gemini CLI integrations it installed all report current.
+1. CI on every push, and the publish workflow before anything is signed, fail when upgrading from
+   the latest published release would need a manual step. They install that release's
+   integrations and printed config from PyPI, run one command with the new executable, and
+   require the old config to load and the Claude Code, Codex, and Gemini CLI integrations to
+   report current.
 2. The metadata gate checks the released changelog section's shape (summary first, known headings
    in order, numbered items) and appends a generated footer with the upgrade and install commands,
    download guide, and diff link. `--notes-only` renders the body for an already published tag.

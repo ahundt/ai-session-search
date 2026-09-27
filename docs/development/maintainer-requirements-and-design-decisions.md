@@ -557,8 +557,9 @@ setting must not need to change anything, and one who did must not have to edit 
 config key keeps its old name as a serde alias, and a key a release accepted is not removed before
 the next major version. Installed files change only in ways the post-upgrade refresh applies without
 touching an edit (`REQ024-delegate-package-updates`). Release notes never carry upgrade steps. The
-publish `upgrade` job, which `verify` waits for, installs the previous release's integrations and printed config, runs the new
-executable, and fails when anything would need a manual step.
+CI `rust` job on every push, and the publish `upgrade` job that `verify` waits for, install the
+latest published release's integrations and printed config, run the new executable, and fail when
+anything would need a manual step.
 
 ## P2 — maintainer execution
 
@@ -688,5 +689,5 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 | `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
 | `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
 | `REQ024-delegate-package-updates` | `update.rs`, release configuration | package ownership/update tests and installed `aise package status/check` |
-| `REQ049-keep-upgrades-one-command` | `config.rs` serde aliases, `integrations.rs` post-upgrade refresh, `scripts/verify_upgrade_path.py`, publish `upgrade` job | alias and refresh unit tests, instruction-text digest test, upgrade check from the previous published release |
+| `REQ049-keep-upgrades-one-command` | `config.rs` serde aliases, `integrations.rs` post-upgrade refresh, `scripts/verify_upgrade_path.py`, CI `rust` job, publish `upgrade` job | alias and refresh unit tests, instruction-text digest test, upgrade check from the previous published release |
 | `REQ027-use-tdd`; `REQ028-test-cross-surface-contracts`; `REQ029-dogfood-installed-artifacts`; `REQ033-commit-coherent-progress`; `REQ034-gate-release-artifacts` | `tests/`, Rust test suites, `run_ci_local.sh`, release workflows | focused tests followed by all local release-gate stages |
