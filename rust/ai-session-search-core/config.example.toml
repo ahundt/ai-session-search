@@ -279,7 +279,8 @@ repeat_phrase_max_words = 5
 # Interactive TUI (`aise tui`) pacing and step behavior.
 # Total preview body budget: the transcript summary's sections scale proportionally to
 # their weights (first prompt, first reply, final prompt, final reply), each floored at one
-# line so a small budget cannot erase a bookend.
+# line so a small budget cannot erase a bookend. The 1.0.0rc2 name `preview_lines` is still
+# accepted.
 preview_body_lines = 34
 # Idle wake interval for the TUI event loop, in milliseconds (minimum 1). Every key redraws
 # immediately; this value paces settled idle turns, while active worker output is checked sooner.

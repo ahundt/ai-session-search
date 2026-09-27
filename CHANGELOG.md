@@ -13,6 +13,12 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
+### Fixed
+
+1. A `config.toml` that sets `[ui].preview_lines`, the 1.0.0rc2 name for
+   `[ui].preview_body_lines`, loads again. 1.0.0rc3 refused it with
+   ``unknown field `preview_lines` ``.
+
 ## [1.0.0rc3] - 2026-09-16
 
 ### Changed
