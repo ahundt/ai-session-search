@@ -44,6 +44,9 @@ pub(crate) const SKILL_MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// transaction receipt either — that one is transient and deleted on commit, while this must
 /// outlive every command.
 const SKILL_MANIFEST_FILE: &str = "skill-install-manifest.json";
+/// Beside the manifest: the newest aise version that brought the recorded skills up to date after
+/// an upgrade. It is only a cache of a check that is safe to repeat.
+const REFRESHED_VERSION_FILE: &str = "integrations-refreshed-version";
 
 /// One file `aise` wrote, relative to its skill root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +92,11 @@ pub(crate) fn manifest_path(config_path: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .join(SKILL_MANIFEST_FILE)
+}
+
+/// Where the post-upgrade refresh records the version it last completed, beside the manifest.
+pub(crate) fn refreshed_version_path(config_path: &Path) -> PathBuf {
+    manifest_path(config_path).with_file_name(REFRESHED_VERSION_FILE)
 }
 
 /// What reading a manifest told us. Absence and damage are different answers.

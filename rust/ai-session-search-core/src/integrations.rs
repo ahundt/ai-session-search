@@ -2825,6 +2825,9 @@ pub(crate) struct SkillWriteOutcome {
     pub(crate) action: String,
     /// Why nothing was written, when that is the outcome.
     pub(crate) problem: Option<String>,
+    /// Whether files on disk changed. `action` is wording for a reader; this is what code tests.
+    #[serde(skip)]
+    pub(crate) changed: bool,
 }
 
 /// Bring every owned skill root up to the embedded content, or repair one exact root.
@@ -2904,6 +2907,7 @@ pub(crate) fn write_owned_skills(
                         format!("rewritten from {status}")
                     },
                     problem: None,
+                    changed: !noop && !dry_run,
                 });
                 if !noop {
                     mutations.extend(planned);
@@ -2918,6 +2922,7 @@ pub(crate) fn write_owned_skills(
                 root: target.root.display().to_string(),
                 action: "not written".to_string(),
                 problem: Some(format!("{error:#}")),
+                changed: false,
             }),
         }
     }
@@ -2970,6 +2975,7 @@ pub(crate) fn write_owned_skills(
                 "removed retired package".to_string()
             },
             problem: None,
+            changed: !dry_run,
         });
     }
     for (link, _) in retired_discovery_links {
@@ -2982,13 +2988,11 @@ pub(crate) fn write_owned_skills(
                 "removed retired discovery link".to_string()
             },
             problem: None,
+            changed: !dry_run,
         });
     }
     Ok(outcomes)
 }
-
-/// Beside the skill manifest: the aise version that last brought owned skills up to date.
-const REFRESHED_VERSION_FILE: &str = "integrations-refreshed-version";
 
 /// What the post-upgrade refresh did, so the caller can say so in one line.
 #[derive(Debug)]
@@ -3019,44 +3023,49 @@ pub(crate) fn refresh_owned_skills_after_upgrade(receipt_path: &Path) -> Result<
 }
 
 fn refresh_owned_skills_for_version(receipt_path: &Path, version: &str) -> Result<UpgradeRefresh> {
-    let marker =
-        crate::skill_manifest::manifest_path(receipt_path).with_file_name(REFRESHED_VERSION_FILE);
-    if fs::read_to_string(&marker).is_ok_and(|recorded| recorded.trim() == version) {
-        return Ok(UpgradeRefresh::NotNeeded);
+    let marker = crate::skill_manifest::refreshed_version_path(receipt_path);
+    // Only a newer version refreshes. Two installs of different versions, such as an old Cargo
+    // build on PATH beside a newer uv install that MCP clients launch, must not rewrite the skill
+    // back and forth, and the older one must never downgrade it.
+    if let Ok(recorded) = fs::read_to_string(&marker) {
+        let recorded = recorded.trim();
+        let is_newer = match (
+            semver::Version::parse(version),
+            semver::Version::parse(recorded),
+        ) {
+            (Ok(running), Ok(recorded)) => running > recorded,
+            _ => version != recorded,
+        };
+        if !is_newer {
+            return Ok(UpgradeRefresh::NotNeeded);
+        }
     }
     let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
-    let refreshed = crate::skill_manifest::load_manifest(&manifest_path)
-        .and_then(|manifest| manifest_recorded_skill_roots(&manifest))
-        .and_then(|mut roots| {
-            // A recorded root whose directory is gone was removed by the user; an upgrade must
-            // not put it back. `aise integrations install` restores it on request.
-            roots.retain(|root| root.is_dir());
-            if roots.is_empty() {
-                return Ok(None);
-            }
-            write_owned_skills(&roots, receipt_path, false, false).map(Some)
-        });
-    let outcomes = match refreshed {
-        Ok(None) => return Ok(UpgradeRefresh::NotNeeded),
-        Err(error) if integration_lock_is_held(&error) => return Ok(UpgradeRefresh::Deferred),
-        other => other,
+    let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
+    let mut roots = manifest_recorded_skill_roots(&manifest)?;
+    // A recorded root whose directory is gone was removed by the user; an upgrade must not put it
+    // back. `aise integrations install` restores it on request.
+    roots.retain(|root| root.is_dir());
+    if roots.is_empty() {
+        return Ok(UpgradeRefresh::NotNeeded);
+    }
+    let outcomes = match write_owned_skills(&roots, receipt_path, false, false) {
+        Ok(outcomes) => outcomes,
+        Err(error)
+            if error
+                .downcast_ref::<crate::text_file_transaction::IntegrationLockHeld>()
+                .is_some() =>
+        {
+            return Ok(UpgradeRefresh::Deferred)
+        }
+        Err(error) => return Err(error),
     };
-    // Recorded whether or not the refresh succeeded: a failure is reported once per version, and
-    // `aise integrations status` keeps describing it, rather than repeating on every command. The
-    // marker only saves repeating a check that is safe to repeat, so a config directory that
-    // cannot hold it is not an error: printing one on every command would be noise, and the
-    // skill itself is what `aise integrations status` reports.
+    // Recorded only after the check completed, so a failure is retried by the next command rather
+    // than silenced until the next release; an edited file is an outcome, not a failure, and is
+    // reported once. A config directory that cannot hold the marker only costs repeating a check
+    // that is safe to repeat, so failing to write it is not reported.
     let _ = fs::write(&marker, format!("{version}\n"));
-    Ok(UpgradeRefresh::Checked(outcomes?.unwrap_or_default()))
-}
-
-/// Whether a transaction failed only because another process holds the integration lock.
-fn integration_lock_is_held(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::WouldBlock)
-    })
+    Ok(UpgradeRefresh::Checked(outcomes))
 }
 
 /// Run [`refresh_owned_skills_after_upgrade`] for a CLI or MCP command and report it on stderr.
@@ -3081,14 +3090,18 @@ pub(crate) fn refresh_owned_skills_after_upgrade_and_report(
                         "aise: left the skill at {} unchanged after upgrading to {version}: {problem}",
                         outcome.root
                     );
-                } else if outcome.action.starts_with("rewritten") {
-                    eprintln!("aise: updated the skill at {} for {version}", outcome.root);
+                } else if outcome.changed {
+                    eprintln!(
+                        "aise: updated {} for {version} ({})",
+                        outcome.root, outcome.action
+                    );
                 }
             }
         }
         Err(error) => eprintln!(
-            "aise: could not update the installed skill for {version}: {error:#}; \
-             `aise integrations status` shows its state"
+            "aise: could not update the installed skill for {version}: {error:#}; the next \
+             command retries, `aise skills update` retries now, and `aise integrations status` \
+             shows its state"
         ),
     }
 }
@@ -6144,6 +6157,48 @@ mod tests {
     }
 
     #[test]
+    fn an_older_aise_never_downgrades_a_skill_a_newer_one_refreshed() {
+        // With an old Cargo build on PATH beside a newer uv install that MCP clients launch,
+        // alternating commands would otherwise rewrite the skill back and forth.
+        let dir = tempdir().unwrap();
+        let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
+        let root = dir.path().join("skills/ai-session-search");
+        let policy = install_skill_as_an_older_release(&receipt, &root);
+        assert!(matches!(
+            refresh_owned_skills_for_version(&receipt, "1.0.0-rc.5").unwrap(),
+            UpgradeRefresh::Checked(_)
+        ));
+        let refreshed = fs::read_to_string(&policy).unwrap();
+        fs::write(&policy, "# an older shipped policy\nschema_version = 1\n").unwrap();
+
+        assert!(matches!(
+            refresh_owned_skills_for_version(&receipt, "1.0.0-rc.4").unwrap(),
+            UpgradeRefresh::NotNeeded
+        ));
+        assert_ne!(
+            fs::read_to_string(&policy).unwrap(),
+            refreshed,
+            "left for the newer version"
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_is_retried_by_the_next_command() {
+        // The marker records a completed check. Written after a failure, it would silence the
+        // problem until the next release.
+        let dir = tempdir().unwrap();
+        let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
+        let root = dir.path().join("skills/ai-session-search");
+        install_skill_as_an_older_release(&receipt, &root);
+        let manifest_path = crate::skill_manifest::manifest_path(&receipt);
+        fs::write(&manifest_path, "{ not json").unwrap();
+
+        assert!(refresh_owned_skills_for_version(&receipt, "9.9.9").is_err());
+        assert!(!crate::skill_manifest::refreshed_version_path(&receipt).exists());
+        assert!(refresh_owned_skills_for_version(&receipt, "9.9.9").is_err());
+    }
+
+    #[test]
     fn an_upgrade_with_no_installed_skill_writes_nothing() {
         let dir = tempdir().unwrap();
         let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
@@ -6165,10 +6220,9 @@ mod tests {
         let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
         let root = dir.path().join("skills/ai-session-search");
         let policy = install_skill_as_an_older_release(&receipt, &root);
-        let mut lock_name = receipt.file_name().unwrap().to_os_string();
-        lock_name.push(".lock");
         let mut lock =
-            crate::durable_fs::open_file_lock(&receipt.with_file_name(lock_name)).unwrap();
+            crate::durable_fs::open_file_lock(&crate::text_file_transaction::lock_path(&receipt))
+                .unwrap();
         let guard = lock.try_write().unwrap();
 
         assert!(matches!(

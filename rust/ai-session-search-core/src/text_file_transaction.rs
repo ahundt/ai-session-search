@@ -315,12 +315,9 @@ where
             lock_path.display()
         )
     })?;
-    let _guard = lock.try_write().with_context(|| {
-        format!(
-            "another integration transaction holds {}",
-            lock_path.display()
-        )
-    })?;
+    let _guard = lock
+        .try_write()
+        .map_err(|error| integration_lock_error(error, &lock_path))?;
     if entry_exists(receipt_path)? {
         bail!(
             "pending integration receipt requires recovery: {}; {}",
@@ -419,12 +416,9 @@ pub(crate) fn recover_text_file_transaction(receipt_path: &Path) -> Result<Recov
             lock_path.display()
         )
     })?;
-    let _guard = lock.try_write().with_context(|| {
-        format!(
-            "another integration transaction holds {}",
-            lock_path.display()
-        )
-    })?;
+    let _guard = lock
+        .try_write()
+        .map_err(|error| integration_lock_error(error, &lock_path))?;
     let receipt = load_receipt(receipt_path)?;
     let outcome = match receipt.phase {
         TransactionPhase::Prepared => RecoveryOutcome::RolledBack {
@@ -805,7 +799,25 @@ fn remove_receipt(path: &Path) -> Result<()> {
     })
 }
 
-fn lock_path(receipt_path: &Path) -> PathBuf {
+/// Another process holds the integration transaction lock. Nothing was changed, and the same
+/// transaction can simply be tried again later, so callers that run unasked, such as the
+/// post-upgrade refresh, defer on exactly this error rather than reporting it.
+#[derive(Debug, thiserror::Error)]
+#[error("another integration transaction holds {}", .0.display())]
+pub(crate) struct IntegrationLockHeld(PathBuf);
+
+fn integration_lock_error(error: std::io::Error, lock_path: &Path) -> anyhow::Error {
+    if error.kind() == ErrorKind::WouldBlock {
+        IntegrationLockHeld(lock_path.to_path_buf()).into()
+    } else {
+        anyhow::Error::new(error).context(format!(
+            "failed to lock integration transactions at {}",
+            lock_path.display()
+        ))
+    }
+}
+
+pub(crate) fn lock_path(receipt_path: &Path) -> PathBuf {
     let mut name = receipt_path
         .file_name()
         .unwrap_or_else(|| OsStr::new("mcp-transaction"))
