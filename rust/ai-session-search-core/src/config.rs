@@ -1503,8 +1503,13 @@ impl Config {
         let raw = read_config_text(&config_path, explicit_config_path)?;
         let document: toml::Value = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
-        let mut config: Config = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
+        let mut config: Config = match without_superseded_names(&document) {
+            // Parsed from the table only when a key must be dropped, so every other file keeps
+            // error messages that point at its own line and column.
+            Some(document) => document.try_into(),
+            None => toml::from_str(&raw),
+        }
+        .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
         let has_database_config = toml_has_key(&document, "index", "db_path");
         let has_cache_config = toml_has_key(&document, "index", "cache_dir");
         let has_index_refresh_config = toml_has_key(&document, "index", "refresh");
@@ -2180,6 +2185,25 @@ fn parse_positive_result_ceiling(name: &str, raw: &str) -> Result<usize> {
              MCP tool result in characters; a ceiling of 0 would reject every result."
         ),
     }
+}
+
+/// `document` without an old key name when the file also sets the current one, or `None`.
+///
+/// A serde alias accepts the old name alone, but a file that sets both fails with "duplicate
+/// field", which names only the new key and stops every command, including the MCP server. No
+/// release loaded such a file (1.0.0rc2 knew only `preview_lines`, 1.0.0rc3 only
+/// `preview_body_lines`), so no earlier behavior depends on it, and the current name wins.
+fn without_superseded_names(document: &toml::Value) -> Option<toml::Value> {
+    if !(toml_has_key(document, "ui", "preview_lines")
+        && toml_has_key(document, "ui", "preview_body_lines"))
+    {
+        return None;
+    }
+    let mut document = document.clone();
+    if let Some(ui) = document.get_mut("ui").and_then(toml::Value::as_table_mut) {
+        ui.remove("preview_lines");
+    }
+    Some(document)
 }
 
 fn toml_has_key(document: &toml::Value, table: &str, key: &str) -> bool {
@@ -3751,6 +3775,22 @@ mod tests {
         // 1.0.0rc3 renamed this key and every config that set it stopped loading.
         let config = toml::from_str::<Config>("[ui]\npreview_lines = 20\n").unwrap();
         assert_eq!(config.ui.preview_body_lines, 20);
+    }
+
+    #[test]
+    fn a_config_setting_both_preview_names_loads_and_the_current_name_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\npreview_lines = 20\npreview_body_lines = 12\n").unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(path),
+                ..ConfigOverrides::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.ui.preview_body_lines, 12);
     }
 
     #[test]
