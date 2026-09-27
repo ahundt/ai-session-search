@@ -126,7 +126,7 @@ network version-check dependencies:
 
 ```toml
 [dependencies]
-ai-session-search = { version = "1.0.0-rc.3", default-features = false }
+ai-session-search = { version = "1.0.0-rc.4", default-features = false }
 ```
 
 The default `release-check` feature remains enabled for `cargo install`,

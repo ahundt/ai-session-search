@@ -13,6 +13,8 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
+## [1.0.0rc4] - 2026-09-27
+
 Upgrading is now a single step: after any package manager replaces `aise`, the first command
 updates the installed skill for you, and a `config.toml` written for 1.0.0rc2 loads again.
 `aise config init` now leaves settings commented out, so defaults a later release changes reach
@@ -285,7 +287,8 @@ consumer comparing receipt numbers with 1.0.0rc1 sees different values for some 
 
 First published release. See the [tag](https://github.com/ahundt/ai-session-search/releases/tag/v1.0.0rc1).
 
-[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc3...HEAD
+[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc4...HEAD
+[1.0.0rc4]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc3...v1.0.0rc4
 [1.0.0rc3]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc2...v1.0.0rc3
 [1.0.0rc2]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc1...v1.0.0rc2
 [1.0.0rc1]: https://github.com/ahundt/ai-session-search/releases/tag/v1.0.0rc1
