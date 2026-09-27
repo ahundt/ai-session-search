@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -12,24 +13,39 @@ from scripts import verify_upgrade_path
 from scripts.verify_upgrade_path import problems_in_status
 
 
-def test_upgrade_status_accepts_current_and_linked_integrations() -> None:
-    status = (
-        "app ~/.ai-session-search/skills/ai-session-search: configured\n"
-        "claude code modern ~/.claude.json: configured\n"
-        "app discovery ~/.claude/skills/ai-session-search: linked -> ~/.ai-session-search/skills\n"
-        "executable alias /build/aisearch: missing\n"
+def _status(*entries: dict[str, object]) -> str:
+    return json.dumps({"integrations": list(entries)})
+
+
+SKILL = {
+    "component": "skill",
+    "client": "app",
+    "path": "~/.ai-session-search/skills/ai-session-search",
+    "state": "configured",
+    "current": True,
+}
+
+
+def test_upgrade_status_accepts_current_integrations_and_skips_aliases() -> None:
+    status = _status(
+        SKILL,
+        {"component": "skill_discovery_link", "client": "app", "path": "~/.claude/skills/ai-session-search",
+         "state": "linked -> ~/.ai-session-search/skills/ai-session-search", "current": True},
+        {"component": "executable_alias", "client": None, "path": "/build/aisearch", "state": "missing",
+         "current": False},
     )
 
     assert problems_in_status(status) == []
 
 
 def test_upgrade_status_reports_anything_left_for_the_user_to_fix() -> None:
-    # 1.0.0rc1's instruction blocks read "outdated" after upgrading; every such line would have
-    # needed `aise integrations install`.
-    status = (
-        "claude ~/.claude/CLAUDE.md: outdated\n"
-        "app ~/.ai-session-search/skills/ai-session-search: outdated, untouched\n"
-        "codex ~/.codex/config.toml: configured\n"
+    # 1.0.0rc1's instruction blocks read "outdated" after upgrading until the refresh learned the
+    # text rc1 wrote; every such entry would have needed `aise integrations install`.
+    status = _status(
+        {"component": "instructions", "client": "claude", "path": "~/.claude/CLAUDE.md", "state": "outdated",
+         "current": False},
+        {**SKILL, "state": "outdated, untouched", "current": False},
+        {"component": "mcp", "client": "codex", "path": "~/.codex/config.toml", "state": "configured", "current": True},
     )
 
     assert problems_in_status(status) == [
@@ -39,10 +55,19 @@ def test_upgrade_status_reports_anything_left_for_the_user_to_fix() -> None:
 
 
 def test_upgrade_status_fails_closed_when_it_finds_no_installed_skill() -> None:
-    # An earlier release that installed nothing, or a changed status wording, must not pass.
-    assert problems_in_status("") == [
+    # An earlier release that installed nothing, or a report that changed shape, must not pass.
+    assert problems_in_status(_status()) == [
         "integrations status reported no installed ai-session-search skill to check"
     ]
+    assert problems_in_status("configured")[0].startswith("integrations status printed no readable JSON")
+
+
+def test_an_earlier_release_is_asked_only_for_the_harnesses_it_supports() -> None:
+    # 1.0.0rc1 predates pi and prime-agent and rejected the whole install when asked for them.
+    rc1_help = "[possible values: all, claude, codex, gemini, antigravity, cursor, windsurf, vscode, zed, opencode]"
+
+    assert verify_upgrade_path.supported_clients(rc1_help) == ["claude", "codex", "gemini", "antigravity", "opencode"]
+    assert verify_upgrade_path.supported_clients("no list here") == []
 
 
 def test_upgrade_check_fails_when_it_cannot_learn_what_to_upgrade_from(monkeypatch: MonkeyPatch) -> None:

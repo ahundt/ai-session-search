@@ -6,13 +6,14 @@
 
 For each earlier release, in an empty home directory:
 
-1. install that release's integrations from PyPI for every harness that installs files an upgrade
-   could leave behind: skills and their discovery links, and both instruction variants;
+1. install that release's integrations from PyPI for every harness it supports that installs files
+   an upgrade could leave behind: skills and their discovery links, and both instruction variants;
 2. save that release's complete `aise config show` output as `config.toml`, as a user who kept
    the printed defaults would have;
 3. run one ordinary command with the candidate executable, which is all an upgrade through uv,
    pip, Cargo, or a native archive does;
-4. require every integration the earlier release installed to report `configured`.
+4. require `aise integrations status --format json` to report every integration the earlier
+   release installed as `current`.
 
 A failure names the release and what would have needed a manual step. CI runs this on every
 push against the Linux build, so a change that breaks upgrades fails before it merges, and the
@@ -35,6 +36,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,17 +46,16 @@ from collections.abc import Sequence
 from scripts.release_versions import PYTHON_RELEASE_VERSION, release_sort_key
 
 PYPI_PROJECT_URL = "https://pypi.org/pypi/ai-session-search/json"
-# The oldest release an upgrade must work from without a manual step. 1.0.0rc1 is excluded: its
-# instruction blocks read "outdated" after any later upgrade, because the instruction text changed
-# in 1.0.0rc2 before the post-upgrade refresh existed, and it is a pre-release outside the
-# compatibility baseline. Lower it only by making those upgrades work.
-UPGRADE_FLOOR = "1.0.0rc2"
+# The oldest release an upgrade must work from without a manual step: the first one published.
+UPGRADE_FLOOR = "1.0.0rc1"
 
 # Every harness whose install writes files an upgrade could leave outdated: skills and discovery
 # links (claude, gemini, antigravity, pi, prime-agent), the MCP-first instruction block (claude,
 # codex, gemini, opencode), and the CLI-only block (pi, prime-agent). Clients that only register an
-# MCP server name the executable's path, which an upgrade keeps.
+# MCP server name the executable's path, which an upgrade keeps. An earlier release is asked only
+# for the ones it supports: 1.0.0rc1 predates pi and prime-agent.
 CLIENTS = ("claude", "codex", "gemini", "antigravity", "opencode", "pi", "prime-agent")
+_POSSIBLE_CLIENTS = re.compile(r"\[possible values: ([^\]]+)\]")
 
 
 def _environment(home: pathlib.Path, executable_dir: pathlib.Path | None) -> dict[str, str]:
@@ -95,33 +96,40 @@ class UpgradeCheckUnavailable(Exception):
     """The earlier release could not be installed or run, so nothing about the upgrade is known."""
 
 
-def _client_arguments() -> list[str]:
-    return [argument for client in CLIENTS for argument in ("--client", client)]
-
-
 def problems_in_status(status: str) -> list[str]:
-    """Return each status line that describes something other than a current integration.
+    """Return each integration in ``aise integrations status --format json`` that is not current.
 
     Executable aliases are skipped: they point at the executable's own directory, which this check
     changes on purpose by running the candidate from the build tree, and a real upgrade keeps.
     """
-    # Fail closed on an empty or unrecognized report: a check that parsed nothing would otherwise
-    # pass, whether the earlier release installed nothing or the status wording changed.
+    try:
+        entries = json.loads(status)["integrations"]
+    except (ValueError, KeyError, TypeError) as error:
+        return [f"integrations status printed no readable JSON report: {error}"]
+    # Fail closed on an empty report: a check that found nothing would otherwise pass, whether the
+    # earlier release installed nothing or the report changed shape.
     if not any(
-        "skills/ai-session-search: " in line and line.startswith("app ")
-        for line in status.splitlines()
+        entry.get("component") == "skill"
+        and re.split(r"[/\\]", entry.get("path", ""))[-1] == "ai-session-search"
+        for entry in entries
     ):
         return ["integrations status reported no installed ai-session-search skill to check"]
-    problems = []
-    for line in status.splitlines():
-        if not line.strip() or line.startswith("executable alias "):
-            continue
-        _, separator, state = line.rpartition(": ")
-        # A line this parser cannot read counts as a problem, so a changed status wording fails
-        # the check rather than passing it.
-        if not separator or (state != "configured" and not state.startswith("linked -> ")):
-            problems.append(line)
-    return problems
+    return [
+        f"{entry.get('client')} {entry.get('path')}: {entry.get('state')}"
+        for entry in entries
+        if entry.get("component") != "executable_alias" and entry.get("current") is not True
+    ]
+
+
+def supported_clients(install_help: str) -> list[str]:
+    """Return the harnesses in ``CLIENTS`` that an ``integrations install --help`` accepts."""
+    listed = _POSSIBLE_CLIENTS.search(install_help)
+    accepted = {value.strip() for value in listed.group(1).split(",")} if listed else set()
+    return [client for client in CLIENTS if client in accepted]
+
+
+def _client_arguments(clients: Sequence[str]) -> list[str]:
+    return [argument for client in clients for argument in ("--client", client)]
 
 
 def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
@@ -132,7 +140,13 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
         home = pathlib.Path(directory).resolve()
         old = ["uvx", "--quiet", "--from", f"ai-session-search=={previous}", "aise"]
         old_environment = _environment(home, None)
-        installed = _run([*old, "integrations", "install", *_client_arguments()], old_environment)
+        install_help = _run([*old, "integrations", "install", "--help"], old_environment)
+        clients = supported_clients(install_help.stdout)
+        if not clients:
+            raise UpgradeCheckUnavailable(
+                f"{previous} could not list the harnesses it supports: {install_help.stderr.strip()}"
+            )
+        installed = _run([*old, "integrations", "install", *_client_arguments(clients)], old_environment)
         # Failing to download or run the earlier release says nothing about the upgrade, and
         # reporting it as "needs a manual step" would send the reader after a bug that is not there.
         if installed.returncode != 0:
@@ -156,7 +170,11 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
                 f"{upgraded.stderr.strip()}"
             ]
         status = _run(
-            [str(executable), "integrations", "status", *_client_arguments()], new_environment
+            [
+                str(executable), "integrations", "status", "--format", "json",
+                *_client_arguments(clients),
+            ],
+            new_environment,
         )
         if status.returncode != 0:
             return [f"integrations status failed after upgrading from {previous}: {status.stderr}"]
@@ -198,8 +216,8 @@ def _check_all(versions: list[str], executable: pathlib.Path) -> int:
         except UpgradeCheckUnavailable as error:
             unavailable = True
             print(
-                f"could not check upgrading from {previous}; this is not an upgrade failure. "
-                f"Rerun when PyPI is reachable: {error}",
+                f"could not check upgrading from {previous}, so this is not an upgrade failure: "
+                f"{error}",
                 file=sys.stderr,
             )
             continue
