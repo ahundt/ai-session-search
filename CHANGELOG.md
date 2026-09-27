@@ -16,17 +16,25 @@ compatibility baseline; tags below it do not define a compatibility contract.
 ## [1.0.0rc4] - 2026-09-27
 
 Upgrading is now a single step: after any package manager replaces `aise`, the first command
-updates the installed skill for you, and a `config.toml` written for 1.0.0rc2 loads again.
-`aise config init` now leaves settings commented out, so defaults a later release changes reach
-files it writes from now on. Upgrading from 1.0.0rc3 needs no action.
+updates the installed skill and the aise instructions in each harness for you, including those
+1.0.0rc1 wrote, and a `config.toml` written for 1.0.0rc2 loads again. `aise config init` now leaves
+settings commented out, so defaults a later release changes reach files it writes from now on.
+Upgrading from 1.0.0rc3 needs no action.
+
+### Added
+
+1. `aise integrations status --format json` reports each integration's component, harness, path,
+   and state, with `current` set to true when it matches the running version.
 
 ### Changed
 
 1. Upgrading no longer needs `aise integrations install`. After `uv tool upgrade`, pip, Cargo,
-   or a native archive replaces `aise`, the first command or MCP server start updates the
-   installed `ai-session-search` skill once and prints a line for each skill it updates. Skill
-   files you edited are left alone and reported once, and a skill directory you deleted stays
-   deleted; `aise integrations install` restores it. Set
+   or a native archive replaces `aise`, the first command or MCP server start updates, once, the
+   installed `ai-session-search` skill and the aise instruction block in each harness's
+   CLAUDE.md, AGENTS.md, or GEMINI.md, and prints a line for each file it updates. A block keeps
+   its place in the file. Anything you edited is left alone and reported once, and a skill
+   directory you deleted stays deleted; `aise integrations install` restores it.
+   `aise package update` does this before it finishes. Set
    `[integrations] refresh_after_upgrade = false` to turn this off.
 2. `aise config init` writes every setting commented out except the database and cache paths.
    Uncommenting a line changes that setting; everything else follows the built-in defaults,
@@ -37,19 +45,19 @@ files it writes from now on. Upgrading from 1.0.0rc3 needs no action.
 
 1. A `config.toml` that sets `[ui].preview_lines`, the 1.0.0rc2 name for
    `[ui].preview_body_lines`, loads again. 1.0.0rc3 refused it with
-   ``unknown field `preview_lines` ``.
+   ``unknown field `preview_lines` ``. A file that sets both uses `preview_body_lines`.
 
 ### For contributors
 
 1. CI and the local gate on every change, and the publish workflow before anything is signed,
-   fail when upgrading from any published release since 1.0.0rc2 would need a manual step. For
-   each release they install its integrations for every harness that writes files and its printed
-   config, run one command with the new executable, and require the config to load and every
-   integration to report current.
+   fail when upgrading from any published release would need a manual step. For each release
+   they install its integrations for every harness it supports that writes files and its printed
+   config, run one command with the new executable, and require the config to load and
+   `aise integrations status --format json` to report every integration current.
 2. The metadata gate checks the released changelog section's shape (summary first, known headings
    in order, numbered items) and appends a generated footer with the upgrade and install commands,
    download guide, and diff link. `--notes-only` renders the body for an already published tag.
-3. Dependency updates: maturin 1.15.0, ruff 0.16.7, mypy 2.3.1, the current `setup-uv` and
+3. Dependency updates: maturin 1.15.0, ruff 0.16.9, mypy 2.3.1, the current `setup-uv` and
    `rust-toolchain` actions, rmcp 3.4.0, clap 4.6.7, yaml-rust2 0.13, and patch releases of toml,
    toml_edit, ureq, and unicode-width. The rmcp requirement rises to 3.4.0, the first release
    with the `ServerConfig` name the MCP server now uses.
