@@ -8,6 +8,7 @@ from scripts.verify_upgrade_path import problems_in_status
 
 def test_upgrade_status_accepts_current_and_linked_integrations() -> None:
     status = (
+        "app ~/.ai-session-search/skills/ai-session-search: configured\n"
         "claude code modern ~/.claude.json: configured\n"
         "app discovery ~/.claude/skills/ai-session-search: linked -> ~/.ai-session-search/skills\n"
         "executable alias /build/aisearch: missing\n"
@@ -28,4 +29,11 @@ def test_upgrade_status_reports_anything_left_for_the_user_to_fix() -> None:
     assert problems_in_status(status) == [
         "claude ~/.claude/CLAUDE.md: outdated",
         "app ~/.ai-session-search/skills/ai-session-search: outdated, untouched",
+    ]
+
+
+def test_upgrade_status_fails_closed_when_it_finds_no_installed_skill() -> None:
+    # An earlier release that installed nothing, or a changed status wording, must not pass.
+    assert problems_in_status("") == [
+        "integrations status reported no installed ai-session-search skill to check"
     ]

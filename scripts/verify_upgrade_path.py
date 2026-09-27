@@ -68,6 +68,13 @@ def problems_in_status(status: str) -> list[str]:
     Executable aliases are skipped: they point at the executable's own directory, which this check
     changes on purpose by running the candidate from the build tree, and a real upgrade keeps.
     """
+    # Fail closed on an empty or unrecognized report: a check that parsed nothing would otherwise
+    # pass, whether the earlier release installed nothing or the status wording changed.
+    if not any(
+        "skills/ai-session-search: " in line and line.startswith("app ")
+        for line in status.splitlines()
+    ):
+        return ["integrations status reported no installed ai-session-search skill to check"]
     problems = []
     for line in status.splitlines():
         if not line.strip() or line.startswith("executable alias "):
