@@ -36,8 +36,8 @@ refresh_after_upgrade = true
 
 [index]
 # Optional explicit state paths. Relative values resolve from ~/.ai-session-search/.
-# Leave these commented to keep the platform data/cache defaults; set db_path to reuse an existing
-# database without moving a large index.
+# Unset, they follow the platform data/cache defaults; set db_path to reuse an existing database
+# without moving a large index.
 # db_path = "/absolute/path/to/index.db"
 # cache_dir = "/absolute/path/to/cache"
 # Implicit read refresh policy: auto, before-query, or existing-only.
