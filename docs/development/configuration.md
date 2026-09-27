@@ -15,8 +15,9 @@ file is created. The database and cache keep separate platform-appropriate defau
 1. Locate the effective file with `aise config file` and inspect the complete
    template with `aise config example`.
 2. Run `aise config init` if no file exists. It records the effective database and cache paths so
-   the state location is visible without moving either directory. It refuses to overwrite an
-   existing entry; use `--force` only after reviewing the replacement.
+   the state location is visible without moving either directory, and writes every other setting
+   commented out, so later releases' defaults keep applying until you uncomment one. It refuses to
+   overwrite an existing entry; use `--force` only after reviewing the replacement.
 3. Edit only durable source paths and runtime settings. Keep query filters,
    output formatting, and migration destinations on the command that uses them.
 4. Run `aise config show`, `aise config origins`, and `aise doctor`. The first
