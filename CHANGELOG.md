@@ -17,9 +17,9 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 1. Upgrading no longer needs `aise integrations install`. After `uv tool upgrade`, pip, Cargo,
    or a native archive replaces `aise`, the first command or MCP server start updates the
-   installed `ai-session-search` skill once and prints one line saying so. Skill files you edited
-   are left alone and reported once. Set `[integrations] refresh_after_upgrade = false` to turn
-   this off.
+   installed `ai-session-search` skill once and prints a line for each skill it updates. Skill
+   files you edited are left alone and reported once. Set
+   `[integrations] refresh_after_upgrade = false` to turn this off.
 2. `aise config init` writes every setting commented out except the database and cache paths.
    Uncommenting a line changes that setting; everything else follows the built-in defaults,
    including ones a later release changes. Existing config files are not touched.
@@ -34,7 +34,8 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 1. The publish workflow fails a release when upgrading from the previous release would need a
    manual step: it installs that release's integrations and printed config from PyPI, runs one
-   command with the new executable, and requires every integration to report `configured`.
+   command with the new executable, and fails unless the old config loads and the Claude Code,
+   Codex, and Gemini CLI integrations it installed all report current.
 2. The metadata gate checks the released changelog section's shape (summary first, known headings
    in order, numbered items) and appends a generated footer with the upgrade and install commands,
    download guide, and diff link. `--notes-only` renders the body for an already published tag.

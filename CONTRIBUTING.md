@@ -164,7 +164,8 @@ separate commits so a single concern can be reverted on its own.
 ## Changelog
 
 Add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) with the change that
-causes it. The released section becomes the GitHub Release body word for word, so write for
+causes it. The released section becomes the GitHub Release body, followed by a generated footer
+with install and upgrade commands, so write for
 someone deciding whether and how to upgrade:
 
 1. Put each item under `Highlights`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
