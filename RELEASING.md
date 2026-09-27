@@ -312,7 +312,8 @@ Before tagging, confirm:
 - The release branch started from a green `main` commit and contains only reviewed version or
   release corrections. Do not rewrite shared history or force-push.
 - `CHANGELOG.md` carries this version: rename `## [Unreleased]` to `## [X.Y.ZrcN] - YYYY-MM-DD`
-  with the tag's date, add a fresh empty `## [Unreleased]` above it, and point the link
+  with the tag's date in New York time, the zone every earlier release used, wherever you are
+  (`TZ=America/New_York date +%F`), add a fresh empty `## [Unreleased]` above it, and point the link
   definitions at the new tag. Open the section with a short summary of what the release means for
   a user, then follow the headings and item rules in [CONTRIBUTING.md](CONTRIBUTING.md#changelog). The metadata gate rejects a missing,
   duplicate, undated, impossible-date, empty, or misshapen section, and `--notes-out FILE` writes
