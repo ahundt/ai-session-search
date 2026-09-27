@@ -6,7 +6,8 @@
 
 For each earlier release, in an empty home directory:
 
-1. install that release's integrations for Claude Code, Codex, and Gemini CLI from PyPI;
+1. install that release's integrations from PyPI for every harness that installs files an upgrade
+   could leave behind: skills and their discovery links, and both instruction variants;
 2. save that release's complete `aise config show` output as `config.toml`, as a user who kept
    the printed defaults would have;
 3. run one ordinary command with the candidate executable, which is all an upgrade through uv,
@@ -17,11 +18,15 @@ A failure names the release and what would have needed a manual step. CI runs th
 push against the Linux build, so a change that breaks upgrades fails before it merges, and the
 `upgrade` job of publish.yml runs it against the native executable before `verify` attests or
 anything is published. It downloads the earlier release with `uvx`, so it needs network access.
-Without `--from` it upgrades from the latest version on PyPI, which is what users have installed:
-between releases that is the last release, and at release time the new version is not on PyPI
-until this check has passed:
+Without `--from` it checks every release PyPI lists from `UPGRADE_FLOOR` on: between releases that
+ends with the last release, and at release time the new version is not on PyPI until this check
+has passed. CI, publish.yml, and RELEASING.md all run it the same way:
 
-    uv run python -m scripts.verify_upgrade_path --executable target/release/aise
+    uv run --no-project python -m scripts.verify_upgrade_path --executable target/release/aise
+
+It refuses to run on Windows: aise finds the home folder there through the Windows known-folder
+API, which HOME and USERPROFILE cannot redirect, so the earlier release would install into the real
+profile.
 """
 
 from __future__ import annotations
@@ -36,13 +41,20 @@ import tempfile
 import urllib.request
 from collections.abc import Sequence
 
-from scripts.release_versions import PYTHON_RELEASE_VERSION
+from scripts.release_versions import PYTHON_RELEASE_VERSION, release_sort_key
 
 PYPI_PROJECT_URL = "https://pypi.org/pypi/ai-session-search/json"
+# The oldest release an upgrade must work from without a manual step. 1.0.0rc1 is excluded: its
+# instruction blocks read "outdated" after any later upgrade, because the instruction text changed
+# in 1.0.0rc2 before the post-upgrade refresh existed, and it is a pre-release outside the
+# compatibility baseline. Lower it only by making those upgrades work.
+UPGRADE_FLOOR = "1.0.0rc2"
 
-CLIENTS = ("claude", "codex", "gemini")
-# Harness directories whose presence makes `aise integrations install` detect the client.
-CLIENT_HOMES = (".claude", ".codex", ".gemini")
+# Every harness whose install writes files an upgrade could leave outdated: skills and discovery
+# links (claude, gemini, antigravity, pi, prime-agent), the MCP-first instruction block (claude,
+# codex, gemini, opencode), and the CLI-only block (pi, prime-agent). Clients that only register an
+# MCP server name the executable's path, which an upgrade keeps.
+CLIENTS = ("claude", "codex", "gemini", "antigravity", "opencode", "pi", "prime-agent")
 
 
 def _environment(home: pathlib.Path, executable_dir: pathlib.Path | None) -> dict[str, str]:
@@ -63,10 +75,20 @@ def _run(argv: Sequence[str], environment: dict[str, str]) -> subprocess.Complet
     return subprocess.run(argv, env=environment, capture_output=True, text=True, check=False)
 
 
-def latest_published_version() -> str:
-    """Return the version PyPI reports as the project's latest release."""
+def _published() -> dict[str, object]:
     with urllib.request.urlopen(PYPI_PROJECT_URL, timeout=30) as response:
-        return str(json.load(response)["info"]["version"])
+        return dict(json.load(response))
+
+
+def published_versions_since(floor: str) -> list[str]:
+    """Return every published release version at or above ``floor``, oldest first."""
+    releases = _published()["releases"]
+    assert isinstance(releases, dict)
+    versions = [version for version in releases if PYTHON_RELEASE_VERSION.fullmatch(version)]
+    return sorted(
+        (version for version in versions if release_sort_key(version) >= release_sort_key(floor)),
+        key=release_sort_key,
+    )
 
 
 def _client_arguments() -> list[str]:
@@ -104,8 +126,6 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
     # into the temporary home when the check finishes.
     with tempfile.TemporaryDirectory(prefix="aise-upgrade-", ignore_cleanup_errors=True) as directory:
         home = pathlib.Path(directory).resolve()
-        for client_home in CLIENT_HOMES:
-            (home / client_home).mkdir()
         old = ["uvx", "--quiet", "--from", f"ai-session-search=={previous}", "aise"]
         old_environment = _environment(home, None)
         installed = _run([*old, "integrations", "install", *_client_arguments()], old_environment)
@@ -142,21 +162,41 @@ def main(argv: list[str] | None = None) -> int:
         "--from",
         dest="previous",
         action="append",
-        help="published version to upgrade from; repeat to check several (default: the latest "
-        "version on PyPI)",
+        help="published version to upgrade from; repeat to check several (default: every "
+        "release PyPI lists from --since on)",
+    )
+    parser.add_argument(
+        "--since",
+        default=UPGRADE_FLOOR,
+        help=f"oldest published release to check when --from is omitted (default: {UPGRADE_FLOOR})",
     )
     args = parser.parse_args(argv)
+    if os.name == "nt":
+        print(
+            "verify_upgrade_path refuses to run on Windows: aise finds the home folder through the "
+            "Windows known-folder API, which HOME and USERPROFILE cannot redirect, so the earlier "
+            "release would install into your real profile. Run it on Linux or macOS; CI runs it "
+            "on Linux.",
+            file=sys.stderr,
+        )
+        return 2
     executable = args.executable.resolve()
+    if PYTHON_RELEASE_VERSION.fullmatch(args.since) is None:
+        print(f"not a release version: {args.since!r}", file=sys.stderr)
+        return 2
     if not args.previous:
         try:
-            args.previous = [latest_published_version()]
+            args.previous = published_versions_since(args.since)
         except (OSError, ValueError, KeyError) as error:
             # Passing here would report an upgrade check that checked nothing.
             print(
-                f"could not read the latest published version from {PYPI_PROJECT_URL}: {error}; "
+                f"could not read the published versions from {PYPI_PROJECT_URL}: {error}; "
                 "pass --from",
                 file=sys.stderr,
             )
+            return 2
+        if not args.previous:
+            print(f"PyPI lists no release at or above {args.since}; pass --from", file=sys.stderr)
             return 2
     failed = False
     for previous in args.previous:

@@ -43,11 +43,27 @@ def test_upgrade_status_fails_closed_when_it_finds_no_installed_skill() -> None:
 
 
 def test_upgrade_check_fails_when_it_cannot_learn_what_to_upgrade_from(monkeypatch: MonkeyPatch) -> None:
-    # Without --from the check upgrades from the latest PyPI release. When that lookup fails,
+    # Without --from the check upgrades from every PyPI release since the floor. When that fails,
     # reporting success would be an upgrade check that checked nothing.
-    def unreachable() -> str:
+    def unreachable() -> dict[str, object]:
         raise OSError("network is unreachable")
 
-    monkeypatch.setattr(verify_upgrade_path, "latest_published_version", unreachable)
+    monkeypatch.setattr(verify_upgrade_path, "_published", unreachable)
 
     assert verify_upgrade_path.main(["--executable", "aise"]) == 2
+
+
+def test_since_checks_every_published_release_from_the_floor(monkeypatch: MonkeyPatch) -> None:
+    # A key or file any of these releases wrote must keep working, not only the latest one's.
+    published: dict[str, object] = {"releases": {"1.0.0rc1": [], "1.0.0rc10": [], "1.0.0rc2": [], "1.0.0rc3": [], "junk": []}}
+    monkeypatch.setattr(verify_upgrade_path, "_published", lambda: published)
+
+    assert verify_upgrade_path.published_versions_since("1.0.0rc2") == ["1.0.0rc2", "1.0.0rc3", "1.0.0rc10"]
+
+
+def test_upgrade_check_refuses_to_touch_a_real_windows_profile(monkeypatch: MonkeyPatch) -> None:
+    # aise finds the Windows home folder through the known-folder API, which HOME and USERPROFILE
+    # cannot redirect, so running the earlier release there would install into the real profile.
+    monkeypatch.setattr(verify_upgrade_path.os, "name", "nt")
+
+    assert verify_upgrade_path.main(["--executable", "aise", "--from", "1.0.0rc3"]) == 2

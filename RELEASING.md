@@ -314,16 +314,14 @@ Before tagging, confirm:
 - `CHANGELOG.md` carries this version: rename `## [Unreleased]` to `## [X.Y.ZrcN] - YYYY-MM-DD`
   with the tag's date, add a fresh empty `## [Unreleased]` above it, and point the link
   definitions at the new tag. Open the section with a short summary of what the release means for
-  a user, then use only `Highlights`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
-  `Security`, and `For contributors`, in that order, with numbered items; the rules for each item
-  are in [CONTRIBUTING.md](CONTRIBUTING.md#changelog). The metadata gate rejects a missing,
+  a user, then follow the headings and item rules in [CONTRIBUTING.md](CONTRIBUTING.md#changelog). The metadata gate rejects a missing,
   duplicate, undated, impossible-date, empty, or misshapen section, and `--notes-out FILE` writes
   the exact body it would publish: the section plus a generated footer with the upgrade command,
   install commands, download guide, and diff link.
-- Upgrading from the latest published release needs nothing but the new executable. CI checks
-  this on every push and the publish `upgrade` job repeats it on the release executable; to run it
-  locally:
-  `cargo build --release --locked --bin aise && uv run python -m scripts.verify_upgrade_path --executable target/release/aise`.
+- Upgrading from each published release since the script's `UPGRADE_FLOOR` needs nothing but the
+  new executable. CI and `./run_ci_local.sh` check this on every change, and the publish `upgrade`
+  job repeats it on the release executable; to run it alone on Linux or macOS:
+  `cargo build --release --locked --bin aise && uv run --no-project python -m scripts.verify_upgrade_path --executable target/release/aise`.
 - The documentation matches this build. Render the release body with `--notes-out`, then read it,
   `README.md`, and every guide under `docs/` the release touches as a first-time reader. Check each
   command, flag, key, setting, and default they name against `aise <command> --help`,
@@ -428,8 +426,8 @@ holds that role and is unaffected.
    container that never received the pin, or a wheel that skipped the rewrite, fails the job
    instead of shipping;
 3. installs and tests the exact artifacts on their target runners;
-4. in a separate read-only `upgrade` job, installs the latest published release's integrations
-   and config from PyPI and runs one command with the new Linux executable, failing if the upgrade would need
+4. in a separate read-only `upgrade` job, installs each published release's integrations and
+   config from PyPI and runs one command with the new Linux executable, failing if the upgrade would need
    any manual step (`scripts/verify_upgrade_path.py`); then `verify` checks the complete artifact
    set, writes `SHA256SUMS`, and creates GitHub build-provenance attestations;
 5. uploads the verified wheels and sdist to TestPyPI and installs the release from that index

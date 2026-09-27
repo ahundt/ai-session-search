@@ -29,8 +29,7 @@ files it writes from now on. Upgrading from 1.0.0rc3 needs no action.
 2. `aise config init` writes every setting commented out except the database and cache paths.
    Uncommenting a line changes that setting; everything else follows the built-in defaults,
    including ones a later release changes. Existing config files are not touched, so a file
-   `aise config init` wrote in 1.0.0rc3 or earlier still pins that release's defaults: delete the
-   lines you did not choose to follow new ones.
+   `aise config init` wrote in 1.0.0rc3 or earlier keeps pinning that release's defaults.
 
 ### Fixed
 
@@ -40,11 +39,11 @@ files it writes from now on. Upgrading from 1.0.0rc3 needs no action.
 
 ### For contributors
 
-1. CI on every push, and the publish workflow before anything is signed, fail when upgrading from
-   the latest published release would need a manual step. They install that release's
-   integrations and printed config from PyPI, run one command with the new executable, and
-   require the old config to load and the Claude Code, Codex, and Gemini CLI integrations to
-   report current.
+1. CI and the local gate on every change, and the publish workflow before anything is signed,
+   fail when upgrading from any published release since 1.0.0rc2 would need a manual step. For
+   each release they install its integrations for every harness that writes files and its printed
+   config, run one command with the new executable, and require the config to load and every
+   integration to report current.
 2. The metadata gate checks the released changelog section's shape (summary first, known headings
    in order, numbered items) and appends a generated footer with the upgrade and install commands,
    download guide, and diff link. `--notes-only` renders the body for an already published tag.

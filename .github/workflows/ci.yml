@@ -75,8 +75,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-targets --all-features --locked
       - run: uv run --no-project python scripts/render_message_search_docs.py --check --aise target/debug/aise
-      # Installs the latest published release's integrations and config from PyPI, runs this
-      # build once, and fails if upgrading would need a manual step. Here it catches the break on
+      # Installs each published release's integrations and config from PyPI, runs this build
+      # once, and fails if upgrading would need a manual step. Here it catches the break on
       # the change that causes it; publish.yml repeats it on the release's own executable.
       - name: Upgrading from the latest release needs no manual step
         run: uv run --no-project python -m scripts.verify_upgrade_path --executable target/debug/aise

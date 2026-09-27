@@ -508,6 +508,18 @@ step "Rust crate packaging" package_rust_crate
 step "Release executable and MCP schema" build_and_verify_release_executable
 step "Python artifacts and install pathways" build_and_verify_python_artifacts
 step "Python runtime license inventory" build_python_license_inventory
+# The CI rust job runs this too. It installs published releases from PyPI into a scratch home, which
+# Windows cannot redirect (aise reads the known-folder API there), so Windows reports a named skip.
+case "$(rustc -vV | sed -n 's/^host: //p')" in
+    *-windows-*)
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+        printf '\n%bSKIPPED: upgrade path from published releases (runs on Linux and macOS)%b\n' "$YELLOW" "$NC"
+        ;;
+    *)
+        step "Upgrade path from published releases" \
+            uv run --no-project python -m scripts.verify_upgrade_path --executable "$CARGO_TARGET_DIR/release/aise"
+        ;;
+esac
 
 # `cargo deny` needs the pinned binary installed, so this follows the actionlint pattern below:
 # report the skip and the exact install command rather than installing anything.

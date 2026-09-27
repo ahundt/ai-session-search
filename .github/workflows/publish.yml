@@ -358,7 +358,7 @@ jobs:
         run: |
           mkdir upgrade
           tar -xzf "dist/ai-session-search-${GITHUB_REF_NAME#v}-x86_64-unknown-linux-gnu.tar.gz" -C upgrade
-          python -m scripts.verify_upgrade_path --executable upgrade/*/aise
+          uv run --no-project python -m scripts.verify_upgrade_path --executable upgrade/*/aise
 
   verify:
     needs: [wheels, native, sdist, crate, sbom, upgrade]

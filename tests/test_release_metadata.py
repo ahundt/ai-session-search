@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.release_versions import cargo_version_for_python
+from scripts.release_versions import cargo_version_for_python, release_sort_key
 from scripts.verify_release_metadata import (
     ReleaseMetadataError,
     check_notes_shape,
@@ -339,3 +339,9 @@ def test_retry_reconciliation_is_idempotent_only_for_exact_registry_state() -> N
         reconcile_registry_artifacts(expected, {"package-1.0.0.whl": "abc"})
     with pytest.raises(ReleaseMetadataError, match="checksum"):
         reconcile_registry_artifacts(expected, {**expected, "package-1.0.0.whl": "wrong"})
+
+
+def test_release_versions_sort_the_way_pep_440_orders_them() -> None:
+    versions = ["1.0.1", "1.0.0", "1.0.0rc10", "1.0.0rc2", "1.0.0b1", "1.0.0a3"]
+
+    assert sorted(versions, key=release_sort_key) == ["1.0.0a3", "1.0.0b1", "1.0.0rc2", "1.0.0rc10", "1.0.0", "1.0.1"]
