@@ -59,6 +59,8 @@ refresh_after_upgrade = true
 ```
 
 Set it to `false` to leave installed skills until `aise skills update` or `aise package update`.
+Only the `aise` executable refreshes, including `aise mcp serve`; the Rust and Python library APIs
+never write installed integrations.
 
 ## Stable-release notifications
 

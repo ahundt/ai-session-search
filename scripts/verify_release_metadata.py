@@ -220,8 +220,9 @@ def release_body(root: pathlib.Path, version: str) -> str:
     return (
         f"{notes}\n"
         "---\n\n"
-        "Upgrade with `aise package update`, which uses whichever package manager installed "
-        "`aise`.\n\n"
+        "Upgrade with `aise package update`: it finds a uv, pip, pipx, Cargo, or Homebrew install, "
+        "runs that manager, and refreshes the installed skill. For a native archive, rerun its "
+        "installer.\n\n"
         "Install:\n\n"
         "```bash\n"
         f"uv tool install ai-session-search=={version}\n"

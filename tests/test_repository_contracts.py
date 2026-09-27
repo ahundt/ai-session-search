@@ -875,6 +875,16 @@ def test_wheels_job_proves_the_pinned_build_clock_reached_the_build() -> None:
     assert '--source-date-epoch "$SOURCE_DATE_EPOCH"' in wheels
 
 
+def test_contributing_lists_the_release_headings_the_gate_enforces() -> None:
+    # The metadata gate enforces NOTES_HEADINGS; CONTRIBUTING.md is where authors read them, and
+    # RELEASING.md links there instead of keeping a third copy.
+    from scripts.verify_release_metadata import NOTES_HEADINGS
+
+    contributing = " ".join((ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").split())
+    listed = ", ".join(f"`{heading}`" for heading in NOTES_HEADINGS[:-1])
+    assert f"{listed}, or `{NOTES_HEADINGS[-1]}`, in that order" in contributing
+
+
 def test_tests_never_run_aise_against_the_developers_real_state() -> None:
     # Any aise command may run the post-upgrade skill refresh, which writes beside the resolved
     # config file. A direct `cargo test` or `pytest` resolved the real ~/.ai-session-search and
