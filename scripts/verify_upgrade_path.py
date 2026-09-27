@@ -13,29 +13,32 @@ For each earlier release, in an empty home directory:
    pip, Cargo, or a native archive does;
 4. require every integration the earlier release installed to report `configured`.
 
-A failure names the release and what would have needed a manual step. The `upgrade` job of
-publish.yml runs this against the Linux native executable, and `verify` waits for it, so nothing
-is attested or published after a failure. It
-downloads the earlier release with `uvx`, so it needs network access. Without `--from` it checks
-the release below the current version's dated section in CHANGELOG.md, which exists only once the
-release is prepared; before that, name the latest published release:
+A failure names the release and what would have needed a manual step. CI runs this on every
+push against the Linux build, so a change that breaks upgrades fails before it merges, and the
+`upgrade` job of publish.yml runs it against the native executable before `verify` attests or
+anything is published. It downloads the earlier release with `uvx`, so it needs network access.
+Without `--from` it upgrades from the latest version on PyPI, which is what users have installed:
+between releases that is the last release, and at release time the new version is not on PyPI
+until this check has passed:
 
-    uv run python -m scripts.verify_upgrade_path --executable target/release/aise --from 1.0.0rc3
+    uv run python -m scripts.verify_upgrade_path --executable target/release/aise
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
-import tomllib
+import urllib.request
 from collections.abc import Sequence
 
 from scripts.release_versions import PYTHON_RELEASE_VERSION
-from scripts.verify_release_metadata import previous_release
+
+PYPI_PROJECT_URL = "https://pypi.org/pypi/ai-session-search/json"
 
 CLIENTS = ("claude", "codex", "gemini")
 # Harness directories whose presence makes `aise integrations install` detect the client.
@@ -58,6 +61,12 @@ def _environment(home: pathlib.Path, executable_dir: pathlib.Path | None) -> dic
 
 def _run(argv: Sequence[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, env=environment, capture_output=True, text=True, check=False)
+
+
+def latest_published_version() -> str:
+    """Return the version PyPI reports as the project's latest release."""
+    with urllib.request.urlopen(PYPI_PROJECT_URL, timeout=30) as response:
+        return str(json.load(response)["info"]["version"])
 
 
 def _client_arguments() -> list[str]:
@@ -133,25 +142,22 @@ def main(argv: list[str] | None = None) -> int:
         "--from",
         dest="previous",
         action="append",
-        help="published version to upgrade from; repeat to check several (default: the release "
-        "below the current version in CHANGELOG.md)",
+        help="published version to upgrade from; repeat to check several (default: the latest "
+        "version on PyPI)",
     )
-    parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd())
     args = parser.parse_args(argv)
     executable = args.executable.resolve()
     if not args.previous:
-        with (args.root / "pyproject.toml").open("rb") as source:
-            version = tomllib.load(source)["project"]["version"]
-        previous = previous_release(args.root, version)
-        if previous is None:
+        try:
+            args.previous = [latest_published_version()]
+        except (OSError, ValueError, KeyError) as error:
             # Passing here would report an upgrade check that checked nothing.
             print(
-                f"CHANGELOG.md has no dated section for {version} with a release below it; pass "
-                "--from with the latest published version",
+                f"could not read the latest published version from {PYPI_PROJECT_URL}: {error}; "
+                "pass --from",
                 file=sys.stderr,
             )
             return 2
-        args.previous = [previous]
     failed = False
     for previous in args.previous:
         if PYTHON_RELEASE_VERSION.fullmatch(previous) is None:
