@@ -211,8 +211,9 @@ changes, including `aise integrations status` and `aise mcp serve`, runs a conse
 refresh once: it rewrites owned skill files that still match what aise recorded, leaves an edited
 file alone and says so on stderr, and visits only roots in the install manifest. Commands that
 install, remove, or update integrations themselves skip it. MCP registrations and aliases name the
-executable path, not its version, and managed instruction text does not change between releases
-without the same refresh, so nothing else needs rerunning. Turn the automatic refresh off with:
+executable path, not its version, and managed instruction text is kept identical across releases,
+because no refresh can yet tell an outdated block from an edited one, so nothing else needs
+rerunning. Turn the automatic refresh off with:
 
 ```toml
 [integrations]

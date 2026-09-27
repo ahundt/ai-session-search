@@ -532,9 +532,10 @@ direct source, or unknown ownership and delegates only to a verified owning mana
 confirmation.
 
 Source checkout, direct URL, Cargo path/Git, and unknown installations receive guidance instead of
-silent registry replacement. After a version change by any manager, refresh only
-manifest-recorded owned skill roots, once, from the first CLI command or MCP server start; an
-update must not discover new clients or rewrite an edited file. Stable executable paths, aliases,
+silent registry replacement. After a version change by any manager, the first command refreshes
+owned skill files once, visiting only manifest-recorded roots; the `skills update` that
+`aise package update` runs also visits detected client roots. Neither configures a new client or
+rewrites an edited file. Stable executable paths, aliases,
 and MCP registrations do not need rewriting. Managed instruction blocks carry no ownership record,
 so their text must not change until the refresh can recognize an unedited block. Uninstall
 integrations before removing the global executable.
