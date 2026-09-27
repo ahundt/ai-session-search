@@ -983,6 +983,12 @@ fn execute(cli: Cli) -> Result<()> {
     let command = match command {
         Commands::Mcp(crate::integrations::McpCmd::Serve) => {
             let resolved = Config::resolve(overrides.clone())?;
+            // Harnesses start the server rather than a CLI command, so an upgrade reaches an
+            // MCP-only user here first. Reported on stderr, which the protocol leaves free.
+            crate::integrations::refresh_owned_skills_after_upgrade_and_report(
+                &resolved.config,
+                &resolved.config_path,
+            );
             return crate::mcp_server::serve_with_config(resolved.config);
         }
         Commands::Mcp(crate::integrations::McpCmd::SchemaBudget(args)) => {
@@ -1059,6 +1065,12 @@ fn execute(cli: Cli) -> Result<()> {
         };
         return crate::skills::run(&config, cmd, &receipt);
     }
+    // After explicit skill management, which may itself be the update the user asked for, and
+    // before any command that reads the index. Config inspection and `package` returned above.
+    crate::integrations::refresh_owned_skills_after_upgrade_and_report(
+        &config,
+        &resolved.config_path,
+    );
     if matches!(command, Commands::Dates) {
         println!("{}", crate::dates::format_reference());
         return Ok(());
