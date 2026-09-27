@@ -40,11 +40,11 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 This release reworks the terminal browser, `aise tui`: typing no longer waits for a search, and you
 can filter sessions, edit the query in place, rebind any key, and press `?` to list them. Three
-changes can affect you: a `config.toml` that sets `[ui].preview_lines` fails to load until you
-rename it (Changed, item 1); the preview now scrolls with `K`/`J` instead of `h`/`l` (item 2); and
-Rust code that builds config structs with a struct literal must start from `Default::default()`
-(item 3). The index format is unchanged, so no reindex is needed. A `rustls` security update is
-included.
+changes can affect you: a `config.toml` that sets `[ui].preview_lines` stops every `aise` command,
+including the MCP server your AI tools start, until you rename it right after upgrading (Changed,
+item 1); the preview now scrolls with `K`/`J` instead of `h`/`l` (item 2); and Rust code that
+builds config structs with a struct literal must start from `Default::default()` (item 3). The
+index format is unchanged, so no reindex is needed. A `rustls` security update is included.
 
 ### Highlights
 
@@ -95,8 +95,9 @@ New and renamed `[ui]` settings, each documented in `config.example.toml`:
 ### Changed
 
 1. `[ui].preview_lines` is now `[ui].preview_body_lines`, and it takes effect: 1.0.0rc2 accepted
-   `preview_lines` but never read it. 1.0.0rc3 fails to load a `config.toml` that still sets the
-   old name, with ``unknown field `preview_lines` ``, so rename it:
+   `preview_lines` but never read it. While `config.toml` still sets the old name, every 1.0.0rc3
+   command, including `aise mcp serve`, exits with ``unknown field `preview_lines` ``. 1.0.0rc2
+   rejects the new name, so rename it right after upgrading:
 
    ```toml
    [ui]
