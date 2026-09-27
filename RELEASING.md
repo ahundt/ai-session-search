@@ -410,8 +410,10 @@ holds that role and is unaffected.
    container that never received the pin, or a wheel that skipped the rewrite, fails the job
    instead of shipping;
 3. installs and tests the exact artifacts on their target runners;
-4. verifies the complete artifact set, writes `SHA256SUMS`, and creates GitHub build-provenance
-   attestations;
+4. verifies the complete artifact set, then installs the previous release's integrations and
+   config from PyPI and runs one command with the new Linux executable, failing if the upgrade
+   would need any manual step (`scripts/verify_upgrade_path.py`); writes `SHA256SUMS`, and
+   creates GitHub build-provenance attestations;
 5. uploads the verified wheels and sdist to TestPyPI and installs the release from that index
    alone, so an unusable distribution stops the release before any immutable version exists.
    The `testpypi` environment has no approval rule, so this adds no pause;

@@ -10,6 +10,7 @@ import pytest
 from scripts.release_versions import cargo_version_for_python
 from scripts.verify_release_metadata import (
     ReleaseMetadataError,
+    previous_release,
     reconcile_registry_artifacts,
     release_notes,
     verify_release_metadata,
@@ -228,6 +229,14 @@ def test_release_metadata_rejects_duplicate_version_sections(tmp_path: Path) -> 
 
     with pytest.raises(ReleaseMetadataError, match=r"more than one.*1\.0\.0rc2"):
         verify_release_metadata(tmp_path, "v1.0.0rc2")
+
+
+def test_previous_release_is_the_dated_section_below_the_version(tmp_path: Path) -> None:
+    _write_changelog(tmp_path, "1.0.0rc2")
+
+    assert previous_release(tmp_path, "1.0.0rc2") == "0.9.0"
+    assert previous_release(tmp_path, "0.9.0") is None
+    assert previous_release(tmp_path, "2.0.0") is None
 
 
 def test_release_notes_return_one_version_section(tmp_path: Path) -> None:
