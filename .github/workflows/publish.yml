@@ -331,9 +331,10 @@ jobs:
           if-no-files-found: error
 
   # An upgrade must need nothing beyond replacing the executable. 1.0.0rc3 renamed a setting
-  # 1.0.0rc2 shipped, and every config that set it stopped loading. This installs the previous
-  # release's integrations and config from PyPI, runs one command with the Linux executable built
-  # above, and fails if anything would have needed a manual step. It runs code downloaded from
+  # 1.0.0rc2 shipped, and every config that set it stopped loading. For every published release
+  # from the script's UPGRADE_FLOOR on, this installs its integrations and config from PyPI, runs
+  # one command with the Linux executable built above, and fails if anything would have needed a
+  # manual step. It runs code downloaded from
   # PyPI, so it gets its own job with the workflow's read-only token rather than running inside
   # `verify`, which can sign attestations; `verify` waits for it.
   upgrade:
@@ -353,7 +354,7 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
-      - name: Upgrading from the previous release needs no manual step
+      - name: Upgrading from every published release needs no manual step
         shell: bash
         run: |
           mkdir upgrade
