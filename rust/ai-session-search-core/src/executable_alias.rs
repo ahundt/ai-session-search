@@ -81,7 +81,8 @@ impl ExecutableAliases {
         Ok(guard)
     }
 
-    pub(crate) fn status_lines(&self) -> Result<Vec<String>> {
+    /// Each alias path with the word `aise integrations status` prints for it.
+    pub(crate) fn statuses(&self) -> Result<Vec<(&Path, &'static str)>> {
         self.aliases
             .iter()
             .map(|alias| {
@@ -90,7 +91,7 @@ impl ExecutableAliases {
                     AliasStatus::Owned => "configured",
                     AliasStatus::Conflict => "conflict (preserved)",
                 };
-                Ok(format!("executable alias {}: {state}", alias.display()))
+                Ok((alias.as_path(), state))
             })
             .collect()
     }
@@ -323,30 +324,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn status_lines_report_missing_then_configured_then_conflict() {
+    fn statuses_report_missing_then_configured_then_conflict() {
         let dir = tempdir().unwrap();
         let executable = dir.path().join("aise");
         fs::write(&executable, "binary").unwrap();
         let aliases = ExecutableAliases::for_test(executable);
 
         // Before install every alias path is missing.
-        let lines = aliases.status_lines().unwrap();
-        assert!(lines.iter().all(|l| l.ends_with("missing")), "{lines:?}");
+        let states = aliases.statuses().unwrap();
+        assert!(states.iter().all(|(_, s)| *s == "missing"), "{states:?}");
 
         // After a committed install every alias is a configured owned symlink.
         aliases.install().unwrap().commit();
-        let lines = aliases.status_lines().unwrap();
-        assert!(lines.iter().all(|l| l.ends_with("configured")), "{lines:?}");
+        let states = aliases.statuses().unwrap();
+        assert!(states.iter().all(|(_, s)| *s == "configured"), "{states:?}");
 
         // Replacing one alias with a non-owned regular file reports a preserved conflict.
         fs::remove_file(dir.path().join("aisearch")).unwrap();
         fs::write(dir.path().join("aisearch"), "user-owned").unwrap();
-        let lines = aliases.status_lines().unwrap();
+        let states = aliases.statuses().unwrap();
         assert!(
-            lines
+            states
                 .iter()
-                .any(|l| l.contains("aisearch") && l.ends_with("conflict (preserved)")),
-            "{lines:?}"
+                .any(|(p, s)| p.ends_with("aisearch") && *s == "conflict (preserved)"),
+            "{states:?}"
         );
     }
 

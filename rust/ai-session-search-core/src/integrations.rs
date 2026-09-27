@@ -321,6 +321,10 @@ pub struct IntegrationStatusArgs {
     /// Do not inspect the `aisearch` and `ai_session_search` executable aliases.
     #[arg(long)]
     pub no_aliases: bool,
+    /// Output format: table for people or JSON for scripts. Each JSON entry has `component`,
+    /// `client`, `path`, `state`, and `current`, which is true when it matches this build.
+    #[arg(long, value_enum, default_value_t = crate::cli::ReportOutputFormat::Table)]
+    pub format: crate::cli::ReportOutputFormat,
     #[command(flatten)]
     pub transaction: IntegrationTransactionArgs,
 }
@@ -1203,32 +1207,24 @@ pub(crate) fn status_with_receipt(
     } else {
         Some(crate::executable_alias::ExecutableAliases::discover()?)
     };
-    if targets.is_empty()
-        && instruction_targets.is_empty()
-        && skill_targets.is_empty()
-        && aliases.is_none()
-    {
-        println!("No supported MCP client config was detected.");
-        return Ok(());
-    }
-    let lines = with_text_file_transaction_read_lock(&receipt, || {
+    let mut entries = with_text_file_transaction_read_lock(&receipt, || {
         ensure_no_pending_transaction(&receipt)?;
-        let mut lines =
+        let mut entries =
             Vec::with_capacity(targets.len() + instruction_targets.len() + skill_targets.len());
         for target in &targets {
-            lines.push(format!(
-                "{} {}: {}",
-                target.label,
-                target.path.display(),
-                status_target(target)?
+            entries.push(IntegrationStatusEntry::new(
+                StatusComponent::Mcp,
+                Some(target.label),
+                &target.path,
+                status_target(target)?,
             ));
         }
         for target in &instruction_targets {
-            lines.push(format!(
-                "{} {}: {}",
-                target.label,
-                target.path.display(),
-                status_instruction_file(target)?
+            entries.push(IntegrationStatusEntry::new(
+                StatusComponent::Instructions,
+                Some(target.label),
+                &target.path,
+                status_instruction_file(target)?,
             ));
         }
         // Read once for the whole report: reloading per target would let two lines disagree if
@@ -1237,37 +1233,119 @@ pub(crate) fn status_with_receipt(
             &crate::skill_manifest::manifest_path(default_receipt),
         )?;
         for target in &skill_targets {
-            lines.push(format!(
-                "{} {}: {}",
-                target.label,
-                target.root.display(),
-                status_skill_file(target, &skill_manifest)?
+            entries.push(IntegrationStatusEntry::new(
+                StatusComponent::Skill,
+                Some(target.label),
+                &target.root,
+                status_skill_file(target, &skill_manifest)?,
             ));
             for link in &target.discovery_links {
-                lines.push(format!(
-                    "{} discovery {}: {}",
-                    target.label,
-                    link.display(),
-                    status_skill_discovery_link(link, &target.root)?
-                ));
+                let (state, current) = status_skill_discovery_link(link, &target.root)?;
+                entries.push(IntegrationStatusEntry {
+                    current,
+                    ..IntegrationStatusEntry::new(
+                        StatusComponent::SkillDiscoveryLink,
+                        Some(target.label),
+                        link,
+                        state,
+                    )
+                });
             }
         }
-        Ok(lines)
+        Ok(entries)
     })?;
-    for line in lines {
-        println!("{line}");
-    }
     if let Some(aliases) = aliases {
-        for line in aliases.status_lines()? {
-            println!("{line}");
+        for (alias, state) in aliases.statuses()? {
+            entries.push(IntegrationStatusEntry::new(
+                StatusComponent::ExecutableAlias,
+                None,
+                alias,
+                state,
+            ));
+        }
+    }
+    match args.format {
+        crate::cli::ReportOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "integrations": entries }))?
+            );
+        }
+        crate::cli::ReportOutputFormat::Table if entries.is_empty() => {
+            println!("No supported MCP client config was detected.");
+        }
+        crate::cli::ReportOutputFormat::Table => {
+            for entry in &entries {
+                println!("{}", entry.line());
+            }
         }
     }
     Ok(())
 }
 
-fn status_skill_discovery_link(link: &Path, canonical_root: &Path) -> Result<String> {
+/// One line of `aise integrations status`, and one entry of its JSON form.
+#[derive(Debug, serde::Serialize)]
+struct IntegrationStatusEntry {
+    component: StatusComponent,
+    /// The harness the entry belongs to; executable aliases belong to none.
+    client: Option<&'static str>,
+    path: String,
+    state: String,
+    /// Whether the entry is exactly what this build installs.
+    current: bool,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StatusComponent {
+    Mcp,
+    Instructions,
+    Skill,
+    SkillDiscoveryLink,
+    ExecutableAlias,
+}
+
+impl IntegrationStatusEntry {
+    fn new(
+        component: StatusComponent,
+        client: Option<&'static str>,
+        path: &Path,
+        state: impl Into<String>,
+    ) -> Self {
+        let state = state.into();
+        Self {
+            component,
+            client,
+            path: path.display().to_string(),
+            // Every status function reports an integration that matches this build as
+            // "configured"; a discovery link says where it points and sets this itself.
+            current: state == ManagedFileState::Current.label(),
+            state,
+        }
+    }
+
+    fn line(&self) -> String {
+        let client = self.client.unwrap_or_default();
+        match self.component {
+            StatusComponent::ExecutableAlias => {
+                format!("executable alias {}: {}", self.path, self.state)
+            }
+            StatusComponent::SkillDiscoveryLink => {
+                format!("{client} discovery {}: {}", self.path, self.state)
+            }
+            StatusComponent::Mcp | StatusComponent::Instructions | StatusComponent::Skill => {
+                format!("{client} {}: {}", self.path, self.state)
+            }
+        }
+    }
+}
+
+/// The state word for a skill discovery link, and whether it points at the canonical root.
+fn status_skill_discovery_link(link: &Path, canonical_root: &Path) -> Result<(String, bool)> {
     match fs::symlink_metadata(link) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(("missing".to_string(), false))
+        }
         Err(error) => {
             Err(error).with_context(|| format!("inspect skill discovery entry {}", link.display()))
         }
@@ -1275,12 +1353,15 @@ fn status_skill_discovery_link(link: &Path, canonical_root: &Path) -> Result<Str
             let target = fs::read_link(link)
                 .with_context(|| format!("read skill discovery link {}", link.display()))?;
             if target == canonical_root {
-                Ok(format!("linked -> {}", canonical_root.display()))
+                Ok((format!("linked -> {}", canonical_root.display()), true))
             } else {
-                Ok(format!("modified link -> {}", target.display()))
+                Ok((format!("modified link -> {}", target.display()), false))
             }
         }
-        Ok(_) => Ok("legacy copied directory or unmanaged entry".to_string()),
+        Ok(_) => Ok((
+            "legacy copied directory or unmanaged entry".to_string(),
+            false,
+        )),
     }
 }
 
@@ -6333,6 +6414,62 @@ mod tests {
             refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap(),
             UpgradeRefresh::NotNeeded
         ));
+    }
+
+    #[test]
+    fn status_json_carries_each_line_with_whether_it_matches_this_build() {
+        // Scripts read `current` instead of parsing the words after the colon, which differ by
+        // component and have changed between releases.
+        let skill = IntegrationStatusEntry::new(
+            StatusComponent::Skill,
+            Some("claude"),
+            Path::new("/h/skills/ai-session-search"),
+            ManagedFileState::Current.label(),
+        );
+        assert_eq!(
+            skill.line(),
+            "claude /h/skills/ai-session-search: configured"
+        );
+        assert_eq!(
+            serde_json::to_value(&skill).unwrap(),
+            json!({
+                "component": "skill",
+                "client": "claude",
+                "path": "/h/skills/ai-session-search",
+                "state": "configured",
+                "current": true
+            })
+        );
+        let outdated = IntegrationStatusEntry::new(
+            StatusComponent::Instructions,
+            Some("codex"),
+            Path::new("/h/.codex/AGENTS.md"),
+            "outdated",
+        );
+        assert!(!outdated.current);
+        assert_eq!(outdated.line(), "codex /h/.codex/AGENTS.md: outdated");
+        let alias = IntegrationStatusEntry::new(
+            StatusComponent::ExecutableAlias,
+            None,
+            Path::new("/bin/aisearch"),
+            "configured",
+        );
+        assert_eq!(alias.line(), "executable alias /bin/aisearch: configured");
+        assert_eq!(serde_json::to_value(&alias).unwrap()["client"], Value::Null);
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let link = dir.path().join("link");
+        let (state, current) = status_skill_discovery_link(&link, &root).unwrap();
+        assert_eq!((state.as_str(), current), ("missing", false));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            let (state, current) = status_skill_discovery_link(&link, &root).unwrap();
+            assert_eq!(state, format!("linked -> {}", root.display()));
+            assert!(current);
+        }
     }
 
     #[test]

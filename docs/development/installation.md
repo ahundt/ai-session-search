@@ -214,7 +214,8 @@ install manifest, and replaces an aise instruction block in a harness's CLAUDE.m
 GEMINI.md where it stands when the block still holds text some release wrote. It leaves an edited
 file or block alone and says so on stderr. Commands that install or remove integrations themselves
 skip it. MCP registrations and aliases name the executable path, not its version, so nothing else
-needs rerunning. Turn the automatic refresh off with:
+needs rerunning. `aise integrations status --format json` reports each integration with a `current`
+field for scripts. Turn the automatic refresh off with:
 
 ```toml
 [integrations]
