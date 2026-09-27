@@ -312,10 +312,13 @@ Before tagging, confirm:
   release corrections. Do not rewrite shared history or force-push.
 - `CHANGELOG.md` carries this version: rename `## [Unreleased]` to `## [X.Y.ZrcN] - YYYY-MM-DD`
   with the tag's date, add a fresh empty `## [Unreleased]` above it, and point the link
-  definitions at the new tag. Anything a user has to do when upgrading belongs first in that
-  section, because the whole section is published as the release body. The metadata gate rejects
-  a missing, duplicate, undated, impossible-date, or empty section, and `--notes-out FILE` writes
-  the body it would publish.
+  definitions at the new tag. Open the section with a short summary of what the release means for
+  a user, then use only `Highlights`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
+  `Security`, and `For contributors`, in that order, with numbered items; the rules for each item
+  are in [CONTRIBUTING.md](CONTRIBUTING.md#changelog). The metadata gate rejects a missing,
+  duplicate, undated, impossible-date, empty, or misshapen section, and `--notes-out FILE` writes
+  the exact body it would publish: the section plus a generated footer with the upgrade command,
+  install commands, download guide, and diff link.
 - `git status --short` is clean.
 - The staged release diff was inspected before its version commit.
 - `python -m scripts.verify_release_metadata --tag vX.Y.ZrcN` passes.

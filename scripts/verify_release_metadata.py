@@ -42,6 +42,22 @@ CHANGELOG = "CHANGELOG.md"
 _CHANGELOG_SECTION = re.compile(r"^## \[(?P<version>[^]]+)\](?: - (?P<date>\d{4}-\d{2}-\d{2}))?\s*$")
 
 
+# A released section reads top to bottom for someone deciding whether and how to upgrade: a short
+# summary, then Keep a Changelog headings in this order. "Highlights" names the few changes most
+# readers came for; "For contributors" keeps build and test work out of the user-facing sections.
+# There is no upgrading heading: upgrading is one command, and the generated footer gives it.
+NOTES_HEADINGS = (
+    "Highlights",
+    "Added",
+    "Changed",
+    "Deprecated",
+    "Removed",
+    "Fixed",
+    "Security",
+    "For contributors",
+)
+
+
 class ReleaseMetadataError(ValueError):
     """Release metadata or observed registry state is inconsistent."""
 
@@ -139,6 +155,81 @@ def release_notes(root: pathlib.Path, version: str) -> str:
     return notes + "\n"
 
 
+def check_notes_shape(notes: str, version: str) -> None:
+    """Reject a released section that does not open with a summary or strays from the headings."""
+    lines = []
+    fenced = False
+    for line in notes.splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced:
+            lines.append(line)
+    where = f"{CHANGELOG} section '## [{version}]'"
+    first = next((line for line in lines if line.strip()), "")
+    if first.startswith(("#", "- ", "* ", "1. ")):
+        raise ReleaseMetadataError(
+            f"{where} must open with a short summary paragraph of what the release means for a "
+            "user, before its first heading or list"
+        )
+    headings = [line[4:].strip() for line in lines if line.startswith("### ")]
+    unknown = [heading for heading in headings if heading not in NOTES_HEADINGS]
+    if unknown:
+        raise ReleaseMetadataError(
+            f"{where} uses {unknown}; release headings are {list(NOTES_HEADINGS)}. Upgrading is "
+            "one command, which the generated footer gives, so there is no upgrade section"
+        )
+    order = [NOTES_HEADINGS.index(heading) for heading in headings]
+    if order != sorted(order) or len(set(order)) != len(order):
+        raise ReleaseMetadataError(
+            f"{where} headings must appear once each in the order {list(NOTES_HEADINGS)}"
+        )
+    bullets = [line for line in lines if line.startswith(("- ", "* "))]
+    if bullets:
+        raise ReleaseMetadataError(
+            f"{where} uses bullet lists; number the items so a reader can cite one: {bullets[0]!r}"
+        )
+
+
+def release_body(root: pathlib.Path, version: str) -> str:
+    """Return the GitHub Release body: the changelog section plus generated install guidance.
+
+    The footer is derived from the version, so the commands in it cannot drift from the release
+    they describe and no author has to write them.
+    """
+    notes = release_notes(root, version)
+    check_notes_shape(notes, version)
+    cargo_version = cargo_version_for_python(version)
+    repository = str(_manifest(root / "pyproject.toml")["project"]["urls"]["Repository"])  # type: ignore[index]
+    previous = previous_release(root, version)
+    diff = (
+        f"[v{previous}...v{version}]({repository}/compare/v{previous}...v{version})"
+        if previous is not None
+        else f"[v{version}]({repository}/tree/v{version})"
+    )
+    return (
+        f"{notes}\n"
+        "---\n\n"
+        "Upgrade with `aise package update`, which uses whichever package manager installed "
+        "`aise`.\n\n"
+        "Install:\n\n"
+        "```bash\n"
+        f"uv tool install ai-session-search=={version}\n"
+        f"python -m pip install ai-session-search=={version}\n"
+        f"cargo install ai-session-search --locked --version {cargo_version}\n"
+        "```\n\n"
+        "Then run `aise integrations install` once to connect your AI tools.\n\n"
+        "| To get | Download |\n"
+        "| --- | --- |\n"
+        f"| The `aise` executable alone | `ai-session-search-{version}-<target>.tar.gz`, or `.zip` "
+        "on Windows |\n"
+        f"| The Python package, offline | `ai_session_search-{version}-cp312-abi3-<platform>.whl` |\n"
+        f"| Source | `ai_session_search-{version}.tar.gz` or the `.crate` |\n\n"
+        "Check a download with `shasum -a 256 -c SHA256SUMS --ignore-missing`. The `*.cdx.json` "
+        "SBOMs and the license files are for audits.\n\n"
+        f"Full diff: {diff}\n"
+    )
+
+
 def previous_release(root: pathlib.Path, version: str) -> str | None:
     """Return the dated release immediately below ``version`` in the changelog, if any."""
     versions = [
@@ -188,7 +279,7 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
                 f"instead of the release version {cargo_version!r}"
             )
     _verify_documented_requirements(root, cargo_version)
-    release_notes(root, version)
+    release_body(root, version)
     return version
 
 
@@ -218,13 +309,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--notes-out",
         type=pathlib.Path,
-        help="write the release's changelog section here for the GitHub Release body",
+        help="write the GitHub Release body here: the changelog section and generated install guidance",
+    )
+    parser.add_argument(
+        "--notes-only",
+        action="store_true",
+        help="check and render the notes for an already published tag without the version checks, "
+        "to revise its release body with `gh release edit --notes-file`",
     )
     args = parser.parse_args(argv)
     try:
-        version = verify_release_metadata(args.root, args.tag)
+        if args.notes_only:
+            version = args.tag.removeprefix("v")
+            body = release_body(args.root, version)
+        else:
+            version = verify_release_metadata(args.root, args.tag)
+            body = release_body(args.root, version)
         if args.notes_out is not None:
-            args.notes_out.write_text(release_notes(args.root, version), encoding="utf-8")
+            args.notes_out.write_text(body, encoding="utf-8")
         print(version)
     except (KeyError, OSError, ReleaseMetadataError, tomllib.TOMLDecodeError) as error:
         print(f"release metadata verification failed: {error}", file=sys.stderr)
