@@ -373,6 +373,20 @@ jobs:
         run: >-
           python -m scripts.verify_release_artifacts
           --release-set --version "${GITHUB_REF_NAME#v}" dist/*
+      # An upgrade must need nothing beyond replacing the executable. 1.0.0rc3 renamed a setting
+      # 1.0.0rc2 shipped, and every config that set it stopped loading; this installs the
+      # previous release's integrations and config from PyPI, runs one command with the Linux
+      # executable built above, and fails if anything would have needed a manual step.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Upgrading from the previous release needs no manual step
+        shell: bash
+        run: |
+          mkdir upgrade
+          tar -xzf "dist/ai-session-search-${GITHUB_REF_NAME#v}-x86_64-unknown-linux-gnu.tar.gz" -C upgrade
+          python -m scripts.verify_upgrade_path --executable upgrade/*/aise
       - run: (cd dist && sha256sum -- * > SHA256SUMS)
       # A real release only. This action has no dry-run — every invocation persists an
       # attestation in the repository's list, and there is no API to remove one — so a

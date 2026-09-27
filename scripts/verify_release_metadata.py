@@ -139,6 +139,19 @@ def release_notes(root: pathlib.Path, version: str) -> str:
     return notes + "\n"
 
 
+def previous_release(root: pathlib.Path, version: str) -> str | None:
+    """Return the dated release immediately below ``version`` in the changelog, if any."""
+    versions = [
+        section["version"]
+        for line in (root / CHANGELOG).read_text(encoding="utf-8").splitlines()
+        if (section := _CHANGELOG_SECTION.match(line)) is not None and section["date"] is not None
+    ]
+    if version not in versions:
+        return None
+    index = versions.index(version)
+    return versions[index + 1] if index + 1 < len(versions) else None
+
+
 def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
     project = _manifest(root / "pyproject.toml")
     core = _manifest(root / "rust/ai-session-search-core/Cargo.toml")
