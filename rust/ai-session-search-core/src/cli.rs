@@ -939,17 +939,24 @@ fn clarify_stale_message_argument(
     error
 }
 
-/// Whether `command` should first bring installed skills up to this version.
+/// Whether `command` should first bring installed integrations up to this version.
+///
+/// `aise skills update` refreshes first, unless it is a dry run: `aise package update` runs it with
+/// the new executable, so the refresh, which also covers instruction files, happens there instead
+/// of waiting for the next command.
 fn refreshes_integrations_after_upgrade(command: &Commands) -> bool {
-    !matches!(
-        command,
+    match command {
         Commands::Integrations(
             IntegrationsCmd::Install(_)
-                | IntegrationsCmd::Uninstall(_)
-                | IntegrationsCmd::Recover(_)
-        ) | Commands::Package(PackageCmd::Update(_))
-            | Commands::Migrate(_)
-    ) && !matches!(command, Commands::Skills(cmd) if cmd.is_management())
+            | IntegrationsCmd::Uninstall(_)
+            | IntegrationsCmd::Recover(_),
+        )
+        | Commands::Package(PackageCmd::Update(_))
+        | Commands::Migrate(_) => false,
+        Commands::Skills(crate::skills::SkillsCmd::Update(args)) => !args.dry_run,
+        Commands::Skills(cmd) => !cmd.is_management(),
+        _ => true,
+    }
 }
 
 fn execute(cli: Cli) -> Result<()> {
@@ -972,7 +979,7 @@ fn execute(cli: Cli) -> Result<()> {
     let mut resolved_early = None;
     if refreshes_integrations_after_upgrade(&cli.command) {
         if let Ok(resolved) = Config::resolve(overrides.clone()) {
-            crate::integrations::refresh_owned_skills_after_upgrade_and_report(
+            crate::integrations::refresh_integrations_after_upgrade_and_report(
                 &resolved.config,
                 &resolved.config_path,
             );
@@ -2476,6 +2483,8 @@ mod tests {
             &["package", "status"],
             &["dates"],
             &["list"],
+            // What `aise package update` runs with the new executable.
+            &["skills", "update"],
         ] {
             assert!(refreshes(args), "{args:?} should refresh first");
         }
@@ -2483,7 +2492,14 @@ mod tests {
             &["integrations", "install"][..],
             &["integrations", "uninstall"],
             &["package", "update"],
-            &["skills", "update"],
+            &["skills", "update", "--dry-run"],
+            &[
+                "skills",
+                "restore",
+                "ai-session-search",
+                "--skill-root",
+                "/x",
+            ],
         ] {
             assert!(!refreshes(args), "{args:?} manages integrations itself");
         }

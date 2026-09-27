@@ -1001,8 +1001,9 @@ impl Default for ReleaseNotificationConfig {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct IntegrationsConfig {
-    /// After aise changes version, rewrite installed skill files it owns that nobody has edited,
-    /// once, from the first CLI command or MCP server start. Edited files are never rewritten.
+    /// After aise changes version, rewrite installed skill files and instruction blocks it wrote
+    /// that nobody has edited, once, from the first CLI command or MCP server start. Edits are
+    /// never rewritten.
     pub refresh_after_upgrade: bool,
 }
 

@@ -197,9 +197,10 @@ cargo uninstall ai-session-search
 `aise package update --yes` skips the confirmation prompt but still requires
 authoritative ownership evidence. The command delegates to uv, pip, pipx,
 Cargo, or Homebrew, then runs the replacement executable's conservative
-`skills update` after the manager succeeds. That command visits detected client
-roots plus every root recorded in the install manifest, including custom roots,
-rewrites only unedited aise-owned files, and never configures new clients. It
+`skills update` after the manager succeeds. That command first runs the post-upgrade refresh
+described below, then visits detected client roots plus every root recorded in the install
+manifest, including custom roots, rewrites only unedited aise-owned files, and never configures new
+clients. It
 never overwrites the executable itself. It refuses
 automatic apply for a direct URL or source checkout, including a maintainer
 checkout installed into a uv tool environment or with `cargo install --path`
@@ -207,13 +208,13 @@ or `cargo install --git`, and for unknown executables. Update the recorded
 source with its original workflow instead.
 
 Upgrading is one command whichever manager owns `aise`. The first command after the version
-changes, including `aise integrations status` and `aise mcp serve`, runs a conservative skill
-refresh once: it rewrites owned skill files that still match what aise recorded, leaves an edited
-file alone and says so on stderr, and visits only roots in the install manifest. Commands that
-install, remove, or update integrations themselves skip it. MCP registrations and aliases name the
-executable path, not its version, and managed instruction text is kept identical across releases,
-because no refresh can yet tell an outdated block from an edited one, so nothing else needs
-rerunning. Turn the automatic refresh off with:
+changes, including `aise integrations status` and `aise mcp serve`, runs a conservative refresh
+once. It rewrites owned skill files that still match what aise recorded, visiting only roots in the
+install manifest, and replaces an aise instruction block in a harness's CLAUDE.md, AGENTS.md, or
+GEMINI.md where it stands when the block still holds text some release wrote. It leaves an edited
+file or block alone and says so on stderr. Commands that install or remove integrations themselves
+skip it. MCP registrations and aliases name the executable path, not its version, so nothing else
+needs rerunning. Turn the automatic refresh off with:
 
 ```toml
 [integrations]

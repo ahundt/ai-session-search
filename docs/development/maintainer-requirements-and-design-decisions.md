@@ -533,12 +533,14 @@ confirmation.
 
 Source checkout, direct URL, Cargo path/Git, and unknown installations receive guidance instead of
 silent registry replacement. After a version change by any manager, the first command refreshes
-owned skill files once, visiting only manifest-recorded roots; the `skills update` that
-`aise package update` runs also visits detected client roots. Neither configures a new client or
-rewrites an edited file. Stable executable paths, aliases,
-and MCP registrations do not need rewriting. Managed instruction blocks carry no ownership record,
-so their text must not change until the refresh can recognize an unedited block. Uninstall
-integrations before removing the global executable.
+owned skill files once, visiting only manifest-recorded roots, and replaces in place each client
+instruction block that still holds text some release wrote; the `skills update` that
+`aise package update` runs does the same first, then also visits detected client roots. Neither
+configures a new client or rewrites an edited file. Stable executable paths, aliases, and MCP
+registrations do not need rewriting. Instruction blocks carry no ownership record, so a block is
+recognized by its text: changing a line requires adding the old line's digest to
+`EARLIER_INSTRUCTION_LINE_DIGESTS`, which a pinned-digest test enforces. Uninstall integrations
+before removing the global executable.
 
 ### REQ025-justify-timeouts
 

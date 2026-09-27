@@ -50,15 +50,16 @@ ignored or normalized later.
 ## Installed integrations after an upgrade
 
 The `[integrations]` panel controls the one-time refresh that the first command after a version
-change performs. It rewrites installed aise-owned skill files that nobody has edited, leaves edited
-ones alone, and reports what it did on stderr:
+change performs. It rewrites installed aise-owned skill files and instruction blocks that nobody
+has edited, leaves edited ones alone, and reports what it did on stderr:
 
 ```toml
 [integrations]
 refresh_after_upgrade = true
 ```
 
-Set it to `false` to leave installed skills until `aise skills update` or `aise package update`.
+Set it to `false` to leave installed integrations until `aise integrations install`; `aise skills
+update` and `aise package update` then refresh skills only.
 Only the `aise` executable refreshes, including `aise mcp serve`; the Rust and Python library APIs
 never write installed integrations.
 

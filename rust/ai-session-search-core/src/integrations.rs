@@ -37,6 +37,12 @@ const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Ses
 /// the three CLI commands that cover the common path and names the installed skill, because the
 /// MCP-first sentence above sends such an agent to a tool it cannot call.
 const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; on this harness the `aise` command and the installed skill are the whole integration. List recent sessions with `aise list --path <dir> --when 7d --limit 10`, find sessions by topic with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; `aise <command> --help` lists every current flag.";
+/// SHA-256 of each instruction line an earlier release wrote and this build no longer does:
+/// 1.0.0rc1's `INSTRUCTIONS_LINE`. The post-upgrade refresh replaces a block that still holds one
+/// of these, or any line above, because aise wrote it; any other text is the user's. When a line
+/// above changes, add the digest of its old text here.
+const EARLIER_INSTRUCTION_LINE_DIGESTS: [&str; 1] =
+    ["3efca133a9dfaf9e359dce78582c83601c4a31c832ebfd6ef1caf5aa4398cfc6"];
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
@@ -2999,58 +3005,82 @@ pub(crate) fn write_owned_skills(
 pub(crate) enum UpgradeRefresh {
     /// Already refreshed for this version, or no aise-owned skill is recorded as installed.
     NotNeeded,
-    /// Every recorded root was checked once for this version.
-    Checked(Vec<SkillWriteOutcome>),
+    /// Every recorded skill root and every client instruction file was checked once.
+    Checked {
+        skills: Vec<SkillWriteOutcome>,
+        instructions: Vec<InstructionRefresh>,
+    },
     /// Another aise process holds the integration lock; the next command tries again.
     Deferred,
 }
 
-/// Bring owned, unedited skill files up to this build once after aise changes version.
+/// What the post-upgrade refresh did to one client instruction file.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InstructionRefresh {
+    /// Its aise block held text an earlier release wrote and now holds this build's.
+    Updated(PathBuf),
+    /// Its aise block holds text aise never wrote, so it was left as the user wrote it.
+    Edited(PathBuf),
+}
+
+/// Bring owned, unedited integration files up to this build once after aise changes version.
 ///
 /// Every release changes the packaged skill, if only its `metadata.version` line, so without this
 /// an upgrade through `uv tool upgrade`, pip, Cargo, or a native archive left the installed skill
 /// outdated until someone ran `aise integrations install`. Only `aise package update` refreshed it.
-/// This runs the same conservative planner as `aise skills update`: files still byte-identical to
-/// what aise recorded are rewritten, and an edited file is left alone and reported. It visits only
-/// the roots the install manifest records, so it never discovers or configures a new client.
+/// Skills go through the same conservative planner as `aise skills update`: files still
+/// byte-identical to what aise recorded are rewritten, and an edited file is left alone and
+/// reported. It visits only the roots the install manifest records, so it never discovers or
+/// configures a new client. Instruction blocks in the clients' CLAUDE.md, AGENTS.md, and GEMINI.md
+/// are replaced in place only while they hold text some release wrote.
 ///
 /// # Errors
 ///
 /// Returns an error when the manifest cannot be read, a root cannot be planned for a reason that is
 /// not about ownership, or the transaction fails for a reason other than lock contention.
-pub(crate) fn refresh_owned_skills_after_upgrade(receipt_path: &Path) -> Result<UpgradeRefresh> {
-    refresh_owned_skills_for_version(receipt_path, env!("CARGO_PKG_VERSION"))
+pub(crate) fn refresh_integrations_after_upgrade(receipt_path: &Path) -> Result<UpgradeRefresh> {
+    refresh_integrations_for_version(
+        receipt_path,
+        env!("CARGO_PKG_VERSION"),
+        ClientLayout::discover().ok().as_ref(),
+    )
 }
 
-fn refresh_owned_skills_for_version(receipt_path: &Path, version: &str) -> Result<UpgradeRefresh> {
-    let marker = crate::skill_manifest::refreshed_version_path(receipt_path);
-    // Only a newer version refreshes. Two installs of different versions, such as an old Cargo
-    // build on PATH beside a newer uv install that MCP clients launch, must not rewrite the skill
-    // back and forth, and the older one must never downgrade it.
-    if let Ok(recorded) = fs::read_to_string(&marker) {
-        let recorded = recorded.trim();
-        let is_newer = match (
-            semver::Version::parse(version),
-            semver::Version::parse(recorded),
-        ) {
-            (Ok(running), Ok(recorded)) => running > recorded,
-            _ => version != recorded,
-        };
-        if !is_newer {
-            return Ok(UpgradeRefresh::NotNeeded);
-        }
+/// `layout` locates the client instruction files; `None` checks skills only.
+fn refresh_integrations_for_version(
+    receipt_path: &Path,
+    version: &str,
+    layout: Option<&ClientLayout>,
+) -> Result<UpgradeRefresh> {
+    if !is_newer_than_refreshed(receipt_path, version) {
+        return Ok(UpgradeRefresh::NotNeeded);
     }
     let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
     let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
     let mut roots = manifest_recorded_skill_roots(&manifest)?;
-    // A recorded root whose directory is gone was removed by the user; an upgrade must not put it
-    // back. `aise integrations install` restores it on request.
-    roots.retain(|root| root.is_dir());
+    // Instruction files hold no install record, so the recorded skill is the evidence that aise
+    // installed integrations with this configuration; without one there is nothing to refresh,
+    // and a process run with its own empty configuration never reads the user's client files.
     if roots.is_empty() {
         return Ok(UpgradeRefresh::NotNeeded);
     }
-    let outcomes = match write_owned_skills(&roots, receipt_path, false, false) {
-        Ok(outcomes) => outcomes,
+    // A recorded root whose directory is gone was removed by the user; an upgrade must not put it
+    // back. `aise integrations install` restores it on request.
+    roots.retain(|root| root.is_dir());
+    let outcome = (|| {
+        let skills = if roots.is_empty() {
+            Vec::new()
+        } else {
+            write_owned_skills(&roots, receipt_path, false, false)?
+        };
+        let instructions = match layout {
+            Some(layout) => refresh_earlier_instruction_blocks(receipt_path, layout)?,
+            None => Vec::new(),
+        };
+        Ok::<_, anyhow::Error>((skills, instructions))
+    })();
+    let (skills, instructions) = match outcome {
+        Ok(checked) => checked,
         Err(error)
             if error
                 .downcast_ref::<crate::text_file_transaction::IntegrationLockHeld>()
@@ -3064,15 +3094,172 @@ fn refresh_owned_skills_for_version(receipt_path: &Path, version: &str) -> Resul
     // than silenced until the next release; an edited file is an outcome, not a failure, and is
     // reported once. A config directory that cannot hold the marker only costs repeating a check
     // that is safe to repeat, so failing to write it is not reported.
-    let _ = fs::write(&marker, format!("{version}\n"));
-    Ok(UpgradeRefresh::Checked(outcomes))
+    record_refreshed_version(receipt_path, version);
+    Ok(UpgradeRefresh::Checked {
+        skills,
+        instructions,
+    })
 }
 
-/// Run [`refresh_owned_skills_after_upgrade`] for a CLI or MCP command and report it on stderr.
+/// Replace every client instruction block that holds text an earlier release wrote.
+///
+/// The block is rewritten where it stands, unlike `aise integrations install`, which moves it to
+/// the end of the file. A file aise cannot read is skipped; `aise integrations status` reports it.
+fn refresh_earlier_instruction_blocks(
+    receipt_path: &Path,
+    layout: &ClientLayout,
+) -> Result<Vec<InstructionRefresh>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut mutations = Vec::new();
+    let mut refreshes = Vec::new();
+    for target in CONCRETE_CLIENTS
+        .into_iter()
+        .flat_map(|client| instruction_targets_for_layout(client, layout))
+    {
+        if !seen.insert(target.path.clone()) {
+            continue;
+        }
+        let path = match target.format {
+            InstructionFormat::ClaudeImport => {
+                let imports_it = read_optional_utf8_regular_file(&target.path)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|text| text.lines().any(is_instruction_reference_line));
+                if !imports_it {
+                    continue;
+                }
+                aise_instruction_path(&target.path)
+            }
+            InstructionFormat::InlineBlock | InstructionFormat::InlineCliBlock => {
+                target.path.clone()
+            }
+        };
+        let Some(original) = read_optional_utf8_regular_file(&path).ok().flatten() else {
+            continue;
+        };
+        let refreshed = match target.format {
+            InstructionFormat::ClaudeImport => refreshed_instruction_file(&original),
+            format => refreshed_instruction_block(&original, format),
+        };
+        match refreshed {
+            BlockRefresh::Current => {}
+            BlockRefresh::Edited => refreshes.push(InstructionRefresh::Edited(path)),
+            BlockRefresh::Replace(next) => {
+                mutations.push(planned_write(&path, &Some(original), next));
+                refreshes.push(InstructionRefresh::Updated(path));
+            }
+        }
+    }
+    let mutations = normalize_planned_mutations(mutations)?;
+    if !mutations.is_empty() {
+        execute_planned_transaction_with_links(receipt_path, &mutations, &[], |_, _| Ok(()))?;
+    }
+    Ok(refreshes)
+}
+
+enum BlockRefresh {
+    /// Already this build's text, or not an aise block this refresh can read.
+    Current,
+    Edited,
+    Replace(String),
+}
+
+/// Whether `line` is instruction text some release of aise wrote.
+fn is_aise_instruction_line(line: &str) -> bool {
+    [
+        INSTRUCTIONS_LINE,
+        CLI_INSTRUCTIONS_LINE,
+        LEGACY_INSTRUCTIONS_LINE,
+    ]
+    .contains(&line)
+        || EARLIER_INSTRUCTION_LINE_DIGESTS
+            .contains(&crate::hashing::sha256(line.as_bytes()).as_str())
+}
+
+/// The inline block in AGENTS.md or GEMINI.md, brought up to this build if aise wrote its text.
+fn refreshed_instruction_block(text: &str, format: InstructionFormat) -> BlockRefresh {
+    if text.matches(INSTRUCTIONS_START).count() != 1 || text.matches(INSTRUCTIONS_END).count() != 1
+    {
+        return BlockRefresh::Current;
+    }
+    let (Some(start), Some(end)) = (text.find(INSTRUCTIONS_START), text.find(INSTRUCTIONS_END))
+    else {
+        return BlockRefresh::Current;
+    };
+    let end = end + INSTRUCTIONS_END.len();
+    if end <= start {
+        return BlockRefresh::Current;
+    }
+    let current = instruction_block(format);
+    let current = current.trim_end();
+    let block = &text[start..end];
+    if block == current {
+        return BlockRefresh::Current;
+    }
+    let body = block
+        .split_once('\n')
+        .and_then(|(_, rest)| rest.strip_suffix(INSTRUCTIONS_END))
+        .map(str::trim);
+    if !body.is_some_and(is_aise_instruction_line) {
+        return BlockRefresh::Edited;
+    }
+    BlockRefresh::Replace(format!("{}{current}{}", &text[..start], &text[end..]))
+}
+
+/// AI_SESSION_SEARCH.md, which CLAUDE.md imports, brought up to this build if aise wrote its text.
+fn refreshed_instruction_file(text: &str) -> BlockRefresh {
+    if is_current_instruction_file(text) {
+        return BlockRefresh::Current;
+    }
+    let body = if text.trim_end() == legacy_instruction_file_content().trim_end() {
+        Some(LEGACY_INSTRUCTIONS_LINE)
+    } else {
+        text.trim_end()
+            .strip_prefix("# AI Session Search (`aise`)\n\n")
+            .and_then(|managed| managed.strip_prefix(INSTRUCTIONS_FILE_START))
+            .and_then(|managed| managed.strip_suffix(INSTRUCTIONS_FILE_END))
+            .map(str::trim)
+    };
+    if body.is_some_and(is_aise_instruction_line) {
+        BlockRefresh::Replace(instruction_file_content())
+    } else {
+        BlockRefresh::Edited
+    }
+}
+
+/// Whether `version` is newer than the version that last refreshed the installed integrations.
+///
+/// Only a newer version refreshes. Two installs of different versions, such as an old Cargo build
+/// on PATH beside a newer uv install that MCP clients launch, must not rewrite the skill back and
+/// forth, and the older one must never downgrade it.
+fn is_newer_than_refreshed(receipt_path: &Path, version: &str) -> bool {
+    let marker = crate::skill_manifest::refreshed_version_path(receipt_path);
+    let Ok(recorded) = fs::read_to_string(marker) else {
+        return true;
+    };
+    let recorded = recorded.trim();
+    match (
+        semver::Version::parse(version),
+        semver::Version::parse(recorded),
+    ) {
+        (Ok(running), Ok(recorded)) => running > recorded,
+        _ => version != recorded,
+    }
+}
+
+/// Record that `version` checked every installed integration, unless a newer one already did.
+fn record_refreshed_version(receipt_path: &Path, version: &str) {
+    if is_newer_than_refreshed(receipt_path, version) {
+        let marker = crate::skill_manifest::refreshed_version_path(receipt_path);
+        let _ = fs::write(marker, format!("{version}\n"));
+    }
+}
+
+/// Run [`refresh_integrations_after_upgrade`] for a CLI or MCP command and report it on stderr.
 ///
 /// Stdout carries command output and the MCP protocol, so every line goes to stderr, and nothing
 /// is printed when nothing changed. `[integrations] refresh_after_upgrade = false` turns it off.
-pub(crate) fn refresh_owned_skills_after_upgrade_and_report(
+pub(crate) fn refresh_integrations_after_upgrade_and_report(
     config: &crate::config::Config,
     config_path: &Path,
 ) {
@@ -3081,10 +3268,13 @@ pub(crate) fn refresh_owned_skills_after_upgrade_and_report(
     }
     let receipt = default_transaction_receipt(config_path);
     let version = env!("CARGO_PKG_VERSION");
-    match refresh_owned_skills_after_upgrade(&receipt) {
+    match refresh_integrations_after_upgrade(&receipt) {
         Ok(UpgradeRefresh::NotNeeded | UpgradeRefresh::Deferred) => {}
-        Ok(UpgradeRefresh::Checked(outcomes)) => {
-            for outcome in outcomes {
+        Ok(UpgradeRefresh::Checked {
+            skills,
+            instructions,
+        }) => {
+            for outcome in skills {
                 if let Some(problem) = outcome.problem {
                     eprintln!(
                         "aise: left the skill at {} unchanged after upgrading to {version}: {problem}",
@@ -3103,11 +3293,26 @@ pub(crate) fn refresh_owned_skills_after_upgrade_and_report(
                     }
                 }
             }
+            for refresh in instructions {
+                match refresh {
+                    InstructionRefresh::Updated(path) => eprintln!(
+                        "aise: updated the aise instructions in {} to {version}",
+                        path.display()
+                    ),
+                    InstructionRefresh::Edited(path) => eprintln!(
+                        "aise: left the aise instructions in {} unchanged after upgrading to \
+                         {version}: they differ from any text aise wrote, so replacing them could \
+                         destroy an edit you meant to keep.\nInspect them, or run `aise \
+                         integrations install` to replace them with this version's",
+                        path.display()
+                    ),
+                }
+            }
         }
         Err(error) => eprintln!(
-            "aise: could not update the installed skill for {version}: {error:#}; the next \
+            "aise: could not update the installed integrations for {version}: {error:#}; the next \
              command retries, `aise skills update` retries now, and `aise integrations status` \
-             shows its state"
+             shows their state"
         ),
     }
 }
@@ -6078,8 +6283,9 @@ mod tests {
         let root = dir.path().join("skills/ai-session-search");
         let policy = install_skill_as_an_older_release(&receipt, &root);
 
-        let UpgradeRefresh::Checked(outcomes) =
-            refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap()
+        let UpgradeRefresh::Checked {
+            skills: outcomes, ..
+        } = refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap()
         else {
             panic!("an outdated install must be refreshed");
         };
@@ -6089,15 +6295,15 @@ mod tests {
 
         assert!(
             matches!(
-                refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap(),
+                refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap(),
                 UpgradeRefresh::NotNeeded
             ),
             "a version is refreshed once, not on every command"
         );
         assert!(
             matches!(
-                refresh_owned_skills_for_version(&receipt, "9.9.10").unwrap(),
-                UpgradeRefresh::Checked(_)
+                refresh_integrations_for_version(&receipt, "9.9.10", None).unwrap(),
+                UpgradeRefresh::Checked { .. }
             ),
             "the next version checks again"
         );
@@ -6111,8 +6317,9 @@ mod tests {
         let policy = install_skill_as_an_older_release(&receipt, &root);
         fs::write(&policy, "# my own rules\nschema_version = 1\n").unwrap();
 
-        let UpgradeRefresh::Checked(outcomes) =
-            refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap()
+        let UpgradeRefresh::Checked {
+            skills: outcomes, ..
+        } = refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap()
         else {
             panic!("the edited root must be checked and reported");
         };
@@ -6123,20 +6330,19 @@ mod tests {
             "an automatic refresh must never overwrite an edit"
         );
         assert!(matches!(
-            refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap(),
+            refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap(),
             UpgradeRefresh::NotNeeded
         ));
     }
 
     #[test]
-    fn instruction_text_is_unchanged_until_an_upgrade_can_refresh_it() {
-        // The post-upgrade refresh covers skills, whose files the install manifest records by
-        // digest. Instruction blocks in AGENTS.md, GEMINI.md, and AI_SESSION_SEARCH.md have no such
-        // record, so an upgrade cannot tell an outdated block from one the user edited, and
-        // changing either line below would leave every installed block "outdated" until the user
-        // ran `aise integrations install` — the manual upgrade step the refresh exists to remove.
-        // Before changing the text, teach `refresh_owned_skills_after_upgrade` to replace blocks
-        // that still equal a previously shipped line, then update these digests.
+    fn changing_instruction_text_keeps_the_old_text_refreshable() {
+        // Instruction blocks have no install record, so the post-upgrade refresh recognizes a
+        // block aise wrote only by its text. Changing either line below without recording the old
+        // one would leave every installed block "outdated" until the user ran
+        // `aise integrations install`, the manual upgrade step the refresh exists to remove.
+        // Before changing the text, add the old line's digest to
+        // `EARLIER_INSTRUCTION_LINE_DIGESTS`, then update the pin here.
         assert_eq!(
             crate::hashing::sha256(INSTRUCTIONS_LINE.as_bytes()),
             "80e00c44e12fb57a3ba7cebd804880a7ce28ebd004e7442a0415ea32cb5399ab"
@@ -6145,6 +6351,126 @@ mod tests {
             crate::hashing::sha256(CLI_INSTRUCTIONS_LINE.as_bytes()),
             "a7bfbb5efc4fd40b0268ce38c0091e17844e2edddd9b8cdfbf7be91588c54442"
         );
+        assert!(is_aise_instruction_line(RC1_INSTRUCTIONS_LINE));
+    }
+
+    /// The line 1.0.0rc1 wrote into every instruction block, including Pi's.
+    const RC1_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`): call the `ai-session-search` MCP `search_sessions` tool to find relevant sessions or `search_messages` for message-level matches, then pass a returned session ID to `get_session`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. If MCP is unavailable, run `aise messages search --help`.";
+
+    /// A home holding what 1.0.0rc1 installed for Claude Code, Codex, and Pi, plus the recorded
+    /// skill that shows aise installed integrations with this configuration.
+    fn home_with_rc1_instructions(dir: &Path) -> (PathBuf, ClientLayout) {
+        let receipt = default_transaction_receipt(&dir.join("config.toml"));
+        install_skill_as_an_older_release(&receipt, &dir.join("skills/ai-session-search"));
+        let home = dir.join("home");
+        let rc1_block =
+            format!("<!-- aise-instructions v1 -->\n{RC1_INSTRUCTIONS_LINE}\n{INSTRUCTIONS_END}");
+        for agents in [
+            home.join(".codex/AGENTS.md"),
+            home.join(".pi/agent/AGENTS.md"),
+        ] {
+            fs::create_dir_all(agents.parent().unwrap()).unwrap();
+            fs::write(&agents, format!("# Mine\n\n{rc1_block}\n\n# Also mine\n")).unwrap();
+        }
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(
+            home.join(".claude/CLAUDE.md"),
+            "# Mine\n\n@AI_SESSION_SEARCH.md\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude/AI_SESSION_SEARCH.md"),
+            format!(
+                "# AI Session Search (`aise`)\n\n{INSTRUCTIONS_FILE_START}\n{RC1_INSTRUCTIONS_LINE}\n{INSTRUCTIONS_FILE_END}\n"
+            ),
+        )
+        .unwrap();
+        let layout = ClientLayout::new(home.clone(), home.join(".config"), ClientPlatform::Linux);
+        (receipt, layout)
+    }
+
+    #[test]
+    fn an_upgrade_replaces_instruction_blocks_an_earlier_release_wrote_where_they_stand() {
+        // 1.0.0rc2 changed the instruction text, so every block 1.0.0rc1 installed read
+        // "outdated" until the user ran `aise integrations install`.
+        let dir = tempdir().unwrap();
+        let (receipt, layout) = home_with_rc1_instructions(dir.path());
+
+        let UpgradeRefresh::Checked { instructions, .. } =
+            refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap()
+        else {
+            panic!("the recorded install must be checked");
+        };
+        let home = &layout.home;
+        assert_eq!(
+            instructions,
+            [
+                InstructionRefresh::Updated(home.join(".claude/AI_SESSION_SEARCH.md")),
+                InstructionRefresh::Updated(home.join(".codex/AGENTS.md")),
+                InstructionRefresh::Updated(home.join(".pi/agent/AGENTS.md")),
+            ]
+        );
+        for client in [McpClient::Claude, McpClient::Codex, McpClient::Pi] {
+            for target in instruction_targets_for_layout(client, &layout) {
+                assert_eq!(
+                    status_instruction_file(&target).unwrap(),
+                    "configured",
+                    "{client:?}"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(home.join(".codex/AGENTS.md")).unwrap(),
+            format!(
+                "# Mine\n\n{}\n\n# Also mine\n",
+                instruction_block(InstructionFormat::InlineBlock).trim_end()
+            ),
+            "the block is replaced where it stands and the user's text around it is kept"
+        );
+        assert_eq!(
+            fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap(),
+            "# Mine\n\n@AI_SESSION_SEARCH.md\n"
+        );
+        assert!(matches!(
+            refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap(),
+            UpgradeRefresh::NotNeeded
+        ));
+    }
+
+    #[test]
+    fn an_upgrade_leaves_an_edited_instruction_block_alone_and_reports_it() {
+        let dir = tempdir().unwrap();
+        let (receipt, layout) = home_with_rc1_instructions(dir.path());
+        let codex = layout.home.join(".codex/AGENTS.md");
+        let edited = fs::read_to_string(&codex)
+            .unwrap()
+            .replace(RC1_INSTRUCTIONS_LINE, "Search my sessions with aise first.");
+        fs::write(&codex, &edited).unwrap();
+
+        let UpgradeRefresh::Checked { instructions, .. } =
+            refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap()
+        else {
+            panic!("the recorded install must be checked");
+        };
+        assert!(instructions.contains(&InstructionRefresh::Edited(codex.clone())));
+        assert_eq!(fs::read_to_string(&codex).unwrap(), edited);
+    }
+
+    #[test]
+    fn an_upgrade_reads_no_client_file_without_a_recorded_install() {
+        // A process that runs with its own empty configuration, as every test does, must not
+        // rewrite the client files of whoever runs it.
+        let dir = tempdir().unwrap();
+        let (_, layout) = home_with_rc1_instructions(dir.path());
+        let receipt = default_transaction_receipt(&dir.path().join("other/config.toml"));
+        let codex = layout.home.join(".codex/AGENTS.md");
+        let before = fs::read_to_string(&codex).unwrap();
+
+        assert!(matches!(
+            refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap(),
+            UpgradeRefresh::NotNeeded
+        ));
+        assert_eq!(fs::read_to_string(&codex).unwrap(), before);
     }
 
     #[test]
@@ -6155,10 +6481,12 @@ mod tests {
         install_skill_as_an_older_release(&receipt, &root);
         fs::remove_dir_all(&root).unwrap();
 
-        assert!(matches!(
-            refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap(),
-            UpgradeRefresh::NotNeeded
-        ));
+        let UpgradeRefresh::Checked { skills, .. } =
+            refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap()
+        else {
+            panic!("the recorded install must still be checked");
+        };
+        assert!(skills.is_empty(), "{skills:#?}");
         assert!(!root.exists(), "a deleted skill must stay deleted");
     }
 
@@ -6171,14 +6499,14 @@ mod tests {
         let root = dir.path().join("skills/ai-session-search");
         let policy = install_skill_as_an_older_release(&receipt, &root);
         assert!(matches!(
-            refresh_owned_skills_for_version(&receipt, "1.0.0-rc.5").unwrap(),
-            UpgradeRefresh::Checked(_)
+            refresh_integrations_for_version(&receipt, "1.0.0-rc.5", None).unwrap(),
+            UpgradeRefresh::Checked { .. }
         ));
         let refreshed = fs::read_to_string(&policy).unwrap();
         fs::write(&policy, "# an older shipped policy\nschema_version = 1\n").unwrap();
 
         assert!(matches!(
-            refresh_owned_skills_for_version(&receipt, "1.0.0-rc.4").unwrap(),
+            refresh_integrations_for_version(&receipt, "1.0.0-rc.4", None).unwrap(),
             UpgradeRefresh::NotNeeded
         ));
         assert_ne!(
@@ -6199,9 +6527,9 @@ mod tests {
         let manifest_path = crate::skill_manifest::manifest_path(&receipt);
         fs::write(&manifest_path, "{ not json").unwrap();
 
-        assert!(refresh_owned_skills_for_version(&receipt, "9.9.9").is_err());
+        assert!(refresh_integrations_for_version(&receipt, "9.9.9", None).is_err());
         assert!(!crate::skill_manifest::refreshed_version_path(&receipt).exists());
-        assert!(refresh_owned_skills_for_version(&receipt, "9.9.9").is_err());
+        assert!(refresh_integrations_for_version(&receipt, "9.9.9", None).is_err());
     }
 
     #[test]
@@ -6210,7 +6538,7 @@ mod tests {
         let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
 
         assert!(matches!(
-            refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap(),
+            refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap(),
             UpgradeRefresh::NotNeeded
         ));
         assert_eq!(
@@ -6232,14 +6560,14 @@ mod tests {
         let guard = lock.try_write().unwrap();
 
         assert!(matches!(
-            refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap(),
+            refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap(),
             UpgradeRefresh::Deferred
         ));
         drop(guard);
         assert!(
             matches!(
-                refresh_owned_skills_for_version(&receipt, "9.9.9").unwrap(),
-                UpgradeRefresh::Checked(_)
+                refresh_integrations_for_version(&receipt, "9.9.9", None).unwrap(),
+                UpgradeRefresh::Checked { .. }
             ),
             "a deferred refresh runs on the next command"
         );

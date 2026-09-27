@@ -29,9 +29,9 @@ request_timeout_ms = 1000
 
 [integrations]
 # After an upgrade by any package manager, the first command (including `aise integrations status`
-# and the MCP server) rewrites installed ai-session-search skill files that still match what aise
-# installed, so upgrading never needs `aise integrations install`. Files you edited are left alone
-# and reported once.
+# and the MCP server) rewrites installed ai-session-search skill files and instruction blocks that
+# still match what aise wrote, so upgrading never needs `aise integrations install`. Anything you
+# edited is left alone and reported once.
 refresh_after_upgrade = true
 
 [index]
