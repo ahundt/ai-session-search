@@ -3091,10 +3091,16 @@ pub(crate) fn refresh_owned_skills_after_upgrade_and_report(
                         outcome.root
                     );
                 } else if outcome.changed {
-                    eprintln!(
-                        "aise: updated {} for {version} ({})",
-                        outcome.root, outcome.action
-                    );
+                    // A skill rewrite is the common case and gets the plain sentence; other
+                    // changes, such as removing a retired package, say what they did.
+                    if outcome.action.starts_with("rewritten") {
+                        eprintln!(
+                            "aise: updated the installed skill at {} to {version}",
+                            outcome.root
+                        );
+                    } else {
+                        eprintln!("aise: {} at {} for {version}", outcome.action, outcome.root);
+                    }
                 }
             }
         }

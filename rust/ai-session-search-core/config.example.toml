@@ -7,8 +7,9 @@
 #
 # Most users can leave this file absent. Built-in defaults are the same values shown here for
 # tunables. `aise config init` writes every setting commented out except the database and cache
-# paths: uncomment a line to change it, and later releases' defaults keep applying to the rest. Provider paths are commented out below so a restored config keeps platform-specific
-# built-in discovery unless you deliberately override paths.
+# paths: uncomment a line to change it, and later releases' defaults keep applying to the rest.
+# Provider paths are commented out below so a restored config keeps platform-specific built-in
+# discovery unless you deliberately override paths.
 #
 # Durable settings use one precedence rule on every supported surface:
 # explicit CLI/API argument > AI_SESSION_SEARCH_* environment variable > this file > typed default.

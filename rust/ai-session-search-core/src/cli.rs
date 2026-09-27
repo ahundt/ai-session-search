@@ -1592,6 +1592,10 @@ fn initial_config_text() -> String {
     let mut text = String::with_capacity(crate::config::CONFIG_EXAMPLE_TOML.len() + 256);
     for line in crate::config::CONFIG_EXAMPLE_TOML.lines() {
         if line == "# db_path = \"/absolute/path/to/index.db\"" {
+            text.push_str(
+                "# `aise config init` recorded where this machine keeps the index; the two lines \
+                 below\n# pin it so a later default cannot move it.\n",
+            );
             text.push_str(&format!("db_path = {db_path}"));
         } else if line == "# cache_dir = \"/absolute/path/to/cache\"" {
             text.push_str(&format!("cache_dir = {cache_dir}"));
