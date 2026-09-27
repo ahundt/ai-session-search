@@ -2433,8 +2433,8 @@ mod tests {
         // `aise integrations status` right after an upgrade reported the skill "outdated", which
         // sent users to the manual `aise integrations install` the refresh exists to remove.
         let refreshes = |args: &[&str]| {
-            let cli = Cli::try_parse_from(std::iter::once("aise").chain(args.iter().copied()))
-                .unwrap();
+            let cli =
+                Cli::try_parse_from(std::iter::once("aise").chain(args.iter().copied())).unwrap();
             refreshes_integrations_after_upgrade(&cli.command)
         };
         for args in [
