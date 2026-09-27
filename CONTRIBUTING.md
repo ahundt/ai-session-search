@@ -106,7 +106,14 @@ other modes and for what a green run does and does not cover.
 
 - **Reproduce first.** Add the smallest failing test at the shared layer before
   implementing, then cover every adapter the change reaches: Rust, PyO3, Python,
-  CLI, MCP, schemas, docs, examples, provider fixtures, and packaging.
+  CLI, MCP, schemas, docs, examples, provider fixtures, and packaging. To show a
+  test guards the fix, revert only the fix and watch the test fail; stashing both
+  proves nothing.
+- **Upgrades stay one command.** A user who replaces `aise` must not have to edit
+  settings or rerun a command. Rename a config key with a serde `alias` that keeps
+  the old name loading, and change installed files only in ways the post-upgrade
+  refresh can apply. The publish workflow's upgrade check fails a release that
+  needs anything more.
 - **One implementation per contract.** Look for duplicated meaning, not just
   duplicated text. Prefer improving an existing seam over adding a parallel one.
 - **Keep surfaces honest.** Presentation windows and character budgets may
@@ -153,6 +160,27 @@ someone reading the log a year from now should not need this conversation.
 Open the pull request against `main`. All required CI checks must pass, and the
 branch must be current with `main` before merge. Keep unrelated changes in
 separate commits so a single concern can be reverted on its own.
+
+## Changelog
+
+Add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) with the change that
+causes it. The released section becomes the GitHub Release body word for word, so write for
+someone deciding whether and how to upgrade:
+
+1. Put each item under `Highlights`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
+   `Security`, or `For contributors`, in that order, and number the items. The metadata gate
+   rejects other headings and bullet lists.
+2. Start with what the user sees or does, then why, in one or two sentences. Name exact commands,
+   keys, and settings.
+3. For a fix, say what went wrong for users of the previous release, then what happens now. A bug
+   that was introduced and fixed between two releases never reached a user and gets no entry.
+4. A changed default or behavior goes under `Changed`, with a before-and-after snippet when a
+   user might want the old behavior back. Never write upgrade steps: upgrading is one command,
+   which the generated footer gives.
+5. Build, test, benchmark, and internal refactoring work goes under `For contributors`.
+6. Leave design reasoning to commit messages and the maintainer requirements document.
+
+At release time the section also gets a short summary paragraph above its first heading.
 
 ## Documentation map
 

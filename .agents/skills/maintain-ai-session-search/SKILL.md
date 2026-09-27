@@ -116,6 +116,9 @@ identity and does not determine priority.
   never silently replace source, URL, path, Git, or unknown installations.
 - `REQ025-justify-timeouts` — Default search and native-query time limits to disabled; add a finite
   timeout only for a measured safety or availability need and document zero/omission semantics.
+- `REQ049-keep-upgrades-one-command` — Upgrading is replacing the executable: keep renamed config
+  keys loading through aliases, change installed files only in ways the post-upgrade refresh
+  applies, and never ship release-note upgrade steps.
 
 ### P2 — maintainer execution
 
@@ -163,7 +166,7 @@ identity and does not determine priority.
    that genuinely require user or maintainer action.
 3. **Design (the P0 data and contract items, `REQ001-preserve-user-data` through
    `REQ012-reject-invalid-combinations`, and every P1 item, `REQ013-resolve-parameters-by-origin`
-   through `REQ025-justify-timeouts`).** Start at the shared
+   through `REQ025-justify-timeouts`, plus `REQ049-keep-upgrades-one-command`).** Start at the shared
    typed service and preserve deliberate surface differences, provider normalization, platform
    paths, ownership states, and parameter precedence. Prefer one strong composable mechanism;
    record serious alternatives and why the selected design is easier to use correctly and harder
@@ -171,7 +174,8 @@ identity and does not determine priority.
 4. **Test and change (`REQ027-use-tdd`, `REQ028-test-cross-surface-contracts`).** Reproduce first,
    add the smallest failing shared-layer test, implement one coherent change, and cover Rust,
    Python/PyO3, CLI, MCP, schemas, docs, examples, provider fixtures, packaging, and installed
-   behavior wherever affected.
+   behavior wherever affected. Show a test guards the fix by reverting only the fix; stashing the
+   test with it proves nothing.
 5. **Measure (`REQ010-protect-complexity-bounds`, `REQ030-benchmark-risky-paths`).** Record a
    comparable baseline for risky paths, rerun the same workload, and report dataset, environment,
    latency distribution, throughput, peak RSS, allocation/copy behavior, I/O, output bytes, and
@@ -182,12 +186,17 @@ identity and does not determine priority.
    inherited environments. Separate configuration, discovery, executable resolution, process,
    protocol, permission, parser, presentation, and harness failures. Exercise package
    status/check, integration dry-run/install/status/uninstall, skill validation, MCP
-   initialize/tools-list, and real provider parsing. Verify AI reports directly.
+   initialize/tools-list, and real provider parsing. Verify AI reports directly. When comparing
+   builds, name each executable by path and record its `--version`; a PATH lookup can resolve to a
+   different install than the one meant.
 7. **Gate (`REQ033-commit-coherent-progress`, `REQ034-gate-release-artifacts`).** Run focused checks
    first, then `./run_ci_local.sh` from a clean commit. Test applicable uv tool/project, pip, Cargo
    registry/path/Git, and native-archive pathways. Exactly one manager should own the global `aise`;
    report every PATH candidate. Build once, verify exact artifacts, and never publish without
-   protected-environment maintainer approval.
+   protected-environment maintainer approval. Before a release, have a reader who did not write the
+   change check the rendered release body and touched docs against the build; check each claim
+   about earlier behavior against the previous tag, because a bug fixed within one cycle never
+   reached a user.
    Keep commit messages and other maintainer-facing prose cold readable: lead with stable behavior
    phrases and omit internal codes, transient task/session identifiers, and raw implementation
    values unless a public contract or exact verification step requires the identifier.

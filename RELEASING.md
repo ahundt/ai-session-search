@@ -319,6 +319,18 @@ Before tagging, confirm:
   duplicate, undated, impossible-date, empty, or misshapen section, and `--notes-out FILE` writes
   the exact body it would publish: the section plus a generated footer with the upgrade command,
   install commands, download guide, and diff link.
+- Upgrading from the previous release needs nothing but the new executable. The publish `verify`
+  job enforces this; run it early, since it needs network access to install that release:
+  `uv run python -m scripts.verify_upgrade_path --executable target/release/aise`.
+- The CI run on the release commit has no new warnings. A green run can still carry them, and
+  deprecations surface there first. List warnings and annotations with
+  `gh run view <run-id> --log | grep -iE 'warning|deprecat'` and `gh run view <run-id>`.
+- The documentation matches this build. Render the release body with `--notes-out`, then read it,
+  `README.md`, and every guide under `docs/` the release touches as a first-time reader. Check each
+  command, flag, key, setting, and default they name against `aise <command> --help`,
+  `aise config example`, and the source, and check the documents against each other. Fix wrong,
+  stale, contradictory, or hard-to-follow text; leave working prose alone. A reviewer or agent that
+  has not seen the change catches what its author reads past.
 - `git status --short` is clean.
 - The staged release diff was inspected before its version commit.
 - `python -m scripts.verify_release_metadata --tag vX.Y.ZrcN` passes.
@@ -510,6 +522,19 @@ recording stays untracked, and `verify_release_artifacts` rejects an archive tha
 
 **6. Verify the three pre-release surfaces**, per [Pre-release semantics](#pre-release-semantics).
 `gh release view vX.Y.ZrcN --json isPrerelease` is the only one a release can get wrong on its own.
+
+## Revising a published release body
+
+The body is generated from `CHANGELOG.md`, so fix the section there first and commit it, then
+render and publish the same bytes. `--notes-only` skips the version checks, which reject any tag
+but the current version once the manifests have moved on:
+
+```bash
+uv run python -m scripts.verify_release_metadata --tag vX.Y.ZrcN --notes-only --notes-out notes.md
+gh release edit vX.Y.ZrcN --notes-file notes.md
+```
+
+Editing a release body changes a public page; it does not change the tag or any artifact.
 
 ## Post-release and recovery
 

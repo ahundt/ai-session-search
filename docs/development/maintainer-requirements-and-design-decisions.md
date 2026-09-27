@@ -549,6 +549,16 @@ Network release notifications are a distinct bounded operation: they are TTY-onl
 disabled for MCP/library/noninteractive use, configurable, and use a finite request timeout so an
 optional notification cannot stall ordinary CLI work.
 
+### REQ049-keep-upgrades-one-command
+
+Upgrading is replacing the executable, by whichever manager owns it; a user who did not change a
+setting must not need to change anything, and one who did must not have to edit it again. A renamed
+config key keeps its old name as a serde alias, and a key a release accepted is not removed before
+the next major version. Installed files change only in ways the post-upgrade refresh applies without
+touching an edit (`REQ024-delegate-package-updates`). Release notes never carry upgrade steps. The
+publish `verify` job installs the previous release's integrations and printed config, runs the new
+executable, and fails when anything would need a manual step.
+
 ## P2 — maintainer execution
 
 ### REQ026-reproduce-material-claims
@@ -587,7 +597,9 @@ interpretation. Historical machine timings are evidence samples, not timeless gu
 
 Source comments, Rust docs, CLI help, MCP schemas, Python docstrings, stubs, examples, public docs,
 and tests must describe the same contract. A surface-specific difference must be named and justified
-at every relevant boundary.
+at every relevant boundary. Before a release, a reader who did not write the change checks every
+command, flag, key, setting, and default the README, guides, and release notes name against the
+build.
 
 ### REQ032-record-design-tradeoffs
 
@@ -622,7 +634,8 @@ and never use destructive history operations as routine cleanup.
 Run `./run_ci_local.sh` from a clean commit before release-candidate claims. Test uv project/tool,
 wheel and source distribution, Cargo registry/path/Git or native archive pathways as applicable.
 Build release artifacts once, verify the exact bytes, and publish only through maintainer-controlled
-protected environments.
+protected environments. The release body is the changelog section plus a generated footer; the
+metadata gate enforces its shape so it reads as what changed for a user, not how it was built.
 
 ### REQ035-critically-review-ai-output
 
@@ -674,4 +687,5 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 | `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
 | `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
 | `REQ024-delegate-package-updates` | `update.rs`, release configuration | package ownership/update tests and installed `aise package status/check` |
+| `REQ049-keep-upgrades-one-command` | `config.rs` serde aliases, `integrations.rs` post-upgrade refresh, `scripts/verify_upgrade_path.py`, publish `verify` job | alias and refresh unit tests, instruction-text digest test, upgrade check from the previous published release |
 | `REQ027-use-tdd`; `REQ028-test-cross-surface-contracts`; `REQ029-dogfood-installed-artifacts`; `REQ033-commit-coherent-progress`; `REQ034-gate-release-artifacts` | `tests/`, Rust test suites, `run_ci_local.sh`, release workflows | focused tests followed by all local release-gate stages |
