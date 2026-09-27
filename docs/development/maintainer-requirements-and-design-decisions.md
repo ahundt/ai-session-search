@@ -532,10 +532,12 @@ direct source, or unknown ownership and delegates only to a verified owning mana
 confirmation.
 
 Source checkout, direct URL, Cargo path/Git, and unknown installations receive guidance instead of
-silent registry replacement. After a manager update, refresh only manifest-recorded owned skill
-roots; stable executable paths, aliases, MCP registrations, and managed instructions do not need
-rewriting, and an update must not discover new clients. Uninstall integrations before removing the
-global executable.
+silent registry replacement. After a version change by any manager, refresh only
+manifest-recorded owned skill roots, once, from the first CLI command or MCP server start; an
+update must not discover new clients or rewrite an edited file. Stable executable paths, aliases,
+and MCP registrations do not need rewriting. Managed instruction blocks carry no ownership record,
+so their text must not change until the refresh can recognize an unedited block. Uninstall
+integrations before removing the global executable.
 
 ### REQ025-justify-timeouts
 

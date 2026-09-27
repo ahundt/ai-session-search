@@ -116,6 +116,8 @@ pub struct Config {
     pub db: DbConfig,
     #[serde(default)]
     pub release_notifications: ReleaseNotificationConfig,
+    #[serde(default)]
+    pub integrations: IntegrationsConfig,
 }
 
 /// Per-invocation configuration overrides. `None` preserves lower-precedence sources.
@@ -212,6 +214,7 @@ struct ConfigFile {
     cli: Option<CliConfig>,
     db: Option<DbConfig>,
     release_notifications: Option<ReleaseNotificationConfig>,
+    integrations: Option<IntegrationsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -316,6 +319,9 @@ impl ConfigFile {
         }
         if let Some(value) = self.release_notifications {
             config.release_notifications = value;
+        }
+        if let Some(value) = self.integrations {
+            config.integrations = value;
         }
         config
     }
@@ -990,6 +996,24 @@ impl Default for ReleaseNotificationConfig {
     }
 }
 
+/// Installed-integration upkeep (`[integrations]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct IntegrationsConfig {
+    /// After aise changes version, rewrite installed skill files it owns that nobody has edited,
+    /// once, from the first CLI command or MCP server start. Edited files are never rewritten.
+    pub refresh_after_upgrade: bool,
+}
+
+impl Default for IntegrationsConfig {
+    fn default() -> Self {
+        Self {
+            refresh_after_upgrade: true,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1262,6 +1286,7 @@ impl Default for Config {
             cli: CliConfig::default(),
             db: DbConfig::default(),
             release_notifications: ReleaseNotificationConfig::default(),
+            integrations: IntegrationsConfig::default(),
         }
     }
 }

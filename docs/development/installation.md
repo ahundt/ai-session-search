@@ -186,11 +186,11 @@ aise package check
 aise integrations uninstall
 
 # Choose only the commands matching the installation owner or project use.
-uv tool upgrade ai-session-search && aise integrations install
+uv tool upgrade ai-session-search
 uv tool uninstall ai-session-search
 uv remove ai-session-search
 python -m pip uninstall ai-session-search
-cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrations install
+cargo install ai-session-search --locked --version '^1.0.0-rc'
 cargo uninstall ai-session-search
 ```
 
@@ -204,6 +204,17 @@ automatic apply for a direct URL or source checkout, including a maintainer
 checkout installed into a uv tool environment or with `cargo install --path`
 or `cargo install --git`, and for unknown executables. Update the recorded
 source with its original workflow instead.
+
+Upgrading is one command whichever manager owns `aise`. The first CLI command or `aise mcp serve`
+after the version changes runs the same conservative skill refresh once: it rewrites owned skill
+files that still match what aise recorded, leaves an edited file alone and says so on stderr, and
+visits only roots in the install manifest. MCP registrations and aliases name the executable path,
+not its version, so they need no refresh. Turn the automatic refresh off with:
+
+```toml
+[integrations]
+refresh_after_upgrade = false
+```
 
 Stable-release notifications are a separate read-only CLI convenience.
 Disable them per invocation with `--skip-release-notification`, by setting
@@ -285,14 +296,13 @@ failed path and recommends `--no-aliases`. The installer never substitutes copie
 hard links, `.cmd` wrappers, or extra Python console scripts because those create divergent
 ownership and update behavior.
 
-For a pip-owned global installation, update and refresh with:
+For a pip-owned global installation, update with:
 
 ```bash
-python -m pip install --upgrade ai-session-search && aise integrations install
+python -m pip install --upgrade ai-session-search
 ```
 
-For a verified native archive, run its rollback-preserving installer and then
-`aise skills update`. The installer publishes
+For a verified native archive, run its rollback-preserving installer. The installer publishes
 `aise-native-install.json` beside the executable; its archive identity and
 SHA-256 digest let `aise package status` distinguish this owner from an unknown
 standalone binary. Replacement still requires a newly downloaded archive whose

@@ -13,6 +13,14 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
+### Changed
+
+1. Upgrading no longer needs `aise integrations install`. After `uv tool upgrade`, pip, Cargo,
+   or a native archive replaces `aise`, the first command or MCP server start updates the
+   installed `ai-session-search` skill once and prints one line saying so. Skill files you edited
+   are left alone and reported once. Set `[integrations] refresh_after_upgrade = false` to turn
+   this off.
+
 ### Fixed
 
 1. A `config.toml` that sets `[ui].preview_lines`, the 1.0.0rc2 name for

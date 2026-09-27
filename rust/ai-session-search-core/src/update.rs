@@ -478,7 +478,7 @@ fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableU
                     receipt.target
                 ),
                 ExecutableUpdateAction::Guidance {
-                    message: "Download the applicable native archive from the GitHub prerelease, verify its SHA256SUMS and build-provenance attestation, then rerun its installer with --replace and an explicit --backup path. Native archives are never downloaded or overwritten automatically; run `aise skills update` after replacement."
+                    message: "Download the applicable native archive from the GitHub prerelease, verify its SHA256SUMS and build-provenance attestation, then rerun its installer with --replace and an explicit --backup path. Native archives are never downloaded or overwritten automatically."
                         .into(),
                 },
             )

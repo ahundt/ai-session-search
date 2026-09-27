@@ -25,6 +25,12 @@ minimum_check_interval_hours = 24
 # uses a longer bounded timeout and reports failures.
 request_timeout_ms = 1000
 
+[integrations]
+# After an upgrade by any package manager, the first CLI command or MCP server start rewrites the
+# installed ai-session-search skill files that still match what aise installed, so upgrading never
+# needs `aise integrations install`. Files you edited are left alone and reported once.
+refresh_after_upgrade = true
+
 [index]
 # Optional explicit state paths. Relative values resolve from ~/.ai-session-search/.
 # Leave these commented to keep the platform data/cache defaults; set db_path to reuse an existing
