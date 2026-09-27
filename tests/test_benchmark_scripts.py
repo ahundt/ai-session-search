@@ -1475,3 +1475,17 @@ def test_tracked_docs_contain_no_personal_install_paths() -> None:
         ROOT / "docs/migration/ai-session-search-major-migration.md",
     ):
         assert personal_home not in path.read_text(encoding="utf-8"), path
+
+
+def test_every_measured_case_runs_with_an_owned_config_and_home(tmp_path: Path) -> None:
+    # A case that inherited the caller's environment resolved the maintainer's real config: a
+    # personal setting changed the measurement, and any aise command may refresh the installed
+    # skill beside that config.
+    benchmark = load_python_file(ROOT / "scripts" / "benchmark_release.py")
+    environment = benchmark.hermetic_environment(tmp_path / "sandbox")
+
+    assert environment["HOME"] == str(tmp_path / "sandbox")
+    assert environment["AI_SESSION_SEARCH_CONFIG"] == str(tmp_path / "sandbox" / "config.toml")
+    assert (tmp_path / "sandbox" / "config.toml").read_text(encoding="utf-8") == ""
+    source = (ROOT / "scripts" / "benchmark_release.py").read_text(encoding="utf-8")
+    assert "environment=hermetic_environment(sandbox)" in source

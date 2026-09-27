@@ -444,6 +444,32 @@ def extract_resource_overrides(
     return overrides
 
 
+def hermetic_environment(sandbox: Path) -> dict[str, str]:
+    """Return an environment whose aise config and home are ``sandbox``, created empty.
+
+    A case run with the caller's environment resolved the maintainer's real config, so a personal
+    setting changed the measurement, and any aise command may refresh the installed skill beside
+    that config. The TUI client builds the same sandbox for its own process.
+    """
+    config = sandbox / "config.toml"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    config.touch()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("AI_SESSION_SEARCH_", "XDG_"))
+    }
+    environment.update(
+        {
+            "HOME": str(sandbox),
+            "USERPROFILE": str(sandbox),
+            "XDG_CONFIG_HOME": str(sandbox / "xdg"),
+            "AI_SESSION_SEARCH_CONFIG": str(config),
+        }
+    )
+    return environment
+
+
 def sample_process(
     argv: list[str],
     normalizations: dict[bytes, bytes] | None = None,
@@ -451,9 +477,10 @@ def sample_process(
     extract_session_ids: bool = False,
     result_json_field: str | None = None,
     resource_json_fields: dict[str, str] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter_ns()
-    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
     peak_rss_kib = 0
     peak_threads = 0
     peak_processes = 0
@@ -706,6 +733,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                     / f"{repetition}.db"
                 )
                 clone_fixture(Path(fixture["path"]), sample_fixture)
+                sandbox = artifact_dir / "sandbox" / label
                 before_fixture_state = sqlite_file_state(sample_fixture)
                 argv = [
                     part.format(
@@ -728,10 +756,12 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                     str(ROOT / "benchmarks").encode(): b"{client_root}",
                     str(ROOT).encode(): b"{repository}",
                     str(Path.home()).encode(): b"{home}",
+                    str(sandbox).encode(): b"{home}",
                 }
                 sample = sample_process(
                     argv,
                     path_normalizations,
+                    environment=hermetic_environment(sandbox),
                     extract_session_ids=(
                         case.get("expected_relation") == "intentional_change_with_oracle"
                     ),
