@@ -875,6 +875,19 @@ def test_wheels_job_proves_the_pinned_build_clock_reached_the_build() -> None:
     assert '--source-date-epoch "$SOURCE_DATE_EPOCH"' in wheels
 
 
+def test_tests_never_run_aise_against_the_developers_real_state() -> None:
+    # Any aise command may run the post-upgrade skill refresh, which writes beside the resolved
+    # config file. A direct `cargo test` or `pytest` resolved the real ~/.ai-session-search and
+    # wrote there. Rust process tests spawn aise only through the isolated `aise()` builder, and
+    # every Python test gets its own config from tests/conftest.py.
+    process_tests = (ROOT / "rust/ai-session-search-core/tests/process_lifecycle.rs").read_text(encoding="utf-8")
+    assert process_tests.count('Command::new(env!("CARGO_BIN_EXE_aise"))') == 1, (
+        "spawn the binary with aise(), which isolates config and home, not Command::new"
+    )
+    conftest = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
+    assert "autouse=True" in conftest and "AI_SESSION_SEARCH_CONFIG" in conftest
+
+
 def test_the_upgrade_check_gates_verify_without_signing_rights() -> None:
     # The check runs the previous release downloaded from PyPI. Inside `verify`, which holds
     # `id-token: write` and `attestations: write`, that code could reach the OIDC token and the

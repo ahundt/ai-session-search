@@ -10,6 +10,35 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
+/// The built `aise`, kept away from the developer's real state.
+///
+/// Any command may run the post-upgrade skill refresh, which reads and writes beside the resolved
+/// config file, and several commands read the home directory. `run_ci_local.sh` and CI export an
+/// isolated config, but a direct `cargo test` does not, and a spawned `aise` would then resolve
+/// the real `~/.ai-session-search`. Every spawn starts here with an empty config and a home of its
+/// own; a test's `--config`, `.env("HOME", ..)`, or `.env("AI_SESSION_SEARCH_CONFIG", ..)`
+/// replaces them.
+fn aise() -> Command {
+    static STATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let state = STATE.get_or_init(|| tempfile::tempdir().unwrap()).path();
+    let home = state.join("home");
+    let config = state.join("config/config.toml");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    if !config.exists() {
+        fs::write(&config, "").unwrap();
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aise"));
+    command
+        .env("AI_SESSION_SEARCH_CONFIG", &config)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"));
+    command
+}
+
 fn isolated_config_paths_args(root: &std::path::Path) -> Vec<String> {
     let config = root.join("config.toml");
     fs::write(&config, "").unwrap();
@@ -78,7 +107,7 @@ fn isolated_integration_install(
     fs::create_dir_all(&home).unwrap();
     let codex_config = home.join(".codex").join("config.toml");
     let executable = env!("CARGO_BIN_EXE_aise");
-    let mut command = Command::new(executable);
+    let mut command = aise();
     command
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -115,7 +144,7 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
     let home = root.path().join("home");
     fs::create_dir_all(&home).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .args([
@@ -151,7 +180,7 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
         .iter()
         .all(|descriptor| descriptor["rule"].is_string() && descriptor["message"].is_string()));
 
-    let mcp_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let mcp_output = aise()
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .args([
@@ -299,7 +328,7 @@ fn integration_install_with_no_selected_components_does_not_start_indexing() {
     let config = write_disabled_provider_config(root.path());
     let home = root.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("PATH", "")
@@ -370,7 +399,7 @@ fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -415,7 +444,7 @@ fn the_registration_environment_sets_the_result_ceiling_of_the_server_it_launche
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", "12345")
         .args([
             "--config",
@@ -455,7 +484,7 @@ fn an_unusable_registration_ceiling_names_the_variable_and_its_accepted_range() 
     let config = write_disabled_provider_config(root.path());
 
     for unusable in ["0", "-1", "not-a-number"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        let output = aise()
             .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", unusable)
             .args([
                 "--config",
@@ -499,7 +528,7 @@ fn config_origins_explains_both_release_critical_mcp_bounds() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -535,7 +564,7 @@ fn inferred_skill_execution_uses_the_indexed_read_lifecycle_and_structured_repor
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -664,7 +693,7 @@ fn explicit_skill_path_runs_its_adjacent_typed_capability() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -721,7 +750,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
     }
     let path = std::env::join_paths([&first, &second]).unwrap();
 
-    let config_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let config_output = aise()
         .args(isolated_config_paths_args(root.path()))
         .env("PATH", &path)
         .output()
@@ -751,7 +780,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
         "{config_stdout}"
     );
 
-    let package_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let package_output = aise()
         .args(["package", "status"])
         .env("PATH", &path)
         .output()
@@ -795,7 +824,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
 
     let mut config_json_args = isolated_config_paths_args(root.path());
     config_json_args.extend(["--format".into(), "json".into()]);
-    let config_json_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let config_json_output = aise()
         .args(config_json_args)
         .env("PATH", &path)
         .output()
@@ -828,7 +857,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
         ])
     );
 
-    let package_json_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let package_json_output = aise()
         .args(["package", "status", "--format", "json"])
         .env("PATH", &path)
         .env("HTTPS_PROXY", "http://127.0.0.1:1")
@@ -1830,7 +1859,7 @@ fn a_registration_ceiling_is_enforced_by_the_server_it_launched() {
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let mut child = aise()
         .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", "1")
         .args(["--config", config.to_str().unwrap(), "mcp", "serve"])
         .stdin(Stdio::piped())
@@ -1982,11 +2011,7 @@ fn skills_config(root: &std::path::Path) -> std::path::PathBuf {
 #[test]
 fn every_leaf_command_names_another_command() {
     fn help_of(path: &[&str]) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_aise"))
-            .args(path)
-            .arg("--help")
-            .output()
-            .unwrap();
+        let output = aise().args(path).arg("--help").output().unwrap();
         assert!(
             output.status.success(),
             "`aise {} --help` failed: {}",
@@ -2090,11 +2115,7 @@ fn every_leaf_command_names_another_command() {
 #[test]
 fn value_taking_flags_state_a_default_or_what_omission_does() {
     fn help_of(path: &[&str]) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_aise"))
-            .args(path)
-            .arg("--help")
-            .output()
-            .unwrap();
+        let output = aise().args(path).arg("--help").output().unwrap();
         String::from_utf8(output.stdout)
             .unwrap()
             .split("Shared options (parsed globally")
@@ -2236,7 +2257,7 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
 /// Dynamic capability help is ordinary successful help, not an operational failure.
 #[test]
 fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .args(["skills", "corrections", "--help"])
         .env(
             "AI_SESSION_SEARCH_CONFIG",
@@ -2284,7 +2305,7 @@ fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
     );
     let config = skills_config(root.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2346,7 +2367,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
     );
     let config = skills_config(root.path());
 
-    let valid = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let valid = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2371,7 +2392,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
         "success must SAY it succeeded; an empty report reads as a broken command"
     );
 
-    let listed = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let listed = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2402,7 +2423,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
     assert_eq!(team["package_version"], serde_json::json!("0.2.0"));
     assert_eq!(team["capability_sha256"].as_str().map(str::len), Some(64));
 
-    let built_in_show = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let built_in_show = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2429,7 +2450,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
     );
 
     // And the selected catalog name reaches the typed capability execution path.
-    let execution = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let execution = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2459,7 +2480,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
     let output_dir = root.path().join("skills");
     let skill_root = output_dir.join("my-rules");
 
-    let dry = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let dry = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2480,7 +2501,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         "--dry-run must write nothing, and this is the assertion that proves it"
     );
 
-    let created = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let created = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2508,7 +2529,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         "a scaffold is the caller's, so it must carry no managed marker"
     );
 
-    let again = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let again = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2525,7 +2546,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         "creating over an existing directory could overwrite the caller's own files"
     );
 
-    let validated = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let validated = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2541,7 +2562,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         String::from_utf8_lossy(&validated.stderr)
     );
 
-    let execution = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let execution = aise()
         .args([
             "--config",
             &config.display().to_string(),
@@ -2571,7 +2592,7 @@ fn skill_run_json_names_selector_resolution_and_output_even_when_matches_are_emp
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let output = aise()
         .args([
             "--config",
             &config.display().to_string(),
