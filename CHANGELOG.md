@@ -13,16 +13,24 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
+Upgrading is now a single step: after any package manager replaces `aise`, the first command
+updates the installed skill for you, and a `config.toml` written for 1.0.0rc2 loads again.
+`aise config init` now leaves settings commented out, so defaults a later release changes reach
+files it writes from now on. Upgrading from 1.0.0rc3 needs no action.
+
 ### Changed
 
 1. Upgrading no longer needs `aise integrations install`. After `uv tool upgrade`, pip, Cargo,
    or a native archive replaces `aise`, the first command or MCP server start updates the
    installed `ai-session-search` skill once and prints a line for each skill it updates. Skill
-   files you edited are left alone and reported once. Set
+   files you edited are left alone and reported once, and a skill directory you deleted stays
+   deleted; `aise integrations install` restores it. Set
    `[integrations] refresh_after_upgrade = false` to turn this off.
 2. `aise config init` writes every setting commented out except the database and cache paths.
    Uncommenting a line changes that setting; everything else follows the built-in defaults,
-   including ones a later release changes. Existing config files are not touched.
+   including ones a later release changes. Existing config files are not touched, so a file
+   `aise config init` wrote in 1.0.0rc3 or earlier still pins that release's defaults: delete the
+   lines you did not choose to follow new ones.
 
 ### Fixed
 
@@ -40,6 +48,10 @@ compatibility baseline; tags below it do not define a compatibility contract.
 2. The metadata gate checks the released changelog section's shape (summary first, known headings
    in order, numbered items) and appends a generated footer with the upgrade and install commands,
    download guide, and diff link. `--notes-only` renders the body for an already published tag.
+3. Dependency updates: maturin 1.15.0, ruff 0.16.7, mypy 2.3.1, the current `setup-uv` and
+   `rust-toolchain` actions, rmcp 3.4.0, clap 4.6.7, yaml-rust2 0.13, and patch releases of toml,
+   toml_edit, ureq, and unicode-width. The rmcp requirement rises to 3.4.0, the first release
+   with the `ServerConfig` name the MCP server now uses.
 
 ## [1.0.0rc3] - 2026-09-16
 
