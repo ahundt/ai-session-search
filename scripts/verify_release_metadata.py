@@ -58,6 +58,11 @@ NOTES_HEADINGS = (
 )
 
 
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+_BULLET = re.compile(r"^\s*[-*+] ")
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)]) ")
+
+
 class ReleaseMetadataError(ValueError):
     """Release metadata or observed registry state is inconsistent."""
 
@@ -157,16 +162,22 @@ def release_notes(root: pathlib.Path, version: str) -> str:
 
 def check_notes_shape(notes: str, version: str) -> None:
     """Reject a released section that does not open with a summary or strays from the headings."""
-    lines = []
-    fenced = False
-    for line in notes.splitlines():
-        if line.startswith("```"):
-            fenced = not fenced
-        elif not fenced:
-            lines.append(line)
     where = f"{CHANGELOG} section '## [{version}]'"
+    lines = []
+    fence: str | None = None
+    for line in notes.splitlines():
+        marker = _FENCE.match(line)
+        if fence is None and marker is not None:
+            fence = marker.group(1)
+        elif fence is not None and marker is not None and marker.group(1).startswith(fence):
+            fence = None
+        elif fence is None:
+            lines.append(line)
+    if fence is not None:
+        # An unclosed fence would hide every later heading and list from the checks below.
+        raise ReleaseMetadataError(f"{where} opens a {fence} code block it never closes")
     first = next((line for line in lines if line.strip()), "")
-    if first.startswith(("#", "- ", "* ", "1. ")):
+    if first.startswith("#") or _LIST_ITEM.match(first):
         raise ReleaseMetadataError(
             f"{where} must open with a short summary paragraph of what the release means for a "
             "user, before its first heading or list"
@@ -183,7 +194,7 @@ def check_notes_shape(notes: str, version: str) -> None:
         raise ReleaseMetadataError(
             f"{where} headings must appear once each in the order {list(NOTES_HEADINGS)}"
         )
-    bullets = [line for line in lines if line.startswith(("- ", "* "))]
+    bullets = [line for line in lines if _BULLET.match(line)]
     if bullets:
         raise ReleaseMetadataError(
             f"{where} uses bullet lists; number the items so a reader can cite one: {bullets[0]!r}"

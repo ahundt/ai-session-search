@@ -82,9 +82,9 @@ def problems_in_status(status: str) -> list[str]:
         if not line.strip() or line.startswith("executable alias "):
             continue
         _, separator, state = line.rpartition(": ")
-        if not separator:
-            continue
-        if state != "configured" and not state.startswith("linked -> "):
+        # A line this parser cannot read counts as a problem, so a changed status wording fails
+        # the check rather than passing it.
+        if not separator or (state != "configured" and not state.startswith("linked -> ")):
             problems.append(line)
     return problems
 

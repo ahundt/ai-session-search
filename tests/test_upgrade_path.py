@@ -50,3 +50,12 @@ def test_upgrade_check_refuses_to_guess_the_previous_release(tmp_path: Path) -> 
     )
 
     assert main(["--executable", "aise", "--root", str(tmp_path)]) == 2
+
+
+def test_upgrade_status_fails_closed_on_a_line_it_cannot_read() -> None:
+    status = (
+        "app ~/.ai-session-search/skills/ai-session-search: configured\n"
+        "claude ~/.claude/CLAUDE.md needs attention\n"
+    )
+
+    assert problems_in_status(status) == ["claude ~/.claude/CLAUDE.md needs attention"]
