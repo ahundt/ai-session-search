@@ -16,9 +16,10 @@ For each earlier release, in an empty home directory:
 A failure names the release and what would have needed a manual step. The `verify` job of
 publish.yml runs this against the Linux native executable before anything is published. It
 downloads the earlier release with `uvx`, so it needs network access. Without `--from` it checks
-the release below the current version in CHANGELOG.md:
+the release below the current version's dated section in CHANGELOG.md, which exists only once the
+release is prepared; before that, name the latest published release:
 
-    uv run python -m scripts.verify_upgrade_path --executable target/release/aise
+    uv run python -m scripts.verify_upgrade_path --executable target/release/aise --from 1.0.0rc3
 """
 
 from __future__ import annotations
@@ -142,8 +143,13 @@ def main(argv: list[str] | None = None) -> int:
             version = tomllib.load(source)["project"]["version"]
         previous = previous_release(args.root, version)
         if previous is None:
-            print(f"CHANGELOG.md names no release below {version}; nothing to upgrade from")
-            return 0
+            # Passing here would report an upgrade check that checked nothing.
+            print(
+                f"CHANGELOG.md has no dated section for {version} with a release below it; pass "
+                "--from with the latest published version",
+                file=sys.stderr,
+            )
+            return 2
         args.previous = [previous]
     failed = False
     for previous in args.previous:

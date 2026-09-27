@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
-from scripts.verify_upgrade_path import problems_in_status
+from pathlib import Path
+
+from scripts.verify_upgrade_path import main, problems_in_status
 
 
 def test_upgrade_status_accepts_current_and_linked_integrations() -> None:
@@ -37,3 +39,14 @@ def test_upgrade_status_fails_closed_when_it_finds_no_installed_skill() -> None:
     assert problems_in_status("") == [
         "integrations status reported no installed ai-session-search skill to check"
     ]
+
+
+def test_upgrade_check_refuses_to_guess_the_previous_release(tmp_path: Path) -> None:
+    # Before the changelog names the new version, there is no release "below" it; reporting
+    # success there would be an upgrade check that checked nothing.
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "1.0.0rc4"\n', encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n## [1.0.0rc3] - 2026-09-16\n\nNotes.\n", encoding="utf-8"
+    )
+
+    assert main(["--executable", "aise", "--root", str(tmp_path)]) == 2
