@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pytest
 from pytest import MonkeyPatch
 
 from scripts import verify_upgrade_path
@@ -67,3 +68,17 @@ def test_upgrade_check_refuses_to_touch_a_real_windows_profile(monkeypatch: Monk
     monkeypatch.setattr(verify_upgrade_path.os, "name", "nt")
 
     assert verify_upgrade_path.main(["--executable", "aise", "--from", "1.0.0rc3"]) == 2
+
+
+def test_a_release_that_cannot_be_downloaded_is_not_reported_as_an_upgrade_failure(
+    monkeypatch: MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A PyPI timeout was reported as "upgrading from 1.0.0rc2 needs a manual step".
+    def unreachable(previous: str, executable: object) -> list[str]:
+        raise verify_upgrade_path.UpgradeCheckUnavailable(f"{previous} could not install: timed out")
+
+    monkeypatch.setattr(verify_upgrade_path, "check_upgrade", unreachable)
+
+    assert verify_upgrade_path.main(["--executable", "aise", "--from", "1.0.0rc2"]) == 2
+    error = capsys.readouterr().err
+    assert "not an upgrade failure" in error and "needs a manual step" not in error

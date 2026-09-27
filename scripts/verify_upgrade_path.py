@@ -91,6 +91,10 @@ def published_versions_since(floor: str) -> list[str]:
     )
 
 
+class UpgradeCheckUnavailable(Exception):
+    """The earlier release could not be installed or run, so nothing about the upgrade is known."""
+
+
 def _client_arguments() -> list[str]:
     return [argument for client in CLIENTS for argument in ("--client", client)]
 
@@ -129,12 +133,18 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
         old = ["uvx", "--quiet", "--from", f"ai-session-search=={previous}", "aise"]
         old_environment = _environment(home, None)
         installed = _run([*old, "integrations", "install", *_client_arguments()], old_environment)
+        # Failing to download or run the earlier release says nothing about the upgrade, and
+        # reporting it as "needs a manual step" would send the reader after a bug that is not there.
         if installed.returncode != 0:
-            return [f"{previous} could not install its integrations: {installed.stderr.strip()}"]
+            raise UpgradeCheckUnavailable(
+                f"{previous} could not install its integrations: {installed.stderr.strip()}"
+            )
         shown = _run([*old, "config", "show"], old_environment)
         config_path = _run([*old, "config", "file"], old_environment).stdout.strip()
         if shown.returncode != 0 or not config_path:
-            return [f"{previous} could not print its configuration: {shown.stderr.strip()}"]
+            raise UpgradeCheckUnavailable(
+                f"{previous} could not print its configuration: {shown.stderr.strip()}"
+            )
         pathlib.Path(config_path).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(config_path).write_text(shown.stdout, encoding="utf-8")
 
@@ -153,6 +163,56 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
         return [
             line.replace(str(home), "~") for line in problems_in_status(status.stdout)
         ]
+
+
+def _versions_to_check(requested: list[str] | None, since: str) -> list[str] | None:
+    """Return the releases to upgrade from, or None after saying why none can be chosen."""
+    for version in [*(requested or []), since]:
+        if PYTHON_RELEASE_VERSION.fullmatch(version) is None:
+            print(f"not a release version: {version!r}", file=sys.stderr)
+            return None
+    if requested:
+        return requested
+    try:
+        versions = published_versions_since(since)
+    except (OSError, ValueError, KeyError) as error:
+        # Passing here would report an upgrade check that checked nothing.
+        print(
+            f"could not read the published versions from {PYPI_PROJECT_URL}: {error}; pass --from",
+            file=sys.stderr,
+        )
+        return None
+    if not versions:
+        print(f"PyPI lists no release at or above {since}; pass --from", file=sys.stderr)
+        return None
+    return versions
+
+
+def _check_all(versions: list[str], executable: pathlib.Path) -> int:
+    """Check each upgrade: 0 when all pass, 1 when any needs a manual step, 2 when any was unknown."""
+    failed = False
+    unavailable = False
+    for previous in versions:
+        try:
+            problems = check_upgrade(previous, executable)
+        except UpgradeCheckUnavailable as error:
+            unavailable = True
+            print(
+                f"could not check upgrading from {previous}; this is not an upgrade failure. "
+                f"Rerun when PyPI is reachable: {error}",
+                file=sys.stderr,
+            )
+            continue
+        if problems:
+            failed = True
+            print(f"upgrading from {previous} needs a manual step:", file=sys.stderr)
+            for problem in problems:
+                print(f"  {problem}", file=sys.stderr)
+        else:
+            print(f"upgrading from {previous}: its config loads and every integration is current")
+    if failed:
+        return 1
+    return 2 if unavailable else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,38 +240,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    executable = args.executable.resolve()
-    if PYTHON_RELEASE_VERSION.fullmatch(args.since) is None:
-        print(f"not a release version: {args.since!r}", file=sys.stderr)
+    versions = _versions_to_check(args.previous, args.since)
+    if versions is None:
         return 2
-    if not args.previous:
-        try:
-            args.previous = published_versions_since(args.since)
-        except (OSError, ValueError, KeyError) as error:
-            # Passing here would report an upgrade check that checked nothing.
-            print(
-                f"could not read the published versions from {PYPI_PROJECT_URL}: {error}; "
-                "pass --from",
-                file=sys.stderr,
-            )
-            return 2
-        if not args.previous:
-            print(f"PyPI lists no release at or above {args.since}; pass --from", file=sys.stderr)
-            return 2
-    failed = False
-    for previous in args.previous:
-        if PYTHON_RELEASE_VERSION.fullmatch(previous) is None:
-            print(f"not a release version: {previous!r}", file=sys.stderr)
-            return 2
-        problems = check_upgrade(previous, executable)
-        if problems:
-            failed = True
-            print(f"upgrading from {previous} needs a manual step:", file=sys.stderr)
-            for problem in problems:
-                print(f"  {problem}", file=sys.stderr)
-        else:
-            print(f"upgrading from {previous}: its config loads and every integration is current")
-    return 1 if failed else 0
+    return _check_all(versions, args.executable.resolve())
 
 
 if __name__ == "__main__":
