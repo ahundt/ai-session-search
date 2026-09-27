@@ -949,7 +949,6 @@ fn refreshes_integrations_after_upgrade(command: &Commands) -> bool {
                 | IntegrationsCmd::Recover(_)
         ) | Commands::Package(PackageCmd::Update(_))
             | Commands::Migrate(_)
-            | Commands::RefreshIndex
     ) && !matches!(command, Commands::Skills(cmd) if cmd.is_management())
 }
 
@@ -970,14 +969,22 @@ fn execute(cli: Cli) -> Result<()> {
     // `aise mcp serve`, finds the installed skill already current. Commands that write
     // integrations or move state themselves are left to do exactly what was asked. A config
     // that fails to load skips the refresh; the command itself reports why.
+    let mut resolved_early = None;
     if refreshes_integrations_after_upgrade(&cli.command) {
         if let Ok(resolved) = Config::resolve(overrides.clone()) {
             crate::integrations::refresh_owned_skills_after_upgrade_and_report(
                 &resolved.config,
                 &resolved.config_path,
             );
+            resolved_early = Some(resolved);
         }
     }
+    // Commands below that need the configuration reuse this one rather than reading the file
+    // again; when it failed to load, resolving again reports the error as the command always has.
+    let mut resolve = || match resolved_early.take() {
+        Some(resolved) => Ok(resolved),
+        None => Config::resolve(overrides.clone()),
+    };
     let command = match cli.command {
         Commands::Integrations(IntegrationsCmd::Install(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
@@ -1008,13 +1015,13 @@ fn execute(cli: Cli) -> Result<()> {
     };
     let command = match command {
         Commands::Mcp(crate::integrations::McpCmd::Serve) => {
-            let resolved = Config::resolve(overrides.clone())?;
+            let resolved = resolve()?;
             return crate::mcp_server::serve_with_config(resolved.config);
         }
         Commands::Mcp(crate::integrations::McpCmd::SchemaBudget(args)) => {
             // Builds the catalogue and measures it; it never opens the index, so it runs on a
             // machine with no sessions and cannot be perturbed by whatever happens to be indexed.
-            let resolved = Config::resolve(overrides.clone())?;
+            let resolved = resolve()?;
             return crate::mcp_schema_budget::run(&args, &resolved.config);
         }
         command => command,
@@ -1048,12 +1055,12 @@ fn execute(cli: Cli) -> Result<()> {
         return run_migration(cmd);
     }
 
-    let resolved = Config::resolve(overrides)?;
+    let resolved = resolve()?;
     let config = resolved.config.clone();
     if let Commands::Package(command) = &command {
         return match command {
             PackageCmd::Status(_) => {
-                unreachable!("package status returns before configuration resolution")
+                unreachable!("package status returned above, before the command dispatch")
             }
             PackageCmd::Check(args) => crate::update::run_package_check(&config, args.format),
             PackageCmd::Update(args) => crate::update::run_package_update(&config, args.yes),
@@ -1588,8 +1595,7 @@ fn initial_config_text() -> String {
             text.push_str(&format!("db_path = {db_path}"));
         } else if line == "# cache_dir = \"/absolute/path/to/cache\"" {
             text.push_str(&format!("cache_dir = {cache_dir}"));
-        } else if line.starts_with(|first: char| first.is_ascii_lowercase()) && line.contains(" = ")
-        {
+        } else if is_setting_line(line) {
             text.push_str("# ");
             text.push_str(line);
         } else {
@@ -1598,6 +1604,12 @@ fn initial_config_text() -> String {
         text.push('\n');
     }
     text
+}
+
+/// A TOML assignment, indented or not; comments and table headers are not settings.
+fn is_setting_line(line: &str) -> bool {
+    let body = line.trim_start();
+    !body.is_empty() && !body.starts_with('#') && !body.starts_with('[') && body.contains('=')
 }
 
 fn write_config_example(path: &std::path::Path, force: bool) -> Result<()> {
@@ -3623,12 +3635,20 @@ mod tests {
         // A file with live defaults froze them: 1.0.0rc2's printed `preview_lines = 30` kept
         // applying after the built-in default moved on. Only what a user uncomments may override.
         let initialized = initial_config_text();
-        let live: Vec<&str> = initialized
-            .lines()
-            .filter(|line| line.starts_with(|first: char| first.is_ascii_lowercase()))
-            .collect();
-        assert_eq!(live.len(), 2, "{live:?}");
-        assert!(live[0].starts_with("db_path = ") && live[1].starts_with("cache_dir = "));
+        // Judged by what TOML reads, not by how lines look: the only values the file sets are
+        // the state paths.
+        fn leaves(table: &toml::Table, prefix: &str, into: &mut Vec<String>) {
+            for (key, value) in table {
+                match value {
+                    toml::Value::Table(inner) => leaves(inner, &format!("{prefix}{key}."), into),
+                    _ => into.push(format!("{prefix}{key}")),
+                }
+            }
+        }
+        let mut live = Vec::new();
+        leaves(&initialized.parse::<toml::Table>().unwrap(), "", &mut live);
+        live.sort();
+        assert_eq!(live, ["index.cache_dir", "index.db_path"]);
 
         let parsed: crate::config::Config = toml::from_str(&initialized).unwrap();
         assert_eq!(
