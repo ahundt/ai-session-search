@@ -197,19 +197,22 @@ cargo uninstall ai-session-search
 `aise package update --yes` skips the confirmation prompt but still requires
 authoritative ownership evidence. The command delegates to uv, pip, pipx,
 Cargo, or Homebrew, then runs the replacement executable's conservative
-`skills update` after the manager succeeds. That command visits only roots in
-the install manifest, including custom roots, and never discovers or configures
-new clients. It never overwrites the executable itself. It refuses
+`skills update` after the manager succeeds. That command visits detected client
+roots plus every root recorded in the install manifest, including custom roots,
+rewrites only unedited aise-owned files, and never configures new clients. It
+never overwrites the executable itself. It refuses
 automatic apply for a direct URL or source checkout, including a maintainer
 checkout installed into a uv tool environment or with `cargo install --path`
 or `cargo install --git`, and for unknown executables. Update the recorded
 source with its original workflow instead.
 
-Upgrading is one command whichever manager owns `aise`. The first CLI command or `aise mcp serve`
-after the version changes runs the same conservative skill refresh once: it rewrites owned skill
-files that still match what aise recorded, leaves an edited file alone and says so on stderr, and
-visits only roots in the install manifest. MCP registrations and aliases name the executable path,
-not its version, so they need no refresh. Turn the automatic refresh off with:
+Upgrading is one command whichever manager owns `aise`. The first command after the version
+changes, including `aise integrations status` and `aise mcp serve`, runs a conservative skill
+refresh once: it rewrites owned skill files that still match what aise recorded, leaves an edited
+file alone and says so on stderr, and visits only roots in the install manifest. Commands that
+install, remove, or update integrations themselves skip it. MCP registrations and aliases name the
+executable path, not its version, and managed instruction text does not change between releases
+without the same refresh, so nothing else needs rerunning. Turn the automatic refresh off with:
 
 ```toml
 [integrations]
@@ -247,11 +250,11 @@ refreshes MCP registrations and managed instructions. This prevents an
 ephemeral `uvx`, source-tree, or Python interpreter process from being copied
 and mislabeled as a package-managed installation.
 
-`aise integrations install` is an idempotent integration refresh: rerunning the same version
-changes no bytes, while running it after a package-manager update refreshes
-owned relative `aisearch -> aise` and `ai_session_search -> aise` symbolic links,
-MCP entries, instruction text, and session-index freshness through the same
-detached preparation path used after a first install. It refuses to replace either alias path when that
+`aise integrations install` is idempotent: rerunning it changes no bytes that are already current,
+and it repairs owned relative `aisearch -> aise` and `ai_session_search -> aise` symbolic links,
+MCP entries, instruction text, and session-index freshness through the same detached preparation
+path used after a first install. Upgrades do not need it; run it to connect a client installed
+since, or to repair what `aise integrations status` reports. It refuses to replace either alias path when that
 path is not an owned symbolic link. Use `--dry-run` before mutation,
 repeat `--client CLIENT` for an explicit include set, repeat
 `--exclude-client CLIENT` to subtract clients, or use `--no-mcp`, `--no-instructions`,

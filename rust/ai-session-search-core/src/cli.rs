@@ -939,6 +939,20 @@ fn clarify_stale_message_argument(
     error
 }
 
+/// Whether `command` should first bring installed skills up to this version.
+fn refreshes_integrations_after_upgrade(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Integrations(
+            IntegrationsCmd::Install(_)
+                | IntegrationsCmd::Uninstall(_)
+                | IntegrationsCmd::Recover(_)
+        ) | Commands::Package(PackageCmd::Update(_))
+            | Commands::Migrate(_)
+            | Commands::RefreshIndex
+    ) && !matches!(command, Commands::Skills(cmd) if cmd.is_management())
+}
+
 fn execute(cli: Cli) -> Result<()> {
     validate_root_options(&cli)?;
     if matches!(&cli.command, Commands::RefreshIndex) {
@@ -952,6 +966,18 @@ fn execute(cli: Cli) -> Result<()> {
         threads: cli.threads,
         index_refresh: cli.index_refresh,
     };
+    // Whatever the user runs first after an upgrade, including `aise integrations status` and
+    // `aise mcp serve`, finds the installed skill already current. Commands that write
+    // integrations or move state themselves are left to do exactly what was asked. A config
+    // that fails to load skips the refresh; the command itself reports why.
+    if refreshes_integrations_after_upgrade(&cli.command) {
+        if let Ok(resolved) = Config::resolve(overrides.clone()) {
+            crate::integrations::refresh_owned_skills_after_upgrade_and_report(
+                &resolved.config,
+                &resolved.config_path,
+            );
+        }
+    }
     let command = match cli.command {
         Commands::Integrations(IntegrationsCmd::Install(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
@@ -983,12 +1009,6 @@ fn execute(cli: Cli) -> Result<()> {
     let command = match command {
         Commands::Mcp(crate::integrations::McpCmd::Serve) => {
             let resolved = Config::resolve(overrides.clone())?;
-            // Harnesses start the server rather than a CLI command, so an upgrade reaches an
-            // MCP-only user here first. Reported on stderr, which the protocol leaves free.
-            crate::integrations::refresh_owned_skills_after_upgrade_and_report(
-                &resolved.config,
-                &resolved.config_path,
-            );
             return crate::mcp_server::serve_with_config(resolved.config);
         }
         Commands::Mcp(crate::integrations::McpCmd::SchemaBudget(args)) => {
@@ -1065,12 +1085,6 @@ fn execute(cli: Cli) -> Result<()> {
         };
         return crate::skills::run(&config, cmd, &receipt);
     }
-    // After explicit skill management, which may itself be the update the user asked for, and
-    // before any command that reads the index. Config inspection and `package` returned above.
-    crate::integrations::refresh_owned_skills_after_upgrade_and_report(
-        &config,
-        &resolved.config_path,
-    );
     if matches!(command, Commands::Dates) {
         println!("{}", crate::dates::format_reference());
         return Ok(());
@@ -2413,6 +2427,35 @@ fn codex_metadata_home_lines(report: &ConfigPathsReport) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_command_after_an_upgrade_refreshes_unless_it_manages_integrations() {
+        // `aise integrations status` right after an upgrade reported the skill "outdated", which
+        // sent users to the manual `aise integrations install` the refresh exists to remove.
+        let refreshes = |args: &[&str]| {
+            let cli = Cli::try_parse_from(std::iter::once("aise").chain(args.iter().copied()))
+                .unwrap();
+            refreshes_integrations_after_upgrade(&cli.command)
+        };
+        for args in [
+            &["integrations", "status"][..],
+            &["mcp", "serve"],
+            &["config", "show"],
+            &["package", "status"],
+            &["dates"],
+            &["list"],
+        ] {
+            assert!(refreshes(args), "{args:?} should refresh first");
+        }
+        for args in [
+            &["integrations", "install"][..],
+            &["integrations", "uninstall"],
+            &["package", "update"],
+            &["skills", "update"],
+        ] {
+            assert!(!refreshes(args), "{args:?} manages integrations itself");
+        }
+    }
     use clap::CommandFactory;
 
     #[test]
