@@ -415,7 +415,10 @@ pub struct IndexConfig {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct UiConfig {
-    #[serde(default = "default_preview_body_lines")]
+    /// Lines of transcript body in the preview. 1.0.0rc2 spelled it `preview_lines`, and a
+    /// config file that still does keeps loading: an upgrade must not require editing settings
+    /// the user wrote for the previous release.
+    #[serde(default = "default_preview_body_lines", alias = "preview_lines")]
     pub preview_body_lines: usize,
     /// Idle wake interval for the TUI event loop. Keys redraw immediately, and active worker
     /// output uses a shorter bounded slice, so this paces only settled idle turns.
@@ -429,8 +432,9 @@ pub struct UiConfig {
     /// Rows the selection moves for PageDown/PageUp in the session list.
     #[serde(default = "default_list_page_rows")]
     pub list_page_rows: usize,
-    /// Rendered rows the preview scrolls for `l`/`h` (and Left/Right). Rows, not transcript
-    /// lines: the scroll offset indexes the wrapped pane, where one long line occupies several.
+    /// Rendered rows the preview scrolls for `K`/`J` (and Shift+Up/Shift+Down). Rows, not
+    /// transcript lines: the scroll offset indexes the wrapped pane, where one long line occupies
+    /// several.
     #[serde(default = "default_preview_scroll_rows")]
     pub preview_scroll_rows: usize,
     /// Rendered rows the preview scrolls for Ctrl-d/Ctrl-u.
@@ -3715,6 +3719,13 @@ mod tests {
                 "{name}: an explicit list must replace defaults without losing order"
             );
         }
+    }
+
+    #[test]
+    fn the_rc2_preview_setting_name_still_sets_the_preview_body() {
+        // 1.0.0rc3 renamed this key and every config that set it stopped loading.
+        let config = toml::from_str::<Config>("[ui]\npreview_lines = 20\n").unwrap();
+        assert_eq!(config.ui.preview_body_lines, 20);
     }
 
     #[test]
