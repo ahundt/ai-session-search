@@ -875,6 +875,20 @@ def test_wheels_job_proves_the_pinned_build_clock_reached_the_build() -> None:
     assert '--source-date-epoch "$SOURCE_DATE_EPOCH"' in wheels
 
 
+def test_the_upgrade_check_gates_verify_without_signing_rights() -> None:
+    # The check runs the previous release downloaded from PyPI. Inside `verify`, which holds
+    # `id-token: write` and `attestations: write`, that code could reach the OIDC token and the
+    # artifacts about to be attested, so it runs in its own read-only job that `verify` waits for.
+    jobs = _workflow_jobs((ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8"))
+    upgrade, verify = jobs["upgrade"], jobs["verify"]
+
+    assert "scripts.verify_upgrade_path" in upgrade
+    assert "scripts.verify_upgrade_path" not in verify
+    assert "permissions:" not in upgrade, "the job keeps the workflow's read-only token"
+    verify_needs = next(line for line in verify.splitlines() if "needs:" in line)
+    assert "upgrade" in verify_needs
+
+
 def test_the_github_release_carries_an_explicit_title() -> None:
     # `--generate-notes` set the release title as a side effect. Replacing it with
     # `--notes-file`, so the body is the changelog section, silently dropped the title:

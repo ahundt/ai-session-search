@@ -320,7 +320,7 @@ Before tagging, confirm:
   duplicate, undated, impossible-date, empty, or misshapen section, and `--notes-out FILE` writes
   the exact body it would publish: the section plus a generated footer with the upgrade command,
   install commands, download guide, and diff link.
-- Upgrading from the previous release needs nothing but the new executable. The publish `verify`
+- Upgrading from the previous release needs nothing but the new executable. The publish `upgrade`
   job enforces this; run it on the release commit first, since it needs network access to
   install that release:
   `cargo build --release --locked --bin aise && uv run python -m scripts.verify_upgrade_path --executable target/release/aise --from <latest published version>`.
@@ -428,10 +428,10 @@ holds that role and is unaffected.
    container that never received the pin, or a wheel that skipped the rewrite, fails the job
    instead of shipping;
 3. installs and tests the exact artifacts on their target runners;
-4. verifies the complete artifact set, then installs the previous release's integrations and
-   config from PyPI and runs one command with the new Linux executable, failing if the upgrade
-   would need any manual step (`scripts/verify_upgrade_path.py`); writes `SHA256SUMS`, and
-   creates GitHub build-provenance attestations;
+4. in a separate read-only `upgrade` job, installs the previous release's integrations and config
+   from PyPI and runs one command with the new Linux executable, failing if the upgrade would need
+   any manual step (`scripts/verify_upgrade_path.py`); then `verify` checks the complete artifact
+   set, writes `SHA256SUMS`, and creates GitHub build-provenance attestations;
 5. uploads the verified wheels and sdist to TestPyPI and installs the release from that index
    alone, so an unusable distribution stops the release before any immutable version exists.
    The `testpypi` environment has no approval rule, so this adds no pause;
