@@ -3141,7 +3141,8 @@ fn refresh_integrations_for_version(
     }
     let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
     let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
-    let mut roots = manifest_recorded_skill_roots(&manifest)?;
+    let mut roots = manifest_recorded_skill_roots(&manifest)
+        .with_context(|| format!("read the skill install record {}", manifest_path.display()))?;
     // Instruction files hold no install record, so the recorded skill is the evidence that aise
     // installed integrations with this configuration; without one there is nothing to refresh,
     // and a process run with its own empty configuration never reads the user's client files.
@@ -3188,7 +3189,8 @@ fn refresh_integrations_for_version(
 /// Replace every client instruction block that holds text an earlier release wrote.
 ///
 /// The block is rewritten where it stands, unlike `aise integrations install`, which moves it to
-/// the end of the file. A file aise cannot read is skipped; `aise integrations status` reports it.
+/// the end of the file. A symlinked, non-UTF-8, or unreadable file is skipped: install refuses such
+/// files, so aise never wrote a block into one.
 fn refresh_earlier_instruction_blocks(
     receipt_path: &Path,
     layout: &ClientLayout,
@@ -3394,9 +3396,11 @@ pub(crate) fn refresh_integrations_after_upgrade_and_report(
             }
         }
         Err(error) => eprintln!(
-            "aise: could not update the installed integrations for {version}: {error:#}; the next \
-             command retries, `aise skills update` retries now, and `aise integrations status` \
-             shows their state"
+            "aise: could not update the installed integrations for {version}: {error:#}\nEvery \
+             command retries until this succeeds; `aise skills update` retries now and `aise \
+             integrations status` shows their state. To stop retrying, set `[integrations] \
+             refresh_after_upgrade = false` in {}",
+            config_path.display()
         ),
     }
 }
