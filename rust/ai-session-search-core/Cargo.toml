@@ -51,7 +51,7 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rayon = "1.11"
 regex = "1.12"
 regex-syntax = "0.8"
-rmcp = { version = "3.1.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["server", "transport-io"] }
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 rusqlite = { version = "0.40", features = ["backup", "bundled", "chrono", "functions", "hooks"] }
@@ -83,6 +83,6 @@ name = "aise"
 path = "src/main.rs"
 
 [dev-dependencies]
-rmcp = { version = "3.1.0", default-features = false, features = ["client", "server", "transport-async-rw"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["client", "server", "transport-async-rw"] }
 tempfile = "3.23"
 tokio = { version = "1.48", features = ["io-util", "rt-multi-thread", "time"] }
