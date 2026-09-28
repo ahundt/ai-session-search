@@ -4542,6 +4542,7 @@ fn is_current_instruction_file(text: &str) -> bool {
 }
 
 fn is_managed_instruction_file(text: &str) -> bool {
+    let text = &text.replace("\r\n", "\n");
     if text.trim_end() == legacy_instruction_file_content().trim_end() {
         return true;
     }
@@ -6609,6 +6610,9 @@ mod tests {
         for path in [&codex, &claude_file] {
             let crlf = fs::read_to_string(path).unwrap().replace('\n', "\r\n");
             fs::write(path, crlf).unwrap();
+        }
+        for target in instruction_targets_for_layout(McpClient::Claude, &layout) {
+            assert_eq!(status_instruction_file(&target).unwrap(), "outdated");
         }
 
         let UpgradeRefresh::Checked { instructions, .. } =
