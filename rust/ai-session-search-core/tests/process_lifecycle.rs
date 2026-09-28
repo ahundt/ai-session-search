@@ -2705,4 +2705,17 @@ fn skills_update_works_with_a_config_outside_the_default_location() {
             String::from_utf8_lossy(&updated.stderr)
         );
     }
+
+    // Updating is not installing. `aise package update` runs this command, and it recreated a
+    // skill the user had deleted, or wrote one for a harness installed with --no-skill.
+    let skill = config.parent().unwrap().join("skills/ai-session-search");
+    assert!(skill.is_dir());
+    fs::remove_dir_all(&skill).unwrap();
+    let updated = run(&["skills", "update"]);
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    assert!(!skill.exists(), "a deleted skill must stay deleted");
 }

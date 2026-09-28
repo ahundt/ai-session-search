@@ -2957,13 +2957,17 @@ pub(crate) fn write_owned_skills(
     // unmoved roots added the recorded app root a second time, as custom, and the command refused.
     rebase_automatic_skill_roots(&mut targets, receipt_path);
     if explicit_roots.is_empty() {
+        // Only directories that still exist: updating is not installing. A skill the user deleted
+        // stays deleted, and a harness installed with --no-skill gets none;
+        // `aise integrations install` or a named --skill-root puts one there on request.
+        targets.retain(|target| target.root.is_dir());
         let discovered_roots = targets
             .iter()
             .map(|target| target.root.clone())
             .collect::<std::collections::HashSet<_>>();
         let recorded_roots = manifest_recorded_skill_roots(&manifest)?
             .into_iter()
-            .filter(|root| !discovered_roots.contains(root))
+            .filter(|root| root.is_dir() && !discovered_roots.contains(root))
             .collect::<Vec<_>>();
         targets.extend(custom_skill_targets(&recorded_roots)?);
     } else {
