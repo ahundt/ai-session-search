@@ -85,13 +85,11 @@ def _publish_install_evidence() -> None:
 def cli_main() -> None:
     """Run the canonical Rust CLI and its official-rmcp stdio server."""
     args = tuple(sys.argv[1:])
-    if args == (MCP_COMMAND, *MCP_SERVE_ARGS):
-        from ai_session_search._native import serve_mcp
-
-        serve_mcp()
-        return
-
-    _publish_install_evidence()
+    # MCP stdio publishes no install evidence, but it runs through the same native command as the
+    # `aise` executable, so the first MCP server start after an upgrade refreshes the installed
+    # integrations there too; the library's `serve_mcp` never writes them.
+    if args != (MCP_COMMAND, *MCP_SERVE_ARGS):
+        _publish_install_evidence()
 
     from ai_session_search._native import _run_cli_command
 

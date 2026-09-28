@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from ai_session_search import native
 from ai_session_search._native import _run_cli_command
 
@@ -239,6 +241,40 @@ def test_single_python_executable_serves_initialize_and_exits_on_eof(tmp_path: P
     # A brevity budget for text every MCP client injects into its system prompt on initialize:
     # the four-step workflow, the provider list, and the skill/CLI pointers fit in it.
     assert len(instructions) <= 700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="aise finds the Windows home folder without HOME")
+def test_the_first_python_mcp_start_after_an_upgrade_refreshes_installed_integrations(
+    tmp_path: Path,
+) -> None:
+    # Harnesses launch `aise mcp serve`, which the console script sent straight to the library's
+    # `serve_mcp`, so a pip or uv upgrade left the installed skill outdated for MCP-only users.
+    executable = shutil.which("aise")
+    assert executable is not None
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        **_environment(tmp_path),
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "AI_SESSION_SEARCH_DATABASE": str(tmp_path / "index.db"),
+    }
+    installed = subprocess.run(
+        [executable, "integrations", "install", "--client", "codex", "--binary", executable,
+         "--no-aliases", "--no-mcp", "--no-instructions"],
+        capture_output=True, text=True, env=environment, timeout=MCP_PROCESS_TIMEOUT_SECONDS,
+    )
+    assert installed.returncode == 0, installed.stderr
+    marker = tmp_path / "integrations-refreshed-version"
+    assert not marker.exists()
+
+    served = subprocess.run(
+        _command("mcp", "serve"), input=f"{_initialize_request()}\n", capture_output=True,
+        text=True, env=environment, timeout=MCP_PROCESS_TIMEOUT_SECONDS, check=True,
+    )
+
+    assert json.loads(served.stdout)["id"] == 1, "stdout must stay pure JSON-RPC"
+    assert marker.is_file(), served.stderr
 
 
 def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> None:

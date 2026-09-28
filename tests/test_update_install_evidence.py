@@ -119,6 +119,11 @@ def test_mcp_stdio_dispatch_never_publishes_update_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
+
+    def run_cli_command(args: list[str]) -> int:
+        calls.append(f"run:{','.join(args)}")
+        return 0
+
     monkeypatch.setattr(sys, "argv", ["aise", "mcp", "serve"])
     monkeypatch.setattr(
         entrypoint,
@@ -130,13 +135,14 @@ def test_mcp_stdio_dispatch_never_publishes_update_evidence(
         "ai_session_search._native",
         _native_module(
             serve_mcp=lambda: calls.append("serve"),
-            run_cli_command=lambda _args: 0,
+            run_cli_command=run_cli_command,
         ),
     )
 
     entrypoint.cli_main()
 
-    assert calls == ["serve"]
+    # Through the native command, so the post-upgrade refresh runs, and never the evidence.
+    assert calls == ["run:mcp,serve"]
 
 
 def test_normal_cli_publishes_evidence_before_native_dispatch(
