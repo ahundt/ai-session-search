@@ -32,8 +32,8 @@ Upgrading from 1.0.0rc3 needs no action.
    or a native archive replaces `aise`, the first command or MCP server start updates the
    installed `ai-session-search` skill once, along with the aise instruction block in each
    harness's CLAUDE.md, AGENTS.md, or GEMINI.md, and prints a line for each skill and file it
-   updates. A block keeps its place in the file, and anything you edited or deleted is left alone
-   and reported once. `aise skills update`, which `aise package update` runs, does this first.
+   updates. A block keeps its place in the file, anything you edited is left alone and reported
+   once, and anything you deleted stays deleted. `aise skills update`, which `aise package update` runs, does this first.
    It covers installs that included the skill, the default; after an install made with
    `--no-skill`, or for instruction files added with `--claude-md`, `--agents-md`, or
    `--gemini-md`, run `aise integrations install`. Set
