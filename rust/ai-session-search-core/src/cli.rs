@@ -734,7 +734,8 @@ enum ConfigCmd {
     ///
     /// Use `aise config init` to write this to disk, or `aise config file` for the path in use.
     Example,
-    /// Write the embedded commented example config to the default config path.
+    /// Write a starting config to the selected config path: the example with every setting but the
+    /// database and cache paths commented out.
     ///
     /// Use `aise config example` to preview the contents first, or `aise config show` afterwards.
     Init(ConfigInitArgs),

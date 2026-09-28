@@ -65,7 +65,8 @@ pub enum SkillsCmd {
     )]
     Create(SkillsCreateArgs),
     /// Bring aise-owned installed skills up to this build's content. User-authored skills are
-    /// only diagnosed, never rewritten.
+    /// only diagnosed, never rewritten. Without --dry-run it first runs the post-upgrade refresh,
+    /// which also updates aise instruction blocks that still hold text a release wrote.
     ///
     /// Use `aise skills validate` afterwards to confirm the package still parses.
     #[command(

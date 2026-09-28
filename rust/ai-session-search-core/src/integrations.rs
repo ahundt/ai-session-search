@@ -3403,7 +3403,7 @@ pub(crate) fn refresh_integrations_after_upgrade_and_report(
                         "aise: left the aise instructions in {} unchanged after upgrading to \
                          {version}: they differ from any text aise wrote, so replacing them could \
                          destroy an edit you meant to keep.\nInspect them, or run `aise \
-                         integrations install` to replace them with this version's",
+                         integrations install --no-skill` to replace them with this version's",
                         path.display()
                     ),
                 }
@@ -3411,8 +3411,8 @@ pub(crate) fn refresh_integrations_after_upgrade_and_report(
         }
         Err(error) => eprintln!(
             "aise: could not update the installed integrations for {version}: {error:#}\nEvery \
-             command retries until this succeeds; `aise skills update` retries now and `aise \
-             integrations status` shows their state. To stop retrying, set `[integrations] \
+             command retries until this succeeds; `aise skills update` retries now and explains \
+             any repair, and `aise integrations status` shows their state. To stop retrying, set `[integrations] \
              refresh_after_upgrade = false` in {}",
             config_path.display()
         ),
