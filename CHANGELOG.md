@@ -13,7 +13,7 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
-## [1.0.0rc4] - 2026-09-27
+## [1.0.0rc4] - 2026-09-28
 
 Upgrading is now a single step: after any package manager replaces `aise`, the first command
 updates the installed skill and the aise instructions in each harness for you, including those
@@ -23,24 +23,26 @@ Upgrading from 1.0.0rc3 needs no action.
 
 ### Added
 
-1. `aise integrations status --format json` reports each integration's component, harness, path,
-   and state, with `current` set to true when it matches the running version.
+1. `aise integrations status --format json` reports each integration's `component`, `client`,
+   `path`, and `state`, and `current`, which is true when it matches the running version.
 
 ### Changed
 
 1. Upgrading no longer needs `aise integrations install`. After `uv tool upgrade`, pip, Cargo,
-   or a native archive replaces `aise`, the first command or MCP server start updates, once, the
-   installed `ai-session-search` skill and the aise instruction block in each harness's
-   CLAUDE.md, AGENTS.md, or GEMINI.md, and prints a line for each skill and file it updates. A
-   block keeps its place in the file. Anything you edited is left alone and reported once, and a
-   skill directory you deleted stays deleted; `aise integrations install` restores it.
-   `aise skills update`, which `aise package update` runs, does this first. Commands that install
-   or remove integrations skip it. Set `[integrations] refresh_after_upgrade = false` to turn this
-   off.
+   or a native archive replaces `aise`, the first command or MCP server start updates the
+   installed `ai-session-search` skill once, along with the aise instruction block in each
+   harness's CLAUDE.md, AGENTS.md, or GEMINI.md, and prints a line for each skill and file it
+   updates. A block keeps its place in the file, and anything you edited or deleted is left alone
+   and reported once. `aise skills update`, which `aise package update` runs, does this first.
+   It covers installs that included the skill, the default; after an install made with
+   `--no-skill`, or for instruction files added with `--claude-md`, `--agents-md`, or
+   `--gemini-md`, run `aise integrations install`. Set
+   `[integrations] refresh_after_upgrade = false` to turn this off.
 2. `aise config init` writes every setting commented out except the database and cache paths.
    Uncommenting a line changes that setting; everything else follows the built-in defaults,
    including ones a later release changes. Existing config files are not touched, so a file
-   `aise config init` wrote in 1.0.0rc3 or earlier keeps pinning that release's defaults.
+   `aise config init` wrote in 1.0.0rc3 or earlier keeps pinning that release's defaults. No
+   default changed in 1.0.0rc4, so such a file needs no edit.
 
 ### Fixed
 
@@ -51,6 +53,9 @@ Upgrading from 1.0.0rc3 needs no action.
    `--config`, `aise skills update` failed with ``selected as both app and custom`` after a
    successful `aise integrations install`, and so did the skill update at the end of
    `aise package update`. It now updates the skill.
+3. `aise skills update`, and so `aise package update`, put back a skill directory you had deleted
+   and wrote a skill for a harness installed with `--no-skill`. It now updates only skill
+   directories that exist; `aise integrations install` adds one.
 
 ### For contributors
 
