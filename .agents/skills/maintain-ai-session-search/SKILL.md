@@ -196,7 +196,9 @@ identity and does not determine priority.
    protected-environment maintainer approval. Before a release, have a reader who did not write the
    change check the rendered release body and touched docs against the build; check each claim
    about earlier behavior against the previous tag, because a bug fixed within one cycle never
-   reached a user.
+   reached a user. Before tagging, work through RELEASING.md's "Before tagging, confirm" list item
+   by item on the exact commit and record each result; a green gate and green CI once stood in for
+   it, and the package build, CI warning check, and final release-body read were skipped.
    Keep commit messages and other maintainer-facing prose cold readable: lead with stable behavior
    phrases and omit internal codes, transient task/session identifiers, and raw implementation
    values unless a public contract or exact verification step requires the identifier.

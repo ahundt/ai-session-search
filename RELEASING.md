@@ -455,6 +455,11 @@ inspection; they do not prove an artifact safe.
 Each step gives both paths. The browser suits an irreversible step you want to look at first; the
 commands suit inspection and repetition. They do the same thing.
 
+**0. Finish every item under "Before tagging, confirm" in [Local gate](#local-gate) on the exact
+commit you will tag,** including `scripts.prepare_packages` with artifact verification, the warning
+check on that commit's CI run, and reading the rendered release body. A green gate and green CI do
+not cover them, and a tag starts the publish workflow at once.
+
 **1. Create and push the tag.** Only the repository admin role can, per the `release-tags` ruleset.
 
 ```bash
