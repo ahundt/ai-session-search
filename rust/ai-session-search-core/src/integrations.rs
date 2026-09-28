@@ -3280,9 +3280,9 @@ fn refreshed_instruction_block(text: &str, format: InstructionFormat) -> BlockRe
     if end <= start {
         return BlockRefresh::Current;
     }
-    let current = instruction_block(format);
-    let current = current.trim_end();
     let block = &text[start..end];
+    // Written with the block's own line endings, so a CRLF file (common on Windows) stays CRLF.
+    let current = with_line_endings_of(block, instruction_block(format).trim_end());
     if block == current {
         return BlockRefresh::Current;
     }
@@ -3297,10 +3297,11 @@ fn refreshed_instruction_block(text: &str, format: InstructionFormat) -> BlockRe
 }
 
 /// AI_SESSION_SEARCH.md, which CLAUDE.md imports, brought up to this build if aise wrote its text.
-fn refreshed_instruction_file(text: &str) -> BlockRefresh {
-    if is_current_instruction_file(text) {
+fn refreshed_instruction_file(original: &str) -> BlockRefresh {
+    if is_current_instruction_file(original) {
         return BlockRefresh::Current;
     }
+    let text = &original.replace("\r\n", "\n");
     let body = if text.trim_end() == legacy_instruction_file_content().trim_end() {
         Some(LEGACY_INSTRUCTIONS_LINE)
     } else {
@@ -3311,9 +3312,18 @@ fn refreshed_instruction_file(text: &str) -> BlockRefresh {
             .map(str::trim)
     };
     if body.is_some_and(is_aise_instruction_line) {
-        BlockRefresh::Replace(instruction_file_content())
+        BlockRefresh::Replace(with_line_endings_of(original, &instruction_file_content()))
     } else {
         BlockRefresh::Edited
+    }
+}
+
+/// `text`, which uses `\n`, with CRLF line endings when `sample` uses them.
+fn with_line_endings_of(sample: &str, text: &str) -> String {
+    if sample.contains("\r\n") {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_string()
     }
 }
 
@@ -4370,7 +4380,8 @@ fn status_inline_instruction_file(path: &Path, format: InstructionFormat) -> Res
     Ok(
         if starts == 1
             && ends == 1
-            && text[start..end].trim_end() == instruction_block(format).trim_end()
+            && text[start..end].replace("\r\n", "\n").trim_end()
+                == instruction_block(format).trim_end()
         {
             "configured"
         } else {
@@ -4525,8 +4536,9 @@ fn legacy_instruction_file_content() -> String {
     format!("# aise\n\n{LEGACY_INSTRUCTIONS_LINE}\n")
 }
 
+/// Line endings do not count: an editor or Git on Windows may have turned them into CRLF.
 fn is_current_instruction_file(text: &str) -> bool {
-    text.trim_end() == instruction_file_content().trim_end()
+    text.replace("\r\n", "\n").trim_end() == instruction_file_content().trim_end()
 }
 
 fn is_managed_instruction_file(text: &str) -> bool {
@@ -6583,6 +6595,42 @@ mod tests {
             refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap(),
             UpgradeRefresh::NotNeeded
         ));
+    }
+
+    #[test]
+    fn an_upgrade_keeps_crlf_line_endings_and_status_reads_crlf_blocks_as_current() {
+        // Git and editors on Windows often store these files with CRLF. The refresh rewrote such
+        // a block with LF lines inside a CRLF file, and status called a current CRLF block
+        // "outdated" or a current AI_SESSION_SEARCH.md edited.
+        let dir = tempdir().unwrap();
+        let (receipt, layout) = home_with_rc1_instructions(dir.path());
+        let codex = layout.home.join(".codex/AGENTS.md");
+        let claude_file = layout.home.join(".claude/AI_SESSION_SEARCH.md");
+        for path in [&codex, &claude_file] {
+            let crlf = fs::read_to_string(path).unwrap().replace('\n', "\r\n");
+            fs::write(path, crlf).unwrap();
+        }
+
+        let UpgradeRefresh::Checked { instructions, .. } =
+            refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap()
+        else {
+            panic!("the recorded install must be checked");
+        };
+        assert!(instructions.contains(&InstructionRefresh::Updated(codex.clone())));
+        assert!(instructions.contains(&InstructionRefresh::Updated(claude_file.clone())));
+        for path in [&codex, &claude_file] {
+            let text = fs::read_to_string(path).unwrap();
+            assert!(!text.replace("\r\n", "").contains('\n'), "{text:?}");
+        }
+        for client in [McpClient::Claude, McpClient::Codex] {
+            for target in instruction_targets_for_layout(client, &layout) {
+                assert_eq!(
+                    status_instruction_file(&target).unwrap(),
+                    "configured",
+                    "{client:?}"
+                );
+            }
+        }
     }
 
     #[test]
