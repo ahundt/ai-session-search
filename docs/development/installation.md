@@ -198,9 +198,9 @@ cargo uninstall ai-session-search
 authoritative ownership evidence. The command delegates to uv, pip, pipx,
 Cargo, or Homebrew, then runs the replacement executable's conservative
 `skills update` after the manager succeeds. That command first runs the post-upgrade refresh
-described below, then visits detected client roots plus every root recorded in the install
-manifest, including custom roots, rewrites only unedited aise-owned files, and never configures new
-clients. It
+described below, then visits the detected client roots and the roots recorded in the install
+manifest, including custom roots, that still exist. It rewrites only unedited aise-owned files, so a
+skill you deleted stays deleted, and it never configures new clients. It
 never overwrites the executable itself. It refuses
 automatic apply for a direct URL or source checkout, including a maintainer
 checkout installed into a uv tool environment or with `cargo install --path`
@@ -212,7 +212,10 @@ changes, including `aise integrations status` and `aise mcp serve`, runs a conse
 once. It rewrites owned skill files that still match what aise recorded, visiting only roots in the
 install manifest, and replaces an aise instruction block in a harness's CLAUDE.md, AGENTS.md, or
 GEMINI.md where it stands when the block still holds text some release wrote. It leaves an edited
-file or block alone and says so on stderr. Commands that install or remove integrations themselves
+file or block alone and says so on stderr. The recorded skill is its evidence that aise installed
+integrations for this configuration, so an install made with `--no-skill` gets no automatic
+refresh, and instruction files added with `--claude-md`, `--agents-md`, or `--gemini-md` are not
+visited; rerun `aise integrations install` for those. Commands that install or remove integrations themselves
 skip it. MCP registrations and aliases name the executable path, not its version, so nothing else
 needs rerunning. `aise integrations status --format json` reports each integration with a `current`
 field for scripts. Turn the automatic refresh off with:

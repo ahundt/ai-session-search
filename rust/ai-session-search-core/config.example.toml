@@ -1,8 +1,8 @@
 # aise example config
 #
-# Copy with:
+# Write a starting config from it, with every setting but the state paths commented out:
 #   aise config init
-# Print without writing:
+# Print this example:
 #   aise config example
 #
 # Most users can leave this file absent. Built-in defaults are the same values shown here for
@@ -31,7 +31,7 @@ request_timeout_ms = 1000
 # After an upgrade by any package manager, the first command (including `aise integrations status`
 # and the MCP server) rewrites installed ai-session-search skill files and instruction blocks that
 # still match what aise wrote, so upgrading never needs `aise integrations install`. Anything you
-# edited is left alone and reported once.
+# edited is left alone and reported once. It runs when the install included the skill.
 refresh_after_upgrade = true
 
 [index]

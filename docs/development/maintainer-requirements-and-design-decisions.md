@@ -535,9 +535,9 @@ Source checkout, direct URL, Cargo path/Git, and unknown installations receive g
 silent registry replacement. After a version change by any manager, the first command refreshes
 owned skill files once, visiting only manifest-recorded roots, and replaces in place each client
 instruction block that still holds text some release wrote; the `skills update` that
-`aise package update` runs does the same first, then also visits detected client roots. Neither
-configures a new client or rewrites an edited file. Stable executable paths, aliases, and MCP
-registrations do not need rewriting. Instruction blocks carry no ownership record, so a block is
+`aise package update` runs does the same first, then also visits detected client roots that still
+exist. Neither configures a new client or rewrites an edited file. Stable executable paths,
+aliases, and MCP registrations do not need rewriting. Instruction blocks carry no ownership record, so a block is
 recognized by its text: changing a line requires adding the old line's digest to
 `EARLIER_INSTRUCTION_LINE_DIGESTS`, which a pinned-digest test enforces. Uninstall integrations
 before removing the global executable.
@@ -692,5 +692,5 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 | `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
 | `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
 | `REQ024-delegate-package-updates` | `update.rs`, release configuration | package ownership/update tests and installed `aise package status/check` |
-| `REQ049-keep-upgrades-one-command` | `config.rs` serde aliases, `integrations.rs` post-upgrade refresh, `scripts/verify_upgrade_path.py`, CI `rust` job, `run_ci_local.sh`, publish `upgrade` job | alias and refresh unit tests, instruction-text digest test, upgrade check from the previous published release |
+| `REQ049-keep-upgrades-one-command` | `config.rs` serde aliases, `integrations.rs` post-upgrade refresh, `scripts/verify_upgrade_path.py`, CI `rust` job, `run_ci_local.sh`, publish `upgrade` job | alias and refresh unit tests, instruction-text digest test, upgrade check from every published release since `UPGRADE_FLOOR` |
 | `REQ027-use-tdd`; `REQ028-test-cross-surface-contracts`; `REQ029-dogfood-installed-artifacts`; `REQ033-commit-coherent-progress`; `REQ034-gate-release-artifacts` | `tests/`, Rust test suites, `run_ci_local.sh`, release workflows | focused tests followed by all local release-gate stages |

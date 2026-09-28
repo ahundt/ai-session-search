@@ -402,7 +402,8 @@ edit MCP client configuration, write instruction files or skills, or scan a sing
 `aisearch` and `ai_session_search` aliases, configures supported components for every detected
 harness, and starts
 building the index in the background. Run `aise doctor` afterward for readiness and recovery
-guidance.
+guidance. After an upgrade, the first `aise` command brings the skill and instructions it
+installed up to date; `[integrations] refresh_after_upgrade = false` turns that off.
 
 Wheels cover CPython 3.12 through 3.14 on manylinux2014 x86_64 and aarch64, macOS x86_64 and
 arm64, and Windows x86_64. Building from source needs Rust 1.88 or newer and a C linker.

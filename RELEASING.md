@@ -547,7 +547,8 @@ compatibility against an index written by the previous release.
 If a stage fails:
 
 - Before any registry publication, fix the cause, rerun the full gate, and create a new tag only
-  if the immutable tag or artifacts changed.
+  if the immutable tag or artifacts changed. An `upgrade` job that says it "could not check"
+  a release failed to reach PyPI or run that release, not the upgrade: rerun the failed jobs.
 - If crates.io succeeded and PyPI failed, rerun only the failed jobs from the same workflow when
   the verified artifacts are unchanged.
 - If both registries succeeded and GitHub Release failed, rerun only the release job from the
