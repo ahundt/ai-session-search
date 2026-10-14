@@ -67,11 +67,9 @@ via rust's `cargo`:
 cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrations install
 ```
 
-No stable version is published yet. The `uv` command resolves the newest release candidate and
-installs it without warning, which is what Python resolvers do for a package that has only
-pre-releases. `cargo install` declines a pre-release unless a requirement asks for one, so the
-Cargo command carries `--version '^1.0.0-rc'`; that range also matches every later stable, so it
-keeps working once 1.0.0 ships. Name an exact version to choose a different one.
+Both commands install the newest stable release. The Cargo range `'^1.0.0-rc'` matches 1.0.0 and
+every later stable as well as the candidates that preceded it, so one command serves every
+published version and needs no edit at a release. Name an exact version to choose a different one.
 
 
 ## Quick start

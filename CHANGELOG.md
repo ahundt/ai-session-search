@@ -13,6 +13,25 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-14
+
+1.0.0 is the first public compatibility baseline: from here the project follows Semantic
+Versioning, so a later 1.x release does not change a documented interface incompatibly. The code
+is 1.0.0rc4's and no default changed, so upgrading from 1.0.0rc4 needs no action.
+
+### Changed
+
+1. `cargo install ai-session-search --locked` resolves a published stable version. While crates.io
+   held only candidates a bare install reported ``could not find `ai-session-search` in registry
+   `crates-io` with version `*` ``, which is why the documented command carries
+   `--version '^1.0.0-rc'`. That range keeps working, because it matches 1.0.0 and every later
+   stable as well as the earlier candidates, so the command needs no edit at a release.
+
+### For contributors
+
+1. A release starts at the "Before tagging, confirm" list in `RELEASING.md` rather than at the
+   tag, and the maintainer skill works through that list item by item and records each result.
+
 ## [1.0.0rc4] - 2026-09-28
 
 Upgrading is now one step: after any package manager replaces `aise`, the first command brings
@@ -301,7 +320,8 @@ consumer comparing receipt numbers with 1.0.0rc1 sees different values for some 
 
 First published release. See the [tag](https://github.com/ahundt/ai-session-search/releases/tag/v1.0.0rc1).
 
-[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc4...HEAD
+[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc4...v1.0.0
 [1.0.0rc4]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc3...v1.0.0rc4
 [1.0.0rc3]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc2...v1.0.0rc3
 [1.0.0rc2]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc1...v1.0.0rc2

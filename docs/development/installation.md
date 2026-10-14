@@ -68,12 +68,12 @@ Install the native Rust command from crates.io:
 cargo install ai-session-search --locked --version '^1.0.0-rc'
 ```
 
-`cargo install` declines a pre-release unless a requirement asks for one, and crates.io currently
-carries only release candidates, so a bare `cargo install ai-session-search` reports `could not
-find ai-session-search in registry crates-io with version *`. The range above matches the
-candidates and every later stable, so it keeps working once 1.0.0 ships. The `uv` and `pip`
-commands need no equivalent: their resolvers use a pre-release when it is the only version
-available.
+crates.io carries 1.0.0, so a bare `cargo install ai-session-search --locked` resolves it. The
+range above is kept because it matches 1.0.0 and every later stable as well as the earlier
+candidates, so one command serves every published version; without a range `cargo install`
+declines a pre-release, which is why the range was required while only candidates existed. The
+`uv` and `pip` commands need no equivalent: their resolvers prefer a stable release and take a
+pre-release only when it is the only version available.
 
 These package installation commands do not create aliases, register MCP servers, write
 managed Markdown or skills, or install client hooks. The common
