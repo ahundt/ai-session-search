@@ -33,7 +33,7 @@ jobs:
         run: >-
           python -m scripts.verify_release_metadata
           --tag "$GITHUB_REF_NAME" --notes-out release-notes.md
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-notes
           path: release-notes.md
@@ -64,7 +64,7 @@ jobs:
           mkdir dist
           cp "$first" dist/
           python -m scripts.verify_release_artifacts dist/*.crate
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crate
           path: dist/*.crate
@@ -153,7 +153,7 @@ jobs:
           uv run --isolated --no-project --with "$wheel" \
             python scripts/verify_installed_distribution.py \
               --source-root "$GITHUB_WORKSPACE"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
@@ -248,7 +248,7 @@ jobs:
           & (Join-Path $bundle.FullName 'install.ps1') -BinDir $bin
           $executable = Join-Path $bin 'aise.exe'
           uv run --isolated --no-project python scripts/verify_native_executable.py --executable $executable
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}
           path: dist/*
@@ -282,7 +282,7 @@ jobs:
           uv run --isolated --no-project --with "$sdist" \
             python scripts/verify_installed_distribution.py \
               --source-root "$GITHUB_WORKSPACE"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -324,7 +324,7 @@ jobs:
             echo "machine-local path leaked into SBOM" >&2
             exit 1
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dependency-sboms
           path: sbom/*.cdx.json
@@ -415,26 +415,26 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-python-distributions
           path: |
             dist/*.whl
             dist/ai_session_search-*.tar.gz
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-native-distributions
           path: |
             dist/ai-session-search-*.tar.gz
             dist/ai-session-search-*.zip
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-crate-distribution
           path: dist/*.crate
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verified-release-metadata
           path: |
