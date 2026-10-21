@@ -13,7 +13,7 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-14
+## [1.0.0] - 2026-10-21
 
 1.0.0 is the first public compatibility baseline: from here the project follows Semantic
 Versioning, so a later 1.x release does not change a documented interface incompatibly. The code
@@ -26,6 +26,16 @@ is 1.0.0rc4's and no default changed, so upgrading from 1.0.0rc4 needs no action
    `crates-io` with version `*` ``, which is why the documented command carries
    `--version '^1.0.0-rc'`. That range keeps working, because it matches 1.0.0 and every later
    stable as well as the earlier candidates, so the command needs no edit at a release.
+
+### Security
+
+1. Update the TLS stack behind the `release-check` feature: `rustls` 0.23.45 to 0.23.46
+   (RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348), `rustls-webpki` 0.103.14 to 0.103.16
+   (RUSTSEC-2026-0382), and `webpki-roots` 1.0.9 to 1.0.10 (RUSTSEC-2026-0381). The two webpki
+   advisories concern certificate paths through distrusted emSign intermediates. These crates
+   reach aise only through `ureq`, which reads the released version for `aise package check` and
+   for the once-a-day notification that follows ordinary interactive CLI output. MCP servers and
+   library calls never make that request, and `[release_notifications] enabled = false` stops it.
 
 ### For contributors
 
