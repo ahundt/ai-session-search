@@ -237,6 +237,9 @@ fn executable_name(stem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Every test here that builds a temporary directory is `#[cfg(unix)]`, because the alias
+    // behavior under test is symlink-based, so the import is dead on Windows.
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     #[cfg(unix)]

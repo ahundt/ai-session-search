@@ -20,7 +20,11 @@ use crate::text_file_transaction::{
 };
 #[cfg(test)]
 use crate::text_file_transaction::{execute_text_file_transaction, publish_text_change};
-use crate::util::{render_posix_shell_command, which};
+use crate::util::which;
+// Only the `#[cfg(unix)]` executable-bit branch renders a shell command, so an unconditional
+// import is dead on Windows and warns there while Clippy's `-D warnings` job runs on Linux.
+#[cfg(unix)]
+use crate::util::render_posix_shell_command;
 
 // Keep the MCP identity aligned with the product and distribution slug. `aise` is the executable;
 // `ai_session_search` is a language identifier and a historical client configuration key.

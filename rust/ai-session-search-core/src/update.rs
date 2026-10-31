@@ -18,7 +18,10 @@ use crate::cli::ReportOutputFormat;
 use crate::config::Config;
 use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
 use crate::hashing::lower_hex;
-use crate::util::{executable_candidates, is_executable_file, render_posix_shell_command};
+use crate::util::{executable_candidates, is_executable_file};
+// Rendering the manual command is a `#[cfg(unix)]` path; see integrations.rs for the same split.
+#[cfg(unix)]
+use crate::util::render_posix_shell_command;
 
 const PACKAGE_NAME: &str = "ai-session-search";
 #[cfg(feature = "release-check")]

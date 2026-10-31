@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::io::{BufRead as _, Read as _, Write as _};
+use std::io::Write as _;
+// `write_all` is reached from a test with no platform gate, but every `read_line` and
+// `read_to_string` call sits in a `#[cfg(unix)]` test, so those two traits are dead on Windows.
+#[cfg(unix)]
+use std::io::{BufRead as _, Read as _};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::Duration;
