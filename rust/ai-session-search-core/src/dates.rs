@@ -69,6 +69,7 @@ pub const TIME_WINDOW_HEADING: &str = "Time window (formats: `aise dates`)";
 // compare each event timestamp. `--when` supplies both bounds and conflicts with the one-sided
 // forms (enforced by clap).
 #[derive(Debug, Clone, Default, Args)]
+#[non_exhaustive]
 pub struct DateRange {
     /// Inclusive lower bound of the query period. Session commands (`list`, `search`, `export`,
     /// `analyze`) intersect it with each session's known span from created_at through updated_at;

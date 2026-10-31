@@ -98,6 +98,7 @@ pub enum SkillsCmd {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct SkillRunEscapeArgs {
     /// Skill name, skill directory, or exact SKILL.md path.
     pub selector: OsString,
@@ -237,6 +238,7 @@ pub(crate) fn parse_skill_selector(value: OsString) -> Result<crate::skill_catal
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct SkillsUpdateArgs {
     /// Extra skill directory to update. Repeat for several; omit to update every detected client
     /// root that already holds an aise-owned skill.
@@ -251,6 +253,7 @@ pub struct SkillsUpdateArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct SkillsRestoreArgs {
     /// Skill to restore. Only the built-in `ai-session-search` skill has an embedded copy to
     /// restore from; aise has no upstream for a skill you wrote.
@@ -268,6 +271,7 @@ pub struct SkillsRestoreArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct SkillsListArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -275,6 +279,7 @@ pub struct SkillsListArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct SkillsShowArgs {
     /// Skill to explain, as `aise skills list` spells it. `ai-session-search` is always
     /// resolvable, because it is compiled into this executable.
@@ -285,6 +290,7 @@ pub struct SkillsShowArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct SkillsValidateArgs {
     /// Skill directory to check — the one holding `SKILL.md`. Need not be on a search path, so a
     /// skill can be checked before it is installed anywhere.
@@ -295,6 +301,7 @@ pub struct SkillsValidateArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct SkillsCreateArgs {
     /// Name of the new skill. Becomes the directory name and the `SKILL.md` `name`, which the
     /// specification requires to be equal: 1-64 characters of lowercase letters, digits, and

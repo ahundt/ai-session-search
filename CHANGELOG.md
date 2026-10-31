@@ -53,6 +53,20 @@ from 1.0.0rc4 needs no action.
    them, in `integrations.rs`, `update.rs`, `executable_alias.rs`, and the process-lifecycle
    tests. Clippy runs with `-D warnings` on Linux, where each one is used, so the Windows jobs
    were the only place they appeared.
+4. `rust-portability` builds with `RUSTFLAGS: -D warnings`, so a warning reachable only under
+   `#[cfg(windows)]` now fails a job instead of none. Registry dependencies are built with
+   `--cap-lints allow`, so this denies the workspace's own warnings and does not make the build
+   hostage to a dependency's lints.
+5. The public Rust API no longer carries command-line plumbing. `analytics::run_vocab`,
+   `run_repeats`, `run_stats`, `run_planning`, `mcp_schema_budget::run`, and
+   `sql_query::schema_path`, with the four argument structs the first four take, are now
+   `pub(crate)` — eleven items. Each took clap-derived arguments and returned `Result<()>` after
+   printing to stdout, so none was usable from a library, and none had a caller outside the crate.
+6. The nineteen argument structs that stay reachable, `DateRange` and `DbSchemaArgs` among them,
+   carry `#[non_exhaustive]`, so adding a command-line flag stays additive instead of breaking a
+   crate that constructs one. The configuration structs were frozen this way before 1.0.0rc3 and
+   this class was missed then. `DateRange` keeps its `Default`, which is how the Python binding
+   and any other caller build one.
 
 ## [1.0.0rc4] - 2026-09-28
 

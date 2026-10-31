@@ -223,6 +223,7 @@ impl Row for RoleStat {
 }
 
 #[derive(Debug, Clone, Args)]
+#[non_exhaustive]
 pub struct CorrectionsArgs {
     /// JSON object containing direct `categories` for this run. It replaces the primary selected
     /// skill's adjacent aise-capability.toml rules while preserving that skill's identity and version.
@@ -281,7 +282,7 @@ pub struct CorrectionsArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct PlanningArgs {
+pub(crate) struct PlanningArgs {
     /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
@@ -310,7 +311,7 @@ pub struct PlanningArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct StatsArgs {
+pub(crate) struct StatsArgs {
     /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
@@ -532,7 +533,7 @@ pub(crate) fn compile_planning_filters(
     Ok(filters)
 }
 
-pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
+pub(crate) fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
     let filters = filters_from(
         db,
         &args.session_id,
@@ -547,7 +548,7 @@ pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()>
     emit(&counts, args.format)
 }
 
-pub fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()> {
+pub(crate) fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()> {
     let filters = filters_from(
         db,
         &args.session_id,
@@ -585,7 +586,7 @@ impl Row for VocabRow {
 }
 
 #[derive(Debug, Args)]
-pub struct VocabArgs {
+pub(crate) struct VocabArgs {
     /// Report only terms starting with this text, which is how you ask about one term instead of
     /// reading all of them. Matching is case-insensitive. Omit it, or pass an empty string, for
     /// every term.
@@ -603,7 +604,7 @@ pub struct VocabArgs {
     pub format: OutputFormat,
 }
 
-pub fn run_vocab(db: &Db, config: &AnalyticsConfig, args: &VocabArgs) -> Result<()> {
+pub(crate) fn run_vocab(db: &Db, config: &AnalyticsConfig, args: &VocabArgs) -> Result<()> {
     let limit = args.limit.unwrap_or(config.vocab_limit);
     let rows: Vec<VocabRow> = db
         .vocabulary(args.trigram, limit, args.prefix.as_deref())?
@@ -670,7 +671,7 @@ impl Row for RepeatGroup {
 }
 
 #[derive(Debug, Args)]
-pub struct RepeatsArgs {
+pub(crate) struct RepeatsArgs {
     /// Optional text to narrow candidate messages before repeat mining. Exact literal by default;
     /// add --regex to interpret it as a Rust regex. A query starting with `-` is parsed as a flag
     /// here; pass it after `--`, with every other flag before the `--`, e.g. `--regex -- ^/\S+`.
@@ -724,7 +725,7 @@ pub struct RepeatsArgs {
     pub format: OutputFormat,
 }
 
-pub fn run_repeats(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
+pub(crate) fn run_repeats(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
     if args.regex && args.query.is_none() {
         bail!("--regex requires QUERY");
     }

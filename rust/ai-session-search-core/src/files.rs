@@ -690,6 +690,7 @@ pub enum FilesCmd {
 }
 
 #[derive(Debug, Args, Clone, Default)]
+#[non_exhaustive]
 pub struct FileScopeArgs {
     /// Restrict to one indexed session source. Omit to include all nine.
     #[arg(long, value_enum)]
@@ -717,6 +718,7 @@ impl FileScopeArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct FilesSearchArgs {
     /// Glob over the basename (`*.rs`), or the full path when it contains `/`. Omit to list
     /// every edited file.
@@ -744,6 +746,7 @@ pub struct FilesSearchArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct FilesHistoryArgs {
     /// File basename or path (e.g. `db.rs` or `src/db.rs`).
     pub file: String,
@@ -761,6 +764,7 @@ pub struct FilesHistoryArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct FilesCrossRefArgs {
     /// Glob over the basename, or the full path when it contains `/`. Omit to cross-reference
     /// every edited file.
@@ -786,6 +790,7 @@ pub struct FilesCrossRefArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct FilesExtractArgs {
     /// File basename or path to reconstruct.
     pub file: String,

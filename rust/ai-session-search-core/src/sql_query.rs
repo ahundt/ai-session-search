@@ -155,6 +155,7 @@ pub enum DbCmd {
 }
 
 #[derive(Debug, Args, Clone)]
+#[non_exhaustive]
 pub struct DbSchemaArgs {
     /// Show columns for one table or virtual table, using SQLite table_xinfo. The `note` column
     /// carries the reading traps: values a correct-looking predicate misreads without erroring.
@@ -170,6 +171,7 @@ pub struct DbSchemaArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+#[non_exhaustive]
 pub struct DbQueryArgs {
     /// One read-only SQL statement. Use `aise db schema` first to inspect tables and
     /// columns. For indexed content or regex search, prefer `aise messages search`.
@@ -282,7 +284,11 @@ pub fn format_query_error(err: anyhow::Error, caller: &str, schema_help: &str) -
     }
 }
 
-pub fn schema_path(path: &Path, busy_timeout_ms: u64, args: &DbSchemaArgs) -> Result<QueryResult> {
+pub(crate) fn schema_path(
+    path: &Path,
+    busy_timeout_ms: u64,
+    args: &DbSchemaArgs,
+) -> Result<QueryResult> {
     let conn = open_read_only(path, busy_timeout_ms)?;
     schema_connection(&conn, args)
 }

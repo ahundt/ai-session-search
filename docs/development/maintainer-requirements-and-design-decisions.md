@@ -628,6 +628,31 @@ whether to retire them is the maintainer's call because it removes a public tool
 `resume_plan` string formatting per returned session; no index read. Deferred until decided; the
 `REQ002-share-typed-contract` gap (Python has no resume) is part of the same change.
 
+Recorded 2026-10-31 before 1.0.0 froze the surface: **what the public Rust API promises.**
+
+`anyhow::Error` appears in 17 public signatures (`lib.rs` error helpers, `db::is_sqlite_busy_error`,
+and others), so the 1.0.0 compatibility promise is coupled to `anyhow` 1.x: an `anyhow` 2.0 would
+be a breaking change for this crate's callers even if no line here changed. Accepted rather than
+wrapped, because a crate-local error enum would have to reproduce the downcast and context
+behavior the CLI already depends on, and `anyhow` has held 1.x since 2019. Revisit if `anyhow`
+announces a 2.0.
+
+`aise vocab` and `aise repeats` reach `analytics::run_vocab` and `analytics::run_repeats` directly
+from `cli.rs`; neither is in `service.rs`, so neither has a typed request, an MCP tool, or a Python
+method. That is the same `REQ002-share-typed-contract` shape as the resume decision above, and it
+is recorded rather than fixed because both functions render to stdout and giving them a typed
+response is a design task, not a rename. Filling the gap later stays additive: a new typed request,
+a new Python method, and a new MCP tool break nothing, so 1.0.0 does not block it.
+
+Those two decisions are why the clap argument structs are shaped the way they are. The 19
+externally reachable ones carry `#[non_exhaustive]` so that adding a flag stays an additive change
+instead of breaking any crate that constructs one, matching the config structs frozen the same way.
+`analytics::run_vocab`, `run_repeats`, `run_stats`, `run_planning`, `mcp_schema_budget::run`, and
+`sql_query::schema_path` are `pub(crate)`: they take clap-derived arguments and return `Result<()>`
+after printing, so they were never usable as a library and had no caller outside this crate.
+`DateRange` and `DbSchemaArgs` stay public because `DbCmd::Schema` and the Python bindings hold
+them; narrowing those would cascade through the public command enums for no gain.
+
 ### REQ033-commit-coherent-progress
 
 Commit coherent, recoverable progress points. Commit messages name exact files or components,

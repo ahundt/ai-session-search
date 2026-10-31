@@ -2232,9 +2232,14 @@ impl DateRange {
                 "when is mutually exclusive with since and until",
             ));
         }
-        Ok(Self {
-            dates: ai_session_search::dates::DateRange { since, until, when },
-        })
+        // `DateRange` is `#[non_exhaustive]`, so a later bound can be added without breaking
+        // callers; that also means this binding sets fields on a default rather than naming
+        // every one in a struct expression.
+        let mut dates = ai_session_search::dates::DateRange::default();
+        dates.since = since;
+        dates.until = until;
+        dates.when = when;
+        Ok(Self { dates })
     }
 
     #[getter]

@@ -1841,7 +1841,7 @@ pub(crate) fn stage_ledger(
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Args)]
-pub struct SchemaBudgetArgs {
+pub(crate) struct SchemaBudgetArgs {
     /// Print the per-stage overhead ledger as JSON instead of checking limits.
     #[arg(long)]
     pub ledger: bool,
@@ -1984,7 +1984,7 @@ fn report(findings: &[Finding]) -> bool {
 }
 
 /// Run the checker against this binary's own advertised catalogue.
-pub fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> anyhow::Result<()> {
+pub(crate) fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> anyhow::Result<()> {
     let listed = crate::mcp_server::advertised_tools(config);
     let tools = listed
         .as_array()

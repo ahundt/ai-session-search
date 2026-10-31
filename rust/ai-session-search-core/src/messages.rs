@@ -819,6 +819,7 @@ impl MessageSearchArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct MessageGetArgs {
     /// Session id or prefix.
     pub id: String,
@@ -875,6 +876,7 @@ pub struct MessageGetArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct TimelineArgs {
     /// Session id or prefix.
     pub id: String,
@@ -935,6 +937,7 @@ pub struct TimelineArgs {
 }
 
 #[derive(Debug, Args)]
+#[non_exhaustive]
 pub struct MessageEvidenceArgs {
     /// Session id or unique prefix.
     pub id: String,

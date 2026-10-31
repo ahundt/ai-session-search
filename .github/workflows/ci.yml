@@ -128,6 +128,14 @@ jobs:
         with:
           shared-key: rust-portability
       - name: Exercise native filesystem, process, installer, and path behavior
+        # `-D warnings` here because the `rust` job runs Clippy on ubuntu only, so a warning that
+        # appears exclusively under `#[cfg(windows)]` had nowhere to fail: four unused imports
+        # survived 1.0.0rc3 and 1.0.0rc4 that way, visible in the logs of every Windows job and
+        # denied by none. Cargo builds registry dependencies with `--cap-lints allow`, so this
+        # denies warnings from the workspace crates without making the build hostage to a
+        # dependency's lints. It costs no extra compile, unlike a second Clippy pass.
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo test -p ai-session-search --all-targets --locked
 
   rust-install:
