@@ -13,11 +13,13 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-21
+## [1.0.0] - 2026-10-31
 
 1.0.0 is the first public compatibility baseline: from here the project follows Semantic
-Versioning, so a later 1.x release does not change a documented interface incompatibly. The code
-is 1.0.0rc4's and no default changed, so upgrading from 1.0.0rc4 needs no action.
+Versioning, so a later 1.x release does not change a documented interface incompatibly. No
+behavior, command, or default changed since 1.0.0rc4; what moved is the TLS and async dependency
+versions the advisories below name, and imports that only Windows reported as unused. Upgrading
+from 1.0.0rc4 needs no action.
 
 ### Changed
 
@@ -36,11 +38,21 @@ is 1.0.0rc4's and no default changed, so upgrading from 1.0.0rc4 needs no action
    reach aise only through `ureq`, which reads the released version for `aise package check` and
    for the once-a-day notification that follows ordinary interactive CLI output. MCP servers and
    library calls never make that request, and `[release_notifications] enabled = false` stops it.
+2. Update `tokio` 1.53.1 to 1.53.3 for RUSTSEC-2026-0386, which reports that `AsyncFd::new` and
+   its related constructors violate I/O safety. `AsyncFd` lives behind tokio's `net` feature,
+   which this crate does not enable, so the unsound constructors were not reachable here.
 
 ### For contributors
 
 1. A release starts at the "Before tagging, confirm" list in `RELEASING.md` rather than at the
    tag, and the maintainer skill works through that list item by item and records each result.
+2. CI now also runs on a daily schedule. Its `licenses` job runs `cargo deny check advisories`,
+   whose verdict depends on the advisory database rather than on this repository, so a new entry
+   against an unchanged lockfile used to be noticed only when someone pushed.
+3. Four imports that only Windows reported as unused are now gated to the platform that uses
+   them, in `integrations.rs`, `update.rs`, `executable_alias.rs`, and the process-lifecycle
+   tests. Clippy runs with `-D warnings` on Linux, where each one is used, so the Windows jobs
+   were the only place they appeared.
 
 ## [1.0.0rc4] - 2026-09-28
 

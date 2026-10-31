@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The `licenses` job runs `cargo deny check advisories`, whose verdict depends on the
+  # advisory database rather than on this repository. Without a schedule a new entry
+  # against an unchanged lockfile is noticed only when someone pushes: RUSTSEC-2026-0386
+  # against tokio 1.53.1 went unseen for ten quiet days and surfaced during unrelated
+  # work. Dependabot is not a substitute, having reported no open alert while cargo-deny
+  # failed on five RUSTSEC advisories. Running the whole workflow keeps ci.yml the single
+  # place a tool version is pinned, which `workflow_pin` in run_ci_local.sh reads.
+  schedule:
+    - cron: '23 7 * * *'
   workflow_call:
 
 permissions:
