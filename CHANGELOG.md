@@ -53,10 +53,12 @@ from 1.0.0rc4 needs no action.
    them, in `integrations.rs`, `update.rs`, `executable_alias.rs`, and the process-lifecycle
    tests. Clippy runs with `-D warnings` on Linux, where each one is used, so the Windows jobs
    were the only place they appeared.
-4. `rust-portability` builds with `RUSTFLAGS: -D warnings`, so a warning reachable only under
-   `#[cfg(windows)]` now fails a job instead of none. Registry dependencies are built with
-   `--cap-lints allow`, so this denies the workspace's own warnings and does not make the build
-   hostage to a dependency's lints.
+4. Four more Windows-only findings are fixed: an unused `bytes` binding in `durable_path.rs`
+   whose sibling arm already used the `_units` form, a test binding in `analysis_publication.rs`
+   moved inside the `#[cfg(unix)]` block that uses it, `ExecutableAliases::for_test` gated to
+   `all(test, unix)` to match its six callers, and the Windows `create_directory_symlink` marked
+   `#[expect(dead_code)]` because every caller is a unix-only test, which means no Windows test
+   exercises a symlinked skill root.
 5. The public Rust API no longer carries command-line plumbing. `analytics::run_vocab`,
    `run_repeats`, `run_stats`, `run_planning`, `mcp_schema_budget::run`, and
    `sql_query::schema_path`, with the four argument structs the first four take, are now

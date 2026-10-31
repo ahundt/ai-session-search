@@ -691,9 +691,9 @@ mod tests {
             "preserve"
         );
 
-        let link = dir.path().join("broken-link");
         #[cfg(unix)]
         {
+            let link = dir.path().join("broken-link");
             std::os::unix::fs::symlink(dir.path().join("missing"), &link).unwrap();
             let link_plan =
                 AnalysisPublicationPlan::new(&link, [AnalysisPublicationFormat::Markdown]).unwrap();

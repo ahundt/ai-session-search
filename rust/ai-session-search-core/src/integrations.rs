@@ -1190,7 +1190,11 @@ fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
+// Unused today: every caller is a `#[cfg(unix)]` test, so no Windows test exercises a symlinked
+// skill root. Kept because the gap is in the tests, not here, and `expect` rather than `allow` so
+// that un-gating one of those tests fails the build until this attribute is removed.
 #[cfg(all(test, windows))]
+#[expect(dead_code)]
 fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
 }

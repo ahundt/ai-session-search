@@ -55,11 +55,11 @@ impl EncodedPath {
     /// it would produce a path that looks plausible and names the wrong file.
     pub(crate) fn to_path_buf(&self) -> Result<PathBuf> {
         match self {
-            Self::UnixBytes(bytes) => {
+            Self::UnixBytes(_bytes) => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::ffi::OsStringExt as _;
-                    Ok(PathBuf::from(OsString::from_vec(bytes.clone())))
+                    Ok(PathBuf::from(OsString::from_vec(_bytes.clone())))
                 }
                 #[cfg(not(unix))]
                 bail!("record contains a Unix path on a non-Unix host")

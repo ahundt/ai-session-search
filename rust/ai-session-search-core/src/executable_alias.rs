@@ -163,7 +163,9 @@ impl ExecutableAliases {
         }
     }
 
-    #[cfg(test)]
+    // All six callers are `#[test] #[cfg(unix)]`, because the alias behavior under test is
+    // symlink-based, so this is dead on Windows unless the cfg matches them.
+    #[cfg(all(test, unix))]
     fn for_test(executable: PathBuf) -> Self {
         let parent = executable.parent().unwrap();
         let target = executable.file_name().unwrap().into();
