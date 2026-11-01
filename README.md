@@ -1,7 +1,6 @@
-
 # AI Session Search (`aise`)
 
-Ultra-fast rust-based search of every local AI coding session with on-the-fly reindexing. Reads Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Prime Agent, Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
+Ultra-fast Rust-based search of every local AI coding session with on-the-fly reindexing. Reads Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Prime Agent, Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
 
 [![PyPI](https://img.shields.io/pypi/v/ai-session-search)](https://pypi.org/project/ai-session-search/)
 [![crates.io](https://img.shields.io/crates/v/ai-session-search)](https://crates.io/crates/ai-session-search)
@@ -14,7 +13,7 @@ Ultra-fast rust-based search of every local AI coding session with on-the-fly re
 
 <img width="1561" height="1098" alt="demo" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
 
-## Nine session formats now interact seamlessly
+## Nine session formats, one index
 
 Your AI coding history is already on disk. Claude Code writes JSONL files named by UUID. Codex
 keeps its own transcript format under `~/.codex`. Cursor, Gemini CLI, Antigravity, and AI Studio
@@ -29,7 +28,7 @@ That index reaches you four ways: the `aise` command line, an MCP server your co
 query mid-conversation, a Rust crate, and a Python package. One parser and one set of query
 types sit underneath all four, so the answer is the same whichever one you ask.
 
-## Common tasks and Example commands
+## Common tasks
 
 | Do this | Command |
 | --- | --- |
@@ -70,7 +69,6 @@ cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrati
 Both commands install the newest stable release. The Cargo range `'^1.0.0-rc'` matches 1.0.0 and
 every later stable as well as the candidates that preceded it, so one command serves every
 published version and needs no edit at a release. Name an exact version to choose a different one.
-
 
 ## Quick start
 
@@ -373,7 +371,7 @@ tradeoff is worth it.
 | `aise config file\|example\|init\|show\|origins\|paths` | Inspect or initialize TOML configuration and resolved paths |
 | `aise package status\|check\|update` | Package ownership, release checks, and manager-driven updates |
 | `aise integrations install\|status\|uninstall\|recover`, `aise mcp serve` | Aliases, MCP registrations, owned instructions and skills, and the MCP transport |
-| `aise db` | Expert read-only SQL; `aise db query --help` lists the tables and the column values a predicate misreads |
+| `aise db schema\|query` | Expert read-only SQL; `aise db schema` prints the tables, or one table's columns, and `aise db query --help` names the column values a predicate misreads |
 | `aise tui` | Interactive session browser with live typeahead search, preview scroll, and session filter bindings (p provider, f class, s window, w warnings); message-field modes stay in `aise messages search` |
 | `aise dates` | Every accepted date and duration form |
 
@@ -388,7 +386,6 @@ two options can never disagree about what comes back. File reconstruction stream
 collision-safe, and export and analysis bundles are immutable and checksummed.
 
 ## Uninstalling and other install details
-
 
 Other paths to the same build: `uvx --from ai-session-search aise --help` to run it once,
 `uv add ai-session-search` for a project dependency, `python -m pip install ai-session-search`
@@ -418,7 +415,7 @@ Uninstalling removes what `aise` installed and leaves your index, configuration,
 files alone. The [installation guide](docs/development/installation.md) covers source builds,
 per-component flags, custom destinations, updates through `aise package update`, and recovery.
 
-On PyPI, `ai-session-search` supersedes the retired `ai_session_tools` package, which was a
+On PyPI, `ai-session-search` supersedes the retired `ai-session-tools` package, which was a
 single-user Python implementation last published as `0.3.1` and receives no further releases.
 
 ## Development

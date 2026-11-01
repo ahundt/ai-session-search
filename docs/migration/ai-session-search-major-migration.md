@@ -6,12 +6,13 @@ Related contracts: [capability parity](capability-parity.md) and
 Historical execution records below preserve the command names and the advertised
 surface counts of their referenced commits, so an entry naming `aise mcp
 serve|recover` or seven MCP tools records what that commit shipped rather than what
-this one does. The current pre-release contract is `aise package
+this one does. The lifecycle contract as of 1.0.0 is `aise package
 status|check|update`, `aise integrations install|status|uninstall|recover`,
 `aise config file|example|init|show|origins|paths`, and `aise mcp serve`. For the
 current advertised tool set, read the emitted catalogue with
-`aise mcp schema-budget --catalogue`; no count is restated here that could drift
-from it.
+`aise mcp schema-budget --catalogue`, which is hidden from `aise mcp --help`
+because it answers a maintainer's question rather than a user's; no count is
+restated here that could drift from it.
 
 ## Objective
 

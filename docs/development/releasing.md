@@ -116,7 +116,12 @@ The release workflow follows this sequence:
    Linux executable, in a separate job with no signing rights.
 6. Aggregate the artifacts, reject missing or unexpected members, hash them,
    and attest the same files that will be published.
-7. Publish the Rust crate, then the Python distributions, then create the
+7. Upload the verified wheels and sdist to TestPyPI and install the release from
+   that index alone. `publish-crate` declares `needs: [verify, publish-testpypi]`,
+   so an unusable distribution stops the release while every registry version is
+   still repairable. The `testpypi` environment carries no approval rule, so this
+   adds no pause.
+8. Publish the Rust crate, then the Python distributions, then create the
    GitHub release from the verified artifacts. Do not rebuild in publish jobs.
 
 Maturin documents that portable Linux wheels require a manylinux container or
@@ -300,7 +305,7 @@ make failures more actionable. Do not layer two tools over the same responsibili
 | `zizmor` | Adopted | Adds GitHub Actions security diagnostics beyond syntax checking. Its exact version is pinned and it runs offline so CI does not require a broad GitHub token: [zizmor](https://docs.zizmor.sh/). |
 | `cargo-semver-checks` | Planned after the first public baseline | Detects public Rust API changes. A first major release has no valid registry baseline, so do not manufacture one: [cargo-semver-checks](https://docs.rs/crate/cargo-semver-checks/latest). |
 | `cargo-binstall` | Planned after repository URLs stabilize | Can install the existing native archives without compilation. Add manifest metadata only when release URLs and signature policy are final: [cargo-binstall](https://github.com/cargo-bins/cargo-binstall). |
-| `cargo-dist` | Evaluation only | It may replace native archive, installer, checksum, and GitHub release code. Adopt only if an experiment preserves Python artifacts, SBOMs, exact-artifact tests, attestations, and protected registry ordering while deleting custom code: [cargo-dist](https://opensource.axo.dev/cargo-dist/). |
+| `dist`, formerly `cargo-dist` | Evaluation only | It may replace native archive, installer, checksum, and GitHub release code. Adopt only if an experiment preserves Python artifacts, SBOMs, exact-artifact tests, attestations, and protected registry ordering while deleting custom code: [the dist book](https://axodotdev.github.io/cargo-dist/book/). The former `opensource.axo.dev` documentation host no longer resolves, so weigh maintenance continuity in the decision. |
 | `release-plz` | Not added | Its release PR/tag/crates.io authority overlaps the protected mixed-registry workflow and requires broader repository permissions. Re-evaluate only if release volume makes manual version preparation the dominant failure source: [release-plz](https://release-plz.dev/). |
 
 `.github/dependabot.yml` requests weekly, reviewable updates for the `uv`, Cargo,
@@ -334,6 +339,12 @@ Before every release:
    subprocesses; verify scoped resources and temporary files are cleaned up.
 5. Record measured latency and memory regressions against the prior release.
 
-Source links in this document were last reviewed on 2026-07-13. Re-check them when
-tool versions or hosted runner labels change; do not treat a copied workflow as
-permanent evidence of current best practice.
+Source links in this document were last read for content on 2026-07-13 and last
+checked for reachability on 2026-10-31. Re-check them when tool versions or
+hosted runner labels change; do not treat a copied workflow as permanent evidence
+of current best practice.
+
+Check reachability with a browser, not only an HTTP client. `crates.io/data-access`
+and `crates.io/docs/trusted-publishing` are client-rendered routes that answer a
+plain `curl` with 404 while serving the documented page to a browser, so a scripted
+link check reports both as dead. Both were correct when this was written.

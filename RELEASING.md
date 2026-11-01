@@ -89,15 +89,16 @@ Do not create a tag until these are also true of the specific release:
 - The exact release commit passes the local gate and package preparation below.
 - Every declaration in the identity table is the new version, and the metadata gate passes
   against the tag you are about to create.
-- If the new version is a final `X.Y.Z` and every published version so far was a candidate, the
-  install documentation no longer says otherwise. `README.md` states "No stable version is
-  published yet" and `docs/development/installation.md` that crates.io "carries only release
-  candidates"; the release that makes those false is the release that publishes them. The
+- The install documentation does not claim that the registries hold only release candidates. The
+  two sentences that did, "No stable version is published yet" in `README.md` and crates.io
+  "carries only release candidates" in `docs/development/installation.md`, were rewritten for
+  1.0.0 and must not return: a published stable release is not undone by the version a working
+  tree declares next, so declaring the following candidate does not make either true again. The
   `--version '^1.0.0-rc'` command itself stays, per
   [Pre-release semantics](#pre-release-semantics). `verify_release_metadata` cannot see this --
   a claim about the registries is not a version declaration -- so
-  `test_the_documentation_stops_claiming_no_stable_release_once_one_is_declared` fails the local
-  gate as soon as `pyproject.toml` drops its `rcN`.
+  `test_the_documentation_does_not_claim_that_no_stable_release_exists` holds the line in the
+  local gate.
 - The message-search response shape is the one you intend to publish. Once any version is on a
   registry, removing a field, renaming one, changing a type, or changing what a value means
   requires incrementing `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION` across the serializer, the
@@ -522,8 +523,8 @@ gh api -X POST "repos/<owner>/<repo>/actions/runs/$RID/pending_deployments" \
 
 **5. Demo media needs nothing per release.** The demo is one GIF in `README.md`, uploaded once by
 dragging it into the GitHub web editor, which stores it under `user-attachments` and leaves an
-`<img>` tag behind. Every release shows that same recording, and neither 1.0.0rc1 nor 1.0.0rc2
-carries demo media as a release asset. Re-record it only when the CLI it shows has changed:
+`<img>` tag behind. Every release shows that same recording, and no published release carries
+demo media as a release asset. Re-record it only when the CLI it shows has changed:
 `uv run python tests/test_demo.py --record`, then replace the image through the web editor. The
 recording stays untracked, and `verify_release_artifacts` rejects an archive that contains one.
 

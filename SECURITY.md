@@ -19,7 +19,7 @@ version; published registry versions are immutable and are never replaced.
 Security fixes target the latest released version on
 [crates.io](https://crates.io/crates/ai-session-search) and
 [PyPI](https://pypi.org/project/ai-session-search/). The retired
-`ai_session_tools` distribution receives no updates of any kind.
+`ai-session-tools` distribution receives no updates of any kind.
 
 ## What this software touches
 

@@ -51,18 +51,13 @@ unused. Upgrading from 1.0.0rc4 needs no action.
    against an unchanged lockfile used to be noticed only when someone pushed.
 3. The `rust-portability` job builds with `-D warnings`, so an item reached only from a
    `#[cfg(unix)]` block can no longer sit unused on Windows without failing a job. Clippy runs on
-   Linux alone, where each such item is live, so these appeared nowhere until a Windows job
-   objected, and a Windows cross-build cannot stand in locally because `ring` and
-   `libsqlite3-sys` both compile C against the MSVC toolchain.
-4. Nine Windows-only findings are fixed under that enforcement. Four unused imports are gated to
-   the platform that uses them, in `integrations.rs`, `update.rs`, `executable_alias.rs`, and the
-   process-lifecycle tests; an unused `bytes` binding in `durable_path.rs` takes the `_bytes` form
-   its sibling arm already used; a test binding in `analysis_publication.rs` moves inside the
-   `#[cfg(unix)]` block that uses it; `ExecutableAliases::for_test` and the
-   `isolated_config_paths_args` test helper are gated to match their callers, all of which are
-   unix-only tests; and the Windows `create_directory_symlink` is marked `#[expect(dead_code)]`,
-   recording that no Windows test exercises a symlinked skill root. The attribute fails the build
-   if such a test is added, so the gap cannot close silently.
+   Linux alone, where every such item is live, so this job is the only place the class appears.
+4. Nine Windows-only findings are fixed under that enforcement, in `integrations.rs`,
+   `update.rs`, `executable_alias.rs`, `durable_path.rs`, `analysis_publication.rs`, and the
+   process-lifecycle tests: four unused imports, an unused match binding, a misplaced test
+   binding, and two helpers now gated to match their unix-only callers. The Windows
+   `create_directory_symlink` is marked `#[expect(dead_code)]`, which records that no Windows test
+   exercises a symlinked skill root and fails the build if one is added.
 5. The public Rust API no longer carries command-line plumbing. `analytics::run_vocab`,
    `run_repeats`, `run_stats`, `run_planning`, `mcp_schema_budget::run`, and
    `sql_query::schema_path`, with the four argument structs the first four take, are now
