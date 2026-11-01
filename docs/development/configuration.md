@@ -62,12 +62,8 @@ ignored or normalized later.
 These hold for every surface and for settings added later, not only the ones documented below.
 
 All entry points use one typed Rust resolver with the precedence above. An omitted value differs
-from an empty or invalid value: empty paths and invalid numbers produce actionable errors rather
-than silently selecting another source. Runtime-derived paths and CPU/thread counts stay typed
-functions, not literal paths or machine-specific values embedded in the binary. An embedded example
-config is useful documentation; an embedded default config is acceptable only if it replaces,
-rather than duplicates, Rust defaults, and a test proves the serialized example, parser, CLI help,
-MCP schemas, and API defaults cannot drift.
+from an empty or invalid one: empty paths and invalid numbers produce actionable errors rather
+than silently selecting another source.
 
 Any future `--config`, setup, or migration flag is available through the shared resolver where the
 surface supports it. Config writes are atomic, preserve unrelated keys, use scoped locks, clean
@@ -522,4 +518,9 @@ unknown TOML keys, CLI/MCP/Python parity, and effective-config provenance. Tests
 
 The embedded `config.example.toml` is documentation, not a second runtime-default source. Typed
 Rust defaults remain canonical, and the example contract test must compare each uncommented
-tunable with those typed defaults.
+tunable with those typed defaults. An embedded default config is acceptable only if it replaces
+rather than duplicates those defaults, and only with a test proving the serialized example,
+parser, CLI help, MCP schemas, and API defaults cannot drift.
+
+Runtime-derived paths and CPU or thread counts stay typed functions, never literal paths or
+machine-specific values embedded in the binary.
