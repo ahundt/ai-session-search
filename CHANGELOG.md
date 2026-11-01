@@ -18,8 +18,8 @@ compatibility baseline; tags below it do not define a compatibility contract.
 1.0.0 is the first public compatibility baseline: from here the project follows Semantic
 Versioning, so a later 1.x release does not change a documented interface incompatibly. No
 behavior, command, or default changed since 1.0.0rc4; what moved is the TLS and async dependency
-versions the advisories below name, and imports that only Windows reported as unused. Upgrading
-from 1.0.0rc4 needs no action.
+versions the advisories below name, and platform gates on items that only Windows reported as
+unused. Upgrading from 1.0.0rc4 needs no action.
 
 ### Changed
 
