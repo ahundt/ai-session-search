@@ -1,14 +1,19 @@
-# Packaging and distribution decisions
+# Releasing: design decisions behind the machinery
 
-This records why the packaging, distribution, and publishing machinery is shaped the
-way it is: the supported target matrix, the install pathways that must keep working,
-the trusted-publishing and provenance policy, and the tool adoptions and rejections
-behind them.
+**This is background. To run a release, use [RELEASING.md](../../RELEASING.md), which is
+the whole procedure.** Nothing here is a step, and no release needs this document to
+succeed.
 
-It is reference material, not a procedure. [RELEASING.md](../../RELEASING.md) is the
-release procedure and the only document a release has to follow; every step and
-pre-tag obligation lives there. Read this when changing the machinery, not when
-running it.
+Read it in two situations:
+
+- you are **changing** how packaging, publishing, or the supported targets work, and
+  need to know what the current shape is protecting;
+- a release step **failed or surprised you**, and you want the reason behind the rule
+  rather than the rule itself.
+
+It records the supported target matrix, the install pathways that must keep working, the
+trusted-publishing and provenance policy, why publication is ordered the way it is, and
+the tool adoptions and rejections behind all of it.
 
 ## Version spellings in each ecosystem
 

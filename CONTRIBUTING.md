@@ -192,7 +192,7 @@ At release time the section also gets a short summary paragraph above its first 
 | Settings resolution across CLI, env, TOML, MCP | [docs/development/configuration.md](docs/development/configuration.md) |
 | Python and Rust library APIs | [docs/development/library-api.md](docs/development/library-api.md) |
 | Running a release, start to finish | [RELEASING.md](RELEASING.md) |
-| Why the packaging and publishing machinery is shaped this way | [docs/development/packaging-and-distribution-decisions.md](docs/development/packaging-and-distribution-decisions.md) |
+| Why the release machinery is shaped this way | [docs/development/releasing-design-decisions.md](docs/development/releasing-design-decisions.md) |
 | Cumulative product contracts | [docs/development/maintainer-requirements-and-design-decisions.md](docs/development/maintainer-requirements-and-design-decisions.md) |
 
 ## License

@@ -1,9 +1,14 @@
 # Releasing AI Session Search
 
-This is the release procedure, and it is the only document a release has to follow. Why the
-packaging and publishing machinery is shaped this way is recorded separately in
-[packaging and distribution decisions](docs/development/packaging-and-distribution-decisions.md),
-which is reference material for changing that machinery rather than for running a release.
+**Start here. This is the whole release procedure, start to finish, and the only document a
+release has to follow.** Work down it in order: set the version, pass the gate, finish
+["Before tagging, confirm"](#local-gate), tag, then approve each protected environment.
+
+| Document | When |
+| --- | --- |
+| **This file** | Running a release. Every step and pre-tag obligation is here. |
+| [Releasing: design decisions behind the machinery](docs/development/releasing-design-decisions.md) | Changing how packaging or publishing works, or asking why a rule here exists. Never required to run a release. |
+
 Nothing in this file authorizes a tag, push, registry publication, trusted-publisher
 registration, or GitHub release: those are maintainer actions taken through the protected
 environments named below.
