@@ -73,13 +73,14 @@ status = search.index_status()
 `SessionQuery.dates` intersects the inclusive query period with each known indexed session span
 from `created_at` through `updated_at`. An exact RFC 3339 value is a zero-width period and matches a
 span containing that instant. The span can contain gaps and is not evidence of continuous process
-activity. `QueryScope.dates` on messages, files, and event analytics instead compares each event's
-own timestamp.
+activity. File queries, event analytics, and `MessageScope.dates` instead compare each event's own
+timestamp.
 
 A finite session list limit bounds returned records, not necessarily SQLite rows considered; a
 zero limit intentionally returns all eligible sessions. Ranked session search also scores all
-eligible session/transcript bytes before retaining its top page. See `REQ010-protect-complexity-bounds`
-in the maintainer requirements for current runtime, memory, I/O, and output-growth bounds.
+eligible session/transcript bytes before retaining its top page. Current runtime, memory, I/O, and
+output-growth bounds are recorded under `REQ010-protect-complexity-bounds` in the
+[maintainer requirements](maintainer-requirements-and-design-decisions.md).
 
 ### Concurrency and resource ownership
 
@@ -135,13 +136,13 @@ published Python wheels, and normal CLI builds.
 ### Depending on a release candidate
 
 Name a release candidate exactly. Cargo excludes prerelease versions from an
-ordinary requirement, so `version = "1"` matches no published candidate until
-`1.0.0` is final. After that release, `version = "1"` is the requirement to use.
+ordinary requirement, so `version = "1"` resolves 1.0.0 and every later stable
+and never a candidate; `version = "1.1.0-rc.1"` is how you ask for one.
 
-### Stable result shapes
+### Result shapes
 
-Public result types are part of the contract and keep their shape across both
-libraries. `CompactOutcome`, returned by the compaction service, reports
+Both libraries return the same shape for a given public result type.
+`CompactOutcome`, returned by the compaction service, reports
 `before_bytes`, `after_bytes`, and `reclaimed_bytes` as exact byte counts (Rust exposes
 `reclaimed_bytes()` as a method); any human-readable unit is the caller's rendering.
 

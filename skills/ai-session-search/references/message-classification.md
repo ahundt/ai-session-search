@@ -124,7 +124,7 @@ aise skills corrections --format json
   "requested_selector": { "name": "corrections" },
   "resolved_skill": {
     "name": "corrections",
-    "package_version": "1.0.0-rc.2",
+    "package_version": "1.0.0",
     "selected_location": { "kind": "embedded" },
     "execution_source": { "kind": "embedded" }
   },
@@ -133,12 +133,12 @@ aise skills corrections --format json
     "result": {
       "receipt": {
         "name": "corrections",
-        "version": "1.0.0-rc.2",
+        "version": "1.0.0",
         "sha256": "cc76…"
       },
       "report": {
         "policies": [
-          { "name": "corrections", "version": "1.0.0-rc.2", "sha256": "cc76…" }
+          { "name": "corrections", "version": "1.0.0", "sha256": "cc76…" }
         ],
         "matches": [
           {

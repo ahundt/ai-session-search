@@ -21,8 +21,8 @@ Executable consolidation is complete: Cargo and Python distributions expose only
 
 ## Public Rust API contract
 
-- Rust is a first-class supported library with SemVer, rustdoc examples, changelog,
-  MSRV policy, feature matrix, and downstream compile tests.
+- Rust is a first-class supported library with rustdoc examples, changelog, MSRV
+  policy, feature matrix, and downstream compile tests.
 - Public request/result types live in core/service crates, have private fields where
   future evolution requires builders, and implement appropriate standard traits.
 - Use newtypes/builders for paths, limits, cursors, time bounds, and operation modes

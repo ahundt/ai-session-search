@@ -7,27 +7,25 @@ SPDX-License-Identifier: Apache-2.0
 
 Notable changes to AI Session Search, newest first.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Version 1.0.0 is the first public
-compatibility baseline; tags below it do not define a compatibility contract.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
 ## [1.0.0] - 2026-11-01
 
-1.0.0 is the first public compatibility baseline: from here the project follows Semantic
-Versioning, so a later 1.x release does not change a documented interface incompatibly. No
-behavior, command, or default changed since 1.0.0rc4; what moved is the TLS and async dependency
-versions the advisories below name, and platform gates on items that only Windows reported as
-unused. Upgrading from 1.0.0rc4 needs no action.
+1.0.0 is the first stable release. Every earlier version published under this name was a release
+candidate of this same release, so nothing published before it is being replaced.
+
+For anyone already running 1.0.0rc4, no behavior, subcommand, or default changed, and upgrading
+needs no action. What moved is the TLS and async dependency versions the advisories below name,
+and platform gates on items that only Windows reported as unused.
 
 ### Changed
 
-1. `cargo install ai-session-search --locked` resolves a published stable version. While crates.io
-   held only candidates a bare install reported ``could not find `ai-session-search` in registry
-   `crates-io` with version `*` ``, which is why the documented command carries
-   `--version '^1.0.0-rc'`. That range keeps working, because it matches 1.0.0 and every later
-   stable as well as the earlier candidates, so the command needs no edit at a release.
+1. `cargo install ai-session-search --locked` installs a published stable version, and the
+   documented command drops `--version '^1.0.0-rc'`. While crates.io held only candidates a bare
+   install reported ``could not find `ai-session-search` in registry `crates-io` with version
+   `*` ``, because `cargo install` takes a pre-release only when a requirement asks for one.
 
 ### Security
 
@@ -55,12 +53,12 @@ unused. Upgrading from 1.0.0rc4 needs no action.
 4. Nine Windows-only findings are fixed under that enforcement, in `integrations.rs`,
    `update.rs`, `executable_alias.rs`, `durable_path.rs`, `analysis_publication.rs`, and the
    process-lifecycle tests: four unused imports, an unused match binding, a misplaced test
-   binding, and two helpers now gated to match their unix-only callers. The Windows
-   `create_directory_symlink` is marked `#[expect(dead_code)]`, which records that no Windows test
+   binding, and two helpers now gated to match their unix-only callers. The ninth, the Windows
+   `create_directory_symlink`, is marked `#[expect(dead_code)]`, which records that no Windows test
    exercises a symlinked skill root and fails the build if one is added.
 5. The public Rust API no longer carries command-line plumbing. `analytics::run_vocab`,
    `run_repeats`, `run_stats`, `run_planning`, `mcp_schema_budget::run`, and
-   `sql_query::schema_path`, with the four argument structs the first four take, are now
+   `sql_query::schema_path`, with the five argument structs the first five take, are now
    `pub(crate)` — eleven items. Each took clap-derived arguments and returned `Result<()>` after
    printing to stdout, so none was usable from a library, and none had a caller outside the crate.
 6. The nineteen argument structs that stay reachable, `DateRange` and `DbSchemaArgs` among them,

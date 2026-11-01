@@ -1,8 +1,6 @@
 # Contributing to AI Session Search
 
-Thanks for your interest. This document covers what the project expects from a
-change, how to run the same gates CI runs, and where the deeper design records
-live.
+Thanks for your interest.
 
 Report a suspected vulnerability privately instead of opening an issue. See
 [SECURITY.md](SECURITY.md).
@@ -79,7 +77,7 @@ tests, and public-API doctests, the release executable and its MCP schema, the
 exact wheel and source distribution install pathways, and workflow syntax when
 `actionlint` is installed.
 
-The hosted operating-system and Python matrices stay CI-owned: CI additionally
+The hosted operating-system and Python matrices stay CI-owned: CI also
 runs the Rust portability suite on macOS and Windows, the Cargo
 registry/path/Git install pathways, `cargo deny check advisories licenses
 sources bans`, and an offline `zizmor` workflow-security audit. CI also runs
@@ -105,7 +103,8 @@ other modes and for what a green run does and does not cover.
 ## What a good change looks like
 
 - **Reproduce first.** Add the smallest failing test at the shared layer before
-  implementing, then cover every adapter the change reaches: Rust, PyO3, Python,
+  implementing, then cover the adapters your change actually reaches. A one-line
+  fix usually reaches one; changing a request field can reach Rust, PyO3, Python,
   CLI, MCP, schemas, docs, examples, provider fixtures, and packaging. To show a
   test guards the fix, revert only the fix and watch the test fail; stashing both
   proves nothing.
@@ -165,12 +164,12 @@ separate commits so a single concern can be reverted on its own.
 
 Add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) with the change that
 causes it. The released section becomes the GitHub Release body, followed by a generated footer
-with install and upgrade commands, so write for
-someone deciding whether and how to upgrade:
+with install and upgrade commands, so write for someone deciding whether and how to upgrade:
 
 1. Put each item under `Highlights`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
-   `Security`, or `For contributors`, in that order, and number the items. The metadata gate
-   rejects other headings and bullet lists.
+   `Security`, or `For contributors`, in that order, and number the items.
+   `scripts/verify_release_metadata.py` checks the released section when a release is cut, so
+   another heading or a bullet list blocks that release rather than your pull request.
 2. Start with what the user sees or does, then why, in one or two sentences. Name exact commands,
    keys, and settings.
 3. For a fix, say what went wrong for users of the previous release, then what happens now. A bug

@@ -1,26 +1,44 @@
 # AI Session Search documentation
 
-Use the repository [README](../README.md) for product capabilities and a quick
-start. The documents below separate user procedures from maintainer records.
+Use the repository [README](../README.md) for what `aise` does and a quick start. This page is
+the index.
 
-## User and operator guides
+## Using aise
 
 | Task | Guide |
 | --- | --- |
 | Install, verify, update, or uninstall `aise` and its MCP integrations | [Installation](development/installation.md) |
 | Resolve CLI, environment, TOML, Rust, Python, and MCP settings | [Configuration](development/configuration.md) |
 | Call AI Session Search from Python or Rust | [Library guide](development/library-api.md) |
+| Report a bug, or submit a change | [CONTRIBUTING.md](../CONTRIBUTING.md) |
+
+On a new installation, follow the installation guide's five steps in order. On an existing one
+with unexpected paths or settings, run `aise config origins` first, then use the configuration
+guide.
+
+## Maintaining and releasing aise
+
+| Task | Guide |
+| --- | --- |
 | Run a release, start to finish | [RELEASING.md](../RELEASING.md) |
 | Change how packaging, publishing, or the supported target matrix works | [Releasing: design decisions](development/releasing-design-decisions.md) |
 | Preserve cumulative product contracts while changing the repository | [Maintainer requirements and design decisions](development/maintainer-requirements-and-design-decisions.md) |
 | Re-check client-imposed MCP limits when a harness or schema changes | [MCP client limits and measured evidence](development/mcp-client-limits-and-measured-evidence.md) |
 
-For a new installation, follow the installation guide's five steps in order.
-For an existing installation with unexpected paths or settings, run `aise
-config origins`, then use the configuration guide. Maintainers preparing a
-release work through `RELEASING.md` from its "Before tagging, confirm" list
-onward, without skipping exact-artifact verification or protected-environment
-approval; it is the whole procedure, and nothing else has to be read to run one.
+`RELEASING.md` is the whole release procedure. Start at its "Before tagging, confirm" list and
+work down, without skipping exact-artifact verification or protected-environment approval.
+
+## Architecture and migration records
+
+These files explain completed design decisions and preserve migration evidence;
+they are not installation checklists.
+
+| Record | Purpose |
+| --- | --- |
+| [Major migration](migration/ai-session-search-major-migration.md) | Ordered migration ledger, checkpoints, and remaining gates |
+| [Capability parity](migration/capability-parity.md) | Legacy capability disposition and semantic-duplication decisions |
+| [Rust/Python API architecture](migration/rust-python-api-architecture.md) | Public API boundaries and distribution contract |
+| [Provenance](migration/provenance.md) | Source histories, transformation, licensing, and credit |
 
 <!-- aise-message-search-contract:start -->
 ## Generated message-search caller contract
@@ -68,15 +86,3 @@ Default precedence, highest first: `explicit` → `detail_preset` → `purpose` 
 
 The full configured catalogue is available from `aise messages search --describe`; MCP clients receive the same canonical parameter identities and planner-resolved MCP defaults in `tools/list`. Ordinary search responses contain only the compact effective request needed to interpret that response.
 <!-- aise-message-search-contract:end -->
-
-## Architecture and migration records
-
-These files explain completed design decisions and preserve migration evidence;
-they are not installation checklists.
-
-| Record | Purpose |
-| --- | --- |
-| [Major migration](migration/ai-session-search-major-migration.md) | Ordered migration ledger, checkpoints, and remaining gates |
-| [Capability parity](migration/capability-parity.md) | Legacy capability disposition and semantic-duplication decisions |
-| [Rust/Python API architecture](migration/rust-python-api-architecture.md) | Public API boundaries and distribution contract |
-| [Provenance](migration/provenance.md) | Source histories, transformation, licensing, and credit |

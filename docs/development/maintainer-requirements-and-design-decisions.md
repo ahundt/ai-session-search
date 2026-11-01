@@ -628,10 +628,10 @@ whether to retire them is the maintainer's call because it removes a public tool
 `resume_plan` string formatting per returned session; no index read. Deferred until decided; the
 `REQ002-share-typed-contract` gap (Python has no resume) is part of the same change.
 
-Recorded 2026-10-31 before 1.0.0 froze the surface: **what the public Rust API promises.**
+Recorded 2026-10-31 before 1.0.0 froze the surface: **what the public Rust API exposes.**
 
 `anyhow::Error` appears in 17 public signatures (`lib.rs` error helpers, `db::is_sqlite_busy_error`,
-and others), so the 1.0.0 compatibility promise is coupled to `anyhow` 1.x: an `anyhow` 2.0 would
+and others), so 1.0.0's public signatures are coupled to `anyhow` 1.x: an `anyhow` 2.0 would
 be a breaking change for this crate's callers even if no line here changed. Accepted rather than
 wrapped, because a crate-local error enum would have to reproduce the downcast and context
 behavior the CLI already depends on, and `anyhow` has held 1.x since 2019. Revisit if `anyhow`

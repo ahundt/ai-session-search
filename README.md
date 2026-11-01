@@ -1,6 +1,8 @@
 # AI Session Search (`aise`)
 
-Ultra-fast Rust-based search of every local AI coding session with on-the-fly reindexing. Reads Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Prime Agent, Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
+Ultra-fast Rust-based search of your local AI coding sessions, reindexing on the fly. Reads
+Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Prime Agent,
+Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
 
 [![PyPI](https://img.shields.io/pypi/v/ai-session-search)](https://pypi.org/project/ai-session-search/)
 [![crates.io](https://img.shields.io/crates/v/ai-session-search)](https://crates.io/crates/ai-session-search)
@@ -11,7 +13,7 @@ Ultra-fast Rust-based search of every local AI coding session with on-the-fly re
      inserts a user-attachments image link in place of this comment. The recording
      itself is untracked; regenerate it with uv run python tests/test_demo.py --record -->
 
-<img width="1561" height="1098" alt="demo" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
+<img width="1561" height="1098" alt="aise searching indexed AI coding sessions from the terminal" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
 
 ## Nine session formats, one index
 
@@ -19,14 +21,32 @@ Your AI coding history is already on disk. Claude Code writes JSONL files named 
 keeps its own transcript format under `~/.codex`. Cursor, Gemini CLI, Antigravity, and AI Studio
 each store sessions somewhere else again, in shapes that share nothing with each other.
 
-So the fix an agent made last month is in there, along with the version of a file it overwrote
-and the reason it stopped halfway through a task, and you have no way to go get any of it.
+So the fix an agent made last month is in there. So is the version of a file it overwrote, and
+the reason it stopped halfway through a task. Getting any of it back means learning nine formats.
 
 `aise` parses all nine formats into one index and searches it.
 
 That index reaches you four ways: the `aise` command line, an MCP server your coding agent can
-query mid-conversation, a Rust crate, and a Python package. One parser and one set of query
-types sit underneath all four, so the answer is the same whichever one you ask.
+query mid-conversation, a Rust crate, and a Python package. One parser and one set of query types
+sit underneath all four, so a query means the same thing on each. MCP alone defaults to a bounded
+page and a character budget, because its results go straight into a model's context;
+[Filters and scopes](#filters-and-scopes) gives the exact defaults.
+
+## Install
+
+Install the global `aise` command with `uv` (recommended):
+
+```bash
+uv tool install ai-session-search && aise integrations install
+```
+
+or with Rust's `cargo`:
+
+```bash
+cargo install ai-session-search --locked && aise integrations install
+```
+
+Both install the newest stable release. Name an exact version to choose a different one.
 
 ## Common tasks
 
@@ -45,30 +65,14 @@ types sit underneath all four, so the answer is the same whichever one you ask.
 | Export a session to Markdown | `aise export SESSION_ID --format markdown` |
 | Check index health and effective paths | `aise doctor`, `aise config paths` |
 
-A harness notice is something the surrounding tool said to the agent: Stop-hook feedback,
-PreToolUse blocks, local-command caveats, task notifications. A transcript often never mentions
-the block that ended a run, so searching these answers the question the transcript cannot. They
-stay out of ordinary results until `--kinds harness-notice` asks for them. Subagent runs get
-indexed as sessions of their own, each one recording the session that spawned it, which keeps
-delegated work searchable once it finishes.
+A run that stopped without saying why usually hit a harness notice: Stop-hook feedback, a
+PreToolUse block, a local-command caveat, a task notification. These are what the surrounding
+tool said to the agent, not what the agent wrote, so they stay out of ordinary results until
+`--kinds harness-notice` asks for them.
 
-## Install
-
-Install the global `aise` command, via `uv` (recommended):
-
-```bash
-uv tool install ai-session-search && aise integrations install
-```
-
-via rust's `cargo`:
-
-```bash
-cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrations install
-```
-
-Both commands install the newest stable release. The Cargo range `'^1.0.0-rc'` matches 1.0.0 and
-every later stable as well as the candidates that preceded it, so one command serves every
-published version and needs no edit at a release. Name an exact version to choose a different one.
+Subagent runs become sessions in their own right, each one recording the session that spawned
+it. `--session-kinds subagent` lists them, and `--parent-session` narrows to the children of
+one run.
 
 ## Quick start
 
@@ -90,8 +94,8 @@ aise files history src/app.py
 aise files extract src/app.py > src/app.py
 ```
 
-`aise COMMAND --help` is authoritative for every parameter and default. Date bounds accept ISO,
-EDTF, durations, and common natural-language forms; `aise dates` is the full reference.
+`aise COMMAND --help` documents every parameter and default. Date bounds accept ISO, EDTF,
+durations, and common natural-language forms; `aise dates` lists every accepted form.
 
 ## MCP server
 
@@ -100,38 +104,33 @@ refactor, and it queries this index and answers inline without you leaving the c
 The server is a subcommand of the same executable, so there is nothing else to install.
 
 ```bash
-aise integrations install    # configures supported components for every detected harness
+aise integrations install    # register the server with every detected harness
 aise integrations status
 aise mcp serve               # direct stdio use by a client
 ```
 
-Eight tools are exposed: `search_sessions`, `search_messages`, `list_sessions`, `get_session`,
-`get_resume_command`, `get_index_status`, `run_skill_capability`, and `query_session_index` for
-read-only SQL.
+The server exposes eight tools: `search_sessions`, `search_messages`, `list_sessions`,
+`get_session`, `get_resume_command`, `get_index_status`, `run_skill_capability`, and
+`query_session_index` for read-only SQL.
 
-The installer writes each MCP client's native JSON or TOML shape for Claude Code and Claude
+`aise integrations install` writes each client's own JSON or TOML shape: Claude Code and Claude
 Desktop, ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI, Antigravity App/IDE/CLI, Cursor,
-Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode VS Code extension. Pi and Prime
-Agent instead receive the shared skill plus native `AGENTS.md` guidance: Pi has no MCP client, and
-Prime's kernel currently accepts remote HTTP MCP integrations rather than a local stdio server.
-Claude receives `CLAUDE.md` guidance, Codex and OpenCode receive a managed `AGENTS.md` block, and
-Gemini and Antigravity share one managed block in `~/.gemini/GEMINI.md`. Every other MCP client receives MCP
-configuration only. No client hooks are installed.
+Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode VS Code extension.
 
-Omit `--client` to update everything detected, or name clients explicitly. Generated
-configuration stores the absolute path of the first `aise` on your PATH, which keeps shells and
-GUI clients on the same installation when their PATH order differs; `--binary PATH` overrides it.
+Two harnesses get guidance rather than MCP configuration, because neither runs a local stdio
+server: Pi has no MCP client, and Prime Agent's kernel currently accepts remote HTTP MCP
+integrations only. Both receive the shared skill and native `AGENTS.md` guidance. Alongside MCP
+configuration, Claude also receives `CLAUDE.md` guidance, Codex and OpenCode a managed
+`AGENTS.md` block, and Gemini and Antigravity one shared managed block in `~/.gemini/GEMINI.md`.
+Every other client gets MCP configuration only, and no client gets hooks.
 
 MCP tools are read-only and bounded. Writing bundles to disk stays a CLI and library operation,
-so no MCP call has a filesystem side effect. Tool inputs are closed schemas validated before the
-index is even opened, and a misspelled field fails with its exact argument path.
+so no MCP call has a filesystem side effect. Tool inputs are closed schemas, and a misspelled
+field fails with its exact argument path.
 
-Install and uninstall preflight every target and write a durable receipt before the first change.
-A failure partway through restores the files already written. An interruption preserves the
-receipt and prints the exact `aise integrations recover` invocation, and recovery only touches
-files that still match its recorded before-and-after image. `aise integrations status` reads the
-receipt and every target under the transaction's shared RAII lock, so it can never report a
-mixture of two installer generations.
+A failed install restores what it had already written, and an interruption prints the exact
+`aise integrations recover` invocation. `aise integrations status` reads every target under the
+transaction's shared RAII lock, so it never reports a half-applied mixture.
 
 ## Speed
 
@@ -156,12 +155,8 @@ reparsed only the 6 sessions whose bytes had changed, so steady-state cost follo
 Refresh runs on access by default, including when an MCP client asks a question, and
 `--index-refresh existing-only` skips it when you want the query cost alone.
 
-Scope flags cut the corpus a query considers. For session list/search/export/analysis, date bounds
-intersect the known indexed span from `created_at` through `updated_at`: `--since` requires the span
-to end on or after the bound, `--until` requires it to start on or before the bound, and `--when`
-requires overlap with the resolved period. That span can contain gaps; it is not a claim of
-continuous process activity. Message, file, and event analytics continue to compare each event's
-own timestamp. `--provider` and `--path` compose with either interpretation. Your index is probably
+Scope flags cut the corpus a query considers, so a narrowed query costs less than these rows;
+[Filters and scopes](#filters-and-scopes) covers what each one selects. Your index is probably
 smaller than this one, so treat these timings as a ceiling.
 
 ## Session sources
@@ -183,12 +178,14 @@ claim they are searchable.
 | Gemini CLI | `gemini-cli` | no; use show/export |
 
 Prime Agent is Pi-derived but stores its own root and RLM-child transcripts under
-`~/.prime/agent`; it remains a separate provider so filters, IDs, diagnostics, and resume commands
-never conflate the two harnesses. Codex desktop and Codex CLI/IDE share one local host under
-`~/.codex`, so they index together.
-The `codex` provider reads that local transcript format only; it does not parse Chat/Work
+`~/.prime/agent`, so it stays a separate provider and never conflates with Pi in filters, IDs,
+or resume commands. Codex desktop and Codex CLI/IDE share one local host under `~/.codex`, so
+they index together.
+
+The `codex` provider reads that local transcript format only. It does not parse Chat/Work
 browser state or sync cloud history, which OpenAI documents as
 [separate histories](https://help.openai.com/en/articles/20001276) in the merged desktop app.
+
 These IDs are the TOML keys in provider configuration, and `aise config paths` prints each
 source's enabled state and effective roots.
 
@@ -223,6 +220,11 @@ aise files extract path/to/file.rs --all --format jsonl
 # See why the planner chose the candidates it did
 aise messages search "database lock" --query-mode fuzzy --limit 20 --receipt-level full --format json
 ```
+
+Date bounds test a session's span, `created_at` through `updated_at`: `--since` needs it to end
+on or after the bound, `--until` to start on or before, `--when` to overlap the period. That span
+can contain gaps, so it is not a claim of continuous activity. Message, file, and event analytics
+compare each event's own timestamp instead.
 
 How many results you get back depends on the surface. Session-level and MCP searches return
 bounded pages, which keeps a client from being flooded. Rust, CLI, and Python message search are
@@ -337,10 +339,10 @@ import through `aise migrate config`.
 
 ## Index maintenance
 
-Never copy a live SQLite index by hand, because the file alone omits its WAL state. Use the
-migration service, which takes an online backup, verifies integrity and row manifests, preserves
-rollback evidence, and publishes the destination atomically. An interrupted migration is
-recoverable from its receipt, and a conflicting destination is never overwritten.
+Never copy a live SQLite index by hand, because the file alone omits its WAL state.
+`aise migrate database` takes an online backup, verifies it, and publishes the destination
+atomically. An interrupted migration is recoverable from its receipt, and a conflicting
+destination is never overwritten.
 
 ```bash
 aise migrate database --help
@@ -377,31 +379,37 @@ tradeoff is worth it.
 
 ## Architecture
 
-A single executable backs the CLI, the MCP server, the Rust crate, and the Python package, and
-they share one index lifecycle and one provider registry. Rust owns parsing, querying, migration,
-and filesystem publication, so Python carries no second scanner and no parallel policy
-implementation. Indexed filtering covers provider, session, path, date, role, message kind, tool,
-sequence, and canonical tool-argument JSON pointer. One `--kinds` set selects message classes, so
-two options can never disagree about what comes back. File reconstruction streams, restores are
-collision-safe, and export and analysis bundles are immutable and checksummed.
+One executable backs the CLI, the MCP server, the Rust crate, and the Python package, over one
+index lifecycle and one provider registry, so a new provider becomes searchable on all four at
+once.
 
-## Uninstalling and other install details
+Rust owns parsing, querying, migration, and filesystem publication, so every surface resolves a
+query through one implementation. Filtering by provider, session, path, date, role, message kind,
+tool, sequence, or canonical tool-argument JSON pointer runs inside the index, and one `--kinds`
+set owns message-class selection.
 
-Other paths to the same build: `uvx --from ai-session-search aise --help` to run it once,
-`uv add ai-session-search` for a project dependency, `python -m pip install ai-session-search`
-for a standard install.
+File reconstruction streams rather than buffering, `files extract --restore` writes a
+`.recovered` sibling and never overwrites, and export and analysis bundles are immutable and
+checksummed.
+
+## Install details and uninstalling
+
+Other paths to the same build: `uvx --from ai-session-search aise --help` runs it once without
+installing, `uv add ai-session-search` adds a project dependency, and
+`python -m pip install ai-session-search` does a standard install.
+
+Wheels cover CPython 3.12 through 3.14 on manylinux2014 x86_64 and aarch64, macOS x86_64 and
+arm64, and Windows x86_64. Building from source needs Rust 1.88 or newer and a C linker.
 
 Installing the package never touches your configuration. It does not create command aliases,
 edit MCP client configuration, write instruction files or skills, or scan a single transcript.
 `aise integrations install` is the explicit second step that does those things: it adds the
 `aisearch` and `ai_session_search` aliases, configures supported components for every detected
-harness, and starts
-building the index in the background. Run `aise doctor` afterward for readiness and recovery
-guidance. After an upgrade, the first `aise` command brings the skill and instructions it
-installed up to date; `[integrations] refresh_after_upgrade = false` turns that off.
+harness, and starts building the index in the background. Run `aise doctor` afterward for
+readiness and recovery guidance.
 
-Wheels cover CPython 3.12 through 3.14 on manylinux2014 x86_64 and aarch64, macOS x86_64 and
-arm64, and Windows x86_64. Building from source needs Rust 1.88 or newer and a C linker.
+After an upgrade, the first `aise` command brings the skill and instructions it installed up to
+date. Set `[integrations] refresh_after_upgrade = false` to turn that off.
 
 To remove it, take the integrations out before the executable, because the uninstaller is what
 knows which entries are its own:
@@ -427,8 +435,7 @@ uv run maturin develop --uv    # required: Python tests import the compiled exte
 ```
 
 The gate builds isolated config, cache, and database state, so it never touches a real user
-index. Run it with no environment prefix: it inherits whatever compiler wrapper Cargo is
-configured to use, and prefixing `RUSTC_WRAPPER=` disables
+index. Run it with no environment prefix: prefixing `RUSTC_WRAPPER=` disables
 [sccache](https://github.com/mozilla/sccache) and forces a cold rebuild.
 
 While iterating:

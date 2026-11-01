@@ -1,8 +1,14 @@
-# Configuration lifecycle
+# Configuration
 
-`aise` resolves durable settings once and passes the resulting typed Rust `Config` to the CLI,
-MCP server, and Python service. Keep query filters, output formats, pagination, and migration
-source/destination arguments invocation-local; they are not persistent configuration.
+`aise` needs no configuration file. With none present it enables every provider at its
+platform-default paths, which `aise config show` prints in full. Create a file only to change a
+source path or a runtime setting.
+
+When one exists, `aise` resolves durable settings once and passes the resulting typed Rust
+`Config` to the CLI, MCP server, and Python service. Query filters and migration destinations
+stay invocation-local. Result limits and line windows have persistent defaults, under
+[search extent](#search-extent-and-elapsed-time-defaults) and
+[output windowing](#output-windowing-defaults).
 
 ## Configure in four steps
 
@@ -18,14 +24,18 @@ file is created. The database and cache keep separate platform-appropriate defau
    the state location is visible without moving either directory, and writes every other setting
    commented out, so later releases' defaults keep applying until you uncomment one. It refuses to
    overwrite an existing entry; use `--force` only after reviewing the replacement.
-3. Edit only durable source paths and runtime settings. Keep query filters,
-   output formatting, and migration destinations on the command that uses them.
+3. Edit only durable source paths and runtime settings. Keep query filters and
+   migration destinations on the command that uses them.
 4. Run `aise config show`, `aise config origins`, and `aise doctor`. The first
    command prints merged values, the second identifies each winning source,
    and the third reports invalid or inaccessible runtime paths.
 
 For automation, set a canonical `AI_SESSION_SEARCH_*` variable or pass the
-corresponding CLI/API argument rather than generating machine-specific TOML.
+corresponding CLI/API argument rather than generating machine-specific TOML. A missing file is
+only an error when you named it: discovery falls back to defaults, while `--config` or
+`AI_SESSION_SEARCH_CONFIG` pointing at a path that does not exist fails with
+`explicit config file does not exist: PATH` rather than silently using defaults you did not ask
+for.
 
 ## Precedence
 
@@ -102,13 +112,15 @@ calls, noninteractive output, and test-only dispatch do not perform notification
 checks. A notification failure is silent and leaves normal command output
 unchanged; explicit package commands report failures.
 
-Provider `paths` has deliberate three-state behavior:
+## Provider source paths
 
-- Omitted provider table or omitted `paths`: use platform defaults.
-- Explicit `paths = []`: search no roots for that provider.
-- Explicit nonempty `paths`: replace platform roots with exactly those paths.
+`[providers.<name>].paths` has three states. `aise config paths` prints the effective roots.
 
-Set `enabled = false` when the provider itself should be disabled.
+- Omitted table, or omitted `paths`: platform defaults.
+- `paths = []`: no roots searched, so that provider returns nothing.
+- Nonempty `paths`: exactly those paths, replacing the platform defaults.
+
+`enabled = false` disables the provider itself.
 
 ## Search access scope
 
@@ -190,49 +202,57 @@ share a separate host-sized Rayon worker pool; this avoids oversubscribing both 
 layers. Set `"host"` to admit one read per available logical CPU, or a positive integer for an
 exact connection/page-cache cap. This setting never changes the separate single-writer election
 used by index refresh.
-`aise integrations install` writes the
-absolute path of the first `aise` on the installer's PATH plus `mcp serve`; `--binary PATH`
-selects a different installation explicitly. The installer supports Claude
-Code/Desktop, ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI, Antigravity
-App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy
-KiloCode VS Code extension. Claude, Codex, OpenCode, Gemini, Antigravity, Pi, and Prime receive
-managed instruction-file guidance. Pi has no native MCP client, and Prime accepts remote HTTP MCP
-integrations rather than the local stdio server, so those selectors install only supported
-components. The repository does not install client hooks. It installs the owned
-`$ai-session-search` skill for detected Claude, Codex, Gemini/Antigravity, Pi, and Prime harnesses
-unless `--no-skill` is passed.
+
+## Integration installer destinations and selectors
+
+`aise integrations install` writes the absolute path of the first `aise` on the installer's PATH
+plus `mcp serve`; `--binary PATH` selects a different installation explicitly.
+
+The installer supports Claude Code/Desktop, ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI,
+Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and
+the legacy KiloCode VS Code extension. Claude, Codex, OpenCode, Gemini, Antigravity, Pi, and
+Prime receive managed instruction-file guidance.
+Pi has no native MCP client, and Prime accepts remote HTTP MCP integrations rather than the local
+stdio server, so those selectors install only supported components.
+The repository does not install client hooks. It installs the owned
+`$ai-session-search` skill for detected Claude, Codex, Gemini/Antigravity, Pi, and Prime
+harnesses unless `--no-skill` is passed.
+
 Antigravity App/IDE and CLI share `~/.gemini/config/mcp_config.json` but use
-`~/.gemini/config/skills/` and `~/.gemini/antigravity-cli/skills/`
-respectively. Install, status,
-uninstall, and recover derive their default
-transaction receipt from the selected config path, so global `--config` and
-`AI_SESSION_SEARCH_CONFIG` select the same recovery namespace without loading the session index.
-Omitting `--client` selects every detected client. Repeated `--client` values
-form an explicit include set; repeated `--exclude-client` values subtract from
-that set. Custom destinations are format-specific: `--json-mcp-config`,
-`--vscode-config`, `--zed-config`, `--opencode-config`, `--codex-config`,
-`--claude-md`, `--gemini-md`, and `--agents-md`. All are repeatable and pass
-through the same preflight, transaction, status, recovery, and uninstall path. Exact custom
-skill destinations use repeatable `--skill-root DIR` (the directory, not a file inside it);
-uninstall preserves them with `--keep-skill`, refuses to remove a directory without the embedded
-ownership marker, and preserves the whole directory whenever any file in it differs from what
-install recorded. The automatic package lives under `~/.ai-session-search/skills/` and is exposed
-through separate harness-native discovery links. An explicit `--config` or
-`AI_SESSION_SEARCH_CONFIG` deliberately selects a portable alternate namespace for that invocation.
-Instruction status is content-aware: `configured` means the current generated
-content is active; `outdated`, `instruction file missing`, `instruction file
-modified`, and `orphaned managed file` identify the exact repair or ownership
-condition. Install upgrades sentinel-owned or recognized legacy content,
-refuses unmanaged imported files before publishing any MCP change, and
-normalizes duplicate managed inline blocks to one. Uninstall removes every
-managed inline block and only whole files that carry recognized aise ownership.
-The same concise text is returned as MCP initialize `instructions`, so clients
-that support server instructions receive the workflow even without a Markdown
-integration. The first 512 characters are self-contained and contract-tested,
-following Codex's current
-[MCP guidance](https://learn.chatgpt.com/docs/extend/mcp.md). Markdown remains
-necessary for harnesses that do not consume server instructions or need the
-guidance before choosing an MCP tool.
+`~/.gemini/config/skills/` and `~/.gemini/antigravity-cli/skills/` respectively.
+
+Install, status, uninstall, and recover derive their default transaction receipt from the
+selected config path, so global `--config` and `AI_SESSION_SEARCH_CONFIG` select the same
+recovery namespace without loading the session index. Either one deliberately selects a portable
+alternate namespace for that invocation.
+
+Omitting `--client` selects every detected client. Repeated `--client` values form an explicit
+include set; repeated `--exclude-client` values subtract from that set.
+
+Custom destinations are format-specific: `--json-mcp-config`, `--vscode-config`, `--zed-config`,
+`--opencode-config`, `--codex-config`, `--claude-md`, `--gemini-md`, and `--agents-md`. All are
+repeatable and pass through the same preflight, transaction, status, recovery, and uninstall
+path.
+
+Exact custom skill destinations use repeatable `--skill-root DIR` (the directory, not a file
+inside it); uninstall preserves them with `--keep-skill`, refuses to remove a directory without
+the embedded ownership marker, and preserves the whole directory whenever any file in it differs
+from what install recorded. The automatic package lives under `~/.ai-session-search/skills/` and
+is exposed through separate harness-native discovery links.
+
+Instruction status is content-aware: `configured` means the current generated content is active;
+`outdated`, `instruction file missing`, `instruction file modified`, and `orphaned managed file`
+identify the exact repair or ownership condition. Install upgrades sentinel-owned or recognized
+legacy content, refuses unmanaged imported files before publishing any MCP change, and normalizes
+duplicate managed inline blocks to one. Uninstall removes every managed inline block and only
+whole files that carry recognized aise ownership.
+
+The same concise text is returned as MCP initialize `instructions`, so clients that support
+server instructions receive the workflow even without a Markdown integration. The first 512
+characters are self-contained and contract-tested, following Codex's current
+[MCP guidance](https://learn.chatgpt.com/docs/extend/mcp.md). Markdown remains necessary for
+harnesses that do not consume server instructions or need the guidance before choosing an MCP
+tool.
 
 ## Search extent and elapsed-time defaults
 
@@ -300,26 +320,40 @@ pipelines can request all summary evidence with `--summary-items 0 --format json
 
 ## TUI display defaults
 
-`[ui]` configures the interactive terminal UI only. Seven interaction keys ship now:
-`idle_poll_interval_ms` (150, minimum 1) paces settled idle turns. Every queued key redraws
-immediately within the same loop turn, and active search/preview output is checked within 10 ms;
-zero is rejected because it would return before polling any key, and intervals that do not fit the
-platform monotonic clock are rejected instead of overflowing the deadline.
-`search_debounce_ms` (150) is how long an edited query must stay unchanged before it becomes a
-search. Typing never waits on it: the keystroke echoes on its own loop turn and the search runs
-off the input thread either way. `0` searches on every keystroke, which is what this did before
-the setting existed, and Enter searches the current query at once whatever the value — so this is
-the one `[ui]` key where zero names a behavior rather than an impossible one, and the only one
-that accepts it. Raise it on a large index, where one search costs seconds and a typed burst
-would otherwise start a scan per character that the next keystroke cancels. `list_page_rows` (10)
-is the PageDown/PageUp jump in the session list; `preview_scroll_rows` (5) and
-`preview_page_rows` (15) are the K/J and Ctrl-d/Ctrl-u scroll amounts, counted in rendered rows
-rather than transcript lines, because the scroll offset indexes the wrapped pane. These step
-values have minimum 1. `provider_label_width` (9, minimum 1) is the session
-list's provider column width — normal panes clamp upward to the longest label, while a pane too
-narrow to contain that label clamps to its actual interior and truncates rather than overflowing;
-`list_pane_percent` (45, range 10–90) is the body width share of the session-list pane, the preview
-pane taking the remainder.
+`aise tui` needs no configuration. Everything under `[ui]` is optional, and one key has a common
+reason to change: raise `search_debounce_ms` on a large index, where a single search costs seconds
+and a typed burst would otherwise start a scan per character that the next keystroke cancels.
+
+| Key | Default | Accepted | Selects |
+| --- | ---: | --- | --- |
+| `search_debounce_ms` | 150 | `0` and up | How long an edited query must stay unchanged before it becomes a search |
+| `idle_poll_interval_ms` | 150 | minimum 1 | How often a settled idle turn wakes |
+| `list_page_rows` | 10 | minimum 1 | The PageDown/PageUp jump in the session list |
+| `preview_scroll_rows` | 5 | minimum 1 | The K/J scroll amount, in rendered rows |
+| `preview_page_rows` | 15 | minimum 1 | The Ctrl-d/Ctrl-u scroll amount, in rendered rows |
+| `provider_label_width` | 9 | minimum 1 | The session list's provider column width |
+| `list_pane_percent` | 45 | 10–90 | The body width share of the session-list pane; the preview takes the remainder |
+| `preview_body_lines` | 34 | | The preview's total body budget |
+
+`search_debounce_ms` is the only one of these that accepts `0`, and the only one where zero names
+a behavior rather than an impossible one: it searches on every keystroke, which is what the TUI
+did before the setting existed. Enter searches the current query at once whatever the value, and
+typing never waits on the debounce, because the keystroke echoes on its own loop turn and the
+search runs off the input thread either way.
+
+Every other key is rejected at zero. `idle_poll_interval_ms` would return before polling any key,
+and an interval that does not fit the platform monotonic clock is rejected rather than allowed to
+overflow the deadline. Queued keys redraw immediately within the same loop turn whatever the
+interval, and active search or preview output is checked within 10 ms.
+
+The two scroll amounts count rendered rows rather than transcript lines, because the scroll offset
+indexes the wrapped pane. `provider_label_width` is a starting width: a normal pane clamps upward
+to the longest label, while a pane too narrow to contain that label clamps to its actual interior
+and truncates rather than overflowing. `preview_body_lines` keeps the canonical-transcript
+bookends at their historical 8/4/8/14 shares even when a role is absent, each floored at one line,
+which preserves the previous preview including Session/CWD metadata while avoiding a full Rust
+`String` clone and an O(turns) vector. Every line in the example file equals its typed Rust
+default.
 
 `[ui].unicode` and `[ui].color` (`auto`, `on`, `off`) say what the terminal on the other end can
 draw, and `crate::terminal_style` resolves them once when the TUI starts — configuration states
@@ -362,41 +396,27 @@ a search.
 
 `[ui.keys]` maps each command to the key presses that reach it, and `crate::keymap` owns that
 vocabulary: `config` stores a `KeyBindings` and validates it with everything else, `tui` asks it
-what a key event means and never parses a key name, and the status bar names whatever is bound
-rather than the defaults. A table names only the actions it changes and the rest keep theirs,
-the same merge `[providers.<name>]` already uses, because replacing the whole table on a partial
-override would unbind every other command to change one. `[]` unbinds an action deliberately.
+what a key event means and never parses a key name, and the status bar names whatever is bound.
+
+A table names only the actions it changes and the rest keep theirs, the same merge
+`[providers.<name>]` already uses, because replacing the whole table on a partial override would
+unbind every other command to change one. `[]` unbinds an action deliberately. A command may be
+reached by as many keys as the table lists, so a reader adding their own keeps the shipped one,
+and a key an action already lists is a repeat and is kept once.
+
 A binding is a single character, `f1` through `f35`, or a named key, optionally chorded with
-`ctrl`, `alt`, `shift`, or `super`; a capital letter is written as itself rather than `shift+`,
-because whether a terminal reports the shift flag beside the character is a property of its
-keyboard protocol. A chorded letter goes further and ignores its case, making `ctrl+c` and
-`ctrl+C` one binding: crossterm substitutes the shifted character and clears the shift flag when
-the terminal reports kitty alternate keys, so keeping the case significant would answer Ctrl+Shift+C
-on one terminal and not another.
-A command may be reached by as many keys as the table lists, so a reader adding their own keeps
-the shipped one; a key an action already lists is a repeat and is kept once.
-Two rules are checked at load: one chord may not mean two things reachable from the same mode
-(which is why Esc can both leave the search box and quit the browser, and Enter can both leave
-it and resume), and `quit` and `interrupt` may not both be unbound. `interrupt` answers in both
-modes and takes two presses, because raw mode turns off the terminal's own interrupt character —
-without it a full-screen application has no interrupt at all.
+`ctrl`, `alt`, `shift`, or `super`. Write a capital letter as itself rather than `shift+`, because
+whether a terminal reports the shift flag beside the character is a property of its keyboard
+protocol. A chorded letter goes further and ignores its case, making `ctrl+c` and `ctrl+C` one
+binding: crossterm substitutes the shifted character and clears the shift flag when the terminal
+reports kitty alternate keys, so keeping the case significant would answer Ctrl+Shift+C on one
+terminal and not another.
 
-`[ui].preview_body_lines` (34) is the preview's total body budget: canonical-transcript
-bookends keep their historical 8/4/8/14 shares even when a role is absent, each floored at one
-line. The default therefore preserves the previous preview, including Session/CWD metadata, while
-avoiding a full Rust `String` clone and O(turns) vector. Every example-file line equals its typed
-Rust default.
-
-## Maintainer checks
-
-Configuration changes require focused tests for all four precedence levels, invalid canonical
-environment values, canonical/legacy conflicts, omitted versus explicit-empty provider paths,
-unknown TOML keys, CLI/MCP/Python parity, and effective-config provenance. Tests must inject
-`ConfigEnvironment`; do not mutate process environment in parallel Rust tests.
-
-The embedded `config.example.toml` is documentation, not a second runtime-default source. Typed
-Rust defaults remain canonical, and the example contract test must compare each uncommented
-tunable with those typed defaults.
+Two rules are checked at load. One chord may not mean two things reachable from the same mode,
+which is why Esc can both leave the search box and quit the browser, and Enter can both leave it
+and resume. `quit` and `interrupt` may not both be unbound: `interrupt` answers in both modes and
+takes two presses, because raw mode turns off the terminal's own interrupt character, and without
+it a full-screen application has no interrupt at all.
 
 ## Client limit budgets
 
@@ -489,3 +509,17 @@ The [`os_str_bytes` documentation](https://docs.rs/os_str_bytes/latest/os_str_by
 platform encoding may change and should not be used for storage, while
 [`camino::Utf8PathBuf`](https://docs.rs/camino/latest/camino/struct.Utf8PathBuf.html) rejects
 non-Unicode paths. Neither is a safer receipt format than explicit platform-native units.
+
+## Maintainer checks
+
+Nothing below this point is needed to configure `aise`; it is what a change to configuration
+itself has to satisfy.
+
+Configuration changes require focused tests for all four precedence levels, invalid canonical
+environment values, canonical/legacy conflicts, omitted versus explicit-empty provider paths,
+unknown TOML keys, CLI/MCP/Python parity, and effective-config provenance. Tests must inject
+`ConfigEnvironment`; do not mutate process environment in parallel Rust tests.
+
+The embedded `config.example.toml` is documentation, not a second runtime-default source. Typed
+Rust defaults remain canonical, and the example contract test must compare each uncommented
+tunable with those typed defaults.

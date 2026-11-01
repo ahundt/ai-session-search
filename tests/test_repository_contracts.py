@@ -192,6 +192,12 @@ def test_the_documentation_does_not_claim_that_no_stable_release_exists() -> Non
     and the assertion would then demand that `README.md` restore a sentence that 1.0.0 had already
     falsified. A published stable release is not undone by the version a working tree declares
     next, so neither claim may return.
+
+    `test_readme_pre_release_disclosure_matches_the_declared_version` was that earlier form, kept
+    as a second copy of this check against the same README sentence, and it is deleted rather than
+    repaired: it read the same `pyproject.toml` phase suffix and demanded the sentence back on the
+    first candidate after 1.0.0, so the two gates became jointly unsatisfiable the moment one of
+    them was corrected.
     """
     for relative, claim in _CLAIMS_RETIRED_AT_THE_FIRST_STABLE_RELEASE.items():
         assert claim not in (ROOT / relative).read_text(encoding="utf-8"), (
@@ -204,12 +210,16 @@ def test_the_documentation_does_not_claim_that_no_stable_release_exists() -> Non
 def test_the_release_check_runs_the_cargo_command_the_readme_gives() -> None:
     """The post-publish check is the only gate that can catch a broken registry install.
 
-    `cargo install` takes a pre-release only when a requirement asks for one, so while crates.io
-    holds nothing but release candidates a bare `cargo install ai-session-search --locked` fails
-    with "could not find `ai-session-search` in registry `crates-io` with version `*`". That
-    shipped on the README, because the check in RELEASING.md substituted `cargo add`, which
-    resolves candidates happily, and the `rust-install` CI job only exercises `--path` and
-    `--git`, which resolve no registry version and run before the crate is published.
+    `cargo add` and `cargo install` resolve by different rules, so a check that substitutes the
+    easier verb reports success against a registry where the documented command fails. That is
+    what happened. RELEASING.md checked `cargo add`; the `rust-install` CI job exercises only
+    `--path` and `--git`, which resolve no registry version at all, and the crate is unpublished
+    while that job runs. A bare `cargo install ai-session-search --locked` therefore shipped on
+    the README while crates.io held nothing but release candidates and the command could only
+    fail with "could not find `ai-session-search` in registry `crates-io` with version `*`".
+
+    Assert that the two are the same command rather than that each exists. Either one is
+    defensible alone; the defect is the pair disagreeing.
     """
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
@@ -218,27 +228,20 @@ def test_the_release_check_runs_the_cargo_command_the_readme_gives() -> None:
     assert documented, "README no longer gives a cargo install command"
     command = documented.group(0).strip()
 
-    # RELEASING.md records each command with its measured outcome, the failing bare form
-    # included, so presence alone proves nothing. Pair each command with the outcome that
-    # follows it and require the README's to be the one that installs. An outcome runs from
-    # the arrow on the command's own line through the indented continuations under it.
-    lines = releasing.splitlines()
-    outcomes = {}
-    for index, line in enumerate(lines):
-        if not line.startswith("cargo install ai-session-search"):
-            continue
-        invocation, _, outcome = line.partition("->")
-        for following in lines[index + 1 :]:
-            if not following.startswith(" "):
-                break
-            outcome += following
-        outcomes[invocation.strip()] = outcome
-    assert command in outcomes, (
-        f"RELEASING.md records no outcome for the README's {command!r}, so a registry install can "
-        "fail for users while the release check reports success"
+    # Read the required-results table, which is the only place using this row shape. The
+    # measured block under it records what each command did while every published version was a
+    # candidate -- the bare `cargo install` failure included -- so parsing that block instead
+    # would reject the command a stable release documents on the strength of its own history.
+    required = dict(
+        re.findall(r"^\| `(cargo install [^`]+)` \| ([^|]+) \|$", releasing, re.MULTILINE)
     )
-    assert "Installing" in outcomes[command] and "error" not in outcomes[command], (
-        f"RELEASING.md records the README's {command!r} as failing: {outcomes[command]!r}"
+    assert command in required, (
+        f"RELEASING.md's install-check table never runs the README's {command!r}, so a registry "
+        f"install can fail for users while the release check reports success. It runs {sorted(required)}"
+    )
+    assert "installs" in required[command], (
+        f"RELEASING.md asks only that the README's {command!r} {required[command].strip()!r}. "
+        "Resolving a version is not installing it, which is the distinction `cargo add` hides."
     )
 
 
@@ -988,29 +991,6 @@ def test_build_provenance_is_attested_only_for_a_real_tag_push() -> None:
         f"the attestation step itself must carry {gate!r}: it persists an entry that cannot be "
         f"deleted, so a workflow_dispatch rehearsal must not create one. Step was:\n{attest_step}"
     )
-
-
-def test_readme_pre_release_disclosure_matches_the_declared_version() -> None:
-    # The README tells readers that `uv tool install` and `cargo install` resolve a release
-    # candidate because no stable version exists. That is true of every version this project has
-    # published so far and becomes false the moment `X.Y.Z` ships, at which point the sentence
-    # would tell people the opposite of what their resolver does. Tie it to the version the
-    # manifest declares, the way the other factual README claims here are tied to their source.
-    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    disclosure = "No stable version is published yet"
-
-    prerelease = any(marker in version for marker in ("a", "b", "rc", "dev"))
-    if prerelease:
-        assert disclosure in readme, (
-            f"version {version} is a pre-release, so the install block must say plain installs "
-            "resolve it"
-        )
-    else:
-        assert disclosure not in readme, (
-            f"version {version} is stable, so the install block must drop the pre-release "
-            "disclosure: both resolvers now prefer the stable release"
-        )
 
 
 def _workflow_jobs(text: str) -> dict[str, str]:

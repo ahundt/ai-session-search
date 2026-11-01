@@ -11,15 +11,18 @@ system, the exact command or MCP request, and what an attacker would gain. A
 reproduction that runs against synthetic fixtures rather than your own session
 transcripts is easier to act on and does not disclose your data.
 
-Expect an acknowledgement within seven days. Fixes ship in a new released
-version; published registry versions are immutable and are never replaced.
+Reports go to the maintainer for triage. A fix ships as a new released version:
+published registry versions are immutable and are never replaced, so a fix
+arrives under a new version number rather than being patched into one you
+already have.
 
-## Supported versions
+## Where fixes are published
 
-Security fixes target the latest released version on
+A fix reaches you as a new release on
 [crates.io](https://crates.io/crates/ai-session-search) and
-[PyPI](https://pypi.org/project/ai-session-search/). The retired
-`ai-session-tools` distribution receives no updates of any kind.
+[PyPI](https://pypi.org/project/ai-session-search/), so `aise package update`
+picks one up. The retired `ai-session-tools` distribution receives no updates of
+any kind.
 
 ## What this software touches
 
@@ -29,11 +32,14 @@ platform application directories. Understanding that boundary makes a report
 easier to classify:
 
 - **Local data only.** It never fetches conversations from a vendor account and
-  never uploads transcripts. The only outbound network request is the optional
-  release check against the GitHub releases API, disabled with
+  never uploads transcripts. The only request `aise` issues itself is the
+  optional release check against the GitHub releases API, disabled with
   `--skip-release-notification`, `AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION=1`,
   or `[release_notifications].enabled = false`, and never performed by MCP stdio
-  or by Rust and Python library calls.
+  or by Rust and Python library calls. `aise package update` reaches a registry
+  only by running the package manager that owns the installation, which also
+  means it replaces the executable; `aise package status` reports the owner
+  without contacting anything.
 - **Indexed content is sensitive.** The index holds whole conversations,
   including any secrets a transcript captured. Reports about the index leaking
   outside its configured directory, about file permissions on it, or about
@@ -51,19 +57,19 @@ Every third-party GitHub Action is pinned to a full-length commit SHA. Release
 artifacts are verified byte-for-byte before publication and carry GitHub
 build-provenance attestations; Python distributions also carry PyPI
 attestations. The crates.io package is reproduced deterministically before the
-protected publish job asks Cargo to package it again. crates.io and PyPI use
-OpenID Connect trusted publishing, while GitHub Release creation uses the
-workflow's repository-scoped `GITHUB_TOKEN`. All publication jobs use protected
-environments that require maintainer approval, and no long-lived registry token
-exists. Publication is triggered by a `v*` tag, and the `release-tags` ruleset
-restricts creating, moving, and deleting those tags to the repository admin
-role.
+protected publish job asks Cargo to package it again.
+
+crates.io and PyPI use OpenID Connect trusted publishing, while GitHub Release
+creation uses the workflow's repository-scoped `GITHUB_TOKEN`, so no long-lived
+registry token exists. Every publication job runs in a protected environment
+that requires maintainer approval. Publication is triggered by a `v*` tag, and
+the `release-tags` ruleset restricts creating, moving, and deleting those tags
+to the repository admin role.
 
 CI runs `cargo deny check advisories licenses sources bans` against the locked
-Rust dependency graph. Exceptions live in `deny.toml`, are recorded one
-identifier at a time with the condition that retires them, and never cover a
-security vulnerability. CycloneDX SBOMs and separate Rust and Python license
-inventories are published with each release.
+Rust dependency graph. Exceptions live in `deny.toml`, recorded one identifier
+at a time with the condition that retires them. CycloneDX SBOMs and separate
+Rust and Python license inventories are published with each release.
 
 Attestations record how an artifact was built. They do not establish that it is
 safe, and they do not replace inspecting it.

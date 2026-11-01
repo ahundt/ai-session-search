@@ -63,8 +63,8 @@ Releases require Rust at or above the workspace `rust-version` (1.88 at the time
 Free-threaded CPython is not supported. The distribution exposes one executable, `aise`, and
 MCP clients run `aise mcp serve`.
 
-1.0.0 is the first public compatibility baseline; the former private single-user package does
-not define the public compatibility contract. Release tools (uv, cargo-cyclonedx, cargo-deny)
+1.0.0 is the first stable release; the interfaces of the former private single-user package do
+not constrain it. Release tools (uv, cargo-cyclonedx, cargo-deny)
 are pinned by version in `.github/workflows/ci.yml`, `prepare-packages.yml`, and `publish.yml`;
 change them only in a separate reviewed toolchain change.
 
@@ -102,7 +102,8 @@ Do not create a tag until these are also true of the specific release:
   "carries only release candidates" in `docs/development/installation.md`, were rewritten for
   1.0.0 and must not return: a published stable release is not undone by the version a working
   tree declares next, so declaring the following candidate does not make either true again. The
-  `--version '^1.0.0-rc'` command itself stays, per
+  documented Cargo command drops `--version '^1.0.0-rc'` in the same release, because a bare
+  `cargo install` reaches a stable version and nothing but a candidate needed the range; see
   [Pre-release semantics](#pre-release-semantics). `verify_release_metadata` cannot see this --
   a claim about the registries is not a version declaration -- so
   `test_the_documentation_does_not_claim_that_no_stable_release_exists` holds the line in the
@@ -228,10 +229,34 @@ the version string the metadata gate already pins. crates.io reporting
 `"max_stable_version": null` is the positive signal that it classified the version as a
 pre-release. A final `X.Y.Z` tag takes the non-prerelease branch of the same `case`.
 
-### While no stable version exists, Python installs take the newest candidate and `cargo install` refuses
+### Run every install command the documentation gives, against the registry
 
-Check every command the documentation gives, one at a time. Measured while `1.0.0rc1` and
-`1.0.0rc2` were the only published versions:
+Nothing upstream of this point can catch a broken registry install. The `rust-install` CI job
+exercises the `--path` and `--git` shapes, which resolve no registry version at all, and the
+crate is still unpublished while that job runs.
+
+Run each of these one at a time against a throwaway destination, and require each to reach the
+version just published:
+
+| Command | Required result |
+| --- | --- |
+| `uv tool install ai-session-search` | resolves the new version |
+| `uv pip install ai-session-search` | resolves the new version |
+| `uv add ai-session-search` | resolves the new version |
+| `python -m pip install ai-session-search` | resolves the new version |
+| `cargo add ai-session-search` | resolves the new version |
+| `cargo install ai-session-search --locked` | installs the new version |
+
+Run the Cargo row exactly as written, because it is the command the README gives. `cargo add`
+and `cargo install` resolve by different rules, so checking the one that is easier to run
+reports success against a registry where the documented command fails. That is how a Cargo
+command that could not install once shipped on the README, and it is why
+`test_the_release_check_runs_the_cargo_command_the_readme_gives` ties this table to the README's
+install block.
+
+#### Why a candidate needed an explicit version range and 1.0.0 does not
+
+Measured while `1.0.0rc1` and `1.0.0rc2` were the only published versions:
 
 ```
 uv tool install ai-session-search             -> ai-session-search==1.0.0rc2
@@ -245,8 +270,13 @@ cargo install ai-session-search --locked --version '^1.0.0-rc'
                                               -> Installing ai-session-search v1.0.0-rc.2
 ```
 
-The last line is the command the README gives, so run that one against a throwaway `--root` and
-require it to install.
+Cargo splits on the verb. `cargo add` resolves a candidate the way the Python resolvers do,
+while `cargo install` takes one only when a requirement asks for it, so while every published
+version was a candidate the README had to carry `--version '^1.0.0-rc'` to install at all.
+Publishing a stable version ends that: `cargo install` reaches a non-prerelease version without
+being asked, so from 1.0.0 the README gives the bare command and the table above is where each
+release proves it still installs. A reader has no way to tell an explicit candidate range from
+an instruction to install a candidate, which is the other reason it does not survive 1.0.0.
 
 The Python result surprises people, so do not "fix" it.
 [PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases) excludes pre-releases
@@ -256,17 +286,6 @@ pre-release." Once any stable version exists those resolvers prefer it and a rel
 is reachable only by an explicit pin. Do not publish a stable version merely to change this, and
 do not yank a candidate to hide it; if plain installs must not reach a pre-release, the only
 real options are to keep release candidates off the public registries or to say so in the README.
-
-Cargo splits on the verb. `cargo add` resolves a candidate the same way Python does, while
-`cargo install` takes one only when a requirement asks for it, which is why the documented Cargo
-command carries `--version '^1.0.0-rc'`. That range matches the candidates and every later
-stable, verified against `clap`, whose `^4.0.0-rc` requirement resolves to a `4.x` stable, so the
-line survives the 1.0.0 release unedited.
-
-Check `cargo install` itself here, because nothing upstream of this point can. The `rust-install`
-CI job exercises the `--path` and `--git` shapes, which resolve no registry version at all, and
-the crate is unpublished while that job runs. Substituting `cargo add` reports success against a
-registry where the documented command fails.
 
 ## Local gate
 

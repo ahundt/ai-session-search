@@ -5,12 +5,6 @@ This guide defines the supported installation pathways for the
 Prefer a package registry for normal use. Install from Git only when testing an
 unreleased change or when a specific commit is required.
 
-The canonical repository URL is
-`https://github.com/ahundt/ai-session-search`. Maintainers must keep it equal to
-`project.urls.Repository` in `pyproject.toml` and `workspace.package.repository`
-in `Cargo.toml`; installation documentation must not introduce a second
-repository identity.
-
 ## Install in five steps
 
 1. Choose exactly one owner for the global `aise` executable: `uv tool`
@@ -19,15 +13,20 @@ repository identity.
    [an immutable Git revision](#install-an-immutable-git-revision) when testing
    unreleased code.
 3. Run `aise --version`, `aise package status`, and `aise config paths` to
-   confirm which executable and state directories are active.
+   confirm which executable and state directories are active. If the shell
+   reports no such command, the installer's bin directory is not on your `PATH`:
+   `uv tool update-shell` adds uv's, and the native archive installs to
+   `$XDG_BIN_HOME` or `~/.local/bin`.
 4. Run `aise integrations install` and `aise integrations status` to create the `aisearch` and
    `ai_session_search` aliases, register the same executable with detected MCP clients,
    and install managed agent instructions. Use
    `aise integrations install --dry-run` first when targeting existing custom files.
 5. Run `aise doctor` to check the background index preparation started by integration
    installation. When it reports a usable index, run `aise list` and
-   `aise search "QUERY"` to verify the search path end to end. Use `aise reindex`
-   only when `aise doctor` reports that explicit recovery is required.
+   `aise search "QUERY"` to verify the search path end to end. When `aise doctor`
+   reports that explicit recovery is required it names the exact command; that is
+   `aise reindex --full` for a stale schema or stale sessions, and `aise reindex`
+   for files that are merely unindexed.
 
 To update or remove the product later, follow [Update and
 uninstall](#update-and-uninstall) in order. Integration removal must happen
@@ -65,20 +64,18 @@ python -m pip install ai-session-search
 Install the native Rust command from crates.io:
 
 ```bash
-cargo install ai-session-search --locked --version '^1.0.0-rc'
+cargo install ai-session-search --locked
 ```
 
-crates.io carries 1.0.0, so a bare `cargo install ai-session-search --locked` resolves it. The
-range above is kept because it matches 1.0.0 and every later stable as well as the earlier
-candidates, so one command serves every published version; without a range `cargo install`
-declines a pre-release, which is why the range was required while only candidates existed. The
-`uv` and `pip` commands need no equivalent: their resolvers prefer a stable release and take a
-pre-release only when it is the only version available.
+Every command above takes the newest stable release. `uv` and `pip` reach a pre-release only
+when it is pinned or is the only version that satisfies the requirement, per
+[PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases); `cargo install` reaches
+one only when a `--version` requirement asks for it. Naming a version is how you install a
+release candidate, not how you avoid one.
 
-These package installation commands do not create aliases, register MCP servers, write
-managed Markdown or skills, or install client hooks. The common
-`aise integrations install` step owns aliases
-and integrations without copying the package-owned executable.
+None of these commands creates aliases, registers MCP servers, writes managed Markdown or skills,
+or installs client hooks. `aise integrations install` does all of that, and it points at the
+package-owned executable rather than copying it.
 
 After any installation method, register the same `aise` executable with detected
 MCP clients:
@@ -97,73 +94,90 @@ configuration resolution or process launch prevents preparation, the valid
 integration files remain installed and the command prints the exact
 configuration path plus `aise reindex` and `aise doctor` recovery steps.
 
-Users who want the recommended executable plus detected-client integration can
-run one fail-fast shell command. Package ownership and MCP configuration remain
-separate transactions, so a package-manager failure never edits client files:
+To install the executable and configure detected clients in one fail-fast command, chain them.
+Package ownership and MCP configuration stay separate transactions, so a package-manager failure
+never edits client files:
 
 ```bash
 uv tool install ai-session-search && aise integrations install
-cargo install ai-session-search --locked --version '^1.0.0-rc' && aise integrations install
+cargo install ai-session-search --locked && aise integrations install
 ```
 
-This follows the same proven lifecycle as RTK (`rtk` installation followed by
-`rtk init -g`) and autorun (uv tool installation followed by
-`autorun --install`), while `aise integrations install` additionally provides dry-run,
-status, per-client selection, durable recovery, and ownership-safe uninstall.
+Chaining with `&&` keeps them two steps rather than merging them: `aise integrations install` runs
+only if the package install succeeded, so a package-manager failure still edits no client files.
+It adds dry-run, status, per-client selection, durable recovery, and ownership-safe uninstall.
 
-The default stored command is the absolute path of the first `aise` on the
-installer's PATH. This prevents a desktop client or harness from selecting a
-shadowed installation through a different PATH order. Use `--binary PATH` to
-select another installation deliberately. Supported selectors are `claude`, `codex`,
-`gemini`, `antigravity`, `pi`, `prime-agent`, `cursor`, `windsurf`, `vscode`, `zed`,
-`opencode`, `openclaw`, and `kilocode`; omission or `all` updates detected clients. Repeat
-`--client CLIENT` to include several explicit clients, or repeat
-`--exclude-client CLIENT` to remove clients from that set. Explicit custom
-paths are always included and are not client aliases, so exclusions do not
-discard them. The Kilo selector is
-explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
-`~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed instruction guidance for Claude, Codex, OpenCode, Gemini,
-Antigravity, Pi, and Prime Agent; Gemini and Antigravity share `~/.gemini/GEMINI.md`, while Pi and
-Prime use `~/.pi/agent/AGENTS.md` and `~/.prime/agent/AGENTS.md`. It does not install hooks. Pi has
-no built-in MCP client, and Prime currently accepts remote HTTP MCP servers rather than a local
-stdio subprocess, so selecting either installs its skill and guidance without writing a false MCP
-registration. It installs one `ai-session-search` skill package for detected or explicitly
-selected Claude, Codex, Gemini, Antigravity, Pi, and Prime Agent harnesses. The app owns the canonical package under
-`~/.ai-session-search/skills/`, beside `~/.ai-session-search/config.toml`. This app directory is a
-sibling of `~/.claude`, not a child of it and not a harness-owned location. The
-`ai-session-search/` package contains general harness guidance in `SKILL.md`, adjacent
+### Which executable the installer registers
+
+The default stored command is the absolute path of the first `aise` on the installer's PATH. This
+prevents a desktop client or harness from selecting a shadowed installation through a different
+PATH order. Use `--binary PATH` to select another installation deliberately.
+
+### Clients and selectors
+
+Supported selectors are `claude`, `codex`, `gemini`, `antigravity`, `pi`, `prime-agent`,
+`cursor`, `windsurf`, `vscode`, `zed`, `opencode`, `openclaw`, and `kilocode`; omission or `all`
+updates detected clients. Repeat `--client CLIENT` to include several explicit clients, or repeat
+`--exclude-client CLIENT` to remove clients from that set. Explicit custom paths are always
+included and are not client aliases, so exclusions do not discard them.
+
+The Kilo selector is explicitly the legacy VS Code extension adapter. Current standalone Kilo
+uses `~/.config/kilo/kilo.jsonc` and is not modified.
+
+### Instruction files and hooks
+
+The installer adds managed instruction guidance for Claude, Codex, OpenCode, Gemini, Antigravity,
+Pi, and Prime Agent; Gemini and Antigravity share `~/.gemini/GEMINI.md`, while Pi and Prime use
+`~/.pi/agent/AGENTS.md` and `~/.prime/agent/AGENTS.md`. It does not install hooks.
+
+Pi has no built-in MCP client, and Prime currently accepts remote HTTP MCP servers rather than a
+local stdio subprocess, so selecting either installs its skill and guidance without writing a
+false MCP registration.
+
+### The skill package and its discovery links
+
+The installer installs one `ai-session-search` skill package for detected or explicitly selected
+Claude, Codex, Gemini, Antigravity, Pi, and Prime Agent harnesses. The app owns the canonical
+package under `~/.ai-session-search/skills/`, beside `~/.ai-session-search/config.toml`. This app
+directory is a sibling of `~/.claude`, not a child of it and not a harness-owned location.
+
+The `ai-session-search/` package contains general harness guidance in `SKILL.md`, adjacent
 `aise-capability.toml` with the deterministic `message-classification` rules executed by
-`aise skills corrections`, and `references/message-classification.md`. Harness-native discovery links
-point to the canonical package from `~/.claude/skills/` (Claude Code CLI/Desktop),
-`~/.agents/skills/` (ChatGPT Codex desktop and Codex CLI/IDE),
-`~/.gemini/skills/` (Gemini), `~/.gemini/config/skills/` (Antigravity
-App/IDE), `~/.gemini/antigravity-cli/skills/` (Antigravity CLI),
-`~/.pi/agent/skills/` (Pi), and `~/.prime/agent/skills/` (Prime Agent). Pi and Prime also read
-`~/.agents/skills/`, but their native links make explicit installs and lifecycle status independent
-of Codex detection. Pi's and Prime's own CLIs accept a repeatable `--skill PATH`, and their
-`--no-skills` only disables discovery, so an explicit path stays active. Selecting several
-harnesses keeps every selected discovery directory; shared destinations are deduplicated. Use
-repeatable `--skill-root DIR` for one or more exact additional package destinations. Each custom
-directory must end in `ai-session-search`; it names a package directory, not a file inside one.
+`aise skills corrections`, and `references/message-classification.md`.
 
-Reinstall replaces a prerelease copied harness package with a discovery link only when the old
-copy is provably app-managed and untouched. A modified file, extra user file, unmanaged directory,
-or retargeted link is preserved and reported instead of overwritten. Uninstall removes a
-discovery entry only while it is still the exact link created by `aise`, and retains the canonical
-package while another supported harness still links to it. Install, `aise skills update`, and
-normal uninstall retire the earlier sibling `corrections` package and its discovery links only
-when the ownership manifest, file digests, and exact link targets still match; dry-run reports each
-planned removal without changing the installation.
-Generated guidance introduces the product as **AI Session Search (`aise`)** and
-walks the four-step workflow with the MCP tool for each (`list_sessions` for
-recent sessions by directory or period, `search_sessions` for a topic,
-`search_messages` for the exact turn, `get_session` to read it), names the
-installed skill and the CLI fallback, and the same sentence is the MCP server's
-`initialize` instructions; Pi and Prime Agent, which get no MCP registration,
-receive the same four steps as `aise` commands. Claude's imported
-`AI_SESSION_SEARCH.md` has an explicit whole-file
-ownership sentinel so upgrades can replace older aise-owned wording while
-refusing to overwrite user-owned content.
+Harness-native discovery links point to the canonical package from `~/.claude/skills/` (Claude
+Code CLI/Desktop), `~/.agents/skills/` (ChatGPT Codex desktop and Codex CLI/IDE),
+`~/.gemini/skills/` (Gemini), `~/.gemini/config/skills/` (Antigravity App/IDE),
+`~/.gemini/antigravity-cli/skills/` (Antigravity CLI), `~/.pi/agent/skills/` (Pi), and
+`~/.prime/agent/skills/` (Prime Agent). Pi and Prime also read `~/.agents/skills/`, but their
+native links make explicit installs and lifecycle status independent of Codex detection.
+
+Pi's and Prime's own CLIs accept a repeatable `--skill PATH`, and their `--no-skills` only
+disables discovery, so an explicit path stays active. Selecting several harnesses keeps every
+selected discovery directory; shared destinations are deduplicated. Use repeatable
+`--skill-root DIR` for one or more exact additional package destinations. Each custom directory
+must end in `ai-session-search`; it names a package directory, not a file inside one.
+
+Nothing you edited is overwritten. A modified file, an extra user file, an unmanaged directory, or
+a retargeted link is preserved and reported instead. Pass `--dry-run` to see every planned write
+and removal before anything changes.
+
+The exact conditions: reinstall replaces a prerelease copied harness package with a discovery
+link only when the old copy is provably app-managed and untouched. Uninstall removes a discovery
+entry only while it is still the exact link created by `aise`, and retains the canonical package
+while another supported harness still links to it. Install, `aise skills update`, and normal
+uninstall retire the earlier sibling `corrections` package and its discovery links only when the
+ownership manifest, file digests, and exact link targets still match.
+
+Generated guidance introduces the product as **AI Session Search (`aise`)** and walks the
+four-step workflow with the MCP tool for each: `list_sessions` for recent sessions by directory or
+period, `search_sessions` for a topic, `search_messages` for the exact turn, and `get_session` to
+read it. It names the installed skill and the CLI fallback, and the same wording is the MCP
+server's `initialize` instructions. Pi and Prime Agent, which get no MCP registration, receive
+those four steps as `aise` commands instead.
+
+Claude's imported `AI_SESSION_SEARCH.md` carries an explicit whole-file ownership sentinel, so an
+upgrade can replace older aise-owned wording while refusing to overwrite user-owned content.
 
 Published wheels support GIL-enabled CPython 3.12 through 3.14 on
 manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do
@@ -190,7 +204,7 @@ uv tool upgrade ai-session-search
 uv tool uninstall ai-session-search
 uv remove ai-session-search
 python -m pip uninstall ai-session-search
-cargo install ai-session-search --locked --version '^1.0.0-rc'
+cargo install ai-session-search --locked   # Cargo upgrades by reinstalling.
 cargo uninstall ai-session-search
 ```
 
@@ -432,6 +446,12 @@ cargo install ai-session-search \
 
 ## Maintainer acceptance contract
 
+The canonical repository URL is `https://github.com/ahundt/ai-session-search`. Keep it equal to
+`project.urls.Repository` in `pyproject.toml` and `workspace.package.repository` in `Cargo.toml`;
+installation documentation must not introduce a second repository identity. When a harness
+changes its configuration syntax or security guidance, update this guide, the CI workflow, and
+the installer acceptance tests in the same commit.
+
 CI checks direct-Git installation without depending on GitHub availability. It
 uses the checked-out repository as a `file://` remote and `$GITHUB_SHA` as the
 immutable revision, then verifies pip, `uv add`, `uv tool install`, `uvx`, and
@@ -498,6 +518,3 @@ is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic re
   [`~/.config/opencode/opencode.json`](https://dev.opencode.ai/docs/config).
 - Kilo documents current standalone MCP configuration in
   [`~/.config/kilo/kilo.jsonc`](https://kilo.ai/docs/automate/mcp/using-in-kilo-code).
-
-When these tools change syntax or security guidance, update this guide, the CI
-workflow, and the installer acceptance tests in the same commit.
