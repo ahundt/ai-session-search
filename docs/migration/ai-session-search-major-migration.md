@@ -651,7 +651,7 @@ remains a maintainer action through the protected environments named in `RELEASI
   active Rust unit tests plus integration suites). The validated archive was installed atomically
   with rollback at `~/.local/bin/aise.rollback.20260714205019`; installed read-only Claude and
   Codex calls returned disjoint provider-correct results. `ea61cfa` then standardized CLI and Rust
-  API filter wording on “indexed session source” while Clap continues to list all eight exact IDs.
+  API filter wording on "indexed session source" while Clap continues to list all eight exact IDs.
 - Tool-name search is general and shared across CLI, MCP, Rust, and Python, but its Unicode
   substring predicate is not B-tree-indexed. On the live index, 1,239,308 tool-tagged rows contain
   only 174 distinct names: bounded common-name searches measured 0.00-0.24 seconds, while a rare

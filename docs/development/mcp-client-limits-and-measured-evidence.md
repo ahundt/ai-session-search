@@ -110,7 +110,7 @@ were never over the budget, and the shared sentences were wrong for some tools t
 covered. Every discarded description is restored: the four tools that always fit ship
 their full text again (the fields `search_sessions` and `list_sessions` share come
 from shared builder helpers so the copies cannot diverge), and `run_skill_capability`
-restores its facts in streamlined form at 4,742 bytes as Codex measures it, under the
+restores its facts in condensed form at 4,742 bytes as Codex measures it, under the
 4,750-byte margin threshold. The transferable lesson: a deduplication test proves the copies
 agree, never that the surviving copy is right, so
 `the_two_since_meanings_stay_apart_on_the_wire` now pins each tool's semantics at the

@@ -147,8 +147,8 @@ errors must name:
 - the smallest exact next command, API call, config location, candidate choice, or restart action;
 - how to verify success and where to obtain authoritative help when external action is required.
 
-Do not return generic “retry,” “restart,” “remove when done,” “invalid input,” or “contact an
-administrator” text when the system has more specific context. Errors remain bounded and redact
+Do not return generic "retry", "restart", "remove when done", "invalid input", or "contact an
+administrator" text when the system has more specific context. Errors remain bounded and redact
 secrets, but preserving actionability takes priority over shaving a few diagnostic bytes.
 
 A condition that clears without anyone changing the checkout is reported as waiting, not as failed.
