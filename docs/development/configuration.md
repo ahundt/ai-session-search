@@ -47,6 +47,25 @@ refresh policy, and search scope.
 Unknown TOML keys and invalid bounded values fail during resolution rather than being silently
 ignored or normalized later.
 
+## Resolver and write contract
+
+These hold for every surface and for settings added later, not only the ones documented below.
+
+All entry points use one typed Rust resolver with the precedence above. An omitted value differs
+from an empty or invalid value: empty paths and invalid numbers produce actionable errors rather
+than silently selecting another source. Runtime-derived paths and CPU/thread counts stay typed
+functions, not literal paths or machine-specific values embedded in the binary. An embedded example
+config is useful documentation; an embedded default config is acceptable only if it replaces,
+rather than duplicates, Rust defaults, and a test proves the serialized example, parser, CLI help,
+MCP schemas, and API defaults cannot drift.
+
+Any future `--config`, setup, or migration flag is available through the shared resolver where the
+surface supports it. Config writes are atomic, preserve unrelated keys, use scoped locks, clean
+temporary files on error, and offer provenance diagnostics that identify the winning source without
+printing secret values. [Atomic configuration initialization](#atomic-configuration-initialization)
+and [MCP client configuration transactions](#mcp-client-configuration-transactions) record how the
+current writers meet that.
+
 ## Installed integrations after an upgrade
 
 The `[integrations]` panel controls the one-time refresh that the first command after a version

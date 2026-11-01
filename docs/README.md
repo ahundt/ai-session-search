@@ -10,15 +10,17 @@ start. The documents below separate user procedures from maintainer records.
 | Install, verify, update, or uninstall `aise` and its MCP integrations | [Installation](development/installation.md) |
 | Resolve CLI, environment, TOML, Rust, Python, and MCP settings | [Configuration](development/configuration.md) |
 | Call AI Session Search from Python or Rust | [Library guide](development/library-api.md) |
-| Build, verify, and publish Cargo, PyPI, and GitHub artifacts | [Releasing packages](development/releasing.md) |
+| Run a release, start to finish | [RELEASING.md](../RELEASING.md) |
+| Change how packaging, publishing, or the supported target matrix works | [Packaging and distribution decisions](development/packaging-and-distribution-decisions.md) |
 | Preserve cumulative product contracts while changing the repository | [Maintainer requirements and design decisions](development/maintainer-requirements-and-design-decisions.md) |
 | Re-check client-imposed MCP limits when a harness or schema changes | [MCP client limits and measured evidence](development/mcp-client-limits-and-measured-evidence.md) |
 
 For a new installation, follow the installation guide's five steps in order.
 For an existing installation with unexpected paths or settings, run `aise
 config origins`, then use the configuration guide. Maintainers preparing a
-release should complete the releasing guide's ordered workflow without skipping
-exact-artifact verification or protected-environment approval.
+release work through `RELEASING.md` from its "Before tagging, confirm" list
+onward, without skipping exact-artifact verification or protected-environment
+approval; it is the whole procedure, and nothing else has to be read to run one.
 
 <!-- aise-message-search-contract:start -->
 ## Generated message-search caller contract

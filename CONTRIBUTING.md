@@ -191,8 +191,8 @@ At release time the section also gets a short summary paragraph above its first 
 | Install, verify, update, uninstall | [docs/development/installation.md](docs/development/installation.md) |
 | Settings resolution across CLI, env, TOML, MCP | [docs/development/configuration.md](docs/development/configuration.md) |
 | Python and Rust library APIs | [docs/development/library-api.md](docs/development/library-api.md) |
-| Building and publishing artifacts | [docs/development/releasing.md](docs/development/releasing.md) |
-| Release operator checklist | [RELEASING.md](RELEASING.md) |
+| Running a release, start to finish | [RELEASING.md](RELEASING.md) |
+| Why the packaging and publishing machinery is shaped this way | [docs/development/packaging-and-distribution-decisions.md](docs/development/packaging-and-distribution-decisions.md) |
 | Cumulative product contracts | [docs/development/maintainer-requirements-and-design-decisions.md](docs/development/maintainer-requirements-and-design-decisions.md) |
 
 ## License

@@ -167,7 +167,7 @@ def test_every_rust_toolchain_step_names_the_toolchain_it_installs() -> None:
 
 # Sentences that were true only while every version on the registries was a release candidate.
 # Each is a flat assertion about the registries rather than a scoped "while only candidates are
-# published", which is why `docs/development/releasing.md` is not among them: its equivalent
+# published", which is why `packaging-and-distribution-decisions.md` is not among them: its
 # sentence carries that scope and stays true.
 _CLAIMS_RETIRED_AT_THE_FIRST_STABLE_RELEASE = {
     "README.md": "No stable version is published yet",
@@ -1163,7 +1163,7 @@ RELEASE_PIPELINE_CALLERS = (
     ".github/workflows/publish.yml",
     "run_ci_local.sh",
     "RELEASING.md",
-    "docs/development/releasing.md",
+    "docs/development/packaging-and-distribution-decisions.md",
 )
 
 
@@ -1321,7 +1321,9 @@ def test_dependency_automation_covers_each_locked_ecosystem() -> None:
 def test_release_guide_records_standard_tool_adoption_decisions() -> None:
     from pathlib import Path
 
-    guide = Path("docs/development/releasing.md").read_text(encoding="utf-8")
+    guide = Path("docs/development/packaging-and-distribution-decisions.md").read_text(
+        encoding="utf-8"
+    )
     for tool in (
         "maturin-action",
         "cibuildwheel",
@@ -1374,7 +1376,7 @@ def test_documentation_has_conventional_names_and_task_navigation() -> None:
     for path in (
         "development/installation.md",
         "development/configuration.md",
-        "development/releasing.md",
+        "development/packaging-and-distribution-decisions.md",
         "migration/ai-session-search-major-migration.md",
     ):
         assert f"]({path})" in index

@@ -1,25 +1,20 @@
-# Releasing Rust and Python packages
+# Packaging and distribution decisions
 
-This document is the maintainer contract for building, testing, and releasing
-`ai-session-search`. It covers the public Rust crate and native executable, the
-PyO3 Python distribution, and the GitHub release archives. It does not grant
-permission to publish a release; a maintainer must approve the protected
-`crates-io`, `pypi`, and `release` environments.
+This records why the packaging, distribution, and publishing machinery is shaped the
+way it is: the supported target matrix, the install pathways that must keep working,
+the trusted-publishing and provenance policy, and the tool adoptions and rejections
+behind them.
 
-## One release identity, ecosystem-native versions
+It is reference material, not a procedure. [RELEASING.md](../../RELEASING.md) is the
+release procedure and the only document a release has to follow; every step and
+pre-tag obligation lives there. Read this when changing the machinery, not when
+running it.
 
-Use one release identity with the canonical spelling required by each package
-ecosystem. For release candidate `N` of version `X.Y.Z`, declare:
+## Version spellings in each ecosystem
 
-| Surface | Version |
-|---|---|
-| `pyproject.toml`, Python artifacts, and Git tag | `X.Y.ZrcN` and `vX.Y.ZrcN` |
-| Cargo manifests, Rust dependencies, and `.crate` artifact | `X.Y.Z-rc.N` |
-
-A final release drops the suffix and spells `X.Y.Z` the same way on both sides.
-Read the version this checkout actually declares out of `pyproject.toml` and the
-Cargo manifests rather than from this table, which is a mapping and not a record
-of the current release.
+[RELEASING.md](../../RELEASING.md#release-identity) holds the authoritative mapping and
+the declarations a release must update. Read the version this checkout actually declares
+out of `pyproject.toml` and the Cargo manifests rather than from any table.
 
 Do not force one spelling into the other ecosystem. Python release candidates
 use the normalized `X.Y.ZrcN` form defined by the
@@ -29,45 +24,6 @@ Cargo requires SemVer prerelease syntax after `-`, as documented by the
 `scripts/release_versions.py` is the sole mapping implementation, and
 `python -m scripts.verify_release_metadata --tag vX.Y.ZrcN` rejects mismatched
 manifests, dependencies, or tags before packaging starts.
-
-## Prepare and release in order
-
-1. Confirm the intended version, supported targets, MSRV, and CPython range in
-   the manifests and [distribution matrix](#supported-distribution-matrix).
-2. Run the complete local gate from a clean commit:
-
-   ```bash
-   ./run_ci_local.sh
-   ```
-
-3. Prepare and verify the complete local package set. The destination must not
-   already exist, which prevents stale artifacts from entering the result:
-
-   ```bash
-   uv run python -m scripts.prepare_packages
-   ```
-
-4. Use `--package rust` or `--package python` only for registry-specific
-   diagnosis. Use `--output-dir PATH` when several immutable candidate sets
-   must coexist; never merge their directories.
-5. Optionally dispatch **Prepare package artifacts** in GitHub Actions with its
-   default `all` scope. Confirm all five wheel targets, the sdist, and the Rust
-   crate complete without publish credentials.
-6. Create the release tag only after `scripts.verify_release_metadata`
-   confirms the Cargo, Python, dependency, and tag versions represent the same
-   release identity.
-   The tag-triggered `publish.yml` reruns the full gate, builds each artifact
-   once, and pauses at protected environments before irreversible publication.
-7. Review artifact membership, hashes, SBOMs, attestations, and exact-artifact
-   installation results in that workflow run. Approve `crates-io`, then `pypi`,
-   then `release`; do not rebuild or substitute files between stages.
-8. Verify the published crate, Python distributions, native archives, checksums,
-   and release notes. If any stage fails, use [Partial release
-   recovery](#partial-release-recovery) rather than deleting or replacing a
-   published version.
-
-No preparation command publishes, edits MCP clients, changes user data, or
-purges shared Cargo, uv, or compiler caches.
 
 ## Supported distribution matrix
 
@@ -99,30 +55,10 @@ typing compatibility. Free-threaded CPython is not implied by `abi3` and must
 not be advertised until it has a separate build and concurrency test matrix.
 See [PyO3 building and distribution](https://pyo3.rs/latest/building-and-distribution.html).
 
-## One build, exact-artifact verification
+## Package preparation and artifact verification
 
-The release workflow follows this sequence:
-
-1. Run the complete reusable CI workflow at the tagged commit.
-2. Require the Git tag, Python version, and Rust crate version to represent the
-   same release identity using the ecosystem-native spellings above.
-3. Build each wheel and native archive once on its matching native runner, then
-   rewrite the wheel's embedded SBOM so workspace crates read `workspace:<path>`
-   rather than the runner's checkout path (`scripts/sanitize_sboms.py`).
-4. Build one sdist and generate locked Rust/Python SBOMs.
-5. Install and exercise each exact artifact outside the source environment, and
-   prove that upgrading from each published release since
-   `scripts/verify_upgrade_path.py`'s `UPGRADE_FLOOR` needs nothing but the new
-   Linux executable, in a separate job with no signing rights.
-6. Aggregate the artifacts, reject missing or unexpected members, hash them,
-   and attest the same files that will be published.
-7. Upload the verified wheels and sdist to TestPyPI and install the release from
-   that index alone. `publish-crate` declares `needs: [verify, publish-testpypi]`,
-   so an unusable distribution stops the release while every registry version is
-   still repairable. The `testpypi` environment carries no approval rule, so this
-   adds no pause.
-8. Publish the Rust crate, then the Python distributions, then create the
-   GitHub release from the verified artifacts. Do not rebuild in publish jobs.
+No preparation command publishes, edits MCP clients, changes user data, or
+purges shared Cargo, uv, or compiler caches.
 
 Maturin documents that portable Linux wheels require a manylinux container or
 Zig and that `manylinux: 2014` makes `maturin-action` enforce the corresponding
@@ -132,8 +68,8 @@ installing an exact local artifact in an isolated environment:
 [uv package guide](https://docs.astral.sh/uv/guides/package/) and
 [uv GitHub Actions guide](https://docs.astral.sh/uv/guides/integration/github/).
 
-The preparation command used in the ordered workflow defaults to the complete
-Cargo and Python set. Narrower scopes are explicit maintainer diagnostics:
+The preparation command defaults to the complete Cargo and Python set. Narrower
+scopes are explicit maintainer diagnostics:
 
 ```bash
 # Registry-specific maintainer diagnostics
@@ -142,7 +78,8 @@ uv run python -m scripts.prepare_packages --package python --output-dir dist/pyt
 ```
 
 The output directory must not already exist, so artifacts from different
-versions cannot mix. Builders stage beside the destination and publish the
+versions cannot mix; pass `--output-dir PATH` when several immutable candidate
+sets have to coexist, and never merge their directories. Builders stage beside the destination and publish the
 verified directory with one atomic rename. Failures remove staging but never
 delete Cargo, uv, or compiler-wrapper caches. The process inherits
 `RUSTC_WRAPPER`, `CARGO_TARGET_DIR`, uv/Python selection, and platform settings;
@@ -169,9 +106,11 @@ manylinux2014 for the five publishable wheel targets.
 
 Run **Prepare package artifacts** manually in GitHub Actions to prepare `all`
 (the default), `rust`, or `python` without acquiring registry credentials or
-publishing. Tag-triggered `.github/workflows/publish.yml` remains the only full
-release authority and still defaults to the coordinated crate, PyPI, native
-archive, provenance, and GitHub release pathway.
+publishing; confirm all five wheel targets, the sdist, and the Rust crate
+complete without publish credentials. Tag-triggered
+`.github/workflows/publish.yml` remains the only full release authority and
+still defaults to the coordinated crate, PyPI, native archive, provenance, and
+GitHub release pathway.
 
 This separation follows the official guidance to keep build artifacts outside
 the minimal OIDC publishing job: [PyPI trusted-publisher security model](https://docs.pypi.org/trusted-publishers/security-model/),
@@ -250,45 +189,17 @@ attestations bind the remaining artifacts to the workflow and commit. See
 [PyPI attestations](https://docs.pypi.org/attestations/producing-attestations/)
 and [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).
 
-## Partial release recovery
+## Why publication is ordered
 
 PyPI, crates.io, and GitHub do not provide a cross-registry transaction. The
 workflow orders irreversible operations so a GitHub release is never announced
-before both package registries accept the version.
-
-| Failure | Maintainer action |
-|---|---|
-| Before either registry publishes | Fix the cause, delete the unpublished tag locally/remotely only with explicit approval, bump if artifacts changed, and restart. |
-| Rust published, PyPI failed | Re-run failed jobs in the same workflow run. Do not re-run the successful crates.io job. If artifacts must change, bump the version; registry files are immutable. |
-| Both registries published, GitHub release failed | Re-run only the failed release job; it downloads the already verified artifacts from the same run. |
-| Published artifact is unsafe or unusable | Yank the affected crate/release files where supported, publish a corrected patch version, and add a regression test. Never replace an immutable artifact under the same version. |
+before both package registries accept the version. What to do when a stage
+fails is in [RELEASING.md](../../RELEASING.md#post-release-and-recovery), which
+holds the per-failure actions.
 
 Record a post-mortem with the failing job, artifact hashes, affected targets,
 registry state, user impact, and the exact prevention test. A yanked release is
 still part of history and must remain documented.
-
-## Configuration lifecycle contract
-
-All entry points must eventually use one typed Rust resolver with this strict
-precedence:
-
-```text
-explicit CLI/API argument > environment variable > config file > built-in default
-```
-
-An omitted value differs from an empty or invalid value. Empty paths and invalid
-numbers must produce actionable errors rather than silently selecting another
-source. Runtime-derived paths and CPU/thread counts remain typed functions, not
-literal paths or machine-specific values embedded in the binary. An embedded
-example config is useful documentation; an embedded default config is acceptable
-only if it replaces, rather than duplicates, Rust defaults and a test proves the
-serialized example, parser, CLI help, MCP schemas, and API defaults cannot drift.
-
-Any future `--config`, setup, or migration flag must be available through the
-shared resolver where the surface supports it. Config writes must be atomic,
-preserve unrelated keys, use scoped locks, clean temporary files on error, and
-offer provenance diagnostics that identify the winning source without printing
-secret values.
 
 ## Standard tooling decision record
 
@@ -314,7 +225,7 @@ same runtime, exact-artifact, license, and workflow gates as a human-authored
 change. GitHub documents SHA-aware Actions updates when version comments are on
 the same line: [Dependabot supported ecosystems](https://docs.github.com/en/code-security/reference/supply-chain-security/supported-ecosystems-and-repositories).
 
-## Reference projects and review cadence
+## Reference projects
 
 These mature projects are architectural references, not dependencies or exact
 templates:
@@ -326,21 +237,10 @@ templates:
 - [PyCA cryptography](https://github.com/pyca/cryptography) demonstrates a
   long-running security-sensitive Rust/Python wheel and release matrix.
 
-Before every release:
-
-1. Check supported Python, Rust MSRV, uv, PyO3, maturin, runner labels, and action
-   pins against their primary documentation.
-2. Review dependency licenses, SBOMs, crate contents, wheel contents, executable
-   startup behavior, MCP initialization, and exact install pathways.
-3. Compare CI and release matrices so every published target has pre-merge or
-   tag-gated native execution evidence.
-4. Run failure injection for interrupted config/index writes, stale locks,
-   read-only state directories, full disks, malformed config, and terminated
-   subprocesses; verify scoped resources and temporary files are cleaned up.
-5. Record measured latency and memory regressions against the prior release.
+## Source link review
 
 Source links in this document were last read for content on 2026-07-13 and last
-checked for reachability on 2026-10-31. Re-check them when tool versions or
+checked for reachability on 2026-11-01. Re-check them when tool versions or
 hosted runner labels change; do not treat a copied workflow as permanent evidence
 of current best practice.
 

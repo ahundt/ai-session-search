@@ -1,9 +1,12 @@
 # Releasing AI Session Search
 
-This is the release operator checklist. The design and recovery contract behind it is
-[docs/development/releasing.md](docs/development/releasing.md). Nothing in this file authorizes
-a tag, push, registry publication, trusted-publisher registration, or GitHub release: those are
-maintainer actions taken through the protected environments named below.
+This is the release procedure, and it is the only document a release has to follow. Why the
+packaging and publishing machinery is shaped this way is recorded separately in
+[packaging and distribution decisions](docs/development/packaging-and-distribution-decisions.md),
+which is reference material for changing that machinery rather than for running a release.
+Nothing in this file authorizes a tag, push, registry publication, trusted-publisher
+registration, or GitHub release: those are maintainer actions taken through the protected
+environments named below.
 
 Run every command from the monorepo root. The Rust workspace is canonical; the Python
 distribution contains the typed PyO3 adapter and compatibility API. Never rebuild between
@@ -351,6 +354,22 @@ Before tagging, confirm:
   `scripts/sanitize_sboms.py` rewrites the wheel in place, both from `scripts.prepare_packages`
   and in the `wheels` job of `publish.yml`, and refuses a path outside the checkout;
   `scripts.verify_release_artifacts` then rejects any wheel that still holds `path+file://`.
+- The supported Python versions, Rust MSRV, uv, PyO3, maturin, hosted runner labels, and action
+  pins still match their primary documentation. A copied workflow is not evidence that it is
+  still current.
+- Dependency licenses, SBOMs, crate contents, wheel contents, executable startup behavior, MCP
+  initialization, and each exact install pathway were reviewed, not just confirmed green. The gate
+  asserts these; this item is the read of what it asserted.
+- Every published target has pre-merge or tag-gated native execution evidence. Compare the CI
+  matrix against the release matrix rather than assuming they agree; a wheel target with no job
+  that runs on it ships untested.
+- Failure injection was run for interrupted config and index writes, stale locks, read-only state
+  directories, full disks, malformed config, and terminated subprocesses, and scoped resources and
+  temporary files were cleaned up in each case.
+- Latency and memory were measured against the prior release and any regression is understood.
+  Use `scripts/benchmark_release.py` with `--fixture generated`, then compare the baseline and
+  candidate JSONL with `scripts/render_benchmark_report.py`. A release whose diff cannot change a
+  hot path can record that reasoning instead of a measurement, naming the diff.
 
 ## TestPyPI rehearsal
 
@@ -560,7 +579,10 @@ If a stage fails:
 - If both registries succeeded and GitHub Release failed, rerun only the release job from the
   same workflow.
 - If any published artifact must change, publish a new version. Never replace an immutable
-  registry version.
+  registry version. When the published artifact is unsafe or unusable rather than merely
+  improvable, yank the affected crate or release files where the registry supports it, publish the
+  corrected version, and add the regression test that prevents a repeat. A yanked release stays
+  part of history and stays documented; `cargo yank` does not free the version number.
 
 Record the failing job, artifact hashes, registry state, affected targets, user impact, and the
 regression test that prevents recurrence.
