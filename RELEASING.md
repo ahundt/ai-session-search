@@ -323,8 +323,11 @@ Before tagging, confirm:
 - `CHANGELOG.md` carries this version: rename `## [Unreleased]` to `## [X.Y.ZrcN] - YYYY-MM-DD`
   with the tag's date in New York time, the zone every earlier release used, wherever you are
   (`TZ=America/New_York date +%F`), add a fresh empty `## [Unreleased]` above it, and point the link
-  definitions at the new tag. Open the section with a short summary of what the release means for
-  a user, then follow the headings and item rules in [CONTRIBUTING.md](CONTRIBUTING.md#changelog). The metadata gate rejects a missing,
+  definitions at the new tag. Recheck this date immediately before tagging. It goes stale at New
+  York midnight, every metadata check still passes with a date that is merely a day old because
+  nothing can tell a wrong date from a deliberate one, and it is published on the release page.
+  Open the section with a short summary of what the release means for a user, then follow the
+  headings and item rules in [CONTRIBUTING.md](CONTRIBUTING.md#changelog). The metadata gate rejects a missing,
   duplicate, undated, impossible-date, empty, or misshapen section, and `--notes-out FILE` writes
   the exact body it would publish: the section plus a generated footer with the upgrade command,
   install commands, download guide, and diff link.

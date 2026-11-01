@@ -13,7 +13,7 @@ compatibility baseline; tags below it do not define a compatibility contract.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-31
+## [1.0.0] - 2026-11-01
 
 1.0.0 is the first public compatibility baseline: from here the project follows Semantic
 Versioning, so a later 1.x release does not change a documented interface incompatibly. No
