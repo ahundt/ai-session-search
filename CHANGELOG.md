@@ -49,16 +49,20 @@ from 1.0.0rc4 needs no action.
 2. CI now also runs on a daily schedule. Its `licenses` job runs `cargo deny check advisories`,
    whose verdict depends on the advisory database rather than on this repository, so a new entry
    against an unchanged lockfile used to be noticed only when someone pushed.
-3. Four imports that only Windows reported as unused are now gated to the platform that uses
-   them, in `integrations.rs`, `update.rs`, `executable_alias.rs`, and the process-lifecycle
-   tests. Clippy runs with `-D warnings` on Linux, where each one is used, so the Windows jobs
-   were the only place they appeared.
-4. Four more Windows-only findings are fixed: an unused `bytes` binding in `durable_path.rs`
-   whose sibling arm already used the `_units` form, a test binding in `analysis_publication.rs`
-   moved inside the `#[cfg(unix)]` block that uses it, `ExecutableAliases::for_test` gated to
-   `all(test, unix)` to match its six callers, and the Windows `create_directory_symlink` marked
-   `#[expect(dead_code)]` because every caller is a unix-only test, which means no Windows test
-   exercises a symlinked skill root.
+3. The `rust-portability` job builds with `-D warnings`, so an item reached only from a
+   `#[cfg(unix)]` block can no longer sit unused on Windows without failing a job. Clippy runs on
+   Linux alone, where each such item is live, so these appeared nowhere until a Windows job
+   objected, and a Windows cross-build cannot stand in locally because `ring` and
+   `libsqlite3-sys` both compile C against the MSVC toolchain.
+4. Nine Windows-only findings are fixed under that enforcement. Four unused imports are gated to
+   the platform that uses them, in `integrations.rs`, `update.rs`, `executable_alias.rs`, and the
+   process-lifecycle tests; an unused `bytes` binding in `durable_path.rs` takes the `_bytes` form
+   its sibling arm already used; a test binding in `analysis_publication.rs` moves inside the
+   `#[cfg(unix)]` block that uses it; `ExecutableAliases::for_test` and the
+   `isolated_config_paths_args` test helper are gated to match their callers, all of which are
+   unix-only tests; and the Windows `create_directory_symlink` is marked `#[expect(dead_code)]`,
+   recording that no Windows test exercises a symlinked skill root. The attribute fails the build
+   if such a test is added, so the gap cannot close silently.
 5. The public Rust API no longer carries command-line plumbing. `analytics::run_vocab`,
    `run_repeats`, `run_stats`, `run_planning`, `mcp_schema_budget::run`, and
    `sql_query::schema_path`, with the four argument structs the first four take, are now

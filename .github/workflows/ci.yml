@@ -128,14 +128,19 @@ jobs:
         with:
           shared-key: rust-portability
       - name: Exercise native filesystem, process, installer, and path behavior
-        # Warnings are not denied here yet. Clippy runs on ubuntu only, so anything used solely
-        # inside a `#[cfg(unix)]` block is dead on Windows and no job fails for it; there are 80
-        # such blocks across 15 files, and enabling `RUSTFLAGS: -D warnings` surfaced four at once
-        # in the lib and its test target, which aborted the build before the integration tests
-        # even compiled. Clearing that tail needs a round trip through this job per attempt,
-        # because a Windows cross-build is not possible on macOS or Linux: `ring` and
-        # `libsqlite3-sys` both compile C and need the MSVC toolchain. Deferred to its own branch
-        # rather than iterated blind on a release commit.
+        # Denying warnings here is what keeps the Windows-only ones visible. Clippy runs on ubuntu
+        # only, so an item reached exclusively from a `#[cfg(unix)]` block is dead on Windows and
+        # nothing failed for it: 80 such blocks span 15 files, and four unused imports reached main
+        # before any job objected. A Windows cross-build cannot stand in locally, because `ring` and
+        # `libsqlite3-sys` both compile C and need the MSVC toolchain, so this job is the only place
+        # the warning appears at all.
+        #
+        # Count the warnings from an undenied run. A denied build stops at the first target that
+        # fails, so its count is truncated: the run that enabled this flag reported four, all in the
+        # lib and its unit tests, and an undenied run after those four were fixed reported a fifth in
+        # `tests/process_lifecycle.rs` — an integration target the denied build never reached.
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo test -p ai-session-search --all-targets --locked
 
   rust-install:

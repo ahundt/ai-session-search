@@ -43,6 +43,8 @@ fn aise() -> Command {
     command
 }
 
+/// Every caller is a `#[cfg(unix)]` test, so this is dead on Windows.
+#[cfg(unix)]
 fn isolated_config_paths_args(root: &std::path::Path) -> Vec<String> {
     let config = root.join("config.toml");
     fs::write(&config, "").unwrap();
