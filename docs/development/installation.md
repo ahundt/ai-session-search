@@ -1,9 +1,8 @@
 # Installation and source-build guide
 
-This guide defines the supported installation pathways for the
-`ai-session-search` Python distribution, Rust crate, and `aise` executable.
-Prefer a package registry for normal use. Install from Git only when testing an
-unreleased change or when a specific commit is required.
+The `ai-session-search` Python distribution, Rust crate, and `aise` executable all install from a
+package registry, which is what to use normally. Install from Git only when testing an unreleased
+change or when you need a specific commit.
 
 ## Install in five steps
 
@@ -70,8 +69,8 @@ cargo install ai-session-search --locked
 Every command above takes the newest stable release. `uv` and `pip` reach a pre-release only
 when it is pinned or is the only version that satisfies the requirement, per
 [PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases); `cargo install` reaches
-one only when a `--version` requirement asks for it. Naming a version is how you install a
-release candidate, not how you avoid one.
+one only when a `--version` requirement asks for it. You never need to name a version to avoid a
+pre-release; name one to install a specific release.
 
 None of these commands creates aliases, registers MCP servers, writes managed Markdown or skills,
 or installs client hooks. `aise integrations install` does all of that, and it points at the
@@ -85,27 +84,25 @@ aise integrations install
 aise integrations status
 ```
 
-After a non-dry-run integration installation commits its owned files, it starts
-best-effort session index preparation in a detached `aise` process and returns
-without waiting for transcript discovery or parsing. Run `aise doctor` to check
-snapshot readiness, refresh progress, or exact recovery guidance. A dry-run or
-an invocation with no selected integration components starts no index work. If
-configuration resolution or process launch prevents preparation, the valid
-integration files remain installed and the command prints the exact
-configuration path plus `aise reindex` and `aise doctor` recovery steps.
+`aise integrations install` returns as soon as it has committed its own files; indexing continues
+in a separate background `aise` process, so you never wait on transcript discovery or parsing.
+Run `aise doctor` to check snapshot readiness, refresh progress, or exact recovery guidance. A dry
+run, or an invocation with no selected integration components, starts no index work. If
+configuration resolution or process launch prevents preparation, the valid integration files
+remain installed and the command prints the exact configuration path plus `aise reindex` and
+`aise doctor` recovery steps.
 
-To install the executable and configure detected clients in one fail-fast command, chain them.
-Package ownership and MCP configuration stay separate transactions, so a package-manager failure
-never edits client files:
+To install the executable and configure detected clients in one go, chain them with `&&`:
 
 ```bash
 uv tool install ai-session-search && aise integrations install
 cargo install ai-session-search --locked && aise integrations install
 ```
 
-Chaining with `&&` keeps them two steps rather than merging them: `aise integrations install` runs
-only if the package install succeeded, so a package-manager failure still edits no client files.
-It adds dry-run, status, per-client selection, durable recovery, and ownership-safe uninstall.
+They stay two steps on purpose. `aise integrations install` runs only if the package install
+succeeded, so a failing package manager edits no client files, and keeping it a separate command
+is what gives it dry-run, status, per-client selection, durable recovery, and ownership-safe
+uninstall.
 
 ### Which executable the installer registers
 
@@ -137,13 +134,15 @@ false MCP registration.
 ### The skill package and its discovery links
 
 The installer installs one `ai-session-search` skill package for detected or explicitly selected
-Claude, Codex, Gemini, Antigravity, Pi, and Prime Agent harnesses. The app owns the canonical
-package under `~/.ai-session-search/skills/`, beside `~/.ai-session-search/config.toml`. This app
-directory is a sibling of `~/.claude`, not a child of it and not a harness-owned location.
+Claude, Codex, Gemini, Antigravity, Pi, and Prime Agent harnesses. `aise` owns the canonical
+package under `~/.ai-session-search/skills/`, beside `~/.ai-session-search/config.toml`. That
+directory sits beside `~/.claude` and inside no harness, so removing a harness never takes the
+package with it.
 
 The `ai-session-search/` package contains general harness guidance in `SKILL.md`, adjacent
 `aise-capability.toml` with the deterministic `message-classification` rules executed by
-`aise skills corrections`, and `references/message-classification.md`.
+`aise skills corrections`, and three `references/` files: `message-classification.md`,
+`recover-prior-work-with-evidence.md`, and `search-costs-and-receipts.md`.
 
 Harness-native discovery links point to the canonical package from `~/.claude/skills/` (Claude
 Code CLI/Desktop), `~/.agents/skills/` (ChatGPT Codex desktop and Codex CLI/IDE),
@@ -162,7 +161,7 @@ Nothing you edited is overwritten. A modified file, an extra user file, an unman
 a retargeted link is preserved and reported instead. Pass `--dry-run` to see every planned write
 and removal before anything changes.
 
-The exact conditions: reinstall replaces a prerelease copied harness package with a discovery
+Reinstall replaces a prerelease copied harness package with a discovery
 link only when the old copy is provably app-managed and untouched. Uninstall removes a discovery
 entry only while it is still the exact link created by `aise`, and retains the canonical package
 while another supported harness still links to it. Install, `aise skills update`, and normal
@@ -182,8 +181,8 @@ upgrade can replace older aise-owned wording while refusing to overwrite user-ow
 Published wheels support GIL-enabled CPython 3.12 through 3.14 on
 manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do
 not require a local Rust compiler. Git, sdist, and Cargo installations build
-native code from source and require Git, Rust 1.88 or newer, and a C linker for
-the target platform.
+native code from source and require Git, Rust 1.88 or newer, and a C compiler
+for the target platform, because SQLite is built from bundled C.
 
 ## Update and uninstall
 
@@ -209,30 +208,34 @@ cargo uninstall ai-session-search
 ```
 
 `aise package update --yes` skips the confirmation prompt but still requires
-authoritative ownership evidence. The command delegates to uv, pip, pipx,
-Cargo, or Homebrew, then runs the replacement executable's conservative
-`skills update` after the manager succeeds. That command first runs the post-upgrade refresh
-described below, then visits the detected client roots and the roots recorded in the install
-manifest, including custom roots, that still exist. It rewrites only unedited aise-owned files, so a
-skill you deleted stays deleted, and it never configures new clients. It
-never overwrites the executable itself. It refuses
-automatic apply for a direct URL or source checkout, including a maintainer
-checkout installed into a uv tool environment or with `cargo install --path`
-or `cargo install --git`, and for unknown executables. Update the recorded
-source with its original workflow instead.
+authoritative ownership evidence. The command delegates the replacement to uv, pip, pipx,
+Cargo, or Homebrew, so the package manager is what swaps the executable, and then, if that
+manager succeeded, runs the new executable's conservative `skills update`. That first runs the
+post-upgrade
+refresh described below, then visits the detected client roots and any roots recorded in the
+install manifest that still exist, custom roots included. It rewrites only unedited aise-owned
+files, so a skill you deleted stays deleted, and it configures no new clients and replaces no
+executable.
 
-Upgrading is one command whichever manager owns `aise`. The first command after the version
-changes, including `aise integrations status` and `aise mcp serve`, runs a conservative refresh
-once. It rewrites owned skill files that still match what aise recorded, visiting only roots in the
-install manifest, and replaces an aise instruction block in a harness's CLAUDE.md, AGENTS.md, or
-GEMINI.md where it stands when the block still holds text some release wrote. It leaves an edited
-file or block alone and says so on stderr. The recorded skill is its evidence that aise installed
-integrations for this configuration, so an install made with `--no-skill` gets no automatic
-refresh, and instruction files added with `--claude-md`, `--agents-md`, or `--gemini-md` are not
-visited; rerun `aise integrations install` for those. Commands that install or remove integrations themselves
-skip it. MCP registrations and aliases name the executable path, not its version, so nothing else
-needs rerunning. `aise integrations status --format json` reports each integration with a `current`
-field for scripts. Turn the automatic refresh off with:
+`aise package update` declines to act automatically on a direct URL or source checkout, including
+a maintainer checkout installed into a uv tool environment or with `cargo install --path` or
+`cargo install --git`, and on an unknown executable. Update a recorded source with its original
+workflow.
+
+Upgrading is one command whichever manager owns `aise`, and nothing else needs rerunning: MCP
+registrations and aliases name the executable path, not its version. The first command after the
+version changes, `aise integrations status` and `aise mcp serve` included, runs a conservative
+refresh once. It rewrites owned skill files that still match what aise recorded, visiting only
+roots in the install manifest, and replaces an aise instruction block in a harness's CLAUDE.md,
+AGENTS.md, or GEMINI.md in place, as long as that block still holds text some release wrote. An
+edited file or block is left alone and reported on stderr.
+
+The recorded skill is the refresh's evidence that aise installed integrations for this
+configuration. An install made with `--no-skill` therefore gets no automatic refresh, and
+instruction files added with `--claude-md`, `--agents-md`, or `--gemini-md` are not visited;
+rerun `aise integrations install` for those. Commands that install or remove integrations
+themselves skip the refresh. `aise integrations status --format json` reports each integration
+with a `current` field for scripts. Turn the automatic refresh off with:
 
 ```toml
 [integrations]
@@ -263,27 +266,17 @@ source session files.
 Integration lifecycle operations are `aise integrations install`, `status`,
 `uninstall`, and `recover`. The `aise mcp` namespace has one user-facing command, `serve`
 (`aise mcp schema-budget` is a hidden maintainer measurement).
-`aise integrations install` does not bypass package
-ownership: the running CLI must already be provided by uv, Cargo, pip, or a
-verified native archive. It verifies that `aise` is on `PATH`, then installs or
-refreshes MCP registrations and managed instructions. This prevents an
-ephemeral `uvx`, source-tree, or Python interpreter process from being copied
-and mislabeled as a package-managed installation.
+`aise integrations install` requires that the running CLI already come from uv, Cargo, pip, or a
+verified native archive, and verifies `aise` is on `PATH` before it installs or refreshes MCP
+registrations and managed instructions. That keeps an ephemeral `uvx`, source-tree, or Python
+interpreter process from being copied and mislabeled as a package-managed installation.
 
 `aise integrations install` is idempotent: rerunning it changes no bytes already current, and
 repairs the owned relative `aisearch` and `ai_session_search` symlinks to `aise`, MCP entries,
-instruction text, and index freshness. Upgrades do not need it; run it to connect a client installed
-since, or to repair what `aise integrations status` reports. It refuses to replace either alias path when that
-path is not an owned symbolic link. Use `--dry-run` before mutation,
-repeat `--client CLIENT` for an explicit include set, repeat
-`--exclude-client CLIENT` to subtract clients, or use `--no-mcp`, `--no-instructions`,
-`--no-skill`, or `--no-aliases` to omit one integration component. The custom config,
-Markdown, and exact `--skill-root` flags are
-shown by `aise integrations install --help`. Use the
-separate `aise integrations uninstall` command with the same target selectors;
-`--keep-mcp`, `--keep-instructions`, `--keep-skill`, and `--keep-aliases` retain the named component
-while removing the other selected integrations. Neither command installs or
-removes the package-owned `aise` executable.
+instruction text, and index freshness. Upgrades do not need it; run it to connect a client
+installed since, or to repair what `aise integrations status` reports. It refuses to replace
+either alias path when that path is not an owned symbolic link, and `--no-mcp`,
+`--no-instructions`, `--no-skill`, or `--no-aliases` omits one integration component.
 
 An ownership marker in `SKILL.md` gates the whole skill directory, so a tree is never left half
 overwritten and half refused.
@@ -309,8 +302,8 @@ Skills participate in the same durable receipt as MCP and instruction edits, and
 published by that same transaction, so it cannot survive a rollback and claim an install that never
 happened.
 
-The links are relative so moving an intact bin directory keeps them valid. Unix supports
-them directly. Windows requires symbolic-link permission (normally Developer Mode or an
+The `aisearch` and `ai_session_search` links are relative, so moving an intact bin directory
+keeps them valid. Unix supports them directly. Windows requires symbolic-link permission (normally Developer Mode or an
 elevated process); if the operating system rejects link creation, the command reports the
 failed path and recommends `--no-aliases`. The installer never substitutes copied binaries,
 hard links, `.cmd` wrappers, or extra Python console scripts because those create divergent
@@ -334,7 +327,7 @@ uv-, Cargo-, pip-, and native-owned executables on one
 `PATH`; `aise package status` reports the active executable and every matching
 candidate when ownership is unclear.
 
-Keep their bin directories distinct as well. In particular, do not point
+Keep the managers' bin directories distinct as well. In particular, do not point
 `UV_TOOL_BIN_DIR` at a Cargo installation root's `bin` directory or a native
 archive destination. Cargo refuses an existing unknown `aise` unless
 `--force` is explicit, but `uv tool install --force` can replace an existing

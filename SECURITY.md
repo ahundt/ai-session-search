@@ -8,26 +8,25 @@ Do not open a public issue for a suspected vulnerability.
 
 Include the `aise --version` output, the installation method, the operating
 system, the exact command or MCP request, and what an attacker would gain. A
-reproduction that runs against synthetic fixtures rather than your own session
-transcripts is easier to act on and does not disclose your data.
+reproduction against synthetic fixtures is easier to act on and discloses none
+of your own session content.
 
 Reports go to the maintainer for triage. A fix ships as a new released version,
-because published registry versions are immutable and are never replaced.
+because a published registry version is immutable.
 
 ## Where fixes are published
 
 A fix reaches you as a new release on
 [crates.io](https://crates.io/crates/ai-session-search) and
 [PyPI](https://pypi.org/project/ai-session-search/), so `aise package update`
-picks one up. The retired `ai-session-tools` distribution receives no updates of
-any kind.
+picks one up. The retired `ai-session-tools` distribution receives no updates.
 
 ## What this software touches
 
 AI Session Search reads AI coding-agent transcripts that already exist on the
 machine running it, and writes an index, cache, and configuration under
-platform application directories. `aise config paths` prints every one of those
-read and write locations on the machine in question.
+platform application directories. `aise config paths` prints those read and
+write locations.
 
 - **Local data only.** It never fetches conversations from a vendor account and
   never uploads transcripts. The only request `aise` issues is the optional
@@ -58,8 +57,8 @@ protected publish job asks Cargo to package it again.
 
 crates.io and PyPI use OpenID Connect trusted publishing, while GitHub Release
 creation uses the workflow's repository-scoped `GITHUB_TOKEN`, so no long-lived
-registry token exists. Every publication job runs in a protected environment
-that requires maintainer approval. Publication is triggered by a `v*` tag, and
+registry token exists. The crates.io, PyPI, and release jobs each run in an
+environment requiring maintainer approval. Publication is triggered by a `v*` tag, and
 the `release-tags` ruleset restricts creating, moving, and deleting those tags
 to the repository admin role.
 

@@ -6,14 +6,15 @@ SPDX-License-Identifier: Apache-2.0
 # Python and Rust library guide
 
 The same typed Rust services back the `aise` CLI, the MCP server, the Rust
-crate, and the Python package. This guide covers the two library surfaces. For
-command-line use see the [README](../../README.md); for settings see the
-[configuration guide](configuration.md).
+crate, and the Python package, so either library answers a query the way the CLI
+does. For command-line use see the [README](../../README.md); for settings see
+the [configuration guide](configuration.md).
 
 ## Python
 
-`SessionSearch` is the lifecycle root. Query objects are immutable typed mirrors
-of the Rust request types, so a request you build once is safe to reuse.
+`SessionSearch` owns the configuration, the database handle, and the worker
+pool. Query objects are immutable mirrors of the Rust request types, so one you
+build is safe to reuse.
 
 ```python
 import ai_session_search as aise
@@ -69,33 +70,33 @@ if sessions:
 status = search.index_status()
 ```
 
-`SessionQuery.dates` intersects the inclusive query period with each known indexed session span
-from `created_at` through `updated_at`. An exact RFC 3339 value is a zero-width period and matches a
-span containing that instant. The span can contain gaps and is not evidence of continuous process
-activity. File queries, event analytics, and `MessageScope.dates` instead compare each event's own
-timestamp.
+`SessionQuery.dates` intersects the inclusive query period with each indexed session span,
+`created_at` through `updated_at`. An exact RFC 3339 value is a zero-width period and matches a
+span containing that instant. A span can contain gaps, so a session matching a one-week period
+may have been touched once in it. File queries, event analytics, and `MessageScope.dates`
+compare each event's own timestamp.
 
-A finite session list limit bounds returned records, not necessarily SQLite rows considered; a
-zero limit intentionally returns all eligible sessions. Ranked session search also scores all
-eligible session/transcript bytes before retaining its top page. Current runtime, memory, I/O, and
+A finite session list limit bounds the records you get back; it does not bound the SQLite rows
+considered, and a zero limit returns all eligible sessions. Ranked session search also scores all
+eligible session/transcript bytes before retaining its top page. Runtime, memory, I/O, and
 output-growth bounds are recorded under `REQ010-protect-complexity-bounds` in the
 [maintainer requirements](maintainer-requirements-and-design-decisions.md).
 
 ### Concurrency and resource ownership
 
-Long native operations release the GIL, so an indexing refresh or a large search
-does not block other Python threads. Reconstruction iterators own their selected
-rows without retaining the database lock, which keeps a slow consumer from
-holding the index open. Publication is explicit: no library call writes a bundle
-to disk as a side effect.
+Long native operations release the GIL, so a refresh or a large search does not
+block other Python threads. Reconstruction iterators own their selected rows
+without holding the database lock, so a slow consumer cannot hold the index
+open. Publication is explicit: no library call writes a bundle to disk as a side
+effect.
 
-Detailed result classes are available from `ai_session_search.native`.
+Detailed result classes come from `ai_session_search.native`.
 
 ## Rust
 
-The `ai-session-search` crate exposes provider-neutral services. Clap, MCP,
-SQLite row, and PyO3 types stay out of its public contracts, so a library
-consumer does not inherit the CLI's dependency graph.
+The `ai-session-search` crate exposes provider-neutral services. MCP, SQLite
+row, and PyO3 types stay out of its public contracts, so a library consumer
+works with the same typed requests and responses every other surface uses.
 
 ```rust,no_run
 use ai_session_search::models::SearchFilters;
@@ -115,33 +116,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The crate documents operation ordering, allocation, pagination, stale-index
-semantics, and error behavior. Filesystem writes take an explicit restore or
-publication plan, so no call chooses a destination on its own.
+Rustdoc on each service covers operation ordering, allocation, pagination,
+stale-index semantics, and errors. Filesystem writes take an explicit
+restore or publication plan, so no call chooses a destination on its own.
 
 ### Features
 
-To drop the network version-check dependencies, disable the default feature:
+To drop the network version-check dependency, disable the default feature:
 
 ```toml
 [dependencies]
 ai-session-search = { version = "1.0.0", default-features = false }
 ```
 
-The default `release-check` feature remains enabled for `cargo install`,
-published Python wheels, and normal CLI builds.
+`release-check` stays enabled for `cargo install`, published Python wheels, and
+normal CLI builds.
 
 ### Depending on a release candidate
 
-Name a release candidate exactly. Cargo excludes prerelease versions from an
-ordinary requirement, so `version = "1"` resolves 1.0.0 and every later stable
-and never a candidate; `version = "1.1.0-rc.1"` is how you ask for one.
+Cargo excludes prereleases from an ordinary requirement, so `version = "1"`
+resolves 1.0.0 or a later stable and never a candidate. Name a candidate
+exactly: `version = "1.1.0-rc.1"`.
 
 ### Result shapes
 
 Both libraries return the same shape for a given public result type.
-`CompactOutcome`, returned by the compaction service, reports
-`before_bytes`, `after_bytes`, and `reclaimed_bytes` as exact byte counts (Rust exposes
+`CompactOutcome` from the compaction service reports `before_bytes`,
+`after_bytes`, and `reclaimed_bytes` as exact byte counts (Rust exposes
 `reclaimed_bytes()` as a method); any human-readable unit is the caller's rendering.
 
 ## Shared semantics
@@ -151,6 +152,6 @@ no operation, purpose, or call limit applies; fuzzy search requires a finite
 page. Presentation settings such as per-message line windows never change which
 messages matched, their ranking, the result count, pagination, or context
 membership. The [generated caller contract](../README.md#generated-message-search-caller-contract)
-lists the shipped defaults for every surface, and
-`aise messages search --describe --describe-surface python|rust` resolves the
-same contract against the active configuration.
+lists the shipped defaults, and
+`aise messages search --describe --describe-surface python|rust` resolves them
+against your active configuration.

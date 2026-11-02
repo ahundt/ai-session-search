@@ -23,13 +23,13 @@ The supported application API is available directly from the crate root:
 use ai_session_search::{MessageFilters, SearchFilters, SessionSearch};
 ```
 
-`SessionSearch` owns configuration, the SQLite connection, and service lifetimes. Keep one
+`SessionSearch` owns the configuration, the SQLite connection, and the worker pool. Keep one
 instance for a related unit of work, then compose the immutable filter and publication types
-re-exported beside it. Existing module paths remain supported; storage, CLI, MCP, provider, and
-PyO3 modules are implementation surfaces rather than the recommended entry point.
+re-exported beside it. The crate root is the entry point to build against; the storage, CLI, MCP,
+provider, and PyO3 modules are implementation surfaces.
 
-Library-only consumers may set `default-features = false` to omit the CLI release-check network
-client. The search, index, export, and recovery APIs do not require the `release-check` feature.
+Set `default-features = false` to omit the CLI's `release-check` network client; search, index,
+export, and recovery do not need it.
 
 ## Documentation
 

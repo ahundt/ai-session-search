@@ -697,7 +697,12 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "~/.gemini/antigravity-cli/skills/" in configuration
     assert "Pi has no native MCP client" in configuration
     assert "Prime accepts remote HTTP MCP" in configuration
-    assert "shared RAII lock" in readme
+    # Pin what a reader can act on, not the Rust idiom's name. Asserting "shared RAII lock" held
+    # the README to implementation vocabulary to make a point a user cannot use; the property that
+    # matters is that status cannot report a half-applied install.
+    normalized_readme = " ".join(readme.split())
+    assert "under the installer's own transaction lock" in normalized_readme
+    assert "never shows you a half-applied state" in normalized_readme
     assert "CPython 3.12 through 3.14" in releasing
     assert "cp312-abi3" in releasing
     assert "Free-threaded CPython is not supported" in releasing
@@ -767,7 +772,16 @@ def test_message_search_default_extent_is_documented_consistently() -> None:
     binding = (ROOT / "rust/ai-session-search-python/src/lib.rs").read_text(encoding="utf-8")
     stub = (ROOT / "ai_session_search/_native.pyi").read_text(encoding="utf-8")
 
-    assert "Rust, CLI, and Python message search are unbounded on omission" in " ".join(readme.split())
+    # Pin the distinction the surfaces actually differ on, in whichever sentence states it: the
+    # three native surfaces return every non-fuzzy match when the limit is omitted, MCP pages, and
+    # fuzzy always pages. One earlier assertion pinned a single phrasing of the first clause, which
+    # fixed the sentence's wording without covering the other two.
+    normalized_readme = " ".join(readme.split())
+    assert "Rust, CLI, or Python message search" in normalized_readme
+    assert "every literal, regex, or no-text match" in normalized_readme
+    assert "--all-results" in normalized_readme
+    assert "Session-level and MCP searches page instead" in normalized_readme
+    assert "Fuzzy search always needs a finite page" in normalized_readme
     assert "every literal, regex, or no-text CLI match" in cli
     assert "Rust, CLI, and Python" in core and "MCP" in core
     assert "Native programmatic/interactive surfaces preserve" in service

@@ -1,22 +1,23 @@
 # Configuration
 
 `aise` needs no configuration file. With none present it enables every provider at its
-platform-default paths, which `aise config show` prints in full. Create a file only to change a
-source path or a runtime setting.
+platform-default paths, which `aise config show` prints in full. Google AI Studio is the one
+provider shipping no default root, so it returns nothing until `[providers.aistudio].paths` names
+one. Otherwise create a file only to change a source path or a runtime setting.
 
-When one exists, `aise` resolves durable settings once and passes the resulting typed Rust
-`Config` to the CLI, MCP server, and Python service. Query filters and migration destinations
-stay invocation-local. Result limits and line windows have persistent defaults, under
+When one exists, `aise` resolves it once and the CLI, MCP server, and Python service all read
+that answer. Query filters and migration destinations go on the command that uses them. Result
+limits and line windows do have persistent defaults, under
 [search extent](#search-extent-and-elapsed-time-defaults) and
 [output windowing](#output-windowing-defaults).
 
 ## Configure in four steps
 
-The default app-owned file is `~/.ai-session-search/config.toml`. This directory is deliberately a
-sibling of harness-owned directories such as `~/.claude`, `~/.codex`, and `~/.gemini`; it is not
-nested under any harness. Existing platform/XDG config files remain readable until the sibling
-file is created. The database and cache keep separate platform-appropriate defaults, and
-`index.db_path` in this file can select an existing database without moving it.
+The default file is `~/.ai-session-search/config.toml`. That directory sits beside `~/.claude`,
+`~/.codex`, and `~/.gemini`, inside none of them, so removing a harness never takes your
+configuration with it. Existing platform/XDG config files remain readable until that file is
+created. The database and cache keep separate platform-appropriate defaults, and `index.db_path`
+here can select an existing database without moving it.
 
 1. Locate the effective file with `aise config file` and inspect the complete
    template with `aise config example`.
@@ -30,12 +31,11 @@ file is created. The database and cache keep separate platform-appropriate defau
    command prints merged values, the second identifies each winning source,
    and the third reports invalid or inaccessible runtime paths.
 
-For automation, set a canonical `AI_SESSION_SEARCH_*` variable or pass the
-corresponding CLI/API argument rather than generating machine-specific TOML. A missing file is
-only an error when you named it: discovery falls back to defaults, while `--config` or
-`AI_SESSION_SEARCH_CONFIG` pointing at a path that does not exist fails with
-`explicit config file does not exist: PATH` rather than silently using defaults you did not ask
-for.
+For automation, set a canonical `AI_SESSION_SEARCH_*` variable or pass the corresponding CLI/API
+argument instead of generating machine-specific TOML. A missing file is only an error when you
+named it: discovery falls back to defaults, while `--config` or `AI_SESSION_SEARCH_CONFIG`
+pointing at a path that does not exist fails with `explicit config file does not exist: PATH`, so
+a typo in that path cannot silently run on defaults.
 
 ## Precedence
 
@@ -46,35 +46,36 @@ From highest to lowest precedence:
 3. TOML configuration value.
 4. Typed Rust and platform default.
 
-The root CLI options are `--config`, `--database`, `--cache-dir`, `--threads`, and
-`--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
+Five root CLI options feed the resolver: `--config`, `--database`, `--cache-dir`, `--threads`,
+and `--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
 `AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and
 `AI_SESSION_SEARCH_INDEX_REFRESH`.
 
 Run `aise config show` to print the merged effective configuration. Run `aise config origins` to
-print the selected source for the config file, database, cache directory, worker threads,
-refresh policy, and search scope.
-Unknown TOML keys and invalid bounded values fail during resolution rather than being silently
-ignored or normalized later.
+print the selected source for the config file, database, cache directory, worker threads, refresh
+policy, search scope, `search_messages_limit`, `max_tool_result_chars`, and each overridden
+client-limit row.
+Unknown TOML keys and invalid bounded values fail at resolution, so a typo cannot sit in the file
+looking applied.
 
 ## Resolver and write contract
 
-These hold for every surface and for settings added later, not only the ones documented below.
+These hold for every surface, including settings added after this document.
 
-All entry points use one typed Rust resolver with the precedence above. An omitted value differs
-from an empty or invalid one: empty paths and invalid numbers produce actionable errors rather
-than silently selecting another source.
+All entry points use one typed Rust resolver with the precedence above. An omitted value falls
+through to the next source, while an empty path or an invalid number is an error, so neither
+quietly hands the decision to another source.
 
-Any future `--config`, setup, or migration flag is available through the shared resolver where the
-surface supports it. Config writes are atomic, preserve unrelated keys, use scoped locks, clean
-temporary files on error, and offer provenance diagnostics that identify the winning source without
-printing secret values. [Atomic configuration initialization](#atomic-configuration-initialization)
+`--config`, setup, and migration flags all reach that shared resolver where the surface supports
+them. Config writes are atomic, preserve unrelated keys, use scoped locks, and clean temporary
+files on error. `aise config origins` names the winning source for each setting and never prints
+a secret value. [Atomic configuration initialization](#atomic-configuration-initialization)
 and [MCP client configuration transactions](#mcp-client-configuration-transactions) record how the
 current writers meet that.
 
 ## Installed integrations after an upgrade
 
-The `[integrations]` panel controls the one-time refresh that the first command after a version
+The `[integrations]` table controls the one-time refresh that the first command after a version
 change performs. It rewrites installed aise-owned skill files and instruction blocks that nobody
 has edited, leaves edited ones alone, and reports what it did on stderr:
 
@@ -90,7 +91,7 @@ never write installed integrations.
 
 ## Stable-release notifications
 
-The `[release_notifications]` panel controls only the optional check after ordinary
+The `[release_notifications]` table controls only the optional check after ordinary
 interactive CLI output:
 
 ```toml
@@ -120,9 +121,9 @@ unchanged; explicit package commands report failures.
 
 ## Search access scope
 
-`[search.scope] mode = "all"` is the default and preserves unrestricted search behavior. To
-restrict every session, message, analysis, file-history, export, resume, and exact-ID read to
-authorized workspaces, use `mode = "allowed-roots"` with one or both trusted standalone sources:
+`[search.scope] mode = "all"` is the default: every configured source is searchable. To confine
+every session, message, analysis, file-history, export, resume, and exact-ID read to authorized
+workspaces, use `mode = "allowed-roots"` with one or both trusted standalone sources:
 
 ```toml
 [search.scope]
@@ -132,21 +133,24 @@ include_invocation_directory = false
 ```
 
 Configured roots must be nonempty absolute directory paths and cannot be a filesystem root.
-`include_invocation_directory = true` adds the process working directory. MCP clients that
-advertise roots contribute their live `roots/list` file URIs; a roots-change notification revokes
-the previous live roots before replacements are accepted, even when a misbehaving client sends the
-notification without advertising `listChanged`. Notification bursts retain one in-flight
-`roots/list` request; stale responses are discarded, and invalid current roots report the exact
-field plus the required `file://` recovery. Session cwd, repository, transcript, and edited-file
-values are searchable evidence only and never grant authority. Restricted mode fails closed when
-no trusted root remains, exact hidden IDs use the normal no-match response, and arbitrary
-`aise db query` or MCP `query_session_index` SQL is disabled because it cannot enforce the shared
-predicate. Schema inspection remains available.
+`include_invocation_directory = true` adds the process working directory.
 
-`aise config show` prints the configured panel, `aise config origins` reports whether that panel
-came from the config file or typed default, and `aise config paths` prints the effective standalone roots,
-their canonical targets, and each contributing origin. MCP roots are connection-local and are not
-reported by a separate CLI process.
+MCP clients that advertise roots contribute their live `roots/list` file URIs. A roots-change
+notification revokes the previous live roots before replacements are accepted, even when a
+misbehaving client sends the notification without advertising `listChanged`. Notification bursts
+retain one in-flight `roots/list` request; stale responses are discarded, and invalid current
+roots report the exact field plus the required `file://` recovery.
+
+Session cwd, repository, transcript, and edited-file values are searchable evidence only and
+never grant authority. With no trusted root left, restricted mode fails and names the fix, while
+exact hidden IDs get the normal no-match response. Free-form `aise db query` and MCP
+`query_session_index` SQL is disabled, since a raw statement could read outside the roots; schema
+inspection stays available.
+
+`aise config show` prints the configured table, `aise config origins` reports whether it came
+from the config file or a typed default, and `aise config paths` prints the effective standalone
+roots, their canonical targets, and each contributing origin. MCP roots are connection-local, so
+a separate CLI process does not report them.
 
 ## Index refresh lifecycle
 
@@ -165,16 +169,17 @@ reported by a separate CLI process.
 Absent databases and structurally unreadable old schemas are repaired synchronously because no
 correct snapshot exists to serve. Schema generations newer than the binary fail closed with an
 upgrade instruction; the binary never guesses that a future layout is compatible. Parser-derived
-data upgrades and archive cleanup complete under one RAII update-lock guard, and schema/freshness
+data upgrades and archive cleanup complete under one update lock, and schema/freshness
 markers are written only after all work succeeds. A crash leaves the prior readable generation and
 causes the next `auto` read to retry in the background.
 
 ## Rust, Python, and MCP
 
-Every struct read from `config.toml` — `Config` and each panel under it — is `#[non_exhaustive]`.
-A downstream crate therefore starts from `Default::default()` and assigns the fields it wants
-instead of writing a struct literal, which is what makes a new setting a minor release rather
-than a breaking one; `[ui]` alone gained ten fields in the cycle before 1.0.0. `ConfigOverrides`
+No struct read from `config.toml` can be built with a struct literal: `Config` and the settings
+tables under it are `#[non_exhaustive]`, and `[ui.keys]` wraps a private map. A downstream crate
+therefore starts from `Default::default()` and assigns the fields it wants, so a new setting does
+not break code that compiles today; `[ui]` alone gained ten fields in the cycle before 1.0.0.
+`ConfigOverrides`
 is deliberately not among them, because it carries CLI and API overrides rather than file
 contents and a literal is how an embedder builds one. `tests/rust-api-consumer` compiles the
 supported pattern from outside the crate, where a struct expression fails with
@@ -217,10 +222,10 @@ harnesses unless `--no-skill` is passed.
 Antigravity App/IDE and CLI share `~/.gemini/config/mcp_config.json` but use
 `~/.gemini/config/skills/` and `~/.gemini/antigravity-cli/skills/` respectively.
 
-Install, status, uninstall, and recover derive their default transaction receipt from the
-selected config path, so global `--config` and `AI_SESSION_SEARCH_CONFIG` select the same
-recovery namespace without loading the session index. Either one deliberately selects a portable
-alternate namespace for that invocation.
+Install, status, uninstall, and recover take their transaction receipt from the selected config
+path, so `--config` and `AI_SESSION_SEARCH_CONFIG` send recovery where the install wrote, without
+loading the session index. Pointing either elsewhere gives that invocation its own receipt,
+keeping a throwaway install separate from your real one.
 
 Omitting `--client` selects every detected client. Repeated `--client` values form an explicit
 include set; repeated `--exclude-client` values subtract from that set.
@@ -244,18 +249,18 @@ duplicate managed inline blocks to one. Uninstall removes every managed inline b
 whole files that carry recognized aise ownership.
 
 The same concise text is returned as MCP initialize `instructions`, so clients that support
-server instructions receive the workflow even without a Markdown integration. The first 512
-characters are self-contained and contract-tested, following Codex's current
-[MCP guidance](https://learn.chatgpt.com/docs/extend/mcp.md). Markdown remains necessary for
+server instructions receive the workflow even without a Markdown integration. The four steps come
+first, so a client that truncates server instructions still delivers them, following Codex's
+current [MCP guidance](https://learn.chatgpt.com/docs/extend/mcp.md). Markdown remains necessary for
 harnesses that do not consume server instructions or need the guidance before choosing an MCP
 tool.
 
 ## Search extent and elapsed-time defaults
 
-Message-search result extents are surface-specific. When no call, purpose, or
-`[search.message-search].default_limit` applies, Rust, CLI, and Python return every literal,
-regex, or no-text match; MCP alone supplies `[mcp].search_messages_limit` because tool results go
-directly into model context. Fuzzy search always requires a finite page. Explicit `all_results`
+When no call, purpose, or `[search.message-search].default_limit` applies, Rust, CLI, and Python
+return every literal, regex, or no-text match; MCP alone supplies
+`[mcp].search_messages_limit`, because a tool result goes straight into model context. Fuzzy
+search always requires a finite page. Explicit `all_results`
 selects the complete eligible corpus on every supported non-fuzzy surface and is never silently
 converted into a page. Session-level `aise list`/`aise search` limits and presentation windows are
 separate controls and do not redefine message-hit membership.
@@ -283,7 +288,7 @@ query correctness or research budgets.
 
 ## Output windowing defaults
 
-Two distinct line-window scopes exist and must never be conflated: whole-transcript windows
+Two line-window scopes cover different things: whole-transcript windows
 (`[cli] show_transcript_lines` for `aise show`, `[mcp] get_session_transcript_lines` for the MCP
 `get_session` transcript view) and per-message caps (`[cli] lines_per_message` for
 `aise messages` commands, `[mcp] lines_per_message` for `search_messages` and focused
@@ -294,25 +299,23 @@ count, pagination, context membership, or reference extraction. This makes a lar
 skimmable without silently discarding hits. `config.example.toml` documents each key beside its
 typed Rust default.
 
-Queried message results expose an independent match-centered `match_view`, even when the selected
-field's head, tail, or character-bounded `field_view` does not contain the match. The retained
-configuration key `[search.message-search].match_evidence_max_chars` supplies the default
-`match_view` budget for compatibility with existing pre-release config files; direct CLI, MCP,
-Python, or Rust parameters and a purpose preference can override it. The typed default is 220
-Unicode scalar characters. This bound is applied only after matching, ranking, page selection, and
-offset handling, so it cannot hide a better result or change `next_offset`. Queryless results and
-neighboring context rows have no match-centered view.
+You always see the text that matched: a queried result carries a match-centered `match_view` even
+when the head, tail, or character-bounded `field_view` you selected does not contain the match.
+`[search.message-search].match_evidence_max_chars` is retained as the default `match_view` budget
+for config files written before 1.0.0; direct CLI, MCP, Python, or Rust parameters and a purpose
+preference override it. The typed default is 220 Unicode scalar characters, applied only after
+matching, ranking, page selection, and offset handling, so it cannot hide a better result or
+change `next_offset`. Queryless results and neighboring context rows have no match-centered view.
 
-Compact summaries use the same sign convention through `summary_items`:
-positive selects the first N records, negative selects the last N, and `0` explicitly keeps all
-records for pipelines. The bounded CLI and MCP default is `-12`. One fair aggregate budget is
-shared by user intent, tool activity, references, and changed-file aggregates; message-derived
-records follow first/last sequence order, while `changed_files` remains an aggregate ordered by
-path and edit count. This is presentation-only and does not change indexing, matching, ranking, or
-detailed retrieval. Rust callers use the typed `EvidenceWindow::First | Last | All` API rather
-than signed integers; first/last database ordering remains an internal inspection primitive.
-Use bounded `search_messages` pages for deterministic non-overlapping detail traversal. CLI
-pipelines can request all summary evidence with `--summary-items 0 --format json`.
+Compact summaries use the same sign convention through `summary_items`: positive selects the
+first N records, negative the last N, and `0` keeps all records for pipelines. The CLI and MCP
+default is `-12`. One budget is shared across user intent, tool activity, references, and
+changed-file aggregates; message-derived records follow first/last sequence order, while
+`changed_files` is ordered by path and edit count. This is presentation-only and does not change
+indexing, matching, ranking, or detailed retrieval. Rust callers use the typed
+`EvidenceWindow::First | Last | All` API instead of signed integers. For deterministic,
+non-overlapping detail traversal use bounded `search_messages` pages, and
+`--summary-items 0 --format json` gives a pipeline every summary record.
 
 ## TUI display defaults
 
@@ -335,9 +338,9 @@ Only `search_debounce_ms` accepts `0`, where it means a search on every keystrok
 waits on it either way: the keystroke echoes on its own loop turn and the search runs off the
 input thread. Enter searches at once whatever the value.
 
-Zero is rejected elsewhere because it names nothing: `idle_poll_interval_ms` would return before
-polling any key, and an interval too large for the platform monotonic clock is rejected rather
-than allowed to overflow the deadline. Queued keys redraw within the same loop turn whatever the
+Zero is rejected elsewhere because it describes no behavior: `idle_poll_interval_ms = 0` would
+return before polling any key. An interval too large for the platform monotonic clock is
+rejected too, so it cannot overflow the deadline. Queued keys redraw within the same loop turn whatever the
 interval, and active output is checked within 10 ms.
 
 The scroll amounts count rendered rows because the scroll offset indexes the wrapped pane.
@@ -348,14 +351,13 @@ even when a role is absent, each floored at one line. Every line in the example 
 typed Rust default.
 
 `[ui].unicode` and `[ui].color` (`auto`, `on`, `off`) say what the terminal on the other end can
-draw, and `crate::terminal_style` resolves them once when the TUI starts — configuration states
-the intent, so nothing about a terminal is decided while a configuration file is parsed. `auto`
-falls back to ASCII only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding that cannot carry
-box drawing, because an unset locale is not evidence of anything, and it drops colour under
-`NO_COLOR` (set and non-empty, whatever the value) or `TERM=dumb`. Every symbol the browser emits
-comes from that one table, and colour is cleared from the finished frame rather than at each
-span, so a widget added later cannot reintroduce either by forgetting to ask. On a monochrome
-terminal bold replaces the colour rather than dropping the emphasis.
+draw, and the TUI resolves them once at startup. Every symbol and every color it draws comes from
+that one resolution, so the setting covers the whole interface.
+
+`auto` falls back to ASCII only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding that
+cannot carry box drawing, because an unset locale is not evidence of anything. It drops color
+under `NO_COLOR` (set and non-empty, whatever the value) or `TERM=dumb`. On a monochrome terminal
+bold replaces the color, so the emphasis survives.
 
 The `help` command, bound to `?`, opens an overlay listing every bound command, and any key
 closes it. The status bar and the empty-list hints read the same bindings, so one rebind updates
@@ -371,11 +373,10 @@ query nor starts a search.
 `[ui.keys]` maps each command to the key presses that reach it, validated with the rest of the
 configuration at load.
 
-A table names only the actions it changes and the rest keep theirs, the same merge
-`[providers.<name>]` already uses, because replacing the whole table on a partial override would
-unbind every other command to change one. `[]` unbinds an action deliberately. A command may be
-reached by as many keys as the table lists, so a reader adding their own keeps the shipped one,
-and a key an action already lists is a repeat and is kept once.
+Name only the actions you want to change; every other action keeps its own keys. That is the same
+merge `[providers.<name>]` already uses, and it means rebinding one command cannot unbind the
+rest. `[]` unbinds an action deliberately. A command may be reached by as many keys as the table
+lists, so adding your own keeps the shipped one, and a key an action already lists is kept once.
 
 A binding is a single character, `f1` through `f35`, or a named key, optionally chorded with
 `ctrl`, `alt`, `shift`, or `super`. Write a capital letter as itself rather than `shift+`, because
@@ -417,10 +418,10 @@ whatever the config file or the shipped table says. `aise config origins` report
 not on their measured default and where each came from. A variable naming no row is rejected and
 the error names the variable, not the row it was translated into. A value that does not parse as
 a whole number is rejected the same way rather than silently dropped, so a typo cannot leave the
-shipped budget in force while the registration looks like it moved one. The `style-*` rows and
-the root-combinator rejection are structural rules, not client caps, so configuration refuses
-them by name: no number makes a client accept the schema, and the fix is to change the schema
-being emitted.
+shipped budget in force while the registration looks like it moved one. The `style-*`,
+`mcp-output-schema-*`, and root-combinator rows are structural rules rather than client caps, so
+configuration refuses them by name: no number makes a client accept the schema, and the fix is to
+change the schema being emitted.
 
 These are client policy, not protocol, and client policy moves: Codex raised its schema budget
 from 4,000 to 5,000 bytes in `b6f9aee16d`, and Gemini CLI's result cap differs by two orders of
@@ -428,16 +429,16 @@ magnitude between forks of one codebase. The shipped numbers are what was measur
 client's source at a pinned version, recorded with their provenance in
 [MCP client limits and measured evidence](mcp-client-limits-and-measured-evidence.md). An
 operator running a client that has since moved sets the new number here rather than waiting for
-a release built against it. A key naming no row is rejected at load, so a typo cannot leave the
-shipped budget in force while appearing to change it.
+a release built against it.
 
 Your own settings change the schema size, because generated descriptions interpolate resolved
 values. `search_messages` measures 4,741 bytes as Codex counts it, the figure pinned in
-`EMITTED_ARTIFACT_CEILINGS`, leaving 259 bytes under Codex's 5,000: a first configured
-`[search.purposes.<name>]` bundle spends about 100 of those and each later bundle about 45. Past that limit Codex
-deletes every parameter
-description and emits no marker, so the server measures its own catalogue when it builds it and
-writes any breach to stderr.
+`EMITTED_ARTIFACT_CEILINGS`, leaving 259 bytes under Codex's 5,000. A first configured
+`[search.purposes.<name>]` bundle spends about 100 of those, and each later one roughly twice its
+name's length, because the name lands both in an enum Codex keeps and in the prose listing
+configured bundles. Past that limit Codex deletes every parameter description and emits no
+marker, so the server measures its own catalogue when it builds it and writes any breach to
+stderr.
 
 ## Atomic configuration initialization
 

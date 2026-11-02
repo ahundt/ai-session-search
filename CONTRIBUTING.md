@@ -27,8 +27,8 @@ indexing, querying, migration, and filesystem publication, and produces the
 `rust/ai-session-search-python` is a typed PyO3 adapter, and the Python package
 is the compatibility API over it. The CLI, MCP server, Rust library, and Python
 API are adapters over the same typed requests and responses: they translate
-syntax, not product semantics. A behavior change belongs in the shared service,
-not in one surface.
+syntax only. Put a behavior change in the shared service, where all four
+surfaces pick it up at once.
 
 ## Development setup
 
@@ -76,12 +76,11 @@ tests, and public-API doctests, the release executable and its MCP schema, the
 exact wheel and source distribution install pathways, and workflow syntax when
 `actionlint` is installed.
 
-The hosted operating-system and Python matrices stay CI-owned: CI also
-runs the Rust portability suite on macOS and Windows, the Cargo
-registry/path/Git install pathways, `cargo deny check advisories licenses
-sources bans`, and an offline `zizmor` workflow-security audit. CI also runs
-`actionlint` at a pinned version, so a workflow syntax error blocks the merge
-even when the local run skipped it.
+The hosted operating-system and Python matrices stay CI-owned. CI also runs the
+Rust portability suite on macOS and Windows, the Cargo registry/path/Git install
+pathways, `cargo deny check advisories licenses sources bans`, an offline
+`zizmor` workflow-security audit, and `actionlint` at a pinned version, so a
+workflow syntax error blocks the merge even when the local run skipped it.
 
 If you develop on macOS or Windows, you can run the same gate against Linux, and
 the MSRV check at its pinned toolchain, without waiting for CI:
