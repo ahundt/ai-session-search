@@ -270,10 +270,9 @@ refreshes MCP registrations and managed instructions. This prevents an
 ephemeral `uvx`, source-tree, or Python interpreter process from being copied
 and mislabeled as a package-managed installation.
 
-`aise integrations install` is idempotent: rerunning it changes no bytes that are already current,
-and it repairs owned relative `aisearch -> aise` and `ai_session_search -> aise` symbolic links,
-MCP entries, instruction text, and session-index freshness through the same detached preparation
-path used after a first install. Upgrades do not need it; run it to connect a client installed
+`aise integrations install` is idempotent: rerunning it changes no bytes already current, and
+repairs the owned relative `aisearch` and `ai_session_search` symlinks to `aise`, MCP entries,
+instruction text, and index freshness. Upgrades do not need it; run it to connect a client installed
 since, or to repair what `aise integrations status` reports. It refuses to replace either alias path when that
 path is not an owned symbolic link. Use `--dry-run` before mutation,
 repeat `--client CLIENT` for an explicit include set, repeat
@@ -286,17 +285,15 @@ separate `aise integrations uninstall` command with the same target selectors;
 while removing the other selected integrations. Neither command installs or
 removes the package-owned `aise` executable.
 
-Skill directories use an explicit ownership marker in `SKILL.md`, which gates the whole
-directory: checking each file separately would let a tree be half owned, so aise would overwrite
-the files it wrote and refuse the one you edited, leaving a directory matching neither version.
+An ownership marker in `SKILL.md` gates the whole skill directory, so a tree is never left half
+overwritten and half refused.
 An unmanaged file at a selected destination stops the entire preflight before MCP, instruction, or
 skill files are published, and the error names the conflicting path and the `--skill-root`
 alternative.
 
 Install also writes `skill-install-manifest.json` beside your config, recording the path, byte
-count, and SHA-256 of every file it wrote. That record is what lets `status` distinguish an older
-install nobody touched from a file you changed -- byte comparison alone answers only "does this
-equal the current build", and a NO covers both. Skill status is therefore one of `configured`,
+count, and SHA-256 of every file it wrote, which is how `status` tells an untouched older install
+apart from a file you changed. Skill status is one of `configured`,
 `outdated, untouched`, `modified or damaged`, `missing`, or `legacy, ownership uncertain`. It never
 claims to know whether a change was an intentional edit or corruption, because nothing on disk
 carries that intent.
@@ -363,9 +360,6 @@ cargo install --root /custom/cargo ai-session-search --locked
 # Extracted verified native archive (the packaged script is named install.sh)
 sh install.sh --bin-dir /custom/bin
 
-# Repository checkout used by maintainers
-sh scripts/install-native.sh --bin-dir /custom/bin
-
 # Register that executable with detected clients
 /custom/bin/aise integrations install --binary /custom/bin/aise
 ```
@@ -377,21 +371,6 @@ executable removal. `aise integrations install --help` exposes typed paths for c
 Zed, OpenCode, Codex TOML, Claude Markdown, Gemini/Antigravity Markdown,
 `AGENTS.md`, and recovery receipt locations; those flags configure
 integrations, not package ownership.
-
-The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desktop and Codex
-CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, **Pi**, **Prime Agent**, Cursor,
-Windsurf, VS Code, Zed, **OpenCode**, OpenClaw, and the legacy KiloCode
-adapter. Pi and Prime Agent acceptance covers native skill discovery, managed `AGENTS.md`, explicit
-selection, status, idempotent reinstall, dry-run, and ownership-safe uninstall; it intentionally
-expects no local stdio MCP target. Antigravity App/IDE and CLI share the current
-`~/.gemini/config/mcp_config.json`; the installer also maintains the two
-legacy Antigravity MCP locations for older harness versions. App/IDE and CLI
-use distinct current skill roots while sharing managed `~/.gemini/GEMINI.md`
-instructions with Gemini. OpenCode uses `mcp.ai-session-search` in
-`~/.config/opencode/opencode.json` and a
-managed block in `~/.config/opencode/AGENTS.md`. Each target must pass install,
-content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe
-uninstall tests.
 
 Managed client configurations and MCP initialization use the descriptive
 `ai-session-search` server identity and the human-readable title **AI Session Search**, while the
@@ -446,6 +425,22 @@ cargo install ai-session-search \
 
 ## Maintainer acceptance contract
 
+The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desktop and Codex
+CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, **Pi**, **Prime Agent**, Cursor, Windsurf, VS
+Code, Zed, **OpenCode**, OpenClaw, and the legacy KiloCode adapter. Each target must pass
+install, content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe uninstall
+tests. Pi and Prime Agent acceptance covers native skill discovery, managed `AGENTS.md`, explicit
+selection, status, idempotent reinstall, dry-run, and ownership-safe uninstall, and intentionally
+expects no local stdio MCP target. Antigravity App/IDE and CLI share the current
+`~/.gemini/config/mcp_config.json` while the installer also maintains the two legacy Antigravity
+MCP locations for older harness versions; they use distinct skill roots and share managed
+`~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.ai-session-search` in
+`~/.config/opencode/opencode.json` and a managed block in `~/.config/opencode/AGENTS.md`.
+
+Maintainers install from a repository checkout with
+`sh scripts/install-native.sh --bin-dir DIR`; the packaged archive ships the same script as
+`install.sh`.
+
 The canonical repository URL is `https://github.com/ahundt/ai-session-search`. Keep it equal to
 `project.urls.Repository` in `pyproject.toml` and `workspace.package.repository` in `Cargo.toml`;
 installation documentation must not introduce a second repository identity. When a harness
@@ -474,13 +469,8 @@ uv cache and `CARGO_TARGET_DIR`: normal standalone invocations reuse uv's platfo
 while `run_ci_local.sh` selects the workspace `target` directory. Set either environment
 variable explicitly to use a different shared cache; the harness never deletes it.
 
-`run_ci_local.sh` defaults `CARGO_INCREMENTAL=0` because its full build/test/package gate
-does not benefit from retaining a second multi-gigabyte incremental graph. It preserves an
-explicit caller value and an inherited `RUSTC_WRAPPER` such as `sccache`; set
-`AI_SESSION_SEARCH_RUSTC_WRAPPER=` to disable that wrapper for one gate. If Cargo reports
-`No space left on device`, inspect `target` first. Remove only workspace-owned output with
-`cargo clean` or a more selective `cargo clean -p <package>` after confirming no other build
-is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic recovery step.
+On `No space left on device`, reclaim with `cargo clean`, or `cargo clean -p <package>`. Never
+delete `$CARGO_HOME` or uv's shared cache to recover space.
 
 ## Primary references
 

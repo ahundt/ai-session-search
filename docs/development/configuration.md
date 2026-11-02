@@ -331,25 +331,21 @@ and a typed burst would otherwise start a scan per character that the next keyst
 | `list_pane_percent` | 45 | 10–90 | The body width share of the session-list pane; the preview takes the remainder |
 | `preview_body_lines` | 34 | | The preview's total body budget |
 
-`search_debounce_ms` is the only one of these that accepts `0`, and the only one where zero names
-a behavior rather than an impossible one: it searches on every keystroke, which is what the TUI
-did before the setting existed. Enter searches the current query at once whatever the value, and
-typing never waits on the debounce, because the keystroke echoes on its own loop turn and the
-search runs off the input thread either way.
+Only `search_debounce_ms` accepts `0`, where it means a search on every keystroke. Typing never
+waits on it either way: the keystroke echoes on its own loop turn and the search runs off the
+input thread. Enter searches at once whatever the value.
 
-Every other key is rejected at zero. `idle_poll_interval_ms` would return before polling any key,
-and an interval that does not fit the platform monotonic clock is rejected rather than allowed to
-overflow the deadline. Queued keys redraw immediately within the same loop turn whatever the
-interval, and active search or preview output is checked within 10 ms.
+Zero is rejected elsewhere because it names nothing: `idle_poll_interval_ms` would return before
+polling any key, and an interval too large for the platform monotonic clock is rejected rather
+than allowed to overflow the deadline. Queued keys redraw within the same loop turn whatever the
+interval, and active output is checked within 10 ms.
 
-The two scroll amounts count rendered rows rather than transcript lines, because the scroll offset
-indexes the wrapped pane. `provider_label_width` is a starting width: a normal pane clamps upward
-to the longest label, while a pane too narrow to contain that label clamps to its actual interior
-and truncates rather than overflowing. `preview_body_lines` keeps the canonical-transcript
-bookends at their historical 8/4/8/14 shares even when a role is absent, each floored at one line,
-which preserves the previous preview including Session/CWD metadata while avoiding a full Rust
-`String` clone and an O(turns) vector. Every line in the example file equals its typed Rust
-default.
+The scroll amounts count rendered rows because the scroll offset indexes the wrapped pane.
+`provider_label_width` is a starting width: a pane clamps upward to the longest label, or, when
+too narrow to hold it, to its own interior, truncating rather than overflowing.
+`preview_body_lines` keeps the canonical-transcript bookends at their historical 8/4/8/14 shares
+even when a role is absent, each floored at one line. Every line in the example file equals its
+typed Rust default.
 
 `[ui].unicode` and `[ui].color` (`auto`, `on`, `off`) say what the terminal on the other end can
 draw, and `crate::terminal_style` resolves them once when the TUI starts — configuration states
@@ -358,41 +354,22 @@ falls back to ASCII only when `LC_ALL`, `LC_CTYPE`, or `LANG` names an encoding 
 box drawing, because an unset locale is not evidence of anything, and it drops colour under
 `NO_COLOR` (set and non-empty, whatever the value) or `TERM=dumb`. Every symbol the browser emits
 comes from that one table, and colour is cleared from the finished frame rather than at each
-span, so a widget added later cannot reintroduce either by forgetting to ask. Two render tests
-hold the line: one asserts no cell outside ASCII anywhere in a frame that has borders, an elided
-error, section rules, and an elision marker; the other asserts no coloured cell while bold
-survives, because emphasis a monochrome terminal can show is what replaces the colour.
+span, so a widget added later cannot reintroduce either by forgetting to ask. On a monochrome
+terminal bold replaces the colour rather than dropping the emphasis.
 
-`help` (`?`) covers the screen with every bound command and the keys that reach it, built from
-the same table the loop dispatches through, so a rebinding changes the help and an unbound
-command is not listed. The status bar is one row and sheds most hints on an eighty-column frame;
-before the list existed, paging, scrolling, top and bottom, and resume had nowhere else to be
-named. The list scrolls with the preview scroll keys and any other key closes it, so nothing has
-to be bound to leave it.
+The `help` command, bound to `?`, opens an overlay listing every bound command, and any key
+closes it. The status bar and the empty-list hints read the same bindings, so one rebind updates
+everywhere keys are taught, and an empty index says so and names `aise reindex`. Inside the
+search box `?` is a character in the query, so the status bar names that box's commands there
+instead.
 
-Three places name keys, and all three read them from the bindings rather than from the shipped
-defaults, so rebinding one changes every place that teaches it. The status bar is contextual: in
-the search box it names that box's own commands — `clear_query`, `delete_word_backward`,
-`cursor_start`/`cursor_end`, and the way out — because `?` cannot open the key list from inside a
-text field, where it is a character in the query. `delete_backward`, `delete_forward`, and the
-caret arrows stay unnamed there; the row is one line and they are what a text field does
-everywhere. An empty session list carries the third: a query or filter that excluded everything
-gets the keys that change them, while an index with nothing in it says so and names
-`aise reindex`, since no key in the browser fills an empty index.
+The search box binds eight editing commands like any other: `cursor_left`, `cursor_right`,
+`cursor_start`, `cursor_end`, `delete_backward`, `delete_forward`, `delete_word_backward`, and
+`clear_query`. Typing a character is not one of them, and moving the caret neither edits the
+query nor starts a search.
 
-The search box is a text field: the caret moves with `cursor_left`, `cursor_right`,
-`cursor_start`, and `cursor_end`, text is removed with `delete_backward`, `delete_forward`,
-`delete_word_backward`, and `clear_query`, and a character with no modifier is inserted where the
-caret sits. Those eight are bound in `[ui.keys]` like every other command; typing a character is
-not, because it is the text rather than a command. The caret is the terminal's own, placed with
-`Frame::set_cursor_position`, so it needs no glyph, appears on a terminal whose encoding has
-none, and takes its shape and blink from the reader's settings; a query wider than the box
-scrolls under it so the caret stays in view. Moving the caret is not an edit and does not start
-a search.
-
-`[ui.keys]` maps each command to the key presses that reach it, and `crate::keymap` owns that
-vocabulary: `config` stores a `KeyBindings` and validates it with everything else, `tui` asks it
-what a key event means and never parses a key name, and the status bar names whatever is bound.
+`[ui.keys]` maps each command to the key presses that reach it, validated with the rest of the
+configuration at load.
 
 A table names only the actions it changes and the rest keep theirs, the same merge
 `[providers.<name>]` already uses, because replacing the whole table on a partial override would
@@ -440,10 +417,10 @@ whatever the config file or the shipped table says. `aise config origins` report
 not on their measured default and where each came from. A variable naming no row is rejected and
 the error names the variable, not the row it was translated into. A value that does not parse as
 a whole number is rejected the same way rather than silently dropped, so a typo cannot leave the
-shipped budget in force while the registration looks like it moved one. Rows whose number is a
-structural rule rather than a client cap — the `style-*` rows and the root-combinator rejection —
-take no override at all: configuration refuses them by name, because no configured number makes
-a client accept the schema; the fix is changing the emitted schema.
+shipped budget in force while the registration looks like it moved one. The `style-*` rows and
+the root-combinator rejection are structural rules, not client caps, so configuration refuses
+them by name: no number makes a client accept the schema, and the fix is to change the schema
+being emitted.
 
 These are client policy, not protocol, and client policy moves: Codex raised its schema budget
 from 4,000 to 5,000 bytes in `b6f9aee16d`, and Gemini CLI's result cap differs by two orders of
@@ -454,12 +431,10 @@ operator running a client that has since moved sets the new number here rather t
 a release built against it. A key naming no row is rejected at load, so a typo cannot leave the
 shipped budget in force while appearing to change it.
 
-The budget matters because the schema is not fixed. Several generated descriptions interpolate
-resolved configuration values, so an operator's own settings change the size of the schema this
-server emits: `search_messages` measures 4,741 bytes as Codex counts it by default (the figure
-pinned in `EMITTED_ARTIFACT_CEILINGS`), a 259-byte margin under Codex's 5,000, and a first
-configured `[search.purposes.<name>]` bundle spends
-about 100 of those bytes with each further bundle spending about 45. Past that limit Codex
+Your own settings change the schema size, because generated descriptions interpolate resolved
+values. `search_messages` measures 4,741 bytes as Codex counts it, the figure pinned in
+`EMITTED_ARTIFACT_CEILINGS`, leaving 259 bytes under Codex's 5,000: a first configured
+`[search.purposes.<name>]` bundle spends about 100 of those and each later bundle about 45. Past that limit Codex
 deletes every parameter
 description and emits no marker, so the server measures its own catalogue when it builds it and
 writes any breach to stderr.
@@ -495,16 +470,11 @@ are rejected before any JSON or TOML mutation instead of being lossily rewritten
 
 The implementation retains the shared `durable_fs` primitive rather than adding a second atomic-file
 crate. Rust's [`OsStrExt`](https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStrExt.html) defines the
-lossless Unix byte representation used in receipts. `tempfile::NamedTempFile::persist_noclobber`
-provides no-clobber publication but explicitly does not sync file contents or the containing
-directory, so it cannot replace the durability layer without extra policy:
-[`tempfile` documentation](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist_noclobber).
-The formatting-preserving TOML API and keyed removal contract are documented by
+lossless Unix byte representation used in receipts, and the formatting-preserving TOML API and
+keyed removal contract come from
 [`toml_edit::DocumentMut`](https://docs.rs/toml_edit/latest/toml_edit/struct.DocumentMut.html).
-The [`os_str_bytes` documentation](https://docs.rs/os_str_bytes/latest/os_str_bytes/) says its
-platform encoding may change and should not be used for storage, while
-[`camino::Utf8PathBuf`](https://docs.rs/camino/latest/camino/struct.Utf8PathBuf.html) rejects
-non-Unicode paths. Neither is a safer receipt format than explicit platform-native units.
+Receipts record explicit platform-native units, because the alternatives either change encoding
+between releases or reject non-Unicode paths.
 
 ## Maintainer checks
 

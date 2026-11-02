@@ -719,7 +719,9 @@ def test_readme_opening_and_format_count_cover_every_provider() -> None:
     summary = readme.split("\n## ", 1)[0]
     for name in README_PROVIDER_NAMES:
         assert name in summary, f"README summary above the first heading omits {name}"
-    assert f"{PROVIDER_COUNT_WORD.capitalize()} session formats" in readme
+    # One count-word anchor, in the prose. A second assertion pinned the same word in a heading,
+    # which forced the heading to stay a noun phrase; the prose anchor alone still fails when a
+    # new provider changes PROVIDER_COUNT_WORD without the README following.
     assert f"parses all {PROVIDER_COUNT_WORD} formats" in readme
     for provider_id in PROVIDER_IDS:
         assert f"`{provider_id}`" in readme, f"README has no session-source row for {provider_id}"

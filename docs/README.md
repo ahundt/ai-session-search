@@ -1,20 +1,15 @@
 # AI Session Search documentation
 
-Use the repository [README](../README.md) for what `aise` does and a quick start. This page is
-the index.
+The repository [README](../README.md) covers what `aise` does and a quick start.
 
 ## Using aise
 
 | Task | Guide |
 | --- | --- |
 | Install, verify, update, or uninstall `aise` and its MCP integrations | [Installation](development/installation.md) |
-| Resolve CLI, environment, TOML, Rust, Python, and MCP settings | [Configuration](development/configuration.md) |
+| Resolve CLI, environment, TOML, Rust, Python, and MCP settings, or find which source won with `aise config origins` | [Configuration](development/configuration.md) |
 | Call AI Session Search from Python or Rust | [Library guide](development/library-api.md) |
 | Report a bug, or submit a change | [CONTRIBUTING.md](../CONTRIBUTING.md) |
-
-On a new installation, follow the installation guide's five steps in order. On an existing one
-with unexpected paths or settings, run `aise config origins` first, then use the configuration
-guide.
 
 ## Maintaining and releasing aise
 
@@ -25,13 +20,11 @@ guide.
 | Preserve cumulative product contracts while changing the repository | [Maintainer requirements and design decisions](development/maintainer-requirements-and-design-decisions.md) |
 | Re-check client-imposed MCP limits when a harness or schema changes | [MCP client limits and measured evidence](development/mcp-client-limits-and-measured-evidence.md) |
 
-`RELEASING.md` is the whole release procedure. Start at its "Before tagging, confirm" list and
-work down, without skipping exact-artifact verification or protected-environment approval.
+A release starts at `RELEASING.md`'s "Before tagging, confirm" list, not at the tag.
 
 ## Architecture and migration records
 
-These files explain completed design decisions and preserve migration evidence;
-they are not installation checklists.
+Completed design decisions and migration evidence, not checklists.
 
 | Record | Purpose |
 | --- | --- |

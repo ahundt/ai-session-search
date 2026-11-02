@@ -11,10 +11,8 @@ system, the exact command or MCP request, and what an attacker would gain. A
 reproduction that runs against synthetic fixtures rather than your own session
 transcripts is easier to act on and does not disclose your data.
 
-Reports go to the maintainer for triage. A fix ships as a new released version:
-published registry versions are immutable and are never replaced, so a fix
-arrives under a new version number rather than being patched into one you
-already have.
+Reports go to the maintainer for triage. A fix ships as a new released version,
+because published registry versions are immutable and are never replaced.
 
 ## Where fixes are published
 
@@ -28,18 +26,17 @@ any kind.
 
 AI Session Search reads AI coding-agent transcripts that already exist on the
 machine running it, and writes an index, cache, and configuration under
-platform application directories. Understanding that boundary makes a report
-easier to classify:
+platform application directories. `aise config paths` prints every one of those
+read and write locations on the machine in question.
 
 - **Local data only.** It never fetches conversations from a vendor account and
-  never uploads transcripts. The only request `aise` issues itself is the
-  optional release check against the GitHub releases API, disabled with
-  `--skip-release-notification`, `AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION=1`,
-  or `[release_notifications].enabled = false`, and never performed by MCP stdio
-  or by Rust and Python library calls. `aise package update` reaches a registry
-  only by running the package manager that owns the installation, which also
-  means it replaces the executable; `aise package status` reports the owner
-  without contacting anything.
+  never uploads transcripts. The only request `aise` issues is the optional
+  release check against the GitHub releases API, which MCP stdio and library
+  calls never perform and which `--skip-release-notification`,
+  `AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION=1`, or
+  `[release_notifications].enabled = false` disables. `aise package update`
+  reaches a registry only by running the package manager that owns the install,
+  replacing the executable; `aise package status` contacts nothing.
 - **Indexed content is sensitive.** The index holds whole conversations,
   including any secrets a transcript captured. Reports about the index leaking
   outside its configured directory, about file permissions on it, or about

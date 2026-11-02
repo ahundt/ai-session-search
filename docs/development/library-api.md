@@ -12,9 +12,8 @@ command-line use see the [README](../../README.md); for settings see the
 
 ## Python
 
-`SessionSearch` is the lifecycle root. Query objects are immutable typed
-conversions over the public Rust request types, so a request built once can be
-reused without the risk that a later call mutated it.
+`SessionSearch` is the lifecycle root. Query objects are immutable typed mirrors
+of the Rust request types, so a request you build once is safe to reuse.
 
 ```python
 import ai_session_search as aise
@@ -122,8 +121,7 @@ publication plan, so no call chooses a destination on its own.
 
 ### Features
 
-Library-only consumers that do not use the CLI release checker can omit its
-network version-check dependencies:
+To drop the network version-check dependencies, disable the default feature:
 
 ```toml
 [dependencies]

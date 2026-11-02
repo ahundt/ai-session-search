@@ -8,10 +8,9 @@ Report a suspected vulnerability privately instead of opening an issue. See
 ## Before you start
 
 Search [existing issues](https://github.com/ahundt/ai-session-search/issues)
-first. For anything beyond a small fix, open an issue describing the observed
-behavior and the outcome you want before writing code; changes that alter public
-behavior are reviewed against recorded product contracts and are easier to land
-when the contract question is settled first.
+first. A one-line fix needs no issue. Anything that alters public behavior does:
+those are reviewed against recorded product contracts, and settling the contract
+question before you write code is what makes them land.
 
 State what you measured. A concrete report names the exact command, the exact
 output, the provider and version involved, and the file and line you are talking
