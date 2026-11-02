@@ -365,7 +365,7 @@ everywhere keys are taught, and an empty index says so and names `aise reindex`.
 search box `?` is a character in the query, so the status bar names that box's commands there
 instead.
 
-The search box binds eight editing commands like any other: `cursor_left`, `cursor_right`,
+The search box binds these editing commands like any other: `cursor_left`, `cursor_right`,
 `cursor_start`, `cursor_end`, `delete_backward`, `delete_forward`, `delete_word_backward`, and
 `clear_query`. Typing a character is not one of them, and moving the caret neither edits the
 query nor starts a search.

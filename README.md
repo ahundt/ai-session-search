@@ -105,9 +105,9 @@ aise integrations status
 aise mcp serve               # direct stdio use by a client
 ```
 
-The server exposes eight tools: `search_sessions`, `search_messages`, `list_sessions`,
-`get_session`, `get_resume_command`, `get_index_status`, `run_skill_capability`, and
-`query_session_index` for read-only SQL.
+The server exposes `search_sessions`, `search_messages`, `list_sessions`, `get_session`,
+`get_resume_command`, `get_index_status`, `run_skill_capability`, and `query_session_index` for
+read-only SQL.
 
 What a harness receives depends on what it can read, in the format and location it expects.
 `--client` limits the install to named harnesses, and no harness gets hooks.
