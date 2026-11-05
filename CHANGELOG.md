@@ -11,7 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-11-01
+## [1.0.0] - 2026-11-05
 
 1.0.0 is the first stable release. Every earlier version published under this name was a release
 candidate of this same release, so nothing published before it is being replaced.
