@@ -82,7 +82,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64
             manylinux: '2014'
-          - os: macos-14
+          - os: macos-15
             target: aarch64
             manylinux: auto
           - os: macos-15-intel
@@ -175,7 +175,7 @@ jobs:
             executable: target/release/aise
             archive-format: tar.gz
             installer: scripts/install-native.sh
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             executable: target/release/aise
             archive-format: tar.gz

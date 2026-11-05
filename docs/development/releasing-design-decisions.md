@@ -53,6 +53,13 @@ of that hosted label as an infrastructure failure, not evidence that ARM64 may
 be silently dropped. The current labels and architectures are defined in the
 [GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
+GitHub retired the `macos-14` image on 2026-11-02, so the macOS arm64 wheel and native archive
+build on `macos-15`. Nothing failed before the release workflows would have run: `ci.yml` tests
+macOS arm64 on `macos-latest`, which GitHub had already moved to macOS 26, so no CI job ever
+touched the retired label. Check each label in `publish.yml` and `prepare-packages.yml` against
+the runners reference above, not against `ci.yml`, because the two matrices can name different
+images for the same architecture and only the release ones gate a publish.
+
 PyO3's stable ABI feature makes one wheel per OS/architecture usable on all
 supported CPython versions. CI still imports and exercises the extension on
 3.12, 3.13, and 3.14 because ABI compatibility does not prove behavioral or
