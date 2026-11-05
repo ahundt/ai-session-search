@@ -13,12 +13,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.0.0] - 2026-11-05
 
-1.0.0 is the first stable release. Every earlier version published under this name was a release
-candidate of this same release, so nothing published before it is being replaced.
+1.0.0 is the first stable release of AI Session Search. `aise` parses nine AI coding-agent session
+formats into one index and searches it from the command line, a Rust crate, a Python package, or
+an MCP server.
 
-For anyone already running 1.0.0rc4, no behavior, subcommand, or default changed, and upgrading
-needs no action. What moved is the TLS and async dependency versions the advisories below name,
-and platform gates on items that only Windows reported as unused.
+Stable release based on 1.0.0rc4, with the dependency updates under Security below.
 
 ### Changed
 
@@ -47,10 +46,10 @@ and platform gates on items that only Windows reported as unused.
 2. CI now also runs on a daily schedule. Its `licenses` job runs `cargo deny check advisories`,
    whose verdict depends on the advisory database rather than on this repository, so a new entry
    against an unchanged lockfile used to be noticed only when someone pushed.
-3. The `rust-portability` job builds with `-D warnings`, so an item reached only from a
-   `#[cfg(unix)]` block can no longer sit unused on Windows without failing a job. Clippy runs on
-   Linux alone, where every such item is live, so this job is the only place the class appears.
-4. Nine Windows-only findings are fixed under that enforcement, in `integrations.rs`,
+3. The `rust-portability` job builds with `-D warnings`, so a `#[cfg(unix)]`-only item that sits
+   unused on Windows now fails the job. Clippy runs on Linux alone, where every such item is
+   live, so this job is the only place the class appears.
+4. Fix nine Windows-only findings under that enforcement, in `integrations.rs`,
    `update.rs`, `executable_alias.rs`, `durable_path.rs`, `analysis_publication.rs`, and the
    process-lifecycle tests: four unused imports, an unused match binding, a misplaced test
    binding, and two helpers now gated to match their unix-only callers. The ninth, the Windows
@@ -61,7 +60,7 @@ and platform gates on items that only Windows reported as unused.
    `sql_query::schema_path`, with the five argument structs the first five take, are now
    `pub(crate)` — eleven items. Each took clap-derived arguments and returned `Result<()>` after
    printing to stdout, so none was usable from a library, and none had a caller outside the crate.
-6. The nineteen argument structs that stay reachable, `DateRange` and `DbSchemaArgs` among them,
+6. The argument structs that stay reachable, `DateRange` and `DbSchemaArgs` among them,
    carry `#[non_exhaustive]`, so adding a command-line flag stays additive instead of breaking a
    crate that constructs one. The configuration structs were frozen this way before 1.0.0rc3 and
    this class was missed then. `DateRange` keeps its `Default`, which is how the Python binding
