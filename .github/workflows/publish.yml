@@ -165,7 +165,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned, not ubuntu-latest: this archive links against the runner's own glibc with no
+          # manylinux container, so a moving label moves the floor a user needs. Its aarch64
+          # sibling below is pinned for the same reason.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             executable: target/release/aise
             archive-format: tar.gz
