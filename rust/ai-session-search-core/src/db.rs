@@ -13143,6 +13143,175 @@ mod tests {
     }
 
     #[test]
+    fn content_search_finds_text_whose_case_the_trigram_index_does_not_fold() {
+        // The trigram prefilter must select a superset of what the verifier accepts. FTS5's
+        // tokenizer folds case from tables older than some Unicode case pairs (Cherokee, whose
+        // ordinary written form is the uppercase syllabary, among 417 scalars), and it stores
+        // U+0130 as itself where the verifier folds it to `i` + U+0307. Each row below is one the
+        // verifier accepts and a prefilter built from lowercased trigrams excluded.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let rows = [
+            "\u{13E3}\u{13B3}\u{13A9} syllabary", // ᏣᎳᎩ, Cherokee as normally written
+            "abİ end",
+            "go to İstanbul now",
+            "nothing relevant here",
+        ];
+        for (seq, content) in rows.iter().enumerate() {
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                    params![seq as i64, content],
+                )
+                .unwrap();
+        }
+        let found = |mode: MessageSearchMode, needle: &str| -> Vec<i64> {
+            let filters = MessageFilters {
+                match_mode: mode,
+                ..Default::default()
+            };
+            db.search_messages_ordered(needle, &filters, MessageOrder::OldestFirst)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.seq)
+                .collect()
+        };
+        let cases: &[(MessageSearchMode, &str, &[i64])] = &[
+            (MessageSearchMode::Literal, "\u{13E3}\u{13B3}\u{13A9}", &[0]),
+            (MessageSearchMode::Literal, "\u{ABB3}\u{AB83}\u{AB79}", &[0]),
+            (MessageSearchMode::Regex, "\u{13E3}\u{13B3}\u{13A9}", &[0]),
+            (MessageSearchMode::Literal, "abi", &[1]),
+            (MessageSearchMode::Literal, "İstanbul", &[2]),
+        ];
+        for (mode, needle, expected) in cases {
+            assert_eq!(
+                found(*mode, needle),
+                *expected,
+                "{mode:?} search for {needle:?} must find every row the verifier accepts"
+            );
+        }
+    }
+
+    #[test]
+    fn prefiltered_content_search_equals_a_full_scan_over_generated_text() {
+        // The prefilter may only narrow work, never results. Rows and needles are generated from
+        // the scalars where FTS5's folding and the verifier's disagree (U+0130 and its halves,
+        // the Kelvin sign, three sigmas, Cherokee and Georgian case pairs FTS5 leaves unfolded)
+        // mixed into ASCII, and every search must return exactly the rows a direct check of every
+        // row returns: the caseless fold for literal mode, the case-sensitive regex for regex.
+        // Fixed-seed xorshift, so a failure names its needle and reproduces everywhere.
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'p', 'i', 'k', 's', 't', ' ', 'A', 'I', 'K', 'S', '\u{130}', '\u{307}',
+            '\u{212A}', 'Σ', 'σ', 'ς', '\u{13A0}', '\u{AB70}', '\u{13E3}', '\u{ABB3}', '\u{1C90}',
+            '\u{10D0}',
+        ];
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut pick = |len: u64| -> String {
+            (0..len)
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let rows: Vec<String> = (0..400).map(|i| pick(4 + i % 17)).collect();
+        for (seq, content) in rows.iter().enumerate() {
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                    params![seq as i64, content],
+                )
+                .unwrap();
+        }
+        let mut needles: Vec<String> = Vec::new();
+        for i in 0..300_usize {
+            if i % 2 == 0 {
+                // A slice of a row on character boundaries, so matches are common.
+                let row: Vec<char> = rows[i % rows.len()].chars().collect();
+                let start = i % row.len();
+                let len = 3 + i % 4;
+                needles.push(row[start..(start + len).min(row.len())].iter().collect());
+            } else {
+                needles.push(pick(3 + (i as u64 % 4)));
+            }
+        }
+
+        let mut prefiltered = 0_u32;
+        let mut matched = 0_u32;
+        for needle in &needles {
+            let folded = crate::util::fold_caseless(needle);
+            if folded.is_empty() {
+                continue;
+            }
+            let pattern = regex::Regex::new(&regex::escape(needle)).unwrap();
+            for (mode, expected) in [
+                (
+                    MessageSearchMode::Literal,
+                    rows.iter()
+                        .enumerate()
+                        .filter(|(_, row)| crate::util::fold_caseless(row).contains(&folded))
+                        .map(|(seq, _)| seq as i64)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    MessageSearchMode::Regex,
+                    rows.iter()
+                        .enumerate()
+                        .filter(|(_, row)| pattern.is_match(row))
+                        .map(|(seq, _)| seq as i64)
+                        .collect::<Vec<_>>(),
+                ),
+            ] {
+                let filters = MessageFilters {
+                    match_mode: mode,
+                    ..Default::default()
+                };
+                let found: Vec<i64> = db
+                    .search_messages_ordered(needle, &filters, MessageOrder::OldestFirst)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit.seq)
+                    .collect();
+                assert_eq!(
+                    found, expected,
+                    "{mode:?} search for {needle:?} must equal a direct check of every row"
+                );
+                matched += u32::from(!expected.is_empty());
+            }
+            prefiltered +=
+                u32::from(crate::trigram::trigram_prefilter(&regex::escape(needle)).is_some());
+        }
+        // Coverage of the property, not of the implementation: both the prefiltered path and
+        // matches must actually occur, or the sweep proves nothing about them.
+        assert!(
+            prefiltered > 50,
+            "only {prefiltered} needles took a prefilter"
+        );
+        assert!(matched > 100, "only {matched} searches matched anything");
+    }
+
+    #[test]
     fn paging_through_a_fuzzy_search_reproduces_the_whole_ranked_result() {
         // Fuzzy ranks in memory and keeps the top `offset + limit` with an unstable selection, so
         // its comparator must be total too. Every row here has the same content and therefore the
