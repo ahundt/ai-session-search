@@ -3068,6 +3068,22 @@ impl Db {
     ///   were level (`--role assistant` 0.95x, `--provider claude` 1.04x), and which value is a
     ///   minority cannot be known without counting it, so the whole family stands aside.
     ///
+    /// Cost, for `P` postings read by the trigram query, `C` candidates it yields, `M` verified
+    /// matches, `L` + `O` the page's limit plus offset, `N` rows in the index, and `k` the index
+    /// position of the `(O + L)`-th match:
+    ///
+    /// * Sorted plan: O(P + C·verify + M log M) time; the sorter holds all `M` matched rows,
+    ///   content included, whatever the limit, spilling to temporary storage past the page cache.
+    /// * Index-ordered plan: O(P + k + candidates before position k · verify) time, and peak
+    ///   memory O(C) for the candidate membership set plus O(L + O) emitted rows. `k` is at most
+    ///   `N`, so the worst case, matches clustered at the end of the order, is one index walk
+    ///   (511 ms warm for 5.7 M rows), and that is the loss the floor below bounds.
+    /// * This decision: O(min(C, [`ORDERED_PAGE_CANDIDATE_FLOOR`])) postings for the probe, and
+    ///   O(1) memory.
+    ///
+    /// Offset paging re-verifies earlier pages on both plans: page `p` of width `L` costs as much as
+    /// one page of width `p · L`.
+    ///
     /// A time window is deliberately NOT excluded: it reduces the rows admitted without reducing
     /// match density in a corpus whose rows are mostly recent, and it measured 1.29x at `--since 3d`
     /// and 10.48x at `--since 1y`. `session_id` and the `seq` bounds are not excluded either,
