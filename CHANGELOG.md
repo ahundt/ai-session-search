@@ -11,6 +11,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+1. Text whose case SQLite's full-text tokenizer does not fold is found again. Cherokee, normally
+   written in the uppercase syllabary, returned nothing even when searched by its exact spelling,
+   and the same held for Georgian Mtavruli, Osage, Adlam and other scripts, 445 lowercase letters
+   in all whose case pairs are newer than the tokenizer's tables. The trigram prefilter now leaves
+   those positions out, so literal and regex searches return every row the matcher accepts.
+2. A needle ending in `i` finds text where that letter is a dotted capital `İ` (`abi` in `abİ`),
+   which the prefilter used to exclude before the matcher saw it.
+3. Results that tie on session and sequence number come back in one fixed order. An index can
+   hold two messages in one session with the same sequence number, and their order was undefined, so
+   `--match-window latest` could keep the wrong one and paging, literal or fuzzy, could swap
+   them between pages.
+
+### Performance
+
+1. Limited literal and regex message searches stop once the page is full instead of sorting every
+   candidate. On an index of 5.7 million messages, `aise messages search error --limit 50` went
+   from 32 s to 0.19 s and `aise messages search "permission denied" --limit 50` from 3.5 s to
+   under 1 s.
+2. A needle containing a dotted capital `İ` uses the trigram index for the rest of its text
+   instead of scanning every message: `aise messages search İstanbul --all-results` went from
+   4.6-6.3 minutes to 3.9-5.2 s on the same index.
+3. The literal matcher skips positions that cannot begin a match, about 3x faster when every
+   candidate has to be checked.
+
 ## [1.0.0] - 2026-11-05
 
 1.0.0 is the first stable release of AI Session Search. `aise` parses nine AI coding-agent session
