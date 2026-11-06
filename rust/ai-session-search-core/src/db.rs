@@ -158,6 +158,33 @@ pub enum MessageOrder {
     NewestFirst,
 }
 
+impl MessageOrder {
+    /// The published message order as a SQL clause, for a statement whose `messages` row is
+    /// aliased `m`.
+    ///
+    /// `(session_id, seq)` does not identify a message. A live 5,736,231-row index holds three
+    /// groups tied on it, and `idx_messages_session_seq` is not unique, so the row id ends the
+    /// clause and makes the order total. Three properties depend on that:
+    ///
+    /// - Offset pagination stays coherent. Every page is its own query, so a tie free to come
+    ///   back in either order can drop a row between two pages or repeat it in both.
+    /// - [`MessageOrder::NewestFirst`] is the exact reverse of [`MessageOrder::OldestFirst`].
+    ///   Reversing only the key left a tie in ascending row order in both directions: on a
+    ///   four-row table tied at ids 20 and 21, oldest gave [10, 20, 21, 30] and newest gave
+    ///   [30, 20, 21, 10], where the reverse of oldest is [30, 21, 20, 10].
+    /// - `idx_messages_session_seq` satisfies the `OldestFirst` clause outright, because its key
+    ///   order is `(session_id, seq, rowid)`. The `INDEXED BY` page plan in
+    ///   [`Db::ordered_page_index_hint`] is therefore order-correct by construction rather than
+    ///   correct only while the sorter happens to agree on ties. SQLite still plans it without
+    ///   `USE TEMP B-TREE FOR ORDER BY`, which the page-plan tests assert.
+    pub(crate) fn order_by_clause(self) -> &'static str {
+        match self {
+            MessageOrder::NewestFirst => " order by m.session_id, m.seq desc, m.id desc",
+            MessageOrder::OldestFirst => " order by m.session_id, m.seq, m.id",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MessageBatchControl {
     Continue,
@@ -2716,11 +2743,7 @@ impl Db {
             }
         };
 
-        sql.push_str(if order == MessageOrder::NewestFirst {
-            " order by m.session_id, m.seq desc"
-        } else {
-            " order by m.session_id, m.seq"
-        });
+        sql.push_str(order.order_by_clause());
         if filters.limit > 0 {
             sql.push_str(" limit ?");
             args.push(Value::Integer(filters.limit as i64));
@@ -2800,11 +2823,7 @@ impl Db {
         );
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        sql.push_str(if order == MessageOrder::NewestFirst {
-            " order by m.session_id, m.seq desc"
-        } else {
-            " order by m.session_id, m.seq"
-        });
+        sql.push_str(order.order_by_clause());
         let ranked_limit = match self.fuzzy_ranking_window("1 = 1", filters)? {
             FuzzyRankingWindow::Rank { limit, .. } => limit,
             FuzzyRankingWindow::PastCorpus { corpus } => {
@@ -2830,9 +2849,9 @@ impl Db {
         let mut matched = 0_i64;
         for row in rows {
             let hit = row?;
-            corpus += 1;
             batch_bytes = batch_bytes.saturating_add(hit.content.len());
-            batch.push(hit);
+            batch.push((corpus as usize, hit));
+            corpus += 1;
             if fuzzy_batch_is_full(batch.len(), batch_bytes) {
                 batch_bytes = 0;
                 let scored = self.runtime.install(|| {
@@ -3161,11 +3180,7 @@ impl Db {
         let base_predicate = fuzzy_derived_scan_predicate(field);
         sql.push_str(" and ");
         sql.push_str(base_predicate);
-        sql.push_str(if order == MessageOrder::NewestFirst {
-            " order by m.session_id, m.seq desc"
-        } else {
-            " order by m.session_id, m.seq"
-        });
+        sql.push_str(order.order_by_clause());
         let pattern = Pattern::new(
             query,
             CaseMatching::Ignore,
@@ -3191,9 +3206,9 @@ impl Db {
         let mut batch_bytes = 0_usize;
         for row in rows {
             let hit = row?;
-            corpus += 1;
             batch_bytes = batch_bytes.saturating_add(hit.content.len());
-            batch.push(hit);
+            batch.push((corpus as usize, hit));
+            corpus += 1;
             if fuzzy_batch_is_full(batch.len(), batch_bytes) {
                 let scored = self.runtime.install(|| {
                     score_fuzzy_derived_hits(
@@ -3265,7 +3280,7 @@ impl Db {
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        sql.push_str(" order by m.session_id, m.seq");
+        sql.push_str(MessageOrder::OldestFirst.order_by_clause());
         let rows = self.query_message_hits(&sql, &args)?;
         let pattern = Pattern::new(
             query,
@@ -3278,7 +3293,7 @@ impl Db {
             &fold_caseless(query),
             SearchField::ToolName,
             None,
-            rows,
+            rows.into_iter().enumerate().collect(),
         );
         Ok(finish_fuzzy_hits(
             scored,
@@ -3393,7 +3408,8 @@ impl Db {
             );
             let mut args = vec![Value::Text(selected_names)];
             append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-            sql.push_str(" order by m.session_id, m.seq limit ?");
+            sql.push_str(MessageOrder::OldestFirst.order_by_clause());
+            sql.push_str(" limit ?");
             args.push(Value::Integer(remaining as i64));
             let mut stmt = self.conn.prepare(&sql)?;
             let rows =
@@ -6215,13 +6231,13 @@ fn score_fuzzy_derived_hits(
     query_lower: &str,
     field: SearchField,
     argument_path: Option<&str>,
-    hits: Vec<MessageHit>,
-) -> Vec<(MessageHit, bool)> {
+    hits: Vec<(usize, MessageHit)>,
+) -> Vec<ScoredFuzzyHit> {
     let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
     hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
-            |(matcher, utf32_buf), mut hit| {
+            |(matcher, utf32_buf), (ordinal, mut hit)| {
                 let value = selected_message_field_parts(&hit, field, argument_path)?.into_owned();
                 utf32_buf.clear();
                 pattern
@@ -6229,7 +6245,7 @@ fn score_fuzzy_derived_hits(
                     .map(|score| {
                         hit.fuzzy_score = Some(score);
                         let exact_phrase = exact_phrase_needle.contains(&value);
-                        (hit, exact_phrase)
+                        (hit, exact_phrase, ordinal)
                     })
             },
         )
@@ -6240,13 +6256,13 @@ fn score_fuzzy_derived_hits(
 fn score_fuzzy_message_hits(
     pattern: &Pattern,
     query_lower: &str,
-    hits: Vec<MessageHit>,
-) -> Vec<(MessageHit, bool)> {
+    hits: Vec<(usize, MessageHit)>,
+) -> Vec<ScoredFuzzyHit> {
     let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
     hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
-            |(matcher, utf32_buf), mut hit| {
+            |(matcher, utf32_buf), (ordinal, mut hit)| {
                 let score = {
                     let haystack = Utf32Str::new(&hit.content, utf32_buf);
                     pattern.score(haystack, matcher)
@@ -6254,7 +6270,7 @@ fn score_fuzzy_message_hits(
                 score.map(|score| {
                     hit.fuzzy_score = Some(score);
                     let exact_phrase = exact_phrase_needle.contains(&hit.content);
-                    (hit, exact_phrase)
+                    (hit, exact_phrase, ordinal)
                 })
             },
         )
@@ -6262,7 +6278,17 @@ fn score_fuzzy_message_hits(
         .collect()
 }
 
-fn compare_fuzzy_hits(left: &(MessageHit, bool), right: &(MessageHit, bool)) -> std::cmp::Ordering {
+/// A fuzzy hit, whether it holds the query as an exact phrase, and its position in the SQL stream.
+///
+/// The position exists to make [`compare_fuzzy_hits`] total. `(session_id, seq)` does not identify
+/// a message (see [`MessageOrder::order_by_clause`]), and [`retain_top_fuzzy_hits`] keeps the top
+/// `offset + limit` with an unstable selection, so two tied rows straddling that cut could come
+/// back in either order, and a different page's cut could keep them the other way round. The
+/// stream is read in the published total order, so its position agrees with it and needs no
+/// extra column or public field.
+type ScoredFuzzyHit = (MessageHit, bool, usize);
+
+fn compare_fuzzy_hits(left: &ScoredFuzzyHit, right: &ScoredFuzzyHit) -> std::cmp::Ordering {
     right
         .0
         .fuzzy_score
@@ -6271,6 +6297,7 @@ fn compare_fuzzy_hits(left: &(MessageHit, bool), right: &(MessageHit, bool)) -> 
         .then_with(|| right.1.cmp(&left.1))
         .then_with(|| left.0.session_id.cmp(&right.0.session_id))
         .then_with(|| left.0.seq.cmp(&right.0.seq))
+        .then_with(|| left.2.cmp(&right.2))
 }
 
 /// The receipt for a fuzzy page that scored every eligible row.
@@ -6348,7 +6375,7 @@ fn top_k_compaction_threshold(limit: usize) -> usize {
     limit.saturating_mul(2).max(FUZZY_SCORE_BATCH_SIZE)
 }
 
-fn retain_top_fuzzy_hits(scored: &mut Vec<(MessageHit, bool)>, limit: usize) {
+fn retain_top_fuzzy_hits(scored: &mut Vec<ScoredFuzzyHit>, limit: usize) {
     if scored.len() > limit {
         scored.select_nth_unstable_by(limit, compare_fuzzy_hits);
         scored.truncate(limit);
@@ -6356,7 +6383,7 @@ fn retain_top_fuzzy_hits(scored: &mut Vec<(MessageHit, bool)>, limit: usize) {
 }
 
 fn finish_fuzzy_hits(
-    mut scored: Vec<(MessageHit, bool)>,
+    mut scored: Vec<ScoredFuzzyHit>,
     ranked_limit: usize,
     offset: usize,
 ) -> Vec<MessageHit> {
@@ -6365,7 +6392,7 @@ fn finish_fuzzy_hits(
     scored
         .into_iter()
         .skip(offset)
-        .map(|(hit, _)| hit)
+        .map(|(hit, _, _)| hit)
         .collect()
 }
 
@@ -12927,7 +12954,9 @@ mod tests {
                 prepared.sql.contains("indexed by idx_messages_session_seq"),
                 "precondition: limit {limit} offset {offset} must be taking the index-ordered plan"
             );
-            let indexed = db.query_message_hits(&prepared.sql, &prepared.args).unwrap();
+            let indexed = db
+                .query_message_hits(&prepared.sql, &prepared.args)
+                .unwrap();
             let sorted_sql = prepared
                 .sql
                 .replace(" indexed by idx_messages_session_seq", "");
@@ -12936,6 +12965,242 @@ mod tests {
                 serialized_hits(&indexed),
                 serialized_hits(&sorted),
                 "limit {limit} offset {offset}: the two plans must agree row for row"
+            );
+        }
+    }
+
+    /// Add a message tied with an existing one on (session_id, seq) that also matches the needle,
+    /// so the published order has to break a tie. The live index holds three such groups.
+    #[cfg(test)]
+    fn inject_tied_twin(db: &Db, seq: i64, needle: &str) {
+        db.conn
+            .execute(
+                "insert into messages(session_id, provider, seq, role, ts, content) \
+                 values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                params![seq, format!("tie twin {needle} tail")],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_descending_order_clause_reverses_tied_rows_too() {
+        // The published SQL order must be total, which this asserts of the clause itself: the
+        // display reversal in `read_session_messages` sits above it, so a caller never sees this
+        // descending sequence directly. (session_id, seq) does not identify a message -- the live
+        // index holds three tied groups across 5,736,231 rows and idx_messages_session_seq is not
+        // unique -- and reversing only the key left a tie in ascending row order in both
+        // directions. Observed on a four-row table tied at ids 20 and 21: oldest [10, 20, 21, 30],
+        // newest [30, 20, 21, 10], where the reverse of oldest is [30, 21, 20, 10].
+        //
+        // `the_newest_window_selects_exactly_the_tail_of_the_oldest_order` below asserts what the
+        // caller actually gets, through the entry point rather than this statement builder.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 300);
+        inject_tied_twin(&db, 0, needle);
+
+        // limit 0 reads the whole match set, so this compares the order itself rather than a page.
+        let filters = MessageFilters::default();
+        let read = |order| {
+            let prepared = db
+                .prepare_non_fuzzy_message_query(needle, &filters, false, order)
+                .unwrap();
+            serialized_hits(
+                &db.query_message_hits(&prepared.sql, &prepared.args)
+                    .unwrap(),
+            )
+        };
+        let oldest = read(MessageOrder::OldestFirst);
+        let newest = read(MessageOrder::NewestFirst);
+        assert!(
+            oldest.len() > 1,
+            "precondition: the fixture must return more than one match"
+        );
+        let mut oldest_reversed = oldest.clone();
+        oldest_reversed.reverse();
+        assert_eq!(
+            newest, oldest_reversed,
+            "newest-first must be the exact reverse of oldest-first, ties included"
+        );
+    }
+
+    #[test]
+    fn the_newest_window_selects_exactly_the_tail_of_the_oldest_order() {
+        // What a caller observes. `read_session_messages` with NewestFirst keeps the LAST `limit`
+        // messages and then reverses them, so results always print oldest-first and `order`
+        // decides which messages are kept rather than how they print. Membership therefore needs
+        // the order to be total: with (session_id, seq) tied across the window boundary, a partial
+        // order leaves SQLite free to keep either tied row, so the window can drop one row and
+        // keep another that the whole-session read places somewhere else.
+        //
+        // Asserted through the entry point, because the clause-level test above proves only that
+        // the statement builder emits a total order, not that the published window honors it.
+        //
+        // This drives the content-search window (`aise messages search --session-id S
+        // --match-window latest`, messages.rs:1053-1057), not the no-text session read: a no-text
+        // read is served by walking idx_messages_session_seq, and walking it backwards reverses
+        // the tie along with everything else, so that path hides the defect. The content search
+        // keeps the sort for NewestFirst, and a sorter holds a tie in its input order whichever
+        // direction the key runs.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 300);
+        inject_tied_twin(&db, 0, needle); // tie at the oldest end
+        inject_tied_twin(&db, 250, needle); // tie across the newest window boundary
+
+        let read = |limit, order| {
+            let filters = MessageFilters {
+                session_id: Some("claude:s1".to_string()),
+                limit,
+                ..Default::default()
+            };
+            let mut hits = db.search_messages_ordered(needle, &filters, order).unwrap();
+            if order == MessageOrder::NewestFirst {
+                // Mirrors messages.rs: the window selects which matches are kept, and the result
+                // is turned back to chronological order before it reaches the caller.
+                hits.reverse();
+            }
+            serialized_hits(&hits)
+        };
+        let whole = read(0, MessageOrder::OldestFirst);
+        // 300 rows yield matches at seq 0, 50, ... 250, plus the two injected twins.
+        assert_eq!(whole.len(), 8, "fixture: six matches plus two tied twins");
+
+        for n in [1_usize, 2, 3, 7] {
+            assert_eq!(
+                read(n, MessageOrder::NewestFirst),
+                whole[whole.len() - n..],
+                "the newest {n} must be exactly the last {n} of the whole-session order"
+            );
+            assert_eq!(
+                read(n, MessageOrder::OldestFirst),
+                whole[..n],
+                "the oldest {n} must be exactly the first {n} of the whole-session order"
+            );
+        }
+    }
+
+    #[test]
+    fn paging_through_a_content_search_reproduces_the_whole_ordered_result() {
+        // Offset pagination is only coherent if the order is total: every page is its own query,
+        // and a tie free to come back in either order can drop a row between two pages or repeat
+        // it in both. This also crosses plans, because the whole-set read takes limit 0 and so
+        // keeps the sort while every page takes the index-ordered plan.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+        inject_tied_twin(&db, 0, needle);
+
+        let whole = {
+            let filters = MessageFilters::default();
+            let prepared = db
+                .prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+                .unwrap();
+            serialized_hits(
+                &db.query_message_hits(&prepared.sql, &prepared.args)
+                    .unwrap(),
+            )
+        };
+        assert!(
+            whole.len() > 100,
+            "precondition: the walk must cross many page boundaries, got {}",
+            whole.len()
+        );
+
+        for page in [1_usize, 7, 50] {
+            let mut walked = Vec::new();
+            for offset in (0..whole.len() + page).step_by(page) {
+                let filters = MessageFilters {
+                    limit: page,
+                    offset,
+                    ..Default::default()
+                };
+                let prepared = db
+                    .prepare_non_fuzzy_message_query(
+                        needle,
+                        &filters,
+                        false,
+                        MessageOrder::OldestFirst,
+                    )
+                    .unwrap();
+                assert!(
+                    prepared.sql.contains("indexed by idx_messages_session_seq"),
+                    "precondition: page {page} at offset {offset} must take the index-ordered plan"
+                );
+                let hits = db
+                    .query_message_hits(&prepared.sql, &prepared.args)
+                    .unwrap();
+                if hits.is_empty() {
+                    break;
+                }
+                walked.extend(serialized_hits(&hits));
+            }
+            assert_eq!(
+                walked, whole,
+                "paging {page} at a time must reproduce the whole ordered result exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn paging_through_a_fuzzy_search_reproduces_the_whole_ranked_result() {
+        // Fuzzy ranks in memory and keeps the top `offset + limit` with an unstable selection, so
+        // its comparator must be total too. Every row here has the same content and therefore the
+        // same score, which leaves (session_id, seq) to decide, and every tenth seq holds a twin,
+        // so page cuts keep landing between two rows the comparator cannot tell apart.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        for seq in 0..400_i64 {
+            let copies = if seq % 10 == 0 { 2 } else { 1 };
+            for _ in 0..copies {
+                db.conn
+                    .execute(
+                        "insert into messages(session_id, provider, seq, role, ts, content) \
+                         values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00', \
+                                'alpha beta gamma')",
+                        params![seq],
+                    )
+                    .unwrap();
+            }
+        }
+        // Distinguish the twins in the serialized hit without changing their score: the role is
+        // not scored, and `serialized_hits` reports it.
+        db.conn
+            .execute(
+                "update messages set role = 'assistant' where id in \
+                 (select max(id) from messages group by seq having count(*) > 1)",
+                [],
+            )
+            .unwrap();
+        let read = |limit: usize, offset: usize| {
+            let filters = MessageFilters {
+                match_mode: MessageSearchMode::Fuzzy,
+                limit,
+                offset,
+                ..Default::default()
+            };
+            serialized_hits(
+                &db.search_messages_ordered("alpha", &filters, MessageOrder::OldestFirst)
+                    .unwrap(),
+            )
+        };
+        let whole = read(10_000, 0);
+        assert_eq!(whole.len(), 440, "precondition: 400 rows plus 40 twins");
+        for page in [1_usize, 7, 50] {
+            let mut walked = Vec::new();
+            for offset in (0..whole.len()).step_by(page) {
+                walked.extend(read(page, offset));
+            }
+            assert_eq!(
+                walked, whole,
+                "fuzzy paging {page} at a time must reproduce the whole ranked result exactly"
             );
         }
     }
@@ -12987,15 +13252,10 @@ mod tests {
                 ..Default::default()
             };
             mutate(&mut filters);
-            db.prepare_non_fuzzy_message_query(
-                needle,
-                &filters,
-                false,
-                MessageOrder::OldestFirst,
-            )
-            .unwrap()
-            .sql
-            .contains("indexed by")
+            db.prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+                .unwrap()
+                .sql
+                .contains("indexed by")
         };
         assert!(
             !with(|f| f.role = Some(crate::models::Role::User)),
