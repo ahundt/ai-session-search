@@ -19,6 +19,21 @@ an MCP server.
 
 Stable release based on 1.0.0rc4, with the dependency updates under Security below.
 
+### Highlights
+
+1. Search every agent's history from one index: Claude Code, Claude Desktop, ChatGPT Codex,
+   Cursor, Antigravity, Pi, Prime Agent, Google AI Studio, and Gemini CLI, on macOS, Linux, and
+   Windows. `aise messages search "permission denied"` finds the turn across all of them.
+2. Get back a file an agent overwrote. `aise files history src/app.py` lists every version in the
+   index, and `aise files extract src/app.py --restore` writes one to a collision-safe
+   `.recovered` sibling.
+3. See why a run stopped. Stop-hook feedback, PreToolUse blocks, local-command caveats and task
+   notifications stay out of ordinary results, so `aise messages search "" --kinds harness-notice`
+   asks for them.
+4. Let your coding agent do the searching. `aise integrations install` registers an MCP server
+   with every harness it finds, so Claude Code can answer "which version of this file did you
+   write before the refactor?" mid-conversation.
+
 ### Changed
 
 1. `cargo install ai-session-search --locked` installs a published stable version, and the
