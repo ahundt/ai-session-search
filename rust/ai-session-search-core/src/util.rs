@@ -529,17 +529,40 @@ impl UnicodeLowerNeedle {
     /// character's expansion widens to that whole character, which is the only range that can be
     /// sliced.
     ///
-    /// Time is O(haystack) folded characters plus O(needle) for the one backward walk, and no
-    /// allocation happens on the scan, which is what keeps [`Self::contains`] cheap enough for
-    /// the per-record ranking loop that calls it for every haystack of every session.
+    /// Let `H` be the haystack's bytes, `C` the bytes that could begin a match, and `N` the
+    /// needle's folded characters. The scan costs O(H) byte comparisons for the skip plus O(C)
+    /// folded characters decoded, plus O(N) for the one backward walk, and allocates nothing.
+    /// Worst case is still O(H) decoded characters, when every position is a candidate: a needle
+    /// whose first character is non-ASCII skips nothing, and a first character as common as a
+    /// space makes C approach H. Peak memory is the needle's `pattern` and `prefix`, O(N), with
+    /// no per-haystack state, which is what keeps [`Self::contains`] cheap enough for the
+    /// per-record ranking loop that calls it for every haystack of every session.
     ///
-    /// The scan is scalar, where the ASCII fold it replaced allocated a lowercased copy and then
-    /// used `str::find`'s SIMD search, so it trades throughput for agreeing with the matcher that
-    /// ranks. Measured end to end on 42.8 MB of message content across 38 sessions, best of five
-    /// `aise search --limit 20 --format json` runs: 34.9 ms to 36.1 ms for a query that matches
-    /// and 35.3 ms to 35.7 ms for one that does not, against the build immediately before this
-    /// change. A single ASCII fast path would recover that, at the cost of a second matcher whose
-    /// agreement with this one nothing checks.
+    /// Only the start state skips. `matched` carries across characters, so a position cannot be
+    /// skipped while a partial match is in progress; the skip re-engages each time the automaton
+    /// returns to zero. Skipped bytes are ASCII bytes that are neither spelling of the needle's
+    /// first folded character, and an ASCII character folds to exactly one ASCII character, so no
+    /// match can begin at one. Every non-ASCII lead byte stays examined, and every character that
+    /// expands is non-ASCII, so a match beginning part-way through an expansion is never skipped.
+    /// That is the whole correctness argument, and it does not depend on where in an expansion an
+    /// ASCII character can appear.
+    ///
+    /// Measured on 618,778,766 bytes of candidate message content from an index of 5.7 million
+    /// messages, best of seven interleaved runs of
+    /// `aise messages search "permission denied" --limit 50 --index-refresh existing-only
+    /// --format json`: 1.11 s against 3.48 s for the unskipped scan, a 3.1x reduction, with the
+    /// `regex` crate over the same candidates at 0.54 s as the floor. Replacing the scalar
+    /// predicate with `memchr2` plus an `is_ascii` confirmation measured 1.06 s, 6.9% better, and
+    /// was not taken: the gain is in the skip rather than the vectorization, and it would add a
+    /// direct dependency for that 6.9%.
+    ///
+    /// The agreement a skip could break is checked. `CASELESS_CASES` drives the matcher, `find_in`
+    /// and the SQL scalar from one table, including a failed candidate before a match that starts
+    /// at an expanding character and a needle inside a single expansion;
+    /// `the_matcher_agrees_with_the_allocating_fold_over_generated_text` sweeps generated text
+    /// against `fold_caseless(haystack).contains(fold_caseless(needle))`; and
+    /// `skipping_a_long_run_still_consults_the_cancellation_callback` pins the granularity above,
+    /// which an unbounded skip silently broke.
     fn find_in_controlled(
         &self,
         haystack: &str,
@@ -550,38 +573,92 @@ impl UnicodeLowerNeedle {
             return ControlFlow::Continue(Some(0..0));
         }
 
+        // The two spellings of an ASCII first needle character, for the start-state skip below.
+        // A non-ASCII first character leaves this `None` and the scan runs unskipped.
+        let skip_lead = self.pattern[0].is_ascii().then(|| {
+            let lower = self.pattern[0] as u8;
+            (lower, lower.to_ascii_uppercase())
+        });
+        let bytes = haystack.as_bytes();
+
         let mut matched = 0_usize;
         let mut next_check = 0_usize;
-        for (offset, character) in haystack.char_indices() {
-            if offset >= next_check {
-                if !keep_going() {
-                    return ControlFlow::Break(());
-                }
-                next_check = offset.saturating_add(CHECK_BYTES);
-            }
-            let character_end = offset + character.len_utf8();
-            for (folded_index, lowered) in fold_caseless_char(character).enumerate() {
-                while matched > 0 && lowered != self.pattern[matched] {
-                    matched = self.prefix[matched - 1];
-                }
-                if lowered == self.pattern[matched] {
-                    matched += 1;
-                    if matched == self.pattern.len() {
-                        // This character supplied `folded_index + 1` of the needle's characters,
-                        // which can be fewer than its whole expansion when the match ends inside
-                        // one. Only the rest were supplied by the characters before it, and there
-                        // may be none: a needle short enough to sit entirely inside one
-                        // character's expansion consumes more folded characters than it has, so
-                        // the count saturates at zero and the backward walk has nothing to do.
-                        let start = source_start_of_folded_match(
-                            haystack,
-                            offset,
-                            self.pattern.len().saturating_sub(folded_index + 1),
-                        );
-                        return ControlFlow::Continue(Some(start..character_end));
+        let mut cursor = 0_usize;
+        'restart: while cursor < haystack.len() {
+            if let Some((lower, upper)) = skip_lead {
+                debug_assert_eq!(matched, 0, "the skip runs only in the start state");
+                // Skip in windows bounded by `next_check`, never over the whole remainder: a run
+                // of non-candidate bytes must not outlast a cancel, and this crate's largest
+                // indexed message is about 80 times `CHECK_BYTES`. The callback is consulted when
+                // the cursor crosses the boundary rather than once per window, because candidates
+                // are a small fraction of ordinary text and a per-window call would add one
+                // closure call per candidate across the whole field.
+                loop {
+                    if cursor >= bytes.len() {
+                        return ControlFlow::Continue(None);
+                    }
+                    if cursor >= next_check {
+                        if !keep_going() {
+                            return ControlFlow::Break(());
+                        }
+                        next_check = cursor.saturating_add(CHECK_BYTES);
+                    }
+                    let window_end = bytes.len().min(next_check);
+                    match bytes[cursor..window_end]
+                        .iter()
+                        .position(|&byte| byte == lower || byte == upper || byte >= 0xC0)
+                    {
+                        Some(delta) => {
+                            cursor += delta;
+                            break;
+                        }
+                        None => cursor = window_end,
                     }
                 }
             }
+            for (relative, character) in haystack[cursor..].char_indices() {
+                let offset = cursor + relative;
+                if offset >= next_check {
+                    if !keep_going() {
+                        return ControlFlow::Break(());
+                    }
+                    next_check = offset.saturating_add(CHECK_BYTES);
+                }
+                let character_end = offset + character.len_utf8();
+                for (folded_index, lowered) in fold_caseless_char(character).enumerate() {
+                    while matched > 0 && lowered != self.pattern[matched] {
+                        matched = self.prefix[matched - 1];
+                    }
+                    if lowered == self.pattern[matched] {
+                        matched += 1;
+                        if matched == self.pattern.len() {
+                            // This character supplied `folded_index + 1` of the needle's
+                            // characters, which can be fewer than its whole expansion when the
+                            // match ends inside one. Only the rest were supplied by the characters
+                            // before it, and there may be none: a needle short enough to sit
+                            // entirely inside one character's expansion consumes more folded
+                            // characters than it has, so the count saturates at zero and the
+                            // backward walk has nothing to do.
+                            let start = source_start_of_folded_match(
+                                haystack,
+                                offset,
+                                self.pattern.len().saturating_sub(folded_index + 1),
+                            );
+                            return ControlFlow::Continue(Some(start..character_end));
+                        }
+                    }
+                }
+                if matched == 0 && skip_lead.is_some() {
+                    // Back in the start state, so the skip applies again from the next character.
+                    // `character_end` is a boundary and strictly greater than `cursor`, which is
+                    // what makes the outer loop terminate. Without a skip there is nothing to
+                    // re-enter for, and restarting per character would rebuild this iterator on
+                    // most characters of the haystack.
+                    cursor = character_end;
+                    continue 'restart;
+                }
+            }
+            break;
         }
         ControlFlow::Continue(None)
     }
@@ -2225,6 +2302,41 @@ pub(crate) mod tests {
             matched > 2_000,
             "the generated sweep found only {matched} matches, too few to cover the match path"
         );
+    }
+
+    /// Skipping stays interruptible: a long run with nothing to match still consults the callback.
+    ///
+    /// The scan skips positions that cannot begin a match, so a field of ordinary text holding
+    /// none of the needle's first character is crossed without decoding a single character. Doing
+    /// that over the whole remainder in one call would consult `keep_going` only after it, and the
+    /// largest message in a real index is far larger than [`CANCELLATION_CHECK_BYTES`], so the
+    /// ranking loop that passes a real callback could not cancel until the field ended.
+    #[test]
+    fn skipping_a_long_run_still_consults_the_cancellation_callback() {
+        // No 'a', and nothing non-ASCII, so every position is skipped.
+        let haystack = "b".repeat(3 * CANCELLATION_CHECK_BYTES + 7);
+        let needle = UnicodeLowerNeedle::from_lowered("aaa");
+
+        let mut calls = 0_usize;
+        let outcome = needle.contains_while(&haystack, || {
+            calls += 1;
+            true
+        });
+        assert_eq!(outcome, Some(false), "there is no match to find");
+        assert!(
+            calls >= 3,
+            "a {}-byte skip consulted the callback {calls} times, so it is coarser than the \
+             {CANCELLATION_CHECK_BYTES}-byte granularity the scan documents",
+            haystack.len()
+        );
+
+        // And a callback that stops partway actually stops the skip.
+        let mut remaining = 2_usize;
+        let cancelled = needle.contains_while(&haystack, || {
+            remaining = remaining.saturating_sub(1);
+            remaining > 0
+        });
+        assert_eq!(cancelled, None, "the skip ignored a cancellation");
     }
 
     #[test]
