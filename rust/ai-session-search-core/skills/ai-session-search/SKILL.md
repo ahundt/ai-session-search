@@ -24,8 +24,9 @@ aise config paths
 ```
 
 Take option spellings from `aise <command> --help`; every command below is current. Session IDs
-are canonical, such as `codex:<id>` or `claude:<id>`, and a message is identified by
-`(session_id, seq)`. Configuration precedence is CLI option, then `AI_SESSION_SEARCH_*`
+are canonical, such as `codex:<id>` or `claude:<id>`, and a message is located by
+`(session_id, seq)`; where two messages share a seq, reading it returns both, in a fixed order.
+Configuration precedence is CLI option, then `AI_SESSION_SEARCH_*`
 environment variable, then `config.toml`, then the embedded default; `aise config file`,
 `aise config show`, and `aise config origins` show it.
 
