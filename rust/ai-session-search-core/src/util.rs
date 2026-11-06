@@ -411,6 +411,21 @@ pub(crate) const CASELESS_CASES: &[CaselessCase] = &[
         contains: false,
         why: "an expansion does not match anything",
     },
+    // The two positional shapes a position-skipping matcher gets wrong while answering every
+    // case above: a candidate that fails before the real match begins, and a match that never
+    // starts at a character boundary of the source text at all.
+    CaselessCase {
+        haystack: "ix İstanbul",
+        needle: "i\u{307}st",
+        contains: true,
+        why: "a failed candidate precedes a match starting at an expanding character",
+    },
+    CaselessCase {
+        haystack: "İx",
+        needle: "i",
+        contains: true,
+        why: "a needle sitting entirely inside one character's expansion",
+    },
     // Sharp s stays distinct from `ss`. That is the contract, not an oversight: the FTS5 trigram
     // index that selects candidates does not fold them together either, so a verifier that did
     // would have to abandon the prefilter and scan the corpus for ordinary German text.
@@ -2113,6 +2128,103 @@ pub(crate) mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    /// The matcher agrees with the allocating fold it replaced, over generated text.
+    ///
+    /// [`CASELESS_CASES`] pins the letters whose spellings disagree, but every case in it names a
+    /// position a human thought of. The risk a position-skipping matcher adds is the position
+    /// nobody wrote down: a start the scan jumps over because a cheap test said no match could
+    /// begin there. Enumerated cases cannot find that, so this sweeps generated text against the
+    /// contract the streaming matcher claims to preserve, `fold_caseless(haystack)` containing
+    /// `fold_caseless(needle)`, which is the allocating fold the scalar scan replaced.
+    ///
+    /// The alphabet is the scalars that make folding disagree with itself: the three sigmas, the
+    /// dotted capital I that folds into two scalars, sharp s which folds to itself rather than to
+    /// `ss`, an accented pair, Cyrillic, and one astral-plane scalar, mixed into ordinary ASCII so
+    /// most positions are the common case and a few are not. Half the needles are cut from the
+    /// haystack, so matches are frequent rather than vanishingly rare, and half are independent,
+    /// so misses are covered too.
+    ///
+    /// The generator is a fixed-seed LCG rather than a dependency: a failure names the iteration
+    /// and reproduces on every machine, which a randomly seeded sweep would not. O(iterations ×
+    /// haystack) with no allocation beyond the two folded strings per iteration.
+    #[test]
+    fn the_matcher_agrees_with_the_allocating_fold_over_generated_text() {
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'c', 'd', 'e', 'i', 's', 't', ' ', '.', 'A', 'B', 'C', 'I', 'S', 'T', 'Σ',
+            'σ', 'ς', 'İ', 'ß', 'É', 'é', 'М', 'м', '😀',
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut matched = 0_u32;
+
+        for iteration in 0..20_000_u32 {
+            let haystack: String = (0..(next() % 24))
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                .collect();
+            let needle: String = if next() % 2 == 0 && !haystack.is_empty() {
+                // A slice of the haystack on a character boundary, so matches are common.
+                let bounds: Vec<usize> = haystack
+                    .char_indices()
+                    .map(|(offset, _)| offset)
+                    .chain([haystack.len()])
+                    .collect();
+                let a = bounds[(next() % bounds.len() as u64) as usize];
+                let b = bounds[(next() % bounds.len() as u64) as usize];
+                haystack[a.min(b)..a.max(b)].to_string()
+            } else {
+                (0..(next() % 5))
+                    .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                    .collect()
+            };
+
+            let folded_needle = fold_caseless(&needle);
+            let oracle = fold_caseless(&haystack).contains(&folded_needle);
+            let matcher = UnicodeLowerNeedle::from_lowered(&folded_needle);
+
+            assert_eq!(
+                matcher.contains(&haystack),
+                oracle,
+                "iteration {iteration}: haystack={haystack:?}, needle={needle:?}"
+            );
+
+            let range = matcher.find_in(&haystack);
+            assert_eq!(
+                range.is_some(),
+                oracle,
+                "iteration {iteration}: locating disagreed with finding, \
+                 haystack={haystack:?}, needle={needle:?}"
+            );
+            if let Some(range) = range {
+                matched += 1;
+                let slice = haystack.get(range.clone()).unwrap_or_else(|| {
+                    panic!(
+                        "iteration {iteration}: range {range:?} splits a character of \
+                         {haystack:?}"
+                    )
+                });
+                // The range widens to whole characters when a match starts or ends inside one
+                // expansion, so the slice folds to text holding the needle rather than equalling
+                // it.
+                assert!(
+                    fold_caseless(slice).contains(&folded_needle),
+                    "iteration {iteration}: slice {slice:?} does not hold needle {needle:?} \
+                     in haystack {haystack:?}"
+                );
+            }
+        }
+
+        // A sweep that matched nothing would pass while testing only the miss path.
+        assert!(
+            matched > 2_000,
+            "the generated sweep found only {matched} matches, too few to cover the match path"
+        );
     }
 
     #[test]
