@@ -327,11 +327,24 @@ Evidence generation, context enrichment, reference extraction, formatting, and p
 must not alter the retrieval plan or selected page. Pagination must be derived from one extra
 retained row, not from post-presentation behavior.
 
+Every published order is total. `(session_id, seq)` does not identify a message, because an index
+can hold two messages in one session with the same sequence number, so SQL ends on the row id
+(`MessageOrder::order_by_clause`) and in-memory ranking ends on the row's position in that SQL
+stream. A partial key leaves ties free to swap between pages, between `--match-window` ends, and
+between an unstable top-K selection and the final sort.
+
 ### REQ008-reject-hidden-cutoffs
 
 Do not introduce silent aggregate byte ceilings, row ceilings, content truncation, time limits, or
 fallback pages. Intentional bounds must be named, typed, documented, reflected in receipts or
 metadata, and rejected when they conflict.
+
+A candidate prefilter narrows work, never results: it must select a superset of what the verifier
+accepts, under the index tokenizer's own case folding, which differs from the verifier's. Where the
+tokenizer folds a character differently (`trigram::FTS5_UNFOLDED_LOWERCASE`, U+0130), the
+prefilter leaves that position out rather than requiring a trigram that excludes matching rows;
+`the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes that set from the
+linked SQLite.
 
 `max_hits_per_page` and `max_context_neighbors_per_hit` are policy ceilings: an oversized resolved
 request errors. They do not silently clamp the request. Explicit `all_results` is not a finite page
