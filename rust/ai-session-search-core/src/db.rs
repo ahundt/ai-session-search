@@ -242,6 +242,25 @@ const SQLITE_PAGE_CACHE_KIB: i64 = 64 * 1_024;
 /// not eagerly allocated resident memory, and SQLite/OS may choose a lower platform-safe value.
 const SQLITE_MMAP_BYTES: i64 = 256 * 1_024 * 1_024;
 
+/// Trigram candidates a limited content page needs before it takes its order from
+/// `idx_messages_session_seq` instead of sorting every verified candidate.
+///
+/// Both plans return the same rows in the same order; they differ in how much they verify. Sorting
+/// rows that carry `content` cannot emit row 1 until the last candidate is verified, so its cost is
+/// `candidates x verify`, measured at 64-133 us per candidate across five queries spanning 15 K to
+/// 1.2 M candidates on a 5.7 M-message index. Taking the order from the index stops at `limit`
+/// matches, and its worst case -- fewer matches than the limit, so the scan reaches the end of the
+/// corpus -- is one full index scan, measured at 511 ms warm for 5.7 M rows.
+///
+/// So the index-ordered plan wins whenever `candidates x verify` exceeds a full index scan, and the
+/// floor is where those meet: 511 ms / 100 us is about 5 K candidates. Below it the sort is already
+/// cheap and the scan would be pure overhead (measured 60 ms against 371 ms at 5 candidates); above
+/// it the saving grows without bound (`aise messages search "session"` verified 1,216,643 candidates
+/// in 77.5 s to return 50 rows). The floor is deliberately the break-even point rather than a
+/// safety margin above it, because the loss below it is bounded by one index scan while the gain
+/// above it is not bounded at all.
+const ORDERED_PAGE_CANDIDATE_FLOOR: i64 = 5_000;
+
 /// Partial covering index over the classes the default search predicate can exclude
 /// ([`crate::models::MessageKind::EXCLUDABLE_BY_DEFAULT`]). It exists for one statement: the
 /// receipt's corpus denominator, `count(rows the structural filters admit)`, whose class clause
@@ -2501,9 +2520,21 @@ impl Db {
 
         debug_assert_ne!(filters.match_mode, MessageSearchMode::Fuzzy);
         let field = filters.field.unwrap_or(SearchField::Content);
-        let mut sql = String::from(
+        // An index hint belongs in the FROM clause, so the page plan has to be decided before the
+        // statement is written. The prefilter the decision needs is a pure function of the query,
+        // so computing it here costs nothing and the content branch below reuses this value.
+        let content_prefilter = if field == SearchField::Content && self.schema_version()? >= 4 {
+            content_prefilter_pattern(query, filters.match_mode)
+                .as_deref()
+                .and_then(crate::trigram::trigram_prefilter)
+        } else {
+            None
+        };
+        let page_index_hint =
+            self.ordered_page_index_hint(filters, order, content_prefilter.as_deref())?;
+        let mut sql = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
-             from messages m where 1 = 1",
+             from messages m{page_index_hint} where 1 = 1",
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
@@ -2520,17 +2551,9 @@ impl Db {
                 sql.push_str(" and rust_regexp(?, m.content)");
                 args.push(Value::Text(query.to_string()));
             }
-            let prefilter_pattern = if filters.match_mode == MessageSearchMode::Regex {
-                Some(query.to_string())
-            } else if literal_query {
-                Some(regex::escape(query))
-            } else {
-                None
-            };
+            let prefilter_pattern = content_prefilter_pattern(query, filters.match_mode);
             if self.schema_version()? >= 4 {
-                let prefilter = prefilter_pattern
-                    .as_deref()
-                    .and_then(crate::trigram::trigram_prefilter);
+                let prefilter = content_prefilter;
                 if let Some(fts_query) = &prefilter {
                     sql.push_str(
                         " and m.id in (
@@ -2997,6 +3020,89 @@ impl Db {
 
     fn fts5_candidate_count(&self, filters: &MessageFilters, fts_query: &str) -> Result<i64> {
         self.fts5_candidate_count_with_base("1 = 1", filters, fts_query)
+    }
+
+    /// `" indexed by idx_messages_session_seq"` when a content page should take its published
+    /// order from that index, or `""` to keep sorting every verified candidate.
+    ///
+    /// Both plans return the same rows in the same order. The index-ordered one additionally lets
+    /// SQLite honor `LIMIT` while scanning, so the verifier runs on the rows up to the last match
+    /// kept rather than on every candidate: measured 601 calls against 26,828 for
+    /// `"permission denied"`, 50 against 14,930 for `"tool_use"`, with identical rows.
+    ///
+    /// Each condition excludes a case measured to lose:
+    ///
+    /// * **A finite limit.** With `--all-results` there is nothing to stop early for, so the scan
+    ///   is pure overhead: 2,060 ms sorted against 2,503 ms index-ordered.
+    /// * **Oldest-first.** Newest-first asks for `session_id` ascending and `seq` descending, which
+    ///   no all-ascending index supplies; steering it keeps a sort anyway
+    ///   (`USE TEMP B-TREE FOR LAST TERM OF ORDER BY`) and pays the scan on top.
+    /// * **A content trigram prefilter.** Without one there is no candidate set to stop against,
+    ///   and the membership test SQLite builds a Bloom filter for is what makes the scan cheap.
+    /// * **[`ORDERED_PAGE_CANDIDATE_FLOOR`] candidates.** Below it the sort is already cheap and
+    ///   the scan is overhead: 60 ms against 371 ms at 5 candidates.
+    /// * **No class or path predicate.** `append_message_filters` writes its predicates before the
+    ///   verifier, so they already short-circuit today's plan, and the index stores neither, so
+    ///   the scan pays a table lookup per row to evaluate them. Worse, narrowing to a minority
+    ///   class cuts match density, so the scan walks proportionally further for the same page:
+    ///   `--role user` measured 395 ms sorted against 802 ms index-ordered. Majority-class values
+    ///   were level (`--role assistant` 0.95x, `--provider claude` 1.04x), and which value is a
+    ///   minority cannot be known without counting it, so the whole family stands aside.
+    ///
+    /// A time window is deliberately NOT excluded: it reduces the rows admitted without reducing
+    /// match density in a corpus whose rows are mostly recent, and it measured 1.29x at `--since 3d`
+    /// and 10.48x at `--since 1y`. `session_id` and the `seq` bounds are not excluded either,
+    /// because they are this index's own leading columns.
+    fn ordered_page_index_hint(
+        &self,
+        filters: &MessageFilters,
+        order: MessageOrder,
+        content_prefilter: Option<&str>,
+    ) -> Result<&'static str> {
+        let Some(fts_query) = content_prefilter else {
+            return Ok("");
+        };
+        if order != MessageOrder::OldestFirst || filters.limit == 0 {
+            return Ok("");
+        }
+        let narrows_by_class_or_path = filters.role.is_some()
+            || filters.kinds.is_some()
+            || filters.providers.is_some()
+            || filters.tool.is_some()
+            || filters.path_prefix.is_some()
+            || filters.workspace_path_prefix.is_some()
+            || filters.transcript_path_prefix.is_some()
+            || !filters.exclude_path_prefixes.is_empty()
+            || !filters.exclude_workspace_path_prefixes.is_empty()
+            || !filters.exclude_transcript_path_prefixes.is_empty()
+            || !filters.exclude_session_ids.is_empty();
+        if narrows_by_class_or_path {
+            return Ok("");
+        }
+        if !self.trigram_candidates_reach(fts_query, ORDERED_PAGE_CANDIDATE_FLOOR)? {
+            return Ok("");
+        }
+        Ok(" indexed by idx_messages_session_seq")
+    }
+
+    /// Whether the content trigram prefilter admits more than `floor` candidates.
+    ///
+    /// The inner `limit` stops the doclist intersection at `floor + 1` rowids, so this costs
+    /// O(floor) rather than O(candidates) and is cheapest exactly where the answer matters most:
+    /// measured 0.5 ms for a needle with 741,429 candidates and 1.1 ms for one with 1,216,643,
+    /// against 42-75 ms for selective needles whose doclists must be walked further to reach the
+    /// floor. The exact count is never needed, only which side of the floor it falls on, so
+    /// [`Db::fts5_candidate_count`] (which is O(candidates) and applies the filters) is the wrong
+    /// tool here even though it answers a similar-looking question.
+    fn trigram_candidates_reach(&self, fts_query: &str, floor: i64) -> Result<bool> {
+        let reached: i64 = self.conn.query_row(
+            "select count(*) from (
+                 select rowid from messages_trigram where messages_trigram match ?1 limit ?2
+             )",
+            rusqlite::params![fts_query, floor + 1],
+            |row| row.get(0),
+        )?;
+        Ok(reached > floor)
     }
 
     /// [`Db::fts5_candidate_count`] over the rows that also satisfy `base_predicate`, an SQL
@@ -5547,6 +5653,20 @@ enum ClassSelection<'a> {
     Unrestricted,
     /// Exactly these classes (`kind in (...)`).
     Only(&'a [crate::models::MessageKind]),
+}
+
+/// The regex source whose required literals drive a content search's trigram prefilter, or `None`
+/// when the query cannot contribute one.
+///
+/// This is the one authority for that rule. The prefilter and the page-plan decision in
+/// [`Db::ordered_page_index_hint`] both need it, and the decision has to be made before the FROM
+/// clause is written, so they cannot share a single evaluation site.
+fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Option<String> {
+    match match_mode {
+        MessageSearchMode::Regex => Some(query.to_string()),
+        MessageSearchMode::Literal if !query.is_empty() => Some(regex::escape(query)),
+        MessageSearchMode::Literal | MessageSearchMode::Fuzzy => None,
+    }
 }
 
 fn append_message_filters(
@@ -12678,6 +12798,230 @@ mod tests {
         assert!(
             p.contains("idx_messages_provider_session_seq") && !p.contains("USE TEMP B-TREE"),
             "provider-scoped pages must use the ordered provider composite without a sort: {p}"
+        );
+    }
+
+    /// Build a database holding `rows` messages that all contain `needle`, so a literal content
+    /// search's trigram prefilter admits every one of them as a candidate.
+    #[cfg(test)]
+    fn db_with_candidate_rows(dir: &std::path::Path, needle: &str, rows: i64) -> Db {
+        let db = Db::open(&dir.join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                )
+                .unwrap();
+            for i in 0..rows {
+                // Every row is a candidate, but only every 50th is a match, which is the shape a
+                // real sparse match has: the trigram prefilter returns a superset because grams of
+                // the needle may appear non-adjacently. `decoy` holds all fifteen trigrams of
+                // "permission denied" -- the rotation supplies every one except "on ", "n d" and
+                // " de", which the tail adds -- without containing the needle itself.
+                let decoy = "denied permission on n d de";
+                let content = if i % 50 == 0 {
+                    format!("row {i} {needle} tail")
+                } else {
+                    format!("row {i} {decoy} tail")
+                };
+                stmt.execute(params![i, content]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        db.conn.execute_batch("analyze").unwrap();
+        db
+    }
+
+    #[test]
+    fn a_limited_content_page_is_ordered_by_index_rather_than_sorted_whole() {
+        // The published order for a content page is (session_id, seq), which
+        // idx_messages_session_seq already stores, so a page with a finite limit can stop once
+        // it has `limit` matches. Sorting rows that carry `content` instead needs
+        // USE TEMP B-TREE FOR ORDER BY, and a sort cannot emit its first row until its last
+        // input arrives -- so every candidate is verified even for `--limit 1`.
+        //
+        // `hot_message_queries_use_indexes_not_full_scans` above already asserts this property,
+        // but only of hand-written SQL. A gate that checks a statement nobody runs is weaker
+        // than the property it is for, so this one asserts it of the statement
+        // `prepare_non_fuzzy_message_query` actually builds.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+
+        let filters = MessageFilters {
+            limit: 50,
+            ..Default::default()
+        };
+        let prepared = db
+            .prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+            .unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!("explain query plan {}", prepared.sql))
+            .unwrap();
+        let plan = stmt
+            .query_map(rusqlite::params_from_iter(prepared.args.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            !plan.contains("USE TEMP B-TREE"),
+            "a limited content page must not sort every verified candidate: {plan}"
+        );
+        assert!(
+            plan.contains("idx_messages_session_seq"),
+            "the page order must come from the (session_id, seq) index: {plan}"
+        );
+    }
+
+    /// Serialize hits the way the published surfaces do, so the comparison covers the match
+    /// offsets (`field_start_char` / `field_end_char`) and not just which rows came back.
+    #[cfg(test)]
+    fn serialized_hits(hits: &[MessageHit]) -> Vec<String> {
+        hits.iter()
+            .map(|hit| serde_json::to_string(hit).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_index_ordered_page_returns_exactly_what_the_sorted_page_returns() {
+        // Stopping early is only sound if it stops on the same rows. Both statements are run here
+        // and compared whole, rather than trusting that the same ORDER BY implies the same page:
+        // (session_id, seq) is not unique in a real index, so a tie's order is whatever the plan
+        // happens to produce, and that is exactly what a plan change could disturb.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+        // A tied (session_id, seq) pair that both match, placed where a 50-row page must include
+        // it. The real index has three such groups across 5.7 M rows.
+        db.conn
+            .execute_batch(
+                "insert into messages(session_id, provider, seq, role, ts, content) \
+                 values('claude:s1','claude',0,'user','2026-06-01T00:00:00+00:00', \
+                   'tie twin permission denied tail');",
+            )
+            .unwrap();
+
+        for (limit, offset) in [(50_usize, 0_usize), (1, 0), (7, 13), (50, 60)] {
+            let filters = MessageFilters {
+                limit,
+                offset,
+                ..Default::default()
+            };
+            let prepared = db
+                .prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+                .unwrap();
+            assert!(
+                prepared.sql.contains("indexed by idx_messages_session_seq"),
+                "precondition: limit {limit} offset {offset} must be taking the index-ordered plan"
+            );
+            let indexed = db.query_message_hits(&prepared.sql, &prepared.args).unwrap();
+            let sorted_sql = prepared
+                .sql
+                .replace(" indexed by idx_messages_session_seq", "");
+            let sorted = db.query_message_hits(&sorted_sql, &prepared.args).unwrap();
+            assert_eq!(
+                serialized_hits(&indexed),
+                serialized_hits(&sorted),
+                "limit {limit} offset {offset}: the two plans must agree row for row"
+            );
+        }
+    }
+
+    #[test]
+    fn the_page_plan_keeps_the_sort_wherever_the_index_order_cannot_pay() {
+        // Each of these was measured to lose; see `Db::ordered_page_index_hint`.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+
+        let hint = |query: &str, limit: usize, order: MessageOrder| {
+            let filters = MessageFilters {
+                limit,
+                ..Default::default()
+            };
+            db.prepare_non_fuzzy_message_query(query, &filters, false, order)
+                .unwrap()
+                .sql
+                .contains("indexed by")
+        };
+
+        assert!(
+            hint(needle, 50, MessageOrder::OldestFirst),
+            "control: an ordinary limited page is steered"
+        );
+        assert!(
+            !hint(needle, 0, MessageOrder::OldestFirst),
+            "all-results has nothing to stop early for, so the scan is pure overhead"
+        );
+        assert!(
+            !hint(needle, 50, MessageOrder::NewestFirst),
+            "newest-first wants seq descending, which an ascending index cannot supply"
+        );
+        assert!(
+            !hint("", 50, MessageOrder::OldestFirst),
+            "a queryless page has no candidate set to stop against"
+        );
+        assert!(
+            !hint("no such needle anywhere", 50, MessageOrder::OldestFirst),
+            "below the candidate floor the sort is already cheap"
+        );
+
+        // A class or path predicate is not stored in (session_id, seq), so the scan pays a table
+        // lookup per row to evaluate it and walks further when it narrows to a minority class.
+        let with = |mutate: fn(&mut MessageFilters)| {
+            let mut filters = MessageFilters {
+                limit: 50,
+                ..Default::default()
+            };
+            mutate(&mut filters);
+            db.prepare_non_fuzzy_message_query(
+                needle,
+                &filters,
+                false,
+                MessageOrder::OldestFirst,
+            )
+            .unwrap()
+            .sql
+            .contains("indexed by")
+        };
+        assert!(
+            !with(|f| f.role = Some(crate::models::Role::User)),
+            "a role filter must keep the sort: --role user measured 395 ms against 802 ms"
+        );
+        assert!(
+            !with(|f| f.providers = Some(vec![crate::models::Provider::Claude])),
+            "a provider filter must keep the sort"
+        );
+        assert!(
+            !with(|f| f.tool = Some("Bash".into())),
+            "a tool-name filter must keep the sort"
+        );
+        assert!(
+            !with(|f| f.path_prefix = Some("/x".into())),
+            "a path filter evaluates a sessions subquery per scanned row"
+        );
+        // A time window neither reduces match density much nor is cheap to replace, and it
+        // measured 1.29x at --since 3d and 10.48x at --since 1y, so it stays eligible.
+        assert!(
+            with(|f| f.since = Some(
+                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )),
+            "a time window must stay eligible for the index-ordered page"
         );
     }
 
