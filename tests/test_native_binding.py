@@ -7,6 +7,7 @@ import ast
 import hashlib
 import inspect
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -2276,3 +2277,158 @@ def test_message_search_request_rejects_incomplete_purpose_and_invalid_windows()
         native.MessageSearchRequest(context_before=-1)
     with pytest.raises(ValueError, match="receipt_level must be"):
         native.MessageSearchRequest(receipt_level="verbose")
+
+
+# One fixture and one case table for every message-search interface; the Rust side lives in
+# rust/ai-session-search-core/tests/search_surface_parity.rs and reads the same file. Shared cases
+# state an explicit limit or all_results, because an omitted limit deliberately means different
+# things per surface (REQ003), and compare [seq, role] only, because presentation is deliberately
+# surface-sized (REQ004).
+_PARITY_FIXTURE = Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/tests/fixtures/search_surface_parity.json"
+
+
+def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
+    spec = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
+    database = tmp_path / "index.db"
+    native.SessionSearch(database)
+    session = spec["session_id"]
+    rows = [(m["seq"], m["role"], m["content"]) for m in spec["messages"]]
+    bulk = spec["bulk"]
+    rows += [(bulk["first_seq"] + i, bulk["role"], f"{bulk['content_prefix']} {i}") for i in range(bulk["count"])]
+    twins = spec["twins"]
+    rows += [(twins["first_seq"] + pair, role, twins["content"]) for pair in range(twins["pairs"]) for role in twins["roles"]]
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "insert into sessions (id, provider, provider_session_id, preview_text, source_path,"
+            " parse_version, discovery_source)"
+            " values (?, 'claude', ?, '', '/fixture/parity.jsonl', 'parity-fixture-v1', 'fixture')",
+            (session, session.removeprefix("claude:")),
+        )
+        connection.executemany(
+            "insert into messages (session_id, provider, seq, role, kind, content) values (?, 'claude', ?, ?, 'conversation', ?)",
+            [(session, seq, role, content) for seq, role, content in rows],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, spec
+
+
+def _parity_expected(spec: dict, expected: object) -> list[tuple[int, str]]:
+    if expected == "twins":
+        twins = spec["twins"]
+        return [(twins["first_seq"] + pair, role) for pair in range(twins["pairs"]) for role in twins["roles"]]
+    assert isinstance(expected, list), expected
+    return [(seq, role) for seq, role in expected]
+
+
+def _parity_ids(results: list[dict]) -> list[tuple[int, str]]:
+    return [(hit["message_ref"]["message_seq"], hit["message_metadata"]["role"]) for hit in results]
+
+
+def _binding_search(database: Path, spec: dict, case: dict, offset: int = 0, limit=None):
+    request = native.MessageSearchRequest(
+        scope=native.MessageScope(session_id=spec["session_id"]) if case.get("in_session") else None,
+        limit=limit if limit is not None else case.get("limit"),
+        offset=offset,
+        all_results=case.get("all_results", False),
+        match_window=case.get("match_window"),
+    )
+    return native.SessionSearch(database).search_messages(case["query"], request, query_mode=case["mode"])
+
+
+def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, offset: int = 0, limit=None):
+    config = tmp_path / "config.toml"
+    config.write_text("", encoding="utf-8")
+    command = [
+        sys.executable,
+        "-c",
+        "from ai_session_search.entrypoint import cli_main; cli_main()",
+        "--database",
+        str(database),
+        "messages",
+        "search",
+        "--format",
+        "json",
+        "--index-refresh",
+        "existing-only",
+        "--skip-release-notification",
+        "--query-mode",
+        case["mode"],
+        "--offset",
+        str(offset),
+    ]
+    limit = limit if limit is not None else case.get("limit")
+    if case.get("all_results"):
+        command.append("--all-results")
+    elif limit is not None:
+        command += ["--limit", str(limit)]
+    if case.get("in_session"):
+        command += ["--session-id", spec["session_id"], "--match-window", "latest"]
+    command += ["--", case["query"]]
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    environment = {
+        **os.environ,
+        "AI_SESSION_SEARCH_CONFIG": str(config),
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+    }
+    return subprocess.run(command, capture_output=True, text=True, env=environment, timeout=120)
+
+
+def test_python_interfaces_return_the_shared_parity_cases(tmp_path: Path) -> None:
+    database, spec = _parity_database(tmp_path)
+    failures = []
+    for case in spec["cases"]:
+        want = _parity_expected(spec, case["expected"])
+        got = _parity_ids(_binding_search(database, spec, case).results)
+        if got != want:
+            failures.append(f"{case['name']} via native binding: got {got}, want {want}")
+        result = _entry_point_search(database, spec, case, tmp_path)
+        if result.returncode != 0:
+            failures.append(f"{case['name']} via entry point: refused: {result.stderr[:300]}")
+        elif (got := _parity_ids(json.loads(result.stdout)["results"])) != want:
+            failures.append(f"{case['name']} via entry point: got {got}, want {want}")
+    assert not failures, "\n".join(failures)
+
+
+def test_python_interfaces_page_through_ties_in_the_shared_total_order(tmp_path: Path) -> None:
+    database, spec = _parity_database(tmp_path)
+    for walk in spec["page_walks"]:
+        want = _parity_expected(spec, walk["expected"])
+        page = walk["page"]
+        offsets = range(0, len(want) + page, page)
+        walked = [hit for offset in offsets for hit in _parity_ids(_binding_search(database, spec, walk, offset, page).results)]
+        assert walked == want, f"{walk['name']}: native binding"
+        if page > 1:
+            # One process per page; the one-row walks are covered by the binding and by the Rust
+            # suite's CLI and MCP processes, so this keeps the entry-point walk to a few spawns.
+            walked = [
+                hit
+                for offset in offsets
+                for hit in _parity_ids(json.loads(_entry_point_search(database, spec, walk, tmp_path, offset, page).stdout)["results"])
+            ]
+            assert walked == want, f"{walk['name']}: entry point"
+
+
+def test_python_interfaces_keep_the_documented_deliberate_differences(tmp_path: Path) -> None:
+    database, spec = _parity_database(tmp_path)
+    omitted = spec["deliberate_differences"]["omitted_limit"]
+    case = {"mode": "literal", "query": omitted["query"]}
+    # REQ003: Python, like Rust and the CLI, returns every match when no limit is given; only MCP
+    # pages by default, because its results enter an agent's context directly.
+    assert len(_binding_search(database, spec, case).results) == omitted["all_surfaces_but_mcp"]
+    result = _entry_point_search(database, spec, case, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert len(json.loads(result.stdout)["results"]) == omitted["all_surfaces_but_mcp"]
+    # REQ003: fuzzy search keeps a finite page on every surface.
+    fuzzy = {
+        "mode": "fuzzy",
+        "query": spec["deliberate_differences"]["fuzzy_rejects_all_results"]["query"],
+        "all_results": True,
+    }
+    with pytest.raises(ValueError, match="fuzzy_rejects_all_results"):
+        _binding_search(database, spec, fuzzy)
+    assert _entry_point_search(database, spec, fuzzy, tmp_path).returncode != 0
