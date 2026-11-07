@@ -1911,28 +1911,51 @@ impl Db {
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let session = &parsed.session;
-        // A complete source parse represents one canonical session. Parser improvements or
-        // mutable sidecar metadata can change the provider session ID; remove prior identities
-        // for this provider/source in the same transaction before publishing the replacement.
-        // Preserve unrelated providers even if they happen to name the same filesystem path.
-        for alias in source_aliases
+        let aliases: Vec<&String> = source_aliases
             .iter()
             .filter(|alias| alias.as_str() != session.source_path)
-        {
-            tx.execute(
-                "delete from sessions where provider = ?1 and source_path = ?2",
-                params![session.provider.as_str(), alias],
+            .collect();
+        // The parser version this source was last indexed with, under its current path or a
+        // verified alias, read before anything below replaces it. Content identifies a message
+        // only while the parser that rendered it is unchanged; see the archive rule below.
+        let mut previous_parse_version: Option<String> = None;
+        for path in std::iter::once(&session.source_path).chain(aliases.iter().copied()) {
+            previous_parse_version = tx
+                .query_row(
+                    "select parse_version from files_seen where provider = ?1 and source_path = ?2",
+                    params![session.provider.as_str(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous_parse_version.is_some() {
+                break;
+            }
+        }
+        let same_parser = previous_parse_version.as_deref() == Some(session.parse_version.as_str());
+        // A complete source parse represents one canonical session. Parser improvements or
+        // mutable sidecar metadata can change the provider session ID, and a verified alias can
+        // move the source path. Earlier identities for this provider and source are retired
+        // after the replacement session row exists (below), so their stored rows can move to it
+        // instead of being deleted with them. Unrelated providers naming the same path are kept.
+        let mut retired_ids: Vec<String> = Vec::new();
+        for path in std::iter::once(&session.source_path).chain(aliases.iter().copied()) {
+            let mut statement = tx.prepare(
+                "select id from sessions where provider = ?1 and source_path = ?2 and id != ?3",
             )?;
+            let ids = statement
+                .query_map(
+                    params![session.provider.as_str(), path, session.id],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            retired_ids.extend(ids);
+        }
+        for alias in &aliases {
             tx.execute(
                 "delete from files_seen where provider = ?1 and source_path = ?2",
                 params![session.provider.as_str(), alias],
             )?;
         }
-        tx.execute(
-            "delete from sessions
-             where provider = ?1 and source_path = ?2 and id != ?3",
-            params![session.provider.as_str(), session.source_path, session.id],
-        )?;
         tx.execute(
             "
             insert into sessions (
@@ -1994,17 +2017,27 @@ impl Db {
             ",
             params![session.id, parsed.transcript_text],
         )?;
-        // The parser version this source was last indexed with, read before the upsert below
-        // replaces it. Content identifies a message only while the parser that rendered it is
-        // unchanged; see the archive rule further down.
-        let previous_parse_version: Option<String> = tx
-            .query_row(
-                "select parse_version from files_seen where provider = ?1 and source_path = ?2",
-                params![session.provider.as_str(), session.source_path],
+        // Move a retired identity's stored rows to the replacement session while it has none,
+        // then retire the identity; its remaining rows go with it through the cascade. Seqs keep
+        // their order because they move as one block into an empty session.
+        for retired in &retired_ids {
+            let holds_rows: bool = tx.query_row(
+                "select exists(select 1 from messages where session_id = ?1)",
+                params![session.id],
                 |row| row.get(0),
-            )
-            .optional()?;
-        let same_parser = previous_parse_version.as_deref() == Some(session.parse_version.as_str());
+            )?;
+            if !holds_rows {
+                tx.execute(
+                    "update messages set session_id = ?1 where session_id = ?2",
+                    params![session.id, retired],
+                )?;
+                tx.execute(
+                    "update file_edits set session_id = ?1 where session_id = ?2",
+                    params![session.id, retired],
+                )?;
+            }
+            tx.execute("delete from sessions where id = ?1", params![retired])?;
+        }
         tx.execute(
             "
             insert into files_seen (
@@ -2111,6 +2144,13 @@ impl Db {
                         unseen
                             .enumerate()
                             .map(|(offset, message)| (next_seq + offset as i64, message)),
+                    )?;
+                    // The session holds more rows than this parse; report the rows it holds.
+                    tx.execute(
+                        "update sessions set message_count =
+                            (select count(*) from messages where session_id = ?1)
+                         where id = ?1",
+                        params![session.id],
                     )?;
                 }
             }
@@ -16148,6 +16188,71 @@ mod tests {
             ],
             "stored messages survive and only new ones are appended"
         );
+        let message_count: i64 = db
+            .conn
+            .query_row(
+                "select message_count from sessions where id = 'codex:archive'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 5, "the session reports the rows it holds");
+    }
+
+    #[test]
+    fn reindexing_a_source_under_a_new_session_id_keeps_its_stored_messages() {
+        // A parser change or a mutable sidecar can give the same source file a new session id.
+        // The stored rows move to the new id instead of being deleted with the old one, and the
+        // archive rule then applies as for any shrunk or rewritten source.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut renamed = archive_session(
+            vec![archive_message(0, "summary of a and b", Conversation)],
+            Vec::new(),
+        );
+        renamed.session.id = "codex:archive-renamed".into();
+        renamed.session.provider_session_id = "archive-renamed".into();
+        db.upsert_session(&renamed, 2, 2).unwrap();
+
+        let rows: Vec<(String, i64, String)> = db
+            .conn
+            .prepare("select session_id, seq, content from messages order by session_id, seq, id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let renamed_id = "codex:archive-renamed".to_string();
+        assert_eq!(
+            rows,
+            [
+                (renamed_id.clone(), 0, "a".to_string()),
+                (renamed_id.clone(), 1, "b".to_string()),
+                (renamed_id, 2, "summary of a and b".to_string()),
+            ]
+        );
+        let sessions: Vec<String> = db
+            .conn
+            .prepare("select id from sessions")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sessions, ["codex:archive-renamed"]);
     }
 
     #[test]
