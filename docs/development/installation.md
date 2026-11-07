@@ -427,8 +427,11 @@ selection, status, idempotent reinstall, dry-run, and ownership-safe uninstall, 
 expects no local stdio MCP target. Antigravity App/IDE and CLI share the current
 `~/.gemini/config/mcp_config.json` while the installer also maintains the two legacy Antigravity
 MCP locations for older harness versions; they use distinct skill roots and share managed
-`~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.ai-session-search` in
-`~/.config/opencode/opencode.json` and a managed block in `~/.config/opencode/AGENTS.md`.
+`~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.servers.ai-session-search`
+with `type: "local"` in `~/.config/opencode/opencode.json`, the layout
+[OpenCode 2 reads](https://opencode.ai/docs/mcp-servers/), and a managed block in
+`~/.config/opencode/AGENTS.md`. Reinstall moves an entry an earlier aise wrote directly under
+`mcp`, which OpenCode 2 ignores.
 
 Maintainers install from a repository checkout with
 `sh scripts/install-native.sh --bin-dir DIR`; the packaged archive ships the same script as

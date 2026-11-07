@@ -206,7 +206,7 @@ pub struct IntegrationTargetsArgs {
     /// register only the clients discovery finds.
     #[arg(long = "zed-config")]
     pub zed_configs: Vec<PathBuf>,
-    /// Extra OpenCode JSON config path using { "mcp": ... }. Repeatable; omit to register
+    /// Extra OpenCode JSON config path using { "mcp": { "servers": ... } }. Repeatable; omit to register
     /// only the clients discovery finds.
     #[arg(long = "opencode-config")]
     pub opencode_configs: Vec<PathBuf>,
@@ -264,7 +264,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent instead receive their native skill and AGENTS.md guidance because Pi has no MCP client and Prime Agent accepts only remote HTTP MCP integrations. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
+    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent instead receive their native skill and AGENTS.md guidance because Pi has no MCP client and Prime Agent accepts only remote HTTP MCP integrations. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.servers.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and an OpenCode entry directly under `mcp`, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -3839,43 +3839,50 @@ fn status_skill_file(
     Ok(worst.label().to_string())
 }
 
+/// Where a JSON client reads its servers, and containers aise wrote to before that the client
+/// no longer reads. Install moves aise's entry out of a superseded container, uninstall clears
+/// both, and status reports an entry left there as stale, the same way old server names are
+/// handled. Add a container here when a client moves its servers.
+struct JsonServerLayout {
+    container: &'static [&'static str],
+    superseded: &'static [&'static [&'static str]],
+}
+
+fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
+    let (container, superseded): (&'static [&'static str], &'static [&'static [&'static str]]) =
+        match format {
+            ConfigFormat::JsonMcpServers => (&["mcpServers"], &[]),
+            ConfigFormat::VscodeServers => (&["servers"], &[]),
+            ConfigFormat::ZedContextServers => (&["context_servers"], &[]),
+            // OpenCode 2 reads `mcp.servers` and ignores servers directly under `mcp`.
+            ConfigFormat::OpenCode => (&["mcp", "servers"], &[&["mcp"]]),
+            ConfigFormat::CodexToml => return None,
+        };
+    Some(JsonServerLayout {
+        container,
+        superseded,
+    })
+}
+
+fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
+    match format {
+        ConfigFormat::VscodeServers => {
+            json!({"type": "stdio", "command": binary, "args": ["mcp", "serve"]})
+        }
+        ConfigFormat::OpenCode => json!({"type": "local", "command": [binary, "mcp", "serve"]}),
+        ConfigFormat::JsonMcpServers
+        | ConfigFormat::ZedContextServers
+        | ConfigFormat::CodexToml => {
+            json!({"command": binary, "args": ["mcp", "serve"]})
+        }
+    }
+}
+
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
     let binary = binary_config_value(binary)?;
     match target.format {
-        ConfigFormat::JsonMcpServers => plan_upsert_keyed_json_server(
-            &target.path,
-            "mcpServers",
-            json!({
-                "command": binary,
-                "args": ["mcp", "serve"]
-            }),
-        ),
         ConfigFormat::CodexToml => plan_upsert_codex_mcp_server(&target.path, binary),
-        ConfigFormat::VscodeServers => plan_upsert_keyed_json_server(
-            &target.path,
-            "servers",
-            json!({
-                "type": "stdio",
-                "command": binary,
-                "args": ["mcp", "serve"]
-            }),
-        ),
-        ConfigFormat::ZedContextServers => plan_upsert_keyed_json_server(
-            &target.path,
-            "context_servers",
-            json!({
-                "command": binary,
-                "args": ["mcp", "serve"]
-            }),
-        ),
-        ConfigFormat::OpenCode => plan_upsert_keyed_json_server(
-            &target.path,
-            "mcp",
-            json!({
-                "command": [binary, "mcp", "serve"],
-                "enabled": true
-            }),
-        ),
+        format => plan_upsert_json_server(&target.path, format, json_server_entry(format, binary)),
     }
 }
 
@@ -3889,66 +3896,110 @@ fn remove_target(target: &Target) -> Result<bool> {
 
 fn plan_remove_target(target: &Target) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
-        ConfigFormat::JsonMcpServers => plan_remove_keyed_json_server(&target.path, "mcpServers"),
         ConfigFormat::CodexToml => plan_remove_codex_mcp_server(&target.path),
-        ConfigFormat::VscodeServers => plan_remove_keyed_json_server(&target.path, "servers"),
-        ConfigFormat::ZedContextServers => {
-            plan_remove_keyed_json_server(&target.path, "context_servers")
-        }
-        ConfigFormat::OpenCode => plan_remove_keyed_json_server(&target.path, "mcp"),
+        format => plan_remove_json_server(&target.path, format),
     }
 }
 
 fn status_target(target: &Target) -> Result<&'static str> {
     match target.format {
-        ConfigFormat::JsonMcpServers => {
-            status_json_keyed_server(&target.path, "mcpServers", target.format)
-        }
         ConfigFormat::CodexToml => status_codex_mcp_server(&target.path),
-        ConfigFormat::VscodeServers => {
-            status_json_keyed_server(&target.path, "servers", target.format)
-        }
-        ConfigFormat::ZedContextServers => {
-            status_json_keyed_server(&target.path, "context_servers", target.format)
-        }
-        ConfigFormat::OpenCode => status_json_keyed_server(&target.path, "mcp", target.format),
+        format => status_json_server(&target.path, format),
     }
 }
 
 #[cfg(test)]
 fn upsert_json_mcp_server(path: &Path, entry: Value) -> Result<()> {
-    upsert_keyed_json_server(path, "mcpServers", entry)
+    let mutations = normalize_planned_mutations(plan_upsert_json_server(
+        path,
+        ConfigFormat::JsonMcpServers,
+        entry,
+    )?)?;
+    publish_planned_mutations(&mutations)
 }
 
 #[cfg(test)]
 fn remove_json_mcp_server(path: &Path) -> Result<bool> {
-    remove_keyed_json_server(path, "mcpServers")
-}
-
-#[cfg(test)]
-fn upsert_keyed_json_server(path: &Path, container_key: &str, entry: Value) -> Result<()> {
     let mutations =
-        normalize_planned_mutations(plan_upsert_keyed_json_server(path, container_key, entry)?)?;
-    publish_planned_mutations(&mutations)
+        normalize_planned_mutations(plan_remove_json_server(path, ConfigFormat::JsonMcpServers)?)?;
+    let changed = !mutations.is_empty();
+    publish_planned_mutations(&mutations)?;
+    Ok(changed)
 }
 
-fn plan_upsert_keyed_json_server(
+fn json_layout_for(format: ConfigFormat) -> Result<JsonServerLayout> {
+    json_server_layout(format)
+        .ok_or_else(|| anyhow!("{format:?} is not a JSON client configuration format"))
+}
+
+/// The object at `keys` under `root`, or `None` when a key is absent. With `create`, absent
+/// keys are inserted as empty objects. A present non-object value is an error naming the key,
+/// since overwriting it would destroy user configuration.
+fn json_container_mut<'a>(
     path: &Path,
-    container_key: &str,
+    root: &'a mut Map<String, Value>,
+    keys: &[&str],
+    create: bool,
+) -> Result<Option<&'a mut Map<String, Value>>> {
+    let mut current = root;
+    for key in keys {
+        if !current.contains_key(*key) {
+            if !create {
+                return Ok(None);
+            }
+            current.insert((*key).to_string(), Value::Object(Map::new()));
+        }
+        current = current
+            .get_mut(*key)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                let dotted = keys.join(".");
+                anyhow!(
+                    "{} has a non-object `{key}` value on the path `{dotted}`; fix the JSON so \
+                     `{key}` is `{{}}`-shaped, or back up and move the file aside before rerunning \
+                     `aise integrations install`",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(Some(current))
+}
+
+fn json_container<'a>(
+    root: &'a Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Map<String, Value>> {
+    keys.iter()
+        .try_fold(root, |current, key| current.get(*key)?.as_object())
+}
+
+/// Removes aise's entries from every superseded container. Errors only when a superseded key
+/// holds a non-object, which the user must resolve.
+fn clear_superseded_json_servers(
+    path: &Path,
+    root: &mut Map<String, Value>,
+    layout: &JsonServerLayout,
+) -> Result<bool> {
+    let mut removed = false;
+    for keys in layout.superseded {
+        if let Some(servers) = json_container_mut(path, root, keys, false)? {
+            removed |= remove_owned_json_server_entries(servers);
+        }
+    }
+    Ok(removed)
+}
+
+fn plan_upsert_json_server(
+    path: &Path,
+    format: ConfigFormat,
     entry: Value,
 ) -> Result<Vec<PlannedFileMutation>> {
+    let layout = json_layout_for(format)?;
     let original = read_optional_utf8_regular_file(path)?;
     let mut root = parse_json_object_or_empty(path, original.as_deref())?;
-    let servers = root
-        .entry(container_key.to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(servers) = servers.as_object_mut() else {
-        return Err(anyhow!(
-            "{} has a non-object `{container_key}` value; fix the JSON so `{container_key}` is \
-             `{{}}`-shaped, or back up and move the file aside before rerunning `aise integrations install`",
-            path.display()
-        ));
-    };
+    clear_superseded_json_servers(path, &mut root, &layout)?;
+    let servers = json_container_mut(path, &mut root, layout.container, true)?
+        .expect("create inserts every missing container");
     for legacy_name in LEGACY_SERVER_NAMES {
         servers.remove(legacy_name);
     }
@@ -3957,28 +4008,16 @@ fn plan_upsert_keyed_json_server(
     Ok(vec![planned_write(path, &original, content)])
 }
 
-#[cfg(test)]
-fn remove_keyed_json_server(path: &Path, container_key: &str) -> Result<bool> {
-    let mutations =
-        normalize_planned_mutations(plan_remove_keyed_json_server(path, container_key)?)?;
-    let changed = !mutations.is_empty();
-    publish_planned_mutations(&mutations)?;
-    Ok(changed)
-}
-
-fn plan_remove_keyed_json_server(
-    path: &Path,
-    container_key: &str,
-) -> Result<Vec<PlannedFileMutation>> {
+fn plan_remove_json_server(path: &Path, format: ConfigFormat) -> Result<Vec<PlannedFileMutation>> {
+    let layout = json_layout_for(format)?;
     let original = read_optional_utf8_regular_file(path)?;
     let Some(text) = original.as_deref() else {
         return Ok(Vec::new());
     };
     let mut root = parse_json_object_or_empty(path, Some(text))?;
-    let removed = root
-        .get_mut(container_key)
-        .and_then(Value::as_object_mut)
+    let mut removed = json_container_mut(path, &mut root, layout.container, false)?
         .is_some_and(remove_owned_json_server_entries);
+    removed |= clear_superseded_json_servers(path, &mut root, &layout)?;
     if removed {
         let content = serde_json::to_string_pretty(&Value::Object(root))? + "\n";
         Ok(vec![planned_write(path, &original, content)])
@@ -4126,7 +4165,7 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
     };
     match format {
         ConfigFormat::OpenCode => {
-            entry.get("enabled").and_then(Value::as_bool) == Some(true)
+            entry.get("type").and_then(Value::as_str) == Some("local")
                 && entry
                     .get("command")
                     .and_then(Value::as_array)
@@ -4154,29 +4193,27 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
     }
 }
 
-fn status_json_keyed_server(
-    path: &Path,
-    container_key: &str,
-    format: ConfigFormat,
-) -> Result<&'static str> {
+fn status_json_server(path: &Path, format: ConfigFormat) -> Result<&'static str> {
+    let layout = json_layout_for(format)?;
     let text = read_optional_utf8_regular_file(path)?;
     if text.is_none() {
         return Ok("missing");
     }
     let root = parse_json_object_or_empty(path, text.as_deref())?;
-    let servers = root.get(container_key).and_then(Value::as_object);
-    let entry = servers.and_then(|servers| servers.get(SERVER_NAME));
-    Ok(match entry {
-        Some(entry) if json_entry_is_current(entry, format) => "configured",
+    let servers = json_container(&root, layout.container);
+    let has_legacy_name = |servers: &Map<String, Value>| {
+        LEGACY_SERVER_NAMES
+            .iter()
+            .any(|name| servers.contains_key(*name))
+    };
+    let left_in_superseded = layout.superseded.iter().any(|keys| {
+        json_container(&root, keys)
+            .is_some_and(|old| old.contains_key(SERVER_NAME) || has_legacy_name(old))
+    });
+    Ok(match servers.and_then(|servers| servers.get(SERVER_NAME)) {
+        Some(entry) if json_entry_is_current(entry, format) && !left_in_superseded => "configured",
         Some(_) => "stale",
-        None if servers.is_some_and(|servers| {
-            LEGACY_SERVER_NAMES
-                .iter()
-                .any(|name| servers.contains_key(*name))
-        }) =>
-        {
-            "stale"
-        }
+        None if left_in_superseded || servers.is_some_and(has_legacy_name) => "stale",
         None => "not configured",
     })
 }
@@ -4685,13 +4722,13 @@ mod tests {
             &json!({"command": "aise", "type": "stdio", "args": ["mcp", "serve"]}),
             ConfigFormat::VscodeServers
         ));
-        // OpenCode: enabled=true and command=[bin,"mcp","serve"].
+        // OpenCode 2: type="local" and command=[bin,"mcp","serve"]; the V1 `enabled` shape is not.
         assert!(json_entry_is_current(
-            &json!({"enabled": true, "command": ["aise", "mcp", "serve"]}),
+            &json!({"type": "local", "command": ["aise", "mcp", "serve"]}),
             ConfigFormat::OpenCode
         ));
         assert!(!json_entry_is_current(
-            &json!({"enabled": false, "command": ["aise", "mcp", "serve"]}),
+            &json!({"enabled": true, "command": ["aise", "mcp", "serve"]}),
             ConfigFormat::OpenCode
         ));
         // CodexToml is never "current" via this JSON predicate, and a non-object is false.
@@ -4875,26 +4912,44 @@ mod tests {
         );
     }
 
+    /// OpenCode 2 reads local servers from `mcp.servers.<name>` with `type: "local"` and ignores
+    /// a server placed directly under `mcp`: `opencode mcp list` 1.18.31 reported "No MCP servers
+    /// configured" for the flat entry aise wrote before. https://opencode.ai/docs/mcp-servers/
     #[test]
-    fn opencode_uses_command_array() {
+    fn opencode_writes_mcp_servers_and_moves_its_flat_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("opencode.json");
-        upsert_target(
-            &Target {
-                label: "opencode",
-                path: path.clone(),
-                format: ConfigFormat::OpenCode,
-                detect_paths: Vec::new(),
-                detect_binaries: Vec::new(),
-            },
-            Path::new("/bin/aise"),
+        fs::write(
+            &path,
+            r#"{"mcp":{"ai-session-search":{"command":["/old/aise","mcp","serve"],"enabled":true},
+                "user-server":{"command":["user"],"enabled":true}}}"#,
         )
         .unwrap();
-        let data: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(data["mcp"][SERVER_NAME]["command"][0], "/bin/aise");
-        assert_eq!(data["mcp"][SERVER_NAME]["command"][1], "mcp");
-        assert_eq!(data["mcp"][SERVER_NAME]["command"][2], "serve");
-        assert_eq!(data["mcp"][SERVER_NAME]["enabled"], true);
+        let target = Target {
+            label: "opencode",
+            path: path.clone(),
+            format: ConfigFormat::OpenCode,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        };
+        assert_eq!(status_target(&target).unwrap(), "stale");
+
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        let data: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            data["mcp"]["servers"][SERVER_NAME],
+            json!({"type": "local", "command": ["/bin/aise", "mcp", "serve"]})
+        );
+        assert!(data["mcp"].get(SERVER_NAME).is_none(), "flat entry moved");
+        assert_eq!(data["mcp"]["user-server"]["command"][0], "user");
+        assert_eq!(status_target(&target).unwrap(), "configured");
+
+        assert!(remove_target(&target).unwrap());
+        let data: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(data["mcp"]["servers"].get(SERVER_NAME).is_none());
+        assert_eq!(data["mcp"]["user-server"]["command"][0], "user");
+        assert_eq!(status_target(&target).unwrap(), "not configured");
     }
 
     #[test]
@@ -4982,8 +5037,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            status_json_keyed_server(&json_path, "mcpServers", ConfigFormat::JsonMcpServers)
-                .unwrap(),
+            status_json_server(&json_path, ConfigFormat::JsonMcpServers).unwrap(),
             "stale"
         );
 
@@ -4994,7 +5048,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            status_json_keyed_server(&opencode_path, "mcp", ConfigFormat::OpenCode).unwrap(),
+            status_json_server(&opencode_path, ConfigFormat::OpenCode).unwrap(),
             "stale"
         );
 
