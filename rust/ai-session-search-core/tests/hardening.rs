@@ -212,7 +212,7 @@ fn large_session_indexes_with_correct_counts() {
 }
 
 #[test]
-fn reindex_after_edit_keeps_fts_in_sync_and_drops_stale_content() {
+fn reindex_after_edit_keeps_fts_in_sync_and_keeps_archived_content() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
     let v1 = r#"{"type":"user","sessionId":"r1","message":{"role":"user","content":[{"type":"text","text":"alpha unique-token-aaa"}]}}"#;
@@ -235,7 +235,9 @@ fn reindex_after_edit_keeps_fts_in_sync_and_drops_stale_content() {
     std::fs::write(projects.join("proj/r1.jsonl"), format!("{v2}\n")).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
 
-    // FTS invariant; old content gone, new content present (triggers kept FTS in sync).
+    // FTS invariant holds, and the index stays the archive: harnesses compact and rewrite
+    // their transcripts, so content the rewritten file no longer holds stays searchable, and the
+    // new content is indexed beside it.
     assert_eq!(
         db.message_count().unwrap(),
         db.messages_fts_count().unwrap()
@@ -247,8 +249,8 @@ fn reindex_after_edit_keeps_fts_in_sync_and_drops_stale_content() {
         )
         .unwrap()
         .len(),
-        0,
-        "stale content must not remain searchable"
+        1,
+        "archived content stays searchable after the source is rewritten"
     );
     assert_eq!(
         db.search_messages(

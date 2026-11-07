@@ -1994,6 +1994,17 @@ impl Db {
             ",
             params![session.id, parsed.transcript_text],
         )?;
+        // The parser version this source was last indexed with, read before the upsert below
+        // replaces it. Content identifies a message only while the parser that rendered it is
+        // unchanged; see the archive rule further down.
+        let previous_parse_version: Option<String> = tx
+            .query_row(
+                "select parse_version from files_seen where provider = ?1 and source_path = ?2",
+                params![session.provider.as_str(), session.source_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let same_parser = previous_parse_version.as_deref() == Some(session.parse_version.as_str());
         tx.execute(
             "
             insert into files_seen (
@@ -2059,25 +2070,86 @@ impl Db {
         } else {
             None
         };
-        let new_messages = match append_from {
-            Some(start) => &parsed.messages[start..],
+        match append_from {
+            // Persist the appended tail with its parse-order seq.
+            Some(start) => insert_messages(
+                &tx,
+                session,
+                parsed.messages[start..].iter().map(|m| (m.seq, m)),
+            )?,
             None => {
-                tx.execute(
-                    "delete from messages where session_id = ?1",
-                    params![session.id],
-                )?;
-                &parsed.messages[..]
+                // The index is the archive: harnesses compact, rewrite and prune their own
+                // transcripts, so a re-parse by the same parser that no longer holds a stored
+                // message must not delete it; the stored rows stay and the parse's new messages
+                // are appended after the highest stored seq. Content is the identity because
+                // role, kind and authorship are parser output. A new parser version may render
+                // the same message differently, and content cannot tell a re-rendered message
+                // from a removed one, so a parser upgrade keeps the full replace, as does a parse
+                // that still holds every stored content.
+                let mut stored = stored_message_keys(&tx, &session.id)?;
+                let parsed_keys: Vec<[u8; 32]> = parsed
+                    .messages
+                    .iter()
+                    .map(|m| archive_key(&[m.content.as_bytes()]))
+                    .collect();
+                if !same_parser || covers_every_stored_key(&stored, &parsed_keys) {
+                    tx.execute(
+                        "delete from messages where session_id = ?1",
+                        params![session.id],
+                    )?;
+                    insert_messages(&tx, session, parsed.messages.iter().map(|m| (m.seq, m)))?;
+                } else {
+                    let unseen = parsed
+                        .messages
+                        .iter()
+                        .zip(&parsed_keys)
+                        .filter(|(_, key)| !take_stored_key(&mut stored, key))
+                        .map(|(message, _)| message);
+                    insert_messages(
+                        &tx,
+                        session,
+                        unseen
+                            .enumerate()
+                            .map(|(offset, message)| (next_seq + offset as i64, message)),
+                    )?;
+                }
             }
-        };
-        // Persist messages with their parse-order seq (0..N).
-        insert_messages(&tx, session, new_messages.iter().map(|m| (m.seq, m)))?;
-        // Re-sync file-edit rows (idempotent, same as messages). `edits` are stored as a
-        // JSON array of [old, new] pairs; `new_content` holds full content for Write only.
-        tx.execute(
-            "delete from file_edits where session_id = ?1",
-            params![session.id],
-        )?;
-        insert_file_edits(&tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
+        }
+        // File edits follow the same rule: under the same parser, replace only when the parse
+        // still holds every stored edit, otherwise keep them and append the new ones. `edits` are stored as a JSON array
+        // of [old, new] pairs; `new_content` holds full content for Write only.
+        let mut stored_edits = stored_file_edit_keys(&tx, &session.id)?;
+        let parsed_edit_keys = parsed
+            .file_edits
+            .iter()
+            .map(file_edit_key)
+            .collect::<Result<Vec<_>>>()?;
+        if !same_parser || covers_every_stored_key(&stored_edits, &parsed_edit_keys) {
+            tx.execute(
+                "delete from file_edits where session_id = ?1",
+                params![session.id],
+            )?;
+            insert_file_edits(&tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
+        } else {
+            let next_edit_seq: i64 = tx.query_row(
+                "select coalesce(max(seq), -1) + 1 from file_edits where session_id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )?;
+            let unseen = parsed
+                .file_edits
+                .iter()
+                .zip(&parsed_edit_keys)
+                .filter(|(_, key)| !take_stored_key(&mut stored_edits, key))
+                .map(|(edit, _)| edit);
+            insert_file_edits(
+                &tx,
+                session,
+                unseen
+                    .enumerate()
+                    .map(|(offset, edit)| (next_edit_seq + offset as i64, edit)),
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -5954,6 +6026,95 @@ fn insert_messages<'a>(
         }
     }
     Ok(())
+}
+
+/// Identity of a stored row for the archive rule in `upsert_session_with_mode`: SHA-256 over
+/// length-framed fields, so no field boundary can be forged by content.
+fn archive_key(fields: &[&[u8]]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+/// Multiset of a session's stored message-content keys. Read only on the non-append path,
+/// where the full replace already rewrites the session: O(stored rows + bytes) time,
+/// O(stored rows) memory for the 32-byte keys.
+fn stored_message_keys(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<HashMap<[u8; 32], usize>> {
+    let mut keys = HashMap::new();
+    let mut statement = tx.prepare("select content from messages where session_id = ?1")?;
+    let mut rows = statement.query(params![session_id])?;
+    while let Some(row) = rows.next()? {
+        let content: String = row.get(0)?;
+        *keys.entry(archive_key(&[content.as_bytes()])).or_insert(0) += 1;
+    }
+    Ok(keys)
+}
+
+fn file_edit_key(edit: &FileEdit) -> Result<[u8; 32]> {
+    let edits_json = if edit.edits.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&edit.edits)?
+    };
+    Ok(archive_key(&[
+        edit.tool.as_bytes(),
+        edit.file_path.as_bytes(),
+        edit.new_content.as_deref().unwrap_or("").as_bytes(),
+        edits_json.as_bytes(),
+    ]))
+}
+
+fn stored_file_edit_keys(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<HashMap<[u8; 32], usize>> {
+    let mut keys = HashMap::new();
+    let mut statement = tx.prepare(
+        "select tool, file_path, new_content, edits_json from file_edits where session_id = ?1",
+    )?;
+    let mut rows = statement.query(params![session_id])?;
+    while let Some(row) = rows.next()? {
+        let tool: String = row.get(0)?;
+        let path: String = row.get(1)?;
+        let new_content: Option<String> = row.get(2)?;
+        let edits_json: Option<String> = row.get(3)?;
+        *keys
+            .entry(archive_key(&[
+                tool.as_bytes(),
+                path.as_bytes(),
+                new_content.as_deref().unwrap_or("").as_bytes(),
+                edits_json.as_deref().unwrap_or("").as_bytes(),
+            ]))
+            .or_insert(0) += 1;
+    }
+    Ok(keys)
+}
+
+/// True when `parsed` holds at least as many copies of every stored key as are stored.
+fn covers_every_stored_key(stored: &HashMap<[u8; 32], usize>, parsed: &[[u8; 32]]) -> bool {
+    let mut remaining = stored.clone();
+    for key in parsed {
+        take_stored_key(&mut remaining, key);
+    }
+    remaining.values().all(|count| *count == 0)
+}
+
+/// Consume one stored copy of `key`; false when none is left, i.e. the parse row is new.
+fn take_stored_key(stored: &mut HashMap<[u8; 32], usize>, key: &[u8; 32]) -> bool {
+    match stored.get_mut(key) {
+        Some(count) if *count > 0 => {
+            *count -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Insert file-edit rows for `session`, with the caller-supplied `seq`. Shared by `upsert_session`
@@ -13770,6 +13931,9 @@ mod tests {
             let mut parsed = parsed_with_messages(&id, &[&content]);
             parsed.session.provider_session_id = format!("allocation-{index}");
             parsed.session.source_path = format!("/allocation/{index}.jsonl");
+            // A new parser version: replacing rows a re-parse by the same parser no longer holds
+            // would delete archived history, so only a parser upgrade replaces them.
+            parsed.session.parse_version = "allocation-parser-v2".into();
             db.replace_session(&parsed, 10 + index, 10 + index).unwrap();
         }
         db.optimize_fts().unwrap();
@@ -15707,7 +15871,9 @@ mod tests {
             .unwrap();
         assert_eq!(new_found.len(), 1, "the appended message is searchable");
 
-        // Shrink → full replace (safe fallback): sentinel gone, content correct.
+        // Shrink under the same parser: the harness compacted or pruned its transcript. The
+        // index is the archive, so the stored rows stay, untouched (sentinel kept), and nothing
+        // the parse still holds is inserted twice.
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "bravo"]),
             3,
@@ -15716,36 +15882,25 @@ mod tests {
         .unwrap();
         assert_eq!(
             contents(&db),
-            ["alpha", "bravo"],
-            "shrink re-replaces fully"
+            ["alpha", "bravo", "charlie", "delta", "echo"],
+            "a shrunk source keeps every stored message"
         );
-        assert_eq!(tagged(&db), 0, "shrink did a full replace");
+        assert_eq!(tagged(&db), 3, "stored rows were kept, not re-inserted");
 
-        // Grow with a CHANGED boundary message (in-place rewrite) → full replace, correct content.
-        db.upsert_session(
-            &parsed_with_messages("claude:s1", &["alpha", "boundary"]),
-            4,
-            70,
-        )
-        .unwrap();
-        db.conn
-            .execute(
-                "update messages set tool_name='SENTINEL' where session_id='claude:s1'",
-                [],
-            )
-            .unwrap();
+        // In-place rewrite under the same parser: stored rows stay and only the rewritten
+        // message is new, appended after the highest stored seq.
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "CHANGED", "extra"]),
-            5,
+            4,
             90,
         )
         .unwrap();
         assert_eq!(
             contents(&db),
-            ["alpha", "CHANGED", "extra"],
-            "boundary content changed → full replace keeps content correct",
+            ["alpha", "bravo", "charlie", "delta", "echo", "CHANGED", "extra"],
+            "a rewritten source keeps the old messages and appends the new ones",
         );
-        assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
+        assert_eq!(tagged(&db), 3, "the stored prefix was not re-inserted");
     }
 
     #[test]
@@ -15881,6 +16036,209 @@ mod tests {
                 (2, "second prompt".to_string())
             ],
             "the appended message must take the seq after the highest stored one"
+        );
+    }
+
+    fn archive_message(
+        seq: i64,
+        content: &str,
+        kind: crate::models::MessageKind,
+    ) -> crate::models::Message {
+        crate::models::Message {
+            seq,
+            role: Role::User,
+            ts: None,
+            tool_name: None,
+            kind,
+            tool_call_id: None,
+            content: content.to_string(),
+            is_compaction: false,
+            provenance: Default::default(),
+        }
+    }
+
+    fn archive_session(
+        messages: Vec<crate::models::Message>,
+        file_edits: Vec<FileEdit>,
+    ) -> ParsedSession {
+        ParsedSession {
+            session: SessionRecord {
+                id: "codex:archive".into(),
+                provider: Provider::Codex,
+                provider_session_id: "archive".into(),
+                title: None,
+                summary: None,
+                cwd: None,
+                repo_root: None,
+                created_at: None,
+                updated_at: None,
+                last_message_at: None,
+                preview_text: String::new(),
+                source_path: "/x/archive.jsonl".into(),
+                message_count: Some(messages.len() as i64),
+                parse_version: "v1".into(),
+                raw_metadata_json: None,
+                parse_warning: None,
+                discovery_source: "test".into(),
+                parent_session_id: None,
+                agent_label: None,
+            },
+            transcript_text: String::new(),
+            messages,
+            file_edits,
+        }
+    }
+
+    fn archive_rows(db: &Db) -> Vec<(i64, String, String)> {
+        db.conn
+            .prepare("select seq, content, kind from messages order by seq, id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn reindexing_a_shrunk_or_rewritten_source_keeps_every_stored_message() {
+        // Harnesses compact, rewrite and prune their own transcripts (Codex rewrote a 4,720-row
+        // session down to 74 records). The index is the archive: a re-parse that no longer
+        // holds a stored message must not delete it. New parse messages are appended after the
+        // highest stored seq.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                    archive_message(2, "c", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "summary of a, b and c", Conversation),
+                    archive_message(1, "d", Conversation),
+                ],
+                Vec::new(),
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        let contents: Vec<(i64, String)> = archive_rows(&db)
+            .into_iter()
+            .map(|(seq, content, _)| (seq, content))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (0, "a".to_string()),
+                (1, "b".to_string()),
+                (2, "c".to_string()),
+                (3, "summary of a, b and c".to_string()),
+                (4, "d".to_string()),
+            ],
+            "stored messages survive and only new ones are appended"
+        );
+    }
+
+    #[test]
+    fn reindexing_a_parse_that_still_holds_every_message_replaces_it() {
+        // When nothing stored would be lost, the full replace still applies, so a parser
+        // upgrade can reclassify stored rows.
+        use crate::models::MessageKind::{Conversation, HarnessNotice};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "<environment_context>", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "<environment_context>", HarnessNotice),
+                ],
+                Vec::new(),
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            archive_rows(&db),
+            [
+                (0, "a".to_string(), "conversation".to_string()),
+                (
+                    1,
+                    "<environment_context>".to_string(),
+                    "harness_notice".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reindexing_a_source_that_lost_a_file_edit_keeps_the_stored_edit() {
+        use crate::models::MessageKind::Conversation;
+        let edit = |seq: i64, content: &str| FileEdit {
+            seq,
+            ts: None,
+            tool: "Write".into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: Some(content.into()),
+            edits: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                vec![edit(0, "v1"), edit(1, "v2")],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![archive_message(0, "summary", Conversation)],
+                vec![edit(0, "v3")],
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        let versions: Vec<String> = db
+            .file_edits_for("f.rs", None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, edit)| edit.new_content.unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            ["v1", "v2", "v3"],
+            "edit history survives the rewrite"
         );
     }
 

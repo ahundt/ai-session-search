@@ -45,6 +45,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    such rows as harness notices, which default search, corrections and repeat mining already
    leave out, and deletes nothing. `Db::purge_injected_messages` is deprecated in favour of
    `Db::classify_injected_messages`.
+7. Reindexing a session whose source got smaller no longer deletes what aise already stored.
+   Harnesses compact, rewrite and prune their own transcripts: one Codex session went from 4,720
+   indexed messages to 16 after Codex rewrote its file, because a re-parse that came out shorter
+   replaced the whole session. Under the same parser, aise now keeps every stored message and file
+   edit and appends only the new ones. A parser upgrade still replaces the session, since a new
+   parser may render the same message differently. A shrink now costs 18.8 ms where the full
+   replace cost 2.2 s on a 20,000-message session.
 
 ### Performance
 
