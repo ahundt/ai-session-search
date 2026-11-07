@@ -12,12 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::cli::ReportOutputFormat;
 use crate::config::Config;
 use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
-use crate::hashing::lower_hex;
 use crate::util::{executable_candidates, is_executable_file};
 // Rendering the manual command is a `#[cfg(unix)]` path; see integrations.rs for the same split.
 #[cfg(unix)]
@@ -373,18 +371,8 @@ fn native_archive_receipt(executable: &Path) -> Option<(PathBuf, NativeArchiveRe
     {
         return None;
     }
-    let mut source = File::open(executable).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = source.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    (lower_hex(hasher.finalize().as_ref()) == receipt.executable_sha256)
-        .then_some((receipt_path, receipt))
+    let digest = crate::hashing::sha256_reader(File::open(executable).ok()?).ok()?;
+    (digest == receipt.executable_sha256).then_some((receipt_path, receipt))
 }
 
 fn is_regular_file_without_symlink(path: &Path) -> bool {
@@ -1676,12 +1664,10 @@ mod tests {
 
     #[test]
     fn executable_bound_native_receipt_reports_native_archive_ownership() {
-        use sha2::{Digest as _, Sha256};
-
         let temp = TempDir::new().unwrap();
         let executable = temp.path().join("aise");
         write_executable(&executable);
-        let digest = lower_hex(Sha256::digest(fs::read(&executable).unwrap()).as_ref());
+        let digest = crate::hashing::sha256(&fs::read(&executable).unwrap());
         fs::write(
             temp.path().join("aise-native-install.json"),
             format!(

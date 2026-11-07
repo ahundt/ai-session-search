@@ -8,6 +8,13 @@
 //! encoding, or the case of the hex to drift apart — and a manifest that hashes differently from
 //! the thing it describes is worse than no manifest. This is the single definition.
 
+// clippy.toml rejects sha2::Sha256 outside this module, so every digest in the project shares one
+// algorithm, one hex encoding, and one framing rule. Code that needs a digest calls a function
+// below: `sha256` for bytes in memory, `sha256_reader` for a file or other reader, and
+// `FramedSha256` for a sequence of values. If none fits, add the function here, with a test,
+// rather than allowing the lint at the call site.
+#![allow(clippy::disallowed_types)]
+
 use std::io::{self, Write};
 
 use serde::Serialize;
@@ -19,6 +26,30 @@ use sha2::{Digest, Sha256};
 /// whitespace- or comment-only edit still changes the digest.
 pub fn sha256(content: &[u8]) -> String {
     lower_hex(Sha256::digest(content).as_ref())
+}
+
+/// Lowercase hex SHA-256 of everything `reader` yields, for files too large to hold in memory.
+///
+/// Equal to [`sha256`] over the same bytes. Time is `O(bytes)`; memory is one 64 KiB buffer.
+pub(crate) fn sha256_reader(reader: impl io::Read) -> io::Result<String> {
+    // digest 0.11 no longer implements io::Write; this adapter lets std's io::copy drive it
+    // without adding the digest-io crate for six lines.
+    struct DigestWriter(Sha256);
+    impl Write for DigestWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.update(buffer);
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut digest = DigestWriter(Sha256::new());
+    io::copy(
+        &mut io::BufReader::with_capacity(64 * 1024, reader),
+        &mut digest,
+    )?;
+    Ok(lower_hex(digest.0.finalize().as_ref()))
 }
 
 /// Lowercase hex encoding for digest output.
@@ -190,6 +221,15 @@ mod tests {
             sha256(b"abc\n"),
             "trailing bytes must count"
         );
+    }
+
+    #[test]
+    fn streamed_reader_digest_equals_the_in_memory_digest() {
+        // 200,003 bytes spans several read buffers and ends mid-buffer.
+        let content: Vec<u8> = (0..200_003_u32).map(|i| (i % 251) as u8).collect();
+        for input in [&b""[..], b"abc", &content] {
+            assert_eq!(sha256_reader(input).unwrap(), sha256(input));
+        }
     }
 
     #[test]
