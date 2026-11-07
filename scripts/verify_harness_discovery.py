@@ -35,11 +35,21 @@ import tempfile
 from collections.abc import Sequence
 
 HARNESSES = ("codex", "opencode", "claude", "gemini")
+SERVER_NAME = "ai-session-search"
+# Markers the CLIs print beside a listed server that will not start: Claude Code shows
+# "✗ Failed to connect" and still exits 0, so the name alone does not prove discovery.
+FAILURE_MARKERS = ("fail", "error", "✗", "✘")
 
 
 def classify(result: subprocess.CompletedProcess[str]) -> str:
-    """Discovery requires both a successful list command and the server name in its output."""
-    return "passed" if result.returncode == 0 and "ai-session-search" in result.stdout + result.stderr else "failed"
+    """Passed only when the list command succeeds and a line naming the server reports no failure.
+
+    Gemini's "Disabled" in an untrusted directory still passes: it proves the server was found.
+    """
+    lines = (result.stdout + "\n" + result.stderr).splitlines()
+    listed = [line.lower() for line in lines if SERVER_NAME in line]
+    healthy = any(not any(marker in line for marker in FAILURE_MARKERS) for line in listed)
+    return "passed" if result.returncode == 0 and healthy else "failed"
 
 
 def exit_code(statuses: Sequence[str]) -> int:

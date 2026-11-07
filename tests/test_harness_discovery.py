@@ -19,6 +19,10 @@ from scripts import verify_harness_discovery as verifier
         (0, "ai-session-search: Disabled (untrusted folder)", "", "passed"),
         (0, "No MCP servers configured", "", "failed"),
         (1, "ai-session-search", "invalid config", "failed"),
+        # Claude Code lists a server that will not start and still exits 0.
+        (0, "ai-session-search: /bin/aise mcp serve - ✗ Failed to connect", "", "failed"),
+        (0, "ai-session-search: /bin/aise mcp serve - ✘ Failed to connect", "", "failed"),
+        (0, "✗ ai-session-search failed", "", "failed"),
     ],
 )
 def test_discovery_requires_success_and_the_server_name(
