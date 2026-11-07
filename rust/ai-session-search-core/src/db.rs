@@ -29,8 +29,8 @@ use crate::models::{
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
-    fold_caseless, parse_datetime, snippet_from_match, snippet_from_match_while, stored_timestamp,
-    UnicodeLowerNeedle, SIGMAS,
+    fold_caseless, parse_stored_timestamp, snippet_from_match, snippet_from_match_while,
+    stored_timestamp, UnicodeLowerNeedle, SIGMAS,
 };
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
@@ -4071,11 +4071,11 @@ impl Db {
                     updated_at: row
                         .get::<_, Option<String>>(5)?
                         .as_deref()
-                        .and_then(crate::util::parse_datetime),
+                        .and_then(crate::util::parse_stored_timestamp),
                     last_message_at: row
                         .get::<_, Option<String>>(6)?
                         .as_deref()
-                        .and_then(crate::util::parse_datetime),
+                        .and_then(crate::util::parse_stored_timestamp),
                     message_count: row.get(7)?,
                     parse_warning: row.get(8)?,
                     parent_session_id: row.get(9)?,
@@ -4444,7 +4444,7 @@ impl Db {
                 )),
                 None => policies.classify(&content),
             }?;
-            let ts = ts.as_deref().and_then(parse_datetime);
+            let ts = ts.as_deref().and_then(parse_stored_timestamp);
             Some(MessageClassificationMatch {
                 session_id,
                 message_seq,
@@ -4618,7 +4618,7 @@ impl Db {
                     last_edited: row
                         .get::<_, Option<String>>(4)?
                         .as_deref()
-                        .and_then(crate::util::parse_datetime),
+                        .and_then(crate::util::parse_stored_timestamp),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4780,7 +4780,7 @@ impl Db {
                 decode_db_enum(provider, 1, "file_edits.provider", Provider::from_db_str)?,
                 FileEdit {
                     seq,
-                    ts: ts.as_deref().and_then(crate::util::parse_datetime),
+                    ts: ts.as_deref().and_then(crate::util::parse_stored_timestamp),
                     tool,
                     file_path,
                     file_name,
@@ -5338,7 +5338,7 @@ impl Db {
                     row.get::<_, i64>(6)?,
                 ))
             })?;
-        let parse_ts = |value: Option<String>| value.as_deref().and_then(parse_datetime);
+        let parse_ts = |value: Option<String>| value.as_deref().and_then(parse_stored_timestamp);
         let first_timestamp = parse_ts(row.2);
         let last_timestamp = parse_ts(row.3);
         Ok(SessionTimeProfile {
@@ -6012,7 +6012,7 @@ fn stored_session_dates(
             |row| Ok([row.get::<_, Option<String>>(0)?, row.get(1)?, row.get(2)?]),
         )
         .optional()?
-        .map(|dates| dates.map(|text| text.as_deref().and_then(parse_datetime))))
+        .map(|dates| dates.map(|text| text.as_deref().and_then(parse_stored_timestamp))))
 }
 
 /// The earliest created_at and the latest updated_at and last_message_at across `dates`, as UTC
@@ -6865,7 +6865,7 @@ fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Re
             "messages.role",
             Role::from_db_str,
         )?,
-        ts: ts.as_deref().and_then(parse_datetime),
+        ts: ts.as_deref().and_then(parse_stored_timestamp),
         tool_name: row.get(offset + 5)?,
         kind: crate::models::MessageKind::from_db_str(&row.get::<_, String>(offset + 6)?),
         tool_call_id: row.get(offset + 7)?,
@@ -7383,15 +7383,15 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         created_at: row
             .get::<_, Option<String>>(7)?
             .as_deref()
-            .and_then(crate::util::parse_datetime),
+            .and_then(crate::util::parse_stored_timestamp),
         updated_at: row
             .get::<_, Option<String>>(8)?
             .as_deref()
-            .and_then(crate::util::parse_datetime),
+            .and_then(crate::util::parse_stored_timestamp),
         last_message_at: row
             .get::<_, Option<String>>(9)?
             .as_deref()
-            .and_then(crate::util::parse_datetime),
+            .and_then(crate::util::parse_stored_timestamp),
         preview_text: row.get(10)?,
         source_path: row.get(11)?,
         message_count: row.get(12)?,

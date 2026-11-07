@@ -927,7 +927,8 @@ pub fn render_posix_shell_command(parts: &[String]) -> Result<String> {
         .map_err(|error| anyhow!("cannot render POSIX shell command: {error}"))
 }
 
-// The stored-timestamp reader, which clippy.toml names as the pathway.
+/// Read a timestamp from a harness's files: RFC 3339, or a bare `YYYY-MM-DD` date read as
+/// midnight UTC. Timestamps the index stored itself are read with [`parse_stored_timestamp`].
 #[allow(clippy::disallowed_methods)]
 pub fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
@@ -961,11 +962,20 @@ pub fn parse_unix_nanos(value: i64) -> Option<DateTime<Utc>> {
     )
 }
 
+/// Read timestamp text the index stored with [`stored_timestamp`]. Strict RFC 3339: a value the
+/// writer cannot produce, such as a bare date, reads as `None` instead of a guessed instant.
+#[allow(clippy::disallowed_methods)]
+pub fn parse_stored_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
 /// The text form of a timestamp stored in the index: RFC 3339 in UTC, offset written `+00:00`.
 ///
 /// SQL filters and orderings compare these strings directly (`ts >= ?`), which equals time order
 /// only because every stored value shares this one offset; write stored timestamps through this
-/// function so they all do. Read them back with [`parse_datetime`].
+/// function so they all do. Read them back with [`parse_stored_timestamp`].
 #[allow(clippy::disallowed_methods)]
 pub fn stored_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
@@ -2115,8 +2125,25 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>()
         );
         for instant in instants {
-            assert_eq!(parse_datetime(&stored_timestamp(instant)), Some(instant));
+            assert_eq!(
+                parse_stored_timestamp(&stored_timestamp(instant)),
+                Some(instant)
+            );
         }
+    }
+
+    #[test]
+    fn stored_timestamp_reader_accepts_only_what_the_writer_produces() {
+        // Harness input may be a bare date; stored text never is, so the stored reader treats
+        // one as malformed rather than guessing midnight UTC.
+        assert_eq!(parse_stored_timestamp("2026-01-02"), None);
+        assert_eq!(parse_stored_timestamp(""), None);
+        assert!(parse_datetime("2026-01-02").is_some());
+        // Every RFC 3339 instant still reads, whatever offset an older writer used.
+        assert_eq!(
+            parse_stored_timestamp("2026-01-02T01:00:00+01:00"),
+            parse_stored_timestamp("2026-01-02T00:00:00+00:00")
+        );
     }
 
     /// Serializes tests that install a stub search path, so a second install never replaces a
