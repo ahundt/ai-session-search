@@ -213,8 +213,8 @@ The installer supports Claude Code/Desktop, ChatGPT Codex desktop and Codex CLI/
 Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and
 Kilo Code. Claude, Codex, OpenCode, Gemini, Antigravity, Pi, and
 Prime receive managed instruction-file guidance.
-Pi has no native MCP client, and Prime accepts remote HTTP MCP integrations rather than the local
-stdio server, so those selectors install only supported components.
+Pi 0.99.0 and newer read `mcpServers` in `~/.pi/agent/mcp.json` as strict JSON and receive
+MCP-first guidance. Prime Agent currently receives only the skill and CLI guidance.
 The repository does not install client hooks. It installs the owned
 `$ai-session-search` skill for detected Claude, Codex, Gemini/Antigravity, Pi, and Prime
 harnesses unless `--no-skill` is passed.

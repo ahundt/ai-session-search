@@ -123,6 +123,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     entry an earlier release left where its client no longer reads it, keeping the executable
     that entry named. A client with no aise entry is not configured.
 
+15. Pi 0.99.0 and newer receive the aise MCP server in `~/.pi/agent/mcp.json` and MCP-first
+    instructions. Earlier installs provided only CLI guidance. Untouched CLI-only integrations
+    gain the MCP registration during the post-upgrade refresh.
+
 ### Performance
 
 1. Limited literal and regex searches stop once the page is full. On an index of 5.7 million
