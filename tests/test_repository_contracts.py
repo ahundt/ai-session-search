@@ -688,7 +688,7 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     ):
         assert native_root in installation
     assert "~/.pi/agent/mcp.json" in installation and "MCP-first" in installation
-    assert "Prime Agent currently" in installation
+    assert "~/.prime/agent/settings.json" in installation and 'type: "stdio"' in installation
     acceptance = installation.split("The integration acceptance matrix", 1)[1]
     assert "Pi" in acceptance and "Prime Agent" in acceptance
     assert "toml_edit::DocumentMut" in configuration
@@ -696,7 +696,7 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "~/.gemini/config/mcp_config.json" in configuration
     assert "~/.gemini/antigravity-cli/skills/" in configuration
     assert "~/.pi/agent/mcp.json" in configuration and "strict JSON" in configuration
-    assert "Prime Agent currently receives only" in configuration
+    assert "~/.prime/agent/settings.json" in configuration and 'type: "stdio"' in configuration
     # Pin what a reader can act on, not the Rust idiom's name. Asserting "shared RAII lock" held
     # the README to implementation vocabulary to make a point a user cannot use; the property that
     # matters is that status cannot report a half-applied install.

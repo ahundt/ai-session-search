@@ -35,6 +35,12 @@ const LEGACY_SERVER_NAMES: [&str; 2] = ["ai_session_search", "aise"];
 const PI_AGENT_DIR: &str = ".pi/agent";
 /// MCP file under the agent root, from the same Pi configuration reference above.
 const PI_MCP_FILE: &str = "mcp.json";
+/// Prime Agent's default root:
+/// https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/crates/pa-cli/src/config.rs#L7-L9
+const PRIME_AGENT_DIR: &str = ".prime/agent";
+/// MCP shares the strict-JSON settings document:
+/// https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/crates/pa-cli/src/mcp_command.rs#L77-L85
+const PRIME_MCP_FILE: &str = "settings.json";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
@@ -42,9 +48,7 @@ const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use
 /// instructions). It names the same four steps as `CLI_INSTRUCTIONS_LINE` in the same order,
 /// with the MCP tool for each, so an agent reads one workflow whichever surface it holds.
 const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) via the `ai-session-search` MCP server: `list_sessions(path_prefix, when, limit)` for recent sessions by directory or period, `search_sessions(query, when, limit)` for sessions by topic, `search_messages(query, context, limit)` for the exact turn, then read it with `get_session(session_id, message_seq)`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, path, context, and time range. The installed `ai-session-search` skill has the full workflow; without MCP, `aise` on the shell does the same (`aise <command> --help`).";
-/// The block for a harness that has no MCP registration for aise (Prime Agent). It leads with
-/// the three CLI commands that cover the common path and names the installed skill, because the
-/// MCP-first sentence above sends such an agent to a tool it cannot call.
+/// Historical CLI-only guidance, retained verbatim to recognize and refresh owned blocks.
 const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; on this harness the `aise` command and the installed skill are the whole integration. List recent sessions with `aise list --path <dir> --when 7d --limit 10`, find sessions by topic with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; `aise <command> --help` lists every current flag.";
 /// SHA-256 of each instruction line an earlier release wrote and this build no longer does:
 /// 1.0.0rc1's `INSTRUCTIONS_LINE`. The post-upgrade refresh replaces a block that still holds one
@@ -269,7 +273,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi also receives its native skill and MCP-first AGENTS.md guidance; Prime Agent receives its native skill and CLI guidance because its MCP registration is not yet supported. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
+    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent also receive their native skill and MCP-first AGENTS.md guidance. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -410,6 +414,9 @@ enum ConfigFormat {
     /// Pi uses `mcpServers` with optional `type`, parsed with JSON.parse:
     /// https://github.com/earendil-works/pi/blob/c23b9ec1ef12a63573d739d4c294f81a377b7d57/packages/coding-agent/src/extensions/mcp/config.ts#L81-L99
     Pi,
+    /// `mcpServers` with a required stdio type tag:
+    /// https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/crates/pa-cli/src/mcp_command.rs#L38-L61
+    PrimeAgent,
     CodexToml,
     VscodeServers,
     ZedContextServers,
@@ -710,10 +717,7 @@ enum InstructionFormat {
     /// One managed inline block whose text leads with the MCP tools, for a harness that also
     /// receives an MCP registration from `aise integrations install`.
     InlineBlock,
-    /// The same managed inline block, but its text leads with the CLI, for a harness that gets no
-    /// MCP registration (Prime Agent).
-    /// Telling such an agent to call `search_sessions` sends it to a tool it does not have; the
-    /// observed cost was repeated `aise ... --help` probes before any search ran.
+    /// Historical CLI-only block, retained for upgrade ownership checks.
     InlineCliBlock,
 }
 
@@ -1933,7 +1937,15 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
                 vec!["pi"],
             )
         }],
-        McpClient::PrimeAgent => Vec::new(),
+        McpClient::PrimeAgent => vec![Target {
+            format: ConfigFormat::PrimeAgent,
+            ..json_target_with_detect(
+                "prime-agent",
+                layout.home.join(PRIME_AGENT_DIR).join(PRIME_MCP_FILE),
+                vec![layout.home.join(PRIME_AGENT_DIR)],
+                vec!["prime-agent"],
+            )
+        }],
         McpClient::Cursor => vec![json_target(
             layout,
             "cursor",
@@ -2054,14 +2066,16 @@ fn instruction_targets_for_layout(
         McpClient::Gemini | McpClient::Antigravity => {
             vec![gemini_instruction_target(layout)]
         }
-        McpClient::Pi => vec![InstructionTarget {
-            format: InstructionFormat::InlineBlock,
-            ..pi_family_instruction_target(layout, "pi", PI_AGENT_DIR, "pi")
-        }],
+        McpClient::Pi => vec![pi_family_instruction_target(
+            layout,
+            "pi",
+            PI_AGENT_DIR,
+            "pi",
+        )],
         McpClient::PrimeAgent => vec![pi_family_instruction_target(
             layout,
             "prime-agent",
-            ".prime/agent",
+            PRIME_AGENT_DIR,
             "prime-agent",
         )],
         McpClient::Opencode => vec![InstructionTarget {
@@ -2089,9 +2103,7 @@ fn pi_family_instruction_target(
     InstructionTarget {
         label,
         path: root.join("AGENTS.md"),
-        // Pi-family harnesses receive no MCP registration (`mcp_targets_for_layout`), so their
-        // block must lead with the CLI.
-        format: InstructionFormat::InlineCliBlock,
+        format: InstructionFormat::InlineBlock,
         detect_paths: vec![root],
         detect_binaries: vec![binary],
     }
@@ -2156,7 +2168,7 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
             vec!["agy"],
         ),
         McpClient::Pi => pi_family_skill_layout(layout, PI_AGENT_DIR, "pi"),
-        McpClient::PrimeAgent => pi_family_skill_layout(layout, ".prime/agent", "prime-agent"),
+        McpClient::PrimeAgent => pi_family_skill_layout(layout, PRIME_AGENT_DIR, "prime-agent"),
         _ => return Vec::new(),
     };
     let canonical_root = layout.home.join(".ai-session-search").join("skills");
@@ -3351,12 +3363,12 @@ fn refresh_superseded_mcp_entries(
                             .ok()
                             .flatten()
                             .is_some_and(|text| {
-                                text.lines()
-                                    .any(|line| line.trim() == CLI_INSTRUCTIONS_LINE)
-                                    && matches!(
-                                        refreshed_instruction_block(&text, instruction.format),
-                                        BlockRefresh::Replace(_)
-                                    )
+                                text.lines().any(|line| {
+                                    line.trim() == InstructionFormat::InlineCliBlock.line()
+                                }) && matches!(
+                                    refreshed_instruction_block(&text, instruction.format),
+                                    BlockRefresh::Replace(_)
+                                )
                             })
                 });
         let existing_binary =
@@ -4124,6 +4136,7 @@ fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
     ) = match format {
         ConfigFormat::JsonMcpServers => (&["mcpServers"], &[], Jsonc),
         ConfigFormat::Pi => (&["mcpServers"], &[], Json),
+        ConfigFormat::PrimeAgent => (&["mcpServers"], &[], Json),
         ConfigFormat::VscodeServers => (&["servers"], &[], Jsonc),
         ConfigFormat::ZedContextServers => (&["context_servers"], &[], Jsonc),
         // OpenCode 2 reads `mcp.servers` and ignores servers directly under `mcp`.
@@ -4142,7 +4155,7 @@ fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
 
 fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
     match format {
-        ConfigFormat::VscodeServers => {
+        ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent => {
             json!({"type": "stdio", "command": binary, "args": ["mcp", "serve"]})
         }
         ConfigFormat::OpenCode | ConfigFormat::Kilo => {
@@ -4771,6 +4784,7 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
         }
         ConfigFormat::JsonMcpServers
         | ConfigFormat::Pi
+        | ConfigFormat::PrimeAgent
         | ConfigFormat::VscodeServers
         | ConfigFormat::ZedContextServers
         | ConfigFormat::OpenClaw => {
@@ -4778,8 +4792,10 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
                 .get("command")
                 .and_then(Value::as_str)
                 .is_some_and(|command| !command.is_empty());
-            let type_is_valid = !matches!(format, ConfigFormat::VscodeServers)
-                || entry.get("type").and_then(Value::as_str) == Some("stdio");
+            let type_is_valid = !matches!(
+                format,
+                ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent
+            ) || entry.get("type").and_then(Value::as_str) == Some("stdio");
             command_is_set
                 && type_is_valid
                 && json_array_is_strings(entry.get("args"), &["mcp", "serve"])
@@ -5540,6 +5556,45 @@ mod tests {
     }
 
     #[test]
+    fn prime_agent_requires_stdio_in_strict_json_settings() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let targets = targets_for_layout(McpClient::PrimeAgent, &layout);
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.path, layout.home.join(".prime/agent/settings.json"));
+        fs::create_dir_all(target.path.parent().unwrap()).unwrap();
+        fs::write(&target.path, r#"{"mcpServers":{"ai-session-search":{"command":"/custom/aise","args":["mcp","serve"]},"other":{"type":"http","url":"https://example.com/mcp"}},"theme":"keep"}"#).unwrap();
+        assert_eq!(status_target(target).unwrap(), "stale");
+        publish_planned_mutations(&plan_upsert_target(target, Path::new("/custom/aise")).unwrap())
+            .unwrap();
+        let data: Value = serde_json::from_str(&fs::read_to_string(&target.path).unwrap()).unwrap();
+        assert_eq!(
+            data["mcpServers"][SERVER_NAME],
+            json!({"type":"stdio","command":"/custom/aise","args":["mcp","serve"]})
+        );
+        assert_eq!(data["theme"], "keep");
+        assert_eq!(data["mcpServers"]["other"]["type"], "http");
+        assert_eq!(status_target(target).unwrap(), "configured");
+        assert!(normalize_planned_mutations(
+            plan_upsert_target(target, Path::new("/custom/aise")).unwrap()
+        )
+        .unwrap()
+        .is_empty());
+        assert!(remove_target(target).unwrap());
+        fs::write(&target.path, "{ // not strict JSON\n\"theme\": \"keep\", }").unwrap();
+        assert!(plan_upsert_target(target, Path::new("/custom/aise")).is_err());
+        assert_eq!(
+            instruction_targets_for_layout(McpClient::PrimeAgent, &layout)[0].format,
+            InstructionFormat::InlineBlock
+        );
+    }
+
+    #[test]
     fn pi_registers_stdio_mcp_in_its_strict_json_config() {
         let dir = tempdir().unwrap();
         let layout = ClientLayout::new(
@@ -5579,26 +5634,31 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_registers_mcp_for_an_existing_pi_cli_integration() {
-        let dir = tempdir().unwrap();
-        let (receipt, layout) = home_with_rc1_instructions(dir.path());
-        let instructions = layout.home.join(".pi/agent/AGENTS.md");
-        fs::write(
-            &instructions,
-            instruction_block(InstructionFormat::InlineCliBlock),
-        )
-        .unwrap();
-        refresh_superseded_mcp_entries(&receipt, &layout, || Ok(PathBuf::from("/custom/aise")))
+    fn an_upgrade_registers_mcp_for_existing_pi_family_cli_integrations() {
+        for (agent_dir, config_file) in
+            [(".pi/agent", "mcp.json"), (".prime/agent", "settings.json")]
+        {
+            let dir = tempdir().unwrap();
+            let (receipt, layout) = home_with_rc1_instructions(dir.path());
+            let instructions = layout.home.join(agent_dir).join("AGENTS.md");
+            fs::create_dir_all(instructions.parent().unwrap()).unwrap();
+            fs::write(
+                &instructions,
+                instruction_block(InstructionFormat::InlineCliBlock),
+            )
             .unwrap();
-        refresh_earlier_instruction_blocks(&receipt, &layout).unwrap();
-        let path = layout.home.join(".pi/agent/mcp.json");
-        let data: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(data["mcpServers"][SERVER_NAME]["command"], "/custom/aise");
-        assert_eq!(
-            fs::read_to_string(instructions).unwrap(),
-            instruction_block(InstructionFormat::InlineBlock)
-        );
-        assert!(!layout.home.join(".prime/agent/settings.json").exists());
+            refresh_superseded_mcp_entries(&receipt, &layout, || Ok(PathBuf::from("/custom/aise")))
+                .unwrap();
+            refresh_earlier_instruction_blocks(&receipt, &layout).unwrap();
+            let path = layout.home.join(agent_dir).join(config_file);
+            let data: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(data["mcpServers"][SERVER_NAME]["command"], "/custom/aise");
+            assert_eq!(
+                fs::read_to_string(instructions).unwrap(),
+                instruction_block(InstructionFormat::InlineBlock)
+            );
+            assert!(!layout.home.join(".cursor/mcp.json").exists());
+        }
     }
 
     #[test]
@@ -9005,46 +9065,15 @@ mod tests {
             (McpClient::Pi, ".pi/agent", "pi"),
             (McpClient::PrimeAgent, ".prime/agent", "prime-agent"),
         ] {
-            if client == McpClient::PrimeAgent {
-                assert!(targets_for_layout(client, &layout).is_empty());
-            }
             let instructions = instruction_targets_for_layout(client, &layout);
             assert_eq!(instructions.len(), 1);
             assert_eq!(
                 instructions[0].path,
                 PathBuf::from(format!("/home/test/{agent_dir}/AGENTS.md"))
             );
-            if client == McpClient::PrimeAgent {
-                assert!(matches!(
-                    instructions[0].format,
-                    InstructionFormat::InlineCliBlock
-                ));
-                let block = instruction_block(instructions[0].format);
-                assert!(block.contains("<!-- aise-instructions v1 -->"), "{block}");
-                assert!(
-                    block.contains(
-                        "the `aise` command and the installed skill are the whole integration"
-                    ),
-                    "{block}"
-                );
-                assert!(
-                    block.contains("aise list --path <dir> --when 7d --limit 10"),
-                    "{block}"
-                );
-                assert!(block.contains("aise search \""), "{block}");
-                assert!(block.contains("aise messages search \""), "{block}");
-                assert!(
-                    block.contains("aise messages get <session-id> --seq"),
-                    "{block}"
-                );
-                assert!(block.contains("`ai-session-search` skill"), "{block}");
-                assert!(
-                    !block.contains("call the `ai-session-search` MCP"),
-                    "pi-family block must not lead with the MCP tools: {block}"
-                );
-            } else {
-                assert_eq!(instructions[0].format, InstructionFormat::InlineBlock);
-            }
+            assert_eq!(instructions[0].format, InstructionFormat::InlineBlock);
+            assert!(instruction_block(instructions[0].format)
+                .contains("`ai-session-search` MCP server"));
             assert_eq!(instructions[0].detect_binaries, vec![binary]);
 
             let skills = skill_targets_for_layout(client, &layout);
@@ -9088,14 +9117,7 @@ mod tests {
             let targets = instruction_targets_for(client).unwrap();
             assert_eq!(targets.len(), 1);
             assert!(targets[0].path.ends_with(suffix));
-            assert!(matches!(
-                targets[0].format,
-                format if format == if client == McpClient::Pi {
-                    InstructionFormat::InlineBlock
-                } else {
-                    InstructionFormat::InlineCliBlock
-                }
-            ));
+            assert_eq!(targets[0].format, InstructionFormat::InlineBlock);
         }
         assert!(instruction_targets_for(McpClient::Opencode)
             .unwrap()
