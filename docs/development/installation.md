@@ -129,9 +129,10 @@ The installer adds managed instruction guidance for Claude, Codex, OpenCode, Gem
 Pi, and Prime Agent; Gemini and Antigravity share `~/.gemini/GEMINI.md`, while Pi and Prime use
 `~/.pi/agent/AGENTS.md` and `~/.prime/agent/AGENTS.md`. It does not install hooks.
 
-Pi has no built-in MCP client, and Prime currently accepts remote HTTP MCP servers rather than a
-local stdio subprocess, so selecting either installs its skill and guidance without writing a
-false MCP registration.
+Pi 0.99.0 and newer load the local stdio server from `mcpServers` in
+`~/.pi/agent/mcp.json` (strict JSON) and receive MCP-first guidance. Existing untouched CLI-only
+Pi integrations gain the registration during the post-upgrade refresh. Prime Agent currently
+receives its skill and CLI guidance without an MCP registration.
 
 ### The skill package and its discovery links
 
@@ -174,8 +175,8 @@ Generated guidance introduces the product as **AI Session Search (`aise`)** and 
 four-step workflow with the MCP tool for each: `list_sessions` for recent sessions by directory or
 period, `search_sessions` for a topic, `search_messages` for the exact turn, and `get_session` to
 read it. It names the installed skill and the CLI fallback, and the same wording is the MCP
-server's `initialize` instructions. Pi and Prime Agent, which get no MCP registration, receive
-those four steps as `aise` commands instead.
+server's `initialize` instructions, including Pi's managed block. Prime Agent currently receives
+those four steps as `aise` commands.
 
 Claude's imported `AI_SESSION_SEARCH.md` carries an explicit whole-file ownership sentinel, so an
 upgrade can replace older aise-owned wording while refusing to overwrite user-owned content.
@@ -424,9 +425,10 @@ The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desk
 CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, **Pi**, **Prime Agent**, Cursor, Windsurf, VS
 Code, Zed, **OpenCode**, OpenClaw, and KiloCode. Each target must pass
 install, content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe uninstall
-tests. Pi and Prime Agent acceptance covers native skill discovery, managed `AGENTS.md`, explicit
-selection, status, idempotent reinstall, dry-run, and ownership-safe uninstall, and intentionally
-expects no local stdio MCP target. Antigravity App/IDE and CLI share the current
+tests. Pi acceptance includes its strict-JSON MCP registration and MCP-first guidance. Pi and
+Prime Agent acceptance covers native skill discovery, managed `AGENTS.md`, explicit selection,
+status, idempotent reinstall, dry-run, and ownership-safe uninstall. Prime Agent currently has
+no local stdio MCP target. Antigravity App/IDE and CLI share the current
 `~/.gemini/config/mcp_config.json` while the installer also maintains the two legacy Antigravity
 MCP locations for older harness versions; they use distinct skill roots and share managed
 `~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.servers.ai-session-search`
