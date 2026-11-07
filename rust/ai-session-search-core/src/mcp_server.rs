@@ -8994,6 +8994,22 @@ mod tests {
             crate::util::display_timestamp(until.unwrap()),
             "2026-01-31T23:59:59.999999999Z"
         );
+        // Durations reach MCP through the same dates.rs parser: a window ending now, with `m`
+        // as minutes and `M` as a calendar month.
+        for (duration, start) in [
+            ("2h", "2026-06-15T10:00:00Z"),
+            ("2d", "2026-06-13T12:00:00Z"),
+            ("30m", "2026-06-15T11:30:00Z"),
+            ("1M", "2026-05-15T12:00:00Z"),
+        ] {
+            let (since, until) = parse_date_bounds(&json!({ "when": duration }), now).unwrap();
+            assert_eq!(
+                since.map(crate::util::display_timestamp).as_deref(),
+                Some(start),
+                "{duration}"
+            );
+            assert_eq!(until, Some(now), "{duration}");
+        }
         assert!(
             parse_date_bounds(&json!({ "when": "2026-01", "since": "2026" }), now).is_err(),
             "`when` must stay mutually exclusive with since/until like CLI DateRange"
