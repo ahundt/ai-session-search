@@ -3158,6 +3158,8 @@ pub(crate) enum UpgradeRefresh {
     Checked {
         skills: Vec<SkillWriteOutcome>,
         instructions: Vec<InstructionRefresh>,
+        /// Client config files whose aise MCP entry moved to where the client now reads it.
+        mcp: Vec<PathBuf>,
     },
     /// Another aise process holds the integration lock; the next command tries again.
     Deferred,
@@ -3223,13 +3225,16 @@ fn refresh_integrations_for_version(
         } else {
             write_owned_skills(&roots, receipt_path, false, false)?
         };
-        let instructions = match layout {
-            Some(layout) => refresh_earlier_instruction_blocks(receipt_path, layout)?,
-            None => Vec::new(),
+        let (instructions, mcp) = match layout {
+            Some(layout) => (
+                refresh_earlier_instruction_blocks(receipt_path, layout)?,
+                refresh_superseded_mcp_entries(receipt_path, layout)?,
+            ),
+            None => (Vec::new(), Vec::new()),
         };
-        Ok::<_, anyhow::Error>((skills, instructions))
+        Ok::<_, anyhow::Error>((skills, instructions, mcp))
     })();
-    let (skills, instructions) = match outcome {
+    let (skills, instructions, mcp) = match outcome {
         Ok(checked) => checked,
         Err(error)
             if error
@@ -3248,7 +3253,81 @@ fn refresh_integrations_for_version(
     Ok(UpgradeRefresh::Checked {
         skills,
         instructions,
+        mcp,
     })
+}
+
+/// Move every aise MCP entry an earlier release wrote where its client no longer reads it: a
+/// superseded container (`mcp.<name>` for OpenCode, `mcpServers` for OpenClaw) or a superseded
+/// file (Zed's macOS Application Support settings). The entry is rewritten through the same
+/// planner as `aise integrations install`, with the executable the old entry named, so an upgrade
+/// never changes which binary a client launches. A client with no aise entry in an old place is
+/// left alone, which keeps an upgrade from configuring new clients, and a file aise cannot read
+/// or parse is skipped: `aise integrations install` reports it.
+fn refresh_superseded_mcp_entries(
+    receipt_path: &Path,
+    layout: &ClientLayout,
+) -> Result<Vec<PathBuf>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut mutations = Vec::new();
+    let mut moved = Vec::new();
+    for target in CONCRETE_CLIENTS
+        .into_iter()
+        .flat_map(|client| targets_for_layout(client, layout))
+    {
+        if !seen.insert(target.path.clone()) {
+            continue;
+        }
+        let Some(binary) = superseded_entry_command(&target) else {
+            continue;
+        };
+        if let Ok(planned) = plan_upsert_target(&target, Path::new(&binary)) {
+            mutations.extend(planned);
+            moved.push(target.path.clone());
+        }
+    }
+    let mutations = normalize_planned_mutations(mutations)?;
+    if !mutations.is_empty() {
+        execute_planned_transaction_with_links(receipt_path, &mutations, &[], |_, _| Ok(()))?;
+    }
+    Ok(moved)
+}
+
+/// The executable named by an aise entry left in one of `target`'s superseded places, if any.
+fn superseded_entry_command(target: &Target) -> Option<String> {
+    let layout = json_server_layout(target.format)?;
+    let read = |path: &Path| {
+        let text = read_optional_utf8_regular_file(path).ok().flatten()?;
+        parse_json_object_or_empty(path, Some(&text), layout.syntax).ok()
+    };
+    let in_old_files = target.superseded_paths.iter().find_map(|path| {
+        let root = read(path)?;
+        std::iter::once(layout.container)
+            .chain(layout.superseded.iter().copied())
+            .find_map(|keys| owned_entry_command(&root, keys))
+    });
+    in_old_files.or_else(|| {
+        let root = read(&target.path)?;
+        layout
+            .superseded
+            .iter()
+            .find_map(|keys| owned_entry_command(&root, keys))
+    })
+}
+
+/// The command of aise's entry under `keys`: a string, or the first element of a command array.
+fn owned_entry_command(root: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    let servers = json_container(root, keys)?;
+    std::iter::once(SERVER_NAME)
+        .chain(LEGACY_SERVER_NAMES)
+        .find_map(|name| {
+            let command = servers.get(name)?.get("command")?;
+            command
+                .as_str()
+                .or_else(|| command.as_array()?.first()?.as_str())
+                .filter(|command| !command.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// Replace every client instruction block that holds text an earlier release wrote.
@@ -3434,7 +3513,15 @@ pub(crate) fn refresh_integrations_after_upgrade_and_report(
         Ok(UpgradeRefresh::Checked {
             skills,
             instructions,
+            mcp,
         }) => {
+            for path in mcp {
+                eprintln!(
+                    "aise: moved the aise MCP server entry in {} to where its client reads it, \
+                     for {version}",
+                    path.display()
+                );
+            }
             for outcome in skills {
                 if let Some(problem) = outcome.problem {
                     eprintln!(
@@ -7021,6 +7108,50 @@ mod tests {
         .unwrap();
         let layout = ClientLayout::new(home.clone(), home.join(".config"), ClientPlatform::Linux);
         (receipt, layout)
+    }
+
+    /// An upgrade needs nothing beyond replacing the executable (scripts/verify_upgrade_path.py),
+    /// so an MCP entry an earlier release wrote where its client no longer reads it is moved by the
+    /// first command after the upgrade, keeping the executable that entry names.
+    #[test]
+    fn an_upgrade_moves_mcp_entries_out_of_places_their_client_no_longer_reads() {
+        let dir = tempdir().unwrap();
+        let (receipt, layout) = home_with_rc1_instructions(dir.path());
+        let home = layout.home.clone();
+        let opencode = home.join(".config/opencode/opencode.json");
+        fs::create_dir_all(opencode.parent().unwrap()).unwrap();
+        fs::write(
+            &opencode,
+            r#"{"mcp":{"ai-session-search":{"command":["/custom/aise","mcp","serve"],"enabled":true}}}"#,
+        )
+        .unwrap();
+        let openclaw = home.join(".openclaw/openclaw.json");
+        fs::create_dir_all(openclaw.parent().unwrap()).unwrap();
+        fs::write(
+            &openclaw,
+            "{ gateway: { port: 1 }, mcpServers: { 'ai-session-search': { command: '/custom/aise', args: ['mcp', 'serve'] } } }\n",
+        )
+        .unwrap();
+
+        let UpgradeRefresh::Checked { mcp, .. } =
+            refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap()
+        else {
+            panic!("the recorded install must be checked");
+        };
+        assert_eq!(mcp, [opencode.clone(), openclaw.clone()]);
+        for client in [McpClient::Opencode, McpClient::Openclaw] {
+            let target = targets_for_layout(client, &layout).remove(0);
+            assert_eq!(status_target(&target).unwrap(), "configured", "{client:?}");
+        }
+        let data: Value = serde_json::from_str(&fs::read_to_string(&opencode).unwrap()).unwrap();
+        assert_eq!(
+            data["mcp"]["servers"][SERVER_NAME]["command"][0], "/custom/aise",
+            "the executable the earlier entry named is kept"
+        );
+        assert!(
+            !home.join(".config/zed/settings.json").exists(),
+            "a client with no aise entry is never configured by an upgrade"
+        );
     }
 
     #[test]
