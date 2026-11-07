@@ -733,15 +733,13 @@ fn is_codex_injected_context(text: &str) -> bool {
 /// The other form of the same rollout: `x.jsonl` for `x.jsonl.zst`, and the reverse. The two are
 /// one source, so the index keeps one session for them whichever form is on disk.
 pub(crate) fn rollout_sibling(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    let sibling = if let Some(plain) = name.strip_suffix(".zst") {
-        plain.ends_with(".jsonl").then(|| plain.to_string())?
-    } else if name.ends_with(".jsonl") {
-        format!("{name}.zst")
+    if crate::source::is_compressed_jsonl(path) {
+        Some(path.with_extension(""))
+    } else if path.extension() == Some(std::ffi::OsStr::new("jsonl")) {
+        Some(path.with_extension("jsonl.zst"))
     } else {
-        return None;
-    };
-    Some(path.with_file_name(sibling))
+        None
+    }
 }
 
 pub(crate) fn codex_home_from_session_root(root: &Path) -> PathBuf {
@@ -976,6 +974,19 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rollout_name_that_is_not_utf8_is_still_recognized_and_paired() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let compressed = Path::new(OsStr::from_bytes(b"/x/rollout-\xff.jsonl.zst"));
+        let plain = Path::new(OsStr::from_bytes(b"/x/rollout-\xff.jsonl"));
+        assert!(crate::source::is_compressed_jsonl(compressed));
+        assert_eq!(super::rollout_sibling(compressed).as_deref(), Some(plain));
+        assert_eq!(super::rollout_sibling(plain).as_deref(), Some(compressed));
+        assert_eq!(super::rollout_sibling(Path::new("/x/notes.txt")), None);
     }
 
     #[test]
