@@ -44,6 +44,12 @@ const PRIME_MCP_FILE: &str = "settings.json";
 /// Cursor's global MCP location:
 /// https://cursor.com/docs/mcp#configuration-locations
 const CURSOR_MCP_PATH: &str = ".cursor/mcp.json";
+/// Claude Code's user-scoped MCP file:
+/// https://code.claude.com/docs/en/mcp#mcp-installation-scopes
+const CLAUDE_USER_MCP_FILE: &str = ".claude.json";
+/// Former aise global target. Claude documents `.mcp.json` only at the project root:
+/// https://code.claude.com/docs/en/claude-directory#choose-the-right-file
+const CLAUDE_SUPERSEDED_MCP_PATH: &str = ".claude/.mcp.json";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
@@ -1862,18 +1868,15 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             .filter(target_detected)
             .collect(),
         McpClient::Claude => vec![
-            json_target_with_detect(
-                "claude code modern",
-                layout.home.join(".claude.json"),
-                vec![layout.home.join(".claude")],
-                vec!["claude"],
-            ),
-            json_target_with_detect(
-                "claude code legacy",
-                layout.home.join(".claude").join(".mcp.json"),
-                vec![layout.home.join(".claude")],
-                vec!["claude"],
-            ),
+            Target {
+                superseded_paths: vec![layout.home.join(CLAUDE_SUPERSEDED_MCP_PATH)],
+                ..json_target_with_detect(
+                    "claude code modern",
+                    layout.home.join(CLAUDE_USER_MCP_FILE),
+                    vec![layout.home.join(".claude")],
+                    vec!["claude"],
+                )
+            },
             json_target_with_detect(
                 "claude desktop",
                 layout
@@ -5570,6 +5573,67 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn claude_legacy_file_is_only_a_superseded_path() {
+        for action in ["install", "upgrade", "uninstall"] {
+            let dir = tempdir().unwrap();
+            let (receipt, layout) = home_with_rc1_instructions(dir.path());
+            let targets = targets_for_layout(McpClient::Claude, &layout);
+            assert_eq!(targets.len(), 2);
+            let target = targets
+                .iter()
+                .find(|target| target.label == "claude code modern")
+                .unwrap();
+            let legacy = layout.home.join(".claude/.mcp.json");
+            assert_eq!(target.superseded_paths, std::slice::from_ref(&legacy));
+            assert!(!targets.iter().any(|target| target.path == legacy));
+            let original = "{ // keep comment\n\"mcpServers\":{\"ai-session-search\":{\"command\":\"/custom/aise\",\"args\":[\"mcp\",\"serve\"]},\"ai_session_search\":{\"command\":\"/custom/aise\"},\"aise\":{\"command\":\"/custom/aise\"},\"other\":{\"command\":\"keep\"}},\"keep\":true}\n";
+            fs::write(&legacy, original).unwrap();
+            assert_eq!(status_target(target).unwrap(), "stale");
+            match action {
+                "install" => {
+                    let planned = plan_upsert_target(target, Path::new("/custom/aise")).unwrap();
+                    assert_eq!(
+                        fs::read_to_string(&legacy).unwrap(),
+                        original,
+                        "planning is read-only"
+                    );
+                    publish_planned_mutations(&planned).unwrap();
+                }
+                "upgrade" => {
+                    refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap();
+                }
+                "uninstall" => {
+                    assert!(remove_target(target).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            let old = fs::read_to_string(&legacy).unwrap();
+            assert!(old.contains("// keep comment"));
+            let old = parse_json_object_or_empty(&legacy, Some(&old), JsonSyntax::Jsonc).unwrap();
+            assert_eq!(old["mcpServers"], json!({"other":{"command":"keep"}}));
+            assert_eq!(old["keep"], true);
+            if action == "uninstall" {
+                assert!(!target.path.exists());
+            } else {
+                assert_eq!(status_target(target).unwrap(), "configured");
+                let modern: Value =
+                    serde_json::from_str(&fs::read_to_string(&target.path).unwrap()).unwrap();
+                assert_eq!(modern["mcpServers"][SERVER_NAME]["command"], "/custom/aise");
+            }
+        }
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let target = targets_for_layout(McpClient::Claude, &layout).remove(0);
+        publish_planned_mutations(&plan_upsert_target(&target, Path::new("/custom/aise")).unwrap())
+            .unwrap();
+        assert!(!layout.home.join(".claude/.mcp.json").exists());
     }
 
     #[test]
@@ -9378,7 +9442,7 @@ mod tests {
         assert!(targets
             .iter()
             .any(|target| target.label == "claude code modern"));
-        assert!(targets
+        assert!(!targets
             .iter()
             .any(|target| target.label == "claude code legacy"));
         assert!(targets

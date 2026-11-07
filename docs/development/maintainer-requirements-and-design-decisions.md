@@ -465,7 +465,7 @@ Do not claim end-to-end support from a configured JSON key or an MCP handshake a
 
 | Harness surface | MCP configuration | Skill discovery | Managed instruction |
 | --- | --- | --- | --- |
-| Claude Code | `~/.claude.json`; legacy `~/.claude/.mcp.json` | `~/.claude/skills` | `~/.claude/CLAUDE.md` |
+| Claude Code | `~/.claude.json`; `~/.claude/.mcp.json` is superseded cleanup only | `~/.claude/skills` | `~/.claude/CLAUDE.md` |
 | Claude Desktop local agent | platform Claude `claude_desktop_config.json` | shared Claude behavior where supported | Claude guidance |
 | ChatGPT Codex desktop and Codex CLI/IDE | shared `~/.codex/config.toml` | `~/.agents/skills` | `~/.codex/AGENTS.md` |
 | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/skills` | `~/.gemini/GEMINI.md` |

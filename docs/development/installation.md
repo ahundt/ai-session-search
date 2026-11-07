@@ -123,6 +123,12 @@ reads in VS Code, JetBrains and the CLI, and keeps the entry in the VS Code exte
 `mcp_settings.json`, which only older extensions and Kilo 7 inside VS Code read. Both name the
 same server, so Kilo loads it once.
 
+Claude Code receives its user MCP registration in `~/.claude.json`. The installer no longer
+writes `~/.claude/.mcp.json`: [Claude documents `.mcp.json` at the project root only](https://code.claude.com/docs/en/mcp#mcp-installation-scopes).
+Install and uninstall remove aise entries from that former global target while preserving
+comments, other servers, and other settings. The post-upgrade refresh moves an existing entry
+to `~/.claude.json`, keeping its executable path.
+
 Cursor receives `type: "stdio"` under `mcpServers` in `~/.cursor/mcp.json`, as required by
 [its STDIO field reference](https://cursor.com/docs/mcp#stdio-server-configuration). The
 post-upgrade refresh adds the field to earlier untyped aise registrations, keeping their

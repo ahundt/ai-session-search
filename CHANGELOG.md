@@ -134,6 +134,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 17. Cursor receives the required `type: "stdio"` in `~/.cursor/mcp.json`. aise omitted the
     field; install and the post-upgrade refresh now add it to earlier untyped registrations.
 
+18. Claude Code no longer receives an aise entry in `~/.claude/.mcp.json`, which is not its
+    user MCP configuration. Install writes `~/.claude.json` and removes aise entries from the old
+    file; the post-upgrade refresh also moves an entry left there, preserving other content.
+
 ### Performance
 
 1. Limited literal and regex searches stop once the page is full. On an index of 5.7 million
