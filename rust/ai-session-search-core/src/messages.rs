@@ -824,8 +824,8 @@ pub struct MessageGetArgs {
     /// Session id or prefix.
     pub id: String,
     /// Select a 0-based sequence number and return a focused window instead of the whole
-    /// session. A sequence held by several messages returns all of them, in the order they were indexed. A
-    /// sequence past the session's end returns no rows. Omit to read the whole session.
+    /// session. A sequence held by several messages returns all of them, in the order they were
+    /// indexed. A sequence past the session's end returns no rows. Omit to read the whole session.
     #[arg(long)]
     pub seq: Option<i64>,
     /// With --seq, include this many neighboring messages (0 or greater) before and after the

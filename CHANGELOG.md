@@ -11,6 +11,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+1. `Db::classify_injected_messages` labels legacy user-role harness output as harness notices
+   and deletes nothing (Fixed item 6).
+
+### Deprecated
+
+1. `Db::purge_injected_messages` now relabels instead of deleting, through
+   `Db::classify_injected_messages`; call that instead.
+
 ### Fixed
 
 1. Text whose case SQLite's full-text tokenizer does not fold is found again. Cherokee, normally
@@ -30,7 +40,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    filters; both now page in one order whatever filters are set. Context windows and file-edit history,
    which replays several edits made by one message in the order they were written, end on the
    same tie-breaker.
-
 5. Appending new messages to an indexed session no longer reuses a sequence number. The
    index migration deletes harness-injected rows without renumbering the rest, and the
    incremental append then numbered new messages from the row count, which falls below the
@@ -43,8 +52,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    `<turn_aborted>` or `<local-command-*>` after every full reindex, removing records the
    parsers now keep on purpose and leaving the sequence gaps behind item 5. It now labels
    such rows as harness notices, which default search, corrections and repeat mining already
-   leave out, and deletes nothing. `Db::purge_injected_messages` is deprecated in favour of
-   `Db::classify_injected_messages`.
+   leave out, and deletes nothing.
 7. Reindexing a session whose source got smaller or was rewritten no longer deletes what aise
    already stored. Harnesses compact, rewrite and prune their own transcripts: one Codex session
    went from 4,720 indexed messages to 16 after Codex rewrote its file, because a re-parse that
