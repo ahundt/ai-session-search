@@ -19,7 +19,7 @@ BENCHMARK_JSON_PREFIX = "AISE_BENCHMARK_JSON="
 
 def load_relevance(path: Path) -> dict[str, Any]:
     matches = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if BENCHMARK_JSON_PREFIX in line:
             payload = line.split(BENCHMARK_JSON_PREFIX, 1)[1]
             row = cast(dict[str, Any], json.loads(payload))
@@ -35,7 +35,7 @@ def load(
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     run: dict[str, Any] | None = None
     samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         row = json.loads(line)
         if row.get("build") != build:
             continue
@@ -293,7 +293,7 @@ def render(
     contracts = candidate_run.get("contracts")
     if contracts is None:
         # Compatibility for private evidence produced before contracts were embedded.
-        manifest = json.loads(Path(candidate_run["metadata"]["manifest"]).read_text())
+        manifest = json.loads(Path(candidate_run["metadata"]["manifest"]).read_text(encoding="utf-8"))
         contracts = {case["id"]: case for case in manifest["cases"]}
     semantic_mismatches = [
         case for case in shared
@@ -503,12 +503,12 @@ def main() -> int:
     )
     output = Path(args.output)
     if args.check:
-        if not output.exists() or output.read_text() != content:
+        if not output.exists() or output.read_text(encoding="utf-8") != content:
             raise SystemExit(f"generated report differs: {output}")
         print(f"report cross-check passed: {output}")
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(content)
+        output.write_text(content, encoding="utf-8")
         print(output)
     return 0
 

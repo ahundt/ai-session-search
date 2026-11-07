@@ -76,9 +76,11 @@ identity and does not determine priority.
   presentation policy, completeness, and whether the selected field has text before or after each
   returned view so shortened output cannot look complete.
 - `REQ007-preserve-page-identity` — Evidence, context, formatting, or presenter failures must not
-  change offsets, next-page identity, or the selected result set.
+  change offsets, next-page identity, or the selected result set; every published order is
+  total, ending on the row id, because `(session_id, seq)` can repeat.
 - `REQ008-reject-hidden-cutoffs` — Do not add silent row, byte, content, or elapsed-time cutoffs;
-  expose intentional bounds as named parameters with origins.
+  expose intentional bounds as named parameters with origins. A candidate prefilter must stay a
+  superset of the verifier under the index tokenizer's own case folding.
 - `REQ009-bound-fuzzy-search` — Score the complete eligible fuzzy corpus while retaining a finite,
   deterministic top-K page; reject unbounded fuzzy requests.
 - `REQ011-validate-language-boundaries` — Keep PyO3 conversions, Rust types, Python stubs,

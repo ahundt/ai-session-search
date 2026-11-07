@@ -3935,25 +3935,26 @@ fn match_view_max_chars(
 
 /// Where `lowered_query` sits in `selected`, in source characters.
 ///
-/// `lowered_query` is folded by [`crate::util::fold_caseless`] and this folds the text the same
-/// way, so the range it reports is the range the matcher that selected the row agreed on. Folding
-/// the two sides by different rules located nothing for text they spelled differently, and the
-/// caller then showed the head of the field as evidence for a match found elsewhere in it.
+/// `lowered_query` is folded by [`crate::util::fold_caseless`], and this asks the same matcher
+/// that selected the row where it matched, so the two cannot disagree. Locating the match by a
+/// second rule found nothing for text the two sides spelled differently, and the caller then
+/// showed the head of the field as evidence for a match found elsewhere in it.
+///
+/// The matcher reports a byte range over `selected` itself, already widened to whole characters,
+/// so converting it costs two counting passes bounded by the match's end and nothing is
+/// allocated. The previous implementation materialized a folded copy of the whole field plus a
+/// `usize` per folded character to map back, which on this project's own index reached about
+/// 8 MB of folded text and 64 MB of mapping for a 500-result page, and about 5 MB and 41 MB for
+/// its single largest message, to locate matches that are then trimmed to the view budget.
 fn literal_char_range(selected: &str, lowered_query: &str) -> Option<FieldCharRange> {
-    let mut lowered = String::new();
-    let mut original_char_for_lowered = Vec::new();
-    for (original_char, value) in selected.chars().enumerate() {
-        for lowered_char in crate::util::fold_caseless_char(value) {
-            lowered.push(lowered_char);
-            original_char_for_lowered.push(original_char);
-        }
-    }
-    let start_byte = lowered.find(lowered_query)?;
-    let start_lowered = lowered[..start_byte].chars().count();
-    let end_lowered = start_lowered + lowered_query.chars().count();
+    let found = crate::util::UnicodeLowerNeedle::from_lowered(lowered_query)
+        .find_in_while(selected, || true)
+        .expect("the unconditional matcher cannot cancel")?;
+    let field_start_char = selected[..found.start].chars().count();
+    let field_end_char_exclusive = field_start_char + selected[found].chars().count();
     Some(FieldCharRange {
-        field_start_char: original_char_for_lowered[start_lowered],
-        field_end_char_exclusive: original_char_for_lowered[end_lowered - 1] + 1,
+        field_start_char,
+        field_end_char_exclusive,
     })
 }
 
@@ -4120,6 +4121,140 @@ fn boundary_evidence(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// The reported character range brackets the match the matcher found, for every shared case.
+    ///
+    /// This is the range published as `field_start_char` and `field_end_char`, and it is what
+    /// centers the snippet a reader sees. Locating it by a second rule is what
+    /// [`crate::util::UnicodeLowerNeedle`] documents as the hazard of a fast path, so this drives
+    /// the one in use from [`crate::util::CASELESS_CASES`], the same table the matcher, `find_in`
+    /// and the SQL scalar answer, and asserts the property rather than the implementation: slicing
+    /// the field at the reported characters yields text whose fold holds the needle. A range that
+    /// merely exists, or that points at the head of the field, fails that.
+    #[test]
+    fn the_reported_character_range_brackets_the_match_for_every_shared_case() {
+        for case in crate::util::CASELESS_CASES {
+            let lowered_query = crate::util::fold_caseless(case.needle);
+            let range = literal_char_range(case.haystack, &lowered_query);
+            assert_eq!(
+                range.is_some(),
+                case.contains,
+                "{}: haystack={:?}, needle={:?}",
+                case.why,
+                case.haystack,
+                case.needle
+            );
+            let Some(range) = range else { continue };
+            let chars: Vec<char> = case.haystack.chars().collect();
+            assert!(
+                range.field_end_char_exclusive <= chars.len()
+                    && range.field_start_char <= range.field_end_char_exclusive,
+                "{}: range {}..{} is outside a field of {} characters",
+                case.why,
+                range.field_start_char,
+                range.field_end_char_exclusive,
+                chars.len()
+            );
+            let slice: String = chars[range.field_start_char..range.field_end_char_exclusive]
+                .iter()
+                .collect();
+            assert!(
+                crate::util::fold_caseless(&slice).contains(&lowered_query),
+                "{}: characters {}..{} of {:?} are {:?}, which does not hold {:?}",
+                case.why,
+                range.field_start_char,
+                range.field_end_char_exclusive,
+                case.haystack,
+                slice,
+                case.needle
+            );
+        }
+    }
+
+    /// The published character range is the one 1.0.0 published, over generated text.
+    ///
+    /// The test above checks that a range holds the needle, which a range moved to a later
+    /// occurrence also satisfies, while `field_start_char` changes for every client reading it.
+    /// So this keeps 1.0.0's implementation verbatim as the oracle (fold the whole field with a
+    /// source-character map, `str::find` the leftmost match, map both ends back) and requires
+    /// equality, over the alphabet whose folds disagree: the three sigmas, dotted capital I that
+    /// folds to two scalars, sharp s, an accented pair, Cyrillic and an astral scalar, mixed into
+    /// ASCII. Half the needles are cut from the haystack, so matches are frequent. Fixed-seed
+    /// xorshift, so a failure names its iteration and reproduces everywhere.
+    #[test]
+    fn the_reported_character_range_equals_the_one_published_by_1_0_0() {
+        fn range_1_0_0(selected: &str, lowered_query: &str) -> Option<FieldCharRange> {
+            let mut lowered = String::new();
+            let mut original_char_for_lowered = Vec::new();
+            for (original_char, value) in selected.chars().enumerate() {
+                for lowered_char in crate::util::fold_caseless_char(value) {
+                    lowered.push(lowered_char);
+                    original_char_for_lowered.push(original_char);
+                }
+            }
+            let start_byte = lowered.find(lowered_query)?;
+            let start_lowered = lowered[..start_byte].chars().count();
+            let end_lowered = start_lowered + lowered_query.chars().count();
+            Some(FieldCharRange {
+                field_start_char: original_char_for_lowered[start_lowered],
+                field_end_char_exclusive: original_char_for_lowered[end_lowered - 1] + 1,
+            })
+        }
+
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'i', 's', 't', ' ', 'A', 'I', 'S', 'Σ', 'σ', 'ς', 'İ', 'ß', 'É', 'é', 'М',
+            'м', '😀',
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut matched = 0_u32;
+        for iteration in 0..20_000_u32 {
+            let haystack: String = (0..(next() % 32))
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                .collect();
+            let needle: String = if next() % 2 == 0 && !haystack.is_empty() {
+                let bounds: Vec<usize> = haystack
+                    .char_indices()
+                    .map(|(offset, _)| offset)
+                    .chain([haystack.len()])
+                    .collect();
+                let a = bounds[(next() % bounds.len() as u64) as usize];
+                let b = bounds[(next() % bounds.len() as u64) as usize];
+                haystack[a.min(b)..a.max(b)].to_string()
+            } else {
+                (1..=(1 + next() % 4))
+                    .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                    .collect()
+            };
+            let lowered_query = crate::util::fold_caseless(&needle);
+            // Literal search never runs an empty needle, and 1.0.0's mapping indexes
+            // `end_lowered - 1`, so an empty one is outside both contracts.
+            if lowered_query.is_empty() {
+                continue;
+            }
+            let expected = range_1_0_0(&haystack, &lowered_query);
+            let actual = literal_char_range(&haystack, &lowered_query);
+            assert_eq!(
+                actual
+                    .as_ref()
+                    .map(|r| (r.field_start_char, r.field_end_char_exclusive)),
+                expected
+                    .as_ref()
+                    .map(|r| (r.field_start_char, r.field_end_char_exclusive)),
+                "iteration {iteration}: haystack={haystack:?}, needle={needle:?}"
+            );
+            matched += u32::from(expected.is_some());
+        }
+        assert!(
+            matched > 2_000,
+            "only {matched} matches; the sweep barely exercised a hit"
+        );
+    }
 
     fn hit(content: impl Into<String>) -> crate::models::MessageHit {
         crate::models::MessageHit {

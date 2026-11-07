@@ -29,7 +29,8 @@ use crate::models::{
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
-    fold_caseless, snippet_from_match, snippet_from_match_while, UnicodeLowerNeedle, SIGMAS,
+    fold_caseless, parse_datetime, snippet_from_match, snippet_from_match_while,
+    UnicodeLowerNeedle, SIGMAS,
 };
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
@@ -52,7 +53,8 @@ use crate::util::{
 ///      builds lazily on first regex use (no per-row trigram work during reindex).
 ///   2: semantic message kinds and tool-call IDs are populated by the provider parsers.
 ///   3: codex `<turn_aborted>` harness-control records are excluded from user messages; the
-///      post-reindex archive purge also removes them when their source transcript is unavailable.
+///      post-reindex pass reclassifies legacy rows of that shape as harness notices, including
+///      rows whose source transcript is unavailable (see [`Db::classify_injected_messages`]).
 ///   4: exact/regex message substring acceleration uses SQLite FTS5 word+trigram indexes.
 ///   5: message authorship, mixed-content part ranges, and source-authoritative mirror
 ///      correlations are persisted for SQL-first behavioral analysis. Existing rows remain
@@ -158,6 +160,33 @@ pub enum MessageOrder {
     NewestFirst,
 }
 
+impl MessageOrder {
+    /// The published message order as a SQL clause, for a statement whose `messages` row is
+    /// aliased `m`.
+    ///
+    /// `(session_id, seq)` does not identify a message. A live 5,736,231-row index holds three
+    /// groups tied on it, and `idx_messages_session_seq` is not unique, so the row id ends the
+    /// clause and makes the order total. Three properties depend on that:
+    ///
+    /// - Offset pagination stays coherent. Every page is its own query, so a tie free to come
+    ///   back in either order can drop a row between two pages or repeat it in both.
+    /// - [`MessageOrder::NewestFirst`] is the exact reverse of [`MessageOrder::OldestFirst`].
+    ///   Reversing only the key left a tie in ascending row order in both directions: on a
+    ///   four-row table tied at ids 20 and 21, oldest gave [10, 20, 21, 30] and newest gave
+    ///   [30, 20, 21, 10], where the reverse of oldest is [30, 21, 20, 10].
+    /// - `idx_messages_session_seq` satisfies the `OldestFirst` clause outright, because its key
+    ///   order is `(session_id, seq, rowid)`. The `INDEXED BY` page plan in
+    ///   [`Db::ordered_page_index_hint`] is therefore order-correct by construction rather than
+    ///   correct only while the sorter happens to agree on ties. SQLite still plans it without
+    ///   `USE TEMP B-TREE FOR ORDER BY`, which the page-plan tests assert.
+    pub(crate) fn order_by_clause(self) -> &'static str {
+        match self {
+            MessageOrder::NewestFirst => " order by m.session_id, m.seq desc, m.id desc",
+            MessageOrder::OldestFirst => " order by m.session_id, m.seq, m.id",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MessageBatchControl {
     Continue,
@@ -242,6 +271,25 @@ const SQLITE_PAGE_CACHE_KIB: i64 = 64 * 1_024;
 /// not eagerly allocated resident memory, and SQLite/OS may choose a lower platform-safe value.
 const SQLITE_MMAP_BYTES: i64 = 256 * 1_024 * 1_024;
 
+/// Trigram candidates a limited content page needs before it takes its order from
+/// `idx_messages_session_seq` instead of sorting every verified candidate.
+///
+/// Both plans return the same rows in the same order; they differ in how much they verify. Sorting
+/// rows that carry `content` cannot emit row 1 until the last candidate is verified, so its cost is
+/// `candidates x verify`, measured at 64-133 us per candidate across five queries spanning 15 K to
+/// 1.2 M candidates on a 5.7 M-message index. Taking the order from the index stops at `limit`
+/// matches, and its worst case -- fewer matches than the limit, so the scan reaches the end of the
+/// corpus -- is one full index scan, measured at 511 ms warm for 5.7 M rows.
+///
+/// So the index-ordered plan wins whenever `candidates x verify` exceeds a full index scan, and the
+/// floor is where those meet: 511 ms / 100 us is about 5 K candidates. Below it the sort is already
+/// cheap and the scan would be pure overhead (measured 60 ms against 371 ms at 5 candidates); above
+/// it the saving grows without bound (`aise messages search "session"` verified 1,216,643 candidates
+/// in 77.5 s to return 50 rows). The floor is deliberately the break-even point rather than a
+/// safety margin above it, because the loss below it is bounded by one index scan while the gain
+/// above it is not bounded at all.
+const ORDERED_PAGE_CANDIDATE_FLOOR: i64 = 5_000;
+
 /// Partial covering index over the classes the default search predicate can exclude
 /// ([`crate::models::MessageKind::EXCLUDABLE_BY_DEFAULT`]). It exists for one statement: the
 /// receipt's corpus denominator, `count(rows the structural filters admit)`, whose class clause
@@ -316,6 +364,13 @@ const CORRECTION_CANDIDATES_SQL: &str =
                )
            )
        )";
+/// Published order of correction candidates, newest first. Timestamp alone is not a total order:
+/// providers may omit it and several messages may share one. Nor is `(session_id, seq)`, which is
+/// not unique, so the row id ends the order; without it SQLite returns tied rows in whichever
+/// direction the chosen index is read (descending when `idx_messages_role_ts` serves `ts desc`,
+/// ascending under a session filter). A total order makes offset pages reproducible and
+/// non-overlapping across the CLI, Rust, Python, and MCP adapters.
+const CORRECTION_ORDER_SQL: &str = " order by m.ts desc, m.session_id asc, m.seq asc, m.id asc";
 const CORRECTION_HUMAN_PARTS_SQL: &str = "select m.id, p.start_char, p.end_char
      from messages m
      join message_content_parts p on p.message_id = m.id
@@ -1808,6 +1863,13 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Persist a full parse of a session's source, for sources that only ever grow.
+    ///
+    /// When the stored rows are a dense prefix of the parse and the last stored row still
+    /// matches the parse at that seq, only the new tail is inserted. Earlier stored rows are
+    /// not compared, so a source rewritten before that boundary keeps its stale rows; use
+    /// [`Db::replace_session`] for sources that can be rewritten. Otherwise this behaves like
+    /// `replace_session`.
     pub fn upsert_session(
         &self,
         parsed: &ParsedSession,
@@ -1817,10 +1879,17 @@ impl Db {
         self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true, &[])
     }
 
-    /// Persist a fully re-parsed session and force message/file rows to be replaced, even
-    /// when the new parse appears to be an append-only growth of the old rows. Use this
-    /// for explicit full reindex/backfill paths so parser/schema fixes repair existing
-    /// rows instead of preserving a stale prefix for performance.
+    /// Persist a full parse of a session's source without the append shortcut, comparing every
+    /// stored row against the parse:
+    ///
+    /// - rows equal to the parse are left untouched;
+    /// - a new parser version replaces the rows, so parser fixes repair them;
+    /// - under the same parser, messages and file edits are decided separately: a parse that
+    ///   still holds every stored row of that kind replaces them, and one that no longer holds a
+    ///   stored row keeps it, because harnesses compact, rewrite and prune their own transcripts
+    ///   and the index is the archive. Rows only the parse holds are added, and the session's
+    ///   text, date span and message count then describe both. A message counts as held when
+    ///   the parse has one with the same role and text.
     pub fn replace_session(
         &self,
         parsed: &ParsedSession,
@@ -1855,30 +1924,85 @@ impl Db {
         allow_append_optimization: bool,
         source_aliases: &[String],
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        // IMMEDIATE takes the write lock before the first read, so another writer committing
+        // between this transaction's reads and its first write cannot fail the upgrade with
+        // SQLITE_BUSY, which the busy handler does not retry for a deferred transaction.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let session = &parsed.session;
+        // Every path this source may have been indexed under: its own and its verified aliases.
+        let source_paths: Vec<&str> = std::iter::once(session.source_path.as_str())
+            .chain(
+                source_aliases
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|alias| *alias != session.source_path),
+            )
+            .collect();
+        // The parser version this source was last indexed with, read before anything below
+        // replaces it. Content identifies a message only while the parser that rendered it is
+        // unchanged; see `store_parsed_messages`.
+        let mut previous_parse_version: Option<String> = None;
+        for path in &source_paths {
+            previous_parse_version = tx
+                .query_row(
+                    "select parse_version from files_seen where provider = ?1 and source_path = ?2",
+                    params![session.provider.as_str(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous_parse_version.is_some() {
+                break;
+            }
+        }
+        let same_parser = previous_parse_version.as_deref() == Some(session.parse_version.as_str());
         // A complete source parse represents one canonical session. Parser improvements or
-        // mutable sidecar metadata can change the provider session ID; remove prior identities
-        // for this provider/source in the same transaction before publishing the replacement.
-        // Preserve unrelated providers even if they happen to name the same filesystem path.
-        for alias in source_aliases
-            .iter()
-            .filter(|alias| alias.as_str() != session.source_path)
-        {
-            tx.execute(
-                "delete from sessions where provider = ?1 and source_path = ?2",
-                params![session.provider.as_str(), alias],
+        // mutable sidecar metadata can change the provider session ID, and a verified alias can
+        // move the source path. Earlier identities for this provider and source are retired
+        // after the replacement session row exists (below), and their stored rows move to it.
+        // Unrelated providers naming the same path are kept.
+        let mut retired_ids: Vec<String> = Vec::new();
+        for path in &source_paths {
+            let mut statement = tx.prepare(
+                "select id from sessions where provider = ?1 and source_path = ?2 and id != ?3
+                 order by id",
             )?;
+            let ids = statement
+                .query_map(
+                    params![session.provider.as_str(), path, session.id],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            retired_ids.extend(ids);
+        }
+        // The date span and session text of every identity this parse replaces, read before the
+        // upsert overwrites them. Only an archive keep, which retains rows the parse lacks, uses
+        // them; the parse speaks for everything else.
+        // Dates are compared as instants: stored RFC 3339 text orders correctly only within one
+        // UTC offset.
+        let mut prior_dates: Vec<SessionDates> = Vec::new();
+        for id in std::iter::once(&session.id).chain(&retired_ids) {
+            prior_dates.extend(stored_session_dates(&tx, id)?);
+        }
+        let mut prior_transcripts: Vec<String> = Vec::new();
+        for id in &retired_ids {
+            prior_transcripts.extend(
+                tx.query_row(
+                    "select transcript_text from transcripts where session_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            );
+        }
+        for alias in &source_paths[1..] {
             tx.execute(
                 "delete from files_seen where provider = ?1 and source_path = ?2",
                 params![session.provider.as_str(), alias],
             )?;
         }
-        tx.execute(
-            "delete from sessions
-             where provider = ?1 and source_path = ?2 and id != ?3",
-            params![session.provider.as_str(), session.source_path, session.id],
-        )?;
         tx.execute(
             "
             insert into sessions (
@@ -1932,14 +2056,12 @@ impl Db {
                 session.agent_label,
             ],
         )?;
-        tx.execute(
-            "
-            insert into transcripts (session_id, transcript_text)
-            values (?1, ?2)
-            on conflict(session_id) do update set transcript_text = excluded.transcript_text
-            ",
-            params![session.id, parsed.transcript_text],
-        )?;
+        // Move each retired identity's stored rows to the replacement session, then retire the
+        // identity; rows the replacement already holds go with it through the cascade.
+        for retired in &retired_ids {
+            move_retired_rows(&tx, &session.id, retired)?;
+            tx.execute("delete from sessions where id = ?1", params![retired])?;
+        }
         tx.execute(
             "
             insert into files_seen (
@@ -1962,70 +2084,70 @@ impl Db {
                 session.parse_version,
             ],
         )?;
-        // Re-sync per-message rows. Session logs are APPEND-ONLY, so when a re-parse only GREW
-        // the message list and the existing rows are an unchanged prefix, insert just the new
-        // tail instead of deleting and re-inserting the whole session. Re-inserting every message
-        // also re-runs the messages_fts triggers over the entire session, so a
-        // delete+insert re-indexed multi-hundred-MB sessions on EVERY incremental reindex — the
-        // dominant reindex cost. The boundary check (the last existing message still matches the
-        // parse at that seq) guards against in-place rewrites; on any mismatch or shrink we fall
-        // back to a full replace. Messages carry seq = parse index, so the appended tail's seqs
-        // never collide with the retained prefix.
-        let existing_count: i64 = tx.query_row(
-            "select count(*) from messages where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
-        let parsed_count = parsed.messages.len() as i64;
-        let append_from: Option<usize> =
-            if allow_append_optimization && existing_count > 0 && parsed_count > existing_count {
-                let boundary = &parsed.messages[(existing_count - 1) as usize];
-                let existing_boundary: Option<String> = tx
-                    .query_row(
-                        "select content from messages where session_id = ?1 and seq = ?2",
-                        params![session.id, boundary.seq],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                (existing_boundary.as_deref() == Some(boundary.content.as_str()))
-                    .then_some(existing_count as usize)
-            } else {
-                None
-            };
-        let new_messages = match append_from {
-            Some(start) => &parsed.messages[start..],
-            None => {
-                tx.execute(
-                    "delete from messages where session_id = ?1",
+        let kept_messages_missing_from_parse =
+            store_parsed_messages(&tx, parsed, allow_append_optimization, same_parser)?;
+        store_parsed_file_edits(&tx, parsed, same_parser)?;
+        if kept_messages_missing_from_parse {
+            // The session holds rows this parse lacks, so its text, span and count describe the
+            // union rather than the parse alone.
+            let stored_transcript: Option<String> = tx
+                .query_row(
+                    "select transcript_text from transcripts where session_id = ?1",
                     params![session.id],
-                )?;
-                &parsed.messages[..]
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // The session's own text first, then each retired identity's, then the parse's.
+            let transcript = merge_transcripts(
+                stored_transcript
+                    .iter()
+                    .chain(&prior_transcripts)
+                    .map(String::as_str)
+                    .chain(std::iter::once(parsed.transcript_text.as_str())),
+            );
+            if stored_transcript.as_deref() != Some(transcript.as_str()) {
+                upsert_transcript(&tx, &session.id, &transcript)?;
             }
-        };
-        // Persist messages with their parse-order seq (0..N).
-        insert_messages(&tx, session, new_messages.iter().map(|m| (m.seq, m)))?;
-        // Re-sync file-edit rows (idempotent, same as messages). `edits` are stored as a
-        // JSON array of [old, new] pairs; `new_content` holds full content for Write only.
-        tx.execute(
-            "delete from file_edits where session_id = ?1",
-            params![session.id],
-        )?;
-        insert_file_edits(&tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
+            let [created_at, updated_at, last_message_at] =
+                widest_session_dates(prior_dates.iter().copied().chain([[
+                    session.created_at,
+                    session.updated_at,
+                    session.last_message_at,
+                ]]));
+            tx.execute(
+                "update sessions set created_at = ?2, updated_at = ?3, last_message_at = ?4,
+                    message_count = (select count(*) from messages where session_id = ?1)
+                 where id = ?1",
+                params![session.id, created_at, updated_at, last_message_at],
+            )?;
+        } else {
+            upsert_transcript(&tx, &session.id, &parsed.transcript_text)?;
+        }
         tx.commit()?;
         Ok(())
     }
 
-    /// Delete `user`-role messages that are harness-injected output, not prompts — content
-    /// leading with `<local-command-stdout>` / `-stderr` / `-caveat` (claude) or
-    /// `<environment_context>` / `<turn_aborted>` (codex). The current parser already excludes
-    /// these from re-parsed files, but sessions whose source file was deleted are never re-visited
-    /// (durable archive), so their already-indexed injected rows persist; this one-time data purge
-    /// reaches them. Returns the number of rows deleted. The `messages_fts` delete trigger keeps the
-    /// word index in sync; the custom trigram base is rebuilt lazily on next use. Run during the
-    /// schema migration (see indexer.rs).
-    pub fn purge_injected_messages(&self) -> Result<usize> {
-        let deleted = self.conn.execute(
-            "delete from messages where role = 'user' and (\
+    /// Reclassify legacy `user`-role rows that are harness-injected output as harness notices:
+    /// content leading with `<local-command-stdout>` / `-stderr` / `-caveat` (claude) or
+    /// `<environment_context>` / `<turn_aborted>` (codex). Current parsers already store these as
+    /// `kind = 'harness_notice'`, `authorship = 'harness'`; rows written before that
+    /// classification, including archived sessions whose source is gone and is never reparsed,
+    /// get the same labels here. Default search, corrections and repeat mining already exclude
+    /// that kind and authorship, so the rows leave user-prose results without leaving the index.
+    ///
+    /// Nothing is deleted: these records are the only evidence of what a harness told an agent,
+    /// and deleting them also left gaps in a session's seqs. Content is unchanged, so the
+    /// full-text triggers do not fire. `mixed` rows keep their parser-assigned content parts and
+    /// are not touched. Idempotent; returns the number of rows reclassified. Run after a full
+    /// reindex or schema backfill (see indexer.rs).
+    ///
+    /// Cost: one pass over `user` rows with a leading-prefix test, the same scan the former
+    /// delete made, plus one row write per reclassified row.
+    pub fn classify_injected_messages(&self) -> Result<usize> {
+        let updated = self.conn.execute(
+            "update messages set kind = 'harness_notice', authorship = 'harness' \
+             where role = 'user' and authorship <> 'mixed' \
+               and (kind <> 'harness_notice' or authorship <> 'harness') and (\
                  content like '<local-command-stdout>%' \
               or content like '<local-command-stderr>%' \
               or content like '<local-command-caveat>%' \
@@ -2033,7 +2155,16 @@ impl Db {
               or content like '<turn_aborted>%')",
             [],
         )?;
-        Ok(deleted)
+        Ok(updated)
+    }
+
+    /// Former name of [`Db::classify_injected_messages`], which it now calls.
+    ///
+    /// It used to delete these rows. That predates storing harness notices, removed records the
+    /// current parsers keep on purpose, and left seq gaps that a later append could reuse.
+    #[deprecated(note = "reclassifies instead of deleting; call `classify_injected_messages`")]
+    pub fn purge_injected_messages(&self) -> Result<usize> {
+        self.classify_injected_messages()
     }
 
     /// The stored incremental tail-parse checkpoint for a file, only when its parser version
@@ -2094,8 +2225,8 @@ impl Db {
 
     /// Append ONLY the new rows from an incremental tail parse to an already-indexed session, in
     /// one transaction (SQLite makes the checkpoint update atomic with the data). New messages /
-    /// file-edits are re-sequenced to continue after the rows already stored, so their seqs match
-    /// what a full parse would assign. Immutable session fields (created_at, summary/first-user)
+    /// file-edits are re-sequenced to continue after the highest seq already stored, so no seq is
+    /// reused; when the stored seqs are dense this is also what a full parse would assign. Immutable session fields (created_at, summary/first-user)
     /// are preserved; updated_at/last_message_at advance only forward; title/preview refresh from
     /// the tail's latest view; cwd fills in if it was NULL; message_count becomes the true count.
     /// The new conversation text is appended to the transcript blob and the session FTS is rebuilt
@@ -2108,48 +2239,54 @@ impl Db {
         size_bytes: i64,
     ) -> Result<()> {
         let session = &tail.session;
-        let tx = self.conn.unchecked_transaction()?;
+        // IMMEDIATE for the same reason as `upsert_session_with_mode`: the reads below precede
+        // the first write.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
 
-        // New messages, re-sequenced after the existing rows (seqs are 0..N parse-order).
+        // New messages and edits continue after the highest stored seq. Stored seqs can have
+        // gaps (rows deleted without renumbering), so the row count is not the next free seq:
+        // numbering from it reused existing seqs and left one (session_id, seq) naming two
+        // messages.
         let existing_count: i64 = tx.query_row(
             "select count(*) from messages where session_id = ?1",
             params![session.id],
             |row| row.get(0),
         )?;
-        // Append messages re-sequenced after the existing rows (seqs are 0..N parse-order).
+        let next_seq = next_message_seq(&tx, &session.id)?;
         insert_messages(
             &tx,
             session,
             tail.new_messages
                 .iter()
                 .enumerate()
-                .map(|(i, m)| (existing_count + i as i64, m)),
+                .map(|(i, m)| (next_seq + i as i64, m)),
         )?;
-
-        // New file edits, re-sequenced after the existing ones.
-        let existing_edit_seq: i64 = tx.query_row(
-            "select coalesce(max(seq), -1) from file_edits where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
+        let next_edit_seq = next_file_edit_seq(&tx, &session.id)?;
         insert_file_edits(
             &tx,
             session,
             tail.new_file_edits
                 .iter()
                 .enumerate()
-                .map(|(i, e)| (existing_edit_seq + 1 + i as i64, e)),
+                .map(|(i, e)| (next_edit_seq + i as i64, e)),
         )?;
 
-        // Advance volatile session metadata; updated_at/last_message_at only move forward (RFC3339
-        // sorts lexically), title/preview take the tail's newest view, cwd fills if it was NULL.
+        // Advance volatile session metadata; updated_at/last_message_at only move forward,
+        // title/preview take the tail's newest view, cwd fills if it was NULL. created_at stays.
         let new_count = existing_count + tail.new_messages.len() as i64;
+        let [_, updated_at, last_message_at] =
+            widest_session_dates(stored_session_dates(&tx, &session.id)?.into_iter().chain([[
+                None,
+                session.updated_at,
+                session.last_message_at,
+            ]]));
         tx.execute(
             "update sessions set
-                updated_at = case when ?2 is not null and ?2 > coalesce(updated_at, '') then ?2
-                                  else updated_at end,
-                last_message_at = case when ?3 is not null and ?3 > coalesce(last_message_at, '') then ?3
-                                       else last_message_at end,
+                updated_at = ?2,
+                last_message_at = ?3,
                 title = ?4,
                 preview_text = ?5,
                 cwd = coalesce(cwd, ?6),
@@ -2157,8 +2294,8 @@ impl Db {
              where id = ?1",
             params![
                 session.id,
-                session.updated_at.map(|value| value.to_rfc3339()),
-                session.last_message_at.map(|value| value.to_rfc3339()),
+                updated_at,
+                last_message_at,
                 session.title,
                 session.preview_text,
                 session.cwd,
@@ -2501,9 +2638,21 @@ impl Db {
 
         debug_assert_ne!(filters.match_mode, MessageSearchMode::Fuzzy);
         let field = filters.field.unwrap_or(SearchField::Content);
-        let mut sql = String::from(
+        // An index hint belongs in the FROM clause, so the page plan has to be decided before the
+        // statement is written. The prefilter the decision needs is a pure function of the query,
+        // so computing it here costs nothing and the content branch below reuses this value.
+        let content_prefilter = if field == SearchField::Content && self.schema_version()? >= 4 {
+            content_prefilter_pattern(query, filters.match_mode)
+                .as_deref()
+                .and_then(crate::trigram::trigram_prefilter)
+        } else {
+            None
+        };
+        let page_index_hint =
+            self.ordered_page_index_hint(filters, order, content_prefilter.as_deref())?;
+        let mut sql = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
-             from messages m where 1 = 1",
+             from messages m{page_index_hint} where 1 = 1",
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
@@ -2520,17 +2669,9 @@ impl Db {
                 sql.push_str(" and rust_regexp(?, m.content)");
                 args.push(Value::Text(query.to_string()));
             }
-            let prefilter_pattern = if filters.match_mode == MessageSearchMode::Regex {
-                Some(query.to_string())
-            } else if literal_query {
-                Some(regex::escape(query))
-            } else {
-                None
-            };
+            let prefilter_pattern = content_prefilter_pattern(query, filters.match_mode);
             if self.schema_version()? >= 4 {
-                let prefilter = prefilter_pattern
-                    .as_deref()
-                    .and_then(crate::trigram::trigram_prefilter);
+                let prefilter = content_prefilter;
                 if let Some(fts_query) = &prefilter {
                     sql.push_str(
                         " and m.id in (
@@ -2693,11 +2834,7 @@ impl Db {
             }
         };
 
-        sql.push_str(if order == MessageOrder::NewestFirst {
-            " order by m.session_id, m.seq desc"
-        } else {
-            " order by m.session_id, m.seq"
-        });
+        sql.push_str(order.order_by_clause());
         if filters.limit > 0 {
             sql.push_str(" limit ?");
             args.push(Value::Integer(filters.limit as i64));
@@ -2777,11 +2914,7 @@ impl Db {
         );
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        sql.push_str(if order == MessageOrder::NewestFirst {
-            " order by m.session_id, m.seq desc"
-        } else {
-            " order by m.session_id, m.seq"
-        });
+        sql.push_str(order.order_by_clause());
         let ranked_limit = match self.fuzzy_ranking_window("1 = 1", filters)? {
             FuzzyRankingWindow::Rank { limit, .. } => limit,
             FuzzyRankingWindow::PastCorpus { corpus } => {
@@ -2807,9 +2940,9 @@ impl Db {
         let mut matched = 0_i64;
         for row in rows {
             let hit = row?;
-            corpus += 1;
             batch_bytes = batch_bytes.saturating_add(hit.content.len());
-            batch.push(hit);
+            batch.push((corpus as usize, hit));
+            corpus += 1;
             if fuzzy_batch_is_full(batch.len(), batch_bytes) {
                 batch_bytes = 0;
                 let scored = self.runtime.install(|| {
@@ -2999,6 +3132,105 @@ impl Db {
         self.fts5_candidate_count_with_base("1 = 1", filters, fts_query)
     }
 
+    /// `" indexed by idx_messages_session_seq"` when a content page should take its published
+    /// order from that index, or `""` to keep sorting every verified candidate.
+    ///
+    /// Both plans return the same rows in the same order. The index-ordered one also lets
+    /// SQLite honor `LIMIT` while scanning, so the verifier runs on the rows up to the last match
+    /// kept rather than on every candidate: measured 601 calls against 26,828 for
+    /// `"permission denied"`, 50 against 14,930 for `"tool_use"`, with identical rows.
+    ///
+    /// Each condition excludes a case measured to lose:
+    ///
+    /// * **A finite limit.** With `--all-results` there is nothing to stop early for, so the scan
+    ///   is pure overhead: 2,060 ms sorted against 2,503 ms index-ordered.
+    /// * **Oldest-first.** Newest-first asks for `session_id` ascending and `seq` descending, which
+    ///   no all-ascending index supplies; steering it keeps a sort anyway
+    ///   (`USE TEMP B-TREE FOR LAST TERM OF ORDER BY`) and pays the scan on top.
+    /// * **A content trigram prefilter.** Without one there is no candidate set to stop against,
+    ///   and the membership test SQLite builds a Bloom filter for is what makes the scan cheap.
+    /// * **[`ORDERED_PAGE_CANDIDATE_FLOOR`] candidates.** Below it the sort is already cheap and
+    ///   the scan is overhead: 60 ms against 371 ms at 5 candidates.
+    /// * **No class or path predicate.** `append_message_filters` writes its predicates before the
+    ///   verifier, so they already short-circuit today's plan, and the index stores neither, so
+    ///   the scan pays a table lookup per row to evaluate them. Worse, narrowing to a minority
+    ///   class cuts match density, so the scan walks proportionally further for the same page:
+    ///   `--role user` measured 395 ms sorted against 802 ms index-ordered. Majority-class values
+    ///   were level (`--role assistant` 0.95x, `--provider claude` 1.04x), and which value is a
+    ///   minority cannot be known without counting it, so the whole family stands aside.
+    ///
+    /// Cost, for `P` postings read by the trigram query, `C` candidates it yields, `M` verified
+    /// matches, `L` + `O` the page's limit plus offset, `N` rows in the index, and `k` the index
+    /// position of the `(O + L)`-th match:
+    ///
+    /// * Sorted plan: O(P + C·verify + M log M) time; the sorter holds all `M` matched rows,
+    ///   content included, whatever the limit, spilling to temporary storage past the page cache.
+    /// * Index-ordered plan: O(P + k + candidates before position k · verify) time, and peak
+    ///   memory O(C) for the candidate membership set plus O(L + O) emitted rows. `k` is at most
+    ///   `N`, so the worst case, matches clustered at the end of the order, is one index walk
+    ///   (511 ms warm for 5.7 M rows), and that is the loss the floor below bounds.
+    /// * This decision: O(min(C, [`ORDERED_PAGE_CANDIDATE_FLOOR`])) postings for the probe, and
+    ///   O(1) memory.
+    ///
+    /// Offset paging re-verifies earlier pages on both plans: page `p` of width `L` costs as much as
+    /// one page of width `p · L`.
+    ///
+    /// A time window is deliberately NOT excluded: it reduces the rows admitted without reducing
+    /// match density in a corpus whose rows are mostly recent, and it measured 1.29x at `--since 3d`
+    /// and 10.48x at `--since 1y`. `session_id` and the `seq` bounds are not excluded either,
+    /// because they are this index's own leading columns.
+    fn ordered_page_index_hint(
+        &self,
+        filters: &MessageFilters,
+        order: MessageOrder,
+        content_prefilter: Option<&str>,
+    ) -> Result<&'static str> {
+        let Some(fts_query) = content_prefilter else {
+            return Ok("");
+        };
+        if order != MessageOrder::OldestFirst || filters.limit == 0 {
+            return Ok("");
+        }
+        let narrows_by_class_or_path = filters.role.is_some()
+            || filters.kinds.is_some()
+            || filters.providers.is_some()
+            || filters.tool.is_some()
+            || filters.path_prefix.is_some()
+            || filters.workspace_path_prefix.is_some()
+            || filters.transcript_path_prefix.is_some()
+            || !filters.exclude_path_prefixes.is_empty()
+            || !filters.exclude_workspace_path_prefixes.is_empty()
+            || !filters.exclude_transcript_path_prefixes.is_empty()
+            || !filters.exclude_session_ids.is_empty();
+        if narrows_by_class_or_path {
+            return Ok("");
+        }
+        if !self.trigram_candidates_reach(fts_query, ORDERED_PAGE_CANDIDATE_FLOOR)? {
+            return Ok("");
+        }
+        Ok(" indexed by idx_messages_session_seq")
+    }
+
+    /// Whether the content trigram prefilter admits more than `floor` candidates.
+    ///
+    /// The inner `limit` stops the doclist intersection at `floor + 1` rowids, so this costs
+    /// O(floor) rather than O(candidates) and is cheapest exactly where the answer matters most:
+    /// measured 0.5 ms for a needle with 741,429 candidates and 1.1 ms for one with 1,216,643,
+    /// against 42-75 ms for selective needles whose doclists must be walked further to reach the
+    /// floor. The exact count is never needed, only which side of the floor it falls on, so
+    /// [`Db::fts5_candidate_count`] (which is O(candidates) and applies the filters) is the wrong
+    /// tool here even though it answers a similar-looking question.
+    fn trigram_candidates_reach(&self, fts_query: &str, floor: i64) -> Result<bool> {
+        let reached: i64 = self.conn.query_row(
+            "select count(*) from (
+                 select rowid from messages_trigram where messages_trigram match ?1 limit ?2
+             )",
+            rusqlite::params![fts_query, floor + 1],
+            |row| row.get(0),
+        )?;
+        Ok(reached > floor)
+    }
+
     /// [`Db::fts5_candidate_count`] over the rows that also satisfy `base_predicate`, an SQL
     /// fragment over alias `m` (`"m.kind = 'tool_call'"` for tool-argument search).
     fn fts5_candidate_count_with_base(
@@ -3055,11 +3287,7 @@ impl Db {
         let base_predicate = fuzzy_derived_scan_predicate(field);
         sql.push_str(" and ");
         sql.push_str(base_predicate);
-        sql.push_str(if order == MessageOrder::NewestFirst {
-            " order by m.session_id, m.seq desc"
-        } else {
-            " order by m.session_id, m.seq"
-        });
+        sql.push_str(order.order_by_clause());
         let pattern = Pattern::new(
             query,
             CaseMatching::Ignore,
@@ -3085,9 +3313,9 @@ impl Db {
         let mut batch_bytes = 0_usize;
         for row in rows {
             let hit = row?;
-            corpus += 1;
             batch_bytes = batch_bytes.saturating_add(hit.content.len());
-            batch.push(hit);
+            batch.push((corpus as usize, hit));
+            corpus += 1;
             if fuzzy_batch_is_full(batch.len(), batch_bytes) {
                 let scored = self.runtime.install(|| {
                     score_fuzzy_derived_hits(
@@ -3159,7 +3387,7 @@ impl Db {
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        sql.push_str(" order by m.session_id, m.seq");
+        sql.push_str(MessageOrder::OldestFirst.order_by_clause());
         let rows = self.query_message_hits(&sql, &args)?;
         let pattern = Pattern::new(
             query,
@@ -3172,7 +3400,7 @@ impl Db {
             &fold_caseless(query),
             SearchField::ToolName,
             None,
-            rows,
+            rows.into_iter().enumerate().collect(),
         );
         Ok(finish_fuzzy_hits(
             scored,
@@ -3287,7 +3515,8 @@ impl Db {
             );
             let mut args = vec![Value::Text(selected_names)];
             append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-            sql.push_str(" order by m.session_id, m.seq limit ?");
+            sql.push_str(MessageOrder::OldestFirst.order_by_clause());
+            sql.push_str(" limit ?");
             args.push(Value::Integer(remaining as i64));
             let mut stmt = self.conn.prepare(&sql)?;
             let rows =
@@ -3699,9 +3928,10 @@ impl Db {
         explain.context("message search explanation was not produced")
     }
 
-    /// Fetch the messages surrounding a `(session_id, seq)` anchor — `before` rows
-    /// before and `after` rows after — for `messages search --context`. Ordered by
-    /// seq; served directly by the `(session_id, seq)` index.
+    /// Fetch every message whose seq lies within `before` sequence numbers before and `after`
+    /// after a `(session_id, seq)` anchor, for `messages search --context`. A seq can hold
+    /// several messages, so the window can hold more than `before + after + 1` rows. Ordered by
+    /// `(seq, id)`; served directly by the `(session_id, seq)` index.
     pub fn message_context(
         &self,
         session_id: &str,
@@ -3727,7 +3957,8 @@ impl Db {
             Value::Integer(seq.saturating_add(after)),
         ];
         push_access_scope(&mut sql, &mut args, "session_id", &self.access_scope);
-        sql.push_str(" order by seq");
+        // (session_id, seq) is not unique; the row id makes the order total.
+        sql.push_str(" order by seq, id");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -3778,7 +4009,7 @@ impl Db {
         );
         let mut args = vec![Value::Text(serde_json::to_string(&bounds)?)];
         push_access_scope(&mut sql, &mut args, "m.session_id", &self.access_scope);
-        sql.push_str(" order by a.ord, m.seq");
+        sql.push_str(" order by a.ord, m.seq, m.id");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             // `ord` is json_each's key over the bounds array, so it numbers the anchors from
@@ -3948,7 +4179,8 @@ impl Db {
                           order by p.ordinal
                         )
                       )
-                    end as content
+                    end as content,
+                    m.id as message_id
              from messages m
              where m.record_relation = 'original'
                and (
@@ -3978,7 +4210,11 @@ impl Db {
                 MessageSearchMode::Fuzzy => unreachable!("fuzzy rejected above"),
             }
         }
-        sql.push_str(" order by attributable.session_id, attributable.seq");
+        // (session_id, seq) is not unique; the row id makes the order total, so a role filter
+        // that reads idx_messages_role_ts cannot hand tied rows to the sort in timestamp order.
+        sql.push_str(
+            " order by attributable.session_id, attributable.seq, attributable.message_id",
+        );
         if filters.limit > 0 {
             sql.push_str(" limit ? offset ?");
             args.push(Value::Integer(filters.limit as i64));
@@ -4107,10 +4343,7 @@ impl Db {
             let mut sql = String::from(CORRECTION_CANDIDATES_SQL);
             let mut args: Vec<Value> = Vec::new();
             append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
-            // Timestamp alone is not a total order: providers may omit it, and several messages
-            // may share one timestamp. Stable tie-breakers make offset pages reproducible and
-            // non-overlapping across the CLI, Rust, Python, and MCP adapters.
-            sql.push_str(" order by m.ts desc, m.session_id asc, m.seq asc");
+            sql.push_str(CORRECTION_ORDER_SQL);
 
             let mut stmt = self.conn.prepare(&sql)?;
             // Materialize each candidate's full content exactly once before going parallel:
@@ -4450,8 +4683,9 @@ impl Db {
 
     /// Ordered raw edits for one file (`files history`/`extract`). Matches by exact
     /// basename, exact path, or path suffix (`%/file`), optionally scoped to an exact session ID.
-    /// Results are ordered by `(session_id, seq)` so callers can number versions per
-    /// session and replay deltas deterministically.
+    /// Results are ordered by `(session_id, seq, id)`, the id keeping several edits made by one
+    /// message in source order, so callers can number versions per session and replay deltas
+    /// deterministically.
     pub fn file_edits_for(
         &self,
         file: &str,
@@ -4509,7 +4743,9 @@ impl Db {
             Value::Text(format!("%/{file}")),
         ];
         push_file_filters(&mut sql, &mut args, query, &self.access_scope);
-        sql.push_str(" order by session_id, seq");
+        // One message can edit a file several times under one seq; version replay applies the
+        // edits in this order, so the row id (source insertion order) ends it.
+        sql.push_str(" order by session_id, seq, id");
 
         let mut stmt = self.conn.prepare(&sql)?;
         let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -5084,7 +5320,7 @@ impl Db {
         self.validate_access_scope()?;
         let mut sql = String::from(
             "with ordered as (
-                 select ts, kind, lag(ts) over (order by seq) as previous_ts
+                 select ts, kind, lag(ts) over (order by seq, id) as previous_ts
                  from messages where session_id = ?",
         );
         let mut args = vec![Value::Text(session_id.to_string())];
@@ -5200,7 +5436,7 @@ const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL: &str = "select seq, group_concat
          order by seq, message_id, ordinal
      )
      group by message_id, seq
-     order by seq";
+     order by seq, message_id";
 
 /// One keyset page of matching session records, ordered by canonical session ID.
 fn analysis_session_page(
@@ -5549,6 +5785,20 @@ enum ClassSelection<'a> {
     Only(&'a [crate::models::MessageKind]),
 }
 
+/// The regex source whose required literals drive a content search's trigram prefilter, or `None`
+/// when the query cannot contribute one.
+///
+/// This is the one authority for that rule. The prefilter and the page-plan decision in
+/// [`Db::ordered_page_index_hint`] both need it, and the decision has to be made before the FROM
+/// clause is written, so they cannot share a single evaluation site.
+fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Option<String> {
+    match match_mode {
+        MessageSearchMode::Regex => Some(query.to_string()),
+        MessageSearchMode::Literal if !query.is_empty() => Some(regex::escape(query)),
+        MessageSearchMode::Literal | MessageSearchMode::Fuzzy => None,
+    }
+}
+
 fn append_message_filters(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -5745,6 +5995,579 @@ fn insert_messages<'a>(
     Ok(())
 }
 
+/// Write a session's transcript row.
+fn upsert_transcript(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    transcript: &str,
+) -> Result<()> {
+    tx.execute(
+        "insert into transcripts (session_id, transcript_text) values (?1, ?2)
+         on conflict(session_id) do update set transcript_text = excluded.transcript_text",
+        params![session_id, transcript],
+    )?;
+    Ok(())
+}
+
+/// A session's created_at, updated_at and last_message_at as instants.
+type SessionDates = [Option<DateTime<Utc>>; 3];
+
+/// A stored session's dates, parsed: stored RFC 3339 text orders correctly only within one UTC
+/// offset, so dates are compared as instants. `None` when the session row does not exist.
+fn stored_session_dates(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<Option<SessionDates>> {
+    Ok(tx
+        .query_row(
+            "select created_at, updated_at, last_message_at from sessions where id = ?1",
+            params![session_id],
+            |row| Ok([row.get::<_, Option<String>>(0)?, row.get(1)?, row.get(2)?]),
+        )
+        .optional()?
+        .map(|dates| dates.map(|text| text.as_deref().and_then(parse_datetime))))
+}
+
+/// The earliest created_at and the latest updated_at and last_message_at across `dates`, as UTC
+/// RFC 3339 text for storage. O(n) for n date triples.
+fn widest_session_dates(dates: impl IntoIterator<Item = SessionDates>) -> [Option<String>; 3] {
+    let (mut created, mut updated, mut last) = (None, None, None);
+    for [c, u, l] in dates {
+        created = created.into_iter().chain(c).min();
+        updated = updated.max(u);
+        last = last.max(l);
+    }
+    [created, updated, last].map(|date: Option<DateTime<Utc>>| date.map(|date| date.to_rfc3339()))
+}
+
+/// Session text after an archive keep: the first text, then each paragraph of every later text
+/// that the merge so far lacks. Paragraphs are the "\n\n"-joined units every provider
+/// transcript and `append_tail` use, so overlapping texts (a session and a retired identity of
+/// the same source) contribute their shared paragraphs once, while a paragraph repeated within
+/// one text is added once per copy the merge lacks. A paragraph break inside one message's text
+/// splits it too, so a message paragraph identical to one already merged appears once, and text
+/// from neighbouring entries can read as contiguous. No unique text is dropped, and the message
+/// rows themselves are unaffected. The text cannot be rebuilt from the rows instead: providers
+/// write transcript entries only for conversation messages, and Claude's hold only the
+/// human-authored part. O(total bytes) time, O(paragraphs) memory.
+fn merge_transcripts<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut held: HashMap<&'a str, usize> = HashMap::new();
+    let mut merged = String::new();
+    for text in texts {
+        let mut text_counts: HashMap<&'a str, usize> = HashMap::new();
+        for paragraph in text.split("\n\n").filter(|paragraph| !paragraph.is_empty()) {
+            let seen = text_counts.entry(paragraph).or_default();
+            *seen += 1;
+            let have = held.entry(paragraph).or_default();
+            if *seen > *have {
+                *have += 1;
+                if !merged.is_empty() {
+                    merged.push_str("\n\n");
+                }
+                merged.push_str(paragraph);
+            }
+        }
+    }
+    merged
+}
+
+/// The next free message seq of a session: one past the highest stored, so no seq is reused
+/// after a gap. Pinned to idx_messages_session_seq, SQLite answers with one O(log N) seek;
+/// folded into a `count(*)` it shared that statement's O(session rows) scan of a covering index
+/// whose second column is not seq (measured on a 40,180-row session: 2.16 ms against 1.30 ms
+/// for the count alone; this form adds 0.002 ms).
+fn next_message_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> {
+    Ok(tx.query_row(
+        "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
+         where session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// The next free file-edit seq of a session: one past the highest stored.
+fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> {
+    Ok(tx.query_row(
+        "select coalesce(max(seq), -1) + 1 from file_edits where session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Bring a session's message rows in line with a full parse. Returns true when stored rows the
+/// parse no longer holds were kept (the archive rule), so the caller describes the union.
+///
+/// - Append: under the same parser, when the stored rows are a dense prefix of the parse whose
+///   last row still matches in every column, only the new tail is inserted. Session logs are
+///   append-only, and re-inserting a whole session re-runs the FTS triggers over every row. Only
+///   that boundary row is compared, so a caller passing `allow_append_optimization` asserts its
+///   sources are append-only.
+/// - Unchanged: under the same parser, a parse whose rows equal the stored rows writes nothing.
+/// - Replace: a parser change, or a parse that holds every stored message (same role and
+///   content), replaces the rows, so a parser upgrade can reclassify them.
+/// - Keep: otherwise the harness compacted, rewrote or pruned its transcript. The index is the
+///   archive, so stored rows stay, and parse messages no stored row of the same role and content
+///   accounts for are appended after the highest stored seq. Content cannot tell a re-rendered
+///   message from a removed one across parser versions, which is why only the same parser keeps.
+///
+/// O(stored + parsed rows and bytes) time off the append path; O(rows) memory for 32-byte keys.
+fn store_parsed_messages(
+    tx: &rusqlite::Transaction<'_>,
+    parsed: &ParsedSession,
+    allow_append_optimization: bool,
+    same_parser: bool,
+) -> Result<bool> {
+    let session = &parsed.session;
+    let existing_count: i64 = tx.query_row(
+        "select count(*) from messages where session_id = ?1",
+        params![session.id],
+        |row| row.get(0),
+    )?;
+    let next_seq = next_message_seq(tx, &session.id)?;
+    let parsed_count = parsed.messages.len() as i64;
+    // A stored prefix is dense only when the next free seq equals its count; a gap would make
+    // the parse's tail seqs collide with stored ones.
+    if allow_append_optimization
+        && same_parser
+        && existing_count > 0
+        && next_seq == existing_count
+        && parsed_count > existing_count
+    {
+        // The whole boundary row must match, so text that repeats by coincidence ("ok",
+        // "continue") at that position cannot pass for it after an archive keep.
+        let boundary = &parsed.messages[(existing_count - 1) as usize];
+        let stored_boundary = stored_message_keys(tx, &session.id, Some(boundary.seq))?;
+        if stored_boundary
+            .first()
+            .is_some_and(|(_, keys)| keys.all_columns == parsed_message_keys(boundary).all_columns)
+        {
+            insert_messages(
+                tx,
+                session,
+                parsed.messages[existing_count as usize..]
+                    .iter()
+                    .map(|m| (m.seq, m)),
+            )?;
+            return Ok(false);
+        }
+    }
+    let stored = stored_message_keys(tx, &session.id, None)?;
+    let parsed_keys: Vec<MessageKeys> = parsed.messages.iter().map(parsed_message_keys).collect();
+    if same_parser
+        && stored
+            .iter()
+            .map(|(_, keys)| keys.all_columns)
+            .eq(parsed_keys.iter().map(|keys| keys.all_columns))
+    {
+        return Ok(false);
+    }
+    if !same_parser
+        || covers_every_stored_key(
+            stored.iter().map(|(_, keys)| keys.role_and_content),
+            parsed_keys.iter().map(|keys| keys.role_and_content),
+        )
+    {
+        tx.execute(
+            "delete from messages where session_id = ?1",
+            params![session.id],
+        )?;
+        insert_messages(tx, session, parsed.messages.iter().map(|m| (m.seq, m)))?;
+        return Ok(false);
+    }
+    let mut stored_roles = key_counts(stored.iter().map(|(_, keys)| keys.role_and_content));
+    let unseen = parsed
+        .messages
+        .iter()
+        .zip(&parsed_keys)
+        .filter(|(_, keys)| !take_key(&mut stored_roles, &keys.role_and_content))
+        .map(|(message, _)| message);
+    insert_messages(
+        tx,
+        session,
+        unseen
+            .enumerate()
+            .map(|(offset, message)| (next_seq + offset as i64, message)),
+    )?;
+    Ok(true)
+}
+
+/// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
+/// replace and keep rules as `store_parsed_messages`. A kept session's edits are renumbered so that
+/// each edit only the parse holds replays immediately before the next stored edit the parse
+/// lists after it (last when none follows): version replay applies edits in seq order, and a
+/// `Write` appended after a retained `Edit` it preceded would reset the file afterwards. Edit
+/// seqs are an order within the session, independent of message seqs, so renumbering moves no
+/// message reference. O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory.
+fn store_parsed_file_edits(
+    tx: &rusqlite::Transaction<'_>,
+    parsed: &ParsedSession,
+    same_parser: bool,
+) -> Result<()> {
+    let session = &parsed.session;
+    let stored = stored_file_edit_keys(tx, &session.id)?;
+    let parsed_keys = parsed
+        .file_edits
+        .iter()
+        .map(parsed_file_edit_keys)
+        .collect::<Result<Vec<_>>>()?;
+    if same_parser
+        && stored
+            .iter()
+            .map(|(_, _, keys)| keys.all_columns)
+            .eq(parsed_keys.iter().map(|keys| keys.all_columns))
+    {
+        return Ok(());
+    }
+    if !same_parser
+        || covers_every_stored_key(
+            stored.iter().map(|(_, _, keys)| keys.edit),
+            parsed_keys.iter().map(|keys| keys.edit),
+        )
+    {
+        tx.execute(
+            "delete from file_edits where session_id = ?1",
+            params![session.id],
+        )?;
+        insert_file_edits(tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
+        return Ok(());
+    }
+    let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
+    for (position, (_, _, keys)) in stored.iter().enumerate() {
+        positions.entry(keys.edit).or_default().push_back(position);
+    }
+    let matched: Vec<Option<usize>> = parsed_keys
+        .iter()
+        .map(|keys| {
+            positions
+                .get_mut(&keys.edit)
+                .and_then(|queue| queue.pop_front())
+        })
+        .collect();
+    // (stored position to precede or follow, 0 = parse-only before 1 = stored, tiebreak index).
+    let mut order: Vec<(usize, u8, usize)> = (0..stored.len()).map(|j| (j, 1, j)).collect();
+    let mut next_retained = stored.len();
+    for (index, position) in matched.iter().enumerate().rev() {
+        match position {
+            Some(position) => next_retained = *position,
+            None => order.push((next_retained, 0, index)),
+        }
+    }
+    order.sort_unstable();
+    let mut renumber = tx.prepare("update file_edits set seq = ?1 where id = ?2")?;
+    let mut inserts = Vec::new();
+    for (seq, (_, source, index)) in order.into_iter().enumerate() {
+        let seq = seq as i64;
+        if source == 1 {
+            let (id, stored_seq, _) = stored[index];
+            if stored_seq != seq {
+                renumber.execute(params![seq, id])?;
+            }
+        } else {
+            inserts.push((seq, &parsed.file_edits[index]));
+        }
+    }
+    insert_file_edits(tx, session, inserts.into_iter())
+}
+
+/// Move a retired identity's rows into `target` before the retired session row is deleted. A
+/// row the target already holds (same role and content for a message, same edit for a file
+/// edit) stays and leaves with the retired session; every other row moves after the target's
+/// highest seq in its stored order. A target with no messages takes the retired messages with
+/// their seqs in one statement. O(target + retired rows and bytes) time, O(rows) key memory.
+fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str) -> Result<()> {
+    let held = stored_message_keys(tx, target, None)?;
+    if held.is_empty() {
+        tx.execute(
+            "update messages set session_id = ?1 where session_id = ?2",
+            params![target, retired],
+        )?;
+    } else {
+        let mut held = key_counts(held.iter().map(|(_, keys)| keys.role_and_content));
+        let next_seq = next_message_seq(tx, target)?;
+        let mut moved = 0;
+        let mut update =
+            tx.prepare("update messages set session_id = ?1, seq = ?2 where id = ?3")?;
+        for (id, keys) in stored_message_keys(tx, retired, None)? {
+            if !take_key(&mut held, &keys.role_and_content) {
+                update.execute(params![target, next_seq + moved, id])?;
+                moved += 1;
+            }
+        }
+    }
+    let mut held = key_counts(
+        stored_file_edit_keys(tx, target)?
+            .iter()
+            .map(|(_, _, keys)| keys.edit),
+    );
+    let next_seq = next_file_edit_seq(tx, target)?;
+    let mut moved = 0;
+    let mut update = tx.prepare("update file_edits set session_id = ?1, seq = ?2 where id = ?3")?;
+    for (id, _, keys) in stored_file_edit_keys(tx, retired)? {
+        if !take_key(&mut held, &keys.edit) {
+            update.execute(params![target, next_seq + moved, id])?;
+            moved += 1;
+        }
+    }
+    Ok(())
+}
+
+type RowDigest = [u8; 32];
+
+/// Identities of one message row for the archive rule (`store_parsed_messages`, `move_retired_rows`).
+///
+/// - `role_and_content` decides whether a parse still holds a stored message, so text a new
+///   message shares with a stored message of another role is not taken for it.
+/// - `all_columns` covers every stored column except the content parts, which the parser derives from
+///   the content; equal `all_columns` sequences mean the parse would write exactly what is stored.
+struct MessageKeys {
+    role_and_content: RowDigest,
+    all_columns: RowDigest,
+}
+
+/// The stored message columns the archive keys read; `None` is SQL NULL.
+struct MessageColumns<'a> {
+    seq: i64,
+    role: Option<&'a str>,
+    kind: Option<&'a str>,
+    authorship: Option<&'a str>,
+    ts: Option<&'a str>,
+    tool_name: Option<&'a str>,
+    tool_call_id: Option<&'a str>,
+    is_compaction: bool,
+    correlation: [Option<&'a str>; 3],
+    record_relation: Option<&'a str>,
+    content: &'a str,
+}
+
+impl MessageColumns<'_> {
+    fn keys(&self) -> MessageKeys {
+        let mut content = FramedSha256::new(b"aise-archive-message-content-v1");
+        content.update_bytes(self.content.as_bytes());
+        let content = content.finish_bytes();
+        let mut role_and_content = FramedSha256::new(b"aise-archive-message-role-v1");
+        role_and_content.update_optional_str(self.role);
+        role_and_content.update_bytes(&content);
+        let mut all_columns = FramedSha256::new(b"aise-archive-message-row-v1");
+        all_columns.update_i64(self.seq);
+        for value in [
+            self.role,
+            self.kind,
+            self.authorship,
+            self.ts,
+            self.tool_name,
+            self.tool_call_id,
+            self.correlation[0],
+            self.correlation[1],
+            self.correlation[2],
+            self.record_relation,
+        ] {
+            all_columns.update_optional_str(value);
+        }
+        all_columns.update_u8(u8::from(self.is_compaction));
+        all_columns.update_bytes(&content);
+        MessageKeys {
+            role_and_content: role_and_content.finish_bytes(),
+            all_columns: all_columns.finish_bytes(),
+        }
+    }
+}
+
+/// Keys of a parsed message, from the same column values `insert_messages` writes.
+fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
+    let ts = message.ts.map(|ts| ts.to_rfc3339());
+    let correlation = message.provenance.correlation_identity.as_ref();
+    MessageColumns {
+        seq: message.seq,
+        role: Some(message.role.as_str()),
+        kind: Some(message.kind.as_str()),
+        authorship: Some(message.provenance.authorship.as_str()),
+        ts: ts.as_deref(),
+        tool_name: message.tool_name.as_deref(),
+        tool_call_id: message.tool_call_id.as_deref(),
+        is_compaction: message.is_compaction,
+        correlation: [
+            correlation.map(|value| value.authority.as_str()),
+            correlation.map(|value| value.scope.as_str()),
+            correlation.map(|value| value.id.as_str()),
+        ],
+        record_relation: Some(message.provenance.record_relation.as_str()),
+        content: &message.content,
+    }
+    .keys()
+}
+
+/// A session's stored message rows as (row id, keys) in (seq, id) order, or only the rows at
+/// `only_seq`. The whole session is read only off the append path: O(stored rows + bytes) time,
+/// O(stored rows) memory for the keys; one seq is an index seek on idx_messages_session_seq.
+fn stored_message_keys(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    only_seq: Option<i64>,
+) -> Result<Vec<(i64, MessageKeys)>> {
+    const COLUMNS: &str = "select id, seq, role, kind, authorship, ts, tool_name, tool_call_id,
+        is_compaction, correlation_authority, correlation_scope, correlation_id, record_relation,
+        content from messages";
+    // Two fixed statements, so the single-seq read stays an index seek: an `?2 is null or`
+    // predicate can keep SQLite off the (session_id, seq) key.
+    let mut statement = tx.prepare(&match only_seq {
+        Some(_) => format!(
+            "{COLUMNS} indexed by idx_messages_session_seq where session_id = ?1 and seq = ?2
+             order by id"
+        ),
+        None => format!("{COLUMNS} where session_id = ?1 order by seq, id"),
+    })?;
+    let mut rows = match only_seq {
+        Some(seq) => statement.query(params![session_id, seq])?,
+        None => statement.query(params![session_id])?,
+    };
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next()? {
+        let text = |index: usize| row.get::<_, Option<String>>(index);
+        let (role, kind, authorship, ts, tool_name, tool_call_id) =
+            (text(2)?, text(3)?, text(4)?, text(5)?, text(6)?, text(7)?);
+        let correlation = [text(9)?, text(10)?, text(11)?];
+        let record_relation = text(12)?;
+        let content: String = row.get(13)?;
+        let columns = MessageColumns {
+            seq: row.get(1)?,
+            role: role.as_deref(),
+            kind: kind.as_deref(),
+            authorship: authorship.as_deref(),
+            ts: ts.as_deref(),
+            tool_name: tool_name.as_deref(),
+            tool_call_id: tool_call_id.as_deref(),
+            is_compaction: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+            correlation: correlation.each_ref().map(Option::as_deref),
+            record_relation: record_relation.as_deref(),
+            content: &content,
+        };
+        keys.push((row.get(0)?, columns.keys()));
+    }
+    Ok(keys)
+}
+
+/// Identities of one file-edit row: `edit` is the edit itself (tool, path, full content and
+/// replacements); `all_columns` adds seq, timestamp and file name, the columns `edit` omits.
+struct FileEditKeys {
+    edit: RowDigest,
+    all_columns: RowDigest,
+}
+
+fn file_edit_keys(
+    seq: i64,
+    ts: Option<&str>,
+    tool: &str,
+    file_path: &str,
+    file_name: &str,
+    new_content: Option<&str>,
+    edits_json: Option<&str>,
+) -> FileEditKeys {
+    let mut edit = FramedSha256::new(b"aise-archive-file-edit-content-v1");
+    edit.update_bytes(tool.as_bytes());
+    edit.update_bytes(file_path.as_bytes());
+    edit.update_optional_str(new_content);
+    edit.update_optional_str(edits_json);
+    let edit = edit.finish_bytes();
+    let mut all_columns = FramedSha256::new(b"aise-archive-file-edit-row-v1");
+    all_columns.update_i64(seq);
+    all_columns.update_optional_str(ts);
+    all_columns.update_bytes(file_name.as_bytes());
+    all_columns.update_bytes(&edit);
+    FileEditKeys {
+        edit,
+        all_columns: all_columns.finish_bytes(),
+    }
+}
+
+/// Keys of a parsed file edit, from the same column values `insert_file_edits` writes.
+fn parsed_file_edit_keys(edit: &FileEdit) -> Result<FileEditKeys> {
+    let ts = edit.ts.map(|ts| ts.to_rfc3339());
+    let edits_json = serialize_edits_json(edit)?;
+    Ok(file_edit_keys(
+        edit.seq,
+        ts.as_deref(),
+        &edit.tool,
+        &edit.file_path,
+        &edit.file_name,
+        edit.new_content.as_deref(),
+        edits_json.as_deref(),
+    ))
+}
+
+/// A session's stored file edits as (row id, seq, keys) in (seq, id) order.
+fn stored_file_edit_keys(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<Vec<(i64, i64, FileEditKeys)>> {
+    let mut statement = tx.prepare(
+        "select id, seq, ts, tool, file_path, file_name, new_content, edits_json
+         from file_edits where session_id = ?1 order by seq, id",
+    )?;
+    let mut rows = statement.query(params![session_id])?;
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next()? {
+        let seq: i64 = row.get(1)?;
+        let ts: Option<String> = row.get(2)?;
+        let tool: String = row.get(3)?;
+        let file_path: String = row.get(4)?;
+        let file_name: String = row.get(5)?;
+        let new_content: Option<String> = row.get(6)?;
+        let edits_json: Option<String> = row.get(7)?;
+        keys.push((
+            row.get(0)?,
+            seq,
+            file_edit_keys(
+                seq,
+                ts.as_deref(),
+                &tool,
+                &file_path,
+                &file_name,
+                new_content.as_deref(),
+                edits_json.as_deref(),
+            ),
+        ));
+    }
+    Ok(keys)
+}
+
+/// Multiset of keys.
+fn key_counts(keys: impl Iterator<Item = RowDigest>) -> HashMap<RowDigest, usize> {
+    let mut counts = HashMap::new();
+    for key in keys {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// True when `parsed` holds at least as many copies of every stored key as are stored.
+fn covers_every_stored_key(
+    mut stored: impl Iterator<Item = RowDigest>,
+    parsed: impl Iterator<Item = RowDigest>,
+) -> bool {
+    let mut parsed = key_counts(parsed);
+    stored.all(|key| take_key(&mut parsed, &key))
+}
+
+/// Consume one copy of `key`; false when none is left.
+fn take_key(keys: &mut HashMap<RowDigest, usize>, key: &RowDigest) -> bool {
+    match keys.get_mut(key) {
+        Some(count) if *count > 0 => {
+            *count -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The `edits_json` column value of a file edit: a JSON `[old, new]` array, NULL when empty.
+fn serialize_edits_json(edit: &FileEdit) -> Result<Option<String>> {
+    Ok(if edit.edits.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&edit.edits)?)
+    })
+}
+
 /// Insert file-edit rows for `session`, with the caller-supplied `seq`. Shared by `upsert_session`
 /// and `append_tail`. `edits` serialize to a JSON `[old, new]` array (NULL when empty); the same
 /// shape both call sites previously duplicated.
@@ -5759,11 +6582,7 @@ fn insert_file_edits<'a>(
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for (seq, edit) in rows {
-        let edits_json = if edit.edits.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&edit.edits)?)
-        };
+        let edits_json = serialize_edits_json(edit)?;
         stmt.execute(params![
             session.id,
             session.provider.as_str(),
@@ -6095,13 +6914,13 @@ fn score_fuzzy_derived_hits(
     query_lower: &str,
     field: SearchField,
     argument_path: Option<&str>,
-    hits: Vec<MessageHit>,
-) -> Vec<(MessageHit, bool)> {
+    hits: Vec<(usize, MessageHit)>,
+) -> Vec<ScoredFuzzyHit> {
     let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
     hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
-            |(matcher, utf32_buf), mut hit| {
+            |(matcher, utf32_buf), (ordinal, mut hit)| {
                 let value = selected_message_field_parts(&hit, field, argument_path)?.into_owned();
                 utf32_buf.clear();
                 pattern
@@ -6109,7 +6928,7 @@ fn score_fuzzy_derived_hits(
                     .map(|score| {
                         hit.fuzzy_score = Some(score);
                         let exact_phrase = exact_phrase_needle.contains(&value);
-                        (hit, exact_phrase)
+                        (hit, exact_phrase, ordinal)
                     })
             },
         )
@@ -6120,13 +6939,13 @@ fn score_fuzzy_derived_hits(
 fn score_fuzzy_message_hits(
     pattern: &Pattern,
     query_lower: &str,
-    hits: Vec<MessageHit>,
-) -> Vec<(MessageHit, bool)> {
+    hits: Vec<(usize, MessageHit)>,
+) -> Vec<ScoredFuzzyHit> {
     let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
     hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
-            |(matcher, utf32_buf), mut hit| {
+            |(matcher, utf32_buf), (ordinal, mut hit)| {
                 let score = {
                     let haystack = Utf32Str::new(&hit.content, utf32_buf);
                     pattern.score(haystack, matcher)
@@ -6134,7 +6953,7 @@ fn score_fuzzy_message_hits(
                 score.map(|score| {
                     hit.fuzzy_score = Some(score);
                     let exact_phrase = exact_phrase_needle.contains(&hit.content);
-                    (hit, exact_phrase)
+                    (hit, exact_phrase, ordinal)
                 })
             },
         )
@@ -6142,7 +6961,17 @@ fn score_fuzzy_message_hits(
         .collect()
 }
 
-fn compare_fuzzy_hits(left: &(MessageHit, bool), right: &(MessageHit, bool)) -> std::cmp::Ordering {
+/// A fuzzy hit, whether it holds the query as an exact phrase, and its position in the SQL stream.
+///
+/// The position exists to make [`compare_fuzzy_hits`] total. `(session_id, seq)` does not identify
+/// a message (see [`MessageOrder::order_by_clause`]), and [`retain_top_fuzzy_hits`] keeps the top
+/// `offset + limit` with an unstable selection, so two tied rows straddling that cut could come
+/// back in either order, and a different page's cut could keep them the other way round. The
+/// stream is read in the published total order, so its position agrees with it and needs no
+/// extra column or public field.
+type ScoredFuzzyHit = (MessageHit, bool, usize);
+
+fn compare_fuzzy_hits(left: &ScoredFuzzyHit, right: &ScoredFuzzyHit) -> std::cmp::Ordering {
     right
         .0
         .fuzzy_score
@@ -6151,6 +6980,7 @@ fn compare_fuzzy_hits(left: &(MessageHit, bool), right: &(MessageHit, bool)) -> 
         .then_with(|| right.1.cmp(&left.1))
         .then_with(|| left.0.session_id.cmp(&right.0.session_id))
         .then_with(|| left.0.seq.cmp(&right.0.seq))
+        .then_with(|| left.2.cmp(&right.2))
 }
 
 /// The receipt for a fuzzy page that scored every eligible row.
@@ -6228,7 +7058,7 @@ fn top_k_compaction_threshold(limit: usize) -> usize {
     limit.saturating_mul(2).max(FUZZY_SCORE_BATCH_SIZE)
 }
 
-fn retain_top_fuzzy_hits(scored: &mut Vec<(MessageHit, bool)>, limit: usize) {
+fn retain_top_fuzzy_hits(scored: &mut Vec<ScoredFuzzyHit>, limit: usize) {
     if scored.len() > limit {
         scored.select_nth_unstable_by(limit, compare_fuzzy_hits);
         scored.truncate(limit);
@@ -6236,7 +7066,7 @@ fn retain_top_fuzzy_hits(scored: &mut Vec<(MessageHit, bool)>, limit: usize) {
 }
 
 fn finish_fuzzy_hits(
-    mut scored: Vec<(MessageHit, bool)>,
+    mut scored: Vec<ScoredFuzzyHit>,
     ranked_limit: usize,
     offset: usize,
 ) -> Vec<MessageHit> {
@@ -6245,7 +7075,7 @@ fn finish_fuzzy_hits(
     scored
         .into_iter()
         .skip(offset)
-        .map(|(hit, _)| hit)
+        .map(|(hit, _, _)| hit)
         .collect()
 }
 
@@ -10528,10 +11358,8 @@ mod tests {
     fn correction_candidate_and_part_queries_use_provenance_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        let candidates = format!(
-            "explain query plan {CORRECTION_CANDIDATES_SQL}
-             order by m.ts desc, m.session_id asc, m.seq asc"
-        );
+        let candidates =
+            format!("explain query plan {CORRECTION_CANDIDATES_SQL}{CORRECTION_ORDER_SQL}");
         let candidate_plan = db
             .conn
             .prepare(&candidates)
@@ -12681,6 +13509,632 @@ mod tests {
         );
     }
 
+    /// Build a database holding `rows` messages that all contain `needle`, so a literal content
+    /// search's trigram prefilter admits every one of them as a candidate.
+    #[cfg(test)]
+    fn db_with_candidate_rows(dir: &std::path::Path, needle: &str, rows: i64) -> Db {
+        let db = Db::open(&dir.join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                )
+                .unwrap();
+            for i in 0..rows {
+                // Every row is a candidate, but only every 50th is a match, which is the shape a
+                // real sparse match has: the trigram prefilter returns a superset because grams of
+                // the needle may appear non-adjacently. `decoy` holds all fifteen trigrams of
+                // "permission denied" -- the rotation supplies every one except "on ", "n d" and
+                // " de", which the tail adds -- without containing the needle itself.
+                let decoy = "denied permission on n d de";
+                let content = if i % 50 == 0 {
+                    format!("row {i} {needle} tail")
+                } else {
+                    format!("row {i} {decoy} tail")
+                };
+                stmt.execute(params![i, content]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        db.conn.execute_batch("analyze").unwrap();
+        db
+    }
+
+    #[test]
+    fn a_limited_content_page_is_ordered_by_index_rather_than_sorted_whole() {
+        // The published order for a content page is (session_id, seq), which
+        // idx_messages_session_seq already stores, so a page with a finite limit can stop once
+        // it has `limit` matches. Sorting rows that carry `content` instead needs
+        // USE TEMP B-TREE FOR ORDER BY, and a sort cannot emit its first row until its last
+        // input arrives -- so every candidate is verified even for `--limit 1`.
+        //
+        // `hot_message_queries_use_indexes_not_full_scans` above already asserts this property,
+        // but only of hand-written SQL. A gate that checks a statement nobody runs is weaker
+        // than the property it is for, so this one asserts it of the statement
+        // `prepare_non_fuzzy_message_query` actually builds.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+
+        let filters = MessageFilters {
+            limit: 50,
+            ..Default::default()
+        };
+        let prepared = db
+            .prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+            .unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!("explain query plan {}", prepared.sql))
+            .unwrap();
+        let plan = stmt
+            .query_map(rusqlite::params_from_iter(prepared.args.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            !plan.contains("USE TEMP B-TREE"),
+            "a limited content page must not sort every verified candidate: {plan}"
+        );
+        assert!(
+            plan.contains("idx_messages_session_seq"),
+            "the page order must come from the (session_id, seq) index: {plan}"
+        );
+    }
+
+    /// Serialize hits the way the published surfaces do, so the comparison covers the match
+    /// offsets (`field_start_char` / `field_end_char`) and not just which rows came back.
+    #[cfg(test)]
+    fn serialized_hits(hits: &[MessageHit]) -> Vec<String> {
+        hits.iter()
+            .map(|hit| serde_json::to_string(hit).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_index_ordered_page_returns_exactly_what_the_sorted_page_returns() {
+        // Stopping early is only sound if it stops on the same rows. Both statements are run here
+        // and compared whole, rather than trusting that the same ORDER BY implies the same page:
+        // (session_id, seq) is not unique in a real index, so a tie's order is whatever the plan
+        // happens to produce, and that is exactly what a plan change could disturb.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+        // A tied (session_id, seq) pair that both match, placed where a 50-row page must include
+        // it. The real index has three such groups across 5.7 M rows.
+        db.conn
+            .execute_batch(
+                "insert into messages(session_id, provider, seq, role, ts, content) \
+                 values('claude:s1','claude',0,'user','2026-06-01T00:00:00+00:00', \
+                   'tie twin permission denied tail');",
+            )
+            .unwrap();
+
+        for (limit, offset) in [(50_usize, 0_usize), (1, 0), (7, 13), (50, 60)] {
+            let filters = MessageFilters {
+                limit,
+                offset,
+                ..Default::default()
+            };
+            let prepared = db
+                .prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+                .unwrap();
+            assert!(
+                prepared.sql.contains("indexed by idx_messages_session_seq"),
+                "precondition: limit {limit} offset {offset} must be taking the index-ordered plan"
+            );
+            let indexed = db
+                .query_message_hits(&prepared.sql, &prepared.args)
+                .unwrap();
+            let sorted_sql = prepared
+                .sql
+                .replace(" indexed by idx_messages_session_seq", "");
+            let sorted = db.query_message_hits(&sorted_sql, &prepared.args).unwrap();
+            assert_eq!(
+                serialized_hits(&indexed),
+                serialized_hits(&sorted),
+                "limit {limit} offset {offset}: the two plans must agree row for row"
+            );
+        }
+    }
+
+    /// Add a message tied with an existing one on (session_id, seq) that also matches the needle,
+    /// so the published order has to break a tie. The live index holds three such groups.
+    #[cfg(test)]
+    fn inject_tied_twin(db: &Db, seq: i64, needle: &str) {
+        db.conn
+            .execute(
+                "insert into messages(session_id, provider, seq, role, ts, content) \
+                 values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                params![seq, format!("tie twin {needle} tail")],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_descending_order_clause_reverses_tied_rows_too() {
+        // The published SQL order must be total, which this asserts of the clause itself: the
+        // display reversal in `read_session_messages` sits above it, so a caller never sees this
+        // descending sequence directly. (session_id, seq) does not identify a message -- the live
+        // index holds three tied groups across 5,736,231 rows and idx_messages_session_seq is not
+        // unique -- and reversing only the key left a tie in ascending row order in both
+        // directions. Observed on a four-row table tied at ids 20 and 21: oldest [10, 20, 21, 30],
+        // newest [30, 20, 21, 10], where the reverse of oldest is [30, 21, 20, 10].
+        //
+        // `the_newest_window_selects_exactly_the_tail_of_the_oldest_order` below asserts what the
+        // caller actually gets, through the entry point rather than this statement builder.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 300);
+        inject_tied_twin(&db, 0, needle);
+
+        // limit 0 reads the whole match set, so this compares the order itself rather than a page.
+        let filters = MessageFilters::default();
+        let read = |order| {
+            let prepared = db
+                .prepare_non_fuzzy_message_query(needle, &filters, false, order)
+                .unwrap();
+            serialized_hits(
+                &db.query_message_hits(&prepared.sql, &prepared.args)
+                    .unwrap(),
+            )
+        };
+        let oldest = read(MessageOrder::OldestFirst);
+        let newest = read(MessageOrder::NewestFirst);
+        assert!(
+            oldest.len() > 1,
+            "precondition: the fixture must return more than one match"
+        );
+        let mut oldest_reversed = oldest.clone();
+        oldest_reversed.reverse();
+        assert_eq!(
+            newest, oldest_reversed,
+            "newest-first must be the exact reverse of oldest-first, ties included"
+        );
+    }
+
+    #[test]
+    fn the_newest_window_selects_exactly_the_tail_of_the_oldest_order() {
+        // What a caller observes. `read_session_messages` with NewestFirst keeps the LAST `limit`
+        // messages and then reverses them, so results always print oldest-first and `order`
+        // decides which messages are kept rather than how they print. Membership therefore needs
+        // the order to be total: with (session_id, seq) tied across the window boundary, a partial
+        // order leaves SQLite free to keep either tied row, so the window can drop one row and
+        // keep another that the whole-session read places somewhere else.
+        //
+        // Asserted through the entry point, because the clause-level test above proves only that
+        // the statement builder emits a total order, not that the published window honors it.
+        //
+        // This drives the content-search window (`aise messages search --session-id S
+        // --match-window latest`, messages.rs:1053-1057), not the no-text session read: a no-text
+        // read is served by walking idx_messages_session_seq, and walking it backwards reverses
+        // the tie along with everything else, so that path hides the defect. The content search
+        // keeps the sort for NewestFirst, and a sorter holds a tie in its input order whichever
+        // direction the key runs.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 300);
+        inject_tied_twin(&db, 0, needle); // tie at the oldest end
+        inject_tied_twin(&db, 250, needle); // tie across the newest window boundary
+
+        let read = |limit, order| {
+            let filters = MessageFilters {
+                session_id: Some("claude:s1".to_string()),
+                limit,
+                ..Default::default()
+            };
+            let mut hits = db.search_messages_ordered(needle, &filters, order).unwrap();
+            if order == MessageOrder::NewestFirst {
+                // Mirrors messages.rs: the window selects which matches are kept, and the result
+                // is turned back to chronological order before it reaches the caller.
+                hits.reverse();
+            }
+            serialized_hits(&hits)
+        };
+        let whole = read(0, MessageOrder::OldestFirst);
+        // 300 rows yield matches at seq 0, 50, ... 250, plus the two injected twins.
+        assert_eq!(whole.len(), 8, "fixture: six matches plus two tied twins");
+
+        for n in [1_usize, 2, 3, 7] {
+            assert_eq!(
+                read(n, MessageOrder::NewestFirst),
+                whole[whole.len() - n..],
+                "the newest {n} must be exactly the last {n} of the whole-session order"
+            );
+            assert_eq!(
+                read(n, MessageOrder::OldestFirst),
+                whole[..n],
+                "the oldest {n} must be exactly the first {n} of the whole-session order"
+            );
+        }
+    }
+
+    #[test]
+    fn paging_through_a_content_search_reproduces_the_whole_ordered_result() {
+        // Offset pagination is only coherent if the order is total: every page is its own query,
+        // and a tie free to come back in either order can drop a row between two pages or repeat
+        // it in both. This also crosses plans, because the whole-set read takes limit 0 and so
+        // keeps the sort while every page takes the index-ordered plan.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+        inject_tied_twin(&db, 0, needle);
+
+        let whole = {
+            let filters = MessageFilters::default();
+            let prepared = db
+                .prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+                .unwrap();
+            serialized_hits(
+                &db.query_message_hits(&prepared.sql, &prepared.args)
+                    .unwrap(),
+            )
+        };
+        assert!(
+            whole.len() > 100,
+            "precondition: the walk must cross many page boundaries, got {}",
+            whole.len()
+        );
+
+        for page in [1_usize, 7, 50] {
+            let mut walked = Vec::new();
+            for offset in (0..whole.len() + page).step_by(page) {
+                let filters = MessageFilters {
+                    limit: page,
+                    offset,
+                    ..Default::default()
+                };
+                let prepared = db
+                    .prepare_non_fuzzy_message_query(
+                        needle,
+                        &filters,
+                        false,
+                        MessageOrder::OldestFirst,
+                    )
+                    .unwrap();
+                assert!(
+                    prepared.sql.contains("indexed by idx_messages_session_seq"),
+                    "precondition: page {page} at offset {offset} must take the index-ordered plan"
+                );
+                let hits = db
+                    .query_message_hits(&prepared.sql, &prepared.args)
+                    .unwrap();
+                if hits.is_empty() {
+                    break;
+                }
+                walked.extend(serialized_hits(&hits));
+            }
+            assert_eq!(
+                walked, whole,
+                "paging {page} at a time must reproduce the whole ordered result exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn content_search_finds_text_whose_case_the_trigram_index_does_not_fold() {
+        // The trigram prefilter must select a superset of what the verifier accepts. FTS5's
+        // tokenizer folds case from tables older than some Unicode case pairs (Cherokee, whose
+        // ordinary written form is the uppercase syllabary, among 417 scalars), and it stores
+        // U+0130 as itself where the verifier folds it to `i` + U+0307. Each row below is one the
+        // verifier accepts and a prefilter built from lowercased trigrams excluded.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let rows = [
+            "\u{13E3}\u{13B3}\u{13A9} syllabary", // ᏣᎳᎩ, Cherokee as normally written
+            "abİ end",
+            "go to İstanbul now",
+            "nothing relevant here",
+        ];
+        for (seq, content) in rows.iter().enumerate() {
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                    params![seq as i64, content],
+                )
+                .unwrap();
+        }
+        let found = |mode: MessageSearchMode, needle: &str| -> Vec<i64> {
+            let filters = MessageFilters {
+                match_mode: mode,
+                ..Default::default()
+            };
+            db.search_messages_ordered(needle, &filters, MessageOrder::OldestFirst)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.seq)
+                .collect()
+        };
+        let cases: &[(MessageSearchMode, &str, &[i64])] = &[
+            (MessageSearchMode::Literal, "\u{13E3}\u{13B3}\u{13A9}", &[0]),
+            (MessageSearchMode::Literal, "\u{ABB3}\u{AB83}\u{AB79}", &[0]),
+            (MessageSearchMode::Regex, "\u{13E3}\u{13B3}\u{13A9}", &[0]),
+            (MessageSearchMode::Literal, "abi", &[1]),
+            (MessageSearchMode::Literal, "İstanbul", &[2]),
+        ];
+        for (mode, needle, expected) in cases {
+            assert_eq!(
+                found(*mode, needle),
+                *expected,
+                "{mode:?} search for {needle:?} must find every row the verifier accepts"
+            );
+        }
+    }
+
+    #[test]
+    fn prefiltered_content_search_equals_a_full_scan_over_generated_text() {
+        // The prefilter may only narrow work, never results. Rows and needles are generated from
+        // the scalars where FTS5's folding and the verifier's disagree (U+0130 and its halves,
+        // the Kelvin sign, three sigmas, Cherokee and Georgian case pairs FTS5 leaves unfolded)
+        // mixed into ASCII, and every search must return exactly the rows a direct check of every
+        // row returns: the caseless fold for literal mode, the case-sensitive regex for regex.
+        // Fixed-seed xorshift, so a failure names its needle and reproduces everywhere.
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'p', 'i', 'k', 's', 't', ' ', 'A', 'I', 'K', 'S', '\u{130}', '\u{307}',
+            '\u{212A}', 'Σ', 'σ', 'ς', '\u{13A0}', '\u{AB70}', '\u{13E3}', '\u{ABB3}', '\u{1C90}',
+            '\u{10D0}',
+        ];
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut pick = |len: u64| -> String {
+            (0..len)
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let rows: Vec<String> = (0..400).map(|i| pick(4 + i % 17)).collect();
+        for (seq, content) in rows.iter().enumerate() {
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00',?2)",
+                    params![seq as i64, content],
+                )
+                .unwrap();
+        }
+        let mut needles: Vec<String> = Vec::new();
+        for i in 0..300_usize {
+            if i % 2 == 0 {
+                // A slice of a row on character boundaries, so matches are common.
+                let row: Vec<char> = rows[i % rows.len()].chars().collect();
+                let start = i % row.len();
+                let len = 3 + i % 4;
+                needles.push(row[start..(start + len).min(row.len())].iter().collect());
+            } else {
+                needles.push(pick(3 + (i as u64 % 4)));
+            }
+        }
+
+        let mut prefiltered = 0_u32;
+        let mut matched = 0_u32;
+        for needle in &needles {
+            let folded = crate::util::fold_caseless(needle);
+            if folded.is_empty() {
+                continue;
+            }
+            let pattern = regex::Regex::new(&regex::escape(needle)).unwrap();
+            for (mode, expected) in [
+                (
+                    MessageSearchMode::Literal,
+                    rows.iter()
+                        .enumerate()
+                        .filter(|(_, row)| crate::util::fold_caseless(row).contains(&folded))
+                        .map(|(seq, _)| seq as i64)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    MessageSearchMode::Regex,
+                    rows.iter()
+                        .enumerate()
+                        .filter(|(_, row)| pattern.is_match(row))
+                        .map(|(seq, _)| seq as i64)
+                        .collect::<Vec<_>>(),
+                ),
+            ] {
+                let filters = MessageFilters {
+                    match_mode: mode,
+                    ..Default::default()
+                };
+                let found: Vec<i64> = db
+                    .search_messages_ordered(needle, &filters, MessageOrder::OldestFirst)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit.seq)
+                    .collect();
+                assert_eq!(
+                    found, expected,
+                    "{mode:?} search for {needle:?} must equal a direct check of every row"
+                );
+                matched += u32::from(!expected.is_empty());
+            }
+            prefiltered +=
+                u32::from(crate::trigram::trigram_prefilter(&regex::escape(needle)).is_some());
+        }
+        // Coverage of the property, not of the implementation: both the prefiltered path and
+        // matches must actually occur, or the sweep proves nothing about them.
+        assert!(
+            prefiltered > 50,
+            "only {prefiltered} needles took a prefilter"
+        );
+        assert!(matched > 100, "only {matched} searches matched anything");
+    }
+
+    #[test]
+    fn paging_through_a_fuzzy_search_reproduces_the_whole_ranked_result() {
+        // Fuzzy ranks in memory and keeps the top `offset + limit` with an unstable selection, so
+        // its comparator must be total too. Every row here has the same content and therefore the
+        // same score, which leaves (session_id, seq) to decide, and every tenth seq holds a twin,
+        // so page cuts keep landing between two rows the comparator cannot tell apart.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        for seq in 0..400_i64 {
+            let copies = if seq % 10 == 0 { 2 } else { 1 };
+            for _ in 0..copies {
+                db.conn
+                    .execute(
+                        "insert into messages(session_id, provider, seq, role, ts, content) \
+                         values('claude:s1','claude',?1,'user','2026-06-01T00:00:00+00:00', \
+                                'alpha beta gamma')",
+                        params![seq],
+                    )
+                    .unwrap();
+            }
+        }
+        // Distinguish the twins in the serialized hit without changing their score: the role is
+        // not scored, and `serialized_hits` reports it.
+        db.conn
+            .execute(
+                "update messages set role = 'assistant' where id in \
+                 (select max(id) from messages group by seq having count(*) > 1)",
+                [],
+            )
+            .unwrap();
+        let read = |limit: usize, offset: usize| {
+            let filters = MessageFilters {
+                match_mode: MessageSearchMode::Fuzzy,
+                limit,
+                offset,
+                ..Default::default()
+            };
+            serialized_hits(
+                &db.search_messages_ordered("alpha", &filters, MessageOrder::OldestFirst)
+                    .unwrap(),
+            )
+        };
+        let whole = read(10_000, 0);
+        assert_eq!(whole.len(), 440, "precondition: 400 rows plus 40 twins");
+        for page in [1_usize, 7, 50] {
+            let mut walked = Vec::new();
+            for offset in (0..whole.len()).step_by(page) {
+                walked.extend(read(page, offset));
+            }
+            assert_eq!(
+                walked, whole,
+                "fuzzy paging {page} at a time must reproduce the whole ranked result exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn the_page_plan_keeps_the_sort_wherever_the_index_order_cannot_pay() {
+        // Each of these was measured to lose; see `Db::ordered_page_index_hint`.
+        let dir = tempfile::tempdir().unwrap();
+        let needle = "permission denied";
+        let db = db_with_candidate_rows(dir.path(), needle, 6_000);
+
+        let hint = |query: &str, limit: usize, order: MessageOrder| {
+            let filters = MessageFilters {
+                limit,
+                ..Default::default()
+            };
+            db.prepare_non_fuzzy_message_query(query, &filters, false, order)
+                .unwrap()
+                .sql
+                .contains("indexed by")
+        };
+
+        assert!(
+            hint(needle, 50, MessageOrder::OldestFirst),
+            "control: an ordinary limited page is steered"
+        );
+        assert!(
+            !hint(needle, 0, MessageOrder::OldestFirst),
+            "all-results has nothing to stop early for, so the scan is pure overhead"
+        );
+        assert!(
+            !hint(needle, 50, MessageOrder::NewestFirst),
+            "newest-first wants seq descending, which an ascending index cannot supply"
+        );
+        assert!(
+            !hint("", 50, MessageOrder::OldestFirst),
+            "a queryless page has no candidate set to stop against"
+        );
+        assert!(
+            !hint("no such needle anywhere", 50, MessageOrder::OldestFirst),
+            "below the candidate floor the sort is already cheap"
+        );
+
+        // A class or path predicate is not stored in (session_id, seq), so the scan pays a table
+        // lookup per row to evaluate it and walks further when it narrows to a minority class.
+        let with = |mutate: fn(&mut MessageFilters)| {
+            let mut filters = MessageFilters {
+                limit: 50,
+                ..Default::default()
+            };
+            mutate(&mut filters);
+            db.prepare_non_fuzzy_message_query(needle, &filters, false, MessageOrder::OldestFirst)
+                .unwrap()
+                .sql
+                .contains("indexed by")
+        };
+        assert!(
+            !with(|f| f.role = Some(crate::models::Role::User)),
+            "a role filter must keep the sort: --role user measured 395 ms against 802 ms"
+        );
+        assert!(
+            !with(|f| f.providers = Some(vec![crate::models::Provider::Claude])),
+            "a provider filter must keep the sort"
+        );
+        assert!(
+            !with(|f| f.tool = Some("Bash".into())),
+            "a tool-name filter must keep the sort"
+        );
+        assert!(
+            !with(|f| f.path_prefix = Some("/x".into())),
+            "a path filter evaluates a sessions subquery per scanned row"
+        );
+        // A time window neither reduces match density much nor is cheap to replace, and it
+        // measured 1.29x at --since 3d and 10.48x at --since 1y, so it stays eligible.
+        assert!(
+            with(|f| f.since = Some(
+                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )),
+            "a time window must stay eligible for the index-ordered page"
+        );
+    }
+
     #[test]
     fn messages_fts_is_rebuilt_when_empty_but_messages_exist() {
         let dir = tempfile::tempdir().unwrap();
@@ -12924,6 +14378,9 @@ mod tests {
             let mut parsed = parsed_with_messages(&id, &[&content]);
             parsed.session.provider_session_id = format!("allocation-{index}");
             parsed.session.source_path = format!("/allocation/{index}.jsonl");
+            // A new parser version: replacing rows a re-parse by the same parser no longer holds
+            // would delete archived history, so only a parser upgrade replaces them.
+            parsed.session.parse_version = "allocation-parser-v2".into();
             db.replace_session(&parsed, 10 + index, 10 + index).unwrap();
         }
         db.optimize_fts().unwrap();
@@ -13494,7 +14951,10 @@ mod tests {
     }
 
     #[test]
-    fn purge_injected_messages_removes_only_leading_marker_user_rows() {
+    fn classify_injected_messages_keeps_leading_marker_user_rows_as_harness_notices() {
+        // These records are stored on purpose (`MessageKind::HarnessNotice`): they are the only
+        // evidence of what a harness told an agent. Legacy rows written before that
+        // classification are reclassified in place; nothing is deleted, so no seq gap opens.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         seed_messages(
@@ -13503,37 +14963,70 @@ mod tests {
                 (
                     "user",
                     "<local-command-stdout>Set model to Opus</local-command-stdout>",
-                ), // purge
-                ("user", "<local-command-stderr>boom</local-command-stderr>"), // purge
+                ), // reclassify
+                ("user", "<local-command-stderr>boom</local-command-stderr>"), // reclassify
                 (
                     "user",
                     "<environment_context>\n<current_date>2026</current_date>",
-                ), // purge
+                ), // reclassify
                 (
                     "user",
                     "<turn_aborted>\nThe user interrupted the previous turn on purpose.",
-                ), // purge
-                ("user", "fix the failing login test before release"),         // KEEP (prompt)
-                ("user", "what does <local-command-stdout> mean in the logs"), // KEEP (not leading)
+                ), // reclassify
+                ("user", "fix the failing login test before release"),         // prompt
+                ("user", "what does <local-command-stdout> mean in the logs"), // not leading
                 (
                     "user",
                     "what does <turn_aborted> mean in a Codex transcript",
-                ), // KEEP (not leading)
+                ), // not leading
                 (
                     "assistant",
                     "<local-command-stdout>tool output</local-command-stdout>",
-                ), // KEEP (not user)
+                ), // not user
             ],
         );
-        let before = db.message_count().unwrap();
-        let purged = db.purge_injected_messages().unwrap();
-        assert_eq!(purged, 4, "the four leading-marker USER rows are deleted");
-        assert_eq!(db.message_count().unwrap(), before - 4);
-        // FTS + trigram stay in sync via the delete triggers.
+        let rows_before = db.message_count().unwrap();
+        let seqs = |db: &Db| -> Vec<i64> {
+            db.conn
+                .prepare("select seq from messages order by id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let seqs_before = seqs(&db);
+
+        assert_eq!(db.classify_injected_messages().unwrap(), 4);
+        assert_eq!(
+            db.classify_injected_messages().unwrap(),
+            0,
+            "a second run finds nothing left to reclassify"
+        );
+        assert_eq!(
+            db.message_count().unwrap(),
+            rows_before,
+            "nothing is deleted"
+        );
+        assert_eq!(seqs(&db), seqs_before, "no seq moves or disappears");
         assert_eq!(
             db.messages_fts_count().unwrap(),
             db.message_count().unwrap()
         );
+        let notices: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages where kind = 'harness_notice' \
+                 and authorship = 'harness' and role = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            notices, 4,
+            "the four leading-marker user rows are notices now"
+        );
+
         let users: Vec<String> = db
             .search_messages(
                 "",
@@ -13546,23 +15039,17 @@ mod tests {
             .into_iter()
             .map(|h| h.content)
             .collect();
-        assert!(
-            users
-                .iter()
-                .any(|c| c.contains("fix the failing login test")),
-            "real prompt kept"
-        );
-        assert!(
-            users
-                .iter()
-                .any(|c| c.starts_with("what does <local-command-stdout>")),
-            "a non-leading mention is kept"
-        );
         assert_eq!(
             users.len(),
             3,
-            "exactly the three legitimate user messages remain"
+            "default user search still returns exactly the three user-written messages: {users:?}"
         );
+        assert!(users
+            .iter()
+            .any(|c| c.contains("fix the failing login test")));
+        assert!(users
+            .iter()
+            .any(|c| c.starts_with("what does <local-command-stdout>")));
     }
 
     #[test]
@@ -13978,6 +15465,182 @@ mod tests {
             "equal and missing timestamps use session id then sequence as stable tie-breakers"
         );
         assert_eq!(combined, page(0, 0), "pages must partition the full result");
+    }
+
+    #[test]
+    fn find_corrections_orders_rows_tied_on_every_sort_key_by_row_id_under_any_filter() {
+        // (session_id, seq) does not identify a message, so rows can tie on all of
+        // `ts desc, session_id, seq`. Unfiltered, SQLite reads idx_messages_role_ts backwards
+        // for `ts desc` and returns such rows in descending row id; filtered to one session it
+        // reads them ascending. The published order ends on the row id so it does not depend on
+        // which index the filters select.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:t','claude','claude:t','','/x','v1','jsonl')",
+                [],
+            )
+            .unwrap();
+        for content in ["you forgot first", "you forgot second", "you forgot third"] {
+            db.conn
+                .execute(
+                    "insert into messages(
+                         session_id, provider, seq, role, ts, content,
+                         authorship, record_relation
+                     ) values('claude:t','claude',4,'user','2026-01-01T00:00:00Z',?1,
+                              'human','original')",
+                    [content],
+                )
+                .unwrap();
+        }
+        let policies = default_policies();
+        let read = |session_id: Option<&str>, offset: usize, limit: usize| {
+            db.find_corrections(
+                &policies,
+                &MessageFilters {
+                    session_id: session_id.map(str::to_string),
+                    offset,
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.content)
+            .collect::<Vec<_>>()
+        };
+        let expected = ["you forgot first", "you forgot second", "you forgot third"];
+        assert_eq!(read(None, 0, 0), expected, "unfiltered");
+        assert_eq!(
+            read(Some("claude:t"), 0, 0),
+            expected,
+            "filtered to the session"
+        );
+        let walked = (0..3)
+            .flat_map(|offset| read(None, offset, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(walked, expected, "pages of one partition the same order");
+    }
+
+    /// Three human user messages tied on `(session_id, seq)`, inserted in row id order with
+    /// descending timestamps, so an index read in timestamp order meets them in reverse.
+    fn insert_tied_human_messages(db: &Db, contents: &[&str]) {
+        db.conn
+            .execute(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:t','claude','claude:t','','/x','v1','jsonl')",
+                [],
+            )
+            .unwrap();
+        for (index, content) in contents.iter().enumerate() {
+            db.conn
+                .execute(
+                    "insert into messages(
+                         session_id, provider, seq, role, ts, content,
+                         authorship, record_relation
+                     ) values('claude:t','claude',4,'user',?1,?2,'human','original')",
+                    params![format!("2026-01-0{}T00:00:00Z", 9 - index), content],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn attributable_human_search_orders_tied_rows_by_row_id_under_any_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let expected = ["repeat first", "repeat second", "repeat third"];
+        insert_tied_human_messages(&db, &expected);
+        let read = |role: Option<Role>, offset: usize, limit: usize| {
+            db.search_attributable_human_messages(
+                "repeat",
+                &MessageFilters {
+                    role,
+                    offset,
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.content)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(read(None, 0, 0), expected, "unfiltered");
+        assert_eq!(
+            read(Some(Role::User), 0, 0),
+            expected,
+            "filtered to user rows"
+        );
+        let walked = (0..3)
+            .flat_map(|offset| read(Some(Role::User), offset, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(walked, expected, "pages of one partition the same order");
+    }
+
+    #[test]
+    fn file_edits_sharing_a_message_keep_their_source_order() {
+        // One message can edit a file several times; those edits share a seq, and version
+        // replay depends on applying them in source order, which is row id order.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:t','claude','claude:t','','/x','v1','jsonl')",
+                [],
+            )
+            .unwrap();
+        for (path, content) in [("/b/x.rs", "v1"), ("/a/x.rs", "v2"), ("/b/x.rs", "v3")] {
+            db.conn
+                .execute(
+                    "insert into file_edits(session_id, provider, seq, ts, tool, file_path, \
+                       file_name, new_content) \
+                     values('claude:t','claude',4,'2026-01-01T00:00:00Z','Write',?1,'x.rs',?2)",
+                    [path, content],
+                )
+                .unwrap();
+        }
+        let contents = |edits: Vec<(String, Provider, FileEdit)>| {
+            edits
+                .into_iter()
+                .map(|(_, _, edit)| edit.new_content.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            contents(db.file_edits_for_session_id("x.rs", "claude:t").unwrap()),
+            ["v1", "v2", "v3"]
+        );
+        assert_eq!(
+            contents(
+                db.file_edits_for_query("/b/x.rs", &FileQuery::default())
+                    .unwrap()
+            ),
+            ["v1", "v3"]
+        );
+    }
+
+    #[test]
+    fn message_context_returns_tied_rows_in_row_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let expected = ["context first", "context second", "context third"];
+        insert_tied_human_messages(&db, &expected);
+        let contents =
+            |hits: Vec<MessageHit>| hits.into_iter().map(|hit| hit.content).collect::<Vec<_>>();
+        assert_eq!(
+            contents(db.message_context("claude:t", 4, 0, 0).unwrap()),
+            expected
+        );
+        let windows = db
+            .message_context_windows(&[("claude:t".to_string(), 4)], 1, 1)
+            .unwrap();
+        assert_eq!(contents(windows.into_iter().next().unwrap()), expected);
     }
 
     #[test]
@@ -14587,8 +16250,8 @@ mod tests {
     fn upsert_appends_only_new_messages_when_session_grows() {
         // Root-cause reindex perf: an append-only session that GREW must NOT delete + re-insert
         // (and re-trigram-index) its unchanged prefix — that re-indexed entire multi-hundred-MB
-        // sessions on every incremental reindex. Detected with a SENTINEL tag on the existing
-        // rows: it survives an append but not a delete+re-insert. (Row ids can't tell them apart
+        // sessions on every incremental reindex. Detected by counting inserted rows with a
+        // temporary trigger: an append inserts only the new rows. (Row ids can't tell them apart
         // — SQLite reuses freed rowids after a delete-all.)
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -14602,15 +16265,14 @@ mod tests {
                 .filter_map(Result::ok)
                 .collect()
         };
-        let tagged = |db: &Db| -> i64 {
-            db.conn
-                .query_row(
-                    "select count(*) from messages where session_id='claude:s1' \
-                     and tool_name='SENTINEL'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap()
+        // Rows inserted since the last call.
+        let inserted = |db: &Db| -> i64 {
+            let count = db
+                .conn
+                .query_row("select count(*) from temp.inserted", [], |r| r.get(0))
+                .unwrap();
+            db.conn.execute("delete from temp.inserted", []).unwrap();
+            count
         };
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]),
@@ -14618,11 +16280,11 @@ mod tests {
             100,
         )
         .unwrap();
-        // Tag the existing rows; a fresh re-insert (from the parse) would not carry the sentinel.
         db.conn
-            .execute(
-                "update messages set tool_name='SENTINEL' where session_id='claude:s1'",
-                [],
+            .execute_batch(
+                "create temp table inserted(id integer);
+                 create temp trigger count_inserts after insert on messages begin
+                     insert into inserted values (new.id); end;",
             )
             .unwrap();
 
@@ -14638,9 +16300,9 @@ mod tests {
             ["alpha", "bravo", "charlie", "delta", "echo"]
         );
         assert_eq!(
-            tagged(&db),
-            3,
-            "prefix rows RETAINED the sentinel (appended, not re-indexed)"
+            inserted(&db),
+            2,
+            "only the two new rows were inserted (appended, not re-indexed)"
         );
         // The appended message is findable by regex search (custom index built lazily over the
         // grown corpus, or covered by the un-indexed delta direct-scan).
@@ -14655,7 +16317,9 @@ mod tests {
             .unwrap();
         assert_eq!(new_found.len(), 1, "the appended message is searchable");
 
-        // Shrink → full replace (safe fallback): sentinel gone, content correct.
+        // Shrink under the same parser: the harness compacted or pruned its transcript. The
+        // index is the archive, so the stored rows stay, untouched, and nothing the parse still
+        // holds is inserted twice.
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "bravo"]),
             3,
@@ -14664,40 +16328,33 @@ mod tests {
         .unwrap();
         assert_eq!(
             contents(&db),
-            ["alpha", "bravo"],
-            "shrink re-replaces fully"
+            ["alpha", "bravo", "charlie", "delta", "echo"],
+            "a shrunk source keeps every stored message"
         );
-        assert_eq!(tagged(&db), 0, "shrink did a full replace");
+        assert_eq!(inserted(&db), 0, "stored rows were kept, not re-inserted");
 
-        // Grow with a CHANGED boundary message (in-place rewrite) → full replace, correct content.
-        db.upsert_session(
-            &parsed_with_messages("claude:s1", &["alpha", "boundary"]),
-            4,
-            70,
-        )
-        .unwrap();
-        db.conn
-            .execute(
-                "update messages set tool_name='SENTINEL' where session_id='claude:s1'",
-                [],
-            )
-            .unwrap();
+        // In-place rewrite under the same parser: stored rows stay and only the rewritten
+        // message is new, appended after the highest stored seq.
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "CHANGED", "extra"]),
-            5,
+            4,
             90,
         )
         .unwrap();
         assert_eq!(
             contents(&db),
-            ["alpha", "CHANGED", "extra"],
-            "boundary content changed → full replace keeps content correct",
+            ["alpha", "bravo", "charlie", "delta", "echo", "CHANGED", "extra"],
+            "a rewritten source keeps the old messages and appends the new ones",
         );
-        assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
+        assert_eq!(
+            inserted(&db),
+            2,
+            "only the rewritten and new messages were inserted"
+        );
     }
 
     #[test]
-    fn replace_session_rewrites_matching_prefix_metadata_on_full_reindex() {
+    fn a_new_parser_version_rewrites_matching_prefix_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
 
@@ -14714,12 +16371,11 @@ mod tests {
             )
             .unwrap();
 
-        db.replace_session(
-            &parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]),
-            2,
-            150,
-        )
-        .unwrap();
+        // Parser fixes bump the parse version, and a new version replaces the rows. Under the
+        // same version a differing role cannot be told from a replaced message, so it is kept.
+        let mut fixed = parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]);
+        fixed.session.parse_version = "v2".into();
+        db.replace_session(&fixed, 2, 150).unwrap();
         let row: (String, Option<String>) = db
             .conn
             .query_row(
@@ -14731,7 +16387,1000 @@ mod tests {
         assert_eq!(
             row,
             ("user".to_string(), None),
-            "full replace must repair stale prefix metadata even when content is unchanged"
+            "a new parser version repairs stale prefix metadata even when content is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_tail_append_advances_session_dates_as_instants_whatever_their_offset() {
+        // 12:00+03:00 is 09:00 UTC, before the appended 10:01Z message, but sorts after it as
+        // text, so a text comparison kept the stale value.
+        use crate::providers::claude::ClaudeAdapter;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("probe.jsonl");
+        let line = |ts: &str, role: &str, text: &str| {
+            format!(
+                "{{\"type\":\"{role}\",\"sessionId\":\"probe\",\"timestamp\":\"{ts}\",\
+                 \"message\":{{\"role\":\"{role}\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            )
+        };
+        std::fs::write(&file, line("2026-06-01T09:00:00Z", "user", "first prompt")).unwrap();
+        let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
+        let source = crate::models::SourceFile {
+            provider: Provider::Claude,
+            path: file.clone(),
+            mtime_ns: 1,
+            size_bytes: std::fs::metadata(&file).unwrap().len() as i64,
+        };
+        let source_path = crate::util::normalize_path(&file);
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(&claude.parse(&source), 1, source.size_bytes)
+            .unwrap();
+        db.set_file_checkpoint(
+            Provider::Claude,
+            &source_path,
+            crate::tail::complete_prefix_offset(&file).unwrap(),
+            &crate::tail::prefix_fingerprint(&file).unwrap(),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "update sessions set updated_at = '2026-06-01T12:00:00+03:00',
+                     last_message_at = '2026-06-01T12:00:00+03:00'",
+                [],
+            )
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(line("2026-06-01T10:01:00Z", "user", "second prompt").as_bytes())
+            .unwrap();
+        let (offset, _) = db
+            .file_checkpoint(
+                Provider::Claude,
+                &source_path,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap()
+            .unwrap();
+        let tail = crate::tail::tail_parse(&file, offset, |cursor, path| {
+            claude.parse_reader(cursor, path)
+        })
+        .unwrap()
+        .expect("a new complete line was appended");
+        db.append_tail(&tail, 2, std::fs::metadata(&file).unwrap().len() as i64)
+            .unwrap();
+        let (updated, last): (String, String) = db
+            .conn
+            .query_row(
+                "select updated_at, last_message_at from sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let expected = "2026-06-01T10:01:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            updated.parse::<DateTime<Utc>>().unwrap(),
+            expected,
+            "{updated}"
+        );
+        assert_eq!(last.parse::<DateTime<Utc>>().unwrap(), expected, "{last}");
+    }
+
+    #[test]
+    fn tail_append_after_a_deleted_row_continues_past_the_highest_seq() {
+        // The former `purge_injected_messages` deleted rows from indexed sessions and left seq
+        // gaps, and older indexes still carry them. An append numbered from `count(*)` then
+        // reused existing seqs: a live Codex session got
+        // three (session_id, seq) pairs holding two messages each. New rows must start after the
+        // highest stored seq, so every seq keeps naming one message.
+        use crate::providers::claude::ClaudeAdapter;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("probe.jsonl");
+        let line = |ts: &str, role: &str, text: &str| {
+            format!(
+                "{{\"type\":\"{role}\",\"sessionId\":\"probe\",\"timestamp\":\"{ts}\",\
+                 \"message\":{{\"role\":\"{role}\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            )
+        };
+        std::fs::write(
+            &file,
+            format!(
+                "{}{}",
+                line("2026-06-01T10:00:00Z", "user", "first prompt"),
+                line("2026-06-01T10:00:05Z", "assistant", "first reply"),
+            ),
+        )
+        .unwrap();
+        let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
+        let source = crate::models::SourceFile {
+            provider: Provider::Claude,
+            path: file.clone(),
+            mtime_ns: 1,
+            size_bytes: std::fs::metadata(&file).unwrap().len() as i64,
+        };
+        let source_path = crate::util::normalize_path(&file);
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = claude.parse(&source);
+        crate::util::backfill_session_dates(&mut parsed.session, source.mtime_ns);
+        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)
+            .unwrap();
+        db.set_file_checkpoint(
+            Provider::Claude,
+            &source_path,
+            crate::tail::complete_prefix_offset(&file).unwrap(),
+            &crate::tail::prefix_fingerprint(&file).unwrap(),
+        )
+        .unwrap();
+        // What the purge does: remove a row without renumbering the rest.
+        db.conn
+            .execute(
+                "delete from messages where session_id='claude:probe' and seq=0",
+                [],
+            )
+            .unwrap();
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(line("2026-06-01T10:01:00Z", "user", "second prompt").as_bytes())
+            .unwrap();
+        let new_size = std::fs::metadata(&file).unwrap().len() as i64;
+        let (offset, _) = db
+            .file_checkpoint(
+                Provider::Claude,
+                &source_path,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap()
+            .unwrap();
+        let tail = crate::tail::tail_parse(&file, offset, |cursor, path| {
+            claude.parse_reader(cursor, path)
+        })
+        .unwrap()
+        .expect("a new complete line was appended");
+        db.append_tail(&tail, 2, new_size).unwrap();
+
+        let rows: Vec<(i64, String)> = db
+            .conn
+            .prepare(
+                "select seq, content from messages where session_id='claude:probe' order by id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (1, "first reply".to_string()),
+                (2, "second prompt".to_string())
+            ],
+            "the appended message must take the seq after the highest stored one"
+        );
+    }
+
+    fn archive_message(
+        seq: i64,
+        content: &str,
+        kind: crate::models::MessageKind,
+    ) -> crate::models::Message {
+        crate::models::Message {
+            seq,
+            role: Role::User,
+            ts: None,
+            tool_name: None,
+            kind,
+            tool_call_id: None,
+            content: content.to_string(),
+            is_compaction: false,
+            provenance: Default::default(),
+        }
+    }
+
+    fn archive_session(
+        messages: Vec<crate::models::Message>,
+        file_edits: Vec<FileEdit>,
+    ) -> ParsedSession {
+        ParsedSession {
+            session: SessionRecord {
+                id: "codex:archive".into(),
+                provider: Provider::Codex,
+                provider_session_id: "archive".into(),
+                title: None,
+                summary: None,
+                cwd: None,
+                repo_root: None,
+                created_at: None,
+                updated_at: None,
+                last_message_at: None,
+                preview_text: String::new(),
+                source_path: "/x/archive.jsonl".into(),
+                message_count: Some(messages.len() as i64),
+                parse_version: "v1".into(),
+                raw_metadata_json: None,
+                parse_warning: None,
+                discovery_source: "test".into(),
+                parent_session_id: None,
+                agent_label: None,
+            },
+            transcript_text: String::new(),
+            messages,
+            file_edits,
+        }
+    }
+
+    fn archive_rows(db: &Db) -> Vec<(i64, String, String)> {
+        db.conn
+            .prepare("select seq, content, kind from messages order by seq, id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn reindexing_a_shrunk_or_rewritten_source_keeps_every_stored_message() {
+        // Harnesses compact, rewrite and prune their own transcripts (Codex rewrote a 4,720-row
+        // session down to 74 records). The index is the archive: a re-parse that no longer
+        // holds a stored message must not delete it. New parse messages are appended after the
+        // highest stored seq.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                    archive_message(2, "c", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "summary of a, b and c", Conversation),
+                    archive_message(1, "d", Conversation),
+                ],
+                Vec::new(),
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        let contents: Vec<(i64, String)> = archive_rows(&db)
+            .into_iter()
+            .map(|(seq, content, _)| (seq, content))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (0, "a".to_string()),
+                (1, "b".to_string()),
+                (2, "c".to_string()),
+                (3, "summary of a, b and c".to_string()),
+                (4, "d".to_string()),
+            ],
+            "stored messages survive and only new ones are appended"
+        );
+        let message_count: i64 = db
+            .conn
+            .query_row(
+                "select message_count from sessions where id = 'codex:archive'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 5, "the session reports the rows it holds");
+    }
+
+    #[test]
+    fn reindexing_a_source_under_a_new_session_id_keeps_its_stored_messages() {
+        // A parser change or a mutable sidecar can give the same source file a new session id.
+        // The stored rows move to the new id instead of being deleted with the old one, and the
+        // archive rule then applies as for any shrunk or rewritten source.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut renamed = archive_session(
+            vec![archive_message(0, "summary of a and b", Conversation)],
+            Vec::new(),
+        );
+        renamed.session.id = "codex:archive-renamed".into();
+        renamed.session.provider_session_id = "archive-renamed".into();
+        db.upsert_session(&renamed, 2, 2).unwrap();
+
+        let rows: Vec<(String, i64, String)> = db
+            .conn
+            .prepare("select session_id, seq, content from messages order by session_id, seq, id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let renamed_id = "codex:archive-renamed".to_string();
+        assert_eq!(
+            rows,
+            [
+                (renamed_id.clone(), 0, "a".to_string()),
+                (renamed_id.clone(), 1, "b".to_string()),
+                (renamed_id, 2, "summary of a and b".to_string()),
+            ]
+        );
+        let sessions: Vec<String> = db
+            .conn
+            .prepare("select id from sessions")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sessions, ["codex:archive-renamed"]);
+    }
+
+    #[test]
+    fn reindexing_a_parse_that_still_holds_every_message_replaces_it() {
+        // When nothing stored would be lost, the full replace still applies, so a parser
+        // upgrade can reclassify stored rows.
+        use crate::models::MessageKind::{Conversation, HarnessNotice};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "<environment_context>", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "<environment_context>", HarnessNotice),
+                ],
+                Vec::new(),
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            archive_rows(&db),
+            [
+                (0, "a".to_string(), "conversation".to_string()),
+                (
+                    1,
+                    "<environment_context>".to_string(),
+                    "harness_notice".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reindexing_a_source_that_lost_a_file_edit_keeps_the_stored_edit() {
+        use crate::models::MessageKind::Conversation;
+        let edit = |seq: i64, content: &str| FileEdit {
+            seq,
+            ts: None,
+            tool: "Write".into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: Some(content.into()),
+            edits: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                vec![edit(0, "v1"), edit(1, "v2")],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![archive_message(0, "summary", Conversation)],
+                vec![edit(0, "v3")],
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        let versions: Vec<String> = db
+            .file_edits_for("f.rs", None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, edit)| edit.new_content.unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            ["v1", "v2", "v3"],
+            "edit history survives the rewrite"
+        );
+    }
+
+    fn session_rows(db: &Db, session_id: &str) -> Vec<(i64, String, String)> {
+        db.conn
+            .prepare(
+                "select seq, role, content from messages where session_id = ?1 order by seq, id",
+            )
+            .unwrap()
+            .query_map([session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn row(seq: i64, role: &str, content: &str) -> (i64, String, String) {
+        (seq, role.to_string(), content.to_string())
+    }
+
+    #[test]
+    fn renaming_into_a_session_that_already_holds_rows_keeps_the_retired_rows() {
+        // The retired identity's rows must survive even when the replacement id already holds
+        // rows; a row both sessions hold is kept once.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut occupied = archive_session(
+            vec![
+                archive_message(0, "b", Conversation),
+                archive_message(1, "x", Conversation),
+            ],
+            Vec::new(),
+        );
+        occupied.session.id = "codex:archive-renamed".into();
+        occupied.session.source_path = "/x/other.jsonl".into();
+        db.upsert_session(&occupied, 1, 1).unwrap();
+
+        let mut renamed = archive_session(
+            vec![archive_message(0, "summary", Conversation)],
+            Vec::new(),
+        );
+        renamed.session.id = "codex:archive-renamed".into();
+        db.upsert_session(&renamed, 2, 2).unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive-renamed"),
+            [
+                row(0, "user", "b"),
+                row(1, "user", "x"),
+                row(2, "user", "a"),
+                row(3, "user", "summary"),
+            ]
+        );
+        assert!(session_rows(&db, "codex:archive").is_empty());
+    }
+
+    #[test]
+    fn renaming_with_several_retired_ids_keeps_every_retired_row() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // Two identities on two verified aliases of one source, both retired by one parse.
+        for (id, content, path) in [
+            ("codex:archive-1", "a", "/x/a1.jsonl"),
+            ("codex:archive-2", "c", "/x/a2.jsonl"),
+        ] {
+            let mut old =
+                archive_session(vec![archive_message(0, content, Conversation)], Vec::new());
+            old.session.id = id.into();
+            old.session.source_path = path.into();
+            db.upsert_session(&old, 1, 1).unwrap();
+        }
+        let mut renamed = archive_session(vec![archive_message(0, "d", Conversation)], Vec::new());
+        renamed.session.id = "codex:archive-3".into();
+        db.upsert_session_reconciling_sources(
+            &renamed,
+            2,
+            2,
+            &["/x/a1.jsonl".to_string(), "/x/a2.jsonl".to_string()],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive-3"),
+            [
+                row(0, "user", "a"),
+                row(1, "user", "c"),
+                row(2, "user", "d")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rewrite_keeps_a_new_message_whose_text_matches_a_stored_one_under_another_role() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "x", Conversation),
+                    archive_message(1, "y", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut reply = archive_message(0, "x", Conversation);
+        reply.role = Role::Assistant;
+        db.upsert_session(&archive_session(vec![reply], Vec::new()), 2, 2)
+            .unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "x"),
+                row(1, "user", "y"),
+                row(2, "assistant", "x")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parse_that_holds_a_stored_text_only_under_another_role_does_not_replace_it() {
+        // Coverage must match on role too: replacing would delete the stored user message.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "yes", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut reply = archive_message(0, "yes", Conversation);
+        reply.role = Role::Assistant;
+        db.replace_session(
+            &archive_session(
+                vec![reply, archive_message(1, "b", Conversation)],
+                Vec::new(),
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "yes"),
+                row(1, "user", "b"),
+                row(2, "assistant", "yes")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_parser_version_replaces_rows_even_when_the_append_boundary_matches() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut upgraded = archive_session(
+            vec![
+                archive_message(0, "x", Conversation),
+                archive_message(1, "b", Conversation),
+                archive_message(2, "c", Conversation),
+            ],
+            Vec::new(),
+        );
+        upgraded.session.parse_version = "v2".into();
+        db.upsert_session(&upgraded, 2, 2).unwrap();
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "x"),
+                row(1, "user", "b"),
+                row(2, "user", "c")
+            ]
+        );
+    }
+
+    #[test]
+    fn merging_a_retired_identity_does_not_repeat_session_text_both_hold() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut retired = archive_session(
+            vec![
+                archive_message(0, "a", Conversation),
+                archive_message(1, "b", Conversation),
+            ],
+            Vec::new(),
+        );
+        retired.transcript_text = "[user] a\n\n[user] b".into();
+        db.upsert_session(&retired, 1, 1).unwrap();
+        let mut occupied = retired.clone();
+        occupied.session.id = "codex:archive-renamed".into();
+        occupied.session.source_path = "/x/other.jsonl".into();
+        db.upsert_session(&occupied, 1, 1).unwrap();
+
+        let mut renamed = archive_session(vec![archive_message(0, "c", Conversation)], Vec::new());
+        renamed.session.id = "codex:archive-renamed".into();
+        renamed.transcript_text = "[user] c".into();
+        db.upsert_session(&renamed, 2, 2).unwrap();
+        let transcript: String = db
+            .conn
+            .query_row(
+                "select transcript_text from transcripts where session_id = 'codex:archive-renamed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transcript, "[user] a\n\n[user] b\n\n[user] c");
+    }
+
+    #[test]
+    fn a_new_edit_before_a_retained_edit_replays_in_source_order() {
+        // A rewrite drops the first Write and adds another Write before a retained Edit. Replay
+        // must apply the new Write before the Edit, or the Write resets the file afterwards.
+        use crate::models::MessageKind::Conversation;
+        let write = |content: &str| FileEdit {
+            seq: 0,
+            ts: None,
+            tool: "Write".into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: Some(content.into()),
+            edits: Vec::new(),
+        };
+        let delta = FileEdit {
+            seq: 1,
+            ts: None,
+            tool: "Edit".into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: None,
+            edits: vec![EditOp {
+                old: "v".into(),
+                new: "w".into(),
+                replace_all: false,
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                vec![write("v1"), delta.clone()],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![archive_message(0, "summary", Conversation)],
+                vec![write("v0"), delta],
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        let replay: Vec<(i64, String)> = db
+            .file_edits_for("f.rs", None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, edit)| (edit.seq, edit.new_content.unwrap_or(edit.tool)))
+            .collect();
+        assert_eq!(
+            replay,
+            [
+                (0, "v1".to_string()),
+                (1, "v0".to_string()),
+                (2, "Edit".to_string())
+            ]
+        );
+        // Replaying the history must apply the Edit to the newer Write: v0 becomes w0.
+        let edits: Vec<FileEdit> = db
+            .file_edits_for("f.rs", None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, edit)| edit)
+            .collect();
+        assert_eq!(
+            crate::files::reconstruct(&edits, edits.len()).as_deref(),
+            Some("w0")
+        );
+    }
+
+    #[test]
+    fn a_kept_rewrite_keeps_archived_session_text_and_the_full_date_span() {
+        use crate::models::MessageKind::Conversation;
+        let at = |text: &str| Some(text.parse::<DateTime<Utc>>().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut original = archive_session(
+            vec![
+                archive_message(0, "alpha", Conversation),
+                archive_message(1, "beta", Conversation),
+            ],
+            Vec::new(),
+        );
+        original.transcript_text = "[user] alpha\n\n[user] beta".into();
+        original.session.created_at = at("2026-01-01T00:00:00Z");
+        original.session.updated_at = at("2026-01-02T00:00:00Z");
+        original.session.last_message_at = at("2026-01-02T00:00:00Z");
+        db.upsert_session(&original, 1, 1).unwrap();
+
+        let mut rewritten = archive_session(
+            vec![
+                archive_message(0, "beta", Conversation),
+                archive_message(1, "gamma", Conversation),
+            ],
+            Vec::new(),
+        );
+        rewritten.transcript_text = "[user] beta\n\n[user] gamma".into();
+        rewritten.session.created_at = at("2026-02-01T00:00:00Z");
+        rewritten.session.updated_at = at("2026-02-02T00:00:00Z");
+        rewritten.session.last_message_at = at("2026-02-02T00:00:00Z");
+        db.upsert_session(&rewritten, 2, 2).unwrap();
+
+        let (transcript, created, updated, last): (String, String, String, String) = db
+            .conn
+            .query_row(
+                "select t.transcript_text, s.created_at, s.updated_at, s.last_message_at
+                 from sessions s join transcripts t on t.session_id = s.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(transcript, "[user] alpha\n\n[user] beta\n\n[user] gamma");
+        assert!(created.starts_with("2026-01-01"), "{created}");
+        assert!(updated.starts_with("2026-02-02"), "{updated}");
+        assert!(last.starts_with("2026-02-02"), "{last}");
+    }
+
+    #[test]
+    fn a_kept_rewrite_compares_session_dates_as_instants_whatever_their_offset() {
+        // RFC 3339 text orders correctly only within one offset: 05:00+05:00 is midnight UTC,
+        // earlier than 00:30Z, yet sorts after it as text.
+        use crate::models::MessageKind::Conversation;
+        let at = |text: &str| Some(text.parse::<DateTime<Utc>>().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let original = archive_session(
+            vec![
+                archive_message(0, "alpha", Conversation),
+                archive_message(1, "beta", Conversation),
+            ],
+            Vec::new(),
+        );
+        db.upsert_session(&original, 1, 1).unwrap();
+        db.conn
+            .execute(
+                "update sessions set created_at = '2026-01-01T05:00:00+05:00',
+                     updated_at = '2026-01-02T05:00:00+05:00'",
+                [],
+            )
+            .unwrap();
+        let mut rewritten =
+            archive_session(vec![archive_message(0, "gamma", Conversation)], Vec::new());
+        rewritten.session.created_at = at("2026-01-01T00:30:00Z");
+        rewritten.session.updated_at = at("2026-01-01T23:30:00Z");
+        db.upsert_session(&rewritten, 2, 2).unwrap();
+        let (created, updated): (String, String) = db
+            .conn
+            .query_row("select created_at, updated_at from sessions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        let instant = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            instant(&created),
+            instant("2026-01-01T00:00:00Z"),
+            "{created}"
+        );
+        assert_eq!(
+            instant(&updated),
+            instant("2026-01-02T00:00:00Z"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn reparsing_an_unchanged_source_rewrites_no_message_or_file_edit_row() {
+        // Compression, a touch, or a metadata-only change re-parses a source to the same rows;
+        // rewriting them would re-run the FTS triggers over the whole session for nothing.
+        use crate::models::MessageKind::Conversation;
+        let parse = || {
+            archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                vec![FileEdit {
+                    seq: 0,
+                    ts: None,
+                    tool: "Write".into(),
+                    file_path: "/x/f.rs".into(),
+                    file_name: "f.rs".into(),
+                    new_content: Some("v1".into()),
+                    edits: Vec::new(),
+                }],
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(&parse(), 1, 1).unwrap();
+        // Row ids cannot show a rewrite: SQLite reuses them after a delete of every row.
+        db.conn
+            .execute_batch(
+                "create temp table writes(tbl text);
+                 create temp trigger m_del after delete on messages begin
+                     insert into writes values ('messages'); end;
+                 create temp trigger m_ins after insert on messages begin
+                     insert into writes values ('messages'); end;
+                 create temp trigger e_del after delete on file_edits begin
+                     insert into writes values ('file_edits'); end;
+                 create temp trigger e_ins after insert on file_edits begin
+                     insert into writes values ('file_edits'); end;",
+            )
+            .unwrap();
+        db.replace_session(&parse(), 2, 2).unwrap();
+        let writes: i64 = db
+            .conn
+            .query_row("select count(*) from temp.writes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(writes, 0);
+    }
+
+    #[test]
+    fn reindex_after_a_deleted_row_never_stores_one_seq_twice() {
+        // The upsert append shortcut keeps the stored prefix when the stored row count marks a
+        // matching boundary in the new parse. After a purge leaves a gap, the count is no longer
+        // the next free seq, so appending the parse's tail from there would reuse a stored seq.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let message = |seq: i64, content: &str| crate::models::Message {
+            seq,
+            role: Role::User,
+            ts: None,
+            tool_name: None,
+            kind: crate::models::MessageKind::Conversation,
+            tool_call_id: None,
+            content: content.to_string(),
+            is_compaction: false,
+            provenance: Default::default(),
+        };
+        let session = |messages: Vec<crate::models::Message>| ParsedSession {
+            session: SessionRecord {
+                id: "claude:gap".into(),
+                provider: Provider::Claude,
+                provider_session_id: "gap".into(),
+                title: None,
+                summary: None,
+                cwd: None,
+                repo_root: None,
+                created_at: None,
+                updated_at: None,
+                last_message_at: None,
+                preview_text: String::new(),
+                source_path: "/x/gap.jsonl".into(),
+                message_count: Some(messages.len() as i64),
+                parse_version: "v1".into(),
+                raw_metadata_json: None,
+                parse_warning: None,
+                discovery_source: "test".into(),
+                parent_session_id: None,
+                agent_label: None,
+            },
+            transcript_text: String::new(),
+            messages,
+            file_edits: Vec::new(),
+        };
+        db.upsert_session(
+            &session(vec![message(0, "a"), message(1, "b"), message(2, "c")]),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .execute("delete from messages where seq = 0", [])
+            .unwrap();
+        // The source grew by one message. Stored: seqs 1 and 2, count 2; parse[1] is "b", which
+        // matches stored seq 1, so the shortcut would append parse[2..] = seqs 2 and 3.
+        db.upsert_session(
+            &session(vec![
+                message(0, "a"),
+                message(1, "b"),
+                message(2, "c"),
+                message(3, "d"),
+            ]),
+            2,
+            2,
+        )
+        .unwrap();
+        let rows: Vec<(i64, String)> = db
+            .conn
+            .prepare("select seq, content from messages order by seq, id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let seqs: Vec<i64> = rows.iter().map(|(seq, _)| *seq).collect();
+        let mut unique = seqs.clone();
+        unique.dedup();
+        assert_eq!(seqs, unique, "a seq names one message: {rows:?}");
+        assert_eq!(
+            rows.last().map(|(_, content)| content.as_str()),
+            Some("d"),
+            "the new message is indexed"
         );
     }
 

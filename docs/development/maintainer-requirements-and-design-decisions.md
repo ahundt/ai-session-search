@@ -327,11 +327,24 @@ Evidence generation, context enrichment, reference extraction, formatting, and p
 must not alter the retrieval plan or selected page. Pagination must be derived from one extra
 retained row, not from post-presentation behavior.
 
+Every published order is total. `(session_id, seq)` does not identify a message, because an index
+can hold two messages in one session with the same sequence number, so SQL ends on the row id
+(`MessageOrder::order_by_clause`) and in-memory ranking ends on the row's position in that SQL
+stream. A partial key leaves ties free to swap between pages, between `--match-window` ends, and
+between an unstable top-K selection and the final sort.
+
 ### REQ008-reject-hidden-cutoffs
 
 Do not introduce silent aggregate byte ceilings, row ceilings, content truncation, time limits, or
 fallback pages. Intentional bounds must be named, typed, documented, reflected in receipts or
 metadata, and rejected when they conflict.
+
+A candidate prefilter narrows work, never results: it must select a superset of what the verifier
+accepts, under the index tokenizer's own case folding, which differs from the verifier's. Where the
+tokenizer folds a character differently (`trigram::FTS5_UNFOLDED_LOWERCASE`, U+0130), the
+prefilter leaves that position out rather than requiring a trigram that excludes matching rows;
+`the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes that set from the
+linked SQLite.
 
 `max_hits_per_page` and `max_context_neighbors_per_hit` are policy ceilings: an oversized resolved
 request errors. They do not silently clamp the request. Explicit `all_results` is not a finite page
@@ -733,7 +746,7 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 | `REQ037-explore-before-change`; `REQ038-map-semantic-ownership`; `REQ039-reuse-or-improve-architecture`; `REQ048-adopt-proven-libraries`; `REQ040-eliminate-semantic-duplication`; `REQ043-reread-active-plans-after-compaction` | repository guidance, complete active plans, architecture seams, dependency manifests/locks/imports, upstream primary sources, git history, installed state, prior-session evidence, and current-session changes | end-to-end plan reread after compaction/resumption, plan-to-diff regression audit, graph plus coverage when available, exact-source review, dependency/library comparison, history diff, installed reproduction |
 | `REQ041-optimize-multi-objective-outcomes`; `REQ044-automate-safe-problem-solving`; `REQ045-own-and-clean-resources`; `REQ046-preserve-boundary-results`; `REQ047-return-actionable-recovery` | typed service owners, iterator/transaction/subprocess lifecycles, Rust/PyO3/Python adapters, CLI/MCP termination, installers/updaters, public error types, `lib.rs` error classifiers, `durable_fs.rs`, `background_refresh.rs` | automatic-recovery and invalid-use fixtures; completion/break/drop/cancel/error/broken-pipe cleanup; GIL/mutex tests; return/error parity; actionable-error snapshots with preserved/cleaned-state assertions; storage-exhaustion classified from both the filesystem and SQLite, and reported as postponed with a retry interval rather than as a failure needing a reindex |
 | `REQ010-protect-complexity-bounds`; `REQ030-benchmark-risky-paths` | `db.rs`, `service.rs`, `trigram_index.rs`, `analysis_pipeline.rs`, `files.rs`, `scripts/benchmark_release.py` | complexity comments/tests, deterministic scale fixtures, latency/CPU/RSS/output benchmark reports |
-| `REQ002-share-typed-contract`; `REQ003-preserve-surface-semantics`; `REQ004-separate-retrieval-presentation`; `REQ005-return-match-evidence`; `REQ006-report-extent-honestly`; `REQ007-preserve-page-identity`; `REQ008-reject-hidden-cutoffs`; `REQ009-bound-fuzzy-search`; `REQ012-reject-invalid-combinations`; `REQ013-resolve-parameters-by-origin` | `rust/ai-session-search-core/src/message_search.rs`, `service.rs`, `messages.rs`, `mcp_server.rs` | `rust/ai-session-search-core/tests/message_search_contract.rs`, service/MCP unit tests, `tests/test_native_binding.py` |
+| `REQ002-share-typed-contract`; `REQ003-preserve-surface-semantics`; `REQ004-separate-retrieval-presentation`; `REQ005-return-match-evidence`; `REQ006-report-extent-honestly`; `REQ007-preserve-page-identity`; `REQ008-reject-hidden-cutoffs`; `REQ009-bound-fuzzy-search`; `REQ012-reject-invalid-combinations`; `REQ013-resolve-parameters-by-origin` | `rust/ai-session-search-core/src/message_search.rs`, `service.rs`, `messages.rs`, `mcp_server.rs` | `rust/ai-session-search-core/tests/message_search_contract.rs`, `rust/ai-session-search-core/tests/search_surface_parity.rs`, service/MCP unit tests, `tests/test_native_binding.py` |
 | `REQ011-validate-language-boundaries` | `rust/ai-session-search-python/src/lib.rs`, `ai_session_search/_native.pyi` | native binding tests, stubtest, runtime/stub parity |
 | `REQ014-use-platform-app-paths`; `REQ015-separate-app-harness-roots`; `REQ016-support-multiple-skill-roots`; `REQ017-preserve-install-ownership`; `REQ018-preserve-unmanaged-content`; `REQ019-verify-each-harness` | `config.rs`, `integrations.rs`, `skills.rs`, `skill_manifest.rs`, `text_file_transaction.rs` | integration/config unit tests and repository contracts |
 | `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |

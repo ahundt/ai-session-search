@@ -11,6 +11,66 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
+   and deletes nothing. See Fixed item 6.
+
+### Deprecated
+
+1. `Db::purge_injected_messages`: it now relabels through `Db::classify_injected_messages`
+   and deletes nothing. Call that instead.
+
+### Fixed
+
+1. Searches find text in Cherokee, Georgian Mtavruli, Osage, Adlam and other scripts whose
+   case pairs SQLite's full-text tokenizer does not fold (445 lowercase letters). Cherokee text
+   returned nothing, even searched by its exact spelling. Literal and regex searches now return
+   every row the matcher accepts.
+2. A needle ending in `i` matches a dotted capital `İ` in the text, so `abi` finds `abİ`.
+3. Messages that tie on session and sequence number come back in one fixed order. Their order
+   was undefined, so `--match-window latest` could keep the wrong message, and literal or fuzzy
+   paging could move one between pages.
+4. `aise corrections` returned messages tied on timestamp, session and sequence number in
+   reverse insertion order, and `aise repeats` did the same under its default user-role filter.
+   Both now page in one order whatever the filters. Context windows and file-edit history use
+   the same tie-breaker, so several edits made by one message replay in the order they were
+   written.
+5. Appending to an indexed session could give two messages the same sequence number. On one
+   40,180-message Codex session, three sequence numbers each named two messages written a day
+   apart. New messages now continue after the highest stored sequence number, and a reindex of
+   a session with gaps in its numbering replaces it from the parse.
+6. A full reindex deleted stored user-role rows starting with `<environment_context>`,
+   `<turn_aborted>` or `<local-command-*>`, records the parsers now keep on purpose. These rows
+   are now labelled harness notices, which default search, corrections and repeat mining leave
+   out, and nothing is deleted.
+7. A reindex no longer deletes stored messages when a harness shrinks or rewrites its
+   transcript. One Codex session went from 4,720 indexed messages to 16 after Codex rewrote
+   its file. With the same parser version, aise keeps the stored messages and file edits and
+   adds the new ones:
+   - session search, the session's dates and its message count cover both;
+   - a new file edit replays before the stored edits that followed it in the source;
+   - a source that gets a new session id moves its rows to that id, skipping rows the id
+     already holds. They used to be deleted with the old id.
+
+   A new parser version still replaces the session, because it may render the same message
+   differently. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
+   avoids took 1.65 s.
+
+### Performance
+
+1. Limited literal and regex searches stop once the page is full. On an index of 5.7 million
+   messages, `aise messages search error --limit 50` went from 32 s to 0.19 s, and
+   `aise messages search "permission denied" --limit 50` from 3.5 s to under 1 s.
+2. A needle containing `İ` uses the trigram index for the rest of its text.
+   `aise messages search İstanbul --all-results` went from 4.6-6.3 minutes to 3.9-5.2 s on the
+   same index.
+3. The literal matcher skips positions that cannot start a match: about 3x faster when every
+   candidate has to be checked.
+4. Reindexing a source whose parse matches what is stored writes nothing. A file whose
+   timestamp changed but whose content did not now takes 27 ms on a 20,000-message session,
+   down from 1.65 s.
+
 ## [1.0.0] - 2026-11-05
 
 1.0.0 is the first stable release of AI Session Search. `aise` parses nine AI coding-agent session

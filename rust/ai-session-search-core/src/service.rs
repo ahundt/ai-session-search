@@ -3134,12 +3134,14 @@ impl<'db> MessageService<'db> {
         self.db.session_metadata(session_ids)
     }
 
-    /// Return a bounded sequence window around one message.
+    /// Return every message whose seq lies within `before` sequence numbers before and `after`
+    /// after `seq`, ordered by `(seq, id)`.
     ///
     /// # Complexity
     ///
-    /// The `(session_id, seq)` index makes database work and memory proportional to
-    /// `before + after + 1`, subject to messages available in the session.
+    /// The `(session_id, seq)` index makes database work and memory proportional to the rows in
+    /// that window: `before + after + 1` sequence numbers times the messages each holds,
+    /// subject to messages available in the session.
     pub fn context(
         &self,
         session_id: &str,

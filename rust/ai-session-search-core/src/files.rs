@@ -328,7 +328,7 @@ pub fn restore_reconstructed(
     create_recovery_file(&base)?.persist(reconstructed.content.as_bytes())
 }
 
-/// Group `(session_id, provider, edit)` rows (already ordered by `(session_id, seq)`)
+/// Group `(session_id, provider, edit)` rows (already ordered by `(session_id, seq, id)`)
 /// into per-session edit lists, preserving order. Each list's index+1 is its version.
 fn group_by_session(
     rows: Vec<(String, Provider, FileEdit)>,

@@ -1,0 +1,70 @@
+{
+  "description": "One fixture and one case table for every message-search interface: the Rust MessageService on each SearchSurface, the aise binary's CLI and MCP server, and the Python binding and entry point. Shared cases pass an explicit limit or all_results and compare result identity and order as [seq, role]; presentation (field views, match views, byte budgets) is deliberately not compared, per REQ004. deliberate_differences pins the documented surface-specific defaults of REQ003. twins adds that many tied pairs (same seq, user then assistant); expected \"twins\" means every pair in seq order, user first. tool_twins does the same for tool rows (an assistant tool call then its tool result, sharing one tool name), searched by field \"tool_name\"; a case without field searches content. reads name a seq whose rows every message-read interface must return in full and in the same order; newest_reads take the newest rows of the session, printed oldest-first.",
+  "session_id": "claude:parity",
+  "messages": [
+    {"seq": 0, "role": "user", "content": "ᏣᎳᎩ syllabary"},
+    {"seq": 1, "role": "user", "content": "abİ end"},
+    {"seq": 2, "role": "user", "content": "go to İstanbul now"},
+    {"seq": 3, "role": "user", "content": "twin needle"},
+    {"seq": 3, "role": "assistant", "content": "twin needle"},
+    {"seq": 4, "role": "user", "content": "twin needle"},
+    {"seq": 5, "role": "user", "content": "nothing relevant here"}
+  ],
+  "bulk": {
+    "first_seq": 100,
+    "count": 20,
+    "role": "user",
+    "content_prefix": "bulk row"
+  },
+  "cases": [
+    {"name": "cherokee found by its own uppercase spelling", "mode": "literal", "query": "ᏣᎳᎩ", "limit": 10, "expected": [[0, "user"]]},
+    {"name": "cherokee found by its lowercase spelling", "mode": "literal", "query": "ꮳꮃꭹ", "limit": 10, "expected": [[0, "user"]]},
+    {"name": "cherokee regex by its exact spelling", "mode": "regex", "query": "ᏣᎳᎩ", "limit": 10, "expected": [[0, "user"]]},
+    {"name": "final i matches a dotted capital I", "mode": "literal", "query": "abi", "limit": 10, "expected": [[1, "user"]]},
+    {"name": "dotted capital I needle", "mode": "literal", "query": "İstanbul", "limit": 10, "expected": [[2, "user"]]},
+    {"name": "tied rows in one total order", "mode": "literal", "query": "twin needle", "all_results": true, "expected": [[3, "user"], [3, "assistant"], [4, "user"]]},
+    {"name": "regex keeps the same total order", "mode": "regex", "query": "twin needle", "all_results": true, "expected": [[3, "user"], [3, "assistant"], [4, "user"]]},
+    {"name": "latest window keeps the true tail across a tie", "mode": "literal", "query": "twin needle", "limit": 2, "match_window": "latest", "in_session": true, "expected": [[3, "assistant"], [4, "user"]]},
+    {"name": "latest window boundary inside a tied pair", "mode": "literal", "query": "pair needle", "limit": 3, "match_window": "latest", "in_session": true, "expected": [[238, "assistant"], [239, "user"], [239, "assistant"]]},
+    {"name": "fuzzy ranks equal scores in the total order", "mode": "fuzzy", "query": "twin needle", "limit": 10, "expected": [[3, "user"], [3, "assistant"], [4, "user"]]},
+    {"name": "tool name literal keeps tied calls and results in the total order", "mode": "literal", "field": "tool_name", "query": "bash", "all_results": true, "expected": "tool_twins"},
+    {"name": "tool name regex keeps the same order", "mode": "regex", "field": "tool_name", "query": "^Bash$", "all_results": true, "expected": "tool_twins"},
+    {"name": "tool name fuzzy ranks equal scores in the total order", "mode": "fuzzy", "field": "tool_name", "query": "bash", "limit": 20, "expected": "tool_twins"},
+    {"name": "tool name latest window boundary inside a tied pair", "mode": "literal", "field": "tool_name", "query": "bash", "limit": 3, "match_window": "latest", "in_session": true, "expected": [[304, "tool"], [305, "assistant"], [305, "tool"]]}
+  ],
+  "page_walks": [
+    {"name": "literal pages of one across a tie", "mode": "literal", "query": "twin needle", "page": 1, "expected": [[3, "user"], [3, "assistant"], [4, "user"]]},
+    {"name": "fuzzy pages of one across a tie", "mode": "fuzzy", "query": "twin needle", "page": 1, "expected": [[3, "user"], [3, "assistant"], [4, "user"]]},
+    {"name": "literal pages of seven across the tied pairs", "mode": "literal", "query": "pair needle", "page": 7, "expected": "twins"},
+    {"name": "fuzzy pages of one across the tied pairs", "mode": "fuzzy", "query": "pair needle", "page": 1, "expected": "twins"},
+    {"name": "fuzzy pages of seven across the tied pairs", "mode": "fuzzy", "query": "pair needle", "page": 7, "expected": "twins"},
+    {"name": "tool name literal pages of one across tied calls", "mode": "literal", "field": "tool_name", "query": "bash", "page": 1, "expected": "tool_twins"},
+    {"name": "tool name fuzzy pages of one across tied calls", "mode": "fuzzy", "field": "tool_name", "query": "bash", "page": 1, "expected": "tool_twins"},
+    {"name": "tool name fuzzy pages of five across tied calls", "mode": "fuzzy", "field": "tool_name", "query": "bash", "page": 5, "expected": "tool_twins"}
+  ],
+  "reads": [
+    {"name": "a user and an assistant message sharing seq 3", "seq": 3, "expected": [[3, "user"], [3, "assistant"]]},
+    {"name": "the last tied conversation pair", "seq": 239, "expected": [[239, "user"], [239, "assistant"]]},
+    {"name": "a tool call and its result sharing a seq", "seq": 305, "expected": [[305, "assistant"], [305, "tool"]]}
+  ],
+  "newest_reads": [
+    {"name": "the newest three rows cut inside a tied pair", "limit": 3, "expected": [[304, "tool"], [305, "assistant"], [305, "tool"]]}
+  ],
+  "deliberate_differences": {
+    "omitted_limit": {"requirement": "REQ003-preserve-surface-semantics", "query": "bulk row", "all_surfaces_but_mcp": 20, "mcp_default_page": 15},
+    "fuzzy_rejects_all_results": {"requirement": "REQ003-preserve-surface-semantics", "query": "twin needle"}
+  },
+  "twins": {
+    "first_seq": 200,
+    "pairs": 40,
+    "content": "pair needle",
+    "roles": ["user", "assistant"]
+  },
+  "tool_twins": {
+    "first_seq": 300,
+    "pairs": 6,
+    "tool_name": "Bash",
+    "content": "shell call",
+    "rows": [["assistant", "tool_call"], ["tool", "tool_result"]]
+  }
+}

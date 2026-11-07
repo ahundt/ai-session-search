@@ -165,46 +165,177 @@ where
     Some(terms.join(" OR "))
 }
 
-/// Decompose one required `literal` into its sorted, deduped, lowercased overlapping 3-grams —
-/// e.g. `econnreset` → `[con, eco, ese, nnr, nre, onn, res, set]`. Returns `None` if the literal
-/// is shorter than [`MIN_TRIGRAM_CHARS`].
+/// Lowercase forms whose uppercase counterparts FTS5's trigram tokenizer does not fold to them.
 ///
-/// These are the AND-group: a row that contains the literal as a contiguous substring contains
-/// ALL of these trigrams, so requiring all of them selects a SUPERSET of rows containing the
-/// literal (the trigrams may be non-adjacent in a candidate — fine, the caller's regex verifies).
-/// Char-based (not byte) to match FTS5's trigram tokenizer and the custom index's tokenization.
-/// Lower-cased because both indexes fold case, so a lower-cased trigram set is a superset of the
-/// regex's any-case matches.
-fn literal_to_trigrams(text: &str) -> Option<Vec<String>> {
+/// FTS5 folds case from its own Unicode tables, which predate these case pairs (Cherokee, whose
+/// ordinary written form is the uppercase syllabary; Georgian Mtavruli; Osage; Adlam; and Latin
+/// letters added in later Unicode versions). Stored text keeps the uppercase scalar while a query
+/// trigram carries the lowercase one, so a trigram containing one of these would exclude rows
+/// the verifier accepts. 445 scalars in 60 inclusive ranges, sorted.
+/// `the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes this from the
+/// SQLite this crate links and fails if a SQLite upgrade changes it.
+const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
+    (0x019B, 0x019B),
+    (0x025C, 0x025C),
+    (0x0261, 0x0261),
+    (0x0264, 0x0264),
+    (0x026A, 0x026A),
+    (0x026C, 0x026C),
+    (0x0282, 0x0282),
+    (0x0287, 0x0287),
+    (0x029D, 0x029E),
+    (0x03F3, 0x03F3),
+    (0x0529, 0x0529),
+    (0x052B, 0x052B),
+    (0x052D, 0x052D),
+    (0x052F, 0x052F),
+    (0x10D0, 0x10FA),
+    (0x10FD, 0x10FF),
+    (0x13F8, 0x13FD),
+    (0x1C8A, 0x1C8A),
+    (0x1D8E, 0x1D8E),
+    (0x2C5F, 0x2C5F),
+    (0xA699, 0xA699),
+    (0xA69B, 0xA69B),
+    (0xA794, 0xA794),
+    (0xA797, 0xA797),
+    (0xA799, 0xA799),
+    (0xA79B, 0xA79B),
+    (0xA79D, 0xA79D),
+    (0xA79F, 0xA79F),
+    (0xA7B5, 0xA7B5),
+    (0xA7B7, 0xA7B7),
+    (0xA7B9, 0xA7B9),
+    (0xA7BB, 0xA7BB),
+    (0xA7BD, 0xA7BD),
+    (0xA7BF, 0xA7BF),
+    (0xA7C1, 0xA7C1),
+    (0xA7C3, 0xA7C3),
+    (0xA7C8, 0xA7C8),
+    (0xA7CA, 0xA7CA),
+    (0xA7CD, 0xA7CD),
+    (0xA7CF, 0xA7CF),
+    (0xA7D1, 0xA7D1),
+    (0xA7D3, 0xA7D3),
+    (0xA7D5, 0xA7D5),
+    (0xA7D7, 0xA7D7),
+    (0xA7D9, 0xA7D9),
+    (0xA7DB, 0xA7DB),
+    (0xA7F6, 0xA7F6),
+    (0xAB53, 0xAB53),
+    (0xAB70, 0xABBF),
+    (0x104D8, 0x104FB),
+    (0x10597, 0x105A1),
+    (0x105A3, 0x105B1),
+    (0x105B3, 0x105B9),
+    (0x105BB, 0x105BC),
+    (0x10CC0, 0x10CF2),
+    (0x10D70, 0x10D85),
+    (0x118C0, 0x118DF),
+    (0x16E60, 0x16E7F),
+    (0x16EBB, 0x16ED3),
+    (0x1E922, 0x1E943),
+];
+
+fn fts5_leaves_uppercase_unfolded(lowercase: char) -> bool {
+    let code = u32::from(lowercase);
+    FTS5_UNFOLDED_LOWERCASE
+        .binary_search_by(|&(start, end)| {
+            if end < code {
+                std::cmp::Ordering::Less
+            } else if start > code {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// Decompose one required `literal` into OR-alternative AND-groups of lowercased 3-grams, e.g.
+/// `econnreset` → `[[con, eco, ese, nnr, nre, onn, res, set]]`, or `None` when no trigram can
+/// safely constrain it.
+///
+/// A row containing the literal contains every trigram of it, so requiring them all selects a
+/// SUPERSET of matching rows (non-adjacent occurrences are fine; the caller verifies). That holds
+/// only for trigrams FTS5 tokenizes the same way on both sides, so three kinds of position are
+/// left out, and the trigrams of every remaining run of at least three characters are required:
+///
+/// - a grapheme whose lowercase spans several scalars (U+0130 lowercases to `i` + U+0307), which
+///   FTS5 folds one scalar at a time;
+/// - a lowercase form whose uppercase FTS5 does not fold to it ([`FTS5_UNFOLDED_LOWERCASE`]);
+/// - a leading U+0307, which a stored U+0130 can supply as the second half of its fold.
+///
+/// A final `i` can be supplied by a stored U+0130 too, which FTS5 keeps as itself, so the
+/// trigram ending there becomes two alternatives, one spelled with each. Leaving it out instead
+/// would cost every short needle ending in `i` (`api`, `cli`) its prefilter.
+///
+/// Before this, any literal holding U+0130 was rejected whole, so `İstanbul` scanned an entire
+/// index rather than using `stanbul`.
+///
+/// Sigma needs no exclusion. FTS5 folds `Σ`, `σ`, and `ς` onto one form, matching the verifier's
+/// own rule (see `crate::util::fold_caseless_char`). The pre-v4 custom index stores the spelling
+/// `str::to_lowercase` chose for each position instead, so a sigma query reaches its verifier by
+/// a direct scan; `Db::prepare_content_prefilter` owns that decision, since only that path reads
+/// the custom index. Time and memory are O(literal characters).
+fn literal_to_trigrams(text: &str) -> Option<Vec<Vec<String>>> {
     let lowercase = text.to_lowercase();
-    // FTS5's trigram tokenizer applies one-scalar Unicode folding, while Rust lowercase can
-    // expand one scalar into a multi-scalar grapheme (notably U+0130 -> `i` + U+0307). The
-    // authoritative verifier uses Rust lowercase, so indexing an expanded or already-decomposed
-    // grapheme could remove a real match before verification. Fall back to the scan path whenever
-    // a lowercase grapheme spans multiple scalars; the candidate set must remain a superset.
-    if lowercase
-        .graphemes(true)
-        .any(|grapheme| grapheme.chars().count() > 1)
-    {
-        return None;
+    let mut chars: Vec<(char, bool)> = Vec::with_capacity(lowercase.len());
+    for grapheme in lowercase.graphemes(true) {
+        let expands = grapheme.chars().count() > 1;
+        chars.extend(
+            grapheme
+                .chars()
+                .map(|c| (c, !expands && !fts5_leaves_uppercase_unfolded(c))),
+        );
     }
-    // Sigma needs no such fallback here. FTS5 folds `Σ`, `σ`, and `ς` onto one form, so each
-    // spelling of a trigram selects the rows holding any of them, matching the verifier's own rule
-    // (see `crate::util::fold_caseless_char`) and keeping the candidate set a superset either way.
-    // The pre-v4 custom index stores the spelling `str::to_lowercase` chose for each position
-    // instead, so a sigma query reaches its verifier by a direct scan; `Db::prepare_content_prefilter`
-    // owns that decision, since only that path reads the custom index.
-    let chars: Vec<char> = lowercase.chars().collect();
-    if chars.len() < MIN_TRIGRAM_CHARS {
-        return None;
+    if let Some(first) = chars.first_mut() {
+        if first.0 == '\u{307}' {
+            first.1 = false;
+        }
     }
-    let mut trigrams: Vec<String> = chars
-        .windows(MIN_TRIGRAM_CHARS)
-        .map(|w| w.iter().collect())
-        .collect();
-    trigrams.sort();
-    trigrams.dedup();
-    Some(trigrams)
+
+    let mut required: Vec<String> = Vec::new();
+    let mut final_alternatives: Option<[String; 2]> = None;
+    let mut index = 0;
+    while index < chars.len() {
+        if !chars[index].1 {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && chars[index].1 {
+            index += 1;
+        }
+        let run: Vec<char> = chars[start..index].iter().map(|&(c, _)| c).collect();
+        if run.len() < MIN_TRIGRAM_CHARS {
+            continue;
+        }
+        let ends_literal = index == chars.len();
+        for window in run.windows(MIN_TRIGRAM_CHARS) {
+            let trigram: String = window.iter().collect();
+            let is_last = std::ptr::eq(window.as_ptr_range().end, run.as_ptr_range().end);
+            if ends_literal && is_last && window[2] == 'i' {
+                let dotted: String = [window[0], window[1], '\u{130}'].iter().collect();
+                final_alternatives = Some([trigram, dotted]);
+            } else {
+                required.push(trigram);
+            }
+        }
+    }
+
+    let group = |extra: Option<String>| {
+        let mut trigrams = required.clone();
+        trigrams.extend(extra);
+        trigrams.sort();
+        trigrams.dedup();
+        trigrams
+    };
+    match final_alternatives {
+        Some([plain, dotted]) => Some(vec![group(Some(plain)), group(Some(dotted))]),
+        None if required.is_empty() => None,
+        None => Some(vec![group(None)]),
+    }
 }
 
 /// Turn a literal sequence into `(min_literal_chars, OR-of-AND groups)`, or `None` if the sequence
@@ -225,7 +356,7 @@ fn seq_to_groups(seq: &Seq) -> Option<(usize, Vec<Vec<String>>)> {
             return None; // can't constrain this alternative => unsafe to prefilter
         }
         min_len = min_len.min(len);
-        groups.push(literal_to_trigrams(text)?);
+        groups.extend(literal_to_trigrams(text)?);
     }
     // Sort+dedup so identical alternatives collapse and output is stable.
     groups.sort();
@@ -446,5 +577,128 @@ mod tests {
             assert_eq!(norm(&groups), norm(&from_string), "mismatch for {pat:?}");
         }
         assert_eq!(trigram_prefilter_groups("ab"), None);
+    }
+
+    /// [`FTS5_UNFOLDED_LOWERCASE`] is exactly what the linked FTS5 tokenizer fails to fold.
+    ///
+    /// Every assigned scalar `h` whose lowercase is one different scalar is tokenized as `a{h}b`
+    /// by the same trigram tokenizer the index uses, and `fts5vocab` reports the stored trigram.
+    /// Where FTS5 stores something for `h` other than what it stores for `lower(h)`, `lower(h)`
+    /// must be in the table, and nothing else may be: a missing entry drops real matches, an extra
+    /// one costs a prefilter for nothing. A SQLite upgrade that changes its folding fails here and
+    /// names the scalars to add or remove.
+    #[test]
+    fn the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create virtual table t using fts5(x, tokenize='trigram', detail='full');
+             create virtual table v using fts5vocab(t, 'instance');",
+        )
+        .unwrap();
+        let scalars: Vec<char> = (0x20_u32..=0x10_FFFF)
+            .filter_map(char::from_u32)
+            .filter(|&c| c != '"')
+            .collect();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut insert = tx
+                .prepare("insert into t(rowid, x) values(?1, ?2)")
+                .unwrap();
+            for &c in &scalars {
+                insert
+                    .execute(rusqlite::params![u32::from(c), format!("a{c}b")])
+                    .unwrap();
+            }
+            drop(insert);
+            tx.commit().unwrap();
+        }
+        let mut stored = std::collections::HashMap::new();
+        let mut query = conn.prepare("select term, doc from v").unwrap();
+        for row in query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .unwrap()
+        {
+            let (term, doc) = row.unwrap();
+            let middle: Vec<char> = term.chars().collect();
+            if middle.len() == 3 {
+                stored.insert(doc, middle[1]);
+            }
+        }
+
+        let mut unfolded: Vec<u32> = Vec::new();
+        for &h in &scalars {
+            let mut lower = h.to_lowercase();
+            let (Some(l), None) = (lower.next(), lower.next()) else {
+                continue;
+            };
+            if l == h {
+                continue;
+            }
+            if let (Some(of_h), Some(of_l)) = (stored.get(&u32::from(h)), stored.get(&u32::from(l)))
+            {
+                if of_h != of_l {
+                    unfolded.push(u32::from(l));
+                }
+            }
+        }
+        unfolded.sort_unstable();
+        unfolded.dedup();
+        let table: Vec<u32> = FTS5_UNFOLDED_LOWERCASE
+            .iter()
+            .flat_map(|&(start, end)| start..=end)
+            .collect();
+        assert!(
+            FTS5_UNFOLDED_LOWERCASE.windows(2).all(|w| w[0].1 < w[1].0),
+            "ranges must be sorted and disjoint for the binary search"
+        );
+        let missing: Vec<String> = unfolded
+            .iter()
+            .filter(|c| !table.contains(c))
+            .map(|c| format!("U+{c:04X}"))
+            .collect();
+        // An entry this toolchain's Unicode gives no case partner is tolerated: the minimum
+        // supported Rust can predate a case pair the table already lists for newer ones, and an
+        // unneeded entry only costs a prefilter on that scalar.
+        let has_case_partner =
+            |c: u32| char::from_u32(c).is_some_and(|c| c.to_uppercase().ne(std::iter::once(c)));
+        let extra: Vec<String> = table
+            .iter()
+            .filter(|&&c| !unfolded.contains(&c) && has_case_partner(c))
+            .map(|c| format!("U+{c:04X}"))
+            .collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "FTS5_UNFOLDED_LOWERCASE disagrees with the linked tokenizer: \
+             missing {missing:?}, extra {extra:?}"
+        );
+    }
+
+    #[test]
+    fn a_literal_holding_an_expanding_or_unfolded_character_keeps_its_safe_runs() {
+        // `İstanbul` used to lose its whole prefilter to the U+0130, and scanned every row.
+        let groups = trigram_prefilter_groups(&regex::escape("İstanbul")).expect("prefilterable");
+        assert_eq!(
+            groups,
+            vec![vec!["anb", "bul", "nbu", "sta", "tan"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()]
+        );
+        // A final `i` may be the first half of a stored U+0130, so its trigram has two spellings,
+        // and a short needle ending in `i` keeps a prefilter.
+        assert_eq!(
+            trigram_prefilter_groups("api").expect("prefilterable"),
+            vec![vec!["api".to_string()], vec!["ap\u{130}".to_string()]]
+        );
+        // Cherokee lowercase forms are left out, because FTS5 stores the uppercase syllabary
+        // unfolded; a needle of nothing else has no safe trigram and is scanned.
+        assert_eq!(trigram_prefilter_groups("\u{13E3}\u{13B3}\u{13A9}"), None);
+        // Only unsafe positions are lost: the ASCII run around them still constrains the set.
+        assert_eq!(
+            trigram_prefilter_groups("err\u{13E3}xyz").expect("prefilterable"),
+            vec![vec!["err".to_string(), "xyz".to_string()]]
+        );
     }
 }

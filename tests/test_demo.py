@@ -731,7 +731,7 @@ def create_dated_demo_dir() -> Path:
     # Find the maximum timestamp across all fixture JSONL files
     max_ts: datetime | None = None
     for jsonl in (DEMO_DIR / "projects").rglob("*.jsonl"):
-        for m in _TS_RE.finditer(jsonl.read_text()):
+        for m in _TS_RE.finditer(jsonl.read_text(encoding="utf-8")):
             ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S.%fZ")
             if max_ts is None or ts > max_ts:
                 max_ts = ts
@@ -751,7 +751,7 @@ def create_dated_demo_dir() -> Path:
         return f'"timestamp": "{(ts + delta).strftime("%Y-%m-%dT%H:%M:%S.000Z")}"'
 
     for jsonl in (tmp_dir / "projects").rglob("*.jsonl"):
-        jsonl.write_text(_TS_RE.sub(_shift, jsonl.read_text()))
+        jsonl.write_text(_TS_RE.sub(_shift, jsonl.read_text(encoding="utf-8")))
 
     return tmp_dir
 
@@ -1577,7 +1577,7 @@ def trim_cast_to_banner(cast_file: Path, banner_marker: str = "self-improvement"
 
     Modifies *cast_file* in place.
     """
-    lines = cast_file.read_text().splitlines()
+    lines = cast_file.read_text(encoding="utf-8").splitlines()
     if len(lines) < 2:
         return
 
@@ -1805,7 +1805,7 @@ def verify_recording(
         print(f"Cast file not found: {cast_file}")
         return False
 
-    content = cast_file.read_text()
+    content = cast_file.read_text(encoding="utf-8")
     passed = 0
     for fragment, description in checks:
         if fragment in content:
@@ -1908,7 +1908,7 @@ class TestDemoFree:
     def test_synthetic_sessions_valid_jsonl(self) -> None:
         """All synthetic session files contain valid JSONL with required fields."""
         for jsonl_file in PROJECTS_DIR.rglob("*.jsonl"):
-            for i, line in enumerate(jsonl_file.read_text().splitlines()):
+            for i, line in enumerate(jsonl_file.read_text(encoding="utf-8").splitlines()):
                 if not line.strip():
                     continue
                 obj = json.loads(line)
@@ -2046,7 +2046,7 @@ class TestDemoFree:
     def test_no_real_user_data_in_synthetic_sessions(self) -> None:
         """Verify synthetic data contains no real usernames or personal paths."""
         for jsonl_file in PROJECTS_DIR.rglob("*.jsonl"):
-            content = jsonl_file.read_text()
+            content = jsonl_file.read_text(encoding="utf-8")
             # The demo uses "demo" as the username, not any real name
             # Real home dirs would be /Users/<realname> — we check the project dirs
             # only contain "demo" as the user

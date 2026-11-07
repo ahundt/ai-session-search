@@ -632,7 +632,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast benchmark gates.
     args = parse_args()
     manifest_path = Path(args.manifest).resolve()
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     validate_manifest(manifest)
     validate_fixture_policy(args.tier, args.fixture, args.allow_private_fixture)
     selected = [case for case in manifest["cases"] if TIER_ORDER[case["tier"]] <= TIER_ORDER[args.tier] and (not args.cases or case["id"] in args.cases)]

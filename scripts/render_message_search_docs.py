@@ -23,7 +23,7 @@ TARGETS = (ROOT / "README.md", ROOT / "docs/README.md", ROOT / "docs/development
 
 def load_specs(spec_directory: Path | None, executable: Path | None) -> dict[str, dict[str, Any]]:
     if spec_directory is not None:
-        return {surface: json.loads((spec_directory / f"{surface}.json").read_text()) for surface in SURFACES}
+        return {surface: json.loads((spec_directory / f"{surface}.json").read_text(encoding="utf-8")) for surface in SURFACES}
 
     with tempfile.TemporaryDirectory(prefix="aise-doc-spec-") as temp:
         config = Path(temp) / "config.toml"
@@ -220,7 +220,7 @@ def main() -> int:
     args = parser.parse_args()
 
     specs = load_specs(args.spec_directory, args.aise)
-    documents = {path: path.read_text() for path in TARGETS}
+    documents = {path: path.read_text(encoding="utf-8") for path in TARGETS}
     rendered = render_targets(specs, documents)
     stale = [path for path in TARGETS if rendered[path] != documents[path]]
     if args.check:
@@ -231,7 +231,7 @@ def main() -> int:
             return 1
         return 0
     for path in stale:
-        path.write_text(rendered[path])
+        path.write_text(rendered[path], encoding="utf-8")
         print(f"wrote {path.relative_to(ROOT)}")
     return 0
 

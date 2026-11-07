@@ -823,9 +823,9 @@ impl MessageSearchArgs {
 pub struct MessageGetArgs {
     /// Session id or prefix.
     pub id: String,
-    /// Select one message by its 0-based sequence number and return a focused window instead of
-    /// the whole session. A sequence past the session's end returns no rows. Omit to read the
-    /// whole session.
+    /// Select a 0-based sequence number and return a focused window instead of the whole
+    /// session. A sequence held by several messages returns all of them, in the order they were
+    /// indexed. A sequence past the session's end returns no rows. Omit to read the whole session.
     #[arg(long)]
     pub seq: Option<i64>,
     /// With --seq, include this many neighboring messages (0 or greater) before and after the
@@ -982,7 +982,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                     || args.dates.when.is_some()
                 {
                     bail!(
-                        "--seq selects one message by sequence, so it takes only --context; \
+                        "--seq selects one sequence number, so it takes only --context; \
                          drop --role, --limit, --order, --offset, --seq-from, --seq-to, --since, \
                          --until, and --when, or omit --seq to read a range of messages"
                     );
