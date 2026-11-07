@@ -4002,37 +4002,21 @@ fn json_layout_for(format: ConfigFormat) -> Result<JsonServerLayout> {
         .ok_or_else(|| anyhow!("{format:?} is not a JSON client configuration format"))
 }
 
-/// The object at `keys` under `root`, or `None` when a key is absent. With `create`, absent
-/// keys are inserted as empty objects. A present non-object value is an error naming the key,
-/// since overwriting it would destroy user configuration.
-fn json_container_mut<'a>(
-    path: &Path,
-    root: &'a mut Map<String, Value>,
-    keys: &[&str],
-    create: bool,
-) -> Result<Option<&'a mut Map<String, Value>>> {
-    let mut current = root;
-    for key in keys {
-        if !current.contains_key(*key) {
-            if !create {
-                return Ok(None);
-            }
-            current.insert((*key).to_string(), Value::Object(Map::new()));
-        }
-        current = current
-            .get_mut(*key)
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                let dotted = keys.join(".");
-                anyhow!(
-                    "{} has a non-object `{key}` value on the path `{dotted}`; fix the JSON so \
-                     `{key}` is `{{}}`-shaped, or back up and move the file aside before rerunning \
-                     `aise integrations install`",
-                    path.display()
-                )
-            })?;
+/// Client JSON files are JSONC: Zed's settings.json, VS Code's mcp.json and kilo.jsonc allow
+/// comments and trailing commas. The other JSON5 extensions stay errors, as in those clients.
+fn jsonc_parse_options() -> jsonc_parser::ParseOptions {
+    jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_non_finite_numbers: false,
+        allow_extended_string_escapes: false,
     }
-    Ok(Some(current))
 }
 
 fn json_container<'a>(
@@ -4043,20 +4027,95 @@ fn json_container<'a>(
         .try_fold(root, |current, key| current.get(*key)?.as_object())
 }
 
+/// A syntax tree of the file that keeps its comments, whitespace and trailing commas, so an
+/// edit changes only aise's entries. `parse_json_object_or_empty` has already rejected invalid
+/// text and a non-object top level, so the root here is an object or empty.
+fn jsonc_document(path: &Path, text: Option<&str>) -> Result<jsonc_parser::cst::CstRootNode> {
+    let text = text
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or("{}\n");
+    jsonc_parser::cst::CstRootNode::parse(text, &jsonc_parse_options())
+        .with_context(|| format!("failed to parse JSON in {}", path.display()))
+}
+
+/// The object at `keys` under `root`, or `None` when a key is absent. With `create`, absent
+/// keys are inserted as empty objects. A present non-object value is an error naming the key,
+/// since overwriting it would destroy user configuration.
+fn jsonc_container(
+    path: &Path,
+    root: &jsonc_parser::cst::CstObject,
+    keys: &[&str],
+    create: bool,
+) -> Result<Option<jsonc_parser::cst::CstObject>> {
+    let mut current = root.clone();
+    for key in keys {
+        let next = match current.get(key) {
+            None if !create => return Ok(None),
+            None => current.object_value_or_create(key),
+            Some(_) => current.object_value(key),
+        };
+        current = next.ok_or_else(|| {
+            let dotted = keys.join(".");
+            anyhow!(
+                "{} has a non-object `{key}` value on the path `{dotted}`; fix the JSON so \
+                 `{key}` is `{{}}`-shaped, or back up and move the file aside before rerunning \
+                 `aise integrations install`",
+                path.display()
+            )
+        })?;
+    }
+    Ok(Some(current))
+}
+
+fn remove_owned_jsonc_entries(servers: &jsonc_parser::cst::CstObject) -> bool {
+    let mut removed = false;
+    for name in std::iter::once(SERVER_NAME).chain(LEGACY_SERVER_NAMES) {
+        if let Some(property) = servers.get(name) {
+            property.remove();
+            removed = true;
+        }
+    }
+    removed
+}
+
 /// Removes aise's entries from every superseded container. Errors only when a superseded key
 /// holds a non-object, which the user must resolve.
-fn clear_superseded_json_servers(
+fn clear_superseded_jsonc_servers(
     path: &Path,
-    root: &mut Map<String, Value>,
+    root: &jsonc_parser::cst::CstObject,
     layout: &JsonServerLayout,
 ) -> Result<bool> {
     let mut removed = false;
     for keys in layout.superseded {
-        if let Some(servers) = json_container_mut(path, root, keys, false)? {
-            removed |= remove_owned_json_server_entries(servers);
+        if let Some(servers) = jsonc_container(path, root, keys, false)? {
+            removed |= remove_owned_jsonc_entries(&servers);
         }
     }
     Ok(removed)
+}
+
+fn jsonc_input(value: &Value) -> jsonc_parser::cst::CstInputValue {
+    use jsonc_parser::cst::CstInputValue;
+    match value {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(value) => CstInputValue::Bool(*value),
+        Value::Number(value) => CstInputValue::Number(value.to_string()),
+        Value::String(value) => CstInputValue::String(value.clone()),
+        Value::Array(items) => CstInputValue::Array(items.iter().map(jsonc_input).collect()),
+        Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), jsonc_input(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn jsonc_content(root: &jsonc_parser::cst::CstRootNode) -> String {
+    let mut content = root.to_string();
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content
 }
 
 fn plan_upsert_json_server(
@@ -4066,16 +4125,29 @@ fn plan_upsert_json_server(
 ) -> Result<Vec<PlannedFileMutation>> {
     let layout = json_layout_for(format)?;
     let original = read_optional_utf8_regular_file(path)?;
-    let mut root = parse_json_object_or_empty(path, original.as_deref())?;
-    clear_superseded_json_servers(path, &mut root, &layout)?;
-    let servers = json_container_mut(path, &mut root, layout.container, true)?
+    parse_json_object_or_empty(path, original.as_deref())?;
+    let document = jsonc_document(path, original.as_deref())?;
+    let root = document.object_value_or_set();
+    clear_superseded_jsonc_servers(path, &root, &layout)?;
+    let servers = jsonc_container(path, &root, layout.container, true)?
         .expect("create inserts every missing container");
     for legacy_name in LEGACY_SERVER_NAMES {
-        servers.remove(legacy_name);
+        if let Some(property) = servers.get(legacy_name) {
+            property.remove();
+        }
     }
-    servers.insert(SERVER_NAME.to_string(), entry);
-    let content = serde_json::to_string_pretty(&Value::Object(root))? + "\n";
-    Ok(vec![planned_write(path, &original, content)])
+    let value = jsonc_input(&entry);
+    match servers.get(SERVER_NAME) {
+        Some(property) => property.set_value(value),
+        None => {
+            servers.append(SERVER_NAME, value);
+        }
+    }
+    Ok(vec![planned_write(
+        path,
+        &original,
+        jsonc_content(&document),
+    )])
 }
 
 fn plan_remove_json_server(path: &Path, format: ConfigFormat) -> Result<Vec<PlannedFileMutation>> {
@@ -4084,13 +4156,18 @@ fn plan_remove_json_server(path: &Path, format: ConfigFormat) -> Result<Vec<Plan
     let Some(text) = original.as_deref() else {
         return Ok(Vec::new());
     };
-    let mut root = parse_json_object_or_empty(path, Some(text))?;
-    let mut removed = json_container_mut(path, &mut root, layout.container, false)?
-        .is_some_and(remove_owned_json_server_entries);
-    removed |= clear_superseded_json_servers(path, &mut root, &layout)?;
+    parse_json_object_or_empty(path, Some(text))?;
+    let document = jsonc_document(path, Some(text))?;
+    let root = document.object_value_or_set();
+    let mut removed = jsonc_container(path, &root, layout.container, false)?
+        .is_some_and(|servers| remove_owned_jsonc_entries(&servers));
+    removed |= clear_superseded_jsonc_servers(path, &root, &layout)?;
     if removed {
-        let content = serde_json::to_string_pretty(&Value::Object(root))? + "\n";
-        Ok(vec![planned_write(path, &original, content)])
+        Ok(vec![planned_write(
+            path,
+            &original,
+            jsonc_content(&document),
+        )])
     } else {
         Ok(Vec::new())
     }
@@ -4175,14 +4252,6 @@ fn parse_codex_document(path: &Path, text: &str) -> Result<toml_edit::DocumentMu
         .with_context(|| format!("failed to parse TOML in {}", path.display()))
 }
 
-fn remove_owned_json_server_entries(servers: &mut Map<String, Value>) -> bool {
-    let mut removed = servers.remove(SERVER_NAME).is_some();
-    for legacy_name in LEGACY_SERVER_NAMES {
-        removed |= servers.remove(legacy_name).is_some();
-    }
-    removed
-}
-
 fn remove_owned_toml_server_entries(servers: &mut toml_edit::Table) -> bool {
     let mut removed = servers.remove(SERVER_NAME).is_some();
     for legacy_name in LEGACY_SERVER_NAMES {
@@ -4207,7 +4276,7 @@ fn parse_json_object_or_empty(path: &Path, text: Option<&str>) -> Result<Map<Str
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
-    match serde_json::from_str::<Value>(text)
+    match jsonc_parser::parse_to_serde_value::<Value>(text, &jsonc_parse_options())
         .with_context(|| format!("failed to parse JSON in {}", path.display()))?
     {
         Value::Object(map) => Ok(map),
@@ -4843,6 +4912,47 @@ mod tests {
             assert_eq!(kilocode.len(), 1);
             assert_eq!(kilocode[0].path, PathBuf::from(expected_kilocode));
         }
+    }
+
+    /// Zed's settings.json and VS Code's mcp.json are JSONC: Zed writes a comment header into a
+    /// new settings file. A strict JSON parse failed the whole install, every client included,
+    /// and rewriting through serde_json would drop the user's comments.
+    #[test]
+    fn jsonc_comments_and_trailing_commas_survive_install_and_uninstall() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = "// Zed settings\n//\n// keep this header\n{\n  \"theme\": \"One Dark\", // keep this note\n  \"context_servers\": {\n    \"user-server\": {\"command\": \"user\"},\n  },\n}\n";
+        fs::write(&path, original).unwrap();
+        let target = Target {
+            label: "zed",
+            path: path.clone(),
+            format: ConfigFormat::ZedContextServers,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+            superseded_paths: Vec::new(),
+        };
+        assert_eq!(status_target(&target).unwrap(), "not configured");
+
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.starts_with("// Zed settings\n//\n// keep this header\n"),
+            "{written}"
+        );
+        assert!(written.contains("// keep this note"), "{written}");
+        assert_eq!(written.matches(SERVER_NAME).count(), 1, "{written}");
+        assert_eq!(status_target(&target).unwrap(), "configured");
+
+        assert!(remove_target(&target).unwrap());
+        let removed = fs::read_to_string(&path).unwrap();
+        assert!(removed.contains("// keep this note") && !removed.contains(SERVER_NAME));
+        assert!(removed.contains("user-server"));
+        assert_eq!(status_target(&target).unwrap(), "not configured");
+
+        fs::write(&path, "// a comment\n[1, 2]\n").unwrap();
+        let error = upsert_target(&target, Path::new("/bin/aise")).unwrap_err();
+        assert!(format!("{error:#}").contains("top level"), "{error:#}");
     }
 
     /// Zed's `paths::config_dir()` per platform; only macOS has a superseded aise location.

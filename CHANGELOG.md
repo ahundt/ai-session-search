@@ -99,6 +99,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `~/Library/Application Support/Zed/settings.json`, but Zed reads `~/.config/zed/settings.json`
     there. Install now writes the file Zed reads and removes aise's entry from the old one,
     keeping any other servers in it. Linux and Windows paths were already correct.
+11. `aise integrations install` edits client JSON files that contain comments or trailing
+    commas, as Zed's settings and VS Code's `mcp.json` allow. One such file made the whole
+    install fail for every client. aise now changes only its own entry and leaves the comments,
+    commas and other settings as they were.
 
 ### Performance
 

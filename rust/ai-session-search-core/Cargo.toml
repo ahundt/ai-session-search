@@ -40,6 +40,9 @@ interim = { version = "0.2.1", features = ["chrono_0_4", "jiff_0_2"] }
 # /etc/localtime; bundled on Windows) and resolves daylight-saving gaps and folds with RFC 5545's
 # "compatible" rule. chrono leaves gaps to the caller and chrono-tz embeds a database snapshot.
 jiff = "0.2.38"
+# Edits JSONC client configs (Zed settings.json, VS Code mcp.json, kilo.jsonc) without dropping
+# their comments; `serde` reads them into serde_json values for status checks.
+jsonc-parser = { version = "0.34", default-features = false, features = ["cst", "serde"] }
 linkify = "0.11"
 nucleo-matcher = "0.3.1"
 # `unstable-rendered-line-info` gates `Paragraph::line_count`, which the preview uses to bound
