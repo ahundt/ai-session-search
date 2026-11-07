@@ -38,8 +38,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    covered, and a time a clock change skips or repeats resolves as
    [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) specifies. `aise dates` shows the zone in
    use.
-4. Durations also accept ISO 8601 (`P1M`, `PT2H`) and compound forms (`1d12h`), and EDTF open
-   intervals (`2026-01/..`, `../2026-03`) select everything after or before a date.
+4. Durations also accept ISO 8601 (`P1M`, `PT2H`), compound (`1y6M`, `1d12h`) and spelled-out
+   (`2 weeks`) forms; `3 days ago` still selects that whole day. EDTF open intervals
+   (`2026-01/..`, `../2026-03`) select everything after or before a date, and a space may
+   separate date and time (`2026-01-15 14:30`), as RFC 3339 allows.
 
 ### Deprecated
 
