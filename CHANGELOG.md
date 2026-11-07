@@ -127,6 +127,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     instructions. Earlier installs provided only CLI guidance. Untouched CLI-only integrations
     gain the MCP registration during the post-upgrade refresh.
 
+16. Prime Agent receives a local aise MCP registration under `mcpServers` in
+    `~/.prime/agent/settings.json` with its required `type: "stdio"`. It previously received only
+    CLI guidance; untouched CLI-only integrations also gain the registration during refresh.
+
 ### Performance
 
 1. Limited literal and regex searches stop once the page is full. On an index of 5.7 million
