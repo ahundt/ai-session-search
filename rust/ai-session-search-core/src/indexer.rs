@@ -749,7 +749,7 @@ pub(crate) fn reindex_until(
     let adapters = ProviderSet::new(config);
     let discovery = adapters.discover_enabled(config);
     let sources = deduplicate_sources(discovery.sources);
-    let discovery_warnings = discovery.warnings;
+    let mut discovery_warnings = discovery.warnings;
     let discovered_source_paths = sources
         .iter()
         .map(|source| (source.provider, normalize_path(&source.path)))
@@ -900,13 +900,19 @@ pub(crate) fn reindex_until(
                     discovery_warnings,
                 })
             }
-            Err(_)
+            Err(error)
                 if indexed_source_paths.contains(&(source.provider, source_path.clone()))
                     || reconciliation.is_some() =>
             {
                 // A failed refresh is not a new archive state. Keep the last successful rows and
-                // their old files_seen metadata so the next refresh retries this source. A source
-                // reconciliation also proves an existing row through a canonical-path alias.
+                // their old files_seen metadata so the next refresh retries this source, and
+                // report the failure. A source reconciliation also proves an existing row through
+                // a canonical-path alias.
+                discovery_warnings.push(crate::source::ProviderDiscoveryWarning::refresh_failed(
+                    source.provider,
+                    &source.path,
+                    &error,
+                ));
                 continue;
             }
             Err(error) => {
@@ -999,6 +1005,10 @@ pub(crate) fn reindex_until(
 /// have crossed the parser's EOF and therefore must force one conservative full parse.
 fn full_parse_checkpoint(source: &SourceFile) -> Result<(i64, String)> {
     let current_size = std::fs::metadata(&source.path)?.len() as i64;
+    if crate::source::is_compressed_jsonl(&source.path) {
+        // No tail checkpoint into compressed bytes; any later change takes the full parse.
+        return Ok((0, crate::tail::prefix_fingerprint(&source.path)?));
+    }
     let complete_offset = if current_size == source.size_bytes {
         crate::tail::complete_prefix_offset(&source.path)?
     } else {
@@ -1051,7 +1061,14 @@ fn source_reconciliation(
 ) -> Result<HashMap<(Provider, String), SourceReconciliation>> {
     let mut indexed_by_identity =
         HashMap::<(Provider, String), Vec<(String, usize, String)>>::new();
+    // Stored paths by name, for a source whose earlier form no longer exists on disk: a Codex
+    // rollout compressed to `.jsonl.zst` (or decompressed on resume) is the same source.
+    let mut indexed_by_path = HashMap::<(Provider, String), (String, usize, String)>::new();
     for (provider, stored_path, sessions, session_id) in db.indexed_source_identities()? {
+        indexed_by_path.insert(
+            (provider, stored_path.clone()),
+            (stored_path.clone(), sessions, session_id.clone()),
+        );
         let Ok(canonical) = std::fs::canonicalize(&stored_path) else {
             continue;
         };
@@ -1064,7 +1081,24 @@ fn source_reconciliation(
         .iter()
         .filter_map(|source| {
             let path = normalize_path(&source.path);
-            let indexed = indexed_by_identity.get(&(source.provider, path.clone()))?;
+            let sibling = (source.provider == Provider::Codex)
+                .then(|| crate::providers::codex::rollout_sibling(&source.path))
+                .flatten()
+                .map(|sibling| normalize_path(&sibling))
+                .and_then(|sibling| indexed_by_path.get(&(source.provider, sibling)).cloned());
+            let mut indexed = indexed_by_identity
+                .get(&(source.provider, path.clone()))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(entry) = sibling {
+                if !indexed.iter().any(|(stored, _, _)| stored == &entry.0) {
+                    indexed.push(entry);
+                }
+            }
+            if indexed.is_empty() {
+                return None;
+            }
+            let indexed = &indexed;
             let aliases = indexed
                 .iter()
                 .filter(|(stored, _, _)| stored != &path)
@@ -1164,6 +1198,11 @@ fn try_tail<F>(
 where
     F: Fn(std::io::Cursor<Vec<u8>>, &std::path::Path) -> Result<crate::models::ParsedSession>,
 {
+    // A compressed rollout is immutable once written and its byte offsets are not JSONL offsets,
+    // so it is always read whole.
+    if crate::source::is_compressed_jsonl(&source.path) {
+        return Ok(TailOutcome::FullParse);
+    }
     let Some((offset, stored_fingerprint)) = db.file_checkpoint(
         source.provider,
         source_path,
@@ -1271,6 +1310,56 @@ mod tests {
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
         config
+    }
+
+    #[test]
+    fn a_failed_refresh_of_an_indexed_source_keeps_its_rows_and_reports_a_warning() {
+        // A compressed rollout that cannot be decoded replaced the plain file the index holds.
+        // The stored rows stay, and the run says which file failed instead of skipping it quietly.
+        let dir = tempfile::tempdir().unwrap();
+        let codex_root = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let plain = codex_root
+            .join("rollout-2026-06-25T03-04-06-019efd97-d602-7922-89dd-467272106505.jsonl");
+        std::fs::write(
+            &plain,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","timestamp":"2026-06-25T07:00:00.000Z","cwd":"/tmp/proj"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"do the thing"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![codex_root.to_string_lossy().to_string()];
+        let db = Db::open(&db_path).unwrap();
+        reindex_until(&config, &db, false, None, &|| false).unwrap();
+        let stored = db.message_count().unwrap();
+        assert!(stored > 0);
+
+        let compressed = plain.with_extension("jsonl.zst");
+        std::fs::write(&compressed, b"not a zstd stream").unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        let ReindexRun::Completed {
+            discovery_warnings, ..
+        } = reindex_until(&config, &db, false, None, &|| false).unwrap()
+        else {
+            panic!("the default token never cancels");
+        };
+
+        assert_eq!(db.message_count().unwrap(), stored, "stored rows stay");
+        let warning = discovery_warnings
+            .iter()
+            // Discovery canonicalizes roots (macOS reports /var as /private/var), so match the
+            // file name rather than the spelling of the temporary directory.
+            .find(|warning| warning.path.ends_with(".jsonl.zst"))
+            .unwrap_or_else(|| panic!("no warning names the failed file: {discovery_warnings:?}"));
+        assert_eq!(warning.operation, "refresh");
+        assert!(warning.readable_sources_preserved);
+        assert!(!warning.message.is_empty());
     }
 
     fn config_with_no_providers(path: &std::path::Path) -> Config {
