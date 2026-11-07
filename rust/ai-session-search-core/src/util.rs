@@ -534,7 +534,12 @@ impl UnicodeLowerNeedle {
     /// folded characters decoded, plus O(N) for the one backward walk, and allocates nothing.
     /// Worst case is still O(H) decoded characters, when every position is a candidate: a needle
     /// whose first character is non-ASCII skips nothing, and a first character as common as a
-    /// space makes C approach H. Peak memory is the needle's `pattern` and `prefix`, O(N), with
+    /// space makes C approach H. The skip's own overhead shows when every character is non-ASCII:
+    /// for the needle `error` over 2.8 MB of Chinese and Japanese text, best of 21 release runs, the
+    /// scan took 1.13-1.23x the unskipped loop (about 1-2 ms), against 0.25x on English prose.
+    /// Restarting the skip only after an ASCII character removed that overhead but made text with
+    /// a space every few CJK characters 1.13-1.17x slower, so it was not taken.
+    /// Peak memory is the needle's `pattern` and `prefix`, O(N), with
     /// no per-haystack state, which is what keeps [`Self::contains`] cheap enough for the
     /// per-record ranking loop that calls it for every haystack of every session.
     ///

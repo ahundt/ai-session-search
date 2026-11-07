@@ -5318,7 +5318,7 @@ impl Db {
         self.validate_access_scope()?;
         let mut sql = String::from(
             "with ordered as (
-                 select ts, kind, lag(ts) over (order by seq) as previous_ts
+                 select ts, kind, lag(ts) over (order by seq, id) as previous_ts
                  from messages where session_id = ?",
         );
         let mut args = vec![Value::Text(session_id.to_string())];
@@ -5434,7 +5434,7 @@ const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL: &str = "select seq, group_concat
          order by seq, message_id, ordinal
      )
      group by message_id, seq
-     order by seq";
+     order by seq, message_id";
 
 /// One keyset page of matching session records, ordered by canonical session ID.
 fn analysis_session_page(
