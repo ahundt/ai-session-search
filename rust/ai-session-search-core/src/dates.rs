@@ -107,6 +107,7 @@ impl DateRange {
     /// Resolve relative to the wall clock, reading values that carry no offset or zone in the
     /// local time zone: the `TZ` environment variable when set, otherwise the system zone. Used
     /// by command handlers.
+    #[allow(clippy::disallowed_methods)] // the one place relative input reads the wall clock
     pub fn resolve_now(&self) -> Result<Bounds> {
         self.resolve_zoned(&jiff::Zoned::now())
     }
@@ -417,6 +418,7 @@ fn day_x_span(
 /// The local time zone: the `TZ` environment variable when set, otherwise the system zone
 /// (`/etc/localtime` on Unix, the Windows zone mapped to IANA). Falls back to UTC when neither
 /// can be determined.
+#[allow(clippy::disallowed_methods)] // the one place the system zone is read
 pub fn local_time_zone() -> TimeZone {
     TimeZone::try_system().unwrap_or(TimeZone::UTC)
 }
