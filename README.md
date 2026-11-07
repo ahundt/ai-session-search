@@ -120,7 +120,8 @@ What a harness receives depends on what it can read, in the format and location 
 | ChatGPT Codex desktop and CLI/IDE | MCP config, managed `AGENTS.md` block, skill |
 | OpenCode | MCP config, managed `AGENTS.md` block |
 | Gemini CLI, Antigravity App/IDE/CLI | MCP config, shared `~/.gemini/GEMINI.md` block, skill |
-| Pi, Prime Agent | Skill and native `AGENTS.md` only: Pi has no MCP client, and Prime's kernel currently takes remote HTTP MCP integrations |
+| Pi 0.99.0+ | MCP config in `~/.pi/agent/mcp.json`, skill, native `AGENTS.md` guidance |
+| Prime Agent | MCP config in `~/.prime/agent/settings.json` with `type: "stdio"`, skill, native `AGENTS.md` guidance |
 | Cursor, Windsurf, VS Code, Zed, OpenClaw, KiloCode | MCP config |
 
 No MCP tool changes your sessions or configuration, and publishing a bundle stays a CLI and
