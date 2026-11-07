@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,11 +17,9 @@ use anyhow::{bail, Context, Result};
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::durable_fs::{entry_exists, sync_file, sync_parent, StagedFile};
-use crate::hashing::lower_hex;
 use crate::indexer::{index_update_lock_path, open_index_update_lock};
 
 #[derive(Debug, Clone)]
@@ -724,18 +722,9 @@ fn core_table_rows(connection: &Connection) -> Result<BTreeMap<String, i64>> {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)
+    let file = File::open(path)
         .with_context(|| format!("failed to open {} for checksum", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(lower_hex(digest.finalize().as_ref()))
+    Ok(crate::hashing::sha256_reader(file)?)
 }
 
 fn write_receipt(path: &Path, receipt: &DatabaseMigrationReceipt) -> Result<()> {
