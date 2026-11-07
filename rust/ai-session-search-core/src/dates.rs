@@ -47,10 +47,11 @@
 //! `db.rs` (uniform `+00:00` rfc3339) remains the storage-side filter.
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use edtf::level_1::{Date as EdtfDate, Edtf, Precision, Season};
 use interim::{parse_date_string, Dialect};
+use jiff::tz::TimeZone;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -96,11 +97,24 @@ pub struct DateRange {
 }
 
 impl DateRange {
-    /// Resolve the flags to `(since, until)` UTC instants relative to `now`.
+    /// Resolve the flags to `(since, until)` UTC instants relative to `now`, reading dates and
+    /// times that carry no offset in UTC. [`DateRange::resolve_now`] reads them in local time.
     pub fn resolve(&self, now: DateTime<Utc>) -> Result<Bounds> {
+        self.resolve_in_zone(now, &TimeZone::UTC)
+    }
+
+    /// Resolve the flags relative to `now`, reading dates and times that carry no offset in the
+    /// IANA time zone `time_zone` (for example `America/New_York` or `UTC`), as ISO 8601 and
+    /// EDTF define them: `2026-11-07` is that day in that zone, while `2026-11-07T14:30:00Z` and
+    /// durations such as `2h` name the same instants everywhere.
+    pub fn resolve_in(&self, now: DateTime<Utc>, time_zone: &str) -> Result<Bounds> {
+        self.resolve_in_zone(now, &named_time_zone(time_zone)?)
+    }
+
+    pub(crate) fn resolve_in_zone(&self, now: DateTime<Utc>, zone: &TimeZone) -> Result<Bounds> {
         if let Some(when) = self.when.as_deref() {
-            let (start, end) =
-                parse_span(when, now).map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
+            let (start, end) = parse_span_in(when, now, zone)
+                .map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
             if start > end {
                 bail!(
                     "invalid --when '{when}': resolved period is reversed; put the earlier date first"
@@ -112,7 +126,7 @@ impl DateRange {
             .since
             .as_deref()
             .map(|raw| {
-                parse_bound(raw, Bound::Start, now)
+                parse_bound_in(raw, Bound::Start, now, zone)
                     .map_err(|err| anyhow!("invalid --since '{raw}': {err}"))
             })
             .transpose()?;
@@ -120,7 +134,7 @@ impl DateRange {
             .until
             .as_deref()
             .map(|raw| {
-                parse_bound(raw, Bound::End, now)
+                parse_bound_in(raw, Bound::End, now, zone)
                     .map_err(|err| anyhow!("invalid --until '{raw}': {err}"))
             })
             .transpose()?;
@@ -130,65 +144,60 @@ impl DateRange {
         Ok((since, until))
     }
 
-    /// Resolve relative to the wall clock. Used by command handlers.
+    /// Resolve relative to the wall clock in the local time zone: the `TZ` environment variable
+    /// when set, otherwise the system zone ([`local_time_zone`]). Used by command handlers.
     pub fn resolve_now(&self) -> Result<Bounds> {
-        self.resolve(Utc::now())
+        self.resolve_in_zone(Utc::now(), &local_time_zone())
     }
 }
 
-/// Parse one token to a single bound (start or end of its period).
+/// Parse one token to a single bound (start or end of its period), reading input without an
+/// offset in UTC.
 pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
-    let (start, end) = parse_span(input, now)?;
+    parse_bound_in(input, bound, now, &TimeZone::UTC)
+}
+
+/// [`parse_bound`], reading input without an offset in `zone`.
+pub(crate) fn parse_bound_in(
+    input: &str,
+    bound: Bound,
+    now: DateTime<Utc>,
+    zone: &TimeZone,
+) -> Result<DateTime<Utc>> {
+    let (start, end) = parse_span_in(input, now, zone)?;
     Ok(match bound {
         Bound::Start => start,
         Bound::End => end,
     })
 }
 
-/// Parse one token to its full `(start, end)` instant span.
-// User-facing --since/--until/--when input is deliberately permissive, so this module parses
-// with chrono directly; clippy.toml names it as the exception for user input.
-#[allow(clippy::disallowed_methods)]
+/// Parse one token to its full `(start, end)` instant span, reading input without an offset in
+/// UTC.
 pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    parse_span_in(input, now, &TimeZone::UTC)
+}
+
+/// [`parse_span`], reading input without an offset in `zone`.
+pub(crate) fn parse_span_in(
+    input: &str,
+    now_utc: DateTime<Utc>,
+    zone: &TimeZone,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let now = zoned(now_utc, zone)?;
     let s = input.trim();
     if s.is_empty() {
         bail!("empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `aise dates`)");
     }
 
-    // 1. Duration shorthand (7d 2w 1M 24h 30m 1y) — not EDTF or natural language.
-    //    Resolves to the window [now - delta, now]: `--since 7d` starts 7 days back,
-    //    `--until 7d` ends now, and `--when 7d` covers the last 7 days. Built with
-    //    checked arithmetic so an absurd magnitude errors cleanly instead of panicking
-    //    chrono's TimeDelta.
-    if let Some(caps) = duration_re().captures(s) {
-        let n: i64 = caps[1]
-            .parse()
-            .map_err(|_| anyhow!("duration number too large in '{s}'"))?;
-        // Lowercase `m` is minutes and uppercase `M` months, as in humantime and systemd;
-        // other units ignore case. Months and years step back calendar months with chrono,
-        // clamping to the last day of a shorter month, so `1M` from March 31 starts on the last
-        // day of February. Checked arithmetic turns an absurd magnitude into an error.
-        let unit = &caps[2];
-        let months = |count: i64| {
-            u32::try_from(count)
-                .ok()
-                .and_then(|count| now.checked_sub_months(Months::new(count)))
-        };
-        let start = match unit {
-            "m" => Duration::try_minutes(n).and_then(|delta| now.checked_sub_signed(delta)),
-            "M" => months(n),
-            _ => match unit.to_ascii_lowercase().as_str() {
-                "min" => Duration::try_minutes(n).and_then(|delta| now.checked_sub_signed(delta)),
-                "mo" => months(n),
-                "y" => n.checked_mul(12).and_then(months),
-                "d" => Duration::try_days(n).and_then(|delta| now.checked_sub_signed(delta)),
-                "w" => Duration::try_weeks(n).and_then(|delta| now.checked_sub_signed(delta)),
-                "h" => Duration::try_hours(n).and_then(|delta| now.checked_sub_signed(delta)),
-                other => bail!("unsupported duration unit '{other}'"),
-            },
-        }
-        .ok_or_else(|| anyhow!("duration '{s}' is out of range"))?;
-        return Ok((start, now));
+    // 1. Durations (7d 2w 1M 24h 30m 1y, 1d12h, P1M, PT2H) are the window [now - span, now].
+    //    jiff applies the span in the zone: months and days are calendar units, so `1M` from
+    //    March 31 starts on the last day of February and `1d` across a daylight-saving change
+    //    keeps the wall-clock time; hours and smaller units are elapsed time.
+    if let Some(span) = parse_duration(s)? {
+        let start = now
+            .checked_sub(span)
+            .map_err(|err| anyhow!("duration '{s}' is out of range: {err}"))?;
+        return Ok((from_timestamp(start.timestamp())?, now_utc));
     }
 
     // EDTF needs uppercase `X`; only uppercase purely date-shaped tokens so NLP
@@ -200,25 +209,37 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
     };
     let s = normalized.as_str();
 
-    // 2. RFC 3339 instant, including fractional seconds and explicit UTC offsets. Parse this
-    //    before EDTF/NLP: the EDTF crate rejects fractional seconds, while the NLP fallback may
-    //    accept the calendar portion and silently widen an exact instant to the whole UTC day.
-    if let Ok(instant) = DateTime::parse_from_rfc3339(s) {
-        let instant = instant.with_timezone(&Utc);
+    // 2. An exact instant with `Z` or an offset (RFC 3339 / RFC 9557), including fractional
+    //    seconds. Parsed before EDTF/NLP: the EDTF crate rejects fractional seconds, and the NLP
+    //    fallback could accept the calendar part and widen an exact instant to a whole day.
+    if let Ok(timestamp) = s.parse::<jiff::Timestamp>() {
+        let instant = from_timestamp(timestamp)?;
         return Ok((instant, instant));
     }
 
-    // 3. Partial-precision datetime (YYYY-MM-DDTHH or …THH:MM) — EDTF rejects these.
-    if let Some(caps) = partial_dt_re().captures(s) {
-        let date_hh = &caps[1]; // "2026-01-15T14"
-        let (start_s, end_s) = match caps.get(2).map(|m| m.as_str()) {
-            None => (format!("{date_hh}:00:00"), format!("{date_hh}:59:59")),
-            Some(mm) => (format!("{date_hh}:{mm}:00"), format!("{date_hh}:{mm}:59")),
+    // 3. A date and time without an offset is local time (ISO 8601, EDTF). Hour or minute
+    //    precision names that whole hour or minute; seconds or finer name one instant.
+    if let Some((_, time)) = s.split_once('T').filter(|(date, _)| date.len() == 10) {
+        let colons = time.matches(':').count();
+        let text = if colons == 0 {
+            format!("{s}:00")
+        } else {
+            s.to_string()
         };
-        return Ok((
-            parse_iso_dt(&start_s)?,
-            end_of_second(parse_iso_dt(&end_s)?),
-        ));
+        if let Ok(start) = text.parse::<jiff::civil::DateTime>() {
+            let length = match colons {
+                0 => Some(jiff::Span::new().hours(1)),
+                1 => Some(jiff::Span::new().minutes(1)),
+                _ => None,
+            };
+            let end = match length {
+                Some(length) => start
+                    .checked_add(length)?
+                    .checked_sub(jiff::Span::new().nanoseconds(1))?,
+                None => start,
+            };
+            return Ok((instant_in(zone, start)?, instant_in(zone, end)?));
+        }
     }
 
     // 4. Single-digit-unspecified day (2026-01-1X, 2026-01-X5, 2026-01-XX) — the
@@ -228,9 +249,7 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
         let tens = caps[3].chars().next().unwrap_or('X');
         let units = caps[4].chars().next().unwrap_or('X');
         if tens == 'X' || units == 'X' {
-            let year: i32 = caps[1].parse()?;
-            let month: u32 = caps[2].parse()?;
-            return day_x_span(year, month, tens, units);
+            return day_x_span(caps[1].parse()?, caps[2].parse()?, tens, units, zone);
         }
     }
 
@@ -238,8 +257,9 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
     //    full datetimes. The library does the parsing; Precision drives bound math.
     if let Ok(edtf) = Edtf::parse(s) {
         return match edtf {
-            Edtf::Date(date) => date_bounds(&date),
-            Edtf::Interval(a, b) => Ok((date_bounds(&a)?.0, date_bounds(&b)?.1)),
+            Edtf::Date(date) => date_bounds(&date, zone),
+            Edtf::Interval(a, b) => Ok((date_bounds(&a, zone)?.0, date_bounds(&b, zone)?.1)),
+            // Zone-less datetimes were read in step 3 and offset ones in step 2.
             Edtf::DateTime(dt) => {
                 let instant = dt.to_chrono(&Utc);
                 Ok((instant, instant))
@@ -250,12 +270,12 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
     }
 
     // 6. Natural language ("yesterday", "3 days ago", "last friday"). These are
-    //    day-granular, so expand the resolved instant to its full UTC calendar day:
+    //    day-granular, so expand the resolved instant to its full calendar day in the zone:
     //    `--when yesterday` then covers the whole day (consistent with `--when
     //    2026-06-24`) instead of a zero-width instant, while `--since`/`--until` take
     //    that day's start/end.
-    if let Ok(instant) = parse_date_string(input.trim(), now, Dialect::Us) {
-        return day_span_of(instant);
+    if let Ok(resolved) = parse_date_string(input.trim(), now.clone(), Dialect::Us) {
+        return days_span(resolved.date(), resolved.date(), zone);
     }
 
     bail!(
@@ -264,17 +284,48 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
     )
 }
 
-/// Expand an [`EdtfDate`] to inclusive `(start, end)` instants from its precision.
-fn date_bounds(date: &EdtfDate) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    match date.precision() {
-        Precision::Century(y) => Ok((start_of_year(y)?, end_of_year(y + 99)?)),
-        Precision::Decade(y) => Ok((start_of_year(y)?, end_of_year(y + 9)?)),
-        Precision::Year(y) | Precision::MonthOfYear(y) | Precision::DayOfYear(y) => {
-            Ok((start_of_year(y)?, end_of_year(y)?))
+/// A duration token, parsed by jiff's friendly or ISO 8601 grammar. `M` alone means months, as
+/// in humantime and systemd (jiff rejects it to avoid confusion with minutes); other units ignore
+/// case. Phrases with spaces, such as `3 days ago`, are left to natural language.
+fn parse_duration(s: &str) -> Result<Option<jiff::Span>> {
+    if s.contains(char::is_whitespace) {
+        return Ok(None);
+    }
+    let months = s
+        .strip_suffix('M')
+        .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()));
+    let span = match months {
+        Some(count) => format!("{count}mo").parse::<jiff::Span>().ok(),
+        None => s
+            .parse::<jiff::Span>()
+            .or_else(|_| s.to_ascii_lowercase().parse())
+            .ok(),
+    };
+    match span {
+        Some(span) if span.is_negative() => {
+            bail!("duration '{s}' is negative; durations count back from now, so write it without '-'")
         }
-        Precision::Month(y, m) | Precision::DayOfMonth(y, m) => month_span(y, m),
-        Precision::Day(y, m, d) => day_span(y, m, d),
-        Precision::Season(y, season) => season_span(y, season),
+        span => Ok(span),
+    }
+}
+
+/// Expand an [`EdtfDate`] to inclusive `(start, end)` instants from its precision.
+fn date_bounds(date: &EdtfDate, zone: &TimeZone) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    match date.precision() {
+        Precision::Century(y) => years_span(y, y + 99, zone),
+        Precision::Decade(y) => years_span(y, y + 9, zone),
+        Precision::Year(y) | Precision::MonthOfYear(y) | Precision::DayOfYear(y) => {
+            years_span(y, y, zone)
+        }
+        Precision::Month(y, m) | Precision::DayOfMonth(y, m) => months_span(y, m, y, m, zone),
+        Precision::Day(y, m, d) => days_span(civil_date(y, m, d)?, civil_date(y, m, d)?, zone),
+        // Meteorological seasons; winter runs into the next calendar year.
+        Precision::Season(y, season) => match season {
+            Season::Spring => months_span(y, 3, y, 5, zone),
+            Season::Summer => months_span(y, 6, y, 8, zone),
+            Season::Autumn => months_span(y, 9, y, 11, zone),
+            Season::Winter => months_span(y, 12, y + 1, 2, zone),
+        },
     }
 }
 
@@ -285,8 +336,9 @@ fn day_x_span(
     month: u32,
     tens: char,
     units: char,
+    zone: &TimeZone,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let max_day = days_in_month(year, month)?;
+    let max_day = u32::try_from(civil_date(year, month, 1)?.days_in_month())?;
     let (lo, hi) = if tens == 'X' && units == 'X' {
         (1, max_day)
     } else if units == 'X' {
@@ -301,106 +353,98 @@ fn day_x_span(
         let hi = (1..=max_day).rev().find(|d| d % 10 == u).unwrap_or(lo);
         (lo, hi)
     };
+    days_span(
+        civil_date(year, month, lo)?,
+        civil_date(year, month, hi)?,
+        zone,
+    )
+}
+
+// ── time zones and calendar spans (jiff) ────────────────────────────────────
+
+/// The local time zone: the `TZ` environment variable when set, otherwise the system zone
+/// (`/etc/localtime` on Unix, the Windows zone mapped to IANA). Falls back to UTC when neither
+/// can be determined.
+pub fn local_time_zone() -> TimeZone {
+    TimeZone::try_system().unwrap_or(TimeZone::UTC)
+}
+
+/// Look up an IANA time zone name such as `America/New_York` or `UTC`.
+fn named_time_zone(name: &str) -> Result<TimeZone> {
+    TimeZone::get(name).map_err(|err| {
+        anyhow!(
+            "unknown time zone '{name}': {err}; use an IANA name such as America/New_York, \
+             Europe/Berlin or UTC"
+        )
+    })
+}
+
+fn zoned(now: DateTime<Utc>, zone: &TimeZone) -> Result<jiff::Zoned> {
+    let nanos = i32::try_from(now.timestamp_subsec_nanos())?;
+    Ok(jiff::Timestamp::new(now.timestamp(), nanos)?.to_zoned(zone.clone()))
+}
+
+fn from_timestamp(timestamp: jiff::Timestamp) -> Result<DateTime<Utc>> {
+    let seconds = crate::util::parse_unix_seconds(timestamp.as_second())
+        .ok_or_else(|| anyhow!("instant {timestamp} is out of range"))?;
+    Ok(seconds + Duration::nanoseconds(i64::from(timestamp.subsec_nanosecond())))
+}
+
+/// The UTC instant a wall-clock time names in `zone`. Daylight-saving transitions resolve with
+/// jiff's "compatible" rule from RFC 5545 and TC39 Temporal: a time that occurs twice takes its
+/// first occurrence, and a time skipped when clocks go forward lands after the gap.
+fn instant_in(zone: &TimeZone, civil: jiff::civil::DateTime) -> Result<DateTime<Utc>> {
+    from_timestamp(zone.to_ambiguous_timestamp(civil).compatible()?)
+}
+
+fn civil_date(year: i32, month: u32, day: u32) -> Result<jiff::civil::Date> {
+    Ok(jiff::civil::Date::new(
+        i16::try_from(year)?,
+        i8::try_from(month)?,
+        i8::try_from(day)?,
+    )?)
+}
+
+/// From the first instant of local day `first` to the last nanosecond of local day `last` in
+/// `zone`. A day may be 23 or 25 hours long, or start after midnight where midnight is skipped.
+fn days_span(
+    first: jiff::civil::Date,
+    last: jiff::civil::Date,
+    zone: &TimeZone,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let start = first.to_zoned(zone.clone())?.start_of_day()?;
+    let end = last.to_zoned(zone.clone())?.end_of_day()?;
     Ok((
-        at(year, month, lo, 0, 0, 0)?,
-        end_of_second(at(year, month, hi, 23, 59, 59)?),
+        from_timestamp(start.timestamp())?,
+        from_timestamp(end.timestamp())?,
     ))
 }
 
-fn season_span(year: i32, season: Season) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    // Meteorological-ish bounds; Winter spans into the next calendar year.
-    let (s, e) = match season {
-        Season::Spring => (month_span(year, 3)?.0, month_span(year, 5)?.1),
-        Season::Summer => (month_span(year, 6)?.0, month_span(year, 8)?.1),
-        Season::Autumn => (month_span(year, 9)?.0, month_span(year, 11)?.1),
-        Season::Winter => (month_span(year, 12)?.0, month_span(year + 1, 2)?.1),
-    };
-    Ok((s, e))
+fn months_span(
+    first_year: i32,
+    first_month: u32,
+    last_year: i32,
+    last_month: u32,
+    zone: &TimeZone,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let first = civil_date(first_year, first_month, 1)?;
+    let last = civil_date(last_year, last_month, 1)?.last_of_month();
+    days_span(first, last, zone)
 }
 
-// ── small chrono helpers ────────────────────────────────────────────────────
-
-fn at(year: i32, month: u32, day: u32, h: u32, mi: u32, s: u32) -> Result<DateTime<Utc>> {
-    Utc.with_ymd_and_hms(year, month, day, h, mi, s)
-        .single()
-        .ok_or_else(|| anyhow!("invalid date {year:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{s:02}"))
-}
-
-fn day_span(year: i32, month: u32, day: u32) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    Ok((
-        at(year, month, day, 0, 0, 0)?,
-        end_of_second(at(year, month, day, 23, 59, 59)?),
-    ))
-}
-
-/// Inclusive `(start, end)` of the UTC calendar day containing `dt`. Used to make
-/// relative natural-language input day-granular.
-fn day_span_of(dt: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let date = dt.date_naive();
-    day_span(date.year(), date.month(), date.day())
-}
-
-fn month_span(year: i32, month: u32) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let last = days_in_month(year, month)?;
-    Ok((
-        at(year, month, 1, 0, 0, 0)?,
-        end_of_second(at(year, month, last, 23, 59, 59)?),
-    ))
-}
-
-fn start_of_year(year: i32) -> Result<DateTime<Utc>> {
-    at(year, 1, 1, 0, 0, 0)
-}
-
-fn end_of_year(year: i32) -> Result<DateTime<Utc>> {
-    Ok(end_of_second(at(year, 12, 31, 23, 59, 59)?))
-}
-
-fn end_of_second(instant: DateTime<Utc>) -> DateTime<Utc> {
-    instant.with_nanosecond(999_999_999).unwrap_or(instant)
-}
-
-fn days_in_month(year: i32, month: u32) -> Result<u32> {
-    let (ny, nm) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    let first_next = NaiveDate::from_ymd_opt(ny, nm, 1)
-        .ok_or_else(|| anyhow!("invalid month {year}-{month:02}"))?;
-    let last = first_next
-        .pred_opt()
-        .ok_or_else(|| anyhow!("date underflow computing month length"))?;
-    Ok(last.day())
-}
-
-// User-facing partial ISO datetimes (`…T14:30`); see parse_span.
-#[allow(clippy::disallowed_methods)]
-fn parse_iso_dt(s: &str) -> Result<DateTime<Utc>> {
-    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-        .map_err(|err| anyhow!("invalid datetime '{s}': {err}"))?;
-    Ok(naive.and_utc())
+fn years_span(
+    first_year: i32,
+    last_year: i32,
+    zone: &TimeZone,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    months_span(first_year, 1, last_year, 12, zone)
 }
 
 // ── cached regexes (compiled once) ──────────────────────────────────────────
 
-fn duration_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^(\d+)((?i:min|mo)|[dwhyDWHY]|m|M)$").expect("valid duration regex")
-    })
-}
-
 fn datelike_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[0-9XxTt:/.\-]+$").expect("valid datelike regex"))
-}
-
-fn partial_dt_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^(\d{4}-\d{2}-\d{2}T\d{2})(?::(\d{2}))?$").expect("valid partial regex")
-    })
 }
 
 fn day_x_re() -> &'static Regex {
@@ -447,6 +491,7 @@ pub fn format_reference() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone as _;
 
     /// Fixed reference instant so duration/NLP cases are deterministic.
     fn now() -> DateTime<Utc> {
@@ -459,6 +504,84 @@ mod tests {
 
     fn iso(s: &str) -> DateTime<Utc> {
         crate::util::parse_datetime(s).unwrap()
+    }
+
+    // ── Time zones: input without an offset is local time (ISO 8601, EDTF) ──
+    fn in_new_york(when: &str, now: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+        let range = DateRange {
+            when: Some(when.to_string()),
+            ..DateRange::default()
+        };
+        let (start, end) = range.resolve_in(iso(now), "America/New_York").unwrap();
+        (start.unwrap(), end.unwrap())
+    }
+
+    #[test]
+    fn input_without_an_offset_is_read_in_the_named_time_zone() {
+        // 8 pm on Nov 7 in New York (EST, UTC-05:00) is 01:00Z on Nov 8.
+        let evening = "2026-11-08T01:00:00Z";
+        let nov_7 = (
+            iso("2026-11-07T05:00:00Z"),
+            iso("2026-11-08T04:59:59.999999999Z"),
+        );
+        assert_eq!(in_new_york("2026-11-07", evening), nov_7);
+        assert_eq!(in_new_york("today", evening), nov_7);
+        assert_eq!(
+            in_new_york("2026-11-07T14:30", evening),
+            (
+                iso("2026-11-07T19:30:00Z"),
+                iso("2026-11-07T19:30:59.999999999Z")
+            )
+        );
+        // Seconds precision names one instant (start == end), read in the zone.
+        let afternoon = iso("2026-11-07T19:30:00Z");
+        assert_eq!(
+            in_new_york("2026-11-07T14:30:00", evening),
+            (afternoon, afternoon)
+        );
+        // An explicit offset or `Z` names one instant wherever the reader is.
+        let exact = iso("2026-11-07T14:30:00Z");
+        assert_eq!(in_new_york("2026-11-07T14:30:00Z", evening), (exact, exact));
+        // A duration is elapsed time and does not depend on the zone.
+        assert_eq!(in_new_york("2h", evening).0, iso("2026-11-07T23:00:00Z"));
+        // The UTC entry points keep the reading existing callers rely on.
+        assert_eq!(
+            span("2026-01-15"),
+            (
+                iso("2026-01-15T00:00:00Z"),
+                iso("2026-01-15T23:59:59.999999999Z")
+            )
+        );
+        let unknown = DateRange::default().resolve_in(iso(evening), "Mars/Olympus_Mons");
+        assert!(unknown.unwrap_err().to_string().contains("IANA name"));
+    }
+
+    #[test]
+    fn daylight_saving_days_and_times_follow_the_zone_rules() {
+        // US clocks went forward at 02:00 on 2026-03-08 and back at 02:00 on 2026-11-01.
+        let now = "2026-12-01T00:00:00Z";
+        let (start, end) = in_new_york("2026-03-08", now);
+        assert_eq!(start, iso("2026-03-08T05:00:00Z"));
+        assert_eq!(end, iso("2026-03-09T03:59:59.999999999Z"), "a 23-hour day");
+        let (start, end) = in_new_york("2026-11-01", now);
+        assert_eq!(start, iso("2026-11-01T04:00:00Z"));
+        assert_eq!(end, iso("2026-11-02T04:59:59.999999999Z"), "a 25-hour day");
+        // 02:30 never happened on 2026-03-08; it reads as the instant after the gap, 03:30 EDT.
+        assert_eq!(
+            in_new_york("2026-03-08T02:30:00", now).0,
+            iso("2026-03-08T07:30:00Z")
+        );
+        // 01:30 happened twice on 2026-11-01; it reads as the first, 01:30 EDT.
+        assert_eq!(
+            in_new_york("2026-11-01T01:30:00", now).0,
+            iso("2026-11-01T05:30:00Z")
+        );
+        // A calendar month back across the change keeps the wall-clock time.
+        assert_eq!(
+            in_new_york("1M", "2026-04-07T16:00:00Z").0,
+            iso("2026-03-07T17:00:00Z"),
+            "noon EDT back one month is noon EST"
+        );
     }
 
     // ── Family 1: duration shorthand ────────────────────────────────────────
