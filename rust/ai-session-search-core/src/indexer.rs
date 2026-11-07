@@ -405,7 +405,7 @@ fn auto_reindex_after_election(
             sessions_updated,
         }) => {
             if schema_backfill_required {
-                db.purge_injected_messages()?;
+                db.classify_injected_messages()?;
                 db.mark_schema_current()?;
                 if db.schema_version()? < SCHEMA_VERSION {
                     db.migrate_message_search_schema_exclusive()?;
@@ -582,7 +582,7 @@ pub(crate) fn refresh_usable_index_nonblocking(
                 ..
             }) => {
                 if schema_backfill_required {
-                    db.purge_injected_messages()?;
+                    db.classify_injected_messages()?;
                     db.mark_schema_current()?;
                     if db.schema_version()? < SCHEMA_VERSION {
                         db.migrate_message_search_schema_exclusive()?;
@@ -684,7 +684,7 @@ fn explicit_reindex_with_writer_permit(
             }
         };
     if effective_full {
-        db.purge_injected_messages()?;
+        db.classify_injected_messages()?;
         db.mark_schema_current()?;
     }
     db.mark_auto_reindex_complete()?;
@@ -1125,7 +1125,7 @@ pub fn ensure_schema_backfilled(
             return Ok(false);
         }
         reindex(config, db, true, progress)?;
-        db.purge_injected_messages()?;
+        db.classify_injected_messages()?;
         db.mark_schema_current()?;
         if db.schema_version()? < SCHEMA_VERSION {
             db.migrate_message_search_schema_exclusive()?;

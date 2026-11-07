@@ -38,6 +38,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    three sequence numbers each came to name two messages written a day apart. Appends now
    continue after the highest stored sequence number, and a reindex whose stored messages have
    a gap replaces the session from the parse rather than appending to it.
+6. A full reindex no longer deletes stored harness records. A cleanup written before harness
+   notices were stored deleted user-role rows starting with `<environment_context>`,
+   `<turn_aborted>` or `<local-command-*>` after every full reindex, removing records the
+   parsers now keep on purpose and leaving the sequence gaps behind item 5. It now labels
+   such rows as harness notices, which default search, corrections and repeat mining already
+   leave out, and deletes nothing. `Db::purge_injected_messages` is deprecated in favour of
+   `Db::classify_injected_messages`.
 
 ### Performance
 

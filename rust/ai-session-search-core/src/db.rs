@@ -52,7 +52,8 @@ use crate::util::{
 ///      builds lazily on first regex use (no per-row trigram work during reindex).
 ///   2: semantic message kinds and tool-call IDs are populated by the provider parsers.
 ///   3: codex `<turn_aborted>` harness-control records are excluded from user messages; the
-///      post-reindex archive purge also removes them when their source transcript is unavailable.
+///      post-reindex pass reclassifies legacy rows of that shape as harness notices, including
+///      rows whose source transcript is unavailable (see [`Db::classify_injected_messages`]).
 ///   4: exact/regex message substring acceleration uses SQLite FTS5 word+trigram indexes.
 ///   5: message authorship, mixed-content part ranges, and source-authoritative mirror
 ///      correlations are persisted for SQL-first behavioral analysis. Existing rows remain
@@ -2081,17 +2082,27 @@ impl Db {
         Ok(())
     }
 
-    /// Delete `user`-role messages that are harness-injected output, not prompts — content
-    /// leading with `<local-command-stdout>` / `-stderr` / `-caveat` (claude) or
-    /// `<environment_context>` / `<turn_aborted>` (codex). The current parser already excludes
-    /// these from re-parsed files, but sessions whose source file was deleted are never re-visited
-    /// (durable archive), so their already-indexed injected rows persist; this one-time data purge
-    /// reaches them. Returns the number of rows deleted. The `messages_fts` delete trigger keeps the
-    /// word index in sync; the custom trigram base is rebuilt lazily on next use. Run during the
-    /// schema migration (see indexer.rs).
-    pub fn purge_injected_messages(&self) -> Result<usize> {
-        let deleted = self.conn.execute(
-            "delete from messages where role = 'user' and (\
+    /// Reclassify legacy `user`-role rows that are harness-injected output as harness notices:
+    /// content leading with `<local-command-stdout>` / `-stderr` / `-caveat` (claude) or
+    /// `<environment_context>` / `<turn_aborted>` (codex). Current parsers already store these as
+    /// `kind = 'harness_notice'`, `authorship = 'harness'`; rows written before that
+    /// classification, including archived sessions whose source is gone and is never reparsed,
+    /// get the same labels here. Default search, corrections and repeat mining already exclude
+    /// that kind and authorship, so the rows leave user-prose results without leaving the index.
+    ///
+    /// Nothing is deleted: these records are the only evidence of what a harness told an agent,
+    /// and deleting them also left gaps in a session's seqs. Content is unchanged, so the
+    /// full-text triggers do not fire. `mixed` rows keep their parser-assigned content parts and
+    /// are not touched. Idempotent; returns the number of rows reclassified. Run after a full
+    /// reindex or schema backfill (see indexer.rs).
+    ///
+    /// Cost: one pass over `user` rows with a leading-prefix test, the same scan the former
+    /// delete made, plus one row write per reclassified row.
+    pub fn classify_injected_messages(&self) -> Result<usize> {
+        let updated = self.conn.execute(
+            "update messages set kind = 'harness_notice', authorship = 'harness' \
+             where role = 'user' and authorship <> 'mixed' \
+               and (kind <> 'harness_notice' or authorship <> 'harness') and (\
                  content like '<local-command-stdout>%' \
               or content like '<local-command-stderr>%' \
               or content like '<local-command-caveat>%' \
@@ -2099,7 +2110,16 @@ impl Db {
               or content like '<turn_aborted>%')",
             [],
         )?;
-        Ok(deleted)
+        Ok(updated)
+    }
+
+    /// Former name of [`Db::classify_injected_messages`], which it now calls.
+    ///
+    /// It used to delete these rows. That predates storing harness notices, removed records the
+    /// current parsers keep on purpose, and left seq gaps that a later append could reuse.
+    #[deprecated(note = "reclassifies instead of deleting; call `classify_injected_messages`")]
+    pub fn purge_injected_messages(&self) -> Result<usize> {
+        self.classify_injected_messages()
     }
 
     /// The stored incremental tail-parse checkpoint for a file, only when its parser version
@@ -14320,7 +14340,10 @@ mod tests {
     }
 
     #[test]
-    fn purge_injected_messages_removes_only_leading_marker_user_rows() {
+    fn classify_injected_messages_keeps_leading_marker_user_rows_as_harness_notices() {
+        // These records are stored on purpose (`MessageKind::HarnessNotice`): they are the only
+        // evidence of what a harness told an agent. Legacy rows written before that
+        // classification are reclassified in place; nothing is deleted, so no seq gap opens.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         seed_messages(
@@ -14329,37 +14352,70 @@ mod tests {
                 (
                     "user",
                     "<local-command-stdout>Set model to Opus</local-command-stdout>",
-                ), // purge
-                ("user", "<local-command-stderr>boom</local-command-stderr>"), // purge
+                ), // reclassify
+                ("user", "<local-command-stderr>boom</local-command-stderr>"), // reclassify
                 (
                     "user",
                     "<environment_context>\n<current_date>2026</current_date>",
-                ), // purge
+                ), // reclassify
                 (
                     "user",
                     "<turn_aborted>\nThe user interrupted the previous turn on purpose.",
-                ), // purge
-                ("user", "fix the failing login test before release"),         // KEEP (prompt)
-                ("user", "what does <local-command-stdout> mean in the logs"), // KEEP (not leading)
+                ), // reclassify
+                ("user", "fix the failing login test before release"),         // prompt
+                ("user", "what does <local-command-stdout> mean in the logs"), // not leading
                 (
                     "user",
                     "what does <turn_aborted> mean in a Codex transcript",
-                ), // KEEP (not leading)
+                ), // not leading
                 (
                     "assistant",
                     "<local-command-stdout>tool output</local-command-stdout>",
-                ), // KEEP (not user)
+                ), // not user
             ],
         );
-        let before = db.message_count().unwrap();
-        let purged = db.purge_injected_messages().unwrap();
-        assert_eq!(purged, 4, "the four leading-marker USER rows are deleted");
-        assert_eq!(db.message_count().unwrap(), before - 4);
-        // FTS + trigram stay in sync via the delete triggers.
+        let rows_before = db.message_count().unwrap();
+        let seqs = |db: &Db| -> Vec<i64> {
+            db.conn
+                .prepare("select seq from messages order by id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let seqs_before = seqs(&db);
+
+        assert_eq!(db.classify_injected_messages().unwrap(), 4);
+        assert_eq!(
+            db.classify_injected_messages().unwrap(),
+            0,
+            "a second run finds nothing left to reclassify"
+        );
+        assert_eq!(
+            db.message_count().unwrap(),
+            rows_before,
+            "nothing is deleted"
+        );
+        assert_eq!(seqs(&db), seqs_before, "no seq moves or disappears");
         assert_eq!(
             db.messages_fts_count().unwrap(),
             db.message_count().unwrap()
         );
+        let notices: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages where kind = 'harness_notice' \
+                 and authorship = 'harness' and role = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            notices, 4,
+            "the four leading-marker user rows are notices now"
+        );
+
         let users: Vec<String> = db
             .search_messages(
                 "",
@@ -14372,23 +14428,17 @@ mod tests {
             .into_iter()
             .map(|h| h.content)
             .collect();
-        assert!(
-            users
-                .iter()
-                .any(|c| c.contains("fix the failing login test")),
-            "real prompt kept"
-        );
-        assert!(
-            users
-                .iter()
-                .any(|c| c.starts_with("what does <local-command-stdout>")),
-            "a non-leading mention is kept"
-        );
         assert_eq!(
             users.len(),
             3,
-            "exactly the three legitimate user messages remain"
+            "default user search still returns exactly the three user-written messages: {users:?}"
         );
+        assert!(users
+            .iter()
+            .any(|c| c.contains("fix the failing login test")));
+        assert!(users
+            .iter()
+            .any(|c| c.starts_with("what does <local-command-stdout>")));
     }
 
     #[test]
@@ -15739,8 +15789,9 @@ mod tests {
 
     #[test]
     fn tail_append_after_a_deleted_row_continues_past_the_highest_seq() {
-        // `purge_injected_messages` deletes rows from indexed sessions and leaves seq gaps. An
-        // append numbered from `count(*)` then reused existing seqs: a live Codex session got
+        // The former `purge_injected_messages` deleted rows from indexed sessions and left seq
+        // gaps, and older indexes still carry them. An append numbered from `count(*)` then
+        // reused existing seqs: a live Codex session got
         // three (session_id, seq) pairs holding two messages each. New rows must start after the
         // highest stored seq, so every seq keeps naming one message.
         use crate::providers::claude::ClaudeAdapter;
