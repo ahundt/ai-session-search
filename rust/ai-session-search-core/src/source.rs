@@ -245,8 +245,8 @@ impl<R: Read> Read for CancellationReader<'_, R> {
 }
 
 /// Whether `path` names zstd-compressed JSONL (`*.jsonl.zst`), the form Codex compresses a
-/// rollout idle for 7 days into. Such a source is read whole through [`open_source_reader`]; its
-/// byte offsets are not JSONL offsets, so it never gets a tail checkpoint.
+/// rollout idle for 7 days into. Such a source is always read whole through
+/// [`open_source_reader`]: its byte offsets are not JSONL offsets, so it is never tail-parsed.
 pub(crate) fn is_compressed_jsonl(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -256,9 +256,11 @@ pub(crate) fn is_compressed_jsonl(path: &std::path::Path) -> bool {
 /// Open a session source for reading its JSONL records, decompressing `*.jsonl.zst` as it is
 /// read so every parser sees the plain records either way. libzstd decodes every frame of the
 /// stream, skips skippable frames, and fails the read on a frame whose stored checksum differs
-/// from its content (Codex writes frames without one). Memory is the frame window, which libzstd
-/// caps at 2^27 bytes (128 MiB) by default, plus its input buffer; time is O(compressed +
-/// decompressed bytes).
+/// from its content (Codex writes frames without one). The decoder itself holds at most one
+/// frame window, which libzstd caps at 2^27 bytes (128 MiB) by default, plus its input buffer;
+/// time is O(compressed + decompressed bytes). The parser reading from it holds what it holds
+/// for a plain file of the decompressed size, including each whole line, so a small compressed
+/// file can need as much memory as its much larger plain form.
 pub(crate) fn open_source_reader(path: &std::path::Path) -> Result<Box<dyn std::io::Read>> {
     let file = std::fs::File::open(path)?;
     if is_compressed_jsonl(path) {
