@@ -10,17 +10,26 @@
 //! The two documented differences are asserted separately so a change to either side fails.
 //!
 //! Interfaces reached here: `MessageService` on each `SearchSurface`, the `aise` binary's
-//! `messages search`, and its MCP server over JSON-RPC. `tests/test_native_binding.py` runs the
-//! same fixture through the Python binding and the Python entry point.
+//! `messages search` and `messages get`, and its MCP server's `search_messages` and `get_session`
+//! over JSON-RPC. `tests/test_native_binding.py` runs the same fixture through the Python binding
+//! and the Python entry point.
+//!
+//! Searches cover content and, through the fixture's tool rows, the derived `tool_name` field,
+//! which has its own query path (`Db::search_derived_message_field`). Reads cover a seq held by
+//! several rows and a newest-first cut inside a tie.
 //!
 //! What fails without which fix, measured by reverting it:
 //! - the trigram prefilter superset (Cherokee by either spelling, regex included, and `abi`
-//!   against `abİ`): 24 checks, every case on all six interfaces here;
-//! - the total order: the fuzzy walks over the 40 tied pairs. The latest-window and three-row tie
-//!   cases are parity checks only, because at this size SQLite serves them by walking
-//!   `idx_messages_session_seq`, which already orders a tie; the sorted plan that exposed the
-//!   defect on a real index is reproduced by the unit test
-//!   `the_newest_window_selects_exactly_the_tail_of_the_oldest_order` in `db.rs`.
+//!   against `abİ`): 24 checks, every case on all six search interfaces here;
+//! - the fuzzy ranking's stream-position tie-breaker: the fuzzy walks over the 40 tied pairs.
+//!
+//! The SQL row-id tie-breaker is not observable at this size: reverting it from
+//! `MessageOrder::order_by_clause` leaves every case here passing, because SQLite serves these
+//! reads by walking `idx_messages_session_seq`, which already orders a tie. Those cases are parity
+//! checks. The plans that do expose the defect are reproduced by unit tests in `db.rs`:
+//! `the_newest_window_selects_exactly_the_tail_of_the_oldest_order`,
+//! `find_corrections_orders_rows_tied_on_every_sort_key_by_row_id_under_any_filter` and
+//! `attributable_human_search_orders_tied_rows_by_row_id_under_any_filter`.
 //!
 //! Deliberate differences, asserted rather than compared:
 //! - An omitted limit returns every literal, regex or no-text match on Rust, CLI and Python, and a
@@ -70,6 +79,7 @@ fn fixture() -> Fixture {
     let role = |name: &str| match name {
         "user" => Role::User,
         "assistant" => Role::Assistant,
+        "tool" => Role::Tool,
         other => panic!("fixture role {other}"),
     };
     let message = |seq: i64, role: Role, content: String| Message {
@@ -111,6 +121,23 @@ fn fixture() -> Fixture {
                 role(name.as_str().unwrap()),
                 twins["content"].as_str().unwrap().to_string(),
             ));
+        }
+    }
+    let tool_twins = &spec["tool_twins"];
+    for pair in 0..tool_twins["pairs"].as_i64().unwrap() {
+        for row in tool_twins["rows"].as_array().unwrap() {
+            let mut call = message(
+                tool_twins["first_seq"].as_i64().unwrap() + pair,
+                role(row[0].as_str().unwrap()),
+                tool_twins["content"].as_str().unwrap().to_string(),
+            );
+            call.tool_name = Some(tool_twins["tool_name"].as_str().unwrap().to_string());
+            call.kind = match row[1].as_str().unwrap() {
+                "tool_call" => MessageKind::ToolCall,
+                "tool_result" => MessageKind::ToolResult,
+                other => panic!("fixture kind {other}"),
+            };
+            messages.push(call);
         }
     }
     let session_id = spec["session_id"].as_str().unwrap().to_string();
@@ -157,18 +184,26 @@ fn fixture() -> Fixture {
 }
 
 fn expected(spec: &Value, value: &Value) -> Ids {
-    if value.as_str() == Some("twins") {
-        let twins = &spec["twins"];
-        let first = twins["first_seq"].as_i64().unwrap();
-        return (0..twins["pairs"].as_i64().unwrap())
-            .flat_map(|pair| {
-                twins["roles"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(move |name| (first + pair, name.as_str().unwrap().to_string()))
-            })
-            .collect();
+    let pairs = |block: &Value, role_of: fn(&Value) -> &str| -> Ids {
+        let first = block["first_seq"].as_i64().unwrap();
+        let roles: Vec<String> = block[if block.get("rows").is_some() {
+            "rows"
+        } else {
+            "roles"
+        }]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| role_of(entry).to_string())
+        .collect();
+        (0..block["pairs"].as_i64().unwrap())
+            .flat_map(|pair| roles.iter().map(move |role| (first + pair, role.clone())))
+            .collect()
+    };
+    match value.as_str() {
+        Some("twins") => return pairs(&spec["twins"], |name| name.as_str().unwrap()),
+        Some("tool_twins") => return pairs(&spec["tool_twins"], |row| row[0].as_str().unwrap()),
+        _ => {}
     }
     value
         .as_array()
@@ -188,6 +223,8 @@ fn expected(spec: &Value, value: &Value) -> Ids {
 #[derive(Clone, Debug)]
 struct Search {
     mode: String,
+    /// `None` searches content; otherwise the snake_case field name MCP and Python use.
+    field: Option<String>,
     query: String,
     limit: Option<usize>,
     offset: usize,
@@ -199,6 +236,7 @@ impl Search {
     fn from_case(case: &Value) -> Self {
         Self {
             mode: case["mode"].as_str().unwrap().into(),
+            field: case["field"].as_str().map(str::to_string),
             query: case["query"].as_str().unwrap().into(),
             limit: case["limit"].as_u64().map(|n| n as usize),
             offset: 0,
@@ -223,7 +261,12 @@ fn service_search(f: &Fixture, surface: SearchSurface, search: &Search) -> anyho
     } else {
         RequestedExtent::page(search.limit, search.offset)?
     };
-    let mut builder = MessageSearchRequest::builder(query, MessageTarget::content()).extent(extent);
+    let target = match search.field.as_deref() {
+        None => MessageTarget::content(),
+        Some("tool_name") => MessageTarget::tool_name(),
+        Some(other) => panic!("field {other}"),
+    };
+    let mut builder = MessageSearchRequest::builder(query, target).extent(extent);
     if search.latest_in_session {
         builder = builder
             .session_id(f.spec["session_id"].as_str().unwrap())?
@@ -293,6 +336,9 @@ fn cli_search(f: &Fixture, search: &Search) -> Result<Value, String> {
         "--offset",
         &search.offset.to_string(),
     ]);
+    if let Some(field) = &search.field {
+        command.args(["--field", &field.replace('_', "-")]);
+    }
     if search.all_results {
         command.arg("--all-results");
     } else if let Some(limit) = search.limit {
@@ -318,6 +364,37 @@ fn cli_search(f: &Fixture, search: &Search) -> Result<Value, String> {
 /// Every search through one `aise mcp serve` process, in order: the `structuredContent` of each
 /// successful call, or the error text of each refused one.
 fn mcp_searches(f: &Fixture, searches: &[Search]) -> Vec<Result<Value, String>> {
+    let calls: Vec<(&str, Value)> = searches
+        .iter()
+        .map(|search| {
+            let mut arguments = json!({
+                "query": search.query,
+                "query_mode": search.mode,
+                "offset": search.offset,
+                "index_refresh": "existing-only",
+            });
+            if let Some(field) = &search.field {
+                arguments["field"] = json!(field);
+            }
+            if search.all_results {
+                arguments["all_results"] = json!(true);
+            } else if let Some(limit) = search.limit {
+                arguments["limit"] = json!(limit);
+            }
+            if search.latest_in_session {
+                arguments["session_id"] = f.spec["session_id"].clone();
+                arguments["match_window"] = json!("latest");
+            }
+            ("search_messages", arguments)
+        })
+        .collect();
+    mcp_calls(f, &calls)
+}
+
+/// Every `(tool, arguments)` call through one `aise mcp serve` process, in order: each successful
+/// call's structured result (its `structuredContent`, or its JSON text content when a tool returns
+/// only text), or the error text of each refused one.
+fn mcp_calls(f: &Fixture, calls: &[(&str, Value)]) -> Vec<Result<Value, String>> {
     let mut child = aise(f)
         .args(["mcp", "serve"])
         .stdin(Stdio::piped())
@@ -332,25 +409,10 @@ fn mcp_searches(f: &Fixture, searches: &[Search]) -> Vec<Result<Value, String>> 
     })
     .to_string()];
     lines.push(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string());
-    for (index, search) in searches.iter().enumerate() {
-        let mut arguments = json!({
-            "query": search.query,
-            "query_mode": search.mode,
-            "offset": search.offset,
-            "index_refresh": "existing-only",
-        });
-        if search.all_results {
-            arguments["all_results"] = json!(true);
-        } else if let Some(limit) = search.limit {
-            arguments["limit"] = json!(limit);
-        }
-        if search.latest_in_session {
-            arguments["session_id"] = f.spec["session_id"].clone();
-            arguments["match_window"] = json!("latest");
-        }
+    for (index, (tool, arguments)) in calls.iter().enumerate() {
         lines.push(
             json!({"jsonrpc": "2.0", "id": index + 1, "method": "tools/call",
-                   "params": {"name": "search_messages", "arguments": arguments}})
+                   "params": {"name": tool, "arguments": arguments}})
             .to_string(),
         );
     }
@@ -368,7 +430,7 @@ fn mcp_searches(f: &Fixture, searches: &[Search]) -> Vec<Result<Value, String>> 
             by_id.insert(id as usize, response);
         }
     }
-    (1..=searches.len())
+    (1..=calls.len())
         .map(|id| {
             let response = by_id
                 .remove(&id)
@@ -380,7 +442,11 @@ fn mcp_searches(f: &Fixture, searches: &[Search]) -> Vec<Result<Value, String>> 
             if result["isError"].as_bool() == Some(true) {
                 return Err(result["content"].to_string());
             }
-            Ok(result["structuredContent"].clone())
+            if !result["structuredContent"].is_null() {
+                return Ok(result["structuredContent"].clone());
+            }
+            let text = result["content"][0]["text"].as_str().unwrap_or_default();
+            serde_json::from_str(text).map_err(|error| format!("{error}: {text}"))
         })
         .collect()
 }
@@ -436,6 +502,7 @@ fn paging_one_row_at_a_time_reproduces_the_whole_order_on_every_interface() {
             .step_by(page)
             .map(|offset| Search {
                 mode: walk["mode"].as_str().unwrap().into(),
+                field: walk["field"].as_str().map(str::to_string),
                 query: walk["query"].as_str().unwrap().into(),
                 limit: Some(page),
                 offset,
@@ -482,6 +549,7 @@ fn an_omitted_limit_keeps_its_documented_per_surface_meaning() {
     let mcp_page = spec["mcp_default_page"].as_u64().unwrap() as usize;
     let search = Search {
         mode: "literal".into(),
+        field: None,
         query: spec["query"].as_str().unwrap().into(),
         limit: None,
         offset: 0,
@@ -519,6 +587,7 @@ fn fuzzy_all_results_is_refused_on_every_interface() {
     let f = fixture();
     let search = Search {
         mode: "fuzzy".into(),
+        field: None,
         query: f.spec["deliberate_differences"]["fuzzy_rejects_all_results"]["query"]
             .as_str()
             .unwrap()
@@ -544,5 +613,201 @@ fn fuzzy_all_results_is_refused_on_every_interface() {
             .unwrap()
             .is_err(),
         "MCP accepted fuzzy all_results"
+    );
+}
+
+/// The `[seq, role]` rows of a message-read result, wherever the interface puts them: the CLI
+/// prints a bare array and MCP `get_session` nests one under its window object.
+fn read_rows(value: &Value) -> Ids {
+    fn find(value: &Value) -> Option<&Vec<Value>> {
+        match value {
+            Value::Array(rows)
+                if rows
+                    .first()
+                    .is_some_and(|row| row.get("seq").is_some() && row.get("role").is_some()) =>
+            {
+                Some(rows)
+            }
+            Value::Array(items) => items.iter().find_map(find),
+            Value::Object(fields) => fields.values().find_map(find),
+            _ => None,
+        }
+    }
+    find(value)
+        .unwrap_or_else(|| panic!("no message rows in {value}"))
+        .iter()
+        .map(|row| {
+            (
+                row["seq"].as_i64().unwrap(),
+                row["role"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn hit_ids(hits: Vec<ai_session_search::models::MessageHit>) -> Ids {
+    hits.into_iter()
+        .map(|hit| (hit.seq, hit.role.as_str().to_string()))
+        .collect()
+}
+
+fn cli_read(f: &Fixture, selector: &[String]) -> Ids {
+    let output = aise(f)
+        .args(["messages", "get", f.spec["session_id"].as_str().unwrap()])
+        .args(selector)
+        .args([
+            "--format",
+            "json",
+            "--index-refresh",
+            "existing-only",
+            "--skip-release-notification",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "aise messages get {selector:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    read_rows(&serde_json::from_slice(&output.stdout).unwrap())
+}
+
+/// `(session_id, seq)` locates rather than identifies a message. Reading a seq returns every row
+/// that holds it, in the published total order, on every message-read interface; and the newest
+/// rows of a session are the tail of that order even when the cut falls inside a tie.
+#[test]
+fn reading_a_shared_seq_returns_every_row_in_one_order_on_every_interface() {
+    use ai_session_search::db::MessageOrder;
+    use ai_session_search::models::MessageFilters;
+
+    let f = fixture();
+    let session_id = f.spec["session_id"].as_str().unwrap().to_string();
+    let db = Db::open(&f.db_path).unwrap();
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    let mut failures: Vec<String> = Vec::new();
+    let mut check = |name: &str, interface: &str, got: Ids, want: &Ids| {
+        if &got != want {
+            failures.push(format!(
+                "{name} via {interface}: got {got:?}, want {want:?}"
+            ));
+        }
+    };
+
+    let reads = f.spec["reads"].as_array().unwrap();
+    let mut calls: Vec<(&str, Value)> = Vec::new();
+    for read in reads {
+        let seq = read["seq"].as_i64().unwrap();
+        calls.push((
+            "get_session",
+            json!({"session_id": session_id, "message_seq": seq, "context": 0}),
+        ));
+        calls.push((
+            "get_session",
+            json!({"session_id": session_id, "seq_from": seq, "seq_to": seq}),
+        ));
+    }
+    let mut mcp = mcp_calls(&f, &calls).into_iter();
+    for read in reads {
+        let name = read["name"].as_str().unwrap();
+        let want = expected(&f.spec, &read["expected"]);
+        let seq = read["seq"].as_i64().unwrap();
+        check(
+            name,
+            "MessageService::context",
+            hit_ids(service.context(&session_id, seq, 0, 0).unwrap()),
+            &want,
+        );
+        let range = MessageFilters {
+            session_id: Some(session_id.clone()),
+            seq_from: Some(seq),
+            seq_to: Some(seq),
+            ..Default::default()
+        };
+        check(
+            name,
+            "MessageService::read_session",
+            hit_ids(
+                service
+                    .read_session(&range, MessageOrder::OldestFirst)
+                    .unwrap(),
+            ),
+            &want,
+        );
+        check(
+            name,
+            "aise messages get --seq",
+            cli_read(&f, &["--seq".into(), seq.to_string()]),
+            &want,
+        );
+        check(
+            name,
+            "aise messages get --seq-from --seq-to",
+            cli_read(
+                &f,
+                &[
+                    "--seq-from".into(),
+                    seq.to_string(),
+                    "--seq-to".into(),
+                    seq.to_string(),
+                ],
+            ),
+            &want,
+        );
+        for interface in [
+            "MCP get_session message_seq",
+            "MCP get_session seq_from/seq_to",
+        ] {
+            match mcp.next().unwrap() {
+                Ok(value) => check(name, interface, read_rows(&value), &want),
+                Err(error) => check(
+                    name,
+                    &format!("{interface}, refused: {error}"),
+                    Ids::new(),
+                    &want,
+                ),
+            }
+        }
+    }
+
+    for read in f.spec["newest_reads"].as_array().unwrap() {
+        let name = read["name"].as_str().unwrap();
+        let want = expected(&f.spec, &read["expected"]);
+        let limit = read["limit"].as_u64().unwrap() as usize;
+        let newest = MessageFilters {
+            session_id: Some(session_id.clone()),
+            limit,
+            ..Default::default()
+        };
+        check(
+            name,
+            "MessageService::read_session newest",
+            hit_ids(
+                service
+                    .read_session(&newest, MessageOrder::NewestFirst)
+                    .unwrap(),
+            ),
+            &want,
+        );
+        check(
+            name,
+            "aise messages get --order newest",
+            cli_read(
+                &f,
+                &[
+                    "--limit".into(),
+                    limit.to_string(),
+                    "--order".into(),
+                    "newest".into(),
+                ],
+            ),
+            &want,
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failing checks:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
 }

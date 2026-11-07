@@ -2292,11 +2292,17 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
     database = tmp_path / "index.db"
     native.SessionSearch(database)
     session = spec["session_id"]
-    rows = [(m["seq"], m["role"], m["content"]) for m in spec["messages"]]
+    rows = [(m["seq"], m["role"], m["content"], None, "conversation") for m in spec["messages"]]
     bulk = spec["bulk"]
-    rows += [(bulk["first_seq"] + i, bulk["role"], f"{bulk['content_prefix']} {i}") for i in range(bulk["count"])]
+    rows += [(bulk["first_seq"] + i, bulk["role"], f"{bulk['content_prefix']} {i}", None, "conversation") for i in range(bulk["count"])]
     twins = spec["twins"]
-    rows += [(twins["first_seq"] + pair, role, twins["content"]) for pair in range(twins["pairs"]) for role in twins["roles"]]
+    rows += [(twins["first_seq"] + pair, role, twins["content"], None, "conversation") for pair in range(twins["pairs"]) for role in twins["roles"]]
+    tools = spec["tool_twins"]
+    rows += [
+        (tools["first_seq"] + pair, role, tools["content"], tools["tool_name"], kind)
+        for pair in range(tools["pairs"])
+        for role, kind in tools["rows"]
+    ]
     connection = sqlite3.connect(database)
     try:
         connection.execute(
@@ -2306,8 +2312,8 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
             (session, session.removeprefix("claude:")),
         )
         connection.executemany(
-            "insert into messages (session_id, provider, seq, role, kind, content) values (?, 'claude', ?, ?, 'conversation', ?)",
-            [(session, seq, role, content) for seq, role, content in rows],
+            "insert into messages (session_id, provider, seq, role, kind, content, tool_name) values (?, 'claude', ?, ?, ?, ?, ?)",
+            [(session, seq, role, kind, content, tool_name) for seq, role, content, tool_name, kind in rows],
         )
         connection.commit()
     finally:
@@ -2319,6 +2325,9 @@ def _parity_expected(spec: dict, expected: object) -> list[tuple[int, str]]:
     if expected == "twins":
         twins = spec["twins"]
         return [(twins["first_seq"] + pair, role) for pair in range(twins["pairs"]) for role in twins["roles"]]
+    if expected == "tool_twins":
+        tools = spec["tool_twins"]
+        return [(tools["first_seq"] + pair, role) for pair in range(tools["pairs"]) for role, _ in tools["rows"]]
     assert isinstance(expected, list), expected
     return [(seq, role) for seq, role in expected]
 
@@ -2334,6 +2343,7 @@ def _binding_search(database: Path, spec: dict, case: dict, offset: int = 0, lim
         offset=offset,
         all_results=case.get("all_results", False),
         match_window=case.get("match_window"),
+        field=case.get("field", "content"),
     )
     return native.SessionSearch(database).search_messages(case["query"], request, query_mode=case["mode"])
 
@@ -2360,6 +2370,8 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
         str(offset),
     ]
     limit = limit if limit is not None else case.get("limit")
+    if case.get("field"):
+        command += ["--field", case["field"].replace("_", "-")]
     if case.get("all_results"):
         command.append("--all-results")
     elif limit is not None:
@@ -2432,3 +2444,52 @@ def test_python_interfaces_keep_the_documented_deliberate_differences(tmp_path: 
     with pytest.raises(ValueError, match="fuzzy_rejects_all_results"):
         _binding_search(database, spec, fuzzy)
     assert _entry_point_search(database, spec, fuzzy, tmp_path).returncode != 0
+
+
+def _parity_entry_point_read(database: Path, spec: dict, selector: list[str], tmp_path: Path) -> list[tuple[int, str]]:
+    config = tmp_path / "config.toml"
+    config.write_text("", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    command = [
+        sys.executable,
+        "-c",
+        "from ai_session_search.entrypoint import cli_main; cli_main()",
+        "--database",
+        str(database),
+        "messages",
+        "get",
+        spec["session_id"],
+        *selector,
+        "--format",
+        "json",
+        "--index-refresh",
+        "existing-only",
+        "--skip-release-notification",
+    ]
+    environment = {**os.environ, "AI_SESSION_SEARCH_CONFIG": str(config), "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")}
+    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=120)
+    assert result.returncode == 0, result.stderr
+    return [(row["seq"], row["role"]) for row in json.loads(result.stdout)]
+
+
+def test_python_interfaces_read_every_row_of_a_shared_seq_in_one_order(tmp_path: Path) -> None:
+    # (session_id, seq) locates rather than identifies a message: every read interface returns all
+    # rows holding the seq, in the published total order, and a newest-first cut inside a tie keeps
+    # the tail of that order.
+    database, spec = _parity_database(tmp_path)
+    search = native.SessionSearch(database)
+    session = spec["session_id"]
+    for read in spec["reads"]:
+        want = _parity_expected(spec, read["expected"])
+        seq = read["seq"]
+        assert [(hit.seq, hit.role) for hit in search.message_context(session, seq)] == want, read["name"]
+        ranged = search.read_session_messages(session, seq_from=seq, seq_to=seq)
+        assert [(hit.seq, hit.role) for hit in ranged] == want, read["name"]
+        assert _parity_entry_point_read(database, spec, ["--seq", str(seq)], tmp_path) == want, read["name"]
+    for read in spec["newest_reads"]:
+        want = _parity_expected(spec, read["expected"])
+        newest = search.read_session_messages(session, order="newest", limit=read["limit"])
+        assert [(hit.seq, hit.role) for hit in newest] == want, read["name"]
+        selector = ["--limit", str(read["limit"]), "--order", "newest"]
+        assert _parity_entry_point_read(database, spec, selector, tmp_path) == want, read["name"]
