@@ -133,29 +133,25 @@ never shows you a half-applied state.
 
 ## Speed
 
-Measured on macOS with Apple silicon against an index of roughly 2.5 million messages, best of
-three warm runs. Each command also carried `--index-refresh existing-only --format json`, so
-the numbers are query cost with no refresh in the path:
+Measured on macOS with Apple silicon against an index of about 6 million messages, best of three
+warm runs, each with `--index-refresh existing-only --format json` so no refresh runs:
 
 | Command | Time |
 | --- | ---: |
-| `aise list --limit 20` | 48 ms |
-| `aise files search "*.rs" --limit 50` | 121 ms |
+| `aise list --limit 20` | 9 ms |
+| `aise files search "*.rs" --limit 50` | 0.37 s |
 | `aise messages search "ECONNRESET\|socket hang" --query-mode regex --limit 50` | 0.3 s |
-| `aise messages search "permission denied" --limit 50` | 1.4 s |
+| `aise messages search "permission denied" --limit 50` | 0.3 s |
 
-Startup accounts for 43 ms of that first row, so `aise list` spends nearly all its time
-launching. Parsing, indexing, and querying are native code with no Python interpreter in the
-path; `cargo install` puts that binary straight on your `PATH`, while the `uv` install reaches it
-through a small Python console script.
+Parsing, indexing, and querying are native code, and the binary starts in about 6 ms. `cargo
+install` puts it on your `PATH`; the `uv` install reaches it through a small Python console script.
 
-Indexing is incremental. A refresh over this index walked 6,324 source files in 13 s and
-reparsed only the 6 sessions whose bytes had changed, so steady-state cost follows new data.
-Refresh runs on access by default, including when an MCP client asks a question, and
-`--index-refresh existing-only` skips it when you want the query cost alone.
+Indexing is incremental: a refresh reparses only the sessions whose bytes changed. On an earlier,
+smaller index, a refresh walked 6,324 source files in 13 s and reparsed 6 sessions. Refresh runs on
+access by default, including when an MCP client asks a question; `--index-refresh existing-only`
+skips it.
 
-A scoped query costs less than these rows ([filters and scopes](#filters-and-scopes)), and your
-index is probably smaller than this one, so treat these timings as a ceiling.
+Scoped queries cost less ([filters and scopes](#filters-and-scopes)), and a smaller index is faster.
 
 ## Session sources
 
