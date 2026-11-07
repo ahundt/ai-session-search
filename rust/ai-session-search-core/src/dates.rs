@@ -314,14 +314,19 @@ fn closed_span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTim
                 1 => Some(jiff::Span::new().minutes(1)),
                 _ => None,
             };
-            let end = match length {
-                Some(length) => start
-                    .checked_add(length)?
-                    .checked_sub(jiff::Span::new().nanoseconds(1))?,
-                None => start,
+            let first = instant_in(zone, start)?;
+            // An hour or minute is a period, and one a clock change repeats covers both
+            // occurrences, so its end is the later one. Seconds name an instant: both ends.
+            let last = match length {
+                Some(length) => {
+                    let end = start
+                        .checked_add(length)?
+                        .checked_sub(jiff::Span::new().nanoseconds(1))?;
+                    from_timestamp(zone.to_ambiguous_timestamp(end).later()?)?
+                }
+                None => first,
             };
-            let last = from_timestamp(zone.to_ambiguous_timestamp(end).later()?)?;
-            return Ok((instant_in(zone, start)?, last));
+            return Ok((first, last));
         }
     }
 
@@ -836,6 +841,13 @@ mod tests {
         let (start, end) = span("2026-11-01T01[America/New_York]");
         assert_eq!(start, iso("2026-11-01T05:00:00Z"));
         assert_eq!(end, iso("2026-11-01T06:59:59.999999999Z"));
+        // A seconds-precise time names one instant, so it takes the first occurrence (the RFC
+        // 5545 and Temporal "compatible" rule) at both ends instead of spanning the repeat.
+        let instant = span("2026-11-01T01:30:00[America/New_York]");
+        assert_eq!(
+            instant,
+            (iso("2026-11-01T05:30:00Z"), iso("2026-11-01T05:30:00Z"))
+        );
     }
 
     #[test]
