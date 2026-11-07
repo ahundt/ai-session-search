@@ -58,12 +58,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    avoids took 1.65 s.
 
 8. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout
-   as `rollout-*.jsonl.zst` and deletes the plain file. aise read only `.jsonl`, so it missed
-   everything Codex wrote after aise's last read of such a session. The compressed file is now
-   the same source as its plain form, and the session keeps its id and stored messages. A `.zst`
-   that cannot be decompressed is a warned parse failure when nothing is indexed for it yet; for
-   an indexed session, aise keeps the stored messages and tries the file again on the next
-   refresh.
+   as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so it missed
+   everything Codex wrote after its last read of such a session. The compressed file is now the
+   same source as its plain form, and the session keeps its id and stored messages. A `.zst`
+   that cannot be decompressed is a warned parse failure for a session not yet indexed. For an
+   indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
+   `aise doctor`, and reads the file again on the next refresh.
 
 ### Performance
 
