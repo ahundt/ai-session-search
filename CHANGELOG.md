@@ -26,6 +26,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    wrote `2026-11-07T19:44:17.663Z`, while `messages`, `files`, analytics, parts of MCP and the
    Python binding wrote `+00:00`; all now use the first form, which chrono's serde, JavaScript's
    `toISOString` and Python's `datetime.fromisoformat` all read. Stored timestamps are unchanged.
+3. Dates and times without an offset are read in your local time zone, as ISO 8601 and EDTF
+   define them: `--when 2026-11-07` and `--when yesterday` mean your day, not the UTC day. `TZ`
+   overrides the system zone, and a trailing zone in RFC 9557 form reads one value in another
+   zone, for example `--since '2026-01-15[Europe/Berlin]'`. This works the same in CLI flags,
+   MCP `since`/`until`/`when` and the Python `DateRange`; `reference_time` accepts the RFC 9557
+   form too. Days that daylight saving shortens or lengthens are handled, and a time skipped or
+   repeated by a clock change resolves as RFC 5545 specifies. `aise dates` shows the zone in use.
+4. Durations also accept ISO 8601 (`P1M`, `PT2H`) and compound forms (`1d12h`), and EDTF open
+   intervals (`2026-01/..`, `../2026-03`) select everything after or before a date.
 
 ### Deprecated
 

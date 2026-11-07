@@ -11,7 +11,7 @@
 //!     variants) and we expand that to instant bounds with `chrono`.
 //!   * **Natural language** (`yesterday`, `3 days ago`, `last friday`) → the
 //!     [`interim`] crate (a `chrono-english` fork).
-//!     Resolved NLP is widened to its whole UTC day (see below), so a time-of-day in the
+//!     Resolved NLP is widened to its whole local day (see below), so a time-of-day in the
 //!     phrase (e.g. `8pm`) is intentionally ignored — use an ISO datetime for second
 //!     precision.
 //!   * **ISO datetimes** (full and partial-precision `…T14`, `…T14:30`) and the
@@ -28,7 +28,7 @@
 //!     `[first instant, last instant]` of the period;
 //!   * a duration (`7d`, `2w`, …) → the window `[now - delta, now]`, so `--when 7d`
 //!     means "the last 7 days";
-//!   * relative natural language (`yesterday`, `3 days ago`) → its whole UTC day, so
+//!   * relative natural language (`yesterday`, `3 days ago`) → its whole local day, so
 //!     `--when yesterday` matches the same span as `--when <that date>`;
 //!   * a full second-precision datetime → `start == end` (an explicit instant);
 //!   * an EDTF interval `A/B` → `(start-of-A, end-of-B)`.
@@ -80,8 +80,9 @@ pub struct DateRange {
     /// Inclusive lower bound of the query period. Session commands (`list`, `search`, `export`,
     /// `analyze`) intersect it with each session's known span from created_at through updated_at;
     /// message, file, and analytics commands compare each event's own timestamp. Accepts EDTF /
-    /// ISO / duration / natural language. Calendar and relative periods use UTC; exact RFC 3339
-    /// timestamps honor `Z` or their explicit offset. Examples: `2026-01-15`, `2026-01`, `202X`,
+    /// ISO / duration / natural language. Values without an offset use local time (`TZ` or the
+    /// system zone), or the zone in a trailing `[Area/City]`; exact RFC 3339 timestamps honor `Z`
+    /// or their offset. Examples: `2026-01-15`, `2026-01`, `202X`,
     /// `7d`, `yesterday`. See `aise dates`. Omit for no lower bound.
     #[arg(long, help_heading = TIME_WINDOW_HEADING)]
     pub since: Option<String>,
@@ -97,93 +98,145 @@ pub struct DateRange {
 }
 
 impl DateRange {
-    /// Resolve the flags to `(since, until)` UTC instants relative to `now`, reading dates and
-    /// times that carry no offset in UTC. [`DateRange::resolve_now`] reads them in local time.
+    /// Resolve the flags to `(since, until)` UTC instants relative to `now`, reading values that
+    /// carry no offset or zone in UTC. [`DateRange::resolve_now`] reads them in local time.
     pub fn resolve(&self, now: DateTime<Utc>) -> Result<Bounds> {
-        self.resolve_in_zone(now, &TimeZone::UTC)
+        self.resolve_zoned(&zoned(now, &TimeZone::UTC)?)
     }
 
-    /// Resolve the flags relative to `now`, reading dates and times that carry no offset in the
-    /// IANA time zone `time_zone` (for example `America/New_York` or `UTC`), as ISO 8601 and
-    /// EDTF define them: `2026-11-07` is that day in that zone, while `2026-11-07T14:30:00Z` and
-    /// durations such as `2h` name the same instants everywhere.
-    pub fn resolve_in(&self, now: DateTime<Utc>, time_zone: &str) -> Result<Bounds> {
-        self.resolve_in_zone(now, &named_time_zone(time_zone)?)
+    /// Resolve relative to the wall clock, reading values that carry no offset or zone in the
+    /// local time zone: the `TZ` environment variable when set, otherwise the system zone. Used
+    /// by command handlers.
+    pub fn resolve_now(&self) -> Result<Bounds> {
+        self.resolve_zoned(&jiff::Zoned::now())
     }
 
-    pub(crate) fn resolve_in_zone(&self, now: DateTime<Utc>, zone: &TimeZone) -> Result<Bounds> {
+    /// Resolve relative to `reference_time`, an RFC 3339 timestamp (`2026-06-15T12:00:00-04:00`,
+    /// whose offset becomes the zone) or an RFC 9557 one naming a zone
+    /// (`2026-06-15T12:00:00[America/New_York]`). Makes relative input reproducible.
+    pub fn resolve_at(&self, reference_time: &str) -> Result<Bounds> {
+        self.resolve_zoned(&reference_zoned(reference_time)?)
+    }
+
+    pub(crate) fn resolve_zoned(&self, now: &jiff::Zoned) -> Result<Bounds> {
         if let Some(when) = self.when.as_deref() {
-            let (start, end) = parse_span_in(when, now, zone)
-                .map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
-            if start > end {
+            let (start, end) =
+                period(when, now).map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
+            if start.zip(end).is_some_and(|(start, end)| start > end) {
                 bail!(
                     "invalid --when '{when}': resolved period is reversed; put the earlier date first"
                 );
             }
-            return Ok((Some(start), Some(end)));
+            return Ok((start, end));
         }
-        let since = self
-            .since
-            .as_deref()
-            .map(|raw| {
-                parse_bound_in(raw, Bound::Start, now, zone)
-                    .map_err(|err| anyhow!("invalid --since '{raw}': {err}"))
+        // `--since 2026-01/..` starts at January; `--since ../2026-01` has no start, so no bound.
+        let side = |raw: Option<&str>, flag: &str, bound: Bound| {
+            raw.map(|raw| {
+                period(raw, now)
+                    .map(|(start, end)| if bound == Bound::Start { start } else { end })
+                    .map_err(|err| anyhow!("invalid --{flag} '{raw}': {err}"))
             })
-            .transpose()?;
-        let until = self
-            .until
-            .as_deref()
-            .map(|raw| {
-                parse_bound_in(raw, Bound::End, now, zone)
-                    .map_err(|err| anyhow!("invalid --until '{raw}': {err}"))
-            })
-            .transpose()?;
+            .transpose()
+            .map(Option::flatten)
+        };
+        let since = side(self.since.as_deref(), "since", Bound::Start)?;
+        let until = side(self.until.as_deref(), "until", Bound::End)?;
         if since.zip(until).is_some_and(|(start, end)| start > end) {
             bail!("resolved --since is later than --until; swap the bounds or move --until later");
         }
         Ok((since, until))
     }
-
-    /// Resolve relative to the wall clock in the local time zone: the `TZ` environment variable
-    /// when set, otherwise the system zone ([`local_time_zone`]). Used by command handlers.
-    pub fn resolve_now(&self) -> Result<Bounds> {
-        self.resolve_in_zone(Utc::now(), &local_time_zone())
-    }
 }
 
 /// Parse one token to a single bound (start or end of its period), reading input without an
-/// offset in UTC.
+/// offset or zone in UTC.
 pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
-    parse_bound_in(input, bound, now, &TimeZone::UTC)
+    let (start, end) = parse_span(input, now)?;
+    Ok(if bound == Bound::Start { start } else { end })
 }
 
-/// [`parse_bound`], reading input without an offset in `zone`.
-pub(crate) fn parse_bound_in(
-    input: &str,
-    bound: Bound,
-    now: DateTime<Utc>,
-    zone: &TimeZone,
-) -> Result<DateTime<Utc>> {
-    let (start, end) = parse_span_in(input, now, zone)?;
-    Ok(match bound {
-        Bound::Start => start,
-        Bound::End => end,
-    })
-}
-
-/// Parse one token to its full `(start, end)` instant span, reading input without an offset in
-/// UTC.
+/// Parse one token to its full `(start, end)` instant span, reading input without an offset or
+/// zone in UTC. An EDTF open interval such as `2026-01/..` has no span and is an error here;
+/// [`DateRange`] accepts it as an unbounded side.
 pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    parse_span_in(input, now, &TimeZone::UTC)
+    match period(input, &zoned(now, &TimeZone::UTC)?)? {
+        (Some(start), Some(end)) => Ok((start, end)),
+        _ => bail!("'{input}' is an open interval; use it as --when, --since or --until"),
+    }
 }
 
-/// [`parse_span`], reading input without an offset in `zone`.
-pub(crate) fn parse_span_in(
-    input: &str,
-    now_utc: DateTime<Utc>,
-    zone: &TimeZone,
-) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let now = zoned(now_utc, zone)?;
+/// The period `input` names, relative to `now`, as inclusive UTC bounds; `None` is an open side
+/// (EDTF `2026-01/..`). Input without an offset or zone is read in `now`'s zone, as ISO 8601
+/// and EDTF define local time; a trailing RFC 9557 annotation (`2026-01-15[Europe/Berlin]`,
+/// `yesterday[Asia/Tokyo]`) reads it in that zone instead.
+pub(crate) fn period(input: &str, now: &jiff::Zoned) -> Result<Bounds> {
+    if let Some((body, name)) = zone_annotation(input.trim()) {
+        // An offset alongside a zone must agree with it (RFC 9557); jiff's Zoned parser checks.
+        if body.parse::<jiff::Timestamp>().is_ok() {
+            let instant = from_timestamp(input.trim().parse::<jiff::Zoned>()?.timestamp())?;
+            return Ok((Some(instant), Some(instant)));
+        }
+        return period(body, &now.with_time_zone(named_time_zone(name)?));
+    }
+    // EDTF open (`2026-01/..`) and unknown (`2026-01/`) ends leave that side unbounded.
+    match Edtf::parse(&normalize_date_token(input.trim())) {
+        Ok(Edtf::IntervalFrom(first, _)) => {
+            return Ok((Some(date_bounds(&first, now.time_zone())?.0), None));
+        }
+        Ok(Edtf::IntervalTo(_, last)) => {
+            return Ok((None, Some(date_bounds(&last, now.time_zone())?.1)));
+        }
+        _ => {}
+    }
+    let (start, end) = span(input, now)?;
+    Ok((Some(start), Some(end)))
+}
+
+/// EDTF needs uppercase `X` and `T`; only purely date-shaped tokens are uppercased, so natural
+/// language ("yesterday", "last friday") keeps its casing.
+fn normalize_date_token(s: &str) -> String {
+    if datelike_re().is_match(s) {
+        s.to_ascii_uppercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// A trailing RFC 9557 time zone annotation, `…[America/New_York]` (`[!…]` marks it critical),
+/// split from the value it annotates. Only a suffix after other content counts, so EDTF
+/// interval slashes and level-2 set brackets are never mistaken for one.
+fn zone_annotation(s: &str) -> Option<(&str, &str)> {
+    let (body, name) = s.strip_suffix(']')?.rsplit_once('[')?;
+    (!body.trim().is_empty()).then(|| (body.trim_end(), name.trim_start_matches('!')))
+}
+
+/// `now` for a reference timestamp: RFC 9557 keeps its named zone, and RFC 3339 keeps its offset
+/// as a fixed zone (`Z` is UTC).
+fn reference_zoned(reference_time: &str) -> Result<jiff::Zoned> {
+    if let Ok(zoned) = reference_time.parse::<jiff::Zoned>() {
+        return Ok(zoned);
+    }
+    let invalid = || {
+        anyhow!(
+            "reference_time must be an RFC 3339 timestamp such as 2026-06-15T12:00:00Z or an \
+             RFC 9557 one such as 2026-06-15T12:00:00[America/New_York], got '{reference_time}'"
+        )
+    };
+    let timestamp: jiff::Timestamp = reference_time.parse().map_err(|_| invalid())?;
+    let offset = match jiff::fmt::temporal::Pieces::parse(reference_time)
+        .map_err(|_| invalid())?
+        .offset()
+    {
+        Some(jiff::fmt::temporal::PiecesOffset::Numeric(numeric)) => numeric.offset(),
+        _ => jiff::tz::Offset::UTC,
+    };
+    Ok(timestamp.to_zoned(TimeZone::fixed(offset)))
+}
+
+/// The closed span of a token without a zone annotation, read in `now`'s zone.
+fn span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let now_utc = from_timestamp(now.timestamp())?;
+    let zone = now.time_zone();
     let s = input.trim();
     if s.is_empty() {
         bail!("empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `aise dates`)");
@@ -200,13 +253,7 @@ pub(crate) fn parse_span_in(
         return Ok((from_timestamp(start.timestamp())?, now_utc));
     }
 
-    // EDTF needs uppercase `X`; only uppercase purely date-shaped tokens so NLP
-    // strings ("yesterday", "last friday") keep their original casing.
-    let normalized = if datelike_re().is_match(s) {
-        s.to_ascii_uppercase()
-    } else {
-        s.to_string()
-    };
+    let normalized = normalize_date_token(s);
     let s = normalized.as_str();
 
     // 2. An exact instant with `Z` or an offset (RFC 3339 / RFC 9557), including fractional
@@ -264,8 +311,13 @@ pub(crate) fn parse_span_in(
                 let instant = dt.to_chrono(&Utc);
                 Ok((instant, instant))
             }
-            // YYear (>4 digit years) and open intervals are out of scope here.
-            _ => bail!("unsupported EDTF form '{s}'"),
+            // Open (`..`) and unknown (empty) ends have no instant; period() reports them as open
+            // sides, so they are refused only where a closed span is required.
+            Edtf::IntervalFrom(_, _) | Edtf::IntervalTo(_, _) => {
+                bail!("'{s}' is an open interval; use it as --when, --since or --until")
+            }
+            // YYear (more than four digits) has no calendar span in chrono's range.
+            Edtf::YYear(_) => bail!("'{s}' is outside the supported years -9999 to 9999"),
         };
     }
 
@@ -379,6 +431,11 @@ fn named_time_zone(name: &str) -> Result<TimeZone> {
     })
 }
 
+/// `now` in the local time zone, for callers that hold a chrono instant.
+pub(crate) fn in_local_zone(now: DateTime<Utc>) -> Result<jiff::Zoned> {
+    zoned(now, &local_time_zone())
+}
+
 fn zoned(now: DateTime<Utc>, zone: &TimeZone) -> Result<jiff::Zoned> {
     let nanos = i32::try_from(now.timestamp_subsec_nanos())?;
     Ok(jiff::Timestamp::new(now.timestamp(), nanos)?.to_zoned(zone.clone()))
@@ -452,38 +509,54 @@ fn day_x_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^(\d{4})-(\d{2})-([0-3X])([0-9X])$").expect("valid day-x regex"))
 }
 
-/// Human-readable format reference for the `dates` command.
+/// Human-readable format reference for the `dates` command. Names the local time zone in
+/// effect, since every value without an offset or zone is read in it.
 pub fn format_reference() -> String {
+    let local = local_time_zone();
+    let zone = local.iana_name().unwrap_or("a fixed offset");
+    let source = if std::env::var_os("TZ").is_some() {
+        "TZ"
+    } else {
+        "the system"
+    };
     [
-        "aise date/time formats (--since, --until, --when)",
-        "",
-        "ISO 8601:",
-        "  2026-01-15T14:30:25.123Z exact fractional instant (offsets normalize to UTC)",
-        "  2026-01-15T14:30:25   exact second",
-        "  2026-01-15T14:30      minute precision (expands to :00..:59)",
-        "  2026-01-15T14         hour precision (expands to :00:00..:59:59)",
-        "  2026-01-15            day        → 00:00:00 .. 23:59:59",
-        "  2026-01               month      → first .. last day",
-        "  2026                  year       → Jan 1 .. Dec 31",
-        "",
-        "EDTF (Extended Date/Time Format, via the `edtf` crate):",
-        "  202X                  decade     → 2020-01-01 .. 2029-12-31",
-        "  19XX                  century    → 1900-01-01 .. 1999-12-31",
-        "  2026-XX               unspecified month → whole year",
-        "  2026-01-XX            unspecified day   → whole month",
-        "  2026-01-1X            partial day digit → 2026-01-10 .. 2026-01-19",
-        "  2026-01/2026-03       interval   → start of A .. end of B",
-        "",
-        "Duration shorthand (the window [now - N, now]):",
-        "  7d 2w 24h 30m 1M 1y     (m = minutes, M or mo = calendar months, y = calendar years)",
-        "",
-        "Natural language (via the `interim` crate; day-granular):",
-        "  today  yesterday  \"3 days ago\"  \"last friday\"",
-        "",
-        "--since uses a period's start, --until its end, --when uses both.",
-        "Calendar periods and relative days use UTC; RFC 3339 timestamps honor their offset.",
-        "A duration spans [now - N, now]; a relative word spans its whole day,",
-        "so `--when 7d` = the last 7 days and `--when yesterday` = all of yesterday.",
+        "aise date/time formats (--since, --until, --when)".to_string(),
+        String::new(),
+        format!(
+            "Local time zone: {zone} (from {source}). Values without an offset or zone use it."
+        ),
+        "Another zone: append it in brackets (RFC 9557), e.g. 2026-01-15[Europe/Berlin],".into(),
+        "yesterday[Asia/Tokyo]; or run with TZ=Area/City. An offset or Z names one instant.".into(),
+        String::new(),
+        "ISO 8601:".into(),
+        "  2026-01-15T14:30:25.123Z exact fractional instant (offsets normalize to UTC)".into(),
+        "  2026-01-15T14:30:25   exact second".into(),
+        "  2026-01-15T14:30      minute precision (expands to :00..:59)".into(),
+        "  2026-01-15T14         hour precision (expands to :00:00..:59:59)".into(),
+        "  2026-01-15            day        → 00:00:00 .. 23:59:59".into(),
+        "  2026-01               month      → first .. last day".into(),
+        "  2026                  year       → Jan 1 .. Dec 31".into(),
+        String::new(),
+        "EDTF (Extended Date/Time Format, via the `edtf` crate):".into(),
+        "  202X                  decade     → 2020-01-01 .. 2029-12-31".into(),
+        "  19XX                  century    → 1900-01-01 .. 1999-12-31".into(),
+        "  2026-XX               unspecified month → whole year".into(),
+        "  2026-01-XX            unspecified day   → whole month".into(),
+        "  2026-01-1X            partial day digit → 2026-01-10 .. 2026-01-19".into(),
+        "  2026-21               season (21-24 = spring..winter)".into(),
+        "  2026-01/2026-03       interval   → start of A .. end of B".into(),
+        "  2026-01/..  ../2026-03  open interval → no end / no start".into(),
+        "  2026?  2026~          uncertain / approximate: same period".into(),
+        String::new(),
+        "Durations (the window [now - N, now]; jiff's units or ISO 8601):".into(),
+        "  7d 2w 24h 30m 1M 1y 1d12h P1M PT2H   (m = minutes, M or mo = months)".into(),
+        String::new(),
+        "Natural language (via the `interim` crate; day-granular):".into(),
+        "  today  yesterday  \"3 days ago\"  \"last friday\"".into(),
+        String::new(),
+        "--since uses a period's start, --until its end, --when uses both.".into(),
+        "A duration spans [now - N, now]; a relative word spans its whole day,".into(),
+        "so `--when 7d` = the last 7 days and `--when yesterday` = all of yesterday.".into(),
     ]
     .join("\n")
 }
@@ -512,7 +585,9 @@ mod tests {
             when: Some(when.to_string()),
             ..DateRange::default()
         };
-        let (start, end) = range.resolve_in(iso(now), "America/New_York").unwrap();
+        let (start, end) = range
+            .resolve_at(&format!("{now}[America/New_York]"))
+            .unwrap();
         (start.unwrap(), end.unwrap())
     }
 
@@ -552,8 +627,105 @@ mod tests {
                 iso("2026-01-15T23:59:59.999999999Z")
             )
         );
-        let unknown = DateRange::default().resolve_in(iso(evening), "Mars/Olympus_Mons");
+        let unknown = period("2026-11-07[Mars/Olympus_Mons]", &utc_now());
         assert!(unknown.unwrap_err().to_string().contains("IANA name"));
+    }
+
+    fn utc_now() -> jiff::Zoned {
+        zoned(now(), &TimeZone::UTC).unwrap()
+    }
+
+    #[test]
+    fn a_trailing_rfc_9557_zone_reads_any_form_in_that_zone() {
+        let berlin_jan_15 = (
+            Some(iso("2026-01-14T23:00:00Z")),
+            Some(iso("2026-01-15T22:59:59.999999999Z")),
+        );
+        assert_eq!(
+            period("2026-01-15[Europe/Berlin]", &utc_now()).unwrap(),
+            berlin_jan_15
+        );
+        // `[!…]` marks the annotation critical; the zone is the same.
+        assert_eq!(
+            period("2026-01-15[!Europe/Berlin]", &utc_now()).unwrap(),
+            berlin_jan_15
+        );
+        // The annotation covers a whole EDTF interval, and its `/` is not an interval separator.
+        assert_eq!(
+            period("2026-01/2026-02[Asia/Tokyo]", &utc_now()).unwrap(),
+            (
+                Some(iso("2025-12-31T15:00:00Z")),
+                Some(iso("2026-02-28T14:59:59.999999999Z"))
+            )
+        );
+        // An offset and a zone together must agree (RFC 9557).
+        let exact = Some(iso("2026-11-07T19:30:00Z"));
+        assert_eq!(
+            period("2026-11-07T14:30:00-05:00[America/New_York]", &utc_now()).unwrap(),
+            (exact, exact)
+        );
+        assert!(period("2026-11-07T14:30:00+01:00[America/New_York]", &utc_now()).is_err());
+        // A leading bracket is not a zone annotation (EDTF level 2 writes sets that way).
+        assert!(period("[2026-01,2026-02]", &utc_now()).is_err());
+    }
+
+    #[test]
+    fn edtf_open_intervals_leave_one_side_unbounded() {
+        let from_january = (Some(iso("2026-01-01T00:00:00Z")), None);
+        assert_eq!(period("2026-01/..", &utc_now()).unwrap(), from_january);
+        assert_eq!(period("2026-01/", &utc_now()).unwrap(), from_january);
+        let to_march = (None, Some(iso("2026-03-31T23:59:59.999999999Z")));
+        assert_eq!(period("../2026-03", &utc_now()).unwrap(), to_march);
+        let when = |value: &str| DateRange {
+            when: Some(value.to_string()),
+            ..DateRange::default()
+        };
+        assert_eq!(when("2026-01/..").resolve(now()).unwrap(), from_january);
+        let since = DateRange {
+            since: Some("../2026-03".to_string()),
+            ..DateRange::default()
+        };
+        assert_eq!(
+            since.resolve(now()).unwrap(),
+            (None, None),
+            "no start, so no lower bound"
+        );
+        assert!(
+            parse_span("2026-01/..", now()).is_err(),
+            "a closed span is required here"
+        );
+        // Certainty qualifiers are accepted; the period they qualify is unchanged.
+        assert_eq!(span("2026?"), span("2026"));
+        assert_eq!(span("2026-01~"), span("2026-01"));
+    }
+
+    #[test]
+    fn a_reference_time_carries_its_zone() {
+        let day = |reference: &str| {
+            DateRange {
+                when: Some("today".to_string()),
+                ..DateRange::default()
+            }
+            .resolve_at(reference)
+            .unwrap()
+        };
+        // RFC 3339: the offset is the zone. RFC 9557: the named zone, with its rules.
+        assert_eq!(
+            day("2026-11-07T20:00:00-05:00"),
+            (
+                Some(iso("2026-11-07T05:00:00Z")),
+                Some(iso("2026-11-08T04:59:59.999999999Z"))
+            )
+        );
+        assert_eq!(
+            day("2026-11-08T01:00:00Z[America/New_York]"),
+            day("2026-11-07T20:00:00-05:00")
+        );
+        assert_eq!(
+            day("2026-06-25T12:00:00Z"),
+            (Some(span("today").0), Some(span("today").1))
+        );
+        assert!(DateRange::default().resolve_at("2026-11-07").is_err());
     }
 
     #[test]

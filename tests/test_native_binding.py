@@ -349,6 +349,26 @@ def test_native_date_resolution_uses_canonical_rust_semantics(
     assert (resolved.since, resolved.until) == (expected_since, expected_until)
 
 
+def test_native_date_resolution_reads_zones_from_values_and_reference_times() -> None:
+    def resolve(when: str, reference_time: str) -> tuple[str | None, str | None]:
+        resolved = native.DateRange(when=when).resolve_bounds(reference_time=reference_time)
+        return (resolved.since, resolved.until)
+
+    new_york_nov_7 = ("2026-11-07T05:00:00Z", "2026-11-08T04:59:59.999999999Z")
+    # An RFC 9557 reference time names the zone values without an offset are read in.
+    assert resolve("today", "2026-11-08T01:00:00Z[America/New_York]") == new_york_nov_7
+    # An RFC 3339 reference keeps its offset as the zone.
+    assert resolve("2026-11-07", "2026-11-07T20:00:00-05:00") == new_york_nov_7
+    # A trailing zone on the value overrides it.
+    assert resolve("2026-11-07[America/New_York]", "2026-11-07T20:00:00Z") == new_york_nov_7
+    # EDTF open intervals leave a side unbounded.
+    assert resolve("2026-01/..", "2026-06-15T12:00:00Z") == ("2026-01-01T00:00:00Z", None)
+    with pytest.raises(ValueError, match="RFC 9557"):
+        native.DateRange(when="today").resolve_bounds(reference_time="2026-06-15")
+    with pytest.raises(ValueError):
+        resolve("2026-11-07T14:30:00+01:00[America/New_York]", "2026-11-07T20:00:00Z")
+
+
 def test_native_date_resolution_supports_independent_bounds() -> None:
     resolved = native.DateRange(since="2026-01", until="2026-03").resolve_bounds(reference_time="2026-06-15T12:00:00Z")
 

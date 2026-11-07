@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::dates::{self, Bound};
+use crate::dates;
 use crate::db::{Db, QueryCancellation};
 use crate::inspect::InspectionOptions;
 use crate::message_search::{
@@ -5923,7 +5923,7 @@ fn apply_session_preview_chars(value: &mut Value, preview_chars: Option<usize>) 
 fn session_span_since_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Inclusive query start. Match when the known indexed session end is at or after it. Calendar/relative periods use UTC; exact RFC 3339 honors its offset and fractional seconds. Examples: '2026-01', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
+        "description": "Inclusive query start. Match when the known indexed session end is at or after it. Local time unless given an offset or a [Area/City] suffix; fractional seconds kept. Examples: '2026-01', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
     })
 }
 
@@ -5939,7 +5939,7 @@ fn session_span_until_schema() -> Value {
 fn session_span_when_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Single UTC period intersected with each known indexed session span, e.g. '2026-01', '7d', or 'yesterday'. Exact RFC 3339 selects spans containing that instant. Spans can contain gaps; this is not continuous process activity. Do not combine with since/until."
+        "description": "Single local period intersected with each known indexed session span, e.g. '2026-01', '7d', or 'yesterday'. Exact RFC 3339 selects spans containing that instant. Spans can contain gaps; this is not continuous process activity. Do not combine with since/until."
     })
 }
 
@@ -5999,39 +5999,26 @@ fn parse_string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// Parse an optional date argument with the shared `dates` grammar (EDTF / ISO / duration /
-/// natural language), resolving to the requested `bound` of its period. Reuses the exact
-/// parser the CLI `--since/--until` flags use, so MCP and CLI accept identical date strings.
-fn parse_date_arg(
-    args: &Value,
-    key: &str,
-    bound: Bound,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(|raw| dates::parse_bound(raw, bound, now).map_err(|e| format!("invalid {key}: {e}")))
-        .transpose()
-}
-
+/// `since`/`until`/`when` through the same [`dates::DateRange`] resolution the CLI flags use, so
+/// MCP and CLI accept identical strings and read values without an offset or zone in the local
+/// time zone of the machine running aise.
 fn parse_date_bounds(
     args: &Value,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<dates::Bounds, String> {
-    if let Some(raw) = args.get("when").and_then(Value::as_str) {
-        if args.get("since").and_then(Value::as_str).is_some()
-            || args.get("until").and_then(Value::as_str).is_some()
-        {
-            return Err("provide `when` OR `since`/`until`, not both".to_string());
-        }
-        let (since, until) =
-            dates::parse_span(raw, now).map_err(|e| format!("invalid when: {e}"))?;
-        return Ok((Some(since), Some(until)));
+    let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
+    let range = dates::DateRange {
+        since: text("since"),
+        until: text("until"),
+        when: text("when"),
+    };
+    if range.when.is_some() && (range.since.is_some() || range.until.is_some()) {
+        return Err("provide `when` OR `since`/`until`, not both".to_string());
     }
-    Ok((
-        parse_date_arg(args, "since", Bound::Start, now)?,
-        parse_date_arg(args, "until", Bound::End, now)?,
-    ))
+    let local = dates::in_local_zone(now).map_err(|error| error.to_string())?;
+    range
+        .resolve_zoned(&local)
+        .map_err(|error| error.to_string())
 }
 
 fn search_filters_from_args(
@@ -8970,7 +8957,7 @@ mod tests {
         let now = crate::util::parse_datetime("2026-06-15T12:00:00Z").unwrap();
 
         let (since_only, until_only) =
-            parse_date_bounds(&json!({ "since": "2026-01" }), now).unwrap();
+            parse_date_bounds(&json!({ "since": "2026-01[UTC]" }), now).unwrap();
         assert_eq!(
             crate::util::display_timestamp(since_only.unwrap()),
             "2026-01-01T00:00:00Z"
@@ -8978,14 +8965,14 @@ mod tests {
         assert!(until_only.is_none(), "`since` alone must stay open-ended");
 
         let (since_only, until_only) =
-            parse_date_bounds(&json!({ "until": "2026-01" }), now).unwrap();
+            parse_date_bounds(&json!({ "until": "2026-01[UTC]" }), now).unwrap();
         assert!(since_only.is_none(), "`until` alone must stay open-ended");
         assert_eq!(
             crate::util::display_timestamp(until_only.unwrap()),
             "2026-01-31T23:59:59.999999999Z"
         );
 
-        let (since, until) = parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap();
+        let (since, until) = parse_date_bounds(&json!({ "when": "2026-01[UTC]" }), now).unwrap();
         assert_eq!(
             crate::util::display_timestamp(since.unwrap()),
             "2026-01-01T00:00:00Z"
@@ -9010,6 +8997,16 @@ mod tests {
             );
             assert_eq!(until, Some(now), "{duration}");
         }
+        // Without a zone the server's local zone applies, the same as the CLI.
+        assert_eq!(
+            parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap(),
+            dates::DateRange {
+                when: Some("2026-01".to_string()),
+                ..dates::DateRange::default()
+            }
+            .resolve_zoned(&dates::in_local_zone(now).unwrap())
+            .unwrap()
+        );
         assert!(
             parse_date_bounds(&json!({ "when": "2026-01", "since": "2026" }), now).is_err(),
             "`when` must stay mutually exclusive with since/until like CLI DateRange"

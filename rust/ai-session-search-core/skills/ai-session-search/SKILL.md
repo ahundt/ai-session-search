@@ -78,7 +78,7 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
 
 ## 4. Filters that apply everywhere
 
-- **Time.** Periods and relative days are UTC. Session list/search/export/analysis date filters
+- **Time.** Values without an offset are local time; append `[Area/City]` for another zone. Session list/search/export/analysis date filters
   intersect the inclusive query period with each known indexed span from `created_at` through
   `updated_at`: `since` tests the span end, `until` tests the span start, and `when` tests both.
   An exact RFC 3339 value is a zero-width period. A span records first and last known activity
