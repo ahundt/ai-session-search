@@ -376,6 +376,31 @@ impl DiscoveryResult {
     }
 }
 
+impl ProviderDiscoveryWarning {
+    /// An indexed source that could not be read on this refresh. Its stored rows are kept and the
+    /// next refresh reads it again, so the warning says which file failed and why.
+    pub(crate) fn refresh_failed(
+        provider: Provider,
+        path: &std::path::Path,
+        error: &anyhow::Error,
+    ) -> Self {
+        let verification_command = "aise doctor --format json".to_string();
+        Self {
+            provider,
+            path: normalize_path(path),
+            operation: "refresh".to_string(),
+            message: format!("{error:#}"),
+            readable_sources_preserved: true,
+            guidance: format!(
+                "The rows indexed from this file's last successful read were kept, and the next \
+                 refresh reads it again. Replace or remove the file if it stays unreadable; run \
+                 `{verification_command}` to verify discovery status."
+            ),
+            verification_command,
+        }
+    }
+}
+
 fn discovery_warning_guidance(preserved: bool, verification_command: &str) -> String {
     let preservation = if preserved {
         "Readable sources from this provider were preserved for indexing."
