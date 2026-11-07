@@ -41,6 +41,9 @@ const PRIME_AGENT_DIR: &str = ".prime/agent";
 /// MCP shares the strict-JSON settings document:
 /// https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/crates/pa-cli/src/mcp_command.rs#L77-L85
 const PRIME_MCP_FILE: &str = "settings.json";
+/// Cursor's global MCP location:
+/// https://cursor.com/docs/mcp#configuration-locations
+const CURSOR_MCP_PATH: &str = ".cursor/mcp.json";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
@@ -417,6 +420,9 @@ enum ConfigFormat {
     /// `mcpServers` with a required stdio type tag:
     /// https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/crates/pa-cli/src/mcp_command.rs#L38-L61
     PrimeAgent,
+    /// Cursor's STDIO field table requires `type: "stdio"` under `mcpServers`:
+    /// https://cursor.com/docs/mcp#stdio-server-configuration
+    Cursor,
     CodexToml,
     VscodeServers,
     ZedContextServers,
@@ -1946,11 +1952,10 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
                 vec!["prime-agent"],
             )
         }],
-        McpClient::Cursor => vec![json_target(
-            layout,
-            "cursor",
-            layout.home.join(".cursor").join("mcp.json"),
-        )],
+        McpClient::Cursor => vec![Target {
+            format: ConfigFormat::Cursor,
+            ..json_target(layout, "cursor", layout.home.join(CURSOR_MCP_PATH))
+        }],
         McpClient::Windsurf => vec![json_target(
             layout,
             "windsurf",
@@ -3420,7 +3425,7 @@ fn codex_entry_without_marketplace(target: &Target) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The executable named by an aise entry left in one of `target`'s superseded places, if any.
+/// The executable named by an aise entry left in a superseded place or entry shape, if any.
 fn superseded_entry_command(target: &Target) -> Option<String> {
     let layout = json_server_layout(target.format)?;
     let read = |path: &Path| {
@@ -3439,6 +3444,16 @@ fn superseded_entry_command(target: &Target) -> Option<String> {
             .superseded
             .iter()
             .find_map(|keys| owned_entry_command(&root, keys))
+            .or_else(|| {
+                let entry = json_container(&root, layout.container)?.get(SERVER_NAME)?;
+                // Earlier aise omitted the transport tag. Repair only that known shape;
+                // explicit transports and custom argument lists remain the user's choice.
+                (entry.get("type").is_none()
+                    && json_entry_is_current(entry, ConfigFormat::JsonMcpServers)
+                    && !json_entry_is_current(entry, target.format))
+                .then(|| owned_entry_command(&root, layout.container))
+                .flatten()
+            })
     })
 }
 
@@ -4137,6 +4152,7 @@ fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
         ConfigFormat::JsonMcpServers => (&["mcpServers"], &[], Jsonc),
         ConfigFormat::Pi => (&["mcpServers"], &[], Json),
         ConfigFormat::PrimeAgent => (&["mcpServers"], &[], Json),
+        ConfigFormat::Cursor => (&["mcpServers"], &[], Jsonc),
         ConfigFormat::VscodeServers => (&["servers"], &[], Jsonc),
         ConfigFormat::ZedContextServers => (&["context_servers"], &[], Jsonc),
         // OpenCode 2 reads `mcp.servers` and ignores servers directly under `mcp`.
@@ -4155,7 +4171,7 @@ fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
 
 fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
     match format {
-        ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent => {
+        ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent | ConfigFormat::Cursor => {
             json!({"type": "stdio", "command": binary, "args": ["mcp", "serve"]})
         }
         ConfigFormat::OpenCode | ConfigFormat::Kilo => {
@@ -4785,6 +4801,7 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
         ConfigFormat::JsonMcpServers
         | ConfigFormat::Pi
         | ConfigFormat::PrimeAgent
+        | ConfigFormat::Cursor
         | ConfigFormat::VscodeServers
         | ConfigFormat::ZedContextServers
         | ConfigFormat::OpenClaw => {
@@ -4794,7 +4811,7 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
                 .is_some_and(|command| !command.is_empty());
             let type_is_valid = !matches!(
                 format,
-                ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent
+                ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent | ConfigFormat::Cursor
             ) || entry.get("type").and_then(Value::as_str) == Some("stdio");
             command_is_set
                 && type_is_valid
@@ -5552,6 +5569,67 @@ mod tests {
                     .map(PathBuf::from)
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[test]
+    fn cursor_requires_stdio_without_changing_other_mcp_clients() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let target = targets_for_layout(McpClient::Cursor, &layout).remove(0);
+        let entry = json_server_entry(target.format, "/custom/aise");
+        assert_eq!(entry["type"], "stdio");
+        let untyped = json!({"command":"/custom/aise","args":["mcp","serve"]});
+        assert!(!json_entry_is_current(&untyped, target.format));
+        assert!(json_entry_is_current(&entry, target.format));
+        assert_eq!(
+            json_server_entry(ConfigFormat::JsonMcpServers, "/custom/aise").get("type"),
+            None
+        );
+        assert!(json_entry_is_current(
+            &untyped,
+            ConfigFormat::JsonMcpServers
+        ));
+        fs::create_dir_all(target.path.parent().unwrap()).unwrap();
+        let original = "{ // keep comment\n\"mcpServers\": {\"ai-session-search\": {\"command\":\"/custom/aise\",\"args\":[\"mcp\",\"serve\"]},\"other\": {\"command\":\"keep\"}},\"keep\":true}\n";
+        fs::write(&target.path, original).unwrap();
+        assert_eq!(status_target(&target).unwrap(), "stale");
+        let receipt = dir.path().join("transaction.json");
+        assert_eq!(
+            refresh_superseded_mcp_entries(&receipt, &layout, || panic!("keep the old executable"))
+                .unwrap(),
+            std::slice::from_ref(&target.path)
+        );
+        assert_eq!(status_target(&target).unwrap(), "configured");
+        let written = fs::read_to_string(&target.path).unwrap();
+        assert!(written.contains("// keep comment"));
+        let root =
+            parse_json_object_or_empty(&target.path, Some(&written), JsonSyntax::Jsonc).unwrap();
+        assert_eq!(root["mcpServers"][SERVER_NAME], entry);
+        assert_eq!(root["mcpServers"]["other"]["command"], "keep");
+        assert!(normalize_planned_mutations(
+            plan_upsert_target(&target, Path::new("/custom/aise")).unwrap()
+        )
+        .unwrap()
+        .is_empty());
+        assert!(remove_target(&target).unwrap());
+        assert_eq!(status_target(&target).unwrap(), "not configured");
+        for custom in [
+            json!({"type":"http","command":"/custom/aise","args":["mcp","serve"]}),
+            json!({"command":"/custom/aise","args":["mcp","serve","--custom"]}),
+        ] {
+            let original = json!({"mcpServers": {SERVER_NAME: custom}}).to_string();
+            fs::write(&target.path, &original).unwrap();
+            assert!(refresh_superseded_mcp_entries(&receipt, &layout, || panic!(
+                "preserve custom entries"
+            ))
+            .unwrap()
+            .is_empty());
+            assert_eq!(fs::read_to_string(&target.path).unwrap(), original);
         }
     }
 

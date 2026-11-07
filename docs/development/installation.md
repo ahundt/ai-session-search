@@ -123,6 +123,11 @@ reads in VS Code, JetBrains and the CLI, and keeps the entry in the VS Code exte
 `mcp_settings.json`, which only older extensions and Kilo 7 inside VS Code read. Both name the
 same server, so Kilo loads it once.
 
+Cursor receives `type: "stdio"` under `mcpServers` in `~/.cursor/mcp.json`, as required by
+[its STDIO field reference](https://cursor.com/docs/mcp#stdio-server-configuration). The
+post-upgrade refresh adds the field to earlier untyped aise registrations, keeping their
+executable path and file comments. Other clients using `mcpServers` keep their own entry format.
+
 ### Instruction files and hooks
 
 The installer adds managed instruction guidance for Claude, Codex, OpenCode, Gemini, Antigravity,
