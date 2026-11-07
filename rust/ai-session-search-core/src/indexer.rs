@@ -999,6 +999,10 @@ pub(crate) fn reindex_until(
 /// have crossed the parser's EOF and therefore must force one conservative full parse.
 fn full_parse_checkpoint(source: &SourceFile) -> Result<(i64, String)> {
     let current_size = std::fs::metadata(&source.path)?.len() as i64;
+    if crate::providers::codex::is_compressed_rollout(&source.path) {
+        // No tail checkpoint into compressed bytes; any later change takes the full parse.
+        return Ok((0, crate::tail::prefix_fingerprint(&source.path)?));
+    }
     let complete_offset = if current_size == source.size_bytes {
         crate::tail::complete_prefix_offset(&source.path)?
     } else {
@@ -1051,7 +1055,14 @@ fn source_reconciliation(
 ) -> Result<HashMap<(Provider, String), SourceReconciliation>> {
     let mut indexed_by_identity =
         HashMap::<(Provider, String), Vec<(String, usize, String)>>::new();
+    // Stored paths by name, for a source whose earlier form no longer exists on disk: a Codex
+    // rollout compressed to `.jsonl.zst` (or decompressed on resume) is the same source.
+    let mut indexed_by_path = HashMap::<(Provider, String), (String, usize, String)>::new();
     for (provider, stored_path, sessions, session_id) in db.indexed_source_identities()? {
+        indexed_by_path.insert(
+            (provider, stored_path.clone()),
+            (stored_path.clone(), sessions, session_id.clone()),
+        );
         let Ok(canonical) = std::fs::canonicalize(&stored_path) else {
             continue;
         };
@@ -1064,7 +1075,24 @@ fn source_reconciliation(
         .iter()
         .filter_map(|source| {
             let path = normalize_path(&source.path);
-            let indexed = indexed_by_identity.get(&(source.provider, path.clone()))?;
+            let sibling = (source.provider == Provider::Codex)
+                .then(|| crate::providers::codex::rollout_sibling(&source.path))
+                .flatten()
+                .map(|sibling| normalize_path(&sibling))
+                .and_then(|sibling| indexed_by_path.get(&(source.provider, sibling)).cloned());
+            let mut indexed = indexed_by_identity
+                .get(&(source.provider, path.clone()))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(entry) = sibling {
+                if !indexed.iter().any(|(stored, _, _)| stored == &entry.0) {
+                    indexed.push(entry);
+                }
+            }
+            if indexed.is_empty() {
+                return None;
+            }
+            let indexed = &indexed;
             let aliases = indexed
                 .iter()
                 .filter(|(stored, _, _)| stored != &path)
@@ -1164,6 +1192,11 @@ fn try_tail<F>(
 where
     F: Fn(std::io::Cursor<Vec<u8>>, &std::path::Path) -> Result<crate::models::ParsedSession>,
 {
+    // A compressed rollout is immutable once written and its byte offsets are not JSONL offsets,
+    // so it is always read whole.
+    if crate::providers::codex::is_compressed_rollout(&source.path) {
+        return Ok(TailOutcome::FullParse);
+    }
     let Some((offset, stored_fingerprint)) = db.file_checkpoint(
         source.provider,
         source_path,

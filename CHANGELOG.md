@@ -57,6 +57,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    differently. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
    avoids took 1.65 s.
 
+8. Codex sessions that Codex has compressed are indexed. After 7 idle days Codex rewrites a
+   rollout as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so
+   nothing written after its last read of such a session was ever indexed (1,182 of the
+   maintainer's rollouts were compressed). The compressed file is read as the same source as its
+   plain form, so the session keeps its id and stored messages, and a corrupt `.zst` becomes a
+   warned parse failure for that session.
+
 ### Performance
 
 1. Limited literal and regex searches stop once the page is full. On an index of 5.7 million
