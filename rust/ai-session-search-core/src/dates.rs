@@ -14,14 +14,11 @@
 //!     Resolved NLP is widened to its whole local day (see below), so a time-of-day in the
 //!     phrase (e.g. `8pm`) is intentionally ignored — use an ISO datetime for second
 //!     precision.
-//!   * **ISO datetimes** (full and partial-precision `…T14`, `…T14:30`) and the
-//!     **duration shorthand** (`7d 2w 24h 30m 1M 1y`) → `chrono` arithmetic;
-//!     these are not EDTF and not standard NLP. The units follow humantime and systemd:
-//!     `m` is minutes and `M` months (ISO 8601 writes the same split as `PT1M` and `P1M`).
-//!     Months and years are calendar months via `chrono`'s `checked_sub_months`, not fixed
-//!     day counts. No dependency we carry parses this shorthand with calendar months
-//!     (humantime and jiff use fixed or differently spelled months), so the token match
-//!     lives here and every date computation is chrono's.
+//!   * **ISO datetimes** (full and partial-precision `…T14`, `…T14:30`), exact instants and
+//!     **durations** (`7d 2w 24h 30m 1M 1y`, `1d12h`, `2 weeks`, `P1M`) → [`jiff`], which
+//!     parses durations in its friendly and ISO 8601 grammars and does calendar arithmetic in
+//!     the time zone. `m` is minutes and `M` months, as in humantime and systemd (jiff spells
+//!     months `mo` and refuses `M`, so `M` after a digit is rewritten to `mo` first).
 //!
 //! Every input resolves to a `(start, end)` pair of UTC instants:
 //!   * a fuzzy period (date, month, year, decade, century, unspecified-digit day) →
@@ -122,10 +119,10 @@ impl DateRange {
     pub(crate) fn resolve_zoned(&self, now: &jiff::Zoned) -> Result<Bounds> {
         if let Some(when) = self.when.as_deref() {
             let (start, end) =
-                period(when, now).map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
+                period(when, now).map_err(|err| anyhow!("invalid when '{when}': {err}"))?;
             if start.zip(end).is_some_and(|(start, end)| start > end) {
                 bail!(
-                    "invalid --when '{when}': resolved period is reversed; put the earlier date first"
+                    "invalid when '{when}': resolved period is reversed; put the earlier date first"
                 );
             }
             return Ok((start, end));
@@ -135,7 +132,7 @@ impl DateRange {
             raw.map(|raw| {
                 period(raw, now)
                     .map(|(start, end)| if bound == Bound::Start { start } else { end })
-                    .map_err(|err| anyhow!("invalid --{flag} '{raw}': {err}"))
+                    .map_err(|err| anyhow!("invalid {flag} '{raw}': {err}"))
             })
             .transpose()
             .map(Option::flatten)
@@ -143,7 +140,7 @@ impl DateRange {
         let since = side(self.since.as_deref(), "since", Bound::Start)?;
         let until = side(self.until.as_deref(), "until", Bound::End)?;
         if since.zip(until).is_some_and(|(start, end)| start > end) {
-            bail!("resolved --since is later than --until; swap the bounds or move --until later");
+            bail!("resolved since is later than until; swap the bounds or move until later");
         }
         Ok((since, until))
     }
@@ -162,7 +159,7 @@ pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<Date
 pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     match period(input, &zoned(now, &TimeZone::UTC)?)? {
         (Some(start), Some(end)) => Ok((start, end)),
-        _ => bail!("'{input}' is an open interval; use it as --when, --since or --until"),
+        _ => bail!("'{input}' is an open interval; use it as when, since or until"),
     }
 }
 
@@ -171,13 +168,14 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
 /// and EDTF define local time; a trailing RFC 9557 annotation (`2026-01-15[Europe/Berlin]`,
 /// `yesterday[Asia/Tokyo]`) reads it in that zone instead.
 pub(crate) fn period(input: &str, now: &jiff::Zoned) -> Result<Bounds> {
-    if let Some((body, name)) = zone_annotation(input.trim()) {
+    if let Some((body, annotations)) = split_annotations(input.trim()) {
         // An offset alongside a zone must agree with it (RFC 9557); jiff's Zoned parser checks.
         if body.parse::<jiff::Timestamp>().is_ok() {
             let instant = from_timestamp(input.trim().parse::<jiff::Zoned>()?.timestamp())?;
             return Ok((Some(instant), Some(instant)));
         }
-        return period(body, &now.with_time_zone(named_time_zone(name)?));
+        let zone = annotated_zone(annotations)?.unwrap_or_else(|| now.time_zone().clone());
+        return period(body, &now.with_time_zone(zone));
     }
     // EDTF open (`2026-01/..`) and unknown (`2026-01/`) ends leave that side unbounded.
     match Edtf::parse(&normalize_date_token(input.trim())) {
@@ -203,19 +201,43 @@ fn normalize_date_token(s: &str) -> String {
     }
 }
 
-/// A trailing RFC 9557 time zone annotation, `…[America/New_York]` (`[!…]` marks it critical),
-/// split from the value it annotates. Only a suffix after other content counts, so EDTF
-/// interval slashes and level-2 set brackets are never mistaken for one.
-fn zone_annotation(s: &str) -> Option<(&str, &str)> {
-    let (body, name) = s.strip_suffix(']')?.rsplit_once('[')?;
-    (!body.trim().is_empty()).then(|| (body.trim_end(), name.trim_start_matches('!')))
+/// Trailing RFC 9557 annotations (`…[America/New_York]`, `…[+05:00]`, `…[u-ca=gregory]`, with
+/// `!` marking one critical), split from the value they annotate. Only a suffix after other
+/// content counts, so EDTF interval slashes and level-2 set brackets are never mistaken for one.
+fn split_annotations(s: &str) -> Option<(&str, &str)> {
+    let mut start = s.len();
+    while s[..start].ends_with(']') {
+        start = s[..start].rfind('[')?;
+    }
+    let body = s[..start].trim_end();
+    (start < s.len() && !body.is_empty()).then(|| (body, &s[start..]))
+}
+
+/// The time zone a run of RFC 9557 annotations names, if any. jiff parses the annotations on a
+/// placeholder timestamp, so zone names, offsets, tags and criticality follow the RFC: unknown
+/// non-critical tags are ignored and critical ones refused.
+fn annotated_zone(annotations: &str) -> Result<Option<TimeZone>> {
+    let placeholder = format!("1970-01-01T00:00:00Z{annotations}");
+    let pieces = jiff::fmt::temporal::Pieces::parse(&placeholder)
+        .map_err(|err| anyhow!("invalid annotation '{annotations}': {err}"))?;
+    match pieces.time_zone_annotation() {
+        None => Ok(None),
+        Some(annotation) => annotation.to_time_zone().map(Some).map_err(|err| {
+            anyhow!(
+                "unknown time zone in '{annotations}': {err}; use an IANA name such as \
+                 America/New_York, Europe/Berlin or UTC"
+            )
+        }),
+    }
 }
 
 /// `now` for a reference timestamp: RFC 9557 keeps its named zone, and RFC 3339 keeps its offset
 /// as a fixed zone (`Z` is UTC).
 fn reference_zoned(reference_time: &str) -> Result<jiff::Zoned> {
-    if let Ok(zoned) = reference_time.parse::<jiff::Zoned>() {
-        return Ok(zoned);
+    if reference_time.trim_end().ends_with(']') {
+        return reference_time
+            .parse::<jiff::Zoned>()
+            .map_err(|err| anyhow!("invalid reference_time '{reference_time}': {err}"));
     }
     let invalid = || {
         anyhow!(
@@ -247,11 +269,19 @@ fn span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)
     //    jiff applies the span in the zone: months and days are calendar units, so `1M` from
     //    March 31 starts on the last day of February and `1d` across a daylight-saving change
     //    keeps the wall-clock time; hours and smaller units are elapsed time.
-    if let Some(span) = parse_duration(s)? {
-        let start = now
-            .checked_sub(span)
+    if let Some(span) = parse_duration(s) {
+        let shifted = now
+            .checked_sub(span.abs())
             .map_err(|err| anyhow!("duration '{s}' is out of range: {err}"))?;
-        return Ok((from_timestamp(start.timestamp())?, now_utc));
+        if !span.is_negative() {
+            return Ok((from_timestamp(shifted.timestamp())?, now_utc));
+        }
+        // `3 days ago` names a day, like `yesterday`: the whole local day it lands on. A bare
+        // negative such as `-2h` has no such reading.
+        if !s.to_ascii_lowercase().contains("ago") {
+            bail!("duration '{s}' is negative; durations count back from now, so write it without '-'");
+        }
+        return days_span(shifted.date(), shifted.date(), zone);
     }
 
     let normalized = normalize_date_token(s);
@@ -267,13 +297,17 @@ fn span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)
 
     // 3. A date and time without an offset is local time (ISO 8601, EDTF). Hour or minute
     //    precision names that whole hour or minute; seconds or finer name one instant.
-    if let Some((_, time)) = s.split_once('T').filter(|(date, _)| date.len() == 10) {
+    let separator = s.get(10..11).filter(|sep| *sep == "T" || *sep == " ");
+    if let Some(time) = separator
+        .and_then(|_| s.get(11..))
+        .filter(|_| datelike_re().is_match(&s[..10]))
+    {
         let colons = time.matches(':').count();
-        let text = if colons == 0 {
-            format!("{s}:00")
-        } else {
-            s.to_string()
-        };
+        let text = format!(
+            "{}T{time}{}",
+            &s[..10],
+            if colons == 0 { ":00" } else { "" }
+        );
         if let Ok(start) = text.parse::<jiff::civil::DateTime>() {
             let length = match colons {
                 0 => Some(jiff::Span::new().hours(1)),
@@ -286,7 +320,8 @@ fn span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)
                     .checked_sub(jiff::Span::new().nanoseconds(1))?,
                 None => start,
             };
-            return Ok((instant_in(zone, start)?, instant_in(zone, end)?));
+            let last = from_timestamp(zone.to_ambiguous_timestamp(end).later()?)?;
+            return Ok((instant_in(zone, start)?, last));
         }
     }
 
@@ -315,7 +350,7 @@ fn span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)
             // Open (`..`) and unknown (empty) ends have no instant; period() reports them as open
             // sides, so they are refused only where a closed span is required.
             Edtf::IntervalFrom(_, _) | Edtf::IntervalTo(_, _) => {
-                bail!("'{s}' is an open interval; use it as --when, --since or --until")
+                bail!("'{s}' is an open interval; use it as when, since or until")
             }
             // YYear (more than four digits) has no calendar span in chrono's range.
             Edtf::YYear(_) => bail!("'{s}' is outside the supported years -9999 to 9999"),
@@ -337,29 +372,21 @@ fn span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)
     )
 }
 
-/// A duration token, parsed by jiff's friendly or ISO 8601 grammar. `M` alone means months, as
-/// in humantime and systemd (jiff rejects it to avoid confusion with minutes); other units ignore
-/// case. Phrases with spaces, such as `3 days ago`, are left to natural language.
-fn parse_duration(s: &str) -> Result<Option<jiff::Span>> {
-    if s.contains(char::is_whitespace) {
-        return Ok(None);
-    }
-    let months = s
-        .strip_suffix('M')
-        .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()));
-    let span = match months {
-        Some(count) => format!("{count}mo").parse::<jiff::Span>().ok(),
-        None => s
-            .parse::<jiff::Span>()
-            .or_else(|_| s.to_ascii_lowercase().parse())
-            .ok(),
-    };
-    match span {
-        Some(span) if span.is_negative() => {
-            bail!("duration '{s}' is negative; durations count back from now, so write it without '-'")
-        }
-        span => Ok(span),
-    }
+/// A duration, parsed by jiff's friendly or ISO 8601 grammar (`7d`, `1d12h`, `2 weeks`, `P1M`).
+/// `M` after a digit means months, as in humantime and systemd (jiff rejects it to avoid
+/// confusion with minutes); other single-letter units ignore case. A negative span, which jiff
+/// reads from `3 days ago`, is returned as such for the caller to place on the calendar.
+fn parse_duration(s: &str) -> Option<jiff::Span> {
+    // jiff first, so ISO 8601 (`P1M` months, `PT1M` minutes) and its own units keep their meaning.
+    s.parse::<jiff::Span>().ok().or_else(|| {
+        let months = months_re().replace_all(s, "${1}mo${2}");
+        months.parse::<jiff::Span>().ok().or_else(|| {
+            // Lowercase only without a stray `M`, so `3MS` is refused rather than read as ms.
+            (!months.contains('M'))
+                .then(|| months.to_ascii_lowercase().parse().ok())
+                .flatten()
+        })
+    })
 }
 
 /// Expand an [`EdtfDate`] to inclusive `(start, end)` instants from its precision.
@@ -423,16 +450,6 @@ pub fn local_time_zone() -> TimeZone {
     TimeZone::try_system().unwrap_or(TimeZone::UTC)
 }
 
-/// Look up an IANA time zone name such as `America/New_York` or `UTC`.
-fn named_time_zone(name: &str) -> Result<TimeZone> {
-    TimeZone::get(name).map_err(|err| {
-        anyhow!(
-            "unknown time zone '{name}': {err}; use an IANA name such as America/New_York, \
-             Europe/Berlin or UTC"
-        )
-    })
-}
-
 /// `now` in the local time zone, for callers that hold a chrono instant.
 pub(crate) fn in_local_zone(now: DateTime<Utc>) -> Result<jiff::Zoned> {
     zoned(now, &local_time_zone())
@@ -471,12 +488,17 @@ fn days_span(
     last: jiff::civil::Date,
     zone: &TimeZone,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let start = first.to_zoned(zone.clone())?.start_of_day()?;
-    let end = last.to_zoned(zone.clone())?.end_of_day()?;
-    Ok((
-        from_timestamp(start.timestamp())?,
-        from_timestamp(end.timestamp())?,
-    ))
+    // jiff's range ends a few hours inside the years -9999 and 9999, so a period reaching past
+    // it is clamped to the first or last representable instant.
+    let start = first
+        .to_zoned(zone.clone())
+        .and_then(|day| day.start_of_day())
+        .map_or(jiff::Timestamp::MIN, |day| day.timestamp());
+    let end = last
+        .to_zoned(zone.clone())
+        .and_then(|day| day.end_of_day())
+        .map_or(jiff::Timestamp::MAX, |day| day.timestamp());
+    Ok((from_timestamp(start)?, from_timestamp(end)?))
 }
 
 fn months_span(
@@ -504,6 +526,11 @@ fn years_span(
 fn datelike_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[0-9XxTt:/.\-]+$").expect("valid datelike regex"))
+}
+
+fn months_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(\d)M(\d|$)").expect("valid months regex"))
 }
 
 fn day_x_re() -> &'static Regex {
@@ -566,6 +593,7 @@ pub fn format_reference() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike as _;
     use chrono::TimeZone as _;
 
     /// Fixed reference instant so duration/NLP cases are deterministic.
@@ -728,6 +756,82 @@ mod tests {
             (Some(span("today").0), Some(span("today").1))
         );
         assert!(DateRange::default().resolve_at("2026-11-07").is_err());
+    }
+
+    #[test]
+    fn durations_parse_through_jiff_with_m_as_months_after_any_digit() {
+        let start = |input: &str| period(input, &utc_now()).unwrap().0.unwrap();
+        // 18 months back, not one year and 6 minutes.
+        assert_eq!(start("1y6M"), iso("2024-12-25T12:00:00Z"));
+        assert_eq!(start("1M2d"), iso("2026-05-23T12:00:00Z"));
+        assert_eq!(start("2 weeks"), now() - Duration::weeks(2));
+        assert_eq!(start("5 mins"), now() - Duration::minutes(5));
+        assert_eq!(start("P1M"), start("1M"));
+        assert!(
+            period("3MS", &utc_now()).is_err(),
+            "not silently milliseconds"
+        );
+        assert!(period("-2h", &utc_now()).is_err());
+        // `N units ago` names the whole day it lands on, like `yesterday`.
+        assert_eq!(span("3 days ago"), span("2026-06-22"));
+    }
+
+    #[test]
+    fn a_space_separates_date_and_time_as_rfc_3339_allows() {
+        assert_eq!(span("2026-01-15 14:30"), span("2026-01-15T14:30"));
+        assert_eq!(span("2026-01-15 14"), span("2026-01-15T14"));
+    }
+
+    #[test]
+    fn periods_past_the_representable_years_clamp_instead_of_failing() {
+        let (_, end) = span("9999");
+        assert_eq!(end.year(), 9999);
+        assert!(span("-9999").0.year() <= -9999);
+    }
+
+    #[test]
+    fn rfc_9557_annotations_follow_the_rfc() {
+        let berlin = span("2026-01-15[Europe/Berlin]");
+        assert_eq!(span("2026-01-15[Europe/Berlin][u-ca=gregory]"), berlin);
+        assert_eq!(
+            span("2026-01-15[+05:00]").0,
+            iso("2026-01-14T19:00:00Z"),
+            "an offset annotation is a fixed zone"
+        );
+        assert_eq!(
+            span("2026-01-15[u-ca=gregory]"),
+            span("2026-01-15"),
+            "a tag alone keeps the zone"
+        );
+        assert!(
+            period("2026-01-15[!x-unknown=1]", &utc_now()).is_err(),
+            "critical tags are refused"
+        );
+        // A reference time with a conflicting offset and zone is refused, not silently used.
+        assert!(DateRange::default()
+            .resolve_at("2026-06-15T12:00:00+01:00[America/New_York]")
+            .is_err());
+        let unknown = DateRange::default().resolve_at("2026-06-15T12:00:00Z[Bogus/Zone]");
+        assert!(unknown.unwrap_err().to_string().contains("Bogus/Zone"));
+    }
+
+    #[test]
+    fn a_repeated_wall_clock_hour_covers_both_occurrences() {
+        // 01:00-01:59 happened twice in New York on 2026-11-01: 05:00-05:59Z and 06:00-06:59Z.
+        let (start, end) = span("2026-11-01T01[America/New_York]");
+        assert_eq!(start, iso("2026-11-01T05:00:00Z"));
+        assert_eq!(end, iso("2026-11-01T06:59:59.999999999Z"));
+    }
+
+    #[test]
+    fn errors_name_the_argument_the_same_way_on_every_surface() {
+        let range = DateRange {
+            when: Some("nonsense".to_string()),
+            ..DateRange::default()
+        };
+        let message = range.resolve(now()).unwrap_err().to_string();
+        assert!(message.starts_with("invalid when 'nonsense'"), "{message}");
+        assert!(!message.contains("--"), "{message}");
     }
 
     #[test]
@@ -1197,7 +1301,7 @@ mod tests {
             when: None,
         };
         let error = r.resolve(now()).unwrap_err().to_string();
-        assert!(error.contains("--since is later than --until"), "{error}");
+        assert!(error.contains("since is later than until"), "{error}");
     }
 
     #[test]
@@ -1223,7 +1327,7 @@ mod tests {
         };
         let err = r.resolve(now()).unwrap_err().to_string();
         assert!(
-            err.contains("--since"),
+            err.contains("invalid since"),
             "error names the offending flag: {err}"
         );
     }
