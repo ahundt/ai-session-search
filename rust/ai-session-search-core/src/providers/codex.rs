@@ -91,15 +91,32 @@ impl CodexAdapter {
     pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
         let walked = walk_roots(&self.roots, None);
-        for entry in walked.entries {
+        // Codex writes the compressed copy and then deletes the plain file, so both can exist for
+        // a moment; the plain file is then the newer, authoritative copy. Deciding from this one
+        // walk, rather than a second stat, keeps exactly one of the two whichever moment the walk
+        // saw.
+        let walked_plain_rollouts: std::collections::HashSet<&Path> = walked
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .collect();
+        let shadowed_by_plain: Vec<bool> = walked
+            .entries
+            .iter()
+            .map(|entry| {
+                crate::source::is_compressed_jsonl(&entry.path)
+                    && rollout_sibling(&entry.path)
+                        .is_some_and(|plain| walked_plain_rollouts.contains(plain.as_path()))
+            })
+            .collect();
+        for (entry, shadowed_by_plain) in walked.entries.into_iter().zip(shadowed_by_plain) {
             let path = &entry.path;
-            let compressed = is_compressed_rollout(path);
+            let compressed = crate::source::is_compressed_jsonl(path);
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") && !compressed {
                 continue;
             }
-            // Codex writes the compressed copy and then deletes the plain file, so both can exist
-            // for a moment; the plain file is then the newer, authoritative copy.
-            if compressed && rollout_sibling(path).is_some_and(|plain| plain.exists()) {
+            if shadowed_by_plain {
                 continue;
             }
             let mtime_ns = entry
@@ -713,14 +730,6 @@ fn is_codex_injected_context(text: &str) -> bool {
         || head.starts_with("<turn_aborted")
 }
 
-/// Codex compresses a rollout idle for 7 days into `rollout-*.jsonl.zst`, one zstd stream of the
-/// exact plain bytes, and deletes the plain file; resuming the thread decompresses it again.
-pub(crate) fn is_compressed_rollout(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl.zst"))
-}
-
 /// The other form of the same rollout: `x.jsonl` for `x.jsonl.zst`, and the reverse. The two are
 /// one source, so the index keeps one session for them whichever form is on disk.
 pub(crate) fn rollout_sibling(path: &Path) -> Option<PathBuf> {
@@ -980,14 +989,7 @@ mod tests {
 
         let bytes = fs::read(&plain).unwrap();
         let compressed = plain.with_extension("jsonl.zst");
-        fs::write(
-            &compressed,
-            ruzstd::encoding::compress_to_vec(
-                bytes.as_slice(),
-                ruzstd::encoding::CompressionLevel::Fastest,
-            ),
-        )
-        .unwrap();
+        fs::write(&compressed, zstd::encode_all(bytes.as_slice(), 1).unwrap()).unwrap();
         // While both forms exist the plain file wins; then Codex deletes it.
         assert_eq!(adapter.discover().len(), 1);
         assert_eq!(adapter.discover()[0].path, plain);

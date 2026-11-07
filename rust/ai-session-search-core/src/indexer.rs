@@ -999,7 +999,7 @@ pub(crate) fn reindex_until(
 /// have crossed the parser's EOF and therefore must force one conservative full parse.
 fn full_parse_checkpoint(source: &SourceFile) -> Result<(i64, String)> {
     let current_size = std::fs::metadata(&source.path)?.len() as i64;
-    if crate::providers::codex::is_compressed_rollout(&source.path) {
+    if crate::source::is_compressed_jsonl(&source.path) {
         // No tail checkpoint into compressed bytes; any later change takes the full parse.
         return Ok((0, crate::tail::prefix_fingerprint(&source.path)?));
     }
@@ -1194,7 +1194,7 @@ where
 {
     // A compressed rollout is immutable once written and its byte offsets are not JSONL offsets,
     // so it is always read whole.
-    if crate::providers::codex::is_compressed_rollout(&source.path) {
+    if crate::source::is_compressed_jsonl(&source.path) {
         return Ok(TailOutcome::FullParse);
     }
     let Some((offset, stored_fingerprint)) = db.file_checkpoint(

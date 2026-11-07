@@ -1033,10 +1033,7 @@ fn compress_rollout(plain: &Path, contents: &str) -> std::path::PathBuf {
     let compressed = plain.with_extension("jsonl.zst");
     std::fs::write(
         &compressed,
-        ruzstd::encoding::compress_to_vec(
-            contents.as_bytes(),
-            ruzstd::encoding::CompressionLevel::Fastest,
-        ),
+        zstd::encode_all(contents.as_bytes(), 1).unwrap(),
     )
     .unwrap();
     std::fs::remove_file(plain).unwrap();
@@ -1101,4 +1098,89 @@ fn compressing_a_rollout_never_drops_what_the_index_already_holds() {
         db.messages_fts_count().unwrap(),
         db.message_count().unwrap()
     );
+}
+
+/// A full index of `contents` as one plain rollout, for comparing transitions against.
+fn full_index_rows(contents: &str) -> Vec<Row> {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_root = dir.path().join("codex");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    std::fs::write(codex_root.join(CODEX_FILE), contents).unwrap();
+    let cfg = codex_only_config(dir.path(), &codex_root);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    rows(&db)
+}
+
+#[test]
+fn a_resumed_rollout_decompressed_back_to_plain_continues_its_session() {
+    // Resuming a compressed thread makes Codex write the plain file again and delete the `.zst`.
+    let dir = tempfile::tempdir().unwrap();
+    let codex_root = dir.path().join("codex");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    let file = codex_root.join(CODEX_FILE);
+    std::fs::write(&file, CODEX_INITIAL).unwrap();
+    let cfg = codex_only_config(dir.path(), &codex_root);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    let compressed = compress_rollout(&file, CODEX_INITIAL);
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+
+    std::fs::write(&file, format!("{CODEX_INITIAL}{CODEX_APPENDED}")).unwrap();
+    std::fs::remove_file(&compressed).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(
+        rows(&db),
+        full_index_rows(&format!("{CODEX_INITIAL}{CODEX_APPENDED}")),
+        "one session, equal to a full index of the resumed plain file"
+    );
+}
+
+#[test]
+fn an_unreadable_compressed_rollout_keeps_the_indexed_session() {
+    // Neither a file that is not zstd at all nor one cut off mid-frame may replace what the index
+    // holds for the plain rollout it replaced.
+    let full = format!("{CODEX_INITIAL}{CODEX_APPENDED}");
+    let intact = zstd::encode_all(full.as_bytes(), 1).unwrap();
+    for (label, bytes) in [
+        ("not zstd", b"not a zstd stream".to_vec()),
+        ("truncated", intact[..intact.len() / 2].to_vec()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_root = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let file = codex_root.join(CODEX_FILE);
+        std::fs::write(&file, &full).unwrap();
+        let cfg = codex_only_config(dir.path(), &codex_root);
+        let db = Db::open(&cfg.db_path()).unwrap();
+        indexer::reindex(&cfg, &db, false, None).unwrap();
+        let before = rows(&db);
+
+        std::fs::write(file.with_extension("jsonl.zst"), bytes).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        indexer::reindex(&cfg, &db, false, None).unwrap();
+        assert_eq!(rows(&db), before, "{label}: every indexed message stays");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rollout_compressed_under_a_root_respelled_through_a_symlink_keeps_its_session() {
+    // The plain file was indexed through a symlinked root; the root is now configured by its
+    // real path. Roots are canonicalized before discovery, so both spellings store one path and
+    // a shorter compressed file still continues the session rather than replacing it.
+    let dir = tempfile::tempdir().unwrap();
+    let real_root = dir.path().join("codex-real");
+    std::fs::create_dir_all(&real_root).unwrap();
+    let link_root = dir.path().join("codex-link");
+    std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+    let file = link_root.join(CODEX_FILE);
+    std::fs::write(&file, format!("{CODEX_INITIAL}{CODEX_APPENDED}")).unwrap();
+    let db = Db::open(&codex_only_config(dir.path(), &link_root).db_path()).unwrap();
+    indexer::reindex(&codex_only_config(dir.path(), &link_root), &db, false, None).unwrap();
+    let before = rows(&db);
+
+    compress_rollout(&file, CODEX_INITIAL);
+    indexer::reindex(&codex_only_config(dir.path(), &real_root), &db, false, None).unwrap();
+    assert_eq!(rows(&db), before, "every indexed message stays");
 }

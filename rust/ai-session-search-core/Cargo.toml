@@ -67,7 +67,7 @@ toml_edit = "0.25.12"
 ureq = { version = "3.3", default-features = false, features = ["json", "platform-verifier", "rustls"], optional = true }
 url = "2.5"
 yaml-rust2 = { version = "0.13", default-features = false }
-ruzstd = "0.9.1"
+zstd = "0.14.3"
 
 [features]
 default = ["release-check"]
