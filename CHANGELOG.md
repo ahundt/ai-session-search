@@ -15,6 +15,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
    and deletes nothing. See Fixed item 6.
+2. AI Session Search appears in the Codex desktop app's Plugins list. Codex lists only plugins
+   from a marketplace, so `aise integrations install` registers its own `ai-session-search`
+   marketplace in `~/.codex/config.toml` and an MCP-only plugin beside the skill packages, which
+   the user can install from Settings > Integrations > Plugins. The existing `[mcp_servers]` entry
+   keeps serving the tools, and the plugin shares its name, so Codex runs one server. Upgrading
+   adds the plugin to an existing Codex install; uninstall removes the marketplace, the plugin
+   and Codex's record of installing it.
 
 ### Changed
 
