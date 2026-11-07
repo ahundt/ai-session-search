@@ -981,12 +981,13 @@ pub fn stored_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
 }
 
-/// The text form of a timestamp shown to people or emitted in JSON output: the same RFC 3339 UTC
-/// text as [`stored_timestamp`], kept separate so presentation can change without touching the
-/// stored format that SQL comparisons depend on.
+/// The text form of a timestamp shown to people or emitted in JSON output: RFC 3339 in UTC with
+/// a `Z` suffix, exactly what chrono's serde writes for the `DateTime` fields of output structs,
+/// so every surface shows one format. Stored text keeps `+00:00` (see [`stored_timestamp`]),
+/// because `Z` sorts after `.` and would break text ordering across fraction lengths.
 #[allow(clippy::disallowed_methods)]
 pub fn display_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339()
+    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 pub fn preview_from_text(value: &str) -> String {
@@ -2128,6 +2129,24 @@ pub(crate) mod tests {
             assert_eq!(
                 parse_stored_timestamp(&stored_timestamp(instant)),
                 Some(instant)
+            );
+        }
+    }
+
+    #[test]
+    fn displayed_timestamps_match_what_serde_writes_for_the_same_instant() {
+        // JSON built from serde-derived structs and text formatted for output must agree, so a
+        // caller reading `aise list` and `aise messages search` sees one timestamp format.
+        for text in [
+            "2026-06-25T12:00:00Z",
+            "2026-06-25T12:00:00.5Z",
+            "2026-06-25T12:00:00.123456Z",
+            "2026-06-25T12:00:00.123456789Z",
+        ] {
+            let instant = parse_stored_timestamp(text).unwrap();
+            assert_eq!(
+                serde_json::to_value(instant).unwrap(),
+                serde_json::Value::String(display_timestamp(instant))
             );
         }
     }

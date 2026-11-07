@@ -22,6 +22,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    do. `--since 1m` meant 30 days and now means 1 minute; write `--since 1M` for a month.
    Months and years now step back calendar months, so `1M` from March 31 starts on the last
    day of February instead of March 1.
+2. Timestamps in output end in `Z` everywhere. `aise list`, `aise doctor` and exports already
+   wrote `2026-11-07T19:44:17.663Z`, while `messages`, `files`, analytics, parts of MCP and the
+   Python binding wrote `+00:00`; all now use the first form, which chrono's serde, JavaScript's
+   `toISOString` and Python's `datetime.fromisoformat` all read. Stored timestamps are unchanged.
 
 ### Deprecated
 
