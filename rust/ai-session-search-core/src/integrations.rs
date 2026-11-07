@@ -519,6 +519,9 @@ struct Target {
     /// Files an earlier aise wrote this client's entry to that the client never reads. Install
     /// and uninstall remove aise's entry from them, and status reports one left there as stale.
     superseded_paths: Vec<PathBuf>,
+    /// Root of aise's own Codex plugin marketplace, set on the Codex user-config target once the
+    /// aise app directory is known. Codex desktop's Plugins list shows only marketplace plugins.
+    codex_marketplace: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -931,6 +934,7 @@ pub(crate) fn install_with_receipt(
     let (mut targets, instruction_targets, mut skill_targets) =
         args.targets.resolve(args.no_instructions, args.no_skill)?;
     rebase_automatic_skill_roots(&mut skill_targets, default_receipt);
+    attach_codex_marketplace(&mut targets, default_receipt);
     if args.no_mcp {
         targets.clear();
     }
@@ -1228,6 +1232,7 @@ pub(crate) fn status_with_receipt(
     let (mut targets, instruction_targets, mut skill_targets) =
         args.targets.resolve(args.no_instructions, args.no_skill)?;
     rebase_automatic_skill_roots(&mut skill_targets, default_receipt);
+    attach_codex_marketplace(&mut targets, default_receipt);
     if args.no_mcp {
         targets.clear();
     }
@@ -1413,6 +1418,7 @@ pub(crate) fn uninstall_with_receipt(
         .targets
         .resolve(args.keep_instructions, args.keep_skill)?;
     rebase_automatic_skill_roots(&mut skill_targets, default_receipt);
+    attach_codex_marketplace(&mut targets, default_receipt);
     if args.keep_mcp {
         targets.clear();
     }
@@ -1758,15 +1764,32 @@ fn all_standard_discovery_links(
 /// `default_receipt` already lives beside the resolved config file. Custom `--skill-root`
 /// destinations are intentionally left exactly where the caller put them.
 fn rebase_automatic_skill_roots(targets: &mut [SkillTarget], default_receipt: &Path) {
-    let app_root = default_receipt
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let app_root = app_root_of(default_receipt);
     for target in targets
         .iter_mut()
         .filter(|target| target.label != CUSTOM_SKILL_TARGET_LABEL)
     {
         target.root = app_root.join("skills").join(target.package.name);
+    }
+}
+
+/// The aise app directory: where the resolved config, its receipt and the managed packages live.
+fn app_root_of(default_receipt: &Path) -> &Path {
+    default_receipt
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Give the Codex user-config target aise's marketplace beside the skill packages, so a relocated
+/// app config moves it too. A `--codex-config` target is an explicit file and gets none.
+fn attach_codex_marketplace(targets: &mut [Target], default_receipt: &Path) {
+    let root = app_root_of(default_receipt).join("codex-marketplace");
+    for target in targets
+        .iter_mut()
+        .filter(|target| target.format == ConfigFormat::CodexToml && target.label == "codex")
+    {
+        target.codex_marketplace = Some(root.clone());
     }
 }
 
@@ -1849,6 +1872,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             detect_paths: vec![layout.home.join(".codex")],
             detect_binaries: vec!["codex"],
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         }],
         McpClient::Gemini => vec![json_target_with_detect(
             "gemini",
@@ -1914,6 +1938,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             detect_paths: vec![layout.vscode_config_dir()],
             detect_binaries: vec!["code"],
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         }],
         McpClient::Zed => vec![Target {
             label: "zed",
@@ -1930,6 +1955,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
                 .collect(),
             detect_binaries: vec!["zed"],
             superseded_paths: layout.zed_superseded_settings(),
+            codex_marketplace: None,
         }],
         McpClient::Opencode => vec![Target {
             label: "opencode",
@@ -1943,6 +1969,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             detect_paths: vec![layout.home.join(".config").join("opencode")],
             detect_binaries: vec!["opencode"],
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         }],
         McpClient::Openclaw => vec![Target {
             format: ConfigFormat::OpenClaw,
@@ -1961,6 +1988,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
                 detect_paths: vec![layout.home.join(".config").join("kilo")],
                 detect_binaries: vec!["kilo"],
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             json_target(
                 layout,
@@ -2285,6 +2313,7 @@ fn custom_targets(
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             })
         })
         .chain(vscode_configs.iter().map(|path| {
@@ -2295,6 +2324,7 @@ fn custom_targets(
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             })
         }))
         .chain(zed_configs.iter().map(|path| {
@@ -2305,6 +2335,7 @@ fn custom_targets(
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             })
         }))
         .chain(opencode_configs.iter().map(|path| {
@@ -2315,6 +2346,7 @@ fn custom_targets(
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             })
         }))
         .chain(codex_configs.iter().map(|path| {
@@ -2325,6 +2357,7 @@ fn custom_targets(
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             })
         }))
         .collect()
@@ -2352,6 +2385,7 @@ fn json_target_with_detect(
         detect_paths,
         detect_binaries,
         superseded_paths: Vec::new(),
+        codex_marketplace: None,
     }
 }
 
@@ -3271,14 +3305,18 @@ fn refresh_superseded_mcp_entries(
     let mut seen = std::collections::HashSet::new();
     let mut mutations = Vec::new();
     let mut moved = Vec::new();
-    for target in CONCRETE_CLIENTS
+    let mut targets = CONCRETE_CLIENTS
         .into_iter()
         .flat_map(|client| targets_for_layout(client, layout))
-    {
+        .collect::<Vec<_>>();
+    attach_codex_marketplace(&mut targets, receipt_path);
+    for target in targets {
         if !seen.insert(target.path.clone()) {
             continue;
         }
-        let Some(binary) = superseded_entry_command(&target) else {
+        let Some(binary) =
+            superseded_entry_command(&target).or_else(|| codex_entry_without_marketplace(&target))
+        else {
             continue;
         };
         if let Ok(planned) = plan_upsert_target(&target, Path::new(&binary)) {
@@ -3291,6 +3329,28 @@ fn refresh_superseded_mcp_entries(
         execute_planned_transaction_with_links(receipt_path, &mutations, &[], |_, _| Ok(()))?;
     }
     Ok(moved)
+}
+
+/// The executable of aise's current Codex `[mcp_servers]` entry when aise's plugin marketplace is
+/// missing or outdated beside it, as after an upgrade from a release that registered only the
+/// server. `None` when the target has no marketplace root or no current aise entry.
+fn codex_entry_without_marketplace(target: &Target) -> Option<String> {
+    let root = target.codex_marketplace.as_deref()?;
+    if status_codex_mcp_server(&target.path).ok()? != "configured"
+        || codex_marketplace_is_current(&target.path, root)
+    {
+        return None;
+    }
+    let text = read_optional_utf8_regular_file(&target.path)
+        .ok()
+        .flatten()?;
+    let document = text.parse::<toml_edit::DocumentMut>().ok()?;
+    document
+        .get("mcp_servers")?
+        .get(SERVER_NAME)?
+        .get("command")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// The executable named by an aise entry left in one of `target`'s superseded places, if any.
@@ -4059,7 +4119,9 @@ fn plan_remove_superseded(target: &Target) -> Result<Vec<PlannedFileMutation>> {
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
     let binary = binary_config_value(binary)?;
     let mut mutations = match target.format {
-        ConfigFormat::CodexToml => plan_upsert_codex_mcp_server(&target.path, binary)?,
+        ConfigFormat::CodexToml => {
+            plan_upsert_codex_mcp_server(&target.path, binary, target.codex_marketplace.as_deref())?
+        }
         format => plan_upsert_json_server(&target.path, format, json_server_entry(format, binary))?,
     };
     mutations.extend(plan_remove_superseded(target)?);
@@ -4082,7 +4144,9 @@ fn plan_remove_target(target: &Target) -> Result<Vec<PlannedFileMutation>> {
 
 fn plan_remove_target_file(target: &Target) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
-        ConfigFormat::CodexToml => plan_remove_codex_mcp_server(&target.path),
+        ConfigFormat::CodexToml => {
+            plan_remove_codex_mcp_server(&target.path, target.codex_marketplace.as_deref())
+        }
         format => plan_remove_json_server(&target.path, format),
     }
 }
@@ -4099,7 +4163,18 @@ fn status_target(target: &Target) -> Result<&'static str> {
 
 fn status_target_file(target: &Target) -> Result<&'static str> {
     match target.format {
-        ConfigFormat::CodexToml => status_codex_mcp_server(&target.path),
+        ConfigFormat::CodexToml => {
+            let status = status_codex_mcp_server(&target.path)?;
+            Ok(match target.codex_marketplace.as_deref() {
+                Some(root)
+                    if status == "configured"
+                        && !codex_marketplace_is_current(&target.path, root) =>
+                {
+                    "stale"
+                }
+                _ => status,
+            })
+        }
         format => status_json_server(&target.path, format),
     }
 }
@@ -4310,11 +4385,15 @@ fn plan_remove_json_server(path: &Path, format: ConfigFormat) -> Result<Vec<Plan
 fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
     let binary = binary_config_value(binary)?;
     publish_planned_mutations(&normalize_planned_mutations(plan_upsert_codex_mcp_server(
-        path, binary,
+        path, binary, None,
     )?)?)
 }
 
-fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<PlannedFileMutation>> {
+fn plan_upsert_codex_mcp_server(
+    path: &Path,
+    binary: &str,
+    marketplace: Option<&Path>,
+) -> Result<Vec<PlannedFileMutation>> {
     let original = read_optional_utf8_regular_file(path)?;
     let text = original.as_deref().unwrap_or_default();
     let mut document = parse_codex_document(path, text)?;
@@ -4337,6 +4416,35 @@ fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<Planned
         servers.remove(legacy_name);
     }
     servers.insert(SERVER_NAME, toml_edit::Item::Table(server));
+    let mut mutations = Vec::new();
+    if let Some(root) = marketplace {
+        let source = root.to_str().ok_or_else(|| {
+            anyhow!(
+                "the aise Codex marketplace path {} is not valid UTF-8 and cannot be written to {}",
+                root.display(),
+                path.display()
+            )
+        })?;
+        let marketplaces = document
+            .entry("marketplaces")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} has non-table marketplaces; convert it to [marketplaces] before installing aise",
+                    path.display()
+                )
+            })?;
+        // The same keys `codex plugin marketplace add <dir>` writes for a local marketplace.
+        let mut entry = toml_edit::Table::new();
+        entry.insert("source_type", toml_edit::value("local"));
+        entry.insert("source", toml_edit::value(source));
+        marketplaces.insert(SERVER_NAME, toml_edit::Item::Table(entry));
+        for (file, content) in codex_marketplace_files(root, binary)? {
+            let original = read_optional_utf8_regular_file(&file)?;
+            mutations.push(planned_write(&file, &original, content));
+        }
+    }
 
     let content = document.to_string();
     parse_codex_document(path, &content).with_context(|| {
@@ -4345,30 +4453,63 @@ fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<Planned
             path.display()
         )
     })?;
-    Ok(vec![planned_write(path, &original, content)])
+    mutations.insert(0, planned_write(path, &original, content));
+    Ok(mutations)
 }
 
 #[cfg(test)]
 fn remove_codex_mcp_server(path: &Path) -> Result<bool> {
-    let mutations = normalize_planned_mutations(plan_remove_codex_mcp_server(path)?)?;
+    let mutations = normalize_planned_mutations(plan_remove_codex_mcp_server(path, None)?)?;
     let changed = !mutations.is_empty();
     publish_planned_mutations(&mutations)?;
     Ok(changed)
 }
 
-fn plan_remove_codex_mcp_server(path: &Path) -> Result<Vec<PlannedFileMutation>> {
+fn plan_remove_codex_mcp_server(
+    path: &Path,
+    marketplace: Option<&Path>,
+) -> Result<Vec<PlannedFileMutation>> {
+    let mut mutations = Vec::new();
+    if let Some(root) = marketplace {
+        for (file, _) in codex_marketplace_files(root, "")? {
+            if let Some(original) = read_optional_utf8_regular_file(&file)? {
+                mutations.push(PlannedFileMutation::Remove {
+                    path: file,
+                    original,
+                });
+            }
+        }
+    }
     let original = read_optional_utf8_regular_file(path)?;
     let Some(text) = original.as_deref() else {
-        return Ok(Vec::new());
+        return Ok(mutations);
     };
     let mut document = parse_codex_document(path, text)?;
-    let removed = document
+    let mut removed = document
         .get_mut("mcp_servers")
         .and_then(toml_edit::Item::as_table_mut)
         .is_some_and(remove_owned_toml_server_entries);
-    if !removed {
-        Ok(Vec::new())
-    } else {
+    if marketplace.is_some() {
+        // The marketplace aise registered, and the install record Codex adds when the user
+        // installs its plugin, which would otherwise point at a marketplace that no longer exists.
+        let installed = format!("{SERVER_NAME}@{SERVER_NAME}");
+        for (table, key) in [
+            ("marketplaces", SERVER_NAME),
+            ("plugins", installed.as_str()),
+        ] {
+            let Some(entries) = document
+                .get_mut(table)
+                .and_then(toml_edit::Item::as_table_mut)
+            else {
+                continue;
+            };
+            removed |= entries.remove(key).is_some();
+            if entries.is_empty() {
+                document.remove(table);
+            }
+        }
+    }
+    if removed {
         let content = document.to_string();
         parse_codex_document(path, &content).with_context(|| {
             format!(
@@ -4376,8 +4517,125 @@ fn plan_remove_codex_mcp_server(path: &Path) -> Result<Vec<PlannedFileMutation>>
                 path.display()
             )
         })?;
-        Ok(vec![planned_write(path, &original, content)])
+        mutations.insert(0, planned_write(path, &original, content));
     }
+    Ok(mutations)
+}
+
+/// The developer name Codex shows for the plugin; Cargo.toml carries no `authors`.
+const CODEX_PLUGIN_DEVELOPER: &str = "Andrew Hundt";
+
+/// The three files of aise's Codex marketplace under `root`, with their content: the
+/// marketplace listing, and an MCP-only plugin whose manifest names no skills, because the skill
+/// already reaches Codex through `~/.agents/skills` and a plugin copy would list it twice. The
+/// listing uses `AVAILABLE`, so the plugin appears for the user to install; the bare
+/// `[mcp_servers]` entry already serves the tools under the same name, and Codex runs one server.
+fn codex_marketplace_files(root: &Path, binary: &str) -> Result<Vec<(PathBuf, String)>> {
+    let plugin = root.join("plugins").join(SERVER_NAME);
+    let listing = json!({
+        "name": SERVER_NAME,
+        "interface": {"displayName": "AI Session Search"},
+        "plugins": [{
+            "name": SERVER_NAME,
+            "source": {"source": "local", "path": format!("./plugins/{SERVER_NAME}")},
+            "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+            "category": "Productivity",
+        }],
+    });
+    let manifest = json!({
+        "name": SERVER_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": env!("CARGO_PKG_DESCRIPTION"),
+        "author": {"name": CODEX_PLUGIN_DEVELOPER},
+        "homepage": env!("CARGO_PKG_HOMEPAGE"),
+        "repository": env!("CARGO_PKG_REPOSITORY"),
+        "license": env!("CARGO_PKG_LICENSE"),
+        "mcpServers": "./.mcp.json",
+        "interface": {
+            "displayName": "AI Session Search",
+            "shortDescription": "Search your local AI coding sessions",
+            "longDescription": env!("CARGO_PKG_DESCRIPTION"),
+            "developerName": CODEX_PLUGIN_DEVELOPER,
+            "category": "Productivity",
+            "capabilities": ["Read"],
+            "websiteURL": env!("CARGO_PKG_HOMEPAGE"),
+        },
+    });
+    let servers = json!({"mcpServers": {SERVER_NAME: json_server_entry(
+        ConfigFormat::JsonMcpServers,
+        binary,
+    )}});
+    let pretty =
+        |value: &Value| Ok::<_, anyhow::Error>(serde_json::to_string_pretty(value)? + "\n");
+    Ok(vec![
+        (
+            root.join(".agents")
+                .join("plugins")
+                .join("marketplace.json"),
+            pretty(&listing)?,
+        ),
+        (
+            plugin.join(".codex-plugin").join("plugin.json"),
+            pretty(&manifest)?,
+        ),
+        (plugin.join(".mcp.json"), pretty(&servers)?),
+    ])
+}
+
+/// Whether `config` registers aise's marketplace at `root` and its files are aise's. The plugin
+/// version and the executable are not compared, so neither an upgrade nor `--binary` alone makes
+/// the plugin read stale; the listing and the manifest must match this build's otherwise.
+fn codex_marketplace_is_current(config: &Path, root: &Path) -> bool {
+    let registered = read_optional_utf8_regular_file(config)
+        .ok()
+        .flatten()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .is_some_and(|document| {
+            let field = |key: &str| {
+                document
+                    .get("marketplaces")
+                    .and_then(|marketplaces| marketplaces.get(SERVER_NAME))
+                    .and_then(|entry| entry.get(key))
+                    .and_then(toml_edit::Item::as_str)
+                    .map(str::to_string)
+            };
+            field("source_type").as_deref() == Some("local")
+                && field("source").as_deref() == root.to_str()
+        });
+    let Ok(expected) = codex_marketplace_files(root, "") else {
+        return false;
+    };
+    let read_json = |path: &Path| {
+        read_optional_utf8_regular_file(path)
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    };
+    let [(listing, listing_text), (manifest, manifest_text), (servers, _)] = expected.as_slice()
+    else {
+        return false;
+    };
+    let same_except = |path: &Path, text: &str, ignored: &str| {
+        let (Some(mut found), Ok(mut wanted)) =
+            (read_json(path), serde_json::from_str::<Value>(text))
+        else {
+            return false;
+        };
+        for value in [&mut found, &mut wanted] {
+            if let Some(object) = value.as_object_mut() {
+                object.remove(ignored);
+            }
+        }
+        found == wanted
+    };
+    registered
+        && same_except(listing, listing_text, "")
+        && same_except(manifest, manifest_text, "version")
+        && read_json(servers).is_some_and(|servers| {
+            servers["mcpServers"]
+                .get(SERVER_NAME)
+                .is_some_and(|entry| json_entry_is_current(entry, ConfigFormat::JsonMcpServers))
+        })
 }
 
 fn parse_codex_document(path: &Path, text: &str) -> Result<toml_edit::DocumentMut> {
@@ -5155,6 +5413,7 @@ mod tests {
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         };
         assert_eq!(status_target(&target).unwrap(), "not configured");
 
@@ -5367,6 +5626,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Path::new("/bin/aise"),
         )
@@ -5379,6 +5639,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Path::new("/bin/aise"),
         )
@@ -5423,6 +5684,7 @@ mod tests {
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         };
         assert_eq!(status_target(&target).unwrap(), "stale");
 
@@ -5456,6 +5718,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Target {
                 label: "vscode",
@@ -5464,6 +5727,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Target {
                 label: "zed",
@@ -5472,6 +5736,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Target {
                 label: "opencode",
@@ -5480,6 +5745,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Target {
                 label: "codex",
@@ -5488,6 +5754,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
         ];
 
@@ -5505,6 +5772,97 @@ mod tests {
             assert!(remove_target(target).unwrap());
             assert_eq!(status_target(target).unwrap(), "not configured");
         }
+    }
+
+    /// Codex desktop's Plugins list shows only marketplace plugins
+    /// (https://developers.openai.com/codex/plugins/build). aise registers its own marketplace,
+    /// `ai-session-search`, the way `codex plugin marketplace add <dir>` does, and lists an
+    /// MCP-only plugin in it: the skill already reaches Codex through `~/.agents/skills`, and a
+    /// plugin copy would list it twice. The shared personal marketplace is never edited.
+    #[test]
+    fn codex_registers_an_aise_marketplace_with_an_mcp_only_plugin() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("home/.codex/config.toml");
+        let root = dir.path().join("app/codex-marketplace");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "# mine\n[existing]\nvalue = true\n").unwrap();
+        let target = Target {
+            label: "codex",
+            path: config.clone(),
+            format: ConfigFormat::CodexToml,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+            superseded_paths: Vec::new(),
+            codex_marketplace: Some(root.clone()),
+        };
+        assert_eq!(status_target(&target).unwrap(), "not configured");
+
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        let toml = fs::read_to_string(&config).unwrap();
+        let marketplace = root.join(".agents/plugins/marketplace.json");
+        let plugin = root.join("plugins").join(SERVER_NAME);
+        let snapshot = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .map(|path| fs::read_to_string(path).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let files = [
+            config.clone(),
+            marketplace.clone(),
+            plugin.join(".codex-plugin/plugin.json"),
+            plugin.join(".mcp.json"),
+        ];
+        let first = snapshot(&files);
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        assert_eq!(snapshot(&files), first, "reinstall is byte-idempotent");
+
+        let document: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert!(toml.contains("# mine") && toml.contains("[existing]"));
+        assert_eq!(
+            document["marketplaces"][SERVER_NAME]["source_type"].as_str(),
+            Some("local")
+        );
+        assert_eq!(
+            document["marketplaces"][SERVER_NAME]["source"].as_str(),
+            root.to_str()
+        );
+        let listed: Value = serde_json::from_str(&first[1]).unwrap();
+        assert_eq!(listed["name"], SERVER_NAME);
+        assert_eq!(listed["plugins"][0]["name"], SERVER_NAME);
+        assert_eq!(
+            listed["plugins"][0]["source"]["path"],
+            "./plugins/ai-session-search"
+        );
+        let manifest: Value = serde_json::from_str(&first[2]).unwrap();
+        assert_eq!(manifest["mcpServers"], "./.mcp.json");
+        assert!(
+            manifest.get("skills").is_none(),
+            "the skill comes from ~/.agents/skills"
+        );
+        let servers: Value = serde_json::from_str(&first[3]).unwrap();
+        assert_eq!(
+            servers["mcpServers"][SERVER_NAME],
+            json!({"command": "/bin/aise", "args": ["mcp", "serve"]})
+        );
+        assert_eq!(status_target(&target).unwrap(), "configured");
+
+        fs::remove_file(plugin.join(".mcp.json")).unwrap();
+        assert_eq!(status_target(&target).unwrap(), "stale");
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+
+        // Installing the plugin from Codex's Plugins page records it under [plugins].
+        let installed = format!(
+            "{}\n[plugins.\"{SERVER_NAME}@{SERVER_NAME}\"]\nenabled = true\n",
+            fs::read_to_string(&config).unwrap()
+        );
+        fs::write(&config, installed).unwrap();
+        assert!(remove_target(&target).unwrap());
+        let left = fs::read_to_string(&config).unwrap();
+        assert!(!left.contains(SERVER_NAME), "{left}");
+        assert!(left.contains("# mine") && left.contains("[existing]"));
+        assert!(!marketplace.exists() && !plugin.join(".mcp.json").exists());
+        assert_eq!(status_target(&target).unwrap(), "not configured");
     }
 
     #[test]
@@ -5675,6 +6033,7 @@ mod tests {
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         };
         let binary = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/aise-\xff".to_vec()));
 
@@ -7152,6 +7511,44 @@ mod tests {
             !home.join(".config/zed/settings.json").exists(),
             "a client with no aise entry is never configured by an upgrade"
         );
+    }
+
+    /// An earlier release registered only `[mcp_servers]` with Codex; the first command after the
+    /// upgrade adds aise's plugin marketplace with the executable that entry names, while a home
+    /// whose Codex config has no aise entry is left without one.
+    #[test]
+    fn an_upgrade_adds_the_codex_marketplace_to_an_existing_codex_entry() {
+        let dir = tempdir().unwrap();
+        let (receipt, layout) = home_with_rc1_instructions(dir.path());
+        let config = layout.home.join(".codex/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            "[mcp_servers.ai-session-search]\ncommand = \"/custom/aise\"\nargs = [\"mcp\", \"serve\"]\n",
+        )
+        .unwrap();
+
+        let UpgradeRefresh::Checked { mcp, .. } =
+            refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap()
+        else {
+            panic!("the recorded install must be checked");
+        };
+        assert_eq!(mcp, std::slice::from_ref(&config));
+        let mut targets = targets_for_layout(McpClient::Codex, &layout);
+        attach_codex_marketplace(&mut targets, &receipt);
+        assert_eq!(status_target(&targets[0]).unwrap(), "configured");
+        let servers = app_root_of(&receipt)
+            .join("codex-marketplace/plugins")
+            .join(SERVER_NAME)
+            .join(".mcp.json");
+        assert!(fs::read_to_string(servers)
+            .unwrap()
+            .contains("/custom/aise"));
+
+        let empty = tempdir().unwrap();
+        let (receipt, layout) = home_with_rc1_instructions(empty.path());
+        refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap();
+        assert!(!app_root_of(&receipt).join("codex-marketplace").exists());
     }
 
     #[test]
@@ -8693,6 +9090,7 @@ mod tests {
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         };
 
         assert!(!target_detected(&target));
@@ -8710,6 +9108,7 @@ mod tests {
             detect_paths: vec![client_dir],
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         };
 
         assert!(target_detected(&target));
@@ -8775,6 +9174,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Target {
                 label: "antigravity cli",
@@ -8783,6 +9183,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Target {
                 label: "antigravity legacy",
@@ -8791,6 +9192,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
             Target {
                 label: "opencode",
@@ -8799,6 +9201,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
+                codex_marketplace: None,
             },
         ];
 
@@ -8849,6 +9252,7 @@ mod tests {
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
+            codex_marketplace: None,
         }
     }
 
