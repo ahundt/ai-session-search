@@ -208,8 +208,8 @@ def test_message_classification_public_result_names_and_fields_are_pinned() -> N
 
 def test_advanced_facade_exports_every_session_search_result_type() -> None:
     module_path = Path(native.__file__)
-    stub = ast.parse(module_path.with_name("_native.pyi").read_text())
-    facade_stub = ast.parse(module_path.with_suffix(".pyi").read_text())
+    stub = ast.parse(module_path.with_name("_native.pyi").read_text(encoding="utf-8"))
+    facade_stub = ast.parse(module_path.with_suffix(".pyi").read_text(encoding="utf-8"))
     session_search = next(node for node in stub.body if isinstance(node, ast.ClassDef) and node.name == "SessionSearch")
     extension_classes = {node.name for node in stub.body if isinstance(node, ast.ClassDef)}
     returned_result_types = {

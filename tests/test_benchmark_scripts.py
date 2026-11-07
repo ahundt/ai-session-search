@@ -49,7 +49,7 @@ def test_release_manifest_rust_driver_uses_only_canonical_query_modes() -> None:
 
 
 def test_rust_benchmark_driver_uses_the_canonical_versioned_response() -> None:
-    source = (ROOT / "rust/ai-session-search-core/examples/benchmark_core.rs").read_text()
+    source = (ROOT / "rust/ai-session-search-core/examples/benchmark_core.rs").read_text(encoding="utf-8")
 
     assert "search_legacy" not in source
     assert "MessageSearchRequest::builder" in source
@@ -133,14 +133,14 @@ def test_temporal_overlap_oracle_uses_closed_session_spans(tmp_path: Path) -> No
 
 
 def test_temporal_oracle_is_release_blocking_for_candidate_not_historical_baseline() -> None:
-    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    source = (ROOT / "scripts/benchmark_release.py").read_text(encoding="utf-8")
 
     assert 'label == "candidate" and not sample["temporal_oracle_match"]' in source
     assert 'sample["temporal_oracle_match"]' in source
 
 
 def test_generated_fixture_has_point_spans_multi_day_spans_and_all_provider_isolation() -> None:
-    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    source = (ROOT / "scripts/benchmark_release.py").read_text(encoding="utf-8")
     config = load_script("benchmark_release.py").generated_fixture_config()
 
     assert "session_number % 2 == 0" in source
@@ -326,7 +326,7 @@ def test_generated_fixture_reindex_cannot_reach_the_running_user_s_transcripts()
     # do not know a name. Pointing HOME at the fixture directory makes the default roots resolve
     # inside it, so the reindex is hermetic whatever the config says and whatever the binary
     # knows.
-    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    source = (ROOT / "scripts/benchmark_release.py").read_text(encoding="utf-8")
     reindex = source.split("def generate_fixture(", 1)[1].split("connection = sqlite3.connect", 1)[0]
 
     assert "env=" in reindex, (
@@ -338,7 +338,7 @@ def test_generated_fixture_reindex_cannot_reach_the_running_user_s_transcripts()
 
 
 def test_generated_fixture_populates_canonical_tui_preview_transcripts() -> None:
-    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    source = (ROOT / "scripts/benchmark_release.py").read_text(encoding="utf-8")
     generator = source.split("def generate_fixture(", 1)[1].split("def metadata(", 1)[0]
     assert "insert into transcripts" in generator
     assert "transcript_lines" in generator
@@ -346,13 +346,13 @@ def test_generated_fixture_populates_canonical_tui_preview_transcripts() -> None
 
 
 def test_benchmark_help_does_not_claim_an_obsolete_fixture_schema() -> None:
-    source = (ROOT / "scripts/benchmark_release.py").read_text()
+    source = (ROOT / "scripts/benchmark_release.py").read_text(encoding="utf-8")
 
     assert "schema-v4" not in source
 
 
 def test_mcp_benchmark_client_uses_only_canonical_search_contract() -> None:
-    source = (ROOT / "benchmarks/mcp_client.py").read_text()
+    source = (ROOT / "benchmarks/mcp_client.py").read_text(encoding="utf-8")
 
     assert '"response_format"' not in source
     assert '["structuredContent"]["hits"]' not in source
@@ -362,7 +362,7 @@ def test_mcp_benchmark_client_uses_only_canonical_search_contract() -> None:
 
 
 def test_python_benchmark_client_uses_only_canonical_search_contract() -> None:
-    source = (ROOT / "benchmarks/python_client.py").read_text()
+    source = (ROOT / "benchmarks/python_client.py").read_text(encoding="utf-8")
 
     assert ".hits" not in source
     assert ".results" in source
@@ -370,7 +370,7 @@ def test_python_benchmark_client_uses_only_canonical_search_contract() -> None:
 
 def test_benchmark_clients_do_not_use_removed_query_mode_flags() -> None:
     for name in ("burst_client.py", "mcp_client.py", "python_client.py", "tui_client.py"):
-        source = (ROOT / "benchmarks" / name).read_text()
+        source = (ROOT / "benchmarks" / name).read_text(encoding="utf-8")
         assert '"--fuzzy"' not in source, name
         assert '"--regex"' not in source, name
 
@@ -388,7 +388,7 @@ def test_tui_client_imports_without_unix_only_modules(
 
 def test_tui_client_latency_case_is_registered_and_opt_in() -> None:
     """The latency measurement is a separate manifest case; the startup case stays untouched."""
-    source = (ROOT / "benchmarks" / "tui_client.py").read_text()
+    source = (ROOT / "benchmarks" / "tui_client.py").read_text(encoding="utf-8")
     assert '"--measure-latency"' in source
     assert '"--queries"' in source
     assert '"--repetitions"' in source
@@ -988,7 +988,7 @@ def test_tui_semantic_probe_rejects_equal_count_wrong_membership(
 
 def test_tui_result_limit_protocol_matches_rust_browser_floor() -> None:
     client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
-    source = (ROOT / "rust/ai-session-search-core/src/tui.rs").read_text()
+    source = (ROOT / "rust/ai-session-search-core/src/tui.rs").read_text(encoding="utf-8")
     match = re.search(r"const TUI_MIN_BROWSER_RESULTS: usize = (\d+);", source)
     assert match is not None
     assert client.TUI_RESULT_LIMIT == int(match.group(1))
