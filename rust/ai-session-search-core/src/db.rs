@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -348,7 +348,6 @@ const AUTO_REINDEX_FRESHNESS_SQL: &str =
      join index_metadata word3 on word3.key = ?5
      where completed.key = ?1";
 const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
-const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
 const CORRECTION_CANDIDATES_SQL: &str =
     "select m.id, m.session_id, m.seq, m.provider, m.ts, m.content, m.authorship
      from messages m
@@ -957,14 +956,11 @@ impl Db {
 
     pub fn auto_reindex_completed_at(&self) -> Result<Option<DateTime<Utc>>> {
         if let Some(value) = self.index_metadata_i64(AUTO_REINDEX_COMPLETED_NS_KEY)? {
-            return Ok(DateTime::from_timestamp(
-                value.div_euclid(NANOSECONDS_PER_SECOND),
-                value.rem_euclid(NANOSECONDS_PER_SECOND) as u32,
-            ));
+            return Ok(crate::util::parse_unix_nanos(value));
         }
         Ok(self
             .index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY)?
-            .and_then(|value| Utc.timestamp_millis_opt(value).single()))
+            .and_then(crate::util::parse_unix_millis))
     }
 
     pub(crate) fn mark_auto_reindex_complete_at(&self, completed_at: DateTime<Utc>) -> Result<()> {
@@ -7558,9 +7554,7 @@ mod tests {
     }
 
     fn utc(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+        crate::util::parse_datetime(value).unwrap()
     }
 
     #[test]
@@ -9303,7 +9297,7 @@ mod tests {
         assert!(!second
             .auto_reindex_is_fresh_at(COMPLETED_MS, INTERVAL_MS)
             .unwrap());
-        let completed_at = Utc.timestamp_millis_opt(COMPLETED_MS).single().unwrap()
+        let completed_at = crate::util::parse_unix_millis(COMPLETED_MS).unwrap()
             + chrono::Duration::nanoseconds(456_789);
         first.mark_auto_reindex_complete_at(completed_at).unwrap();
         assert_eq!(
@@ -12994,11 +12988,11 @@ mod tests {
         assert_eq!(profile.timestamped_messages, 3);
         assert_eq!(profile.undated_messages, 1);
         assert_eq!(
-            profile.first_timestamp.unwrap().to_rfc3339(),
+            crate::util::display_timestamp(profile.first_timestamp.unwrap()),
             "2026-01-01T00:00:00.100+00:00"
         );
         assert_eq!(
-            profile.last_timestamp.unwrap().to_rfc3339(),
+            crate::util::display_timestamp(profile.last_timestamp.unwrap()),
             "2026-04-30T00:00:00.300+00:00"
         );
         assert_eq!(profile.observed_span_seconds, Some(10_281_600));
@@ -14129,11 +14123,8 @@ mod tests {
         // A time window neither reduces match density much nor is cheap to replace, and it
         // measured 1.29x at --since 3d and 10.48x at --since 1y, so it stays eligible.
         assert!(
-            with(|f| f.since = Some(
-                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00+00:00")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc)
-            )),
+            with(|f| f.since =
+                Some(crate::util::parse_datetime("2020-01-01T00:00:00+00:00").unwrap())),
             "a time window must stay eligible for the index-ordered page"
         );
     }
@@ -15942,7 +15933,7 @@ mod tests {
                  values('claude:s1','claude','s1','','/x','v1','jsonl');",
             )
             .unwrap();
-        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+        let base = crate::util::parse_datetime("2026-01-01T00:00:00Z").unwrap();
         let n = 600i64;
         {
             let tx = db.conn.unchecked_transaction().unwrap();
@@ -15958,7 +15949,7 @@ mod tests {
                     )
                     .unwrap();
                 for i in 0..n {
-                    let ts = (base + chrono::Duration::seconds(i)).to_rfc3339();
+                    let ts = stored_timestamp(base + chrono::Duration::seconds(i));
                     let content = if i % 5 == 0 {
                         format!("row-{i} you forgot the tests")
                     } else {

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
+# Standard pathways for dates and times. CI runs clippy with -D warnings, so a call listed here
+# fails the build with its reason. A sanctioned exception carries
+# #[allow(clippy::disallowed_methods)] at the call site with a comment naming why: the pathway
+# itself in util.rs, user-facing input in dates.rs (deliberately permissive), or a harness's own
+# on-disk format in its provider.
+disallowed-methods = [
+    { path = "chrono::DateTime::parse_from_rfc3339", reason = "read stored timestamps with util::parse_datetime; parse --since/--until/--when input with dates.rs" },
+    { path = "chrono::DateTime::parse_from_str", reason = "read stored timestamps with util::parse_datetime; parse user input with dates.rs; a harness's on-disk format is parsed in its provider with an #[allow] naming the format" },
+    { path = "chrono::NaiveDateTime::parse_from_str", reason = "read stored timestamps with util::parse_datetime; parse user input with dates.rs; a harness's on-disk format is parsed in its provider with an #[allow] naming the format" },
+    { path = "chrono::NaiveDate::parse_from_str", reason = "read stored timestamps with util::parse_datetime; parse user input with dates.rs; a harness's on-disk format is parsed in its provider with an #[allow] naming the format" },
+    { path = "chrono::DateTime::from_timestamp", reason = "convert Unix time with util::parse_unix_seconds or util::parse_unix_nanos" },
+    { path = "chrono::DateTime::from_timestamp_millis", reason = "convert Unix time with util::parse_unix_millis" },
+    { path = "chrono::DateTime::from_timestamp_micros", reason = "convert Unix time with util::parse_unix_seconds, parse_unix_millis or parse_unix_nanos" },
+    { path = "chrono::DateTime::from_timestamp_nanos", reason = "convert Unix time with util::parse_unix_nanos" },
+    { path = "chrono::TimeZone::timestamp_opt", reason = "convert Unix time with util::parse_unix_seconds or util::parse_unix_nanos" },
+    { path = "chrono::TimeZone::timestamp_millis_opt", reason = "convert Unix time with util::parse_unix_millis" },
+    { path = "chrono::TimeZone::timestamp_nanos", reason = "convert Unix time with util::parse_unix_nanos" },
+    { path = "chrono::DateTime::to_rfc3339", reason = "write timestamps stored in SQLite with util::stored_timestamp and timestamps shown to people or emitted as JSON with util::display_timestamp" },
+]

@@ -278,7 +278,7 @@ fn rows(db: &Db) -> Vec<Row> {
                 h.role.as_str().to_string(),
                 h.tool_name.clone(),
                 h.content.clone(),
-                h.ts.map(|t| t.to_rfc3339()),
+                h.ts.map(ai_session_search::util::display_timestamp),
             )
         })
         .collect()

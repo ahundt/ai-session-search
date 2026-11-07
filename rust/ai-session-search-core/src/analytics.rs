@@ -184,7 +184,9 @@ impl Row for MessageClassificationMatch {
         vec![
             self.session_id.clone(),
             self.message_seq.to_string(),
-            self.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
+            self.ts
+                .map(crate::util::display_timestamp)
+                .unwrap_or_default(),
             self.policy_name.clone(),
             self.category.clone(),
             self.matched_text.clone(),
@@ -628,7 +630,7 @@ impl RepeatGroupExample {
         Self {
             session_id: hit.session_id.clone(),
             seq: hit.seq,
-            ts: hit.ts.map(|ts| ts.to_rfc3339()),
+            ts: hit.ts.map(crate::util::display_timestamp),
             preview: truncate_for_display(repeat_mining_text(&hit.content), TABLE_CONTENT_CHARS),
             context_command: context_command(&hit.session_id, hit.seq, context),
         }

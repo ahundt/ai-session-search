@@ -66,7 +66,7 @@ fn indexed() -> (tempfile::TempDir, Db) {
 }
 
 fn at(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    ai_session_search::util::parse_datetime(s).unwrap()
 }
 
 #[test]

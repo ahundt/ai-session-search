@@ -477,9 +477,9 @@ mod tests {
 
         for (filename, expected) in cases {
             assert_eq!(
-                timestamp_from_filename(Path::new(filename))
-                    .unwrap()
-                    .to_rfc3339(),
+                crate::util::display_timestamp(
+                    timestamp_from_filename(Path::new(filename)).unwrap()
+                ),
                 expected
             );
         }
