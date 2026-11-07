@@ -5548,6 +5548,7 @@ fn push_session_filters(
 /// hour, and minute periods to the final nanosecond while preserving explicit RFC3339 instants.
 /// Always rendering nine fractional digits makes lexicographic SQLite comparison agree with
 /// chronological order and preserves an exact fractional bound for race reconstruction.
+#[allow(clippy::disallowed_methods)] // the nine-digit form is this bound's contract; see above
 fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
     until.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
 }
