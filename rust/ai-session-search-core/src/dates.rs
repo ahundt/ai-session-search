@@ -15,11 +15,13 @@
 //!     phrase (e.g. `8pm`) is intentionally ignored — use an ISO datetime for second
 //!     precision.
 //!   * **ISO datetimes** (full and partial-precision `…T14`, `…T14:30`) and the
-//!     **duration shorthand** (`7d 2w 1m 24h 30min 1y`) → `chrono` arithmetic;
-//!     these are not EDTF and not standard NLP.
-//!     The shorthand is parsed here on purpose: `1m` means 30 days in this grammar,
-//!     while general-purpose duration parsers such as `humantime` read `m` as minutes,
-//!     so adopting one would change what existing commands select.
+//!     **duration shorthand** (`7d 2w 24h 30m 1M 1y`) → `chrono` arithmetic;
+//!     these are not EDTF and not standard NLP. The units follow humantime and systemd:
+//!     `m` is minutes and `M` months (ISO 8601 writes the same split as `PT1M` and `P1M`).
+//!     Months and years are calendar months via `chrono`'s `checked_sub_months`, not fixed
+//!     day counts. No dependency we carry parses this shorthand with calendar months
+//!     (humantime and jiff use fixed or differently spelled months), so the token match
+//!     lives here and every date computation is chrono's.
 //!
 //! Every input resolves to a `(start, end)` pair of UTC instants:
 //!   * a fuzzy period (date, month, year, decade, century, unspecified-digit day) →
@@ -45,7 +47,7 @@
 //! `db.rs` (uniform `+00:00` rfc3339) remains the storage-side filter.
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Timelike, Utc};
 use clap::Args;
 use edtf::level_1::{Date as EdtfDate, Edtf, Precision, Season};
 use interim::{parse_date_string, Dialect};
@@ -153,7 +155,7 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
         bail!("empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `aise dates`)");
     }
 
-    // 1. Duration shorthand (7d 2w 1m 24h 30min 1y) — not EDTF or natural language.
+    // 1. Duration shorthand (7d 2w 1M 24h 30m 1y) — not EDTF or natural language.
     //    Resolves to the window [now - delta, now]: `--since 7d` starts 7 days back,
     //    `--until 7d` ends now, and `--when 7d` covers the last 7 days. Built with
     //    checked arithmetic so an absurd magnitude errors cleanly instead of panicking
@@ -162,19 +164,30 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
         let n: i64 = caps[1]
             .parse()
             .map_err(|_| anyhow!("duration number too large in '{s}'"))?;
-        let delta = match caps[2].to_ascii_lowercase().as_str() {
-            "d" => Duration::try_days(n),
-            "w" => Duration::try_weeks(n),
-            "h" => Duration::try_hours(n),
-            "min" => Duration::try_minutes(n),
-            "m" => n.checked_mul(30).and_then(Duration::try_days), // 1m ≈ 30 days
-            "y" => n.checked_mul(365).and_then(Duration::try_days), // 1y ≈ 365 days
-            other => bail!("unsupported duration unit '{other}'"),
+        // Lowercase `m` is minutes and uppercase `M` months, as in humantime and systemd;
+        // other units ignore case. Months and years step back calendar months with chrono,
+        // clamping to the last day of a shorter month, so `1M` from March 31 starts on the last
+        // day of February. Checked arithmetic turns an absurd magnitude into an error.
+        let unit = &caps[2];
+        let months = |count: i64| {
+            u32::try_from(count)
+                .ok()
+                .and_then(|count| now.checked_sub_months(Months::new(count)))
+        };
+        let start = match unit {
+            "m" => Duration::try_minutes(n).and_then(|delta| now.checked_sub_signed(delta)),
+            "M" => months(n),
+            _ => match unit.to_ascii_lowercase().as_str() {
+                "min" => Duration::try_minutes(n).and_then(|delta| now.checked_sub_signed(delta)),
+                "mo" => months(n),
+                "y" => n.checked_mul(12).and_then(months),
+                "d" => Duration::try_days(n).and_then(|delta| now.checked_sub_signed(delta)),
+                "w" => Duration::try_weeks(n).and_then(|delta| now.checked_sub_signed(delta)),
+                "h" => Duration::try_hours(n).and_then(|delta| now.checked_sub_signed(delta)),
+                other => bail!("unsupported duration unit '{other}'"),
+            },
         }
         .ok_or_else(|| anyhow!("duration '{s}' is out of range"))?;
-        let start = now
-            .checked_sub_signed(delta)
-            .ok_or_else(|| anyhow!("duration '{s}' is out of range"))?;
         return Ok((start, now));
     }
 
@@ -247,7 +260,7 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
 
     bail!(
         "unrecognized date/time '{input}' — try 2026-01-15, 2026-01, 2026, 202X, 2026-01-1X, \
-         2026-01/2026-03, 7d, 2w, 1m, 24h, 1y, yesterday, '3 days ago' (run `aise dates`)"
+         2026-01/2026-03, 7d, 2w, 1M, 24h, 1y, yesterday, '3 days ago' (run `aise dates`)"
     )
 }
 
@@ -373,7 +386,9 @@ fn parse_iso_dt(s: &str) -> Result<DateTime<Utc>> {
 
 fn duration_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(\d+)(min|[dwmhy])$").expect("valid duration regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"^(\d+)((?i:min|mo)|[dwhyDWHY]|m|M)$").expect("valid duration regex")
+    })
 }
 
 fn datelike_re() -> &'static Regex {
@@ -416,7 +431,7 @@ pub fn format_reference() -> String {
         "  2026-01/2026-03       interval   → start of A .. end of B",
         "",
         "Duration shorthand (the window [now - N, now]):",
-        "  7d 2w 1m 24h 30min 1y   (m ≈ 30 days, y ≈ 365 days)",
+        "  7d 2w 24h 30m 1M 1y     (m = minutes, M or mo = calendar months, y = calendar years)",
         "",
         "Natural language (via the `interim` crate; day-granular):",
         "  today  yesterday  \"3 days ago\"  \"last friday\"",
@@ -457,13 +472,35 @@ mod tests {
         assert_eq!(span("2h"), (now() - Duration::hours(2), now()));
         assert_eq!(span("2d"), (now() - Duration::days(2), now()));
         assert_eq!(span("30min"), (now() - Duration::minutes(30), now()));
-        assert_eq!(span("1m"), (now() - Duration::days(30), now())); // m ≈ 30 days
-        assert_eq!(span("1y"), (now() - Duration::days(365), now())); // y ≈ 365 days
-                                                                      // The window is non-empty: start strictly before end.
+        // Lowercase m is minutes and uppercase M is calendar months, as in humantime and
+        // systemd; ISO 8601 writes the same split as PT1M and P1M.
+        assert_eq!(span("5m"), (now() - Duration::minutes(5), now()));
+        assert_eq!(span("1M"), (iso("2026-05-25T12:00:00Z"), now()));
+        assert_eq!(span("1mo"), span("1M"));
+        assert_eq!(span("30min"), span("30m"));
+        assert_eq!(span("1y"), (iso("2025-06-25T12:00:00Z"), now()));
+        assert_eq!(span("2Y"), (iso("2024-06-25T12:00:00Z"), now()));
+        // The window is non-empty: start strictly before end.
         let (start, end) = span("7d");
         assert!(start < end);
         // Case-insensitive unit.
         assert_eq!(span("24H"), (now() - Duration::hours(24), now()));
+    }
+
+    #[test]
+    fn calendar_months_clamp_to_the_last_day_of_a_shorter_month() {
+        // Fixed 30-day months started a "1M" window on 2026-03-01 from 2026-03-31; a calendar
+        // month back from March 31 is the last day of February.
+        let march_31 = iso("2026-03-31T08:00:00Z");
+        assert_eq!(
+            parse_span("1M", march_31).unwrap().0,
+            iso("2026-02-28T08:00:00Z")
+        );
+        let leap_day = iso("2024-02-29T08:00:00Z");
+        assert_eq!(
+            parse_span("1y", leap_day).unwrap().0,
+            iso("2023-02-28T08:00:00Z")
+        );
     }
 
     #[test]
@@ -707,7 +744,8 @@ mod tests {
             "2w",
             "24h",
             "30min",
-            "1m",
+            "5m",
+            "1M",
             "1y",
             "2026-01-15T14:30:25",
             "2026-01-15T14",

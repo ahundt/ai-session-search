@@ -16,6 +16,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
    and deletes nothing. See Fixed item 6.
 
+### Changed
+
+1. Duration shorthand reads `m` as minutes and `M` or `mo` as months, as humantime and systemd
+   do. `--since 1m` meant 30 days and now means 1 minute; write `--since 1M` for a month.
+   Months and years now step back calendar months, so `1M` from March 31 starts on the last
+   day of February instead of March 1.
+
 ### Deprecated
 
 1. `Db::purge_injected_messages`: it now relabels through `Db::classify_injected_messages`
