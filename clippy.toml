@@ -18,7 +18,8 @@ disallowed-methods = [
     { path = "chrono::TimeZone::timestamp_opt", reason = "convert Unix time with util::parse_unix_seconds or util::parse_unix_nanos" },
     { path = "chrono::TimeZone::timestamp_millis_opt", reason = "convert Unix time with util::parse_unix_millis" },
     { path = "chrono::TimeZone::timestamp_nanos", reason = "convert Unix time with util::parse_unix_nanos" },
-    { path = "chrono::DateTime::to_rfc3339", reason = "write timestamps stored in SQLite with util::stored_timestamp and timestamps shown to people or emitted as JSON with util::display_timestamp" },
+    { path = "chrono::DateTime::to_rfc3339", reason = "write timestamps stored in SQLite with util::stored_timestamp and timestamp text for output with util::display_timestamp" },
+    { path = "chrono::DateTime::to_rfc3339_opts", reason = "write timestamps stored in SQLite with util::stored_timestamp and timestamp text for output with util::display_timestamp; an upper SQL time bound uses db.rs until_bound_text" },
 ]
 
 # Content digests. Every SHA-256 goes through rust/ai-session-search-core/src/hashing.rs, so the
