@@ -97,10 +97,19 @@ pub fn expand_tilde_required(path: &Path) -> anyhow::Result<PathBuf> {
     };
     if path == Path::new("~") {
         home()
-    } else if let Ok(rest) = path.strip_prefix(Path::new("~")) {
-        Ok(home()?.join(rest))
+    } else if path.starts_with(Path::new("~")) {
+        Ok(expand_tilde_with_home(path, &home()?))
     } else {
         Ok(path.to_path_buf())
+    }
+}
+
+/// Expand a write destination with an already captured home, without rereading process state.
+pub(crate) fn expand_tilde_with_home(path: &Path, home: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix(Path::new("~")) {
+        home.join(rest)
+    } else {
+        path.to_path_buf()
     }
 }
 
