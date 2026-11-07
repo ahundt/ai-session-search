@@ -131,6 +131,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `~/.prime/agent/settings.json` with its required `type: "stdio"`. It previously received only
     CLI guidance; untouched CLI-only integrations also gain the registration during refresh.
 
+17. Cursor receives the required `type: "stdio"` in `~/.cursor/mcp.json`. aise omitted the
+    field; install and the post-upgrade refresh now add it to earlier untyped registrations.
+
 ### Performance
 
 1. Limited literal and regex searches stop once the page is full. On an index of 5.7 million
