@@ -235,7 +235,7 @@ pub fn render_full(
                 session
                     .session
                     .updated_at
-                    .map(|value| value.to_rfc3339())
+                    .map(crate::util::display_timestamp)
                     .unwrap_or_else(|| "-".to_string()),
                 session.session.preview_text,
                 session.transcript_text

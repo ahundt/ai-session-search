@@ -2016,7 +2016,7 @@ impl<'app> AnalysisService<'app> {
             last_selected_session_id: traversal.last_selected_session_id,
             max_selected_session_updated_at: traversal
                 .max_selected_session_updated_at
-                .map(|value| value.to_rfc3339()),
+                .map(crate::util::display_timestamp),
             policy_digest: policy.policy_digest(),
             corpus_digest: traversal.corpus_digest,
             result_digest: result.result_digest(),

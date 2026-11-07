@@ -278,7 +278,7 @@ fn rows(db: &Db) -> Vec<Row> {
                 h.role.as_str().to_string(),
                 h.tool_name.clone(),
                 h.content.clone(),
-                h.ts.map(|t| t.to_rfc3339()),
+                h.ts.map(ai_session_search::util::display_timestamp),
             )
         })
         .collect()
@@ -812,7 +812,7 @@ fn claude_desktop_sidecar_change_refreshes_without_audit_append() {
             "user".to_string(),
             None,
             "hello desktop".to_string(),
-            Some("2026-04-01T00:00:00+00:00".to_string())
+            Some("2026-04-01T00:00:00Z".to_string())
         )],
         "sidecar-only refresh must not duplicate messages"
     );

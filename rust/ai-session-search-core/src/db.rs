@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -29,8 +29,8 @@ use crate::models::{
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
-    fold_caseless, parse_datetime, snippet_from_match, snippet_from_match_while,
-    UnicodeLowerNeedle, SIGMAS,
+    fold_caseless, parse_stored_timestamp, snippet_from_match, snippet_from_match_while,
+    stored_timestamp, UnicodeLowerNeedle, SIGMAS,
 };
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
@@ -348,7 +348,6 @@ const AUTO_REINDEX_FRESHNESS_SQL: &str =
      join index_metadata word3 on word3.key = ?5
      where completed.key = ?1";
 const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
-const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
 const CORRECTION_CANDIDATES_SQL: &str =
     "select m.id, m.session_id, m.seq, m.provider, m.ts, m.content, m.authorship
      from messages m
@@ -957,14 +956,11 @@ impl Db {
 
     pub fn auto_reindex_completed_at(&self) -> Result<Option<DateTime<Utc>>> {
         if let Some(value) = self.index_metadata_i64(AUTO_REINDEX_COMPLETED_NS_KEY)? {
-            return Ok(DateTime::from_timestamp(
-                value.div_euclid(NANOSECONDS_PER_SECOND),
-                value.rem_euclid(NANOSECONDS_PER_SECOND) as u32,
-            ));
+            return Ok(crate::util::parse_unix_nanos(value));
         }
         Ok(self
             .index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY)?
-            .and_then(|value| Utc.timestamp_millis_opt(value).single()))
+            .and_then(crate::util::parse_unix_millis))
     }
 
     pub(crate) fn mark_auto_reindex_complete_at(&self, completed_at: DateTime<Utc>) -> Result<()> {
@@ -2042,9 +2038,9 @@ impl Db {
                 session.summary,
                 session.cwd,
                 session.repo_root,
-                session.created_at.map(|value| value.to_rfc3339()),
-                session.updated_at.map(|value| value.to_rfc3339()),
-                session.last_message_at.map(|value| value.to_rfc3339()),
+                session.created_at.map(stored_timestamp),
+                session.updated_at.map(stored_timestamp),
+                session.last_message_at.map(stored_timestamp),
                 session.preview_text,
                 session.source_path,
                 session.message_count,
@@ -2080,7 +2076,7 @@ impl Db {
                 session.source_path,
                 mtime_ns,
                 size_bytes,
-                Utc::now().to_rfc3339(),
+                stored_timestamp(Utc::now()),
                 session.parse_version,
             ],
         )?;
@@ -2325,7 +2321,7 @@ impl Db {
                 session.source_path,
                 mtime_ns,
                 size_bytes,
-                Utc::now().to_rfc3339(),
+                stored_timestamp(Utc::now()),
                 tail.new_tail_offset,
                 tail.new_fingerprint,
                 session.parse_version,
@@ -4075,11 +4071,11 @@ impl Db {
                     updated_at: row
                         .get::<_, Option<String>>(5)?
                         .as_deref()
-                        .and_then(crate::util::parse_datetime),
+                        .and_then(crate::util::parse_stored_timestamp),
                     last_message_at: row
                         .get::<_, Option<String>>(6)?
                         .as_deref()
-                        .and_then(crate::util::parse_datetime),
+                        .and_then(crate::util::parse_stored_timestamp),
                     message_count: row.get(7)?,
                     parse_warning: row.get(8)?,
                     parent_session_id: row.get(9)?,
@@ -4448,11 +4444,7 @@ impl Db {
                 )),
                 None => policies.classify(&content),
             }?;
-            let ts = ts.as_deref().and_then(|value| {
-                chrono::DateTime::parse_from_rfc3339(value)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            });
+            let ts = ts.as_deref().and_then(parse_stored_timestamp);
             Some(MessageClassificationMatch {
                 session_id,
                 message_seq,
@@ -4626,7 +4618,7 @@ impl Db {
                     last_edited: row
                         .get::<_, Option<String>>(4)?
                         .as_deref()
-                        .and_then(crate::util::parse_datetime),
+                        .and_then(crate::util::parse_stored_timestamp),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4788,7 +4780,7 @@ impl Db {
                 decode_db_enum(provider, 1, "file_edits.provider", Provider::from_db_str)?,
                 FileEdit {
                     seq,
-                    ts: ts.as_deref().and_then(crate::util::parse_datetime),
+                    ts: ts.as_deref().and_then(crate::util::parse_stored_timestamp),
                     tool,
                     file_path,
                     file_name,
@@ -5346,13 +5338,7 @@ impl Db {
                     row.get::<_, i64>(6)?,
                 ))
             })?;
-        let parse_ts = |value: Option<String>| {
-            value.and_then(|value| {
-                chrono::DateTime::parse_from_rfc3339(&value)
-                    .ok()
-                    .map(|timestamp| timestamp.with_timezone(&Utc))
-            })
-        };
+        let parse_ts = |value: Option<String>| value.as_deref().and_then(parse_stored_timestamp);
         let first_timestamp = parse_ts(row.2);
         let last_timestamp = parse_ts(row.3);
         Ok(SessionTimeProfile {
@@ -5562,6 +5548,7 @@ fn push_session_filters(
 /// hour, and minute periods to the final nanosecond while preserving explicit RFC3339 instants.
 /// Always rendering nine fractional digits makes lexicographic SQLite comparison agree with
 /// chronological order and preserves an exact fractional bound for race reconstruction.
+#[allow(clippy::disallowed_methods)] // the nine-digit form is this bound's contract; see above
 fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
     until.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
 }
@@ -5968,7 +5955,7 @@ fn insert_messages<'a>(
             session.provider.as_str(),
             seq,
             message.role.as_str(),
-            message.ts.map(|ts| ts.to_rfc3339()),
+            message.ts.map(stored_timestamp),
             message.tool_name,
             message.kind.as_str(),
             message.tool_call_id,
@@ -6025,7 +6012,7 @@ fn stored_session_dates(
             |row| Ok([row.get::<_, Option<String>>(0)?, row.get(1)?, row.get(2)?]),
         )
         .optional()?
-        .map(|dates| dates.map(|text| text.as_deref().and_then(parse_datetime))))
+        .map(|dates| dates.map(|text| text.as_deref().and_then(parse_stored_timestamp))))
 }
 
 /// The earliest created_at and the latest updated_at and last_message_at across `dates`, as UTC
@@ -6037,7 +6024,7 @@ fn widest_session_dates(dates: impl IntoIterator<Item = SessionDates>) -> [Optio
         updated = updated.max(u);
         last = last.max(l);
     }
-    [created, updated, last].map(|date: Option<DateTime<Utc>>| date.map(|date| date.to_rfc3339()))
+    [created, updated, last].map(|date: Option<DateTime<Utc>>| date.map(stored_timestamp))
 }
 
 /// Session text after an archive keep: the first text, then each paragraph of every later text
@@ -6374,7 +6361,7 @@ impl MessageColumns<'_> {
 
 /// Keys of a parsed message, from the same column values `insert_messages` writes.
 fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
-    let ts = message.ts.map(|ts| ts.to_rfc3339());
+    let ts = message.ts.map(stored_timestamp);
     let correlation = message.provenance.correlation_identity.as_ref();
     MessageColumns {
         seq: message.seq,
@@ -6481,7 +6468,7 @@ fn file_edit_keys(
 
 /// Keys of a parsed file edit, from the same column values `insert_file_edits` writes.
 fn parsed_file_edit_keys(edit: &FileEdit) -> Result<FileEditKeys> {
-    let ts = edit.ts.map(|ts| ts.to_rfc3339());
+    let ts = edit.ts.map(stored_timestamp);
     let edits_json = serialize_edits_json(edit)?;
     Ok(file_edit_keys(
         edit.seq,
@@ -6587,7 +6574,7 @@ fn insert_file_edits<'a>(
             session.id,
             session.provider.as_str(),
             seq,
-            edit.ts.map(|ts| ts.to_rfc3339()),
+            edit.ts.map(stored_timestamp),
             edit.tool,
             edit.file_path,
             edit.file_name,
@@ -6613,17 +6600,32 @@ fn push_ts_window(
     since: Option<chrono::DateTime<Utc>>,
     until: Option<chrono::DateTime<Utc>>,
 ) {
-    use rusqlite::types::Value;
+    push_time_bounds(sql, args, col, col, since, until);
+}
+
+/// Append inclusive time-window predicates for something that starts at `start_column` and ends
+/// at `end_column`: it overlaps `[since, until]` when it ends at or after `since` and starts at or
+/// before `until`. An event (one timestamp) passes the same column twice. The one owner of the
+/// bound text: `stored_timestamp` for the lower bound and `until_bound_text` for the upper, so
+/// every window compares stored text the same way. O(1) time and memory per call.
+fn push_time_bounds<A: From<String>>(
+    sql: &mut String,
+    args: &mut Vec<A>,
+    start_column: &str,
+    end_column: &str,
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+) {
     use std::fmt::Write as _;
     // `write!` into the existing String avoids a throwaway `format!` allocation; writing to a
     // String is infallible, so the `Result` is discarded.
     if let Some(since) = since {
-        let _ = write!(sql, " and {col} >= ?");
-        args.push(Value::Text(since.to_rfc3339()));
+        let _ = write!(sql, " and {end_column} >= ?");
+        args.push(A::from(stored_timestamp(since)));
     }
     if let Some(until) = until {
-        let _ = write!(sql, " and {col} <= ?");
-        args.push(Value::Text(until_bound_text(until)));
+        let _ = write!(sql, " and {start_column} <= ?");
+        args.push(A::from(until_bound_text(until)));
     }
 }
 
@@ -6806,14 +6808,16 @@ fn push_session_time_window(
     since: Option<chrono::DateTime<Utc>>,
     until: Option<chrono::DateTime<Utc>>,
 ) {
-    if let Some(since) = since {
-        sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
-        args.push(since.to_rfc3339());
-    }
-    if let Some(until) = until {
-        sql.push_str(" and coalesce(s.created_at, s.updated_at) <= ? ");
-        args.push(until_bound_text(until));
-    }
+    push_time_bounds(
+        sql,
+        args,
+        "coalesce(s.created_at, s.updated_at)",
+        "coalesce(s.updated_at, s.created_at)",
+        since,
+        until,
+    );
+    // Callers append further clauses directly after this one.
+    sql.push(' ');
 }
 
 fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
@@ -6861,11 +6865,7 @@ fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Re
             "messages.role",
             Role::from_db_str,
         )?,
-        ts: ts.and_then(|value| {
-            chrono::DateTime::parse_from_rfc3339(&value)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        }),
+        ts: ts.as_deref().and_then(parse_stored_timestamp),
         tool_name: row.get(offset + 5)?,
         kind: crate::models::MessageKind::from_db_str(&row.get::<_, String>(offset + 6)?),
         tool_call_id: row.get(offset + 7)?,
@@ -7383,15 +7383,15 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         created_at: row
             .get::<_, Option<String>>(7)?
             .as_deref()
-            .and_then(crate::util::parse_datetime),
+            .and_then(crate::util::parse_stored_timestamp),
         updated_at: row
             .get::<_, Option<String>>(8)?
             .as_deref()
-            .and_then(crate::util::parse_datetime),
+            .and_then(crate::util::parse_stored_timestamp),
         last_message_at: row
             .get::<_, Option<String>>(9)?
             .as_deref()
-            .and_then(crate::util::parse_datetime),
+            .and_then(crate::util::parse_stored_timestamp),
         preview_text: row.get(10)?,
         source_path: row.get(11)?,
         message_count: row.get(12)?,
@@ -7555,9 +7555,7 @@ mod tests {
     }
 
     fn utc(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+        crate::util::parse_datetime(value).unwrap()
     }
 
     #[test]
@@ -9300,7 +9298,7 @@ mod tests {
         assert!(!second
             .auto_reindex_is_fresh_at(COMPLETED_MS, INTERVAL_MS)
             .unwrap());
-        let completed_at = Utc.timestamp_millis_opt(COMPLETED_MS).single().unwrap()
+        let completed_at = crate::util::parse_unix_millis(COMPLETED_MS).unwrap()
             + chrono::Duration::nanoseconds(456_789);
         first.mark_auto_reindex_complete_at(completed_at).unwrap();
         assert_eq!(
@@ -10452,7 +10450,7 @@ mod tests {
                      id, provider, provider_session_id, cwd, repo_root, preview_text,
                      source_path, updated_at, parse_version, discovery_source
                  ) values ('s1','claude','s1','/repo','/repo','ordinary text','/p',?1,'1','test')",
-                params![Utc::now().to_rfc3339()],
+                params![stored_timestamp(Utc::now())],
             )
             .unwrap();
 
@@ -12991,12 +12989,12 @@ mod tests {
         assert_eq!(profile.timestamped_messages, 3);
         assert_eq!(profile.undated_messages, 1);
         assert_eq!(
-            profile.first_timestamp.unwrap().to_rfc3339(),
-            "2026-01-01T00:00:00.100+00:00"
+            crate::util::display_timestamp(profile.first_timestamp.unwrap()),
+            "2026-01-01T00:00:00.100Z"
         );
         assert_eq!(
-            profile.last_timestamp.unwrap().to_rfc3339(),
-            "2026-04-30T00:00:00.300+00:00"
+            crate::util::display_timestamp(profile.last_timestamp.unwrap()),
+            "2026-04-30T00:00:00.300Z"
         );
         assert_eq!(profile.observed_span_seconds, Some(10_281_600));
         assert_eq!(profile.max_message_gap_seconds, Some(7_603_200));
@@ -14126,11 +14124,8 @@ mod tests {
         // A time window neither reduces match density much nor is cheap to replace, and it
         // measured 1.29x at --since 3d and 10.48x at --since 1y, so it stays eligible.
         assert!(
-            with(|f| f.since = Some(
-                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00+00:00")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc)
-            )),
+            with(|f| f.since =
+                Some(crate::util::parse_datetime("2020-01-01T00:00:00+00:00").unwrap())),
             "a time window must stay eligible for the index-ordered page"
         );
     }
@@ -15939,7 +15934,7 @@ mod tests {
                  values('claude:s1','claude','s1','','/x','v1','jsonl');",
             )
             .unwrap();
-        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+        let base = crate::util::parse_datetime("2026-01-01T00:00:00Z").unwrap();
         let n = 600i64;
         {
             let tx = db.conn.unchecked_transaction().unwrap();
@@ -15955,7 +15950,7 @@ mod tests {
                     )
                     .unwrap();
                 for i in 0..n {
-                    let ts = (base + chrono::Duration::seconds(i)).to_rfc3339();
+                    let ts = stored_timestamp(base + chrono::Duration::seconds(i));
                     let content = if i % 5 == 0 {
                         format!("row-{i} you forgot the tests")
                     } else {

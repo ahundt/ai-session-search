@@ -18,8 +18,9 @@ use crate::models::{
 use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, parse_datetime, parse_unix_seconds,
-    preview_from_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    minimal_record, normalize_path, observe_session_end, parse_datetime, parse_unix_millis,
+    parse_unix_seconds, preview_from_text, truncate_for_display, RawMessage,
+    UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -875,10 +876,6 @@ fn thread_columns(conn: &Connection) -> Result<Vec<String>> {
         columns.push(row?);
     }
     Ok(columns)
-}
-
-fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
-    DateTime::<Utc>::from_timestamp_millis(value)
 }
 
 fn load_index_titles(path: &Path) -> Result<SidecarLoad<HashMap<String, String>>> {

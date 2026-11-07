@@ -6561,7 +6561,7 @@ fn message_window_value(
                 "role": c.role.as_str(),
                 "kind": c.kind.as_str(),
                 "provider": c.provider.as_str(),
-                "ts": c.ts.map(|t| t.to_rfc3339()),
+                "ts": c.ts.map(crate::util::display_timestamp),
                 "tool_name": c.tool_name,
                 "tool_call_id": c.tool_call_id,
                 "is_match": c.seq == seq,
@@ -6618,7 +6618,7 @@ fn message_range_value(
                 "role": c.role.as_str(),
                 "kind": c.kind.as_str(),
                 "provider": c.provider.as_str(),
-                "ts": c.ts.map(|t| t.to_rfc3339()),
+                "ts": c.ts.map(crate::util::display_timestamp),
                 "tool_name": c.tool_name,
                 "tool_call_id": c.tool_call_id,
                 "is_match": seq_from == Some(c.seq),
@@ -6678,7 +6678,10 @@ fn insert_time(
     value: Option<chrono::DateTime<chrono::Utc>>,
 ) {
     if let Some(value) = value {
-        out.insert(key.to_string(), json!(value.to_rfc3339()));
+        out.insert(
+            key.to_string(),
+            json!(crate::util::display_timestamp(value)),
+        );
     }
 }
 
@@ -8964,15 +8967,13 @@ mod tests {
 
     #[test]
     fn mcp_date_helpers_support_when_and_reject_mixed_bounds() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let now = crate::util::parse_datetime("2026-06-15T12:00:00Z").unwrap();
 
         let (since_only, until_only) =
             parse_date_bounds(&json!({ "since": "2026-01" }), now).unwrap();
         assert_eq!(
-            since_only.unwrap().to_rfc3339(),
-            "2026-01-01T00:00:00+00:00"
+            crate::util::display_timestamp(since_only.unwrap()),
+            "2026-01-01T00:00:00Z"
         );
         assert!(until_only.is_none(), "`since` alone must stay open-ended");
 
@@ -8980,16 +8981,35 @@ mod tests {
             parse_date_bounds(&json!({ "until": "2026-01" }), now).unwrap();
         assert!(since_only.is_none(), "`until` alone must stay open-ended");
         assert_eq!(
-            until_only.unwrap().to_rfc3339(),
-            "2026-01-31T23:59:59.999999999+00:00"
+            crate::util::display_timestamp(until_only.unwrap()),
+            "2026-01-31T23:59:59.999999999Z"
         );
 
         let (since, until) = parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap();
-        assert_eq!(since.unwrap().to_rfc3339(), "2026-01-01T00:00:00+00:00");
         assert_eq!(
-            until.unwrap().to_rfc3339(),
-            "2026-01-31T23:59:59.999999999+00:00"
+            crate::util::display_timestamp(since.unwrap()),
+            "2026-01-01T00:00:00Z"
         );
+        assert_eq!(
+            crate::util::display_timestamp(until.unwrap()),
+            "2026-01-31T23:59:59.999999999Z"
+        );
+        // Durations reach MCP through the same dates.rs parser: a window ending now, with `m`
+        // as minutes and `M` as a calendar month.
+        for (duration, start) in [
+            ("2h", "2026-06-15T10:00:00Z"),
+            ("2d", "2026-06-13T12:00:00Z"),
+            ("30m", "2026-06-15T11:30:00Z"),
+            ("1M", "2026-05-15T12:00:00Z"),
+        ] {
+            let (since, until) = parse_date_bounds(&json!({ "when": duration }), now).unwrap();
+            assert_eq!(
+                since.map(crate::util::display_timestamp).as_deref(),
+                Some(start),
+                "{duration}"
+            );
+            assert_eq!(until, Some(now), "{duration}");
+        }
         assert!(
             parse_date_bounds(&json!({ "when": "2026-01", "since": "2026" }), now).is_err(),
             "`when` must stay mutually exclusive with since/until like CLI DateRange"
@@ -9002,9 +9022,7 @@ mod tests {
 
     #[test]
     fn mcp_search_filters_normalize_path_and_share_since_until_when() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let now = crate::util::parse_datetime("2026-06-15T12:00:00Z").unwrap();
         let filters = search_filters_from_args(
             &json!({
                 "provider": "claude",
