@@ -95,6 +95,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    ignores, so `opencode mcp list` reported no servers. It is now written to
    `mcp.servers.ai-session-search` with `type: "local"`, and `aise integrations install` moves
    an entry left in the old place.
+10. Zed on macOS loads the aise MCP server. aise wrote it to
+    `~/Library/Application Support/Zed/settings.json`, but Zed reads `~/.config/zed/settings.json`
+    there. Install now writes the file Zed reads and removes aise's entry from the old one,
+    keeping any other servers in it. Linux and Windows paths were already correct.
 
 ### Performance
 
