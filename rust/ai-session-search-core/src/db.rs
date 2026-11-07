@@ -1982,18 +1982,9 @@ impl Db {
         // them; the parse speaks for everything else.
         // Dates are compared as instants: stored RFC 3339 text orders correctly only within one
         // UTC offset.
-        let mut prior_dates: Vec<[Option<DateTime<Utc>>; 3]> = Vec::new();
+        let mut prior_dates: Vec<SessionDates> = Vec::new();
         for id in std::iter::once(&session.id).chain(&retired_ids) {
-            if let Some(dates) = tx
-                .query_row(
-                    "select created_at, updated_at, last_message_at from sessions where id = ?1",
-                    params![id],
-                    |row| Ok([row.get::<_, Option<String>>(0)?, row.get(1)?, row.get(2)?]),
-                )
-                .optional()?
-            {
-                prior_dates.push(dates.map(|text| text.as_deref().and_then(parse_datetime)));
-            }
+            prior_dates.extend(stored_session_dates(&tx, id)?);
         }
         let mut prior_transcripts: Vec<String> = Vec::new();
         for id in &retired_ids {
@@ -2117,31 +2108,17 @@ impl Db {
             if stored_transcript.as_deref() != Some(transcript.as_str()) {
                 upsert_transcript(&tx, &session.id, &transcript)?;
             }
-            // The earliest start and the latest activity across the stored identities and the
-            // parse.
-            let parsed_dates = [
-                session.created_at,
-                session.updated_at,
-                session.last_message_at,
-            ];
-            let dates = |column: usize| {
-                prior_dates
-                    .iter()
-                    .map(move |dates| dates[column])
-                    .chain([parsed_dates[column]])
-                    .flatten()
-            };
-            let rfc3339 = |date: Option<DateTime<Utc>>| date.map(|date| date.to_rfc3339());
+            let [created_at, updated_at, last_message_at] =
+                widest_session_dates(prior_dates.iter().copied().chain([[
+                    session.created_at,
+                    session.updated_at,
+                    session.last_message_at,
+                ]]));
             tx.execute(
                 "update sessions set created_at = ?2, updated_at = ?3, last_message_at = ?4,
                     message_count = (select count(*) from messages where session_id = ?1)
                  where id = ?1",
-                params![
-                    session.id,
-                    rfc3339(dates(0).min()),
-                    rfc3339(dates(1).max()),
-                    rfc3339(dates(2).max()),
-                ],
+                params![session.id, created_at, updated_at, last_message_at],
             )?;
         } else {
             upsert_transcript(&tx, &session.id, &parsed.transcript_text)?;
@@ -2297,15 +2274,19 @@ impl Db {
                 .map(|(i, e)| (next_edit_seq + i as i64, e)),
         )?;
 
-        // Advance volatile session metadata; updated_at/last_message_at only move forward (RFC3339
-        // sorts lexically), title/preview take the tail's newest view, cwd fills if it was NULL.
+        // Advance volatile session metadata; updated_at/last_message_at only move forward,
+        // title/preview take the tail's newest view, cwd fills if it was NULL. created_at stays.
         let new_count = existing_count + tail.new_messages.len() as i64;
+        let [_, updated_at, last_message_at] =
+            widest_session_dates(stored_session_dates(&tx, &session.id)?.into_iter().chain([[
+                None,
+                session.updated_at,
+                session.last_message_at,
+            ]]));
         tx.execute(
             "update sessions set
-                updated_at = case when ?2 is not null and ?2 > coalesce(updated_at, '') then ?2
-                                  else updated_at end,
-                last_message_at = case when ?3 is not null and ?3 > coalesce(last_message_at, '') then ?3
-                                       else last_message_at end,
+                updated_at = ?2,
+                last_message_at = ?3,
                 title = ?4,
                 preview_text = ?5,
                 cwd = coalesce(cwd, ?6),
@@ -2313,8 +2294,8 @@ impl Db {
              where id = ?1",
             params![
                 session.id,
-                session.updated_at.map(|value| value.to_rfc3339()),
-                session.last_message_at.map(|value| value.to_rfc3339()),
+                updated_at,
+                last_message_at,
                 session.title,
                 session.preview_text,
                 session.cwd,
@@ -6026,6 +6007,37 @@ fn upsert_transcript(
         params![session_id, transcript],
     )?;
     Ok(())
+}
+
+/// A session's created_at, updated_at and last_message_at as instants.
+type SessionDates = [Option<DateTime<Utc>>; 3];
+
+/// A stored session's dates, parsed: stored RFC 3339 text orders correctly only within one UTC
+/// offset, so dates are compared as instants. `None` when the session row does not exist.
+fn stored_session_dates(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<Option<SessionDates>> {
+    Ok(tx
+        .query_row(
+            "select created_at, updated_at, last_message_at from sessions where id = ?1",
+            params![session_id],
+            |row| Ok([row.get::<_, Option<String>>(0)?, row.get(1)?, row.get(2)?]),
+        )
+        .optional()?
+        .map(|dates| dates.map(|text| text.as_deref().and_then(parse_datetime))))
+}
+
+/// The earliest created_at and the latest updated_at and last_message_at across `dates`, as UTC
+/// RFC 3339 text for storage. O(n) for n date triples.
+fn widest_session_dates(dates: impl IntoIterator<Item = SessionDates>) -> [Option<String>; 3] {
+    let (mut created, mut updated, mut last) = (None, None, None);
+    for [c, u, l] in dates {
+        created = created.into_iter().chain(c).min();
+        updated = updated.max(u);
+        last = last.max(l);
+    }
+    [created, updated, last].map(|date: Option<DateTime<Utc>>| date.map(|date| date.to_rfc3339()))
 }
 
 /// Session text after an archive keep: the first text, then each paragraph of every later text
@@ -16377,6 +16389,85 @@ mod tests {
             ("user".to_string(), None),
             "a new parser version repairs stale prefix metadata even when content is unchanged"
         );
+    }
+
+    #[test]
+    fn a_tail_append_advances_session_dates_as_instants_whatever_their_offset() {
+        // 12:00+03:00 is 09:00 UTC, before the appended 10:01Z message, but sorts after it as
+        // text, so a text comparison kept the stale value.
+        use crate::providers::claude::ClaudeAdapter;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("probe.jsonl");
+        let line = |ts: &str, role: &str, text: &str| {
+            format!(
+                "{{\"type\":\"{role}\",\"sessionId\":\"probe\",\"timestamp\":\"{ts}\",\
+                 \"message\":{{\"role\":\"{role}\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            )
+        };
+        std::fs::write(&file, line("2026-06-01T09:00:00Z", "user", "first prompt")).unwrap();
+        let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
+        let source = crate::models::SourceFile {
+            provider: Provider::Claude,
+            path: file.clone(),
+            mtime_ns: 1,
+            size_bytes: std::fs::metadata(&file).unwrap().len() as i64,
+        };
+        let source_path = crate::util::normalize_path(&file);
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(&claude.parse(&source), 1, source.size_bytes)
+            .unwrap();
+        db.set_file_checkpoint(
+            Provider::Claude,
+            &source_path,
+            crate::tail::complete_prefix_offset(&file).unwrap(),
+            &crate::tail::prefix_fingerprint(&file).unwrap(),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "update sessions set updated_at = '2026-06-01T12:00:00+03:00',
+                     last_message_at = '2026-06-01T12:00:00+03:00'",
+                [],
+            )
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(line("2026-06-01T10:01:00Z", "user", "second prompt").as_bytes())
+            .unwrap();
+        let (offset, _) = db
+            .file_checkpoint(
+                Provider::Claude,
+                &source_path,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap()
+            .unwrap();
+        let tail = crate::tail::tail_parse(&file, offset, |cursor, path| {
+            claude.parse_reader(cursor, path)
+        })
+        .unwrap()
+        .expect("a new complete line was appended");
+        db.append_tail(&tail, 2, std::fs::metadata(&file).unwrap().len() as i64)
+            .unwrap();
+        let (updated, last): (String, String) = db
+            .conn
+            .query_row(
+                "select updated_at, last_message_at from sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let expected = "2026-06-01T10:01:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            updated.parse::<DateTime<Utc>>().unwrap(),
+            expected,
+            "{updated}"
+        );
+        assert_eq!(last.parse::<DateTime<Utc>>().unwrap(), expected, "{last}");
     }
 
     #[test]
