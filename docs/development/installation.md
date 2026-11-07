@@ -118,8 +118,10 @@ updates detected clients. Repeat `--client CLIENT` to include several explicit c
 `--exclude-client CLIENT` to remove clients from that set. Explicit custom paths are always
 included and are not client aliases, so exclusions do not discard them.
 
-The Kilo selector is explicitly the legacy VS Code extension adapter. Current standalone Kilo
-uses `~/.config/kilo/kilo.jsonc` and is not modified.
+The Kilo selector writes `mcp.ai-session-search` into `~/.config/kilo/kilo.jsonc`, which Kilo 7
+reads in VS Code, JetBrains and the CLI, and keeps the entry in the VS Code extension's
+`mcp_settings.json`, which only older extensions and Kilo 7 inside VS Code read. Both name the
+same server, so Kilo loads it once.
 
 ### Instruction files and hooks
 
@@ -420,7 +422,7 @@ cargo install ai-session-search \
 
 The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desktop and Codex
 CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, **Pi**, **Prime Agent**, Cursor, Windsurf, VS
-Code, Zed, **OpenCode**, OpenClaw, and the legacy KiloCode adapter. Each target must pass
+Code, Zed, **OpenCode**, OpenClaw, and KiloCode. Each target must pass
 install, content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe uninstall
 tests. Pi and Prime Agent acceptance covers native skill discovery, managed `AGENTS.md`, explicit
 selection, status, idempotent reinstall, dry-run, and ownership-safe uninstall, and intentionally
@@ -502,5 +504,7 @@ delete `$CARGO_HOME` or uv's shared cache to recover space.
   [Model Context Protocol](https://learn.chatgpt.com/docs/extend/mcp.md).
 - OpenCode documents its cross-platform global configuration at
   [`~/.config/opencode/opencode.json`](https://dev.opencode.ai/docs/config).
-- Kilo documents current standalone MCP configuration in
-  [`~/.config/kilo/kilo.jsonc`](https://kilo.ai/docs/automate/mcp/using-in-kilo-code).
+- Kilo documents its MCP configuration in
+  [`~/.config/kilo/kilo.jsonc`](https://kilo.ai/docs/automate/mcp/using-in-kilo-code), and its
+  [config loader](https://github.com/Kilo-Org/kilocode/blob/main/packages/opencode/src/kilocode/config/config.ts)
+  merges the legacy `mcp_settings.json` only inside VS Code or its daemon.

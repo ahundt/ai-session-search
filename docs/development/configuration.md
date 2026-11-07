@@ -211,7 +211,7 @@ plus `mcp serve`; `--binary PATH` selects a different installation explicitly.
 
 The installer supports Claude Code/Desktop, ChatGPT Codex desktop and Codex CLI/IDE, Gemini CLI,
 Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and
-the legacy KiloCode VS Code extension. Claude, Codex, OpenCode, Gemini, Antigravity, Pi, and
+Kilo Code. Claude, Codex, OpenCode, Gemini, Antigravity, Pi, and
 Prime receive managed instruction-file guidance.
 Pi has no native MCP client, and Prime accepts remote HTTP MCP integrations rather than the local
 stdio server, so those selectors install only supported components.
