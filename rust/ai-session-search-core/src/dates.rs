@@ -79,8 +79,8 @@ pub struct DateRange {
     /// message, file, and analytics commands compare each event's own timestamp. Accepts EDTF /
     /// ISO / duration / natural language. Values without an offset use local time (`TZ` or the
     /// system zone), or the zone in a trailing `[Area/City]`; exact RFC 3339 timestamps honor `Z`
-    /// or their offset. Examples: `2026-01-15`, `2026-01`, `202X`,
-    /// `7d`, `yesterday`. See `aise dates`. Omit for no lower bound.
+    /// or their offset. Examples: `2026-01-15`, `2026-01`, `202X`, `7d`, `yesterday`,
+    /// `2026-01-15[Europe/Berlin]`. See `aise dates`. Omit for no lower bound.
     #[arg(long, help_heading = TIME_WINDOW_HEADING)]
     pub since: Option<String>,
     /// Inclusive upper bound of the query period. Same formats as `--since`; periods resolve to
@@ -187,7 +187,7 @@ pub(crate) fn period(input: &str, now: &jiff::Zoned) -> Result<Bounds> {
         }
         _ => {}
     }
-    let (start, end) = span(input, now)?;
+    let (start, end) = closed_span(input, now)?;
     Ok((Some(start), Some(end)))
 }
 
@@ -257,7 +257,7 @@ fn reference_zoned(reference_time: &str) -> Result<jiff::Zoned> {
 }
 
 /// The closed span of a token without a zone annotation, read in `now`'s zone.
-fn span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+fn closed_span(input: &str, now: &jiff::Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let now_utc = from_timestamp(now.timestamp())?;
     let zone = now.time_zone();
     let s = input.trim();
@@ -562,6 +562,7 @@ pub fn format_reference() -> String {
         "  2026-01-15T14:30:25   exact second".into(),
         "  2026-01-15T14:30      minute precision (expands to :00..:59)".into(),
         "  2026-01-15T14         hour precision (expands to :00:00..:59:59)".into(),
+        "  2026-01-15 14:30      a space may replace the T, as RFC 3339 allows".into(),
         "  2026-01-15            day        → 00:00:00 .. 23:59:59".into(),
         "  2026-01               month      → first .. last day".into(),
         "  2026                  year       → Jan 1 .. Dec 31".into(),
@@ -578,7 +579,8 @@ pub fn format_reference() -> String {
         "  2026?  2026~          uncertain / approximate: same period".into(),
         String::new(),
         "Durations (the window [now - N, now]; jiff's units or ISO 8601):".into(),
-        "  7d 2w 24h 30m 1M 1y 1d12h P1M PT2H   (m = minutes, M or mo = months)".into(),
+        "  7d 2w 24h 30m 1M 1y   (m = minutes, M or mo = months)".into(),
+        "  1y6M 1d12h \"2 weeks\" P1M PT2H   compound, spelled out, ISO 8601".into(),
         String::new(),
         "Natural language (via the `interim` crate; day-granular):".into(),
         "  today  yesterday  \"3 days ago\"  \"last friday\"".into(),
