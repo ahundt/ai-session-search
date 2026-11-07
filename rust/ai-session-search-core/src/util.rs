@@ -943,6 +943,19 @@ pub fn parse_unix_seconds(value: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(value, 0)
 }
 
+pub fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_millis(value)
+}
+
+/// The text form of a timestamp stored in the index: RFC 3339 in UTC, offset written `+00:00`.
+///
+/// SQL filters and orderings compare these strings directly (`ts >= ?`), which equals time order
+/// only because every stored value shares this one offset; write stored timestamps through this
+/// function so they all do. Read them back with [`parse_datetime`].
+pub fn stored_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339()
+}
+
 pub fn preview_from_text(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2049,6 +2062,41 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stored_timestamps_are_utc_text_whose_order_is_time_order() {
+        let at = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            stored_timestamp(at("2026-01-02T03:04:05Z")),
+            "2026-01-02T03:04:05+00:00"
+        );
+        assert_eq!(
+            stored_timestamp(at("2026-01-02T08:04:05.123+05:00")),
+            "2026-01-02T03:04:05.123+00:00"
+        );
+        let instants = [
+            at("2026-01-02T03:04:05Z"),
+            at("2026-01-02T03:04:05.000001Z"),
+            at("2026-01-02T03:04:05.5Z"),
+            at("2026-01-02T03:04:05.123Z"),
+            at("2026-01-02T03:04:06Z"),
+            at("2025-12-31T23:59:59.999Z"),
+        ];
+        let mut by_text: Vec<String> = instants.iter().copied().map(stored_timestamp).collect();
+        by_text.sort();
+        let mut by_time = instants.to_vec();
+        by_time.sort();
+        assert_eq!(
+            by_text,
+            by_time
+                .into_iter()
+                .map(stored_timestamp)
+                .collect::<Vec<_>>()
+        );
+        for instant in instants {
+            assert_eq!(parse_datetime(&stored_timestamp(instant)), Some(instant));
+        }
+    }
 
     /// Serializes tests that install a stub search path, so a second install never replaces a
     /// first one that is still in use and the first's cleanup never clears the second's.
