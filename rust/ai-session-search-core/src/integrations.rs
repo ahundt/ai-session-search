@@ -264,7 +264,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent instead receive their native skill and AGENTS.md guidance because Pi has no MCP client and Prime Agent accepts only remote HTTP MCP integrations. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.servers.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and an OpenCode entry directly under `mcp`, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
+    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent instead receive their native skill and AGENTS.md guidance because Pi has no MCP client and Prime Agent accepts only remote HTTP MCP integrations. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -408,6 +408,8 @@ enum ConfigFormat {
     OpenCode,
     /// Kilo Code 7: OpenCode's local-server entry, kept directly under `mcp`.
     Kilo,
+    /// OpenClaw: `mcp.servers` in a JSON5 file.
+    OpenClaw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1942,11 +1944,14 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             detect_binaries: vec!["opencode"],
             superseded_paths: Vec::new(),
         }],
-        McpClient::Openclaw => vec![json_target(
-            layout,
-            "openclaw",
-            layout.home.join(".openclaw").join("openclaw.json"),
-        )],
+        McpClient::Openclaw => vec![Target {
+            format: ConfigFormat::OpenClaw,
+            ..json_target(
+                layout,
+                "openclaw",
+                layout.home.join(".openclaw").join("openclaw.json"),
+            )
+        }],
         McpClient::Kilocode => vec![
             Target {
                 label: "kilocode",
@@ -3890,26 +3895,43 @@ fn status_skill_file(
 /// Where a JSON client reads its servers, and containers aise wrote to before that the client
 /// no longer reads. Install moves aise's entry out of a superseded container, uninstall clears
 /// both, and status reports an entry left there as stale, the same way old server names are
-/// handled. Add a container here when a client moves its servers.
+/// handled. Add a container here when a client moves its servers. `syntax` is what the client's
+/// own parser accepts, so aise can edit any file the client can read.
 struct JsonServerLayout {
     container: &'static [&'static str],
     superseded: &'static [&'static [&'static str]],
+    syntax: JsonSyntax,
+}
+
+/// JSONC: comments and trailing commas (VS Code, Zed, OpenCode, Kilo, Claude, Gemini).
+/// JSON5: also unquoted keys, single quotes and the other JSON5 forms (OpenClaw).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonSyntax {
+    Jsonc,
+    Json5,
 }
 
 fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
-    let (container, superseded): (&'static [&'static str], &'static [&'static [&'static str]]) =
-        match format {
-            ConfigFormat::JsonMcpServers => (&["mcpServers"], &[]),
-            ConfigFormat::VscodeServers => (&["servers"], &[]),
-            ConfigFormat::ZedContextServers => (&["context_servers"], &[]),
-            // OpenCode 2 reads `mcp.servers` and ignores servers directly under `mcp`.
-            ConfigFormat::OpenCode => (&["mcp", "servers"], &[&["mcp"]]),
-            ConfigFormat::Kilo => (&["mcp"], &[]),
-            ConfigFormat::CodexToml => return None,
-        };
+    use JsonSyntax::{Json5, Jsonc};
+    let (container, superseded, syntax): (
+        &'static [&'static str],
+        &'static [&'static [&'static str]],
+        JsonSyntax,
+    ) = match format {
+        ConfigFormat::JsonMcpServers => (&["mcpServers"], &[], Jsonc),
+        ConfigFormat::VscodeServers => (&["servers"], &[], Jsonc),
+        ConfigFormat::ZedContextServers => (&["context_servers"], &[], Jsonc),
+        // OpenCode 2 reads `mcp.servers` and ignores servers directly under `mcp`.
+        ConfigFormat::OpenCode => (&["mcp", "servers"], &[&["mcp"]], Jsonc),
+        ConfigFormat::Kilo => (&["mcp"], &[], Jsonc),
+        // OpenClaw reads `mcp.servers` from JSON5; earlier aise wrote a top-level `mcpServers`.
+        ConfigFormat::OpenClaw => (&["mcp", "servers"], &[&["mcpServers"]], Json5),
+        ConfigFormat::CodexToml => return None,
+    };
     Some(JsonServerLayout {
         container,
         superseded,
+        syntax,
     })
 }
 
@@ -3923,6 +3945,7 @@ fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
         }
         ConfigFormat::JsonMcpServers
         | ConfigFormat::ZedContextServers
+        | ConfigFormat::OpenClaw
         | ConfigFormat::CodexToml => {
             json!({"command": binary, "args": ["mcp", "serve"]})
         }
@@ -4018,20 +4041,23 @@ fn json_layout_for(format: ConfigFormat) -> Result<JsonServerLayout> {
         .ok_or_else(|| anyhow!("{format:?} is not a JSON client configuration format"))
 }
 
-/// Client JSON files are JSONC: Zed's settings.json, VS Code's mcp.json and kilo.jsonc allow
-/// comments and trailing commas. The other JSON5 extensions stay errors, as in those clients.
-fn jsonc_parse_options() -> jsonc_parser::ParseOptions {
-    jsonc_parser::ParseOptions {
-        allow_comments: true,
-        allow_trailing_commas: true,
-        allow_loose_object_property_names: false,
-        allow_missing_commas: false,
-        allow_single_quoted_strings: false,
-        allow_hexadecimal_numbers: false,
-        allow_unary_plus_numbers: false,
-        allow_bare_decimal_point_numbers: false,
-        allow_non_finite_numbers: false,
-        allow_extended_string_escapes: false,
+/// The syntax a client's own parser accepts. JSONC clients reject the other JSON5 forms, so aise
+/// does too rather than write a file the client cannot read; jsonc-parser's defaults are JSON5.
+fn jsonc_parse_options(syntax: JsonSyntax) -> jsonc_parser::ParseOptions {
+    match syntax {
+        JsonSyntax::Json5 => jsonc_parser::ParseOptions::default(),
+        JsonSyntax::Jsonc => jsonc_parser::ParseOptions {
+            allow_comments: true,
+            allow_trailing_commas: true,
+            allow_loose_object_property_names: false,
+            allow_missing_commas: false,
+            allow_single_quoted_strings: false,
+            allow_hexadecimal_numbers: false,
+            allow_unary_plus_numbers: false,
+            allow_bare_decimal_point_numbers: false,
+            allow_non_finite_numbers: false,
+            allow_extended_string_escapes: false,
+        },
     }
 }
 
@@ -4046,11 +4072,15 @@ fn json_container<'a>(
 /// A syntax tree of the file that keeps its comments, whitespace and trailing commas, so an
 /// edit changes only aise's entries. `parse_json_object_or_empty` has already rejected invalid
 /// text and a non-object top level, so the root here is an object or empty.
-fn jsonc_document(path: &Path, text: Option<&str>) -> Result<jsonc_parser::cst::CstRootNode> {
+fn jsonc_document(
+    path: &Path,
+    text: Option<&str>,
+    syntax: JsonSyntax,
+) -> Result<jsonc_parser::cst::CstRootNode> {
     let text = text
         .filter(|text| !text.trim().is_empty())
         .unwrap_or("{}\n");
-    jsonc_parser::cst::CstRootNode::parse(text, &jsonc_parse_options())
+    jsonc_parser::cst::CstRootNode::parse(text, &jsonc_parse_options(syntax))
         .with_context(|| format!("failed to parse JSON in {}", path.display()))
 }
 
@@ -4141,8 +4171,8 @@ fn plan_upsert_json_server(
 ) -> Result<Vec<PlannedFileMutation>> {
     let layout = json_layout_for(format)?;
     let original = read_optional_utf8_regular_file(path)?;
-    parse_json_object_or_empty(path, original.as_deref())?;
-    let document = jsonc_document(path, original.as_deref())?;
+    parse_json_object_or_empty(path, original.as_deref(), layout.syntax)?;
+    let document = jsonc_document(path, original.as_deref(), layout.syntax)?;
     let root = document.object_value_or_set();
     clear_superseded_jsonc_servers(path, &root, &layout)?;
     let servers = jsonc_container(path, &root, layout.container, true)?
@@ -4172,8 +4202,8 @@ fn plan_remove_json_server(path: &Path, format: ConfigFormat) -> Result<Vec<Plan
     let Some(text) = original.as_deref() else {
         return Ok(Vec::new());
     };
-    parse_json_object_or_empty(path, Some(text))?;
-    let document = jsonc_document(path, Some(text))?;
+    parse_json_object_or_empty(path, Some(text), layout.syntax)?;
+    let document = jsonc_document(path, Some(text), layout.syntax)?;
     let root = document.object_value_or_set();
     let mut removed = jsonc_container(path, &root, layout.container, false)?
         .is_some_and(|servers| remove_owned_jsonc_entries(&servers));
@@ -4287,12 +4317,16 @@ fn binary_config_value(binary: &Path) -> Result<&str> {
     })
 }
 
-fn parse_json_object_or_empty(path: &Path, text: Option<&str>) -> Result<Map<String, Value>> {
+fn parse_json_object_or_empty(
+    path: &Path,
+    text: Option<&str>,
+    syntax: JsonSyntax,
+) -> Result<Map<String, Value>> {
     let text = text.unwrap_or_default();
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
-    match jsonc_parser::parse_to_serde_value::<Value>(text, &jsonc_parse_options())
+    match jsonc_parser::parse_to_serde_value::<Value>(text, &jsonc_parse_options(syntax))
         .with_context(|| format!("failed to parse JSON in {}", path.display()))?
     {
         Value::Object(map) => Ok(map),
@@ -4333,7 +4367,8 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
         }
         ConfigFormat::JsonMcpServers
         | ConfigFormat::VscodeServers
-        | ConfigFormat::ZedContextServers => {
+        | ConfigFormat::ZedContextServers
+        | ConfigFormat::OpenClaw => {
             let command_is_set = entry
                 .get("command")
                 .and_then(Value::as_str)
@@ -4354,7 +4389,7 @@ fn status_json_server(path: &Path, format: ConfigFormat) -> Result<&'static str>
     if text.is_none() {
         return Ok("missing");
     }
-    let root = parse_json_object_or_empty(path, text.as_deref())?;
+    let root = parse_json_object_or_empty(path, text.as_deref(), layout.syntax)?;
     let servers = json_container(&root, layout.container);
     let has_legacy_name = |servers: &Map<String, Value>| {
         LEGACY_SERVER_NAMES
@@ -4969,7 +5004,8 @@ mod tests {
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("// user note"), "{written}");
         let data: Value =
-            jsonc_parser::parse_to_serde_value(&written, &jsonc_parse_options()).unwrap();
+            jsonc_parser::parse_to_serde_value(&written, &jsonc_parse_options(JsonSyntax::Jsonc))
+                .unwrap();
         assert_eq!(
             data["mcp"][SERVER_NAME],
             json!({"type": "local", "command": ["/bin/aise", "mcp", "serve"]})
@@ -4977,6 +5013,41 @@ mod tests {
         assert_eq!(data["mcp"]["user-server"]["command"][0], "user");
         assert_eq!(data["permission"]["bash"], "allow");
         assert_eq!(status_target(&target).unwrap(), "configured");
+        assert!(remove_target(&target).unwrap());
+        assert_eq!(status_target(&target).unwrap(), "not configured");
+    }
+
+    /// OpenClaw reads servers from `mcp.servers` (openclaw/openclaw src/config/mcp-config.ts) and
+    /// parses `~/.openclaw/openclaw.json` as JSON5 (src/config/io.load.ts). aise wrote a top-level
+    /// `mcpServers`, which OpenClaw never reads.
+    #[test]
+    fn openclaw_writes_mcp_servers_in_json5_and_moves_the_top_level_entry() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let layout = ClientLayout::new(home.clone(), home.join(".config"), ClientPlatform::Linux);
+        let target = targets_for_layout(McpClient::Openclaw, &layout).remove(0);
+        assert_eq!(target.path, home.join(".openclaw/openclaw.json"));
+        fs::create_dir_all(target.path.parent().unwrap()).unwrap();
+        fs::write(
+            &target.path,
+            "{\n  // gateway settings\n  gateway: { port: 18789 },\n  mcpServers: {\n    'ai-session-search': { command: '/old/aise', args: ['mcp', 'serve'] },\n  },\n}\n",
+        )
+        .unwrap();
+        assert_eq!(status_target(&target).unwrap(), "stale");
+
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        let written = fs::read_to_string(&target.path).unwrap();
+        assert!(written.contains("// gateway settings"), "{written}");
+        let data: Value =
+            jsonc_parser::parse_to_serde_value(&written, &Default::default()).unwrap();
+        assert_eq!(
+            data["mcp"]["servers"][SERVER_NAME],
+            json!({"command": "/bin/aise", "args": ["mcp", "serve"]})
+        );
+        assert!(data["mcpServers"].get(SERVER_NAME).is_none(), "{written}");
+        assert_eq!(data["gateway"]["port"], 18789);
+        assert_eq!(status_target(&target).unwrap(), "configured");
+
         assert!(remove_target(&target).unwrap());
         assert_eq!(status_target(&target).unwrap(), "not configured");
     }

@@ -107,6 +107,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     extension's `mcp_settings.json`, which Kilo 7 reads only inside VS Code. Install now also
     writes `mcp.ai-session-search` into `~/.config/kilo/kilo.jsonc`, which every Kilo 7 surface
     reads.
+13. OpenClaw loads the aise MCP server. aise wrote a top-level `mcpServers` in
+    `~/.openclaw/openclaw.json`, but OpenClaw reads servers from `mcp.servers`, and its file is
+    JSON5, which aise could not parse. Install now writes `mcp.servers.ai-session-search`, removes
+    the old entry, and keeps the file's comments and JSON5 syntax.
 
 ### Performance
 
