@@ -103,6 +103,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     commas, as Zed's settings and VS Code's `mcp.json` allow. One such file made the whole
     install fail for every client. aise now changes only its own entry and leaves the comments,
     commas and other settings as they were.
+12. The Kilo Code CLI and JetBrains plugin load the aise MCP server. aise wrote only the VS Code
+    extension's `mcp_settings.json`, which Kilo 7 reads only inside VS Code. Install now also
+    writes `mcp.ai-session-search` into `~/.config/kilo/kilo.jsonc`, which every Kilo 7 surface
+    reads.
 
 ### Performance
 

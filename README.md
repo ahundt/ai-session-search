@@ -121,7 +121,7 @@ What a harness receives depends on what it can read, in the format and location 
 | OpenCode | MCP config, managed `AGENTS.md` block |
 | Gemini CLI, Antigravity App/IDE/CLI | MCP config, shared `~/.gemini/GEMINI.md` block, skill |
 | Pi, Prime Agent | Skill and native `AGENTS.md` only: Pi has no MCP client, and Prime's kernel currently takes remote HTTP MCP integrations |
-| Cursor, Windsurf, VS Code, Zed, OpenClaw, legacy KiloCode | MCP config |
+| Cursor, Windsurf, VS Code, Zed, OpenClaw, KiloCode | MCP config |
 
 No MCP tool changes your sessions or configuration, and publishing a bundle stays a CLI and
 library operation. A query does refresh the index, writing `aise`'s own state;

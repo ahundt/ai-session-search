@@ -678,7 +678,7 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "do not change matches, ranking, result" in configuration
     assert "skimmable without silently discarding hits" in configuration
     installation = (ROOT / "docs/development/installation.md").read_text(encoding="utf-8")
-    assert "legacy VS Code extension adapter" in installation
+    assert "~/.config/kilo/kilo.jsonc" in installation and "mcp_settings.json" in installation
     assert "does not install" in installation and "hooks" in installation
     assert "ChatGPT Codex desktop" in installation
     assert "~/.gemini/config/mcp_config.json" in installation

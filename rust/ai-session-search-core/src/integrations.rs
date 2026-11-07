@@ -406,6 +406,8 @@ enum ConfigFormat {
     VscodeServers,
     ZedContextServers,
     OpenCode,
+    /// Kilo Code 7: OpenCode's local-server entry, kept directly under `mcp`.
+    Kilo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1945,16 +1947,27 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             "openclaw",
             layout.home.join(".openclaw").join("openclaw.json"),
         )],
-        McpClient::Kilocode => vec![json_target(
-            layout,
-            "kilocode legacy vscode extension",
-            layout
-                .vscode_config_dir()
-                .join("globalStorage")
-                .join("kilocode.kilo-code")
-                .join("settings")
-                .join("mcp_settings.json"),
-        )],
+        McpClient::Kilocode => vec![
+            Target {
+                label: "kilocode",
+                // Kilo Code 7, like OpenCode, uses this XDG-style location on every OS.
+                path: layout.home.join(".config").join("kilo").join("kilo.jsonc"),
+                format: ConfigFormat::Kilo,
+                detect_paths: vec![layout.home.join(".config").join("kilo")],
+                detect_binaries: vec!["kilo"],
+                superseded_paths: Vec::new(),
+            },
+            json_target(
+                layout,
+                "kilocode legacy vscode extension",
+                layout
+                    .vscode_config_dir()
+                    .join("globalStorage")
+                    .join("kilocode.kilo-code")
+                    .join("settings")
+                    .join("mcp_settings.json"),
+            ),
+        ],
     }
 }
 
@@ -3891,6 +3904,7 @@ fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
             ConfigFormat::ZedContextServers => (&["context_servers"], &[]),
             // OpenCode 2 reads `mcp.servers` and ignores servers directly under `mcp`.
             ConfigFormat::OpenCode => (&["mcp", "servers"], &[&["mcp"]]),
+            ConfigFormat::Kilo => (&["mcp"], &[]),
             ConfigFormat::CodexToml => return None,
         };
     Some(JsonServerLayout {
@@ -3904,7 +3918,9 @@ fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
         ConfigFormat::VscodeServers => {
             json!({"type": "stdio", "command": binary, "args": ["mcp", "serve"]})
         }
-        ConfigFormat::OpenCode => json!({"type": "local", "command": [binary, "mcp", "serve"]}),
+        ConfigFormat::OpenCode | ConfigFormat::Kilo => {
+            json!({"type": "local", "command": [binary, "mcp", "serve"]})
+        }
         ConfigFormat::JsonMcpServers
         | ConfigFormat::ZedContextServers
         | ConfigFormat::CodexToml => {
@@ -4303,7 +4319,7 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
         return false;
     };
     match format {
-        ConfigFormat::OpenCode => {
+        ConfigFormat::OpenCode | ConfigFormat::Kilo => {
             entry.get("type").and_then(Value::as_str) == Some("local")
                 && entry
                     .get("command")
@@ -4909,9 +4925,60 @@ mod tests {
 
             assert_eq!(opencode.len(), 1);
             assert_eq!(opencode[0].path, PathBuf::from(expected_opencode));
-            assert_eq!(kilocode.len(), 1);
-            assert_eq!(kilocode[0].path, PathBuf::from(expected_kilocode));
+            assert_eq!(kilocode.len(), 2);
+            assert_eq!(kilocode[1].path, PathBuf::from(expected_kilocode));
         }
+    }
+
+    /// Kilo Code 7 loads `~/.config/kilo/kilo.jsonc` (servers directly under `mcp`, OpenCode's
+    /// local entry) in every mode; it merges the legacy extension `mcp_settings.json` only inside
+    /// VS Code or its daemon (Kilo-Org/kilocode packages/opencode/src/kilocode/config/config.ts),
+    /// so the legacy file stays a second target for older extensions.
+    #[test]
+    fn kilocode_writes_kilo_jsonc_beside_the_legacy_extension_file() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        for (platform, config) in [
+            (
+                ClientPlatform::Macos,
+                home.join("Library/Application Support"),
+            ),
+            (ClientPlatform::Linux, home.join(".config")),
+            (ClientPlatform::Windows, home.join("AppData/Roaming")),
+        ] {
+            let layout = ClientLayout::new(home.clone(), config, platform);
+            let targets = targets_for_layout(McpClient::Kilocode, &layout);
+            assert_eq!(targets.len(), 2, "{platform:?}");
+            assert_eq!(targets[0].path, home.join(".config/kilo/kilo.jsonc"));
+            assert!(targets[1]
+                .path
+                .ends_with("kilocode.kilo-code/settings/mcp_settings.json"));
+        }
+
+        let path = home.join(".config/kilo/kilo.jsonc");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "{\n  // user note\n  \"mcp\": {\"user-server\": {\"command\": [\"user\"], \"type\": \"local\"}},\n  \"permission\": {\"bash\": \"allow\"},\n}\n",
+        )
+        .unwrap();
+        let layout = ClientLayout::new(home.clone(), home.join(".config"), ClientPlatform::Linux);
+        let target = targets_for_layout(McpClient::Kilocode, &layout).remove(0);
+        assert_eq!(status_target(&target).unwrap(), "not configured");
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("// user note"), "{written}");
+        let data: Value =
+            jsonc_parser::parse_to_serde_value(&written, &jsonc_parse_options()).unwrap();
+        assert_eq!(
+            data["mcp"][SERVER_NAME],
+            json!({"type": "local", "command": ["/bin/aise", "mcp", "serve"]})
+        );
+        assert_eq!(data["mcp"]["user-server"]["command"][0], "user");
+        assert_eq!(data["permission"]["bash"], "allow");
+        assert_eq!(status_target(&target).unwrap(), "configured");
+        assert!(remove_target(&target).unwrap());
+        assert_eq!(status_target(&target).unwrap(), "not configured");
     }
 
     /// Zed's settings.json and VS Code's mcp.json are JSONC: Zed writes a comment header into a
