@@ -740,7 +740,7 @@ mod tests {
                 .session
                 .created_at
                 .map(crate::util::display_timestamp),
-            Some("2026-06-18T11:50:00+00:00".to_string()),
+            Some("2026-06-18T11:50:00Z".to_string()),
             "the earliest event starts the span even though it arrived last"
         );
         assert_eq!(
@@ -748,7 +748,7 @@ mod tests {
                 .session
                 .updated_at
                 .map(crate::util::display_timestamp),
-            Some("2026-06-18T12:30:00+00:00".to_string()),
+            Some("2026-06-18T12:30:00Z".to_string()),
             "the latest event ends the span even though an older record followed it"
         );
         assert!(

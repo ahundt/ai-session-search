@@ -12990,11 +12990,11 @@ mod tests {
         assert_eq!(profile.undated_messages, 1);
         assert_eq!(
             crate::util::display_timestamp(profile.first_timestamp.unwrap()),
-            "2026-01-01T00:00:00.100+00:00"
+            "2026-01-01T00:00:00.100Z"
         );
         assert_eq!(
             crate::util::display_timestamp(profile.last_timestamp.unwrap()),
-            "2026-04-30T00:00:00.300+00:00"
+            "2026-04-30T00:00:00.300Z"
         );
         assert_eq!(profile.observed_span_seconds, Some(10_281_600));
         assert_eq!(profile.max_message_gap_seconds, Some(7_603_200));
