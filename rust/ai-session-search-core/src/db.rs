@@ -1941,7 +1941,7 @@ impl Db {
             .collect();
         // The parser version this source was last indexed with, read before anything below
         // replaces it. Content identifies a message only while the parser that rendered it is
-        // unchanged; see `sync_messages`.
+        // unchanged; see `store_parsed_messages`.
         let mut previous_parse_version: Option<String> = None;
         for path in &source_paths {
             previous_parse_version = tx
@@ -2089,10 +2089,10 @@ impl Db {
                 session.parse_version,
             ],
         )?;
-        let kept_archived_messages =
-            sync_messages(&tx, parsed, allow_append_optimization, same_parser)?;
-        sync_file_edits(&tx, parsed, same_parser)?;
-        if kept_archived_messages {
+        let kept_messages_missing_from_parse =
+            store_parsed_messages(&tx, parsed, allow_append_optimization, same_parser)?;
+        store_parsed_file_edits(&tx, parsed, same_parser)?;
+        if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
             // union rather than the parse alone.
             prior_transcripts.extend(
@@ -6119,7 +6119,7 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 ///   message from a removed one across parser versions, which is why only the same parser keeps.
 ///
 /// O(stored + parsed rows and bytes) time off the append path; O(rows) memory for 32-byte keys.
-fn sync_messages(
+fn store_parsed_messages(
     tx: &rusqlite::Transaction<'_>,
     parsed: &ParsedSession,
     allow_append_optimization: bool,
@@ -6164,8 +6164,8 @@ fn sync_messages(
     if same_parser
         && stored
             .iter()
-            .map(|(_, keys)| keys.row)
-            .eq(parsed_keys.iter().map(|keys| keys.row))
+            .map(|(_, keys)| keys.all_columns)
+            .eq(parsed_keys.iter().map(|keys| keys.all_columns))
     {
         return Ok(false);
     }
@@ -6182,12 +6182,12 @@ fn sync_messages(
         insert_messages(tx, session, parsed.messages.iter().map(|m| (m.seq, m)))?;
         return Ok(false);
     }
-    let mut stored_roles = key_counts(stored.iter().map(|(_, keys)| keys.role));
+    let mut stored_roles = key_counts(stored.iter().map(|(_, keys)| keys.role_and_content));
     let unseen = parsed
         .messages
         .iter()
         .zip(&parsed_keys)
-        .filter(|(_, keys)| !take_key(&mut stored_roles, &keys.role))
+        .filter(|(_, keys)| !take_key(&mut stored_roles, &keys.role_and_content))
         .map(|(message, _)| message);
     insert_messages(
         tx,
@@ -6200,13 +6200,13 @@ fn sync_messages(
 }
 
 /// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
-/// replace and keep rules as `sync_messages`. A kept session's edits are renumbered so that
+/// replace and keep rules as `store_parsed_messages`. A kept session's edits are renumbered so that
 /// each edit only the parse holds replays immediately before the next stored edit the parse
 /// lists after it (last when none follows): version replay applies edits in seq order, and a
 /// `Write` appended after a retained `Edit` it preceded would reset the file afterwards. Edit
 /// seqs are an order within the session, independent of message seqs, so renumbering moves no
 /// message reference. O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory.
-fn sync_file_edits(
+fn store_parsed_file_edits(
     tx: &rusqlite::Transaction<'_>,
     parsed: &ParsedSession,
     same_parser: bool,
@@ -6221,15 +6221,15 @@ fn sync_file_edits(
     if same_parser
         && stored
             .iter()
-            .map(|(_, _, keys)| keys.row)
-            .eq(parsed_keys.iter().map(|keys| keys.row))
+            .map(|(_, _, keys)| keys.all_columns)
+            .eq(parsed_keys.iter().map(|keys| keys.all_columns))
     {
         return Ok(());
     }
     if !same_parser
         || covers_every_stored_key(
-            stored.iter().map(|(_, _, keys)| keys.content),
-            parsed_keys.iter().map(|keys| keys.content),
+            stored.iter().map(|(_, _, keys)| keys.edit),
+            parsed_keys.iter().map(|keys| keys.edit),
         )
     {
         tx.execute(
@@ -6241,16 +6241,13 @@ fn sync_file_edits(
     }
     let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
     for (position, (_, _, keys)) in stored.iter().enumerate() {
-        positions
-            .entry(keys.content)
-            .or_default()
-            .push_back(position);
+        positions.entry(keys.edit).or_default().push_back(position);
     }
     let matched: Vec<Option<usize>> = parsed_keys
         .iter()
         .map(|keys| {
             positions
-                .get_mut(&keys.content)
+                .get_mut(&keys.edit)
                 .and_then(|queue| queue.pop_front())
         })
         .collect();
@@ -6293,13 +6290,13 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
             params![target, retired],
         )?;
     } else {
-        let mut held = key_counts(held.iter().map(|(_, keys)| keys.role));
+        let mut held = key_counts(held.iter().map(|(_, keys)| keys.role_and_content));
         let next_seq = next_message_seq(tx, target)?;
         let mut moved = 0;
         let mut update =
             tx.prepare("update messages set session_id = ?1, seq = ?2 where id = ?3")?;
         for (id, keys) in stored_message_keys(tx, retired)? {
-            if !take_key(&mut held, &keys.role) {
+            if !take_key(&mut held, &keys.role_and_content) {
                 update.execute(params![target, next_seq + moved, id])?;
                 moved += 1;
             }
@@ -6308,13 +6305,13 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
     let mut held = key_counts(
         stored_file_edit_keys(tx, target)?
             .iter()
-            .map(|(_, _, keys)| keys.content),
+            .map(|(_, _, keys)| keys.edit),
     );
     let next_seq = next_file_edit_seq(tx, target)?;
     let mut moved = 0;
     let mut update = tx.prepare("update file_edits set session_id = ?1, seq = ?2 where id = ?3")?;
     for (id, _, keys) in stored_file_edit_keys(tx, retired)? {
-        if !take_key(&mut held, &keys.content) {
+        if !take_key(&mut held, &keys.edit) {
             update.execute(params![target, next_seq + moved, id])?;
             moved += 1;
         }
@@ -6324,18 +6321,18 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
 
 type RowDigest = [u8; 32];
 
-/// Identities of one message row for the archive rule (`sync_messages`, `move_retired_rows`).
+/// Identities of one message row for the archive rule (`store_parsed_messages`, `move_retired_rows`).
 ///
 /// - `content` alone decides whether a parse still holds every stored message, so a same-parser
 ///   parse that re-renders metadata still replaces.
-/// - `role` adds the role, so text a new message shares with a stored message of another role
-///   is not taken for it.
-/// - `row` covers every stored column except the content parts, which the parser derives from
-///   the content; equal `row` sequences mean the parse would write exactly what is stored.
+/// - `role_and_content` adds the role, so text a new message shares with a stored message of
+///   another role is not taken for it.
+/// - `all_columns` covers every stored column except the content parts, which the parser derives from
+///   the content; equal `all_columns` sequences mean the parse would write exactly what is stored.
 struct MessageKeys {
     content: RowDigest,
-    role: RowDigest,
-    row: RowDigest,
+    role_and_content: RowDigest,
+    all_columns: RowDigest,
 }
 
 /// The stored message columns the archive keys read; `None` is SQL NULL.
@@ -6358,11 +6355,11 @@ impl MessageColumns<'_> {
         let mut content = FramedSha256::new(b"aise-archive-message-content-v1");
         content.update_bytes(self.content.as_bytes());
         let content = content.finish_bytes();
-        let mut role = FramedSha256::new(b"aise-archive-message-role-v1");
-        role.update_optional_str(self.role);
-        role.update_bytes(&content);
-        let mut row = FramedSha256::new(b"aise-archive-message-row-v1");
-        row.update_i64(self.seq);
+        let mut role_and_content = FramedSha256::new(b"aise-archive-message-role-v1");
+        role_and_content.update_optional_str(self.role);
+        role_and_content.update_bytes(&content);
+        let mut all_columns = FramedSha256::new(b"aise-archive-message-row-v1");
+        all_columns.update_i64(self.seq);
         for value in [
             self.role,
             self.kind,
@@ -6375,14 +6372,14 @@ impl MessageColumns<'_> {
             self.correlation[2],
             self.record_relation,
         ] {
-            row.update_optional_str(value);
+            all_columns.update_optional_str(value);
         }
-        row.update_u8(u8::from(self.is_compaction));
-        row.update_bytes(&content);
+        all_columns.update_u8(u8::from(self.is_compaction));
+        all_columns.update_bytes(&content);
         MessageKeys {
             content,
-            role: role.finish_bytes(),
-            row: row.finish_bytes(),
+            role_and_content: role_and_content.finish_bytes(),
+            all_columns: all_columns.finish_bytes(),
         }
     }
 }
@@ -6449,11 +6446,11 @@ fn stored_message_keys(
     Ok(keys)
 }
 
-/// Identities of one file-edit row: `content` is the edit itself (tool, path, full content and
-/// replacements); `row` adds seq, timestamp and file name, the columns `content` omits.
+/// Identities of one file-edit row: `edit` is the edit itself (tool, path, full content and
+/// replacements); `all_columns` adds seq, timestamp and file name, the columns `edit` omits.
 struct FileEditKeys {
-    content: RowDigest,
-    row: RowDigest,
+    edit: RowDigest,
+    all_columns: RowDigest,
 }
 
 fn file_edit_keys(
@@ -6465,27 +6462,27 @@ fn file_edit_keys(
     new_content: Option<&str>,
     edits_json: Option<&str>,
 ) -> FileEditKeys {
-    let mut content = FramedSha256::new(b"aise-archive-file-edit-content-v1");
-    content.update_bytes(tool.as_bytes());
-    content.update_bytes(file_path.as_bytes());
-    content.update_optional_str(new_content);
-    content.update_optional_str(edits_json);
-    let content = content.finish_bytes();
-    let mut row = FramedSha256::new(b"aise-archive-file-edit-row-v1");
-    row.update_i64(seq);
-    row.update_optional_str(ts);
-    row.update_bytes(file_name.as_bytes());
-    row.update_bytes(&content);
+    let mut edit = FramedSha256::new(b"aise-archive-file-edit-content-v1");
+    edit.update_bytes(tool.as_bytes());
+    edit.update_bytes(file_path.as_bytes());
+    edit.update_optional_str(new_content);
+    edit.update_optional_str(edits_json);
+    let edit = edit.finish_bytes();
+    let mut all_columns = FramedSha256::new(b"aise-archive-file-edit-row-v1");
+    all_columns.update_i64(seq);
+    all_columns.update_optional_str(ts);
+    all_columns.update_bytes(file_name.as_bytes());
+    all_columns.update_bytes(&edit);
     FileEditKeys {
-        content,
-        row: row.finish_bytes(),
+        edit,
+        all_columns: all_columns.finish_bytes(),
     }
 }
 
 /// Keys of a parsed file edit, from the same column values `insert_file_edits` writes.
 fn parsed_file_edit_keys(edit: &FileEdit) -> Result<FileEditKeys> {
     let ts = edit.ts.map(|ts| ts.to_rfc3339());
-    let edits_json = file_edit_ops_json(edit)?;
+    let edits_json = serialize_edits_json(edit)?;
     Ok(file_edit_keys(
         edit.seq,
         ts.as_deref(),
@@ -6563,7 +6560,7 @@ fn take_key(keys: &mut HashMap<RowDigest, usize>, key: &RowDigest) -> bool {
 }
 
 /// The `edits_json` column value of a file edit: a JSON `[old, new]` array, NULL when empty.
-fn file_edit_ops_json(edit: &FileEdit) -> Result<Option<String>> {
+fn serialize_edits_json(edit: &FileEdit) -> Result<Option<String>> {
     Ok(if edit.edits.is_empty() {
         None
     } else {
@@ -6585,7 +6582,7 @@ fn insert_file_edits<'a>(
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for (seq, edit) in rows {
-        let edits_json = file_edit_ops_json(edit)?;
+        let edits_json = serialize_edits_json(edit)?;
         stmt.execute(params![
             session.id,
             session.provider.as_str(),
