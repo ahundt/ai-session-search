@@ -185,7 +185,7 @@ impl Row for MessageClassificationMatch {
             self.session_id.clone(),
             self.message_seq.to_string(),
             self.ts
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
             self.policy_name.clone(),
             self.category.clone(),

@@ -22,17 +22,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    do. `--since 1m` meant 30 days and now means 1 minute; write `--since 1M` for a month.
    Months and years now step back calendar months, so `1M` from March 31 starts on the last
    day of February instead of March 1.
-2. Timestamps in output end in `Z` everywhere. `aise list`, `aise doctor` and exports already
-   wrote `2026-11-07T19:44:17.663Z`, while `messages`, `files`, analytics, parts of MCP and the
-   Python binding wrote `+00:00`; all now use the first form, which chrono's serde, JavaScript's
-   `toISOString` and Python's `datetime.fromisoformat` all read. Stored timestamps are unchanged.
-3. Dates and times without an offset are read in your local time zone, as ISO 8601 and EDTF
-   define them: `--when 2026-11-07` and `--when yesterday` mean your day, not the UTC day. `TZ`
-   overrides the system zone, and a trailing zone in RFC 9557 form reads one value in another
-   zone, for example `--since '2026-01-15[Europe/Berlin]'`. This works the same in CLI flags,
-   MCP `since`/`until`/`when` and the Python `DateRange`; `reference_time` accepts the RFC 9557
-   form too. Days that daylight saving shortens or lengthens are handled, and a time skipped or
-   repeated by a clock change resolves as RFC 5545 specifies. `aise dates` shows the zone in use.
+2. Timestamps have one machine form and one for people. JSON output, MCP results and the Python
+   binding end in `Z` (`2026-11-07T20:31:22.663Z`), the form chrono's serde,
+   JavaScript and Python 3.12 read; `messages`, `files`, analytics and parts of MCP used to write
+   `+00:00`. Tables and `aise show` print local time with its offset
+   (`2026-11-07T15:31:22.663-05:00`), which can be pasted into `--since`. Stored timestamps are
+   unchanged.
+3. A date or time without an offset is read in your local time zone, as
+   [EDTF](https://www.loc.gov/standards/datetime/) and ISO 8601 define it. At 8 pm in New York,
+   `--when yesterday` and `--when 2026-11-07` now mean your day, not the UTC day. `TZ` overrides
+   the system zone. To read one value in another zone, append the zone in
+   [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) form: `--since '2026-01-15[Europe/Berlin]'`.
+   CLI flags, MCP `since`/`until`/`when` and the Python `DateRange` accept the same strings, and
+   `reference_time` takes that form too. Days that daylight saving shortens or lengthens are
+   covered, and a time a clock change skips or repeats resolves as
+   [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) specifies. `aise dates` shows the zone in
+   use.
 4. Durations also accept ISO 8601 (`P1M`, `PT2H`) and compound forms (`1d12h`), and EDTF open
    intervals (`2026-01/..`, `../2026-03`) select everything after or before a date.
 

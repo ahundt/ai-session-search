@@ -981,6 +981,21 @@ pub fn stored_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
 }
 
+/// Timestamp text for people reading a table or terminal: RFC 3339 in the local time zone with
+/// its offset (`2026-11-07T15:31:22.663-05:00`). It names the same instant as
+/// [`display_timestamp`] and can be passed back to `--since`; JSON and other machine output use
+/// [`display_timestamp`].
+pub fn display_local_timestamp(value: DateTime<Utc>) -> String {
+    let nanos = i32::try_from(value.timestamp_subsec_nanos()).unwrap_or(0);
+    match jiff::Timestamp::new(value.timestamp(), nanos) {
+        Ok(instant) => {
+            let offset = crate::dates::local_time_zone().to_offset(instant);
+            instant.display_with_offset(offset).to_string()
+        }
+        Err(_) => display_timestamp(value),
+    }
+}
+
 /// The text form of a timestamp shown to people or emitted in JSON output: RFC 3339 in UTC with
 /// a `Z` suffix, exactly what chrono's serde writes for the `DateTime` fields of output structs,
 /// so every surface shows one format. Stored text keeps `+00:00` (see [`stored_timestamp`]),
@@ -2131,6 +2146,17 @@ pub(crate) mod tests {
                 Some(instant)
             );
         }
+    }
+
+    #[test]
+    fn local_display_names_the_same_instant_with_the_local_offset() {
+        let instant = parse_stored_timestamp("2026-11-07T20:31:22.663Z").unwrap();
+        let text = display_local_timestamp(instant);
+        // Whatever the machine's zone, the text carries an explicit offset and reads back to the
+        // same instant, so it can be pasted into --since.
+        assert!(!text.ends_with('Z') || crate::dates::local_time_zone() == jiff::tz::TimeZone::UTC);
+        assert_eq!(parse_stored_timestamp(&text), Some(instant));
+        assert!(text.starts_with("2026-11-0"));
     }
 
     #[test]
