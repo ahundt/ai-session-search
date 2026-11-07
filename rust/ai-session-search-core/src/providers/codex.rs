@@ -93,8 +93,8 @@ impl CodexAdapter {
         let walked = walk_roots(&self.roots, None);
         // Codex writes the compressed copy and then deletes the plain file, so both can exist for
         // a moment; the plain file is then the newer, authoritative copy. Deciding from this one
-        // walk, rather than a second stat, keeps exactly one of the two whichever moment the walk
-        // saw.
+        // walk keeps exactly one of the two. If Codex deletes the plain file after the walk, its
+        // read fails, the stored session stays as it was, and the next refresh finds the `.zst`.
         let walked_plain_rollouts: std::collections::HashSet<&Path> = walked
             .entries
             .iter()
