@@ -488,16 +488,24 @@ fn days_span(
     last: jiff::civil::Date,
     zone: &TimeZone,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    // jiff's range ends a few hours inside the years -9999 and 9999, so a period reaching past
-    // it is clamped to the first or last representable instant.
+    // jiff's range ends a few hours inside the years -9999 and 9999, so an endpoint past it is
+    // clamped to the boundary that date lies beyond, keeping `9999-12-31` at the end of time
+    // rather than widening it to the whole range.
+    let beyond = |day: jiff::civil::Date| {
+        if day.year() < 0 {
+            jiff::Timestamp::MIN
+        } else {
+            jiff::Timestamp::MAX
+        }
+    };
     let start = first
         .to_zoned(zone.clone())
         .and_then(|day| day.start_of_day())
-        .map_or(jiff::Timestamp::MIN, |day| day.timestamp());
+        .map_or_else(|_| beyond(first), |day| day.timestamp());
     let end = last
         .to_zoned(zone.clone())
         .and_then(|day| day.end_of_day())
-        .map_or(jiff::Timestamp::MAX, |day| day.timestamp());
+        .map_or_else(|_| beyond(last), |day| day.timestamp());
     Ok((from_timestamp(start)?, from_timestamp(end)?))
 }
 
@@ -789,6 +797,11 @@ mod tests {
         let (_, end) = span("9999");
         assert_eq!(end.year(), 9999);
         assert!(span("-9999").0.year() <= -9999);
+        // A day wholly past jiff's last instant clamps both ends to that boundary; its start
+        // falling back to the first instant selected the whole supported history instead.
+        let (start, end) = span("9999-12-31[UTC]");
+        assert_eq!((start.year(), end.year()), (9999, 9999), "{start} .. {end}");
+        assert!(start <= end);
     }
 
     #[test]
