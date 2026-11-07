@@ -29,7 +29,7 @@ use crate::models::{
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
-    fold_caseless, parse_datetime, snippet_from_match, snippet_from_match_while,
+    fold_caseless, parse_datetime, snippet_from_match, snippet_from_match_while, stored_timestamp,
     UnicodeLowerNeedle, SIGMAS,
 };
 
@@ -2042,9 +2042,9 @@ impl Db {
                 session.summary,
                 session.cwd,
                 session.repo_root,
-                session.created_at.map(|value| value.to_rfc3339()),
-                session.updated_at.map(|value| value.to_rfc3339()),
-                session.last_message_at.map(|value| value.to_rfc3339()),
+                session.created_at.map(stored_timestamp),
+                session.updated_at.map(stored_timestamp),
+                session.last_message_at.map(stored_timestamp),
                 session.preview_text,
                 session.source_path,
                 session.message_count,
@@ -2080,7 +2080,7 @@ impl Db {
                 session.source_path,
                 mtime_ns,
                 size_bytes,
-                Utc::now().to_rfc3339(),
+                stored_timestamp(Utc::now()),
                 session.parse_version,
             ],
         )?;
@@ -2325,7 +2325,7 @@ impl Db {
                 session.source_path,
                 mtime_ns,
                 size_bytes,
-                Utc::now().to_rfc3339(),
+                stored_timestamp(Utc::now()),
                 tail.new_tail_offset,
                 tail.new_fingerprint,
                 session.parse_version,
@@ -4448,11 +4448,7 @@ impl Db {
                 )),
                 None => policies.classify(&content),
             }?;
-            let ts = ts.as_deref().and_then(|value| {
-                chrono::DateTime::parse_from_rfc3339(value)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            });
+            let ts = ts.as_deref().and_then(parse_datetime);
             Some(MessageClassificationMatch {
                 session_id,
                 message_seq,
@@ -5346,13 +5342,7 @@ impl Db {
                     row.get::<_, i64>(6)?,
                 ))
             })?;
-        let parse_ts = |value: Option<String>| {
-            value.and_then(|value| {
-                chrono::DateTime::parse_from_rfc3339(&value)
-                    .ok()
-                    .map(|timestamp| timestamp.with_timezone(&Utc))
-            })
-        };
+        let parse_ts = |value: Option<String>| value.as_deref().and_then(parse_datetime);
         let first_timestamp = parse_ts(row.2);
         let last_timestamp = parse_ts(row.3);
         Ok(SessionTimeProfile {
@@ -5968,7 +5958,7 @@ fn insert_messages<'a>(
             session.provider.as_str(),
             seq,
             message.role.as_str(),
-            message.ts.map(|ts| ts.to_rfc3339()),
+            message.ts.map(stored_timestamp),
             message.tool_name,
             message.kind.as_str(),
             message.tool_call_id,
@@ -6037,7 +6027,7 @@ fn widest_session_dates(dates: impl IntoIterator<Item = SessionDates>) -> [Optio
         updated = updated.max(u);
         last = last.max(l);
     }
-    [created, updated, last].map(|date: Option<DateTime<Utc>>| date.map(|date| date.to_rfc3339()))
+    [created, updated, last].map(|date: Option<DateTime<Utc>>| date.map(stored_timestamp))
 }
 
 /// Session text after an archive keep: the first text, then each paragraph of every later text
@@ -6374,7 +6364,7 @@ impl MessageColumns<'_> {
 
 /// Keys of a parsed message, from the same column values `insert_messages` writes.
 fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
-    let ts = message.ts.map(|ts| ts.to_rfc3339());
+    let ts = message.ts.map(stored_timestamp);
     let correlation = message.provenance.correlation_identity.as_ref();
     MessageColumns {
         seq: message.seq,
@@ -6481,7 +6471,7 @@ fn file_edit_keys(
 
 /// Keys of a parsed file edit, from the same column values `insert_file_edits` writes.
 fn parsed_file_edit_keys(edit: &FileEdit) -> Result<FileEditKeys> {
-    let ts = edit.ts.map(|ts| ts.to_rfc3339());
+    let ts = edit.ts.map(stored_timestamp);
     let edits_json = serialize_edits_json(edit)?;
     Ok(file_edit_keys(
         edit.seq,
@@ -6587,7 +6577,7 @@ fn insert_file_edits<'a>(
             session.id,
             session.provider.as_str(),
             seq,
-            edit.ts.map(|ts| ts.to_rfc3339()),
+            edit.ts.map(stored_timestamp),
             edit.tool,
             edit.file_path,
             edit.file_name,
@@ -6619,7 +6609,7 @@ fn push_ts_window(
     // String is infallible, so the `Result` is discarded.
     if let Some(since) = since {
         let _ = write!(sql, " and {col} >= ?");
-        args.push(Value::Text(since.to_rfc3339()));
+        args.push(Value::Text(stored_timestamp(since)));
     }
     if let Some(until) = until {
         let _ = write!(sql, " and {col} <= ?");
@@ -6808,7 +6798,7 @@ fn push_session_time_window(
 ) {
     if let Some(since) = since {
         sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
-        args.push(since.to_rfc3339());
+        args.push(stored_timestamp(since));
     }
     if let Some(until) = until {
         sql.push_str(" and coalesce(s.created_at, s.updated_at) <= ? ");
@@ -6861,11 +6851,7 @@ fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Re
             "messages.role",
             Role::from_db_str,
         )?,
-        ts: ts.and_then(|value| {
-            chrono::DateTime::parse_from_rfc3339(&value)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        }),
+        ts: ts.as_deref().and_then(parse_datetime),
         tool_name: row.get(offset + 5)?,
         kind: crate::models::MessageKind::from_db_str(&row.get::<_, String>(offset + 6)?),
         tool_call_id: row.get(offset + 7)?,
@@ -10452,7 +10438,7 @@ mod tests {
                      id, provider, provider_session_id, cwd, repo_root, preview_text,
                      source_path, updated_at, parse_version, discovery_source
                  ) values ('s1','claude','s1','/repo','/repo','ordinary text','/p',?1,'1','test')",
-                params![Utc::now().to_rfc3339()],
+                params![stored_timestamp(Utc::now())],
             )
             .unwrap();
 
