@@ -29,7 +29,8 @@ use crate::models::{
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
-    fold_caseless, snippet_from_match, snippet_from_match_while, UnicodeLowerNeedle, SIGMAS,
+    fold_caseless, parse_datetime, snippet_from_match, snippet_from_match_while,
+    UnicodeLowerNeedle, SIGMAS,
 };
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
@@ -1979,17 +1980,19 @@ impl Db {
         // The date span and session text of every identity this parse replaces, read before the
         // upsert overwrites them. Only an archive keep, which retains rows the parse lacks, uses
         // them; the parse speaks for everything else.
-        let mut prior_span = SessionSpan::default();
+        // Dates are compared as instants: stored RFC 3339 text orders correctly only within one
+        // UTC offset.
+        let mut prior_dates: Vec<[Option<DateTime<Utc>>; 3]> = Vec::new();
         for id in std::iter::once(&session.id).chain(&retired_ids) {
-            if let Some(span) = tx
+            if let Some(dates) = tx
                 .query_row(
                     "select created_at, updated_at, last_message_at from sessions where id = ?1",
                     params![id],
-                    |row| Ok(SessionSpan::new(row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok([row.get::<_, Option<String>>(0)?, row.get(1)?, row.get(2)?]),
                 )
                 .optional()?
             {
-                prior_span.widen(span);
+                prior_dates.push(dates.map(|text| text.as_deref().and_then(parse_datetime)));
             }
         }
         let mut prior_transcripts: Vec<String> = Vec::new();
@@ -2114,21 +2117,30 @@ impl Db {
             if stored_transcript.as_deref() != Some(transcript.as_str()) {
                 upsert_transcript(&tx, &session.id, &transcript)?;
             }
+            // The earliest start and the latest activity across the stored identities and the
+            // parse.
+            let parsed_dates = [
+                session.created_at,
+                session.updated_at,
+                session.last_message_at,
+            ];
+            let dates = |column: usize| {
+                prior_dates
+                    .iter()
+                    .map(move |dates| dates[column])
+                    .chain([parsed_dates[column]])
+                    .flatten()
+            };
+            let rfc3339 = |date: Option<DateTime<Utc>>| date.map(|date| date.to_rfc3339());
             tx.execute(
-                "update sessions set
-                    created_at = case when ?2 is not null and (created_at is null or ?2 < created_at)
-                                      then ?2 else created_at end,
-                    updated_at = case when ?3 is not null and ?3 > coalesce(updated_at, '')
-                                      then ?3 else updated_at end,
-                    last_message_at = case when ?4 is not null and ?4 > coalesce(last_message_at, '')
-                                           then ?4 else last_message_at end,
+                "update sessions set created_at = ?2, updated_at = ?3, last_message_at = ?4,
                     message_count = (select count(*) from messages where session_id = ?1)
                  where id = ?1",
                 params![
                     session.id,
-                    prior_span.created_at,
-                    prior_span.updated_at,
-                    prior_span.last_message_at
+                    rfc3339(dates(0).min()),
+                    rfc3339(dates(1).max()),
+                    rfc3339(dates(2).max()),
                 ],
             )?;
         } else {
@@ -6016,53 +6028,16 @@ fn upsert_transcript(
     Ok(())
 }
 
-/// Earliest start and latest activity across session rows, as stored RFC 3339 UTC text. Every
-/// writer stores `DateTime<Utc>::to_rfc3339`, whose text orders chronologically, the same
-/// comparison `append_tail` makes in SQL.
-#[derive(Default)]
-struct SessionSpan {
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    last_message_at: Option<String>,
-}
-
-impl SessionSpan {
-    fn new(
-        created_at: Option<String>,
-        updated_at: Option<String>,
-        last_message_at: Option<String>,
-    ) -> Self {
-        Self {
-            created_at,
-            updated_at,
-            last_message_at,
-        }
-    }
-
-    fn widen(&mut self, other: SessionSpan) {
-        fn pick(current: &mut Option<String>, other: Option<String>, later: bool) {
-            if let Some(other) = other {
-                let replace = current
-                    .as_ref()
-                    .is_none_or(|value| (other > *value) == later);
-                if replace {
-                    *current = Some(other);
-                }
-            }
-        }
-        pick(&mut self.created_at, other.created_at, false);
-        pick(&mut self.updated_at, other.updated_at, true);
-        pick(&mut self.last_message_at, other.last_message_at, true);
-    }
-}
-
 /// Session text after an archive keep: the first text, then each paragraph of every later text
 /// that the merge so far lacks. Paragraphs are the "\n\n"-joined units every provider
 /// transcript and `append_tail` use, so overlapping texts (a session and a retired identity of
 /// the same source) contribute their shared paragraphs once, while a paragraph repeated within
 /// one text is added once per copy the merge lacks. A paragraph break inside one message's text
-/// splits it too, so a message paragraph equal to a held paragraph is not repeated; the message
-/// rows themselves are unaffected. O(total bytes) time, O(paragraphs) memory.
+/// splits it too, so a message paragraph identical to one already merged appears once, and text
+/// from neighbouring entries can read as contiguous. No unique text is dropped, and the message
+/// rows themselves are unaffected. The text cannot be rebuilt from the rows instead: providers
+/// write transcript entries only for conversation messages, and Claude's hold only the
+/// human-authored part. O(total bytes) time, O(paragraphs) memory.
 fn merge_transcripts<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
     let mut held: HashMap<&'a str, usize> = HashMap::new();
     let mut merged = String::new();
@@ -17137,6 +17112,53 @@ mod tests {
         assert!(created.starts_with("2026-01-01"), "{created}");
         assert!(updated.starts_with("2026-02-02"), "{updated}");
         assert!(last.starts_with("2026-02-02"), "{last}");
+    }
+
+    #[test]
+    fn a_kept_rewrite_compares_session_dates_as_instants_whatever_their_offset() {
+        // RFC 3339 text orders correctly only within one offset: 05:00+05:00 is midnight UTC,
+        // earlier than 00:30Z, yet sorts after it as text.
+        use crate::models::MessageKind::Conversation;
+        let at = |text: &str| Some(text.parse::<DateTime<Utc>>().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let original = archive_session(
+            vec![
+                archive_message(0, "alpha", Conversation),
+                archive_message(1, "beta", Conversation),
+            ],
+            Vec::new(),
+        );
+        db.upsert_session(&original, 1, 1).unwrap();
+        db.conn
+            .execute(
+                "update sessions set created_at = '2026-01-01T05:00:00+05:00',
+                     updated_at = '2026-01-02T05:00:00+05:00'",
+                [],
+            )
+            .unwrap();
+        let mut rewritten =
+            archive_session(vec![archive_message(0, "gamma", Conversation)], Vec::new());
+        rewritten.session.created_at = at("2026-01-01T00:30:00Z");
+        rewritten.session.updated_at = at("2026-01-01T23:30:00Z");
+        db.upsert_session(&rewritten, 2, 2).unwrap();
+        let (created, updated): (String, String) = db
+            .conn
+            .query_row("select created_at, updated_at from sessions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        let instant = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            instant(&created),
+            instant("2026-01-01T00:00:00Z"),
+            "{created}"
+        );
+        assert_eq!(
+            instant(&updated),
+            instant("2026-01-02T00:00:00Z"),
+            "{updated}"
+        );
     }
 
     #[test]
