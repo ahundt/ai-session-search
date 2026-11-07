@@ -61,8 +61,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    rollout as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so
    nothing written after its last read of such a session was ever indexed (1,182 of the
    maintainer's rollouts were compressed). The compressed file is read as the same source as its
-   plain form, so the session keeps its id and stored messages, and a corrupt `.zst` becomes a
-   warned parse failure for that session.
+   plain form, so the session keeps its id and stored messages. A `.zst` that cannot be
+   decompressed is a warned parse failure when nothing is indexed for it yet; for an indexed
+   session, aise keeps the stored messages and tries the file again on the next refresh.
 
 ### Performance
 
