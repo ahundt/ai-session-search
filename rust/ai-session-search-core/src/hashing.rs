@@ -56,6 +56,17 @@ impl FramedSha256 {
         update_length_prefixed(&mut self.digest, value);
     }
 
+    /// Append an optional text value; a presence byte keeps `None` distinct from `Some("")`.
+    pub(crate) fn update_optional_str(&mut self, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.update_u8(1);
+                self.update_bytes(value.as_bytes());
+            }
+            None => self.update_u8(0),
+        }
+    }
+
     /// Append bytes whose complete length was already framed by the caller.
     ///
     /// This supports serializers that write one logical value in multiple chunks without making
@@ -97,6 +108,11 @@ impl FramedSha256 {
         encoded.push_str("sha256:");
         push_lower_hex(&mut encoded, bytes.as_ref());
         encoded
+    }
+
+    /// Finish as the raw 32 digest bytes, for in-memory identity sets that never leave the process.
+    pub(crate) fn finish_bytes(self) -> [u8; 32] {
+        self.digest.finalize().into()
     }
 
     /// Finish as four signed words for fixed-width SQLite metadata.

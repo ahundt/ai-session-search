@@ -45,13 +45,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    such rows as harness notices, which default search, corrections and repeat mining already
    leave out, and deletes nothing. `Db::purge_injected_messages` is deprecated in favour of
    `Db::classify_injected_messages`.
-7. Reindexing a session whose source got smaller no longer deletes what aise already stored.
-   Harnesses compact, rewrite and prune their own transcripts: one Codex session went from 4,720
-   indexed messages to 16 after Codex rewrote its file, because a re-parse that came out shorter
-   replaced the whole session. Under the same parser, aise now keeps every stored message and file
-   edit and appends only the new ones. A parser upgrade still replaces the session, since a new
-   parser may render the same message differently. A shrink now costs 18.8 ms where the full
-   replace cost 2.2 s on a 20,000-message session.
+7. Reindexing a session whose source got smaller or was rewritten no longer deletes what aise
+   already stored. Harnesses compact, rewrite and prune their own transcripts: one Codex session
+   went from 4,720 indexed messages to 16 after Codex rewrote its file, because a re-parse that
+   came out shorter replaced the whole session. Under the same parser, aise now keeps every
+   stored message and file edit and adds the new ones, and the session text that session search
+   reads, the session's dates and its message count cover both. A new file edit replays before
+   the stored edits it came before in the source. A source parsed under a new session id moves
+   its stored rows to the new id, except rows that id already holds, where they used to be
+   deleted with the old id. A parser upgrade still replaces the session, since a new parser may
+   render the same message differently. On a 20,000-message session, keeping the stored rows
+   after a shrink takes 43 ms; the full replace it avoids took 1.65 s.
 
 ### Performance
 
@@ -64,6 +68,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    4.6-6.3 minutes to 3.9-5.2 s on the same index.
 3. The literal matcher skips positions that cannot begin a match, about 3x faster when every
    candidate has to be checked.
+4. Reindexing a source whose parse matches what is already stored writes nothing, so a file whose
+   timestamp changed without its content no longer rewrites the session: 27 ms instead of 1.65 s
+   for a 20,000-message session.
 
 ## [1.0.0] - 2026-11-05
 

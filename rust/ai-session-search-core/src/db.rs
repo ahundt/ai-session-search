@@ -1862,6 +1862,13 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Persist a full parse of a session's source, for sources that only ever grow.
+    ///
+    /// When the stored rows are a dense prefix of the parse and the last stored row still
+    /// matches the parse at that seq, only the new tail is inserted. Earlier stored rows are
+    /// not compared, so a source rewritten before that boundary keeps its stale rows; use
+    /// [`Db::replace_session`] for sources that can be rewritten. Otherwise this behaves like
+    /// `replace_session`.
     pub fn upsert_session(
         &self,
         parsed: &ParsedSession,
@@ -1871,10 +1878,16 @@ impl Db {
         self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true, &[])
     }
 
-    /// Persist a fully re-parsed session and force message/file rows to be replaced, even
-    /// when the new parse appears to be an append-only growth of the old rows. Use this
-    /// for explicit full reindex/backfill paths so parser/schema fixes repair existing
-    /// rows instead of preserving a stale prefix for performance.
+    /// Persist a full parse of a session's source without the append shortcut, comparing every
+    /// stored row against the parse:
+    ///
+    /// - rows equal to the parse are left untouched;
+    /// - a new parser version, or a parse that still holds every stored message and file edit,
+    ///   replaces the rows, so parser and schema fixes repair them;
+    /// - under the same parser, a parse that no longer holds a stored row keeps it, because
+    ///   harnesses compact, rewrite and prune their own transcripts and the index is the
+    ///   archive. Messages and edits only the parse holds are added; the session's text, date
+    ///   span and message count then describe both.
     pub fn replace_session(
         &self,
         parsed: &ParsedSession,
@@ -1909,17 +1922,28 @@ impl Db {
         allow_append_optimization: bool,
         source_aliases: &[String],
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        // IMMEDIATE takes the write lock before the first read, so another writer committing
+        // between this transaction's reads and its first write cannot fail the upgrade with
+        // SQLITE_BUSY, which the busy handler does not retry for a deferred transaction.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let session = &parsed.session;
-        let aliases: Vec<&String> = source_aliases
-            .iter()
-            .filter(|alias| alias.as_str() != session.source_path)
+        // Every path this source may have been indexed under: its own and its verified aliases.
+        let source_paths: Vec<&str> = std::iter::once(session.source_path.as_str())
+            .chain(
+                source_aliases
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|alias| *alias != session.source_path),
+            )
             .collect();
-        // The parser version this source was last indexed with, under its current path or a
-        // verified alias, read before anything below replaces it. Content identifies a message
-        // only while the parser that rendered it is unchanged; see the archive rule below.
+        // The parser version this source was last indexed with, read before anything below
+        // replaces it. Content identifies a message only while the parser that rendered it is
+        // unchanged; see `sync_messages`.
         let mut previous_parse_version: Option<String> = None;
-        for path in std::iter::once(&session.source_path).chain(aliases.iter().copied()) {
+        for path in &source_paths {
             previous_parse_version = tx
                 .query_row(
                     "select parse_version from files_seen where provider = ?1 and source_path = ?2",
@@ -1935,12 +1959,13 @@ impl Db {
         // A complete source parse represents one canonical session. Parser improvements or
         // mutable sidecar metadata can change the provider session ID, and a verified alias can
         // move the source path. Earlier identities for this provider and source are retired
-        // after the replacement session row exists (below), so their stored rows can move to it
-        // instead of being deleted with them. Unrelated providers naming the same path are kept.
+        // after the replacement session row exists (below), and their stored rows move to it.
+        // Unrelated providers naming the same path are kept.
         let mut retired_ids: Vec<String> = Vec::new();
-        for path in std::iter::once(&session.source_path).chain(aliases.iter().copied()) {
+        for path in &source_paths {
             let mut statement = tx.prepare(
-                "select id from sessions where provider = ?1 and source_path = ?2 and id != ?3",
+                "select id from sessions where provider = ?1 and source_path = ?2 and id != ?3
+                 order by id",
             )?;
             let ids = statement
                 .query_map(
@@ -1950,7 +1975,34 @@ impl Db {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             retired_ids.extend(ids);
         }
-        for alias in &aliases {
+        // The date span and session text of every identity this parse replaces, read before the
+        // upsert overwrites them. Only an archive keep, which retains rows the parse lacks, uses
+        // them; the parse speaks for everything else.
+        let mut prior_span = SessionSpan::default();
+        for id in std::iter::once(&session.id).chain(&retired_ids) {
+            if let Some(span) = tx
+                .query_row(
+                    "select created_at, updated_at, last_message_at from sessions where id = ?1",
+                    params![id],
+                    |row| Ok(SessionSpan::new(row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+            {
+                prior_span.widen(span);
+            }
+        }
+        let mut prior_transcripts: Vec<String> = Vec::new();
+        for id in &retired_ids {
+            prior_transcripts.extend(
+                tx.query_row(
+                    "select transcript_text from transcripts where session_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            );
+        }
+        for alias in &source_paths[1..] {
             tx.execute(
                 "delete from files_seen where provider = ?1 and source_path = ?2",
                 params![session.provider.as_str(), alias],
@@ -2009,33 +2061,10 @@ impl Db {
                 session.agent_label,
             ],
         )?;
-        tx.execute(
-            "
-            insert into transcripts (session_id, transcript_text)
-            values (?1, ?2)
-            on conflict(session_id) do update set transcript_text = excluded.transcript_text
-            ",
-            params![session.id, parsed.transcript_text],
-        )?;
-        // Move a retired identity's stored rows to the replacement session while it has none,
-        // then retire the identity; its remaining rows go with it through the cascade. Seqs keep
-        // their order because they move as one block into an empty session.
+        // Move each retired identity's stored rows to the replacement session, then retire the
+        // identity; rows the replacement already holds go with it through the cascade.
         for retired in &retired_ids {
-            let holds_rows: bool = tx.query_row(
-                "select exists(select 1 from messages where session_id = ?1)",
-                params![session.id],
-                |row| row.get(0),
-            )?;
-            if !holds_rows {
-                tx.execute(
-                    "update messages set session_id = ?1 where session_id = ?2",
-                    params![session.id, retired],
-                )?;
-                tx.execute(
-                    "update file_edits set session_id = ?1 where session_id = ?2",
-                    params![session.id, retired],
-                )?;
-            }
+            move_retired_rows(&tx, &session.id, retired)?;
             tx.execute("delete from sessions where id = ?1", params![retired])?;
         }
         tx.execute(
@@ -2060,135 +2089,41 @@ impl Db {
                 session.parse_version,
             ],
         )?;
-        // Re-sync per-message rows. Session logs are APPEND-ONLY, so when a re-parse only GREW
-        // the message list and the existing rows are an unchanged prefix, insert just the new
-        // tail instead of deleting and re-inserting the whole session. Re-inserting every message
-        // also re-runs the messages_fts triggers over the entire session, so a
-        // delete+insert re-indexed multi-hundred-MB sessions on EVERY incremental reindex — the
-        // dominant reindex cost. The boundary check (the last existing message still matches the
-        // parse at that seq) guards against in-place rewrites; on any mismatch or shrink we fall
-        // back to a full replace. Messages carry seq = parse index, so the appended tail's seqs
-        // continue the retained prefix only while that prefix is dense (0..count-1). A purge
-        // that deleted rows without renumbering breaks that: the count then lands below the
-        // highest stored seq and the tail would reuse stored seqs, so a gapped prefix takes the
-        // full replace, which renumbers it from the parse. The max is one O(log N) seek on
-        // idx_messages_session_seq; see `append_tail`.
-        let existing_count: i64 = tx.query_row(
-            "select count(*) from messages where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
-        let next_seq: i64 = tx.query_row(
-            "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
-             where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
-        let parsed_count = parsed.messages.len() as i64;
-        let append_from: Option<usize> = if allow_append_optimization
-            && existing_count > 0
-            && next_seq == existing_count
-            && parsed_count > existing_count
-        {
-            let boundary = &parsed.messages[(existing_count - 1) as usize];
-            let existing_boundary: Option<String> = tx
-                .query_row(
-                    "select content from messages where session_id = ?1 and seq = ?2",
-                    params![session.id, boundary.seq],
+        let kept_archived_messages =
+            sync_messages(&tx, parsed, allow_append_optimization, same_parser)?;
+        sync_file_edits(&tx, parsed, same_parser)?;
+        if kept_archived_messages {
+            // The session holds rows this parse lacks, so its text, span and count describe the
+            // union rather than the parse alone.
+            prior_transcripts.extend(
+                tx.query_row(
+                    "select transcript_text from transcripts where session_id = ?1",
+                    params![session.id],
                     |row| row.get(0),
                 )
-                .optional()?;
-            (existing_boundary.as_deref() == Some(boundary.content.as_str()))
-                .then_some(existing_count as usize)
-        } else {
-            None
-        };
-        match append_from {
-            // Persist the appended tail with its parse-order seq.
-            Some(start) => insert_messages(
-                &tx,
-                session,
-                parsed.messages[start..].iter().map(|m| (m.seq, m)),
-            )?,
-            None => {
-                // The index is the archive: harnesses compact, rewrite and prune their own
-                // transcripts, so a re-parse by the same parser that no longer holds a stored
-                // message must not delete it; the stored rows stay and the parse's new messages
-                // are appended after the highest stored seq. Content is the identity because
-                // role, kind and authorship are parser output. A new parser version may render
-                // the same message differently, and content cannot tell a re-rendered message
-                // from a removed one, so a parser upgrade keeps the full replace, as does a parse
-                // that still holds every stored content.
-                let mut stored = stored_message_keys(&tx, &session.id)?;
-                let parsed_keys: Vec<[u8; 32]> = parsed
-                    .messages
-                    .iter()
-                    .map(|m| archive_key(&[m.content.as_bytes()]))
-                    .collect();
-                if !same_parser || covers_every_stored_key(&stored, &parsed_keys) {
-                    tx.execute(
-                        "delete from messages where session_id = ?1",
-                        params![session.id],
-                    )?;
-                    insert_messages(&tx, session, parsed.messages.iter().map(|m| (m.seq, m)))?;
-                } else {
-                    let unseen = parsed
-                        .messages
-                        .iter()
-                        .zip(&parsed_keys)
-                        .filter(|(_, key)| !take_stored_key(&mut stored, key))
-                        .map(|(message, _)| message);
-                    insert_messages(
-                        &tx,
-                        session,
-                        unseen
-                            .enumerate()
-                            .map(|(offset, message)| (next_seq + offset as i64, message)),
-                    )?;
-                    // The session holds more rows than this parse; report the rows it holds.
-                    tx.execute(
-                        "update sessions set message_count =
-                            (select count(*) from messages where session_id = ?1)
-                         where id = ?1",
-                        params![session.id],
-                    )?;
-                }
-            }
-        }
-        // File edits follow the same rule: under the same parser, replace only when the parse
-        // still holds every stored edit, otherwise keep them and append the new ones. `edits` are stored as a JSON array
-        // of [old, new] pairs; `new_content` holds full content for Write only.
-        let mut stored_edits = stored_file_edit_keys(&tx, &session.id)?;
-        let parsed_edit_keys = parsed
-            .file_edits
-            .iter()
-            .map(file_edit_key)
-            .collect::<Result<Vec<_>>>()?;
-        if !same_parser || covers_every_stored_key(&stored_edits, &parsed_edit_keys) {
+                .optional()?,
+            );
+            let transcript = merge_transcripts(&prior_transcripts, &parsed.transcript_text);
+            upsert_transcript(&tx, &session.id, &transcript)?;
             tx.execute(
-                "delete from file_edits where session_id = ?1",
-                params![session.id],
+                "update sessions set
+                    created_at = case when ?2 is not null and (created_at is null or ?2 < created_at)
+                                      then ?2 else created_at end,
+                    updated_at = case when ?3 is not null and ?3 > coalesce(updated_at, '')
+                                      then ?3 else updated_at end,
+                    last_message_at = case when ?4 is not null and ?4 > coalesce(last_message_at, '')
+                                           then ?4 else last_message_at end,
+                    message_count = (select count(*) from messages where session_id = ?1)
+                 where id = ?1",
+                params![
+                    session.id,
+                    prior_span.created_at,
+                    prior_span.updated_at,
+                    prior_span.last_message_at
+                ],
             )?;
-            insert_file_edits(&tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
         } else {
-            let next_edit_seq: i64 = tx.query_row(
-                "select coalesce(max(seq), -1) + 1 from file_edits where session_id = ?1",
-                params![session.id],
-                |row| row.get(0),
-            )?;
-            let unseen = parsed
-                .file_edits
-                .iter()
-                .zip(&parsed_edit_keys)
-                .filter(|(_, key)| !take_stored_key(&mut stored_edits, key))
-                .map(|(edit, _)| edit);
-            insert_file_edits(
-                &tx,
-                session,
-                unseen
-                    .enumerate()
-                    .map(|(offset, edit)| (next_edit_seq + offset as i64, edit)),
-            )?;
+            upsert_transcript(&tx, &session.id, &parsed.transcript_text)?;
         }
         tx.commit()?;
         Ok(())
@@ -2306,27 +2241,23 @@ impl Db {
         size_bytes: i64,
     ) -> Result<()> {
         let session = &tail.session;
-        let tx = self.conn.unchecked_transaction()?;
+        // IMMEDIATE for the same reason as `upsert_session_with_mode`: the reads below precede
+        // the first write.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
 
-        // New messages continue after the highest stored seq. Stored seqs can have gaps
-        // (`purge_injected_messages` deletes rows without renumbering), so the row count is not
-        // the next free seq: numbering from it reused existing seqs and left one (session_id, seq)
-        // naming two messages.
+        // New messages and edits continue after the highest stored seq. Stored seqs can have
+        // gaps (rows deleted without renumbering), so the row count is not the next free seq:
+        // numbering from it reused existing seqs and left one (session_id, seq) naming two
+        // messages.
         let existing_count: i64 = tx.query_row(
             "select count(*) from messages where session_id = ?1",
             params![session.id],
             |row| row.get(0),
         )?;
-        // A separate statement pinned to idx_messages_session_seq lets SQLite answer max(seq) with
-        // one O(log N) index seek. Folded into the count above, it shared that statement's
-        // O(session rows) scan of a covering index whose second column is not seq: measured on a
-        // 40,180-row session, 2.16 ms against 1.30 ms for the count alone; this form adds 0.002 ms.
-        let next_seq: i64 = tx.query_row(
-            "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
-             where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
+        let next_seq = next_message_seq(&tx, &session.id)?;
         insert_messages(
             &tx,
             session,
@@ -2335,20 +2266,14 @@ impl Db {
                 .enumerate()
                 .map(|(i, m)| (next_seq + i as i64, m)),
         )?;
-
-        // New file edits, re-sequenced after the existing ones.
-        let existing_edit_seq: i64 = tx.query_row(
-            "select coalesce(max(seq), -1) from file_edits where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
+        let next_edit_seq = next_file_edit_seq(&tx, &session.id)?;
         insert_file_edits(
             &tx,
             session,
             tail.new_file_edits
                 .iter()
                 .enumerate()
-                .map(|(i, e)| (existing_edit_seq + 1 + i as i64, e)),
+                .map(|(i, e)| (next_edit_seq + i as i64, e)),
         )?;
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward (RFC3339
@@ -6068,93 +5993,582 @@ fn insert_messages<'a>(
     Ok(())
 }
 
-/// Identity of a stored row for the archive rule in `upsert_session_with_mode`: SHA-256 over
-/// length-framed fields, so no field boundary can be forged by content.
-fn archive_key(fields: &[&[u8]]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for field in fields {
-        hasher.update((field.len() as u64).to_le_bytes());
-        hasher.update(field);
-    }
-    hasher.finalize().into()
+/// Write a session's transcript row.
+fn upsert_transcript(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    transcript: &str,
+) -> Result<()> {
+    tx.execute(
+        "insert into transcripts (session_id, transcript_text) values (?1, ?2)
+         on conflict(session_id) do update set transcript_text = excluded.transcript_text",
+        params![session_id, transcript],
+    )?;
+    Ok(())
 }
 
-/// Multiset of a session's stored message-content keys. Read only on the non-append path,
-/// where the full replace already rewrites the session: O(stored rows + bytes) time,
-/// O(stored rows) memory for the 32-byte keys.
+/// Earliest start and latest activity across session rows, as stored RFC 3339 UTC text. Every
+/// writer stores `DateTime<Utc>::to_rfc3339`, whose text orders chronologically, the same
+/// comparison `append_tail` makes in SQL.
+#[derive(Default)]
+struct SessionSpan {
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    last_message_at: Option<String>,
+}
+
+impl SessionSpan {
+    fn new(
+        created_at: Option<String>,
+        updated_at: Option<String>,
+        last_message_at: Option<String>,
+    ) -> Self {
+        Self {
+            created_at,
+            updated_at,
+            last_message_at,
+        }
+    }
+
+    fn widen(&mut self, other: SessionSpan) {
+        fn pick(current: &mut Option<String>, other: Option<String>, later: bool) {
+            if let Some(other) = other {
+                let replace = current
+                    .as_ref()
+                    .is_none_or(|value| (other > *value) == later);
+                if replace {
+                    *current = Some(other);
+                }
+            }
+        }
+        pick(&mut self.created_at, other.created_at, false);
+        pick(&mut self.updated_at, other.updated_at, true);
+        pick(&mut self.last_message_at, other.last_message_at, true);
+    }
+}
+
+/// Session text after an archive keep: the stored text, then each parse paragraph it lacks.
+/// Paragraphs are the "\n\n"-joined units every provider transcript and `append_tail` use; a
+/// paragraph the parse repeats is added once per copy the stored text lacks. O(stored + parsed
+/// bytes) time, O(paragraphs) memory.
+fn merge_transcripts(stored: &[String], parsed: &str) -> String {
+    let mut held: HashMap<&str, usize> = HashMap::new();
+    let mut merged = String::new();
+    for text in stored.iter().filter(|text| !text.is_empty()) {
+        for paragraph in text.split("\n\n") {
+            *held.entry(paragraph).or_default() += 1;
+        }
+        if !merged.is_empty() {
+            merged.push_str("\n\n");
+        }
+        merged.push_str(text);
+    }
+    for paragraph in parsed
+        .split("\n\n")
+        .filter(|paragraph| !paragraph.is_empty())
+    {
+        match held.get_mut(paragraph) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                if !merged.is_empty() {
+                    merged.push_str("\n\n");
+                }
+                merged.push_str(paragraph);
+            }
+        }
+    }
+    merged
+}
+
+/// The next free message seq of a session: one past the highest stored, so no seq is reused
+/// after a gap. Pinned to idx_messages_session_seq, SQLite answers with one O(log N) seek;
+/// folded into a `count(*)` it shared that statement's O(session rows) scan of a covering index
+/// whose second column is not seq (measured on a 40,180-row session: 2.16 ms against 1.30 ms
+/// for the count alone; this form adds 0.002 ms).
+fn next_message_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> {
+    Ok(tx.query_row(
+        "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
+         where session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// The next free file-edit seq of a session: one past the highest stored.
+fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> {
+    Ok(tx.query_row(
+        "select coalesce(max(seq), -1) + 1 from file_edits where session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Bring a session's message rows in line with a full parse. Returns true when stored rows the
+/// parse no longer holds were kept (the archive rule), so the caller describes the union.
+///
+/// - Append: when the stored rows are a dense prefix of the parse whose last row still matches,
+///   only the new tail is inserted. Session logs are append-only, and re-inserting a whole
+///   session re-runs the FTS triggers over every row. Only that boundary row is compared, so a
+///   caller passing `allow_append_optimization` asserts its sources are append-only.
+/// - Unchanged: under the same parser, a parse whose rows equal the stored rows writes nothing.
+/// - Replace: a parser change, or a parse that holds every stored content, replaces the rows,
+///   so a parser upgrade can reclassify them.
+/// - Keep: otherwise the harness compacted, rewrote or pruned its transcript. The index is the
+///   archive, so stored rows stay, and parse messages no stored row of the same role and content
+///   accounts for are appended after the highest stored seq. Content cannot tell a re-rendered
+///   message from a removed one across parser versions, which is why only the same parser keeps.
+///
+/// O(stored + parsed rows and bytes) time off the append path; O(rows) memory for 32-byte keys.
+fn sync_messages(
+    tx: &rusqlite::Transaction<'_>,
+    parsed: &ParsedSession,
+    allow_append_optimization: bool,
+    same_parser: bool,
+) -> Result<bool> {
+    let session = &parsed.session;
+    let existing_count: i64 = tx.query_row(
+        "select count(*) from messages where session_id = ?1",
+        params![session.id],
+        |row| row.get(0),
+    )?;
+    let next_seq = next_message_seq(tx, &session.id)?;
+    let parsed_count = parsed.messages.len() as i64;
+    // A stored prefix is dense only when the next free seq equals its count; a gap would make
+    // the parse's tail seqs collide with stored ones.
+    if allow_append_optimization
+        && existing_count > 0
+        && next_seq == existing_count
+        && parsed_count > existing_count
+    {
+        let boundary = &parsed.messages[(existing_count - 1) as usize];
+        let existing_boundary: Option<String> = tx
+            .query_row(
+                "select content from messages where session_id = ?1 and seq = ?2",
+                params![session.id, boundary.seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_boundary.as_deref() == Some(boundary.content.as_str()) {
+            insert_messages(
+                tx,
+                session,
+                parsed.messages[existing_count as usize..]
+                    .iter()
+                    .map(|m| (m.seq, m)),
+            )?;
+            return Ok(false);
+        }
+    }
+    let stored = stored_message_keys(tx, &session.id)?;
+    let parsed_keys: Vec<MessageKeys> = parsed.messages.iter().map(parsed_message_keys).collect();
+    if same_parser
+        && stored
+            .iter()
+            .map(|(_, keys)| keys.row)
+            .eq(parsed_keys.iter().map(|keys| keys.row))
+    {
+        return Ok(false);
+    }
+    if !same_parser
+        || covers_every_stored_key(
+            stored.iter().map(|(_, keys)| keys.content),
+            parsed_keys.iter().map(|keys| keys.content),
+        )
+    {
+        tx.execute(
+            "delete from messages where session_id = ?1",
+            params![session.id],
+        )?;
+        insert_messages(tx, session, parsed.messages.iter().map(|m| (m.seq, m)))?;
+        return Ok(false);
+    }
+    let mut stored_roles = key_counts(stored.iter().map(|(_, keys)| keys.role));
+    let unseen = parsed
+        .messages
+        .iter()
+        .zip(&parsed_keys)
+        .filter(|(_, keys)| !take_key(&mut stored_roles, &keys.role))
+        .map(|(message, _)| message);
+    insert_messages(
+        tx,
+        session,
+        unseen
+            .enumerate()
+            .map(|(offset, message)| (next_seq + offset as i64, message)),
+    )?;
+    Ok(true)
+}
+
+/// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
+/// replace and keep rules as `sync_messages`. A kept session's edits are renumbered so that
+/// each edit only the parse holds replays immediately before the next stored edit the parse
+/// lists after it (last when none follows): version replay applies edits in seq order, and a
+/// `Write` appended after a retained `Edit` it preceded would reset the file afterwards. Edit
+/// seqs are an order within the session, independent of message seqs, so renumbering moves no
+/// message reference. O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory.
+fn sync_file_edits(
+    tx: &rusqlite::Transaction<'_>,
+    parsed: &ParsedSession,
+    same_parser: bool,
+) -> Result<()> {
+    let session = &parsed.session;
+    let stored = stored_file_edit_keys(tx, &session.id)?;
+    let parsed_keys = parsed
+        .file_edits
+        .iter()
+        .map(parsed_file_edit_keys)
+        .collect::<Result<Vec<_>>>()?;
+    if same_parser
+        && stored
+            .iter()
+            .map(|(_, _, keys)| keys.row)
+            .eq(parsed_keys.iter().map(|keys| keys.row))
+    {
+        return Ok(());
+    }
+    if !same_parser
+        || covers_every_stored_key(
+            stored.iter().map(|(_, _, keys)| keys.content),
+            parsed_keys.iter().map(|keys| keys.content),
+        )
+    {
+        tx.execute(
+            "delete from file_edits where session_id = ?1",
+            params![session.id],
+        )?;
+        insert_file_edits(tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
+        return Ok(());
+    }
+    let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
+    for (position, (_, _, keys)) in stored.iter().enumerate() {
+        positions
+            .entry(keys.content)
+            .or_default()
+            .push_back(position);
+    }
+    let matched: Vec<Option<usize>> = parsed_keys
+        .iter()
+        .map(|keys| {
+            positions
+                .get_mut(&keys.content)
+                .and_then(|queue| queue.pop_front())
+        })
+        .collect();
+    // (stored position to precede or follow, 0 = parse-only before 1 = stored, tiebreak index).
+    let mut order: Vec<(usize, u8, usize)> = (0..stored.len()).map(|j| (j, 1, j)).collect();
+    let mut next_retained = stored.len();
+    for (index, position) in matched.iter().enumerate().rev() {
+        match position {
+            Some(position) => next_retained = *position,
+            None => order.push((next_retained, 0, index)),
+        }
+    }
+    order.sort_unstable();
+    let mut renumber = tx.prepare("update file_edits set seq = ?1 where id = ?2")?;
+    let mut inserts = Vec::new();
+    for (seq, (_, source, index)) in order.into_iter().enumerate() {
+        let seq = seq as i64;
+        if source == 1 {
+            let (id, stored_seq, _) = stored[index];
+            if stored_seq != seq {
+                renumber.execute(params![seq, id])?;
+            }
+        } else {
+            inserts.push((seq, &parsed.file_edits[index]));
+        }
+    }
+    insert_file_edits(tx, session, inserts.into_iter())
+}
+
+/// Move a retired identity's rows into `target` before the retired session row is deleted. A
+/// row the target already holds (same role and content for a message, same edit for a file
+/// edit) stays and leaves with the retired session; every other row moves after the target's
+/// highest seq in its stored order. A target with no messages takes the retired messages with
+/// their seqs in one statement. O(target + retired rows and bytes) time, O(rows) key memory.
+fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str) -> Result<()> {
+    let held = stored_message_keys(tx, target)?;
+    if held.is_empty() {
+        tx.execute(
+            "update messages set session_id = ?1 where session_id = ?2",
+            params![target, retired],
+        )?;
+    } else {
+        let mut held = key_counts(held.iter().map(|(_, keys)| keys.role));
+        let next_seq = next_message_seq(tx, target)?;
+        let mut moved = 0;
+        let mut update =
+            tx.prepare("update messages set session_id = ?1, seq = ?2 where id = ?3")?;
+        for (id, keys) in stored_message_keys(tx, retired)? {
+            if !take_key(&mut held, &keys.role) {
+                update.execute(params![target, next_seq + moved, id])?;
+                moved += 1;
+            }
+        }
+    }
+    let mut held = key_counts(
+        stored_file_edit_keys(tx, target)?
+            .iter()
+            .map(|(_, _, keys)| keys.content),
+    );
+    let next_seq = next_file_edit_seq(tx, target)?;
+    let mut moved = 0;
+    let mut update = tx.prepare("update file_edits set session_id = ?1, seq = ?2 where id = ?3")?;
+    for (id, _, keys) in stored_file_edit_keys(tx, retired)? {
+        if !take_key(&mut held, &keys.content) {
+            update.execute(params![target, next_seq + moved, id])?;
+            moved += 1;
+        }
+    }
+    Ok(())
+}
+
+type RowDigest = [u8; 32];
+
+/// Identities of one message row for the archive rule (`sync_messages`, `move_retired_rows`).
+///
+/// - `content` alone decides whether a parse still holds every stored message, so a same-parser
+///   parse that re-renders metadata still replaces.
+/// - `role` adds the role, so text a new message shares with a stored message of another role
+///   is not taken for it.
+/// - `row` covers every stored column except the content parts, which the parser derives from
+///   the content; equal `row` sequences mean the parse would write exactly what is stored.
+struct MessageKeys {
+    content: RowDigest,
+    role: RowDigest,
+    row: RowDigest,
+}
+
+/// The stored message columns the archive keys read; `None` is SQL NULL.
+struct MessageColumns<'a> {
+    seq: i64,
+    role: Option<&'a str>,
+    kind: Option<&'a str>,
+    authorship: Option<&'a str>,
+    ts: Option<&'a str>,
+    tool_name: Option<&'a str>,
+    tool_call_id: Option<&'a str>,
+    is_compaction: bool,
+    correlation: [Option<&'a str>; 3],
+    record_relation: Option<&'a str>,
+    content: &'a str,
+}
+
+impl MessageColumns<'_> {
+    fn keys(&self) -> MessageKeys {
+        let mut content = FramedSha256::new(b"aise-archive-message-content-v1");
+        content.update_bytes(self.content.as_bytes());
+        let content = content.finish_bytes();
+        let mut role = FramedSha256::new(b"aise-archive-message-role-v1");
+        role.update_optional_str(self.role);
+        role.update_bytes(&content);
+        let mut row = FramedSha256::new(b"aise-archive-message-row-v1");
+        row.update_i64(self.seq);
+        for value in [
+            self.role,
+            self.kind,
+            self.authorship,
+            self.ts,
+            self.tool_name,
+            self.tool_call_id,
+            self.correlation[0],
+            self.correlation[1],
+            self.correlation[2],
+            self.record_relation,
+        ] {
+            row.update_optional_str(value);
+        }
+        row.update_u8(u8::from(self.is_compaction));
+        row.update_bytes(&content);
+        MessageKeys {
+            content,
+            role: role.finish_bytes(),
+            row: row.finish_bytes(),
+        }
+    }
+}
+
+/// Keys of a parsed message, from the same column values `insert_messages` writes.
+fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
+    let ts = message.ts.map(|ts| ts.to_rfc3339());
+    let correlation = message.provenance.correlation_identity.as_ref();
+    MessageColumns {
+        seq: message.seq,
+        role: Some(message.role.as_str()),
+        kind: Some(message.kind.as_str()),
+        authorship: Some(message.provenance.authorship.as_str()),
+        ts: ts.as_deref(),
+        tool_name: message.tool_name.as_deref(),
+        tool_call_id: message.tool_call_id.as_deref(),
+        is_compaction: message.is_compaction,
+        correlation: [
+            correlation.map(|value| value.authority.as_str()),
+            correlation.map(|value| value.scope.as_str()),
+            correlation.map(|value| value.id.as_str()),
+        ],
+        record_relation: Some(message.provenance.record_relation.as_str()),
+        content: &message.content,
+    }
+    .keys()
+}
+
+/// A session's stored message rows as (row id, keys) in (seq, id) order. Read only off the
+/// append path: O(stored rows + bytes) time, O(stored rows) memory for the keys.
 fn stored_message_keys(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
-) -> Result<HashMap<[u8; 32], usize>> {
-    let mut keys = HashMap::new();
-    let mut statement = tx.prepare("select content from messages where session_id = ?1")?;
+) -> Result<Vec<(i64, MessageKeys)>> {
+    let mut statement = tx.prepare(
+        "select id, seq, role, kind, authorship, ts, tool_name, tool_call_id, is_compaction,
+                correlation_authority, correlation_scope, correlation_id, record_relation, content
+         from messages where session_id = ?1 order by seq, id",
+    )?;
     let mut rows = statement.query(params![session_id])?;
+    let mut keys = Vec::new();
     while let Some(row) = rows.next()? {
-        let content: String = row.get(0)?;
-        *keys.entry(archive_key(&[content.as_bytes()])).or_insert(0) += 1;
+        let text = |index: usize| row.get::<_, Option<String>>(index);
+        let (role, kind, authorship, ts, tool_name, tool_call_id) =
+            (text(2)?, text(3)?, text(4)?, text(5)?, text(6)?, text(7)?);
+        let correlation = [text(9)?, text(10)?, text(11)?];
+        let record_relation = text(12)?;
+        let content: String = row.get(13)?;
+        let columns = MessageColumns {
+            seq: row.get(1)?,
+            role: role.as_deref(),
+            kind: kind.as_deref(),
+            authorship: authorship.as_deref(),
+            ts: ts.as_deref(),
+            tool_name: tool_name.as_deref(),
+            tool_call_id: tool_call_id.as_deref(),
+            is_compaction: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+            correlation: correlation.each_ref().map(Option::as_deref),
+            record_relation: record_relation.as_deref(),
+            content: &content,
+        };
+        keys.push((row.get(0)?, columns.keys()));
     }
     Ok(keys)
 }
 
-fn file_edit_key(edit: &FileEdit) -> Result<[u8; 32]> {
-    let edits_json = if edit.edits.is_empty() {
-        String::new()
-    } else {
-        serde_json::to_string(&edit.edits)?
-    };
-    Ok(archive_key(&[
-        edit.tool.as_bytes(),
-        edit.file_path.as_bytes(),
-        edit.new_content.as_deref().unwrap_or("").as_bytes(),
-        edits_json.as_bytes(),
-    ]))
+/// Identities of one file-edit row: `content` is the edit itself (tool, path, full content and
+/// replacements); `row` adds seq, timestamp and file name, the columns `content` omits.
+struct FileEditKeys {
+    content: RowDigest,
+    row: RowDigest,
 }
 
+fn file_edit_keys(
+    seq: i64,
+    ts: Option<&str>,
+    tool: &str,
+    file_path: &str,
+    file_name: &str,
+    new_content: Option<&str>,
+    edits_json: Option<&str>,
+) -> FileEditKeys {
+    let mut content = FramedSha256::new(b"aise-archive-file-edit-content-v1");
+    content.update_bytes(tool.as_bytes());
+    content.update_bytes(file_path.as_bytes());
+    content.update_optional_str(new_content);
+    content.update_optional_str(edits_json);
+    let content = content.finish_bytes();
+    let mut row = FramedSha256::new(b"aise-archive-file-edit-row-v1");
+    row.update_i64(seq);
+    row.update_optional_str(ts);
+    row.update_bytes(file_name.as_bytes());
+    row.update_bytes(&content);
+    FileEditKeys {
+        content,
+        row: row.finish_bytes(),
+    }
+}
+
+/// Keys of a parsed file edit, from the same column values `insert_file_edits` writes.
+fn parsed_file_edit_keys(edit: &FileEdit) -> Result<FileEditKeys> {
+    let ts = edit.ts.map(|ts| ts.to_rfc3339());
+    let edits_json = file_edit_ops_json(edit)?;
+    Ok(file_edit_keys(
+        edit.seq,
+        ts.as_deref(),
+        &edit.tool,
+        &edit.file_path,
+        &edit.file_name,
+        edit.new_content.as_deref(),
+        edits_json.as_deref(),
+    ))
+}
+
+/// A session's stored file edits as (row id, seq, keys) in (seq, id) order.
 fn stored_file_edit_keys(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
-) -> Result<HashMap<[u8; 32], usize>> {
-    let mut keys = HashMap::new();
+) -> Result<Vec<(i64, i64, FileEditKeys)>> {
     let mut statement = tx.prepare(
-        "select tool, file_path, new_content, edits_json from file_edits where session_id = ?1",
+        "select id, seq, ts, tool, file_path, file_name, new_content, edits_json
+         from file_edits where session_id = ?1 order by seq, id",
     )?;
     let mut rows = statement.query(params![session_id])?;
+    let mut keys = Vec::new();
     while let Some(row) = rows.next()? {
-        let tool: String = row.get(0)?;
-        let path: String = row.get(1)?;
-        let new_content: Option<String> = row.get(2)?;
-        let edits_json: Option<String> = row.get(3)?;
-        *keys
-            .entry(archive_key(&[
-                tool.as_bytes(),
-                path.as_bytes(),
-                new_content.as_deref().unwrap_or("").as_bytes(),
-                edits_json.as_deref().unwrap_or("").as_bytes(),
-            ]))
-            .or_insert(0) += 1;
+        let seq: i64 = row.get(1)?;
+        let ts: Option<String> = row.get(2)?;
+        let tool: String = row.get(3)?;
+        let file_path: String = row.get(4)?;
+        let file_name: String = row.get(5)?;
+        let new_content: Option<String> = row.get(6)?;
+        let edits_json: Option<String> = row.get(7)?;
+        keys.push((
+            row.get(0)?,
+            seq,
+            file_edit_keys(
+                seq,
+                ts.as_deref(),
+                &tool,
+                &file_path,
+                &file_name,
+                new_content.as_deref(),
+                edits_json.as_deref(),
+            ),
+        ));
     }
     Ok(keys)
 }
 
-/// True when `parsed` holds at least as many copies of every stored key as are stored.
-fn covers_every_stored_key(stored: &HashMap<[u8; 32], usize>, parsed: &[[u8; 32]]) -> bool {
-    let mut remaining = stored.clone();
-    for key in parsed {
-        take_stored_key(&mut remaining, key);
+/// Multiset of keys.
+fn key_counts(keys: impl Iterator<Item = RowDigest>) -> HashMap<RowDigest, usize> {
+    let mut counts = HashMap::new();
+    for key in keys {
+        *counts.entry(key).or_insert(0) += 1;
     }
-    remaining.values().all(|count| *count == 0)
+    counts
 }
 
-/// Consume one stored copy of `key`; false when none is left, i.e. the parse row is new.
-fn take_stored_key(stored: &mut HashMap<[u8; 32], usize>, key: &[u8; 32]) -> bool {
-    match stored.get_mut(key) {
+/// True when `parsed` holds at least as many copies of every stored key as are stored.
+fn covers_every_stored_key(
+    mut stored: impl Iterator<Item = RowDigest>,
+    parsed: impl Iterator<Item = RowDigest>,
+) -> bool {
+    let mut parsed = key_counts(parsed);
+    stored.all(|key| take_key(&mut parsed, &key))
+}
+
+/// Consume one copy of `key`; false when none is left.
+fn take_key(keys: &mut HashMap<RowDigest, usize>, key: &RowDigest) -> bool {
+    match keys.get_mut(key) {
         Some(count) if *count > 0 => {
             *count -= 1;
             true
         }
         _ => false,
     }
+}
+
+/// The `edits_json` column value of a file edit: a JSON `[old, new]` array, NULL when empty.
+fn file_edit_ops_json(edit: &FileEdit) -> Result<Option<String>> {
+    Ok(if edit.edits.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&edit.edits)?)
+    })
 }
 
 /// Insert file-edit rows for `session`, with the caller-supplied `seq`. Shared by `upsert_session`
@@ -6171,11 +6585,7 @@ fn insert_file_edits<'a>(
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for (seq, edit) in rows {
-        let edits_json = if edit.edits.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&edit.edits)?)
-        };
+        let edits_json = file_edit_ops_json(edit)?;
         stmt.execute(params![
             session.id,
             session.provider.as_str(),
@@ -16345,6 +16755,302 @@ mod tests {
             ["v1", "v2", "v3"],
             "edit history survives the rewrite"
         );
+    }
+
+    fn session_rows(db: &Db, session_id: &str) -> Vec<(i64, String, String)> {
+        db.conn
+            .prepare(
+                "select seq, role, content from messages where session_id = ?1 order by seq, id",
+            )
+            .unwrap()
+            .query_map([session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn row(seq: i64, role: &str, content: &str) -> (i64, String, String) {
+        (seq, role.to_string(), content.to_string())
+    }
+
+    #[test]
+    fn renaming_into_a_session_that_already_holds_rows_keeps_the_retired_rows() {
+        // The retired identity's rows must survive even when the replacement id already holds
+        // rows; a row both sessions hold is kept once.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut occupied = archive_session(
+            vec![
+                archive_message(0, "b", Conversation),
+                archive_message(1, "x", Conversation),
+            ],
+            Vec::new(),
+        );
+        occupied.session.id = "codex:archive-renamed".into();
+        occupied.session.source_path = "/x/other.jsonl".into();
+        db.upsert_session(&occupied, 1, 1).unwrap();
+
+        let mut renamed = archive_session(
+            vec![archive_message(0, "summary", Conversation)],
+            Vec::new(),
+        );
+        renamed.session.id = "codex:archive-renamed".into();
+        db.upsert_session(&renamed, 2, 2).unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive-renamed"),
+            [
+                row(0, "user", "b"),
+                row(1, "user", "x"),
+                row(2, "user", "a"),
+                row(3, "user", "summary"),
+            ]
+        );
+        assert!(session_rows(&db, "codex:archive").is_empty());
+    }
+
+    #[test]
+    fn renaming_with_several_retired_ids_keeps_every_retired_row() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // Two identities on two verified aliases of one source, both retired by one parse.
+        for (id, content, path) in [
+            ("codex:archive-1", "a", "/x/a1.jsonl"),
+            ("codex:archive-2", "c", "/x/a2.jsonl"),
+        ] {
+            let mut old =
+                archive_session(vec![archive_message(0, content, Conversation)], Vec::new());
+            old.session.id = id.into();
+            old.session.source_path = path.into();
+            db.upsert_session(&old, 1, 1).unwrap();
+        }
+        let mut renamed = archive_session(vec![archive_message(0, "d", Conversation)], Vec::new());
+        renamed.session.id = "codex:archive-3".into();
+        db.upsert_session_reconciling_sources(
+            &renamed,
+            2,
+            2,
+            &["/x/a1.jsonl".to_string(), "/x/a2.jsonl".to_string()],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive-3"),
+            [
+                row(0, "user", "a"),
+                row(1, "user", "c"),
+                row(2, "user", "d")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rewrite_keeps_a_new_message_whose_text_matches_a_stored_one_under_another_role() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "x", Conversation),
+                    archive_message(1, "y", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut reply = archive_message(0, "x", Conversation);
+        reply.role = Role::Assistant;
+        db.upsert_session(&archive_session(vec![reply], Vec::new()), 2, 2)
+            .unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "x"),
+                row(1, "user", "y"),
+                row(2, "assistant", "x")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_edit_before_a_retained_edit_replays_in_source_order() {
+        // A rewrite drops the first Write and adds another Write before a retained Edit. Replay
+        // must apply the new Write before the Edit, or the Write resets the file afterwards.
+        use crate::models::MessageKind::Conversation;
+        let write = |content: &str| FileEdit {
+            seq: 0,
+            ts: None,
+            tool: "Write".into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: Some(content.into()),
+            edits: Vec::new(),
+        };
+        let delta = FileEdit {
+            seq: 1,
+            ts: None,
+            tool: "Edit".into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: None,
+            edits: vec![EditOp {
+                old: "v".into(),
+                new: "w".into(),
+                replace_all: false,
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                vec![write("v1"), delta.clone()],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![archive_message(0, "summary", Conversation)],
+                vec![write("v0"), delta],
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        let replay: Vec<(i64, String)> = db
+            .file_edits_for("f.rs", None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, edit)| (edit.seq, edit.new_content.unwrap_or(edit.tool)))
+            .collect();
+        assert_eq!(
+            replay,
+            [
+                (0, "v1".to_string()),
+                (1, "v0".to_string()),
+                (2, "Edit".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_kept_rewrite_keeps_archived_session_text_and_the_full_date_span() {
+        use crate::models::MessageKind::Conversation;
+        let at = |text: &str| Some(text.parse::<DateTime<Utc>>().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut original = archive_session(
+            vec![
+                archive_message(0, "alpha", Conversation),
+                archive_message(1, "beta", Conversation),
+            ],
+            Vec::new(),
+        );
+        original.transcript_text = "[user] alpha\n\n[user] beta".into();
+        original.session.created_at = at("2026-01-01T00:00:00Z");
+        original.session.updated_at = at("2026-01-02T00:00:00Z");
+        original.session.last_message_at = at("2026-01-02T00:00:00Z");
+        db.upsert_session(&original, 1, 1).unwrap();
+
+        let mut rewritten = archive_session(
+            vec![
+                archive_message(0, "beta", Conversation),
+                archive_message(1, "gamma", Conversation),
+            ],
+            Vec::new(),
+        );
+        rewritten.transcript_text = "[user] beta\n\n[user] gamma".into();
+        rewritten.session.created_at = at("2026-02-01T00:00:00Z");
+        rewritten.session.updated_at = at("2026-02-02T00:00:00Z");
+        rewritten.session.last_message_at = at("2026-02-02T00:00:00Z");
+        db.upsert_session(&rewritten, 2, 2).unwrap();
+
+        let (transcript, created, updated, last): (String, String, String, String) = db
+            .conn
+            .query_row(
+                "select t.transcript_text, s.created_at, s.updated_at, s.last_message_at
+                 from sessions s join transcripts t on t.session_id = s.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(transcript, "[user] alpha\n\n[user] beta\n\n[user] gamma");
+        assert!(created.starts_with("2026-01-01"), "{created}");
+        assert!(updated.starts_with("2026-02-02"), "{updated}");
+        assert!(last.starts_with("2026-02-02"), "{last}");
+    }
+
+    #[test]
+    fn reparsing_an_unchanged_source_rewrites_no_row() {
+        // Compression, a touch, or a metadata-only change re-parses a source to the same rows;
+        // rewriting them would re-run the FTS triggers over the whole session for nothing.
+        use crate::models::MessageKind::Conversation;
+        let parse = || {
+            archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                vec![FileEdit {
+                    seq: 0,
+                    ts: None,
+                    tool: "Write".into(),
+                    file_path: "/x/f.rs".into(),
+                    file_name: "f.rs".into(),
+                    new_content: Some("v1".into()),
+                    edits: Vec::new(),
+                }],
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(&parse(), 1, 1).unwrap();
+        // Row ids cannot show a rewrite: SQLite reuses them after a delete of every row.
+        db.conn
+            .execute_batch(
+                "create temp table writes(tbl text);
+                 create temp trigger m_del after delete on messages begin
+                     insert into writes values ('messages'); end;
+                 create temp trigger m_ins after insert on messages begin
+                     insert into writes values ('messages'); end;
+                 create temp trigger e_del after delete on file_edits begin
+                     insert into writes values ('file_edits'); end;
+                 create temp trigger e_ins after insert on file_edits begin
+                     insert into writes values ('file_edits'); end;",
+            )
+            .unwrap();
+        db.replace_session(&parse(), 2, 2).unwrap();
+        let writes: i64 = db
+            .conn
+            .query_row("select count(*) from temp.writes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(writes, 0);
     }
 
     #[test]
