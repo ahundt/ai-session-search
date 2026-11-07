@@ -2271,24 +2271,14 @@ impl DateRange {
 
     /// Resolve all expressions through the canonical Rust date parser.
     ///
-    /// `reference_time` is optional in normal use and exists so callers can make
-    /// relative expressions deterministic in tests and reproducible workflows.
+    /// Values without an offset are read in the local time zone (`TZ` or the system zone).
+    /// `reference_time` fixes "now" for reproducible results: an RFC 3339 timestamp, whose offset
+    /// becomes the zone, or an RFC 9557 one naming a zone, such as
+    /// `2026-06-15T12:00:00[America/New_York]`.
     #[pyo3(signature = (*, reference_time=None))]
     fn resolve_bounds(&self, reference_time: Option<&str>) -> PyResult<ResolvedDateRange> {
         let bounds = match reference_time {
-            Some(value) => {
-                // User input that must be an exact RFC 3339 instant: util::parse_datetime would
-                // also accept a bare date, so this keeps chrono's strict parser on purpose.
-                #[allow(clippy::disallowed_methods)]
-                let now = chrono::DateTime::parse_from_rfc3339(value)
-                    .map(|value| value.with_timezone(&chrono::Utc))
-                    .map_err(|_| {
-                        PyValueError::new_err(format!(
-                            "reference_time must be an RFC 3339 timestamp, got {value:?}"
-                        ))
-                    })?;
-                self.dates.resolve(now)
-            }
+            Some(value) => self.dates.resolve_at(value),
             None => self.dates.resolve_now(),
         }
         .map_err(value_error)?;
