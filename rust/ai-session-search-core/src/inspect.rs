@@ -450,7 +450,7 @@ pub fn inspection_rows(
             &mut rows,
             "session",
             "created_at",
-            &created.to_rfc3339(),
+            &crate::util::display_timestamp(created),
             options,
         );
     }
@@ -459,7 +459,7 @@ pub fn inspection_rows(
             &mut rows,
             "session",
             "updated_at",
-            &updated.to_rfc3339(),
+            &crate::util::display_timestamp(updated),
             options,
         );
     }
@@ -468,7 +468,7 @@ pub fn inspection_rows(
             &mut rows,
             "session",
             "last_message_at",
-            &last_message.to_rfc3339(),
+            &crate::util::display_timestamp(last_message),
             options,
         );
     }
@@ -551,7 +551,7 @@ fn push_exact_row(rows: &mut Vec<InspectionRow>, section: &str, key: &str, value
 fn message_preview(hit: &MessageHit, preview_chars: usize) -> Result<MessagePreview> {
     Ok(MessagePreview {
         seq: hit.seq,
-        ts: hit.ts.map(|ts| ts.to_rfc3339()),
+        ts: hit.ts.map(crate::util::display_timestamp),
         chars: hit.content.chars().count(),
         preview: truncate_for_display(&hit.content, preview_chars),
         expand_command: expand_command(hit)?,
@@ -561,7 +561,7 @@ fn message_preview(hit: &MessageHit, preview_chars: usize) -> Result<MessagePrev
 fn tool_activity(hit: &MessageHit, preview_chars: usize) -> Result<ToolActivity> {
     Ok(ToolActivity {
         seq: hit.seq,
-        ts: hit.ts.map(|ts| ts.to_rfc3339()),
+        ts: hit.ts.map(crate::util::display_timestamp),
         tool_name: hit.tool_name.clone(),
         kind: classify_tool_activity(hit),
         chars: hit.content.chars().count(),

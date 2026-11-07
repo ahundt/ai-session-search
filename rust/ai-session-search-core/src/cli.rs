@@ -2088,14 +2088,14 @@ fn print_session_detail(session: &SessionRecord) {
         "Created: {}",
         session
             .created_at
-            .map(|value| value.to_rfc3339())
+            .map(crate::util::display_timestamp)
             .unwrap_or_else(|| "-".to_string())
     );
     println!(
         "Updated: {}",
         session
             .updated_at
-            .map(|value| value.to_rfc3339())
+            .map(crate::util::display_timestamp)
             .unwrap_or_else(|| "-".to_string())
     );
     println!("Messages: {}", session.message_count.unwrap_or_default());
@@ -2209,7 +2209,10 @@ fn print_doctor(
             .readiness
             .snapshot
             .last_successful_refresh_at
-            .map(|value| format!("; last successful refresh {}", value.to_rfc3339()))
+            .map(|value| format!(
+                "; last successful refresh {}",
+                crate::util::display_timestamp(value)
+            ))
             .unwrap_or_default()
     );
     let refresh = &status.readiness.refresh;
@@ -2297,7 +2300,7 @@ fn print_auto_reindex_status(config: &Config, db: &Db) -> Result<()> {
     match completed_at {
         Some(value) => println!(
             "Auto-reindex last completed: {} ({}, {}, {})",
-            value.to_rfc3339(),
+            crate::util::display_timestamp(value),
             relative_age(Some(value)),
             if fresh { "fresh" } else { "stale" },
             window
