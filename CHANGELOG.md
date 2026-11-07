@@ -91,6 +91,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    that cannot be decompressed is a warned parse failure for a session not yet indexed. For an
    indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
    `aise doctor`, and reads the file again on the next refresh.
+9. OpenCode loads the aise MCP server. aise wrote it directly under `mcp`, which OpenCode 2
+   ignores, so `opencode mcp list` reported no servers. It is now written to
+   `mcp.servers.ai-session-search` with `type: "local"`, and `aise integrations install` moves
+   an entry left in the old place.
 
 ### Performance
 
