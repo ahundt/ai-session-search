@@ -479,14 +479,28 @@ impl ClientLayout {
         }
     }
 
+    /// Zed's `paths::config_dir()`: `~/.config/zed` on macOS, the XDG config directory on Linux,
+    /// and `%APPDATA%\Zed` on Windows. https://github.com/zed-industries/zed/blob/main/crates/paths/src/paths.rs
     fn zed_config_dir(&self) -> PathBuf {
         if self.platform == ClientPlatform::Macos {
-            self.home
+            self.home.join(".config").join("zed")
+        } else {
+            self.config.join("zed")
+        }
+    }
+
+    /// Where earlier aise releases wrote Zed's settings on macOS. Zed keeps only extensions
+    /// there and never reads a settings.json from it.
+    fn zed_superseded_settings(&self) -> Vec<PathBuf> {
+        if self.platform == ClientPlatform::Macos {
+            vec![self
+                .home
                 .join("Library")
                 .join("Application Support")
                 .join("Zed")
+                .join("settings.json")]
         } else {
-            self.config.join("zed")
+            Vec::new()
         }
     }
 }
@@ -498,6 +512,9 @@ struct Target {
     format: ConfigFormat,
     detect_paths: Vec<PathBuf>,
     detect_binaries: Vec<&'static str>,
+    /// Files an earlier aise wrote this client's entry to that the client never reads. Install
+    /// and uninstall remove aise's entry from them, and status reports one left there as stale.
+    superseded_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1827,6 +1844,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             format: ConfigFormat::CodexToml,
             detect_paths: vec![layout.home.join(".codex")],
             detect_binaries: vec!["codex"],
+            superseded_paths: Vec::new(),
         }],
         McpClient::Gemini => vec![json_target_with_detect(
             "gemini",
@@ -1891,13 +1909,23 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             format: ConfigFormat::VscodeServers,
             detect_paths: vec![layout.vscode_config_dir()],
             detect_binaries: vec!["code"],
+            superseded_paths: Vec::new(),
         }],
         McpClient::Zed => vec![Target {
             label: "zed",
             path: layout.zed_config_dir().join("settings.json"),
             format: ConfigFormat::ZedContextServers,
-            detect_paths: vec![layout.zed_config_dir()],
+            // Zed keeps extensions in the superseded directory, so it still shows Zed is present.
+            detect_paths: std::iter::once(layout.zed_config_dir())
+                .chain(
+                    layout
+                        .zed_superseded_settings()
+                        .iter()
+                        .filter_map(|path| path.parent().map(Path::to_path_buf)),
+                )
+                .collect(),
             detect_binaries: vec!["zed"],
+            superseded_paths: layout.zed_superseded_settings(),
         }],
         McpClient::Opencode => vec![Target {
             label: "opencode",
@@ -1910,6 +1938,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
             format: ConfigFormat::OpenCode,
             detect_paths: vec![layout.home.join(".config").join("opencode")],
             detect_binaries: vec!["opencode"],
+            superseded_paths: Vec::new(),
         }],
         McpClient::Openclaw => vec![json_target(
             layout,
@@ -2237,6 +2266,7 @@ fn custom_targets(
                 format: ConfigFormat::JsonMcpServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             })
         })
         .chain(vscode_configs.iter().map(|path| {
@@ -2246,6 +2276,7 @@ fn custom_targets(
                 format: ConfigFormat::VscodeServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             })
         }))
         .chain(zed_configs.iter().map(|path| {
@@ -2255,6 +2286,7 @@ fn custom_targets(
                 format: ConfigFormat::ZedContextServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             })
         }))
         .chain(opencode_configs.iter().map(|path| {
@@ -2264,6 +2296,7 @@ fn custom_targets(
                 format: ConfigFormat::OpenCode,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             })
         }))
         .chain(codex_configs.iter().map(|path| {
@@ -2273,6 +2306,7 @@ fn custom_targets(
                 format: ConfigFormat::CodexToml,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             })
         }))
         .collect()
@@ -2299,6 +2333,7 @@ fn json_target_with_detect(
         format: ConfigFormat::JsonMcpServers,
         detect_paths,
         detect_binaries,
+        superseded_paths: Vec::new(),
     }
 }
 
@@ -3878,12 +3913,31 @@ fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
     }
 }
 
+/// The same client configuration at one of `target`'s superseded paths.
+fn superseded_targets(target: &Target) -> impl Iterator<Item = Target> + '_ {
+    target.superseded_paths.iter().map(|path| Target {
+        path: path.clone(),
+        superseded_paths: Vec::new(),
+        ..target.clone()
+    })
+}
+
+fn plan_remove_superseded(target: &Target) -> Result<Vec<PlannedFileMutation>> {
+    let mut mutations = Vec::new();
+    for old in superseded_targets(target) {
+        mutations.extend(plan_remove_target_file(&old)?);
+    }
+    Ok(mutations)
+}
+
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
     let binary = binary_config_value(binary)?;
-    match target.format {
-        ConfigFormat::CodexToml => plan_upsert_codex_mcp_server(&target.path, binary),
-        format => plan_upsert_json_server(&target.path, format, json_server_entry(format, binary)),
-    }
+    let mut mutations = match target.format {
+        ConfigFormat::CodexToml => plan_upsert_codex_mcp_server(&target.path, binary)?,
+        format => plan_upsert_json_server(&target.path, format, json_server_entry(format, binary))?,
+    };
+    mutations.extend(plan_remove_superseded(target)?);
+    Ok(mutations)
 }
 
 #[cfg(test)]
@@ -3895,6 +3949,12 @@ fn remove_target(target: &Target) -> Result<bool> {
 }
 
 fn plan_remove_target(target: &Target) -> Result<Vec<PlannedFileMutation>> {
+    let mut mutations = plan_remove_target_file(target)?;
+    mutations.extend(plan_remove_superseded(target)?);
+    Ok(mutations)
+}
+
+fn plan_remove_target_file(target: &Target) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
         ConfigFormat::CodexToml => plan_remove_codex_mcp_server(&target.path),
         format => plan_remove_json_server(&target.path, format),
@@ -3902,6 +3962,16 @@ fn plan_remove_target(target: &Target) -> Result<Vec<PlannedFileMutation>> {
 }
 
 fn status_target(target: &Target) -> Result<&'static str> {
+    let status = status_target_file(target)?;
+    for old in superseded_targets(target) {
+        if matches!(status_target_file(&old)?, "configured" | "stale") {
+            return Ok("stale");
+        }
+    }
+    Ok(status)
+}
+
+fn status_target_file(target: &Target) -> Result<&'static str> {
     match target.format {
         ConfigFormat::CodexToml => status_codex_mcp_server(&target.path),
         format => status_json_server(&target.path, format),
@@ -4775,6 +4845,46 @@ mod tests {
         }
     }
 
+    /// Zed's `paths::config_dir()` per platform; only macOS has a superseded aise location.
+    #[test]
+    fn injected_platform_layout_resolves_zed_settings_on_every_platform() {
+        for (platform, home, config, expected, superseded) in [
+            (
+                ClientPlatform::Macos,
+                "/Users/alice",
+                "/Users/alice/Library/Application Support",
+                "/Users/alice/.config/zed/settings.json",
+                Some("/Users/alice/Library/Application Support/Zed/settings.json"),
+            ),
+            (
+                ClientPlatform::Linux,
+                "/home/alice",
+                "/home/alice/.config",
+                "/home/alice/.config/zed/settings.json",
+                None,
+            ),
+            (
+                ClientPlatform::Windows,
+                "C:/Users/Alice",
+                "C:/Users/Alice/AppData/Roaming",
+                "C:/Users/Alice/AppData/Roaming/zed/settings.json",
+                None,
+            ),
+        ] {
+            let layout = ClientLayout::new(PathBuf::from(home), PathBuf::from(config), platform);
+            let zed = targets_for_layout(McpClient::Zed, &layout);
+            assert_eq!(zed.len(), 1);
+            assert_eq!(zed[0].path, PathBuf::from(expected));
+            assert_eq!(
+                zed[0].superseded_paths,
+                superseded
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn pi_family_paths_are_platform_independent_home_relative_contracts() {
         for (platform, home, config) in [
@@ -4864,6 +4974,50 @@ mod tests {
         assert_eq!(data["keep"], true);
     }
 
+    /// Zed reads `~/.config/zed/settings.json` on macOS (`paths::config_dir()` in Zed's source).
+    /// Earlier aise wrote `~/Library/Application Support/Zed/settings.json`, which Zed never reads.
+    #[test]
+    fn zed_on_macos_uses_dot_config_and_moves_the_entry_out_of_application_support() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let layout = ClientLayout::new(
+            home.clone(),
+            home.join("Library").join("Application Support"),
+            ClientPlatform::Macos,
+        );
+        let old = home.join("Library/Application Support/Zed/settings.json");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(
+            &old,
+            r#"{"context_servers":{"ai-session-search":{"command":"/old/aise","args":["mcp","serve"]},
+                "user-server":{"command":"user"}}}"#,
+        )
+        .unwrap();
+        let target = targets_for_layout(McpClient::Zed, &layout).remove(0);
+        assert_eq!(target.path, home.join(".config/zed/settings.json"));
+        assert!(
+            target_detected(&target),
+            "the Application Support directory alone still detects Zed"
+        );
+        assert_eq!(status_target(&target).unwrap(), "stale");
+
+        upsert_target(&target, Path::new("/bin/aise")).unwrap();
+        let new: Value = serde_json::from_str(&fs::read_to_string(&target.path).unwrap()).unwrap();
+        assert_eq!(new["context_servers"][SERVER_NAME]["command"], "/bin/aise");
+        let left: Value = serde_json::from_str(&fs::read_to_string(&old).unwrap()).unwrap();
+        assert!(left["context_servers"].get(SERVER_NAME).is_none());
+        assert_eq!(left["context_servers"]["user-server"]["command"], "user");
+        assert_eq!(status_target(&target).unwrap(), "configured");
+
+        assert!(remove_target(&target).unwrap());
+        assert_eq!(status_target(&target).unwrap(), "not configured");
+
+        let linux = ClientLayout::new(home.clone(), home.join(".config"), ClientPlatform::Linux);
+        let linux_target = targets_for_layout(McpClient::Zed, &linux).remove(0);
+        assert_eq!(linux_target.path, home.join(".config/zed/settings.json"));
+        assert!(linux_target.superseded_paths.is_empty());
+    }
+
     #[test]
     fn vscode_and_zed_use_their_native_container_keys() {
         let dir = tempdir().unwrap();
@@ -4877,6 +5031,7 @@ mod tests {
                 format: ConfigFormat::VscodeServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Path::new("/bin/aise"),
         )
@@ -4888,6 +5043,7 @@ mod tests {
                 format: ConfigFormat::ZedContextServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Path::new("/bin/aise"),
         )
@@ -4931,6 +5087,7 @@ mod tests {
             format: ConfigFormat::OpenCode,
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
+            superseded_paths: Vec::new(),
         };
         assert_eq!(status_target(&target).unwrap(), "stale");
 
@@ -4963,6 +5120,7 @@ mod tests {
                 format: ConfigFormat::JsonMcpServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Target {
                 label: "vscode",
@@ -4970,6 +5128,7 @@ mod tests {
                 format: ConfigFormat::VscodeServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Target {
                 label: "zed",
@@ -4977,6 +5136,7 @@ mod tests {
                 format: ConfigFormat::ZedContextServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Target {
                 label: "opencode",
@@ -4984,6 +5144,7 @@ mod tests {
                 format: ConfigFormat::OpenCode,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Target {
                 label: "codex",
@@ -4991,6 +5152,7 @@ mod tests {
                 format: ConfigFormat::CodexToml,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
         ];
 
@@ -5177,6 +5339,7 @@ mod tests {
             format: ConfigFormat::JsonMcpServers,
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
+            superseded_paths: Vec::new(),
         };
         let binary = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/aise-\xff".to_vec()));
 
@@ -8150,6 +8313,7 @@ mod tests {
             format: ConfigFormat::JsonMcpServers,
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
+            superseded_paths: Vec::new(),
         };
 
         assert!(!target_detected(&target));
@@ -8166,6 +8330,7 @@ mod tests {
             format: ConfigFormat::JsonMcpServers,
             detect_paths: vec![client_dir],
             detect_binaries: Vec::new(),
+            superseded_paths: Vec::new(),
         };
 
         assert!(target_detected(&target));
@@ -8230,6 +8395,7 @@ mod tests {
                 format: ConfigFormat::JsonMcpServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Target {
                 label: "antigravity cli",
@@ -8237,6 +8403,7 @@ mod tests {
                 format: ConfigFormat::JsonMcpServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Target {
                 label: "antigravity legacy",
@@ -8244,6 +8411,7 @@ mod tests {
                 format: ConfigFormat::JsonMcpServers,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
             Target {
                 label: "opencode",
@@ -8251,6 +8419,7 @@ mod tests {
                 format: ConfigFormat::OpenCode,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
+                superseded_paths: Vec::new(),
             },
         ];
 
@@ -8300,6 +8469,7 @@ mod tests {
             format,
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
+            superseded_paths: Vec::new(),
         }
     }
 
