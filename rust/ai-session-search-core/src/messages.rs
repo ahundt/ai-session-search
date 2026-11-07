@@ -78,7 +78,7 @@ impl Row for MessageHit {
             self.role.as_str().to_string(),
             self.tool_name.clone().unwrap_or_default(),
             self.ts
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
             truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
         ]
@@ -100,7 +100,7 @@ impl Row for MessageSearchHit {
             self.role.as_str().to_string(),
             self.tool_name.clone().unwrap_or_default(),
             self.ts
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
             self.match_evidence()
                 .map(format_match_evidence)
@@ -255,7 +255,7 @@ impl Row for ContextRow {
             self.hit.tool_name.clone().unwrap_or_default(),
             self.hit
                 .ts
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
             self.match_evidence
                 .as_ref()
@@ -346,7 +346,7 @@ impl Row for MessageHitWithRefs {
             self.hit.tool_name.clone().unwrap_or_default(),
             self.hit
                 .ts
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
             self.ref_summary.clone(),
             truncate_for_display(&self.hit.content, TABLE_CONTENT_CHARS),
@@ -379,7 +379,7 @@ impl Row for ContextRowWithRefs {
             self.row
                 .hit
                 .ts
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
             self.row
                 .match_evidence

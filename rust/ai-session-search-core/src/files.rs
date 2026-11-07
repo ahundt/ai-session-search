@@ -637,7 +637,7 @@ impl Row for FileEditSummary {
             self.edits.to_string(),
             self.sessions.to_string(),
             self.last_edited
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
         ]
     }
@@ -653,7 +653,7 @@ impl Row for FileVersion {
             self.version.to_string(),
             self.tool.clone(),
             self.ts
-                .map(crate::util::display_timestamp)
+                .map(crate::util::display_local_timestamp)
                 .unwrap_or_default(),
             self.lines.to_string(),
             self.file_path.clone(),
