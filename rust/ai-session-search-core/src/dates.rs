@@ -17,6 +17,9 @@
 //!   * **ISO datetimes** (full and partial-precision `…T14`, `…T14:30`) and the
 //!     **duration shorthand** (`7d 2w 1m 24h 30min 1y`) → `chrono` arithmetic;
 //!     these are not EDTF and not standard NLP.
+//!     The shorthand is parsed here on purpose: `1m` means 30 days in this grammar,
+//!     while general-purpose duration parsers such as `humantime` read `m` as minutes,
+//!     so adopting one would change what existing commands select.
 //!
 //! Every input resolves to a `(start, end)` pair of UTC instants:
 //!   * a fuzzy period (date, month, year, decade, century, unspecified-digit day) →
@@ -451,6 +454,8 @@ mod tests {
         assert_eq!(span("7d"), (now() - Duration::days(7), now()));
         assert_eq!(span("2w"), (now() - Duration::weeks(2), now()));
         assert_eq!(span("24h"), (now() - Duration::hours(24), now()));
+        assert_eq!(span("2h"), (now() - Duration::hours(2), now()));
+        assert_eq!(span("2d"), (now() - Duration::days(2), now()));
         assert_eq!(span("30min"), (now() - Duration::minutes(30), now()));
         assert_eq!(span("1m"), (now() - Duration::days(30), now())); // m ≈ 30 days
         assert_eq!(span("1y"), (now() - Duration::days(365), now())); // y ≈ 365 days
