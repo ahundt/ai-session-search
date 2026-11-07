@@ -6603,17 +6603,32 @@ fn push_ts_window(
     since: Option<chrono::DateTime<Utc>>,
     until: Option<chrono::DateTime<Utc>>,
 ) {
-    use rusqlite::types::Value;
+    push_time_bounds(sql, args, col, col, since, until);
+}
+
+/// Append inclusive time-window predicates for something that starts at `start_column` and ends
+/// at `end_column`: it overlaps `[since, until]` when it ends at or after `since` and starts at or
+/// before `until`. An event (one timestamp) passes the same column twice. The one owner of the
+/// bound text: `stored_timestamp` for the lower bound and `until_bound_text` for the upper, so
+/// every window compares stored text the same way. O(1) time and memory per call.
+fn push_time_bounds<A: From<String>>(
+    sql: &mut String,
+    args: &mut Vec<A>,
+    start_column: &str,
+    end_column: &str,
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+) {
     use std::fmt::Write as _;
     // `write!` into the existing String avoids a throwaway `format!` allocation; writing to a
     // String is infallible, so the `Result` is discarded.
     if let Some(since) = since {
-        let _ = write!(sql, " and {col} >= ?");
-        args.push(Value::Text(stored_timestamp(since)));
+        let _ = write!(sql, " and {end_column} >= ?");
+        args.push(A::from(stored_timestamp(since)));
     }
     if let Some(until) = until {
-        let _ = write!(sql, " and {col} <= ?");
-        args.push(Value::Text(until_bound_text(until)));
+        let _ = write!(sql, " and {start_column} <= ?");
+        args.push(A::from(until_bound_text(until)));
     }
 }
 
@@ -6796,14 +6811,16 @@ fn push_session_time_window(
     since: Option<chrono::DateTime<Utc>>,
     until: Option<chrono::DateTime<Utc>>,
 ) {
-    if let Some(since) = since {
-        sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
-        args.push(stored_timestamp(since));
-    }
-    if let Some(until) = until {
-        sql.push_str(" and coalesce(s.created_at, s.updated_at) <= ? ");
-        args.push(until_bound_text(until));
-    }
+    push_time_bounds(
+        sql,
+        args,
+        "coalesce(s.created_at, s.updated_at)",
+        "coalesce(s.updated_at, s.created_at)",
+        since,
+        until,
+    );
+    // Callers append further clauses directly after this one.
+    sql.push(' ');
 }
 
 fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
