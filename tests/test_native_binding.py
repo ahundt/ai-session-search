@@ -2387,7 +2387,7 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
     }
-    return subprocess.run(command, capture_output=True, text=True, env=environment, timeout=120)
+    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=environment, timeout=120)
 
 
 def test_python_interfaces_return_the_shared_parity_cases(tmp_path: Path) -> None:
@@ -2468,7 +2468,7 @@ def _parity_entry_point_read(database: Path, spec: dict, selector: list[str], tm
         "--skip-release-notification",
     ]
     environment = {**os.environ, "AI_SESSION_SEARCH_CONFIG": str(config), "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")}
-    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=120)
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=environment, timeout=120)
     assert result.returncode == 0, result.stderr
     return [(row["seq"], row["role"]) for row in json.loads(result.stdout)]
 

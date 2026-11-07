@@ -31,7 +31,7 @@ def load_python_file(path: Path) -> ModuleType:
 
 
 def test_release_manifest_clients_use_only_canonical_query_modes() -> None:
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
     client_cases = [case for case in manifest["cases"] if case["surface"] in {"python", "mcp"} and "--mode" in case["argv"]]
     assert client_cases
     for case in client_cases:
@@ -40,7 +40,7 @@ def test_release_manifest_clients_use_only_canonical_query_modes() -> None:
 
 
 def test_release_manifest_rust_driver_uses_only_canonical_query_modes() -> None:
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
     rust_cases = [case for case in manifest["cases"] if case["surface"] == "rust" and "--operation" not in case["argv"]]
 
     assert rust_cases
@@ -57,8 +57,8 @@ def test_rust_benchmark_driver_uses_the_canonical_versioned_response() -> None:
 
 
 def test_release_manifest_fixture_schema_matches_the_rust_database_owner() -> None:
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
-    database_source = (ROOT / "rust/ai-session-search-core/src/db.rs").read_text()
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
+    database_source = (ROOT / "rust/ai-session-search-core/src/db.rs").read_text(encoding="utf-8")
     match = re.search(r"^pub const SCHEMA_VERSION: i64 = (\d+);$", database_source, re.MULTILINE)
 
     assert match is not None, "db.rs must keep one public integer SCHEMA_VERSION owner"
@@ -67,7 +67,7 @@ def test_release_manifest_fixture_schema_matches_the_rust_database_owner() -> No
 
 @pytest.mark.parametrize("removed_flag", ["--regex", "--fuzzy"])
 def test_release_manifest_uses_canonical_cli_query_mode(removed_flag: str) -> None:
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
     cli_search_cases = [case for case in manifest["cases"] if case["surface"] == "cli" and "messages" in case["argv"]]
     assert cli_search_cases
     assert all(removed_flag not in case["argv"] for case in cli_search_cases)
@@ -75,7 +75,7 @@ def test_release_manifest_uses_canonical_cli_query_mode(removed_flag: str) -> No
 
 def test_release_manifest_has_complete_four_surface_search_matrix() -> None:
     benchmark = load_script("benchmark_release.py")
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
     benchmark.validate_manifest(manifest)
     broken = json.loads(json.dumps(manifest))
     broken["cases"] = [case for case in broken["cases"] if case["id"] != "mcp-fuzzy-content"]
@@ -84,7 +84,7 @@ def test_release_manifest_has_complete_four_surface_search_matrix() -> None:
 
 
 def test_temporal_benchmarks_reuse_clients_and_require_oracle_semantics() -> None:
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
     temporal = [case for case in manifest["cases"] if case.get("temporal_mode")]
 
     assert {(case["surface"], "search" in case["id"]) for case in temporal} == {
@@ -161,7 +161,7 @@ def test_generated_fixture_has_point_spans_multi_day_spans_and_all_provider_isol
 
 
 def test_release_manifest_has_same_server_mcp_reader_bound_matrix() -> None:
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
     cases = {case["reader_bound"]: case for case in manifest["cases"] if case.get("workload") == "same-server-mcp-fuzzy-readers"}
 
     assert set(cases) == {"auto", "host", 1, 2, 4, 8}
@@ -393,7 +393,7 @@ def test_tui_client_latency_case_is_registered_and_opt_in() -> None:
     assert '"--queries"' in source
     assert '"--repetitions"' in source
     assert source.count('print(\'{"preview":true,"sessions":true,"terminal_restored":true}\')') == 1
-    manifest = json.loads((ROOT / "benchmarks" / "release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks" / "release_manifest.json").read_text(encoding="utf-8"))
     cases = {case["id"]: case for case in manifest["cases"]}
     assert "--measure-latency" in cases["tui-typeahead-latency"]["argv"]
     assert cases["tui-typeahead-latency"]["result_json_field"] == "result_digest"
@@ -1257,7 +1257,7 @@ def test_tui_startup_refuses_to_claim_unobserved_terminal_restoration(
 
 
 def test_release_manifest_does_not_pass_search_refresh_policy_to_db_commands() -> None:
-    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text(encoding="utf-8"))
     db_cases = [case for case in manifest["cases"] if "db" in case["argv"]]
 
     assert db_cases
