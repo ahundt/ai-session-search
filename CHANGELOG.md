@@ -24,6 +24,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    hold two messages in one session with the same sequence number, and their order was undefined, so
    `--match-window latest` could keep the wrong one and paging, literal or fuzzy, could swap
    them between pages.
+4. The same holds outside message search. `aise corrections` returned messages tied on
+   timestamp, session and sequence number in reverse insertion order, and `aise repeats` did the
+   same under its default user-role filter, because each followed whichever index served the
+   filters; both now page in one order whatever filters are set. Context windows and file-edit history,
+   which replays several edits made by one message in the order they were written, end on the
+   same tie-breaker.
 
 ### Performance
 

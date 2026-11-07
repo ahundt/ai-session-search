@@ -362,6 +362,13 @@ const CORRECTION_CANDIDATES_SQL: &str =
                )
            )
        )";
+/// Published order of correction candidates, newest first. Timestamp alone is not a total order:
+/// providers may omit it and several messages may share one. Nor is `(session_id, seq)`, which is
+/// not unique, so the row id ends the order; without it SQLite returns tied rows in whichever
+/// direction the chosen index is read (descending when `idx_messages_role_ts` serves `ts desc`,
+/// ascending under a session filter). A total order makes offset pages reproducible and
+/// non-overlapping across the CLI, Rust, Python, and MCP adapters.
+const CORRECTION_ORDER_SQL: &str = " order by m.ts desc, m.session_id asc, m.seq asc, m.id asc";
 const CORRECTION_HUMAN_PARTS_SQL: &str = "select m.id, p.start_char, p.end_char
      from messages m
      join message_content_parts p on p.message_id = m.id
@@ -3865,7 +3872,8 @@ impl Db {
             Value::Integer(seq.saturating_add(after)),
         ];
         push_access_scope(&mut sql, &mut args, "session_id", &self.access_scope);
-        sql.push_str(" order by seq");
+        // (session_id, seq) is not unique; the row id makes the order total.
+        sql.push_str(" order by seq, id");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -3916,7 +3924,7 @@ impl Db {
         );
         let mut args = vec![Value::Text(serde_json::to_string(&bounds)?)];
         push_access_scope(&mut sql, &mut args, "m.session_id", &self.access_scope);
-        sql.push_str(" order by a.ord, m.seq");
+        sql.push_str(" order by a.ord, m.seq, m.id");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             // `ord` is json_each's key over the bounds array, so it numbers the anchors from
@@ -4086,7 +4094,8 @@ impl Db {
                           order by p.ordinal
                         )
                       )
-                    end as content
+                    end as content,
+                    m.id as message_id
              from messages m
              where m.record_relation = 'original'
                and (
@@ -4116,7 +4125,11 @@ impl Db {
                 MessageSearchMode::Fuzzy => unreachable!("fuzzy rejected above"),
             }
         }
-        sql.push_str(" order by attributable.session_id, attributable.seq");
+        // (session_id, seq) is not unique; the row id makes the order total, so a role filter
+        // that reads idx_messages_role_ts cannot hand tied rows to the sort in timestamp order.
+        sql.push_str(
+            " order by attributable.session_id, attributable.seq, attributable.message_id",
+        );
         if filters.limit > 0 {
             sql.push_str(" limit ? offset ?");
             args.push(Value::Integer(filters.limit as i64));
@@ -4245,10 +4258,7 @@ impl Db {
             let mut sql = String::from(CORRECTION_CANDIDATES_SQL);
             let mut args: Vec<Value> = Vec::new();
             append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
-            // Timestamp alone is not a total order: providers may omit it, and several messages
-            // may share one timestamp. Stable tie-breakers make offset pages reproducible and
-            // non-overlapping across the CLI, Rust, Python, and MCP adapters.
-            sql.push_str(" order by m.ts desc, m.session_id asc, m.seq asc");
+            sql.push_str(CORRECTION_ORDER_SQL);
 
             let mut stmt = self.conn.prepare(&sql)?;
             // Materialize each candidate's full content exactly once before going parallel:
@@ -4647,7 +4657,9 @@ impl Db {
             Value::Text(format!("%/{file}")),
         ];
         push_file_filters(&mut sql, &mut args, query, &self.access_scope);
-        sql.push_str(" order by session_id, seq");
+        // One message can edit a file several times under one seq; version replay applies the
+        // edits in this order, so the row id (source insertion order) ends it.
+        sql.push_str(" order by session_id, seq, id");
 
         let mut stmt = self.conn.prepare(&sql)?;
         let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -10691,10 +10703,8 @@ mod tests {
     fn correction_candidate_and_part_queries_use_provenance_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        let candidates = format!(
-            "explain query plan {CORRECTION_CANDIDATES_SQL}
-             order by m.ts desc, m.session_id asc, m.seq asc"
-        );
+        let candidates =
+            format!("explain query plan {CORRECTION_CANDIDATES_SQL}{CORRECTION_ORDER_SQL}");
         let candidate_plan = db
             .conn
             .prepare(&candidates)
@@ -14767,6 +14777,182 @@ mod tests {
             "equal and missing timestamps use session id then sequence as stable tie-breakers"
         );
         assert_eq!(combined, page(0, 0), "pages must partition the full result");
+    }
+
+    #[test]
+    fn find_corrections_orders_rows_tied_on_every_sort_key_by_row_id_under_any_filter() {
+        // (session_id, seq) does not identify a message, so rows can tie on all of
+        // `ts desc, session_id, seq`. Unfiltered, SQLite reads idx_messages_role_ts backwards
+        // for `ts desc` and returns such rows in descending row id; filtered to one session it
+        // reads them ascending. The published order ends on the row id so it does not depend on
+        // which index the filters select.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:t','claude','claude:t','','/x','v1','jsonl')",
+                [],
+            )
+            .unwrap();
+        for content in ["you forgot first", "you forgot second", "you forgot third"] {
+            db.conn
+                .execute(
+                    "insert into messages(
+                         session_id, provider, seq, role, ts, content,
+                         authorship, record_relation
+                     ) values('claude:t','claude',4,'user','2026-01-01T00:00:00Z',?1,
+                              'human','original')",
+                    [content],
+                )
+                .unwrap();
+        }
+        let policies = default_policies();
+        let read = |session_id: Option<&str>, offset: usize, limit: usize| {
+            db.find_corrections(
+                &policies,
+                &MessageFilters {
+                    session_id: session_id.map(str::to_string),
+                    offset,
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.content)
+            .collect::<Vec<_>>()
+        };
+        let expected = ["you forgot first", "you forgot second", "you forgot third"];
+        assert_eq!(read(None, 0, 0), expected, "unfiltered");
+        assert_eq!(
+            read(Some("claude:t"), 0, 0),
+            expected,
+            "filtered to the session"
+        );
+        let walked = (0..3)
+            .flat_map(|offset| read(None, offset, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(walked, expected, "pages of one partition the same order");
+    }
+
+    /// Three human user messages tied on `(session_id, seq)`, inserted in row id order with
+    /// descending timestamps, so an index read in timestamp order meets them in reverse.
+    fn insert_tied_human_messages(db: &Db, contents: &[&str]) {
+        db.conn
+            .execute(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:t','claude','claude:t','','/x','v1','jsonl')",
+                [],
+            )
+            .unwrap();
+        for (index, content) in contents.iter().enumerate() {
+            db.conn
+                .execute(
+                    "insert into messages(
+                         session_id, provider, seq, role, ts, content,
+                         authorship, record_relation
+                     ) values('claude:t','claude',4,'user',?1,?2,'human','original')",
+                    params![format!("2026-01-0{}T00:00:00Z", 9 - index), content],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn attributable_human_search_orders_tied_rows_by_row_id_under_any_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let expected = ["repeat first", "repeat second", "repeat third"];
+        insert_tied_human_messages(&db, &expected);
+        let read = |role: Option<Role>, offset: usize, limit: usize| {
+            db.search_attributable_human_messages(
+                "repeat",
+                &MessageFilters {
+                    role,
+                    offset,
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.content)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(read(None, 0, 0), expected, "unfiltered");
+        assert_eq!(
+            read(Some(Role::User), 0, 0),
+            expected,
+            "filtered to user rows"
+        );
+        let walked = (0..3)
+            .flat_map(|offset| read(Some(Role::User), offset, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(walked, expected, "pages of one partition the same order");
+    }
+
+    #[test]
+    fn file_edits_sharing_a_message_keep_their_source_order() {
+        // One message can edit a file several times; those edits share a seq, and version
+        // replay depends on applying them in source order, which is row id order.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:t','claude','claude:t','','/x','v1','jsonl')",
+                [],
+            )
+            .unwrap();
+        for (path, content) in [("/b/x.rs", "v1"), ("/a/x.rs", "v2"), ("/b/x.rs", "v3")] {
+            db.conn
+                .execute(
+                    "insert into file_edits(session_id, provider, seq, ts, tool, file_path, \
+                       file_name, new_content) \
+                     values('claude:t','claude',4,'2026-01-01T00:00:00Z','Write',?1,'x.rs',?2)",
+                    [path, content],
+                )
+                .unwrap();
+        }
+        let contents = |edits: Vec<(String, Provider, FileEdit)>| {
+            edits
+                .into_iter()
+                .map(|(_, _, edit)| edit.new_content.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            contents(db.file_edits_for_session_id("x.rs", "claude:t").unwrap()),
+            ["v1", "v2", "v3"]
+        );
+        assert_eq!(
+            contents(
+                db.file_edits_for_query("/b/x.rs", &FileQuery::default())
+                    .unwrap()
+            ),
+            ["v1", "v3"]
+        );
+    }
+
+    #[test]
+    fn message_context_returns_tied_rows_in_row_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let expected = ["context first", "context second", "context third"];
+        insert_tied_human_messages(&db, &expected);
+        let contents =
+            |hits: Vec<MessageHit>| hits.into_iter().map(|hit| hit.content).collect::<Vec<_>>();
+        assert_eq!(
+            contents(db.message_context("claude:t", 4, 0, 0).unwrap()),
+            expected
+        );
+        let windows = db
+            .message_context_windows(&[("claude:t".to_string(), 4)], 1, 1)
+            .unwrap();
+        assert_eq!(contents(windows.into_iter().next().unwrap()), expected);
     }
 
     #[test]
