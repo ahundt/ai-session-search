@@ -126,7 +126,7 @@ To drop the network version-check dependency, disable the default feature:
 
 ```toml
 [dependencies]
-ai-session-search = { version = "1.0.0", default-features = false }
+ai-session-search = { version = "1.0.1", default-features = false }
 ```
 
 `release-check` stays enabled for `cargo install`, published Python wheels, and
