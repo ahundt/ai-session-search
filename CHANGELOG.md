@@ -106,6 +106,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    timestamp changed but whose content did not now takes 27 ms on a 20,000-message session,
    down from 1.65 s.
 
+### For contributors
+
+1. `Cargo.lock` takes the newest compatible release of each dependency that is at least 7 days
+   old as of November 7, 2026, the cooldown `.github/dependabot.yml` applies. Among them:
+   `rmcp` 3.4.0 to 3.8.0,
+   `tokio` 1.53.3 to 1.54.1, `pyo3` 0.29.2 to 0.29.3, `ureq` 3.4.2 to 3.5.0, and `uuid` 1.24.0 to
+   1.29.0. `jiff` stays at 0.2.39, which `main` already uses.
+   `dirs` 7, `pyo3` 0.30 and `rusqlite` 0.41 are left for separate changes.
+
 ## [1.0.0] - 2026-11-05
 
 1.0.0 is the first stable release of AI Session Search. `aise` parses nine AI coding-agent session
