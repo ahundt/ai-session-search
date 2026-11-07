@@ -247,10 +247,14 @@ impl<R: Read> Read for CancellationReader<'_, R> {
 /// Whether `path` names zstd-compressed JSONL (`*.jsonl.zst`), the form Codex compresses a
 /// rollout idle for 7 days into. Such a source is always read whole through
 /// [`open_source_reader`]: its byte offsets are not JSONL offsets, so it is never tail-parsed.
+/// Compares `OsStr` components, so a file name that is not valid UTF-8 still matches.
 pub(crate) fn is_compressed_jsonl(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+    use std::ffi::OsStr;
+    path.extension() == Some(OsStr::new("zst"))
+        && path
+            .file_stem()
+            .and_then(|stem| std::path::Path::new(stem).extension())
+            == Some(OsStr::new("jsonl"))
 }
 
 /// Open a session source for reading its JSONL records, decompressing `*.jsonl.zst` as it is
@@ -537,6 +541,8 @@ mod tests {
             ("rollout.jsonl", false),
             ("notes.zst", false),
             ("rollout.json.zst", false),
+            (".jsonl.zst", false),
+            ("dir.jsonl.zst/file", false),
         ] {
             assert_eq!(
                 is_compressed_jsonl(std::path::Path::new(name)),
