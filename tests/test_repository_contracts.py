@@ -689,6 +689,8 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
         assert native_root in installation
     assert "~/.pi/agent/mcp.json" in installation and "MCP-first" in installation
     assert "~/.prime/agent/settings.json" in installation and 'type: "stdio"' in installation
+    for mcp_path in ("~/.pi/agent/mcp.json", "~/.prime/agent/settings.json"):
+        assert mcp_path in readme
     acceptance = installation.split("The integration acceptance matrix", 1)[1]
     assert "Pi" in acceptance and "Prime Agent" in acceptance
     assert "toml_edit::DocumentMut" in configuration
