@@ -3844,9 +3844,10 @@ impl Db {
         explain.context("message search explanation was not produced")
     }
 
-    /// Fetch the messages surrounding a `(session_id, seq)` anchor — `before` rows
-    /// before and `after` rows after — for `messages search --context`. Ordered by
-    /// seq; served directly by the `(session_id, seq)` index.
+    /// Fetch every message whose seq lies within `before` sequence numbers before and `after`
+    /// after a `(session_id, seq)` anchor, for `messages search --context`. A seq can hold
+    /// several messages, so the window can hold more than `before + after + 1` rows. Ordered by
+    /// `(seq, id)`; served directly by the `(session_id, seq)` index.
     pub fn message_context(
         &self,
         session_id: &str,
@@ -4598,8 +4599,9 @@ impl Db {
 
     /// Ordered raw edits for one file (`files history`/`extract`). Matches by exact
     /// basename, exact path, or path suffix (`%/file`), optionally scoped to an exact session ID.
-    /// Results are ordered by `(session_id, seq)` so callers can number versions per
-    /// session and replay deltas deterministically.
+    /// Results are ordered by `(session_id, seq, id)`, the id keeping several edits made by one
+    /// message in source order, so callers can number versions per session and replay deltas
+    /// deterministically.
     pub fn file_edits_for(
         &self,
         file: &str,
