@@ -111,6 +111,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `~/.openclaw/openclaw.json`, but OpenClaw reads servers from `mcp.servers`, and its file is
     JSON5, which aise could not parse. Install now writes `mcp.servers.ai-session-search`, removes
     the old entry, and keeps the file's comments and JSON5 syntax.
+14. Upgrading moves these MCP entries without a manual step. The first command after an upgrade
+    already refreshed installed skills and instruction blocks; it now also moves an aise MCP
+    entry an earlier release left where its client no longer reads it, keeping the executable
+    that entry named. A client with no aise entry is not configured.
 
 ### Performance
 
