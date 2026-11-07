@@ -550,12 +550,12 @@ fn truncation_falls_back_to_full_parse() {
     // Shrink the file to just the first 3 lines (a copytruncate-style rotation).
     std::fs::write(&file, INITIAL).unwrap();
     indexer::reindex(&cfg, &db, false, None).unwrap();
-    // A full reparse re-derived the (now shorter) session: 7 messages, durable archive keeps none
-    // of the removed tail (delete+insert replace on shrink).
+    // A full reparse of the shorter file holds nothing new, and the index is the archive: the
+    // 4 messages the truncated file no longer holds stay, none is inserted twice.
     assert_eq!(
         rows(&db).len(),
-        7,
-        "shrink → full reparse of the truncated file"
+        11,
+        "shrink → full reparse keeps the archived tail"
     );
     assert_eq!(
         db.messages_fts_count().unwrap(),
@@ -592,10 +592,23 @@ fn rewritten_head_falls_back_to_full_parse() {
     let full_db = Db::open(&cfg2.db_path()).unwrap();
     indexer::reindex(&cfg2, &full_db, true, None).unwrap();
 
+    // The index is the archive: every message the oracle holds is indexed, after the 7
+    // messages of the original file, which the rewrite no longer holds but which stay.
+    let indexed = rows(&db);
+    let oracle = rows(&full_db);
+    let content = |row: &Row| row.3.clone();
+    let mut kept = indexed.iter().map(content).collect::<Vec<_>>();
+    for wanted in oracle.iter().map(content) {
+        let position = kept
+            .iter()
+            .position(|have| *have == wanted)
+            .unwrap_or_else(|| panic!("oracle message missing after the rewrite: {wanted}"));
+        kept.remove(position);
+    }
+    assert_eq!(kept.len(), 7, "the original messages stay: {kept:?}");
     assert_eq!(
-        rows(&db),
-        rows(&full_db),
-        "rewritten head → full reparse equals oracle"
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap()
     );
 }
 
@@ -645,7 +658,11 @@ fn total_reparse_failure_preserves_the_last_successful_archive() {
     std::fs::write(&file, claude_message_line("recovered after failure")).unwrap();
     let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
     assert_eq!(updated, 1, "the stale checkpoint must retry after recovery");
-    assert_eq!(message_contents(&db), ["recovered after failure"]);
+    assert_eq!(
+        message_contents(&db),
+        ["archived before failure", "recovered after failure"],
+        "the recovered file is indexed and the archived message stays"
+    );
 }
 
 #[test]
@@ -671,7 +688,10 @@ fn same_size_body_rewrite_past_the_head_fingerprint_is_reparsed() {
     assert_eq!(updated, 1);
     let contents = message_contents(&db);
     assert!(contents.iter().any(|content| content == "body-bbbb"));
-    assert!(!contents.iter().any(|content| content == "body-aaaa"));
+    assert!(
+        contents.iter().any(|content| content == "body-aaaa"),
+        "the rewritten-away message stays in the archive"
+    );
 }
 
 #[test]
@@ -703,12 +723,15 @@ fn full_parse_replaces_a_changed_prefix_even_when_its_boundary_is_unchanged() {
     let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
 
     assert_eq!(updated, 1);
+    // The changed prefix is re-parsed: its new content is indexed, appended after the stored
+    // messages, which all stay.
     assert_eq!(
         message_contents(&db),
         [
-            "opening-new",
+            "opening-old",
             "middle-stable",
             "boundary-stable",
+            "opening-new",
             "appended-message",
         ]
     );
