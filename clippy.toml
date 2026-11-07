@@ -20,3 +20,10 @@ disallowed-methods = [
     { path = "chrono::TimeZone::timestamp_nanos", reason = "convert Unix time with util::parse_unix_nanos" },
     { path = "chrono::DateTime::to_rfc3339", reason = "write timestamps stored in SQLite with util::stored_timestamp and timestamps shown to people or emitted as JSON with util::display_timestamp" },
 ]
+
+# Content digests. Every SHA-256 goes through rust/ai-session-search-core/src/hashing.rs, so the
+# algorithm, hex encoding, and value framing cannot differ between two digests that are compared.
+# When this fires, call the hashing.rs function that fits; if none does, add one there with a test.
+disallowed-types = [
+    { path = "sha2::Sha256", reason = "hash bytes with hashing::sha256, a reader or file with hashing::sha256_reader, and a sequence of values with hashing::FramedSha256; if none fits, add a function to hashing.rs instead of an #[allow]" },
+]
