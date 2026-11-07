@@ -201,6 +201,58 @@ jobs:
             --source-root "$GITHUB_WORKSPACE" \
             --timeout-seconds 600
 
+  harness-discovery:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: '3.12'
+          enable-cache: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master; no semver tags, and upstream requires a master-history SHA
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: harness-discovery
+      - run: cargo build -p ai-session-search --bin aise --locked
+      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      # npm view <package> time --json, checked 2026-11-07: Codex 2026-10-29,
+      # OpenCode 2026-09-14, Claude 2026-10-30, Gemini 2026-07-16. All >= 7 days old.
+      # Claude 2.1.319 was published 2026-11-06 and is intentionally too recent to use.
+      - name: Install pinned harness CLIs without AI credentials
+        run: | # zizmor: ignore[adhoc-packages] Exact-version test subjects; npm selects platform-specific CLI packages.
+          npm install --global --no-audit --no-fund \
+            @openai/codex@0.166.0 opencode-ai@1.18.31 \
+            @anthropic-ai/claude-code@2.1.315 @google/gemini-cli@0.51.0
+          # The standalone script permits missing CLIs; CI requires installation of all four.
+          for cli in codex opencode claude gemini; do
+            command -v "$cli" || exit 1
+          done
+      - name: Discover the installed MCP server without login
+        # Windows checks only Codex and OpenCode through explicit temporary config paths
+        # and CODEX_HOME/OPENCODE_CONFIG. Claude/Gemini are named skips until full profile
+        # redirection is verified; HOME cannot redirect aise's Windows known-folder API.
+        env:
+          AISE_EXECUTABLE: ${{ runner.os == 'Windows' && 'target/debug/aise.exe' || 'target/debug/aise' }}
+        run: uv run --no-project python scripts/verify_harness_discovery.py --executable "$AISE_EXECUTABLE"
+
   python:
     strategy:
       fail-fast: false
