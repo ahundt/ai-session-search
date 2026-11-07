@@ -2023,28 +2023,41 @@ impl Db {
         // dominant reindex cost. The boundary check (the last existing message still matches the
         // parse at that seq) guards against in-place rewrites; on any mismatch or shrink we fall
         // back to a full replace. Messages carry seq = parse index, so the appended tail's seqs
-        // never collide with the retained prefix.
+        // continue the retained prefix only while that prefix is dense (0..count-1). A purge
+        // that deleted rows without renumbering breaks that: the count then lands below the
+        // highest stored seq and the tail would reuse stored seqs, so a gapped prefix takes the
+        // full replace, which renumbers it from the parse. The max is one O(log N) seek on
+        // idx_messages_session_seq; see `append_tail`.
         let existing_count: i64 = tx.query_row(
             "select count(*) from messages where session_id = ?1",
             params![session.id],
             |row| row.get(0),
         )?;
+        let next_seq: i64 = tx.query_row(
+            "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
+             where session_id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )?;
         let parsed_count = parsed.messages.len() as i64;
-        let append_from: Option<usize> =
-            if allow_append_optimization && existing_count > 0 && parsed_count > existing_count {
-                let boundary = &parsed.messages[(existing_count - 1) as usize];
-                let existing_boundary: Option<String> = tx
-                    .query_row(
-                        "select content from messages where session_id = ?1 and seq = ?2",
-                        params![session.id, boundary.seq],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                (existing_boundary.as_deref() == Some(boundary.content.as_str()))
-                    .then_some(existing_count as usize)
-            } else {
-                None
-            };
+        let append_from: Option<usize> = if allow_append_optimization
+            && existing_count > 0
+            && next_seq == existing_count
+            && parsed_count > existing_count
+        {
+            let boundary = &parsed.messages[(existing_count - 1) as usize];
+            let existing_boundary: Option<String> = tx
+                .query_row(
+                    "select content from messages where session_id = ?1 and seq = ?2",
+                    params![session.id, boundary.seq],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            (existing_boundary.as_deref() == Some(boundary.content.as_str()))
+                .then_some(existing_count as usize)
+        } else {
+            None
+        };
         let new_messages = match append_from {
             Some(start) => &parsed.messages[start..],
             None => {
@@ -2147,8 +2160,8 @@ impl Db {
 
     /// Append ONLY the new rows from an incremental tail parse to an already-indexed session, in
     /// one transaction (SQLite makes the checkpoint update atomic with the data). New messages /
-    /// file-edits are re-sequenced to continue after the rows already stored, so their seqs match
-    /// what a full parse would assign. Immutable session fields (created_at, summary/first-user)
+    /// file-edits are re-sequenced to continue after the highest seq already stored, so no seq is
+    /// reused; when the stored seqs are dense this is also what a full parse would assign. Immutable session fields (created_at, summary/first-user)
     /// are preserved; updated_at/last_message_at advance only forward; title/preview refresh from
     /// the tail's latest view; cwd fills in if it was NULL; message_count becomes the true count.
     /// The new conversation text is appended to the transcript blob and the session FTS is rebuilt
@@ -2163,20 +2176,32 @@ impl Db {
         let session = &tail.session;
         let tx = self.conn.unchecked_transaction()?;
 
-        // New messages, re-sequenced after the existing rows (seqs are 0..N parse-order).
+        // New messages continue after the highest stored seq. Stored seqs can have gaps
+        // (`purge_injected_messages` deletes rows without renumbering), so the row count is not
+        // the next free seq: numbering from it reused existing seqs and left one (session_id, seq)
+        // naming two messages.
         let existing_count: i64 = tx.query_row(
             "select count(*) from messages where session_id = ?1",
             params![session.id],
             |row| row.get(0),
         )?;
-        // Append messages re-sequenced after the existing rows (seqs are 0..N parse-order).
+        // A separate statement pinned to idx_messages_session_seq lets SQLite answer max(seq) with
+        // one O(log N) index seek. Folded into the count above, it shared that statement's
+        // O(session rows) scan of a covering index whose second column is not seq: measured on a
+        // 40,180-row session, 2.16 ms against 1.30 ms for the count alone; this form adds 0.002 ms.
+        let next_seq: i64 = tx.query_row(
+            "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
+             where session_id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )?;
         insert_messages(
             &tx,
             session,
             tail.new_messages
                 .iter()
                 .enumerate()
-                .map(|(i, m)| (existing_count + i as i64, m)),
+                .map(|(i, m)| (next_seq + i as i64, m)),
         )?;
 
         // New file edits, re-sequenced after the existing ones.
@@ -15709,6 +15734,187 @@ mod tests {
             row,
             ("user".to_string(), None),
             "full replace must repair stale prefix metadata even when content is unchanged"
+        );
+    }
+
+    #[test]
+    fn tail_append_after_a_deleted_row_continues_past_the_highest_seq() {
+        // `purge_injected_messages` deletes rows from indexed sessions and leaves seq gaps. An
+        // append numbered from `count(*)` then reused existing seqs: a live Codex session got
+        // three (session_id, seq) pairs holding two messages each. New rows must start after the
+        // highest stored seq, so every seq keeps naming one message.
+        use crate::providers::claude::ClaudeAdapter;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("probe.jsonl");
+        let line = |ts: &str, role: &str, text: &str| {
+            format!(
+                "{{\"type\":\"{role}\",\"sessionId\":\"probe\",\"timestamp\":\"{ts}\",\
+                 \"message\":{{\"role\":\"{role}\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            )
+        };
+        std::fs::write(
+            &file,
+            format!(
+                "{}{}",
+                line("2026-06-01T10:00:00Z", "user", "first prompt"),
+                line("2026-06-01T10:00:05Z", "assistant", "first reply"),
+            ),
+        )
+        .unwrap();
+        let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
+        let source = crate::models::SourceFile {
+            provider: Provider::Claude,
+            path: file.clone(),
+            mtime_ns: 1,
+            size_bytes: std::fs::metadata(&file).unwrap().len() as i64,
+        };
+        let source_path = crate::util::normalize_path(&file);
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = claude.parse(&source);
+        crate::util::backfill_session_dates(&mut parsed.session, source.mtime_ns);
+        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)
+            .unwrap();
+        db.set_file_checkpoint(
+            Provider::Claude,
+            &source_path,
+            crate::tail::complete_prefix_offset(&file).unwrap(),
+            &crate::tail::prefix_fingerprint(&file).unwrap(),
+        )
+        .unwrap();
+        // What the purge does: remove a row without renumbering the rest.
+        db.conn
+            .execute(
+                "delete from messages where session_id='claude:probe' and seq=0",
+                [],
+            )
+            .unwrap();
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(line("2026-06-01T10:01:00Z", "user", "second prompt").as_bytes())
+            .unwrap();
+        let new_size = std::fs::metadata(&file).unwrap().len() as i64;
+        let (offset, _) = db
+            .file_checkpoint(
+                Provider::Claude,
+                &source_path,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap()
+            .unwrap();
+        let tail = crate::tail::tail_parse(&file, offset, |cursor, path| {
+            claude.parse_reader(cursor, path)
+        })
+        .unwrap()
+        .expect("a new complete line was appended");
+        db.append_tail(&tail, 2, new_size).unwrap();
+
+        let rows: Vec<(i64, String)> = db
+            .conn
+            .prepare(
+                "select seq, content from messages where session_id='claude:probe' order by id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (1, "first reply".to_string()),
+                (2, "second prompt".to_string())
+            ],
+            "the appended message must take the seq after the highest stored one"
+        );
+    }
+
+    #[test]
+    fn reindex_after_a_deleted_row_never_stores_one_seq_twice() {
+        // The upsert append shortcut keeps the stored prefix when the stored row count marks a
+        // matching boundary in the new parse. After a purge leaves a gap, the count is no longer
+        // the next free seq, so appending the parse's tail from there would reuse a stored seq.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let message = |seq: i64, content: &str| crate::models::Message {
+            seq,
+            role: Role::User,
+            ts: None,
+            tool_name: None,
+            kind: crate::models::MessageKind::Conversation,
+            tool_call_id: None,
+            content: content.to_string(),
+            is_compaction: false,
+            provenance: Default::default(),
+        };
+        let session = |messages: Vec<crate::models::Message>| ParsedSession {
+            session: SessionRecord {
+                id: "claude:gap".into(),
+                provider: Provider::Claude,
+                provider_session_id: "gap".into(),
+                title: None,
+                summary: None,
+                cwd: None,
+                repo_root: None,
+                created_at: None,
+                updated_at: None,
+                last_message_at: None,
+                preview_text: String::new(),
+                source_path: "/x/gap.jsonl".into(),
+                message_count: Some(messages.len() as i64),
+                parse_version: "v1".into(),
+                raw_metadata_json: None,
+                parse_warning: None,
+                discovery_source: "test".into(),
+                parent_session_id: None,
+                agent_label: None,
+            },
+            transcript_text: String::new(),
+            messages,
+            file_edits: Vec::new(),
+        };
+        db.upsert_session(
+            &session(vec![message(0, "a"), message(1, "b"), message(2, "c")]),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .execute("delete from messages where seq = 0", [])
+            .unwrap();
+        // The source grew by one message. Stored: seqs 1 and 2, count 2; parse[1] is "b", which
+        // matches stored seq 1, so the shortcut would append parse[2..] = seqs 2 and 3.
+        db.upsert_session(
+            &session(vec![
+                message(0, "a"),
+                message(1, "b"),
+                message(2, "c"),
+                message(3, "d"),
+            ]),
+            2,
+            2,
+        )
+        .unwrap();
+        let rows: Vec<(i64, String)> = db
+            .conn
+            .prepare("select seq, content from messages order by seq, id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let seqs: Vec<i64> = rows.iter().map(|(seq, _)| *seq).collect();
+        let mut unique = seqs.clone();
+        unique.dedup();
+        assert_eq!(seqs, unique, "a seq names one message: {rows:?}");
+        assert_eq!(
+            rows.last().map(|(_, content)| content.as_str()),
+            Some("d"),
+            "the new message is indexed"
         );
     }
 

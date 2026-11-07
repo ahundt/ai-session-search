@@ -31,6 +31,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    which replays several edits made by one message in the order they were written, end on the
    same tie-breaker.
 
+5. Appending new messages to an indexed session no longer reuses a sequence number. The
+   index migration deletes harness-injected rows without renumbering the rest, and the
+   incremental append then numbered new messages from the row count, which falls below the
+   highest stored sequence number once a row is gone: on one 40,180-message Codex session,
+   three sequence numbers each came to name two messages written a day apart. Appends now
+   continue after the highest stored sequence number, and a reindex whose stored messages have
+   a gap replaces the session from the parse rather than appending to it.
+
 ### Performance
 
 1. Limited literal and regex message searches stop once the page is full instead of sorting every
