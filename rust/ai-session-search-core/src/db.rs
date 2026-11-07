@@ -1882,12 +1882,13 @@ impl Db {
     /// stored row against the parse:
     ///
     /// - rows equal to the parse are left untouched;
-    /// - a new parser version, or a parse that still holds every stored message and file edit,
-    ///   replaces the rows, so parser and schema fixes repair them;
-    /// - under the same parser, a parse that no longer holds a stored row keeps it, because
-    ///   harnesses compact, rewrite and prune their own transcripts and the index is the
-    ///   archive. Messages and edits only the parse holds are added; the session's text, date
-    ///   span and message count then describe both.
+    /// - a new parser version replaces the rows, so parser fixes repair them;
+    /// - under the same parser, messages and file edits are decided separately: a parse that
+    ///   still holds every stored row of that kind replaces them, and one that no longer holds a
+    ///   stored row keeps it, because harnesses compact, rewrite and prune their own transcripts
+    ///   and the index is the archive. Rows only the parse holds are added, and the session's
+    ///   text, date span and message count then describe both. A message counts as held when
+    ///   the parse has one with the same role and text.
     pub fn replace_session(
         &self,
         parsed: &ParsedSession,
@@ -2095,16 +2096,24 @@ impl Db {
         if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
             // union rather than the parse alone.
-            prior_transcripts.extend(
-                tx.query_row(
+            let stored_transcript: Option<String> = tx
+                .query_row(
                     "select transcript_text from transcripts where session_id = ?1",
                     params![session.id],
                     |row| row.get(0),
                 )
-                .optional()?,
+                .optional()?;
+            // The session's own text first, then each retired identity's, then the parse's.
+            let transcript = merge_transcripts(
+                stored_transcript
+                    .iter()
+                    .chain(&prior_transcripts)
+                    .map(String::as_str)
+                    .chain(std::iter::once(parsed.transcript_text.as_str())),
             );
-            let transcript = merge_transcripts(&prior_transcripts, &parsed.transcript_text);
-            upsert_transcript(&tx, &session.id, &transcript)?;
+            if stored_transcript.as_deref() != Some(transcript.as_str()) {
+                upsert_transcript(&tx, &session.id, &transcript)?;
+            }
             tx.execute(
                 "update sessions set
                     created_at = case when ?2 is not null and (created_at is null or ?2 < created_at)
@@ -6047,29 +6056,24 @@ impl SessionSpan {
     }
 }
 
-/// Session text after an archive keep: the stored text, then each parse paragraph it lacks.
-/// Paragraphs are the "\n\n"-joined units every provider transcript and `append_tail` use; a
-/// paragraph the parse repeats is added once per copy the stored text lacks. O(stored + parsed
-/// bytes) time, O(paragraphs) memory.
-fn merge_transcripts(stored: &[String], parsed: &str) -> String {
-    let mut held: HashMap<&str, usize> = HashMap::new();
+/// Session text after an archive keep: the first text, then each paragraph of every later text
+/// that the merge so far lacks. Paragraphs are the "\n\n"-joined units every provider
+/// transcript and `append_tail` use, so overlapping texts (a session and a retired identity of
+/// the same source) contribute their shared paragraphs once, while a paragraph repeated within
+/// one text is added once per copy the merge lacks. A paragraph break inside one message's text
+/// splits it too, so a message paragraph equal to a held paragraph is not repeated; the message
+/// rows themselves are unaffected. O(total bytes) time, O(paragraphs) memory.
+fn merge_transcripts<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut held: HashMap<&'a str, usize> = HashMap::new();
     let mut merged = String::new();
-    for text in stored.iter().filter(|text| !text.is_empty()) {
-        for paragraph in text.split("\n\n") {
-            *held.entry(paragraph).or_default() += 1;
-        }
-        if !merged.is_empty() {
-            merged.push_str("\n\n");
-        }
-        merged.push_str(text);
-    }
-    for paragraph in parsed
-        .split("\n\n")
-        .filter(|paragraph| !paragraph.is_empty())
-    {
-        match held.get_mut(paragraph) {
-            Some(count) if *count > 0 => *count -= 1,
-            _ => {
+    for text in texts {
+        let mut text_counts: HashMap<&'a str, usize> = HashMap::new();
+        for paragraph in text.split("\n\n").filter(|paragraph| !paragraph.is_empty()) {
+            let seen = text_counts.entry(paragraph).or_default();
+            *seen += 1;
+            let have = held.entry(paragraph).or_default();
+            if *seen > *have {
+                *have += 1;
                 if !merged.is_empty() {
                     merged.push_str("\n\n");
                 }
@@ -6106,13 +6110,14 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 /// Bring a session's message rows in line with a full parse. Returns true when stored rows the
 /// parse no longer holds were kept (the archive rule), so the caller describes the union.
 ///
-/// - Append: when the stored rows are a dense prefix of the parse whose last row still matches,
-///   only the new tail is inserted. Session logs are append-only, and re-inserting a whole
-///   session re-runs the FTS triggers over every row. Only that boundary row is compared, so a
-///   caller passing `allow_append_optimization` asserts its sources are append-only.
+/// - Append: under the same parser, when the stored rows are a dense prefix of the parse whose
+///   last row still matches in every column, only the new tail is inserted. Session logs are
+///   append-only, and re-inserting a whole session re-runs the FTS triggers over every row. Only
+///   that boundary row is compared, so a caller passing `allow_append_optimization` asserts its
+///   sources are append-only.
 /// - Unchanged: under the same parser, a parse whose rows equal the stored rows writes nothing.
-/// - Replace: a parser change, or a parse that holds every stored content, replaces the rows,
-///   so a parser upgrade can reclassify them.
+/// - Replace: a parser change, or a parse that holds every stored message (same role and
+///   content), replaces the rows, so a parser upgrade can reclassify them.
 /// - Keep: otherwise the harness compacted, rewrote or pruned its transcript. The index is the
 ///   archive, so stored rows stay, and parse messages no stored row of the same role and content
 ///   accounts for are appended after the highest stored seq. Content cannot tell a re-rendered
@@ -6136,19 +6141,19 @@ fn store_parsed_messages(
     // A stored prefix is dense only when the next free seq equals its count; a gap would make
     // the parse's tail seqs collide with stored ones.
     if allow_append_optimization
+        && same_parser
         && existing_count > 0
         && next_seq == existing_count
         && parsed_count > existing_count
     {
+        // The whole boundary row must match, so text that repeats by coincidence ("ok",
+        // "continue") at that position cannot pass for it after an archive keep.
         let boundary = &parsed.messages[(existing_count - 1) as usize];
-        let existing_boundary: Option<String> = tx
-            .query_row(
-                "select content from messages where session_id = ?1 and seq = ?2",
-                params![session.id, boundary.seq],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if existing_boundary.as_deref() == Some(boundary.content.as_str()) {
+        let stored_boundary = stored_message_keys(tx, &session.id, Some(boundary.seq))?;
+        if stored_boundary
+            .first()
+            .is_some_and(|(_, keys)| keys.all_columns == parsed_message_keys(boundary).all_columns)
+        {
             insert_messages(
                 tx,
                 session,
@@ -6159,7 +6164,7 @@ fn store_parsed_messages(
             return Ok(false);
         }
     }
-    let stored = stored_message_keys(tx, &session.id)?;
+    let stored = stored_message_keys(tx, &session.id, None)?;
     let parsed_keys: Vec<MessageKeys> = parsed.messages.iter().map(parsed_message_keys).collect();
     if same_parser
         && stored
@@ -6171,8 +6176,8 @@ fn store_parsed_messages(
     }
     if !same_parser
         || covers_every_stored_key(
-            stored.iter().map(|(_, keys)| keys.content),
-            parsed_keys.iter().map(|keys| keys.content),
+            stored.iter().map(|(_, keys)| keys.role_and_content),
+            parsed_keys.iter().map(|keys| keys.role_and_content),
         )
     {
         tx.execute(
@@ -6283,7 +6288,7 @@ fn store_parsed_file_edits(
 /// highest seq in its stored order. A target with no messages takes the retired messages with
 /// their seqs in one statement. O(target + retired rows and bytes) time, O(rows) key memory.
 fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str) -> Result<()> {
-    let held = stored_message_keys(tx, target)?;
+    let held = stored_message_keys(tx, target, None)?;
     if held.is_empty() {
         tx.execute(
             "update messages set session_id = ?1 where session_id = ?2",
@@ -6295,7 +6300,7 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
         let mut moved = 0;
         let mut update =
             tx.prepare("update messages set session_id = ?1, seq = ?2 where id = ?3")?;
-        for (id, keys) in stored_message_keys(tx, retired)? {
+        for (id, keys) in stored_message_keys(tx, retired, None)? {
             if !take_key(&mut held, &keys.role_and_content) {
                 update.execute(params![target, next_seq + moved, id])?;
                 moved += 1;
@@ -6323,14 +6328,11 @@ type RowDigest = [u8; 32];
 
 /// Identities of one message row for the archive rule (`store_parsed_messages`, `move_retired_rows`).
 ///
-/// - `content` alone decides whether a parse still holds every stored message, so a same-parser
-///   parse that re-renders metadata still replaces.
-/// - `role_and_content` adds the role, so text a new message shares with a stored message of
-///   another role is not taken for it.
+/// - `role_and_content` decides whether a parse still holds a stored message, so text a new
+///   message shares with a stored message of another role is not taken for it.
 /// - `all_columns` covers every stored column except the content parts, which the parser derives from
 ///   the content; equal `all_columns` sequences mean the parse would write exactly what is stored.
 struct MessageKeys {
-    content: RowDigest,
     role_and_content: RowDigest,
     all_columns: RowDigest,
 }
@@ -6377,7 +6379,6 @@ impl MessageColumns<'_> {
         all_columns.update_u8(u8::from(self.is_compaction));
         all_columns.update_bytes(&content);
         MessageKeys {
-            content,
             role_and_content: role_and_content.finish_bytes(),
             all_columns: all_columns.finish_bytes(),
         }
@@ -6408,18 +6409,30 @@ fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
     .keys()
 }
 
-/// A session's stored message rows as (row id, keys) in (seq, id) order. Read only off the
-/// append path: O(stored rows + bytes) time, O(stored rows) memory for the keys.
+/// A session's stored message rows as (row id, keys) in (seq, id) order, or only the rows at
+/// `only_seq`. The whole session is read only off the append path: O(stored rows + bytes) time,
+/// O(stored rows) memory for the keys; one seq is an index seek on idx_messages_session_seq.
 fn stored_message_keys(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
+    only_seq: Option<i64>,
 ) -> Result<Vec<(i64, MessageKeys)>> {
-    let mut statement = tx.prepare(
-        "select id, seq, role, kind, authorship, ts, tool_name, tool_call_id, is_compaction,
-                correlation_authority, correlation_scope, correlation_id, record_relation, content
-         from messages where session_id = ?1 order by seq, id",
-    )?;
-    let mut rows = statement.query(params![session_id])?;
+    const COLUMNS: &str = "select id, seq, role, kind, authorship, ts, tool_name, tool_call_id,
+        is_compaction, correlation_authority, correlation_scope, correlation_id, record_relation,
+        content from messages";
+    // Two fixed statements, so the single-seq read stays an index seek: an `?2 is null or`
+    // predicate can keep SQLite off the (session_id, seq) key.
+    let mut statement = tx.prepare(&match only_seq {
+        Some(_) => format!(
+            "{COLUMNS} indexed by idx_messages_session_seq where session_id = ?1 and seq = ?2
+             order by id"
+        ),
+        None => format!("{COLUMNS} where session_id = ?1 order by seq, id"),
+    })?;
+    let mut rows = match only_seq {
+        Some(seq) => statement.query(params![session_id, seq])?,
+        None => statement.query(params![session_id])?,
+    };
     let mut keys = Vec::new();
     while let Some(row) = rows.next()? {
         let text = |index: usize| row.get::<_, Option<String>>(index);
@@ -16250,8 +16263,8 @@ mod tests {
     fn upsert_appends_only_new_messages_when_session_grows() {
         // Root-cause reindex perf: an append-only session that GREW must NOT delete + re-insert
         // (and re-trigram-index) its unchanged prefix — that re-indexed entire multi-hundred-MB
-        // sessions on every incremental reindex. Detected with a SENTINEL tag on the existing
-        // rows: it survives an append but not a delete+re-insert. (Row ids can't tell them apart
+        // sessions on every incremental reindex. Detected by counting inserted rows with a
+        // temporary trigger: an append inserts only the new rows. (Row ids can't tell them apart
         // — SQLite reuses freed rowids after a delete-all.)
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -16265,15 +16278,14 @@ mod tests {
                 .filter_map(Result::ok)
                 .collect()
         };
-        let tagged = |db: &Db| -> i64 {
-            db.conn
-                .query_row(
-                    "select count(*) from messages where session_id='claude:s1' \
-                     and tool_name='SENTINEL'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap()
+        // Rows inserted since the last call.
+        let inserted = |db: &Db| -> i64 {
+            let count = db
+                .conn
+                .query_row("select count(*) from temp.inserted", [], |r| r.get(0))
+                .unwrap();
+            db.conn.execute("delete from temp.inserted", []).unwrap();
+            count
         };
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]),
@@ -16281,11 +16293,11 @@ mod tests {
             100,
         )
         .unwrap();
-        // Tag the existing rows; a fresh re-insert (from the parse) would not carry the sentinel.
         db.conn
-            .execute(
-                "update messages set tool_name='SENTINEL' where session_id='claude:s1'",
-                [],
+            .execute_batch(
+                "create temp table inserted(id integer);
+                 create temp trigger count_inserts after insert on messages begin
+                     insert into inserted values (new.id); end;",
             )
             .unwrap();
 
@@ -16301,9 +16313,9 @@ mod tests {
             ["alpha", "bravo", "charlie", "delta", "echo"]
         );
         assert_eq!(
-            tagged(&db),
-            3,
-            "prefix rows RETAINED the sentinel (appended, not re-indexed)"
+            inserted(&db),
+            2,
+            "only the two new rows were inserted (appended, not re-indexed)"
         );
         // The appended message is findable by regex search (custom index built lazily over the
         // grown corpus, or covered by the un-indexed delta direct-scan).
@@ -16319,8 +16331,8 @@ mod tests {
         assert_eq!(new_found.len(), 1, "the appended message is searchable");
 
         // Shrink under the same parser: the harness compacted or pruned its transcript. The
-        // index is the archive, so the stored rows stay, untouched (sentinel kept), and nothing
-        // the parse still holds is inserted twice.
+        // index is the archive, so the stored rows stay, untouched, and nothing the parse still
+        // holds is inserted twice.
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "bravo"]),
             3,
@@ -16332,7 +16344,7 @@ mod tests {
             ["alpha", "bravo", "charlie", "delta", "echo"],
             "a shrunk source keeps every stored message"
         );
-        assert_eq!(tagged(&db), 3, "stored rows were kept, not re-inserted");
+        assert_eq!(inserted(&db), 0, "stored rows were kept, not re-inserted");
 
         // In-place rewrite under the same parser: stored rows stay and only the rewritten
         // message is new, appended after the highest stored seq.
@@ -16347,11 +16359,15 @@ mod tests {
             ["alpha", "bravo", "charlie", "delta", "echo", "CHANGED", "extra"],
             "a rewritten source keeps the old messages and appends the new ones",
         );
-        assert_eq!(tagged(&db), 3, "the stored prefix was not re-inserted");
+        assert_eq!(
+            inserted(&db),
+            2,
+            "only the rewritten and new messages were inserted"
+        );
     }
 
     #[test]
-    fn replace_session_rewrites_matching_prefix_metadata_on_full_reindex() {
+    fn a_new_parser_version_rewrites_matching_prefix_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
 
@@ -16368,12 +16384,11 @@ mod tests {
             )
             .unwrap();
 
-        db.replace_session(
-            &parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]),
-            2,
-            150,
-        )
-        .unwrap();
+        // Parser fixes bump the parse version, and a new version replaces the rows. Under the
+        // same version a differing role cannot be told from a replaced message, so it is kept.
+        let mut fixed = parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]);
+        fixed.session.parse_version = "v2".into();
+        db.replace_session(&fixed, 2, 150).unwrap();
         let row: (String, Option<String>) = db
             .conn
             .query_row(
@@ -16385,7 +16400,7 @@ mod tests {
         assert_eq!(
             row,
             ("user".to_string(), None),
-            "full replace must repair stale prefix metadata even when content is unchanged"
+            "a new parser version repairs stale prefix metadata even when content is unchanged"
         );
     }
 
@@ -16891,6 +16906,116 @@ mod tests {
     }
 
     #[test]
+    fn a_parse_that_holds_a_stored_text_only_under_another_role_does_not_replace_it() {
+        // Coverage must match on role too: replacing would delete the stored user message.
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "yes", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut reply = archive_message(0, "yes", Conversation);
+        reply.role = Role::Assistant;
+        db.replace_session(
+            &archive_session(
+                vec![reply, archive_message(1, "b", Conversation)],
+                Vec::new(),
+            ),
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "yes"),
+                row(1, "user", "b"),
+                row(2, "assistant", "yes")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_parser_version_replaces_rows_even_when_the_append_boundary_matches() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut upgraded = archive_session(
+            vec![
+                archive_message(0, "x", Conversation),
+                archive_message(1, "b", Conversation),
+                archive_message(2, "c", Conversation),
+            ],
+            Vec::new(),
+        );
+        upgraded.session.parse_version = "v2".into();
+        db.upsert_session(&upgraded, 2, 2).unwrap();
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "x"),
+                row(1, "user", "b"),
+                row(2, "user", "c")
+            ]
+        );
+    }
+
+    #[test]
+    fn merging_a_retired_identity_does_not_repeat_session_text_both_hold() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut retired = archive_session(
+            vec![
+                archive_message(0, "a", Conversation),
+                archive_message(1, "b", Conversation),
+            ],
+            Vec::new(),
+        );
+        retired.transcript_text = "[user] a\n\n[user] b".into();
+        db.upsert_session(&retired, 1, 1).unwrap();
+        let mut occupied = retired.clone();
+        occupied.session.id = "codex:archive-renamed".into();
+        occupied.session.source_path = "/x/other.jsonl".into();
+        db.upsert_session(&occupied, 1, 1).unwrap();
+
+        let mut renamed = archive_session(vec![archive_message(0, "c", Conversation)], Vec::new());
+        renamed.session.id = "codex:archive-renamed".into();
+        renamed.transcript_text = "[user] c".into();
+        db.upsert_session(&renamed, 2, 2).unwrap();
+        let transcript: String = db
+            .conn
+            .query_row(
+                "select transcript_text from transcripts where session_id = 'codex:archive-renamed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transcript, "[user] a\n\n[user] b\n\n[user] c");
+    }
+
+    #[test]
     fn a_new_edit_before_a_retained_edit_replays_in_source_order() {
         // A rewrite drops the first Write and adds another Write before a retained Edit. Replay
         // must apply the new Write before the Edit, or the Write resets the file afterwards.
@@ -16954,6 +17079,17 @@ mod tests {
                 (2, "Edit".to_string())
             ]
         );
+        // Replaying the history must apply the Edit to the newer Write: v0 becomes w0.
+        let edits: Vec<FileEdit> = db
+            .file_edits_for("f.rs", None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, edit)| edit)
+            .collect();
+        assert_eq!(
+            crate::files::reconstruct(&edits, edits.len()).as_deref(),
+            Some("w0")
+        );
     }
 
     #[test]
@@ -17004,7 +17140,7 @@ mod tests {
     }
 
     #[test]
-    fn reparsing_an_unchanged_source_rewrites_no_row() {
+    fn reparsing_an_unchanged_source_rewrites_no_message_or_file_edit_row() {
         // Compression, a touch, or a metadata-only change re-parses a source to the same rows;
         // rewriting them would re-run the FTS triggers over the whole session for nothing.
         use crate::models::MessageKind::Conversation;
