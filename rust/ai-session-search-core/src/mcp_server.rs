@@ -8973,7 +8973,7 @@ mod tests {
             parse_date_bounds(&json!({ "since": "2026-01" }), now).unwrap();
         assert_eq!(
             crate::util::display_timestamp(since_only.unwrap()),
-            "2026-01-01T00:00:00+00:00"
+            "2026-01-01T00:00:00Z"
         );
         assert!(until_only.is_none(), "`since` alone must stay open-ended");
 
@@ -8982,17 +8982,17 @@ mod tests {
         assert!(since_only.is_none(), "`until` alone must stay open-ended");
         assert_eq!(
             crate::util::display_timestamp(until_only.unwrap()),
-            "2026-01-31T23:59:59.999999999+00:00"
+            "2026-01-31T23:59:59.999999999Z"
         );
 
         let (since, until) = parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap();
         assert_eq!(
             crate::util::display_timestamp(since.unwrap()),
-            "2026-01-01T00:00:00+00:00"
+            "2026-01-01T00:00:00Z"
         );
         assert_eq!(
             crate::util::display_timestamp(until.unwrap()),
-            "2026-01-31T23:59:59.999999999+00:00"
+            "2026-01-31T23:59:59.999999999Z"
         );
         assert!(
             parse_date_bounds(&json!({ "when": "2026-01", "since": "2026" }), now).is_err(),

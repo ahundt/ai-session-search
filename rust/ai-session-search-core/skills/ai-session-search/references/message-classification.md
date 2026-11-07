@@ -145,7 +145,7 @@ aise skills corrections --format json
             "session_id": "claude:0f9c…",
             "message_seq": 42,
             "provider": "claude",
-            "ts": "2026-06-03T00:00:00+00:00",
+            "ts": "2026-06-03T00:00:00Z",
             "policy_name": "corrections",
             "category": "skip_step",
             "matched_text": "you forgot",
