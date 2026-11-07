@@ -244,16 +244,29 @@ impl<R: Read> Read for CancellationReader<'_, R> {
     }
 }
 
+/// Open a session source for reading its JSONL records. Codex compresses a rollout idle for 7
+/// days into `rollout-*.jsonl.zst`, one zstd stream of the exact plain bytes; that form is
+/// decompressed as it is read, in O(1) extra memory beyond the decoder's window, so every parser
+/// sees the plain records either way.
+pub(crate) fn open_source_reader(path: &std::path::Path) -> Result<Box<dyn std::io::Read>> {
+    let file = std::fs::File::open(path)?;
+    if crate::providers::codex::is_compressed_rollout(path) {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(BufReader::new(file))
+            .map_err(|error| anyhow::anyhow!("{} is not a zstd stream: {error}", path.display()))?;
+        return Ok(Box::new(decoder));
+    }
+    Ok(Box::new(file))
+}
+
 fn parse_jsonl_until(
     source: &SourceFile,
     should_cancel: &dyn Fn() -> bool,
     parse: impl FnOnce(
-        BufReader<CancellationReader<'_, std::fs::File>>,
+        BufReader<CancellationReader<'_, Box<dyn std::io::Read>>>,
     ) -> Result<crate::models::ParsedSession>,
 ) -> Result<crate::models::ParsedSession> {
-    let file = std::fs::File::open(&source.path)?;
     parse(BufReader::new(CancellationReader {
-        inner: file,
+        inner: open_source_reader(&source.path)?,
         should_cancel,
     }))
 }

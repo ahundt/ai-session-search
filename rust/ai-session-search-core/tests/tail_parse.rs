@@ -1026,3 +1026,79 @@ fn codex_rollout_without_session_meta_indexes_as_a_point_span_and_the_reindex_co
         meta_less.parse_warning
     );
 }
+
+/// Codex compresses a rollout idle for 7 days into `rollout-*.jsonl.zst` (the same bytes, one
+/// zstd stream) and deletes the plain file. The compressed file continues the indexed session.
+fn compress_rollout(plain: &Path, contents: &str) -> std::path::PathBuf {
+    let compressed = plain.with_extension("jsonl.zst");
+    std::fs::write(
+        &compressed,
+        ruzstd::encoding::compress_to_vec(
+            contents.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    )
+    .unwrap();
+    std::fs::remove_file(plain).unwrap();
+    compressed
+}
+
+#[test]
+fn a_compressed_codex_rollout_continues_its_indexed_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_root = dir.path().join("codex");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    let file = codex_root.join(CODEX_FILE);
+    std::fs::write(&file, CODEX_INITIAL).unwrap();
+    let cfg = codex_only_config(dir.path(), &codex_root);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(rows(&db).len(), 2);
+
+    compress_rollout(&file, &format!("{CODEX_INITIAL}{CODEX_APPENDED}"));
+    let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(updated, 1, "the compressed rollout is read");
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let codex_root2 = dir2.path().join("codex");
+    std::fs::create_dir_all(&codex_root2).unwrap();
+    std::fs::write(
+        codex_root2.join(CODEX_FILE),
+        format!("{CODEX_INITIAL}{CODEX_APPENDED}"),
+    )
+    .unwrap();
+    let cfg2 = codex_only_config(dir2.path(), &codex_root2);
+    let full_db = Db::open(&cfg2.db_path()).unwrap();
+    indexer::reindex(&cfg2, &full_db, true, None).unwrap();
+    assert_eq!(
+        rows(&db),
+        rows(&full_db),
+        "one session, equal to a full index of the plain bytes"
+    );
+
+    let (_seen, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(updated, 0, "an unchanged compressed rollout is not re-read");
+}
+
+#[test]
+fn compressing_a_rollout_never_drops_what_the_index_already_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_root = dir.path().join("codex");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    let file = codex_root.join(CODEX_FILE);
+    std::fs::write(&file, format!("{CODEX_INITIAL}{CODEX_APPENDED}")).unwrap();
+    let cfg = codex_only_config(dir.path(), &codex_root);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    let before = rows(&db);
+
+    // The compressed file holds less than the index (history the index kept, or a source the
+    // harness pruned): the new path must be treated as the same source, so nothing is lost.
+    compress_rollout(&file, CODEX_INITIAL);
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    assert_eq!(rows(&db), before, "every indexed message stays");
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap()
+    );
+}
