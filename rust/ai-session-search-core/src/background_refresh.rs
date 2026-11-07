@@ -711,8 +711,7 @@ mod tests {
         config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
         config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
         let db = crate::db::Db::open(&config.db_path()).unwrap();
-        let millisecond =
-            chrono::DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+        let millisecond = crate::util::parse_unix_millis(Utc::now().timestamp_millis()).unwrap();
         let report_time = millisecond + chrono::Duration::nanoseconds(100_000);
         let completed_at = millisecond + chrono::Duration::nanoseconds(900_000);
         let report = BackgroundRefreshReport {

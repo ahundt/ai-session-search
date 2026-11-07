@@ -141,6 +141,9 @@ pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<Date
 }
 
 /// Parse one token to its full `(start, end)` instant span.
+// User-facing --since/--until/--when input is deliberately permissive, so this module parses
+// with chrono directly; clippy.toml names it as the exception for user input.
+#[allow(clippy::disallowed_methods)]
 pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let s = input.trim();
     if s.is_empty() {
@@ -355,6 +358,8 @@ fn days_in_month(year: i32, month: u32) -> Result<u32> {
     Ok(last.day())
 }
 
+// User-facing partial ISO datetimes (`…T14:30`); see parse_span.
+#[allow(clippy::disallowed_methods)]
 fn parse_iso_dt(s: &str) -> Result<DateTime<Utc>> {
     let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
         .map_err(|err| anyhow!("invalid datetime '{s}': {err}"))?;
@@ -435,7 +440,7 @@ mod tests {
     }
 
     fn iso(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+        crate::util::parse_datetime(s).unwrap()
     }
 
     // ── Family 1: duration shorthand ────────────────────────────────────────

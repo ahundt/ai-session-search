@@ -736,12 +736,18 @@ mod tests {
         let record = adapter.parse(source);
 
         assert_eq!(
-            record.session.created_at.map(|at| at.to_rfc3339()),
+            record
+                .session
+                .created_at
+                .map(crate::util::display_timestamp),
             Some("2026-06-18T11:50:00+00:00".to_string()),
             "the earliest event starts the span even though it arrived last"
         );
         assert_eq!(
-            record.session.updated_at.map(|at| at.to_rfc3339()),
+            record
+                .session
+                .updated_at
+                .map(crate::util::display_timestamp),
             Some("2026-06-18T12:30:00+00:00".to_string()),
             "the latest event ends the span even though an older record followed it"
         );

@@ -927,6 +927,8 @@ pub fn render_posix_shell_command(parts: &[String]) -> Result<String> {
         .map_err(|error| anyhow!("cannot render POSIX shell command: {error}"))
 }
 
+// The stored-timestamp reader, which clippy.toml names as the pathway.
+#[allow(clippy::disallowed_methods)]
 pub fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
@@ -939,12 +941,24 @@ pub fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
         })
 }
 
+// The Unix-time pathways clippy.toml names; every other conversion calls one of these.
+#[allow(clippy::disallowed_methods)]
 pub fn parse_unix_seconds(value: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(value, 0)
 }
 
+#[allow(clippy::disallowed_methods)]
 pub fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(value)
+}
+
+/// Nanoseconds since the Unix epoch, including negative values before it.
+#[allow(clippy::disallowed_methods)]
+pub fn parse_unix_nanos(value: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(
+        value.div_euclid(1_000_000_000),
+        value.rem_euclid(1_000_000_000) as u32,
+    )
 }
 
 /// The text form of a timestamp stored in the index: RFC 3339 in UTC, offset written `+00:00`.
@@ -952,7 +966,16 @@ pub fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
 /// SQL filters and orderings compare these strings directly (`ts >= ?`), which equals time order
 /// only because every stored value shares this one offset; write stored timestamps through this
 /// function so they all do. Read them back with [`parse_datetime`].
+#[allow(clippy::disallowed_methods)]
 pub fn stored_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339()
+}
+
+/// The text form of a timestamp shown to people or emitted in JSON output: the same RFC 3339 UTC
+/// text as [`stored_timestamp`], kept separate so presentation can change without touching the
+/// stored format that SQL comparisons depend on.
+#[allow(clippy::disallowed_methods)]
+pub fn display_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
 }
 
@@ -1700,9 +1723,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
 
 /// Convert a file mtime in nanoseconds-since-epoch to a UTC datetime.
 pub fn datetime_from_mtime_ns(mtime_ns: i64) -> Option<DateTime<Utc>> {
-    let secs = mtime_ns.div_euclid(1_000_000_000);
-    let nanos = mtime_ns.rem_euclid(1_000_000_000) as u32;
-    DateTime::from_timestamp(secs, nanos)
+    parse_unix_nanos(mtime_ns)
 }
 
 /// Widen a session's observed start to include `timestamp`, keeping the earliest seen.
@@ -1769,8 +1790,8 @@ pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
             let reversal = format!(
                 "session '{}' has created_at {} after updated_at {}; the span was stored in order",
                 session.id,
-                created_at.to_rfc3339(),
-                updated_at.to_rfc3339()
+                display_timestamp(created_at),
+                display_timestamp(updated_at)
             );
             session.created_at = Some(updated_at);
             session.updated_at = Some(created_at);
@@ -1793,8 +1814,8 @@ pub fn validate_session_date_order(session: &SessionRecord) -> anyhow::Result<()
         (Some(created_at), Some(updated_at)) => anyhow::bail!(
             "session '{}' has created_at {} after updated_at {}; provider timestamp normalization must produce an ordered known span",
             session.id,
-            created_at.to_rfc3339(),
-            updated_at.to_rfc3339()
+            display_timestamp(created_at),
+            display_timestamp(updated_at)
         ),
         _ => anyhow::bail!(
             "session '{}' has no complete date span after mtime fallback; verify the source file timestamp and provider parser",
