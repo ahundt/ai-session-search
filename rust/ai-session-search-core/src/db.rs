@@ -3142,7 +3142,7 @@ impl Db {
     /// `" indexed by idx_messages_session_seq"` when a content page should take its published
     /// order from that index, or `""` to keep sorting every verified candidate.
     ///
-    /// Both plans return the same rows in the same order. The index-ordered one additionally lets
+    /// Both plans return the same rows in the same order. The index-ordered one also lets
     /// SQLite honor `LIMIT` while scanning, so the verifier runs on the rows up to the last match
     /// kept rather than on every candidate: measured 601 calls against 26,828 for
     /// `"permission denied"`, 50 against 14,930 for `"tool_use"`, with identical rows.

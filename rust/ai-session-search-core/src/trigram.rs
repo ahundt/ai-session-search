@@ -261,7 +261,7 @@ fn fts5_leaves_uppercase_unfolded(lowercase: char) -> bool {
 /// only for trigrams FTS5 tokenizes the same way on both sides, so three kinds of position are
 /// left out, and the trigrams of every remaining run of at least three characters are required:
 ///
-/// - a grapheme whose lowercase spans several scalars (notably U+0130 → `i` + U+0307), which
+/// - a grapheme whose lowercase spans several scalars (U+0130 lowercases to `i` + U+0307), which
 ///   FTS5 folds one scalar at a time;
 /// - a lowercase form whose uppercase FTS5 does not fold to it ([`FTS5_UNFOLDED_LOWERCASE`]);
 /// - a leading U+0307, which a stored U+0130 can supply as the second half of its fold.
