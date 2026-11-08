@@ -178,8 +178,17 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
             .as_array()
             .unwrap()
             .len(),
-        28
+        29
     );
+    assert_eq!(
+        specification["configured_default"]["content_authorship"],
+        "any"
+    );
+    assert!(specification["registry"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|descriptor| descriptor["parameter"] == "content_authorship"));
     assert!(specification["registry"]["rules"]
         .as_array()
         .unwrap()
