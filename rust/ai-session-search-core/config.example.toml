@@ -41,6 +41,10 @@ refresh_after_upgrade = true
 # mcp_config = "profiles/work/config.toml"
 # instruction_file = "profiles/work/AGENTS.md"
 # skill_discovery_roots = ["shared/skills"] # parent directories; aise appends /ai-session-search
+# [integrations.paths.pi]
+# mcp_config = "profiles/pi/mcp.json" # strict JSON
+# [integrations.paths.prime-agent]
+# mcp_config = "profiles/prime/settings.json" # strict JSON; stdio transport
 # [integrations.paths.openclaw]
 # mcp_config = "profiles/openclaw.json5"
 # [integrations.paths.kilocode]

@@ -1064,10 +1064,12 @@ impl IntegrationSurface {
 
     fn accepted_fields(self) -> &'static [&'static str] {
         match self {
-            Self::ClaudeCode | Self::Codex | Self::Gemini | Self::Antigravity => {
-                &["mcp_config", "instruction_file", "skill_discovery_roots"]
-            }
-            Self::Pi | Self::PrimeAgent => &["instruction_file", "skill_discovery_roots"],
+            Self::ClaudeCode
+            | Self::Codex
+            | Self::Gemini
+            | Self::Antigravity
+            | Self::Pi
+            | Self::PrimeAgent => &["mcp_config", "instruction_file", "skill_discovery_roots"],
             Self::Opencode => &["mcp_config", "instruction_file"],
             _ => &["mcp_config"],
         }
@@ -3368,7 +3370,6 @@ mcp_config = "kilo.jsonc"
         for (surface, key, value, accepted) in [
             ("codex", "mcp_confg", "'file'", "mcp_config"),
             ("cursor", "instruction_file", "'AGENTS.md'", "mcp_config"),
-            ("pi", "mcp_config", "'file.json'", "instruction_file"),
             (
                 "opencode",
                 "skill_discovery_roots",
@@ -3413,10 +3414,13 @@ mcp_config = "kilo.jsonc"
                 "antigravity",
                 &["mcp_config", "instruction_file", "skill_discovery_roots"][..],
             ),
-            ("pi", &["instruction_file", "skill_discovery_roots"][..]),
+            (
+                "pi",
+                &["mcp_config", "instruction_file", "skill_discovery_roots"][..],
+            ),
             (
                 "prime-agent",
-                &["instruction_file", "skill_discovery_roots"][..],
+                &["mcp_config", "instruction_file", "skill_discovery_roots"][..],
             ),
             ("opencode", &["mcp_config", "instruction_file"][..]),
             ("claude-desktop", &["mcp_config"][..]),

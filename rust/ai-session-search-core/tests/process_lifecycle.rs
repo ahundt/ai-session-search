@@ -33,18 +33,11 @@ fn aise() -> Command {
         fs::write(&config, "").unwrap();
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_aise"));
-    for key in [
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "GEMINI_CLI_HOME",
-        "PI_CODING_AGENT_DIR",
-        "PRIME_AGENT_CODING_AGENT_DIR",
-        "FLATPAK_XDG_CONFIG_HOME",
-        "OPENCLAW_CONFIG_PATH",
-        "OPENCLAW_STATE_DIR",
-        "OPENCLAW_HOME",
-        "OPENCLAW_PROFILE",
-    ] {
+    for key in include_str!("../harness-environment.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
         command.env_remove(key);
     }
     command

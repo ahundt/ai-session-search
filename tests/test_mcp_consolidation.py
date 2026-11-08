@@ -16,6 +16,13 @@ import pytest
 from ai_session_search import native
 from ai_session_search._native import _run_cli_command
 
+HARNESS_ENVIRONMENT = frozenset(
+    line.strip()
+    for line in (Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/harness-environment.txt")
+    .read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+)
+
 MCP_PROCESS_TIMEOUT_SECONDS = 10
 BACKGROUND_REFRESH_TIMEOUT_SECONDS = 30
 
@@ -204,11 +211,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     return {
         **{
             key: value for key, value in os.environ.items()
-            if key not in {
-                "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR",
-                "PRIME_AGENT_CODING_AGENT_DIR", "FLATPAK_XDG_CONFIG_HOME", "OPENCLAW_CONFIG_PATH",
-                "OPENCLAW_STATE_DIR", "OPENCLAW_HOME", "OPENCLAW_PROFILE",
-            }
+            if key not in HARNESS_ENVIRONMENT
         },
         "AI_SESSION_SEARCH_CONFIG": str(config_path),
         "AI_SESSION_SEARCH_CACHE_DIR": str(tmp_path / "cache"),

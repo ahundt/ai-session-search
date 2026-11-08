@@ -50,7 +50,7 @@ const CURSOR_MCP_PATH: &str = ".cursor/mcp.json";
 const CLAUDE_USER_MCP_FILE: &str = ".claude.json";
 /// Former aise global target. Claude documents `.mcp.json` only at the project root:
 /// https://code.claude.com/docs/en/claude-directory#choose-the-right-file
-const CLAUDE_SUPERSEDED_MCP_PATH: &str = ".claude/.mcp.json";
+const CLAUDE_SUPERSEDED_MCP_FILE: &str = ".mcp.json";
 /// Gemini v0.28.0+ and Codex share this root to avoid literal-path skill conflicts:
 /// https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillManager.ts#L71-L79
 const SHARED_SKILLS_PATH: &str = ".agents/skills";
@@ -293,7 +293,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent also receive their native skill and MCP-first AGENTS.md guidance. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills (Codex and Gemini), ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
+    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent also receive their native skill and MCP-first AGENTS.md guidance. Automatic paths follow harness environment variables; [integrations.paths.<surface>] overrides MCP configs, instruction files, or skill discovery roots. Config paths replace automatic endpoints; CLI path flags add targets. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills (Codex and Gemini), ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -485,25 +485,17 @@ struct LayoutEnvironment {
 }
 
 impl LayoutEnvironment {
-    const KEYS: &'static [&'static str] = &[
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "GEMINI_CLI_HOME",
-        "PI_CODING_AGENT_DIR",
-        "PRIME_AGENT_CODING_AGENT_DIR",
-        "XDG_CONFIG_HOME",
-        "FLATPAK_XDG_CONFIG_HOME",
-        "OPENCLAW_CONFIG_PATH",
-        "OPENCLAW_STATE_DIR",
-        "OPENCLAW_HOME",
-        "OPENCLAW_PROFILE",
-    ];
+    fn keys() -> impl Iterator<Item = &'static str> {
+        include_str!("../harness-environment.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    }
 
     fn capture() -> Result<Self> {
         Ok(Self {
-            values: Self::KEYS
-                .iter()
-                .filter_map(|key| std::env::var_os(key).map(|value| ((*key).to_string(), value)))
+            values: Self::keys()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key.to_string(), value)))
                 .collect(),
             cwd: std::env::current_dir()
                 .context("resolve harness paths from the working directory")?,
@@ -639,30 +631,31 @@ impl ClientLayout {
             .get("CLAUDE_CONFIG_DIR")
             .map(|_| claude.join(".claude.json"))
             .unwrap_or_else(|| home.join(CLAUDE_USER_MCP_FILE));
-        // https://github.com/openai/codex/blob/main/codex-rs/utils/home-dir/src/lib.rs#L11-L22
+        // https://github.com/openai/codex/blob/d960b366941bf062adb4d43111e81b64507e8879/codex-rs/utils/home-dir/src/lib.rs#L13-L25
         // Empty is unset; nonempty values are literal paths, without tilde expansion.
         // https://learn.chatgpt.com/docs/build-skills (user discovery remains ~/.agents/skills).
         let codex = env.path("CODEX_HOME", home.join(".codex"));
         let agents = home.join(".agents");
-        // https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts#L20-L26
-        // https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/config/storage.ts#L50-L56
+        // https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/utils/paths.ts#L20-L26
+        // https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L50-L56
         // Truthy alternative HOME, not a replacement for .gemini; Antigravity is independent.
-        let gemini = env.path("GEMINI_CLI_HOME", home.clone()).join(".gemini");
+        let gemini_home = env.path("GEMINI_CLI_HOME", home.clone());
+        let gemini = gemini_home.join(".gemini");
         let antigravity = home.join(".gemini");
-        // https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/config.ts#L587-L593
+        // https://github.com/earendil-works/pi/blob/c23b9ec1ef12a63573d739d4c294f81a377b7d57/packages/coding-agent/src/config.ts#L629-L636
         let pi = env
             .get("PI_CODING_AGENT_DIR")
             .map(|value| env.expanded(Path::new(value), &home))
-            .unwrap_or_else(|| home.join(".pi/agent"));
-        // https://github.com/PrimeIntellect-ai/prime-agent/blob/main/prime-agent-runtime/src/rlm/mcp_base.py#L50-L59
+            .unwrap_or_else(|| home.join(PI_AGENT_DIR));
+        // https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/prime-agent-runtime/src/rlm/mcp_base.py#L56-L66
         // Named variable only: the runtime's Pi fallback is not verified for host discovery.
         let prime = env
             .get("PRIME_AGENT_CODING_AGENT_DIR")
             .map(|value| env.expanded(Path::new(value), &home))
-            .unwrap_or_else(|| home.join(".prime/agent"));
-        // https://github.com/sindresorhus/xdg-basedir/blob/main/index.js#L9-L10: || treats empty as unset.
+            .unwrap_or_else(|| home.join(PRIME_AGENT_DIR));
+        // https://github.com/sindresorhus/xdg-basedir/blob/4c068bce91132119b8590627ee51b70790551b80/index.js#L9-L10: || treats empty as unset.
         // https://github.com/anomalyco/opencode/blob/70881b2937fab1e425416659445875952730934a/packages/opencode/src/global/index.ts#L9
-        // https://github.com/Kilo-Org/kilocode/blob/main/packages/kilo-jetbrains/README.md#dev-storage-isolation
+        // https://github.com/Kilo-Org/kilocode/blob/b6a49d01c10d7e26c42a8a14b3441b7a1856c04c/packages/kilo-jetbrains/README.md#dev-storage-isolation
         let xdg = env.path("XDG_CONFIG_HOME", home.join(".config"));
         let opencode = xdg.join("opencode");
         let kilo = xdg.join("kilo");
@@ -674,7 +667,7 @@ impl ClientLayout {
         };
         let desktop = native_config.join("Claude");
         let vscode = native_config.join("Code/User");
-        // https://github.com/zed-industries/zed/blob/main/crates/paths/src/paths.rs#L111-L129
+        // https://github.com/zed-industries/zed/blob/b5cd310b3b54dfc659fcc06453e6358843dfe216/crates/paths/src/paths.rs#L121-L140
         // Linux var(Ok) includes an empty Flatpak value, unlike XDG's || semantics.
         // Windows casing remains the existing aise compatibility policy.
         let zed = match platform {
@@ -704,9 +697,9 @@ impl ClientLayout {
         } else {
             Vec::new()
         };
-        // https://github.com/openclaw/openclaw/blob/main/src/config/paths.ts#L222-L231
-        // https://github.com/openclaw/openclaw/blob/main/src/config/state-dir.ts#L20-L49
-        // https://github.com/openclaw/openclaw/blob/main/src/cli/profile-utils.ts#L4-L33
+        // https://github.com/openclaw/openclaw/blob/3651abf03ad802976e1a9a6fd46967ef96ef2e38/src/config/paths.ts#L226-L246
+        // https://github.com/openclaw/openclaw/blob/3651abf03ad802976e1a9a6fd46967ef96ef2e38/src/config/state-dir.ts#L20-L49
+        // https://github.com/openclaw/openclaw/blob/3651abf03ad802976e1a9a6fd46967ef96ef2e38/src/cli/profile-utils.ts#L4-L33
         // OpenClaw trims values, expands tilde, and resolves relative paths from invocation cwd.
         let trimmed = |key: &str| -> Option<&str> {
             env.get(key)
@@ -714,7 +707,7 @@ impl ClientLayout {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         };
-        // https://github.com/openclaw/openclaw/blob/main/packages/normalization-core/src/home-dir.ts#L3-L6
+        // https://github.com/openclaw/openclaw/blob/3651abf03ad802976e1a9a6fd46967ef96ef2e38/packages/normalization-core/src/home-dir.ts#L3-L6
         let claw_home = trimmed("OPENCLAW_HOME")
             .filter(|value| *value != "undefined" && *value != "null")
             .map(|value| env.expanded(Path::new(value), &home))
@@ -787,7 +780,7 @@ impl ClientLayout {
                 instruction,
                 skill_roots,
                 retired_skill_roots: if name == IntegrationSurface::Gemini {
-                    vec![home.join(GEMINI_RETIRED_SKILLS_PATH)]
+                    vec![gemini_home.join(GEMINI_RETIRED_SKILLS_PATH)]
                 } else {
                     Vec::new()
                 },
@@ -807,7 +800,7 @@ impl ClientLayout {
                     ConfigFormat::JsonMcpServers,
                     vec![claude.clone()],
                     vec!["claude"],
-                    vec![home.join(CLAUDE_SUPERSEDED_MCP_PATH)],
+                    vec![claude.join(CLAUDE_SUPERSEDED_MCP_FILE)],
                 )],
                 instruction(
                     "claude",
@@ -872,8 +865,9 @@ impl ClientLayout {
                     InstructionFormat::InlineBlock,
                     vec!["gemini", "agy"],
                 ),
+                // Aise shares Codex's actual-home link; config can select Gemini's relocated root.
                 vec![home.join(SHARED_SKILLS_PATH)],
-                vec![gemini],
+                vec![gemini.clone()],
                 vec!["gemini"],
             ),
             surface(
@@ -915,9 +909,9 @@ impl ClientLayout {
                 McpClient::Pi,
                 vec![mcp(
                     "pi",
-                    home.join(PI_AGENT_DIR).join(PI_MCP_FILE),
+                    pi.join(PI_MCP_FILE),
                     ConfigFormat::Pi,
-                    vec![home.join(PI_AGENT_DIR)],
+                    vec![pi.clone()],
                     vec!["pi"],
                     Vec::new(),
                 )],
@@ -937,9 +931,9 @@ impl ClientLayout {
                 McpClient::PrimeAgent,
                 vec![mcp(
                     "prime-agent",
-                    home.join(PRIME_AGENT_DIR).join(PRIME_MCP_FILE),
+                    prime.join(PRIME_MCP_FILE),
                     ConfigFormat::PrimeAgent,
-                    vec![home.join(PRIME_AGENT_DIR)],
+                    vec![prime.clone()],
                     vec!["prime-agent"],
                     Vec::new(),
                 )],
@@ -2351,14 +2345,24 @@ fn prepare_skill_discovery_uninstall(
             .unwrap_or_default();
         // Older manifests lack users. Infer only the two formerly distinct, owned links.
         if clients.is_empty() {
-            for (client, root) in [
-                ("codex", SHARED_SKILLS_PATH),
-                ("gemini", GEMINI_RETIRED_SKILLS_PATH),
-            ] {
-                if fs::read_link(layout.home.join(root).join(target.package.name))
-                    .is_ok_and(|destination| destination == target.root)
-                {
-                    clients.push(client.to_string());
+            for surface in &layout.surfaces {
+                let roots = match surface.client {
+                    McpClient::Codex => &surface.skill_roots,
+                    McpClient::Gemini => &surface.retired_skill_roots,
+                    _ => continue,
+                };
+                if roots.iter().any(|root| {
+                    fs::read_link(root.join(target.package.name))
+                        .is_ok_and(|destination| destination == target.root)
+                }) {
+                    clients.push(
+                        surface
+                            .client
+                            .to_possible_value()
+                            .unwrap()
+                            .get_name()
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -6048,6 +6052,33 @@ mod tests {
     }
 
     #[test]
+    fn captured_environment_names_match_resolver_inputs() {
+        let captured = LayoutEnvironment::keys().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            captured.len(),
+            LayoutEnvironment::keys().count(),
+            "duplicate capture name"
+        );
+        let resolver = include_str!("integrations.rs")
+            .split("fn from_environment(")
+            .nth(1)
+            .unwrap()
+            .split("let mcp =")
+            .next()
+            .unwrap();
+        let referenced = resolver
+            .split('"')
+            .filter(|token| {
+                token.contains('_') && token.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            captured, referenced,
+            "capture every harness variable the resolver reads"
+        );
+    }
+
+    #[test]
     fn environment_layout_uses_harness_roots_on_every_platform() {
         let dir = tempdir().unwrap();
         let home = dir.path().join("home");
@@ -6078,19 +6109,19 @@ mod tests {
                     McpClient::Gemini,
                     Some(".gemini/settings.json"),
                     Some(".gemini/GEMINI.md"),
-                    Some(".gemini/skills"),
+                    None,
                 ),
                 (
                     "PI_CODING_AGENT_DIR",
                     McpClient::Pi,
-                    None,
+                    Some("mcp.json"),
                     Some("AGENTS.md"),
                     Some("skills"),
                 ),
                 (
                     "PRIME_AGENT_CODING_AGENT_DIR",
                     McpClient::PrimeAgent,
-                    None,
+                    Some("settings.json"),
                     Some("AGENTS.md"),
                     Some("skills"),
                 ),
@@ -6201,6 +6232,12 @@ mod tests {
                 }
                 if client == McpClient::Gemini {
                     assert_eq!(
+                        skill_targets_for_layout(client, &layout)[0].discovery_links,
+                        [home
+                            .join(SHARED_SKILLS_PATH)
+                            .join(AI_SESSION_SEARCH_SKILL_NAME)]
+                    );
+                    assert_eq!(
                         targets_for_layout(McpClient::Antigravity, &layout)[0].path,
                         home.join(".gemini/config/mcp_config.json")
                     );
@@ -6241,10 +6278,9 @@ mod tests {
             ClientPlatform::Windows,
         ] {
             let defaults = ClientLayout::new(home.clone(), config.clone(), platform);
-            let empty = LayoutEnvironment::KEYS
-                .iter()
-                .filter(|key| **key != "FLATPAK_XDG_CONFIG_HOME")
-                .map(|key| (*key, ""))
+            let empty = LayoutEnvironment::keys()
+                .filter(|key| *key != "FLATPAK_XDG_CONFIG_HOME")
+                .map(|key| (key, ""))
                 .collect::<Vec<_>>();
             let layout =
                 ClientLayout::with_environment(home.clone(), config.clone(), platform, &empty)
@@ -6353,6 +6389,109 @@ mod tests {
     }
 
     #[test]
+    fn newly_supported_mcp_paths_follow_environment_and_config() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        for platform in [
+            ClientPlatform::Macos,
+            ClientPlatform::Linux,
+            ClientPlatform::Windows,
+        ] {
+            let layout = ClientLayout::with_environment(
+                home.clone(),
+                home.join("native"),
+                platform,
+                &[
+                    ("PI_CODING_AGENT_DIR", "~/relocated/pi"),
+                    ("PRIME_AGENT_CODING_AGENT_DIR", "~/relocated/prime"),
+                    ("CLAUDE_CONFIG_DIR", "relocated/claude"),
+                ],
+            )
+            .unwrap();
+            for (client, root, filename, format) in [
+                (McpClient::Pi, "pi", "mcp.json", ConfigFormat::Pi),
+                (
+                    McpClient::PrimeAgent,
+                    "prime",
+                    "settings.json",
+                    ConfigFormat::PrimeAgent,
+                ),
+            ] {
+                let target = targets_for_layout(client, &layout).remove(0);
+                let expected = home.join("relocated").join(root);
+                assert_eq!(target.path, expected.join(filename));
+                assert_eq!(target.detect_paths, [expected]);
+                assert_eq!(target.format, format);
+            }
+            let claude = targets_for_layout(McpClient::Claude, &layout).remove(0);
+            assert_eq!(
+                claude.superseded_paths,
+                [home.join("relocated/claude/.mcp.json")]
+            );
+            let config: IntegrationsConfig = toml::from_str("[paths.pi]\nmcp_config='~/configured/pi.json'\n[paths.prime-agent]\nmcp_config='~/configured/prime.json'\n").unwrap();
+            let configured = layout.with_config(&config).unwrap();
+            for (client, filename, format) in [
+                (McpClient::Pi, "pi.json", ConfigFormat::Pi),
+                (
+                    McpClient::PrimeAgent,
+                    "prime.json",
+                    ConfigFormat::PrimeAgent,
+                ),
+            ] {
+                let target = targets_for_layout(client, &configured).remove(0);
+                assert_eq!(target.path, home.join("configured").join(filename));
+                assert_eq!(target.format, format);
+            }
+        }
+    }
+
+    #[test]
+    fn relocated_claude_superseded_file_is_cleaned_through_each_lifecycle_action() {
+        for action in ["install", "upgrade", "uninstall"] {
+            let dir = tempdir().unwrap();
+            let home = dir.path().join("home");
+            let layout = ClientLayout::with_environment(
+                home.clone(),
+                home.join("native"),
+                ClientPlatform::Linux,
+                &[("CLAUDE_CONFIG_DIR", "relocated/claude")],
+            )
+            .unwrap();
+            let target = targets_for_layout(McpClient::Claude, &layout).remove(0);
+            let legacy = home.join("relocated/claude/.mcp.json");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(&legacy, r#"{"mcpServers":{"ai-session-search":{"command":"/custom/aise","args":["mcp","serve"]},"other":{"command":"keep"}},"keep":true}"#).unwrap();
+            match action {
+                "install" => upsert_target(&target, Path::new("/custom/aise")).unwrap(),
+                "upgrade" => {
+                    refresh_superseded_mcp_entries(
+                        &dir.path().join("receipt.json"),
+                        &layout,
+                        || panic!("preserve executable"),
+                    )
+                    .unwrap();
+                }
+                "uninstall" => {
+                    assert!(remove_target(&target).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            let old: Value = serde_json::from_str(&fs::read_to_string(&legacy).unwrap()).unwrap();
+            assert_eq!(old["mcpServers"], json!({"other":{"command":"keep"}}));
+            assert_eq!(old["keep"], true);
+            assert_eq!(
+                status_target(&target).unwrap(),
+                if action == "uninstall" {
+                    "missing"
+                } else {
+                    "configured"
+                }
+            );
+            assert!(!home.join(".claude").exists());
+        }
+    }
+
+    #[test]
     fn configured_endpoints_replace_categories_and_keep_their_native_formats() {
         let dir = tempdir().unwrap();
         let home = dir.path().join("home");
@@ -6404,12 +6543,12 @@ mod tests {
                     );
                     assert_eq!(target.path, root.join("mcp"));
                     assert_eq!(target.format, before.mcp[0].format);
-                    assert_eq!(target.detect_paths, [root.clone()]);
+                    assert_eq!(target.detect_paths, std::slice::from_ref(&root));
                     assert!(target.superseded_paths.is_empty());
                 }
                 if let Some(target) = &after.instruction {
                     assert_eq!(target.path, root.join("instructions.md"));
-                    assert_eq!(target.detect_paths, [root.clone()]);
+                    assert_eq!(target.detect_paths, std::slice::from_ref(&root));
                 }
                 if !after.skill_roots.is_empty() {
                     assert_eq!(
@@ -6457,6 +6596,14 @@ mod tests {
         let layout = automatic.with_config(&config).unwrap();
         assert!(skill_targets_for_layout(McpClient::Codex, &layout).is_empty());
         assert!(
+            all_standard_discovery_links(&layout, &AI_SESSION_SEARCH_SKILL_PACKAGE)
+                .contains(&home.join(".agents/skills/ai-session-search")),
+            "Gemini still uses the shared root"
+        );
+        let config: IntegrationsConfig =
+            toml::from_str("[paths.gemini]\nskill_discovery_roots=[]\n").unwrap();
+        let layout = layout.with_config(&config).unwrap();
+        assert!(
             !all_standard_discovery_links(&layout, &AI_SESSION_SEARCH_SKILL_PACKAGE)
                 .contains(&home.join(".agents/skills/ai-session-search"))
         );
@@ -6483,7 +6630,7 @@ mod tests {
                 "preserve the registered executable"
             ))
             .unwrap(),
-            [claw.path.clone()]
+            std::slice::from_ref(&claw.path)
         );
         assert_eq!(status_target(&claw).unwrap(), "configured");
         let value: Value = jsonc_parser::parse_to_serde_value(
@@ -6523,6 +6670,7 @@ mod tests {
             let home = dir.path().join("home");
             let codex = dir.path().join("codex work");
             let pi = dir.path().join("pi work");
+            let prime = dir.path().join("prime work");
             let layout = ClientLayout::with_environment(
                 home.clone(),
                 home.join("native"),
@@ -6530,6 +6678,7 @@ mod tests {
                 &[
                     ("CODEX_HOME", codex.to_str().unwrap()),
                     ("PI_CODING_AGENT_DIR", pi.to_str().unwrap()),
+                    ("PRIME_AGENT_CODING_AGENT_DIR", prime.to_str().unwrap()),
                 ],
             )
             .unwrap();
@@ -6540,6 +6689,8 @@ mod tests {
                 "codex".into(),
                 "--client".into(),
                 "pi".into(),
+                "--client".into(),
+                "prime-agent".into(),
                 "--no-aliases".into(),
                 "--binary".into(),
                 binary.into_os_string(),
@@ -6549,11 +6700,23 @@ mod tests {
             assert_eq!(target.path, codex.join("config.toml"));
             assert_eq!(status_target(&target).unwrap(), "configured");
             assert!(!home.join(".codex").exists());
+            for (client, path) in [
+                (McpClient::Pi, pi.join("mcp.json")),
+                (McpClient::PrimeAgent, prime.join("settings.json")),
+            ] {
+                let mcp = targets_for_layout(client, &layout).remove(0);
+                assert_eq!(mcp.path, path);
+                assert_eq!(status_target(&mcp).unwrap(), "configured");
+            }
+            assert!(!home.join(PI_AGENT_DIR).exists());
+            assert!(!home.join(PRIME_AGENT_DIR).exists());
             let args = parse_integration_args::<IntegrationStatusArgs>(vec![
                 "--client".into(),
                 "codex".into(),
                 "--client".into(),
                 "pi".into(),
+                "--client".into(),
+                "prime-agent".into(),
                 "--no-aliases".into(),
             ]);
             status_for_layout(args, &receipt, &layout).unwrap();
@@ -6588,6 +6751,21 @@ mod tests {
                 "--keep-aliases".into(),
             ]);
             uninstall_for_layout(args, &receipt, &layout).unwrap();
+            assert!(canonical.exists(), "Prime Agent still owns the package");
+            assert_eq!(
+                status_target(&targets_for_layout(McpClient::Pi, &layout)[0]).unwrap(),
+                "not configured"
+            );
+            let args = parse_integration_args::<IntegrationUninstallArgs>(vec![
+                "--client".into(),
+                "prime-agent".into(),
+                "--keep-aliases".into(),
+            ]);
+            uninstall_for_layout(args, &receipt, &layout).unwrap();
+            assert_eq!(
+                status_target(&targets_for_layout(McpClient::PrimeAgent, &layout)[0]).unwrap(),
+                "not configured"
+            );
             assert!(!canonical.exists());
         }
     }

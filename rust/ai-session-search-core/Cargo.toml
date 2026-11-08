@@ -16,6 +16,7 @@ include = [
     "NOTICE",
     "README.md",
     "config.example.toml",
+    "harness-environment.txt",
     "examples/**",
     "skills/**",
     "src/**",

@@ -403,11 +403,14 @@ skill_discovery_roots = ["shared/skills"]
 mcp_config = "/srv/openclaw/team.json5"
 ```
 
+Pi and Prime Agent accept `mcp_config` overrides for their strict-JSON MCP files.
 Config paths replace automatic endpoints; the existing repeatable CLI path flags add extra targets.
 Relative config paths resolve beside the aise config, and skill roots are parent directories under
 which aise creates an `ai-session-search` link. Install, status, uninstall, and post-upgrade refresh
-share these settings. See [configuration](configuration.md#integration-installer-destinations-and-selectors)
-for precedence, supported fields, upstream environment semantics, and historical-destination limits.
+share these settings. Gemini's shared skill link stays under the actual home unless
+`skill_discovery_roots` overrides it. See
+[configuration](configuration.md#integration-installer-destinations-and-selectors) for precedence,
+supported fields, pinned upstream evidence, and historical-destination limits.
 
 Managed client configurations and MCP initialization use the descriptive
 `ai-session-search` server identity and the human-readable title **AI Session Search**, while the
@@ -548,5 +551,5 @@ delete `$CARGO_HOME` or uv's shared cache to recover space.
   [`~/.config/opencode/opencode.json`](https://dev.opencode.ai/docs/config).
 - Kilo documents its MCP configuration in
   [`~/.config/kilo/kilo.jsonc`](https://kilo.ai/docs/automate/mcp/using-in-kilo-code), and its
-  [config loader](https://github.com/Kilo-Org/kilocode/blob/main/packages/opencode/src/kilocode/config/config.ts)
+  [config loader](https://github.com/Kilo-Org/kilocode/blob/b6a49d01c10d7e26c42a8a14b3441b7a1856c04c/packages/opencode/src/kilocode/config/config.ts)
   merges the legacy `mcp_settings.json` only inside VS Code or its daemon.
