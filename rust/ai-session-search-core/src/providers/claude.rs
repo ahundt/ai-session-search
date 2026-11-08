@@ -205,6 +205,7 @@ impl ClaudeAdapter {
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
         let mut queue_operation_counts: HashMap<String, usize> = HashMap::new();
         let mut queue_occurrences: HashMap<String, usize> = HashMap::new();
+        let queue_scope = std::cell::OnceCell::new();
         let mut requires_full_parse_for_tail = false;
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
@@ -322,7 +323,17 @@ impl ClaudeAdapter {
                                 raw_message = raw_message.with_correlation_identity(
                                     MessageCorrelationIdentity {
                                         authority: MessageCorrelationAuthority::SourceLocal,
-                                        scope: format!("claude_queue:{source_path}"),
+                                        // Verified aliases must name the same physical source.
+                                        scope: queue_scope
+                                            .get_or_init(|| {
+                                                let physical = std::fs::canonicalize(path)
+                                                    .unwrap_or_else(|_| path.to_path_buf());
+                                                format!(
+                                                    "claude_queue:{}",
+                                                    normalize_path(&physical)
+                                                )
+                                            })
+                                            .clone(),
                                         id: format!("{identity_key}#{occurrence_id}"),
                                     },
                                 );
@@ -1973,6 +1984,49 @@ mod tests {
                 .iter()
                 .all(|p| p.input_delivery_state
                     == Some(crate::models::InputDeliveryState::Submitted)));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verified_source_aliases_do_not_duplicate_identical_queue_submissions() {
+        let temp = tempdir().unwrap();
+        let real_root = temp.path().join("real");
+        std::fs::create_dir(&real_root).unwrap();
+        let alias_root = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-alias","timestamp":"2026-06-16T20:58:02Z","content":"same queued submission"}"#;
+        std::fs::write(
+            real_root.join("session.jsonl"),
+            format!("{record}\n{record}\n"),
+        )
+        .unwrap();
+        let old_adapter = ClaudeAdapter::new(vec![alias_root]);
+        let old_source = old_adapter.discover().remove(0);
+        let initial = old_adapter.parse(&old_source);
+        let new_adapter = ClaudeAdapter::new(vec![real_root]);
+        let new_source = new_adapter.discover().remove(0);
+        assert_eq!(
+            std::fs::canonicalize(&old_source.path).unwrap(),
+            std::fs::canonicalize(&new_source.path).unwrap()
+        );
+        let reparsed = new_adapter.parse(&new_source);
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.upsert_session(&initial, 1, 1).unwrap();
+        for generation in [2, 3] {
+            db.upsert_session_reconciling_sources(
+                &reparsed,
+                generation,
+                generation,
+                &[initial.session.source_path.clone()],
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                db.message_count().unwrap(),
+                2,
+                "aliases are one source; its two identical submissions remain independent"
+            );
         }
     }
 
