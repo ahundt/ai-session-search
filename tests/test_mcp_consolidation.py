@@ -345,6 +345,42 @@ def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> No
     assert not configured_database.exists()
 
 
+def test_mcp_reads_an_index_requiring_a_newer_writer(tmp_path: Path) -> None:
+    from scripts.verify_harness_discovery import environment as controlled_environment
+
+    environment = controlled_environment(tmp_path)
+    config = Path(environment["AI_SESSION_SEARCH_CONFIG"])
+    config.parent.mkdir(parents=True)
+    config.write_text("\n".join(f"[providers.{provider}]\nenabled = false" for provider in
+        ("claude", "claude-desktop", "codex", "cursor", "antigravity", "pi",
+         "prime-agent", "aistudio", "gemini-cli")), encoding="utf-8")
+    database = Path(environment["AI_SESSION_SEARCH_DATABASE"])
+    search = native.SessionSearch(database, config_path=config, cache_dir=tmp_path / "cache")
+    del search
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("update index_metadata set value=2 where key='minimum_writer_compatibility'")
+        connection.commit()
+    finally:
+        connection.close()
+    requests = "\n".join([_initialize_request(), json.dumps({
+        "jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+            "name":"get_index_status", "arguments":{},
+        },
+    }), ""])
+    result = subprocess.run(_command("mcp", "serve"), input=requests, capture_output=True,
+        text=True, env=environment, timeout=MCP_PROCESS_TIMEOUT_SECONDS, check=True)
+    responses = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [response["id"] for response in responses] == [1, 2]
+    assert not responses[1]["result"].get("isError", False), responses[1]
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("select value from index_metadata where key='minimum_writer_compatibility'").fetchone() == (2,)
+        assert connection.execute("select value from index_metadata where key='auto_reindex_completed_ms'").fetchone() is None
+    finally:
+        connection.close()
+
+
 def test_single_python_executable_terminates_under_sigterm(tmp_path: Path) -> None:
     if sys.platform == "win32":
         return

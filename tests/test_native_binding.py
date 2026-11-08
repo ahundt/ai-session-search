@@ -855,10 +855,32 @@ with sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True) as db:
         )
     )
     assert inspection == {
-        "version": 5,
+        "version": 6,
         "journal_mode": "wal",
         "objects": ["messages_trigram", "messages_trigram_vocab"],
     }
+
+
+def test_native_compatibility_reader_only_refuses_maintenance(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("\n".join(
+        f"[providers.{provider}]\nenabled = false" for provider in
+        ("claude", "claude-desktop", "codex", "cursor", "antigravity", "pi",
+         "prime-agent", "aistudio", "gemini-cli")
+    ), encoding="utf-8")
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database, config_path=config, cache_dir=tmp_path / "cache")
+    del search
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("update index_metadata set value=2 where key='minimum_writer_compatibility'")
+        connection.commit()
+    finally:
+        connection.close()
+    search = native.SessionSearch(database, config_path=config, cache_dir=tmp_path / "cache")
+    assert search.search_messages("missing", native.MessageSearchRequest(limit=1)).results == []
+    with pytest.raises(RuntimeError, match=r"minimum_writer_compatibility=2.*supports 1"):
+        search.reindex(full=True)
 
 
 def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> None:

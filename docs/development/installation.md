@@ -223,6 +223,11 @@ for the target platform, because SQLite is built from bundled C.
 
 ## Update and uninstall
 
+Before upgrading an index used by 1.0.0, **stop running aise processes (restart harnesses)**.
+The 1.0.1 generation-6 promotion blocks fresh 1.0.0 data opens, but cannot revoke a writer that
+already opened the index. Keep the promoted archive if downgrading; 1.0.0 needs a separate
+generation-5 snapshot, which omits any history archived after that snapshot.
+
 Use the same owner for installation, update, and removal. Before removing a
 global command, remove its MCP registrations while the command is still
 available:

@@ -239,6 +239,32 @@ otherwise refuse the session transaction atomically, including session identity 
 updates. Content occurrences are counted, so repeated text cannot stand in for missing evidence.
 Preserve the prior index and sources until a parser can represent the archived evidence.
 
+Index compatibility uses three independent controls. Generation 6 fences executables that predate
+archive preservation; the healthy generation 5 to 6 promotion inserts only compatibility metadata
+and updates `user_version` under the elected writer in one immediate transaction. Parser generation
+stays at 5. Layout repair, FTS rebuilding, and source backfill remain separate operations.
+
+Within generation 6, `index_metadata.minimum_reader_compatibility` and
+`index_metadata.minimum_writer_compatibility` are positive integer levels, initially 1. Missing,
+malformed, and zero levels fail closed. Raise the writer level when an older writer could damage
+evidence even though its queries still work. Raise the reader level when older queries cannot
+interpret stored meaning, including provider or enum changes. Change the generation for a contract
+that cannot be expressed by these levels, such as an incompatible physical layout. A package release
+alone does not change any of these values, and a downgrade never lowers them.
+
+A supported reader with an unsupported writer opens with SQLite `query_only`, suppresses automatic
+maintenance, and returns required/supported levels for explicit maintenance. Every durable write
+transaction rechecks compatibility after acquiring its SQLite write lock. Initialization, promotion,
+repair, and service maintenance also use the existing cross-process writer permit. SQLite owns the
+internal transactions for `VACUUM` and checkpoint statements; their compatibility check runs under
+the maintenance permit before executing them.
+
+Before upgrading an index used by 1.0.0, stop running aise processes and restart harnesses. A 1.0.0
+writer that checked readability before waiting for election can still write after promotion because
+it does not recheck inside its transaction. Generation 6 blocks fresh public 1.0.0 opens; it cannot
+revoke old handles. Keep the generation-6 archive on downgrade; use a separate generation-5 snapshot
+for 1.0.0 if needed, accepting that the snapshot omits later archive additions.
+
 ### REQ002-share-typed-contract
 
 Rust, Python, CLI, and MCP must route message search and deterministic capabilities through shared

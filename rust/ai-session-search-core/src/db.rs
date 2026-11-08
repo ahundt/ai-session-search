@@ -33,12 +33,10 @@ use crate::util::{
     stored_timestamp, UnicodeLowerNeedle, SIGMAS,
 };
 
-/// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
-/// the upstream session-only release never set SQLite's `pragma user_version`, so any pre-existing
-/// index reads as `0`. [`Db::needs_backfill`] compares this constant against `user_version` to
-/// trigger a one-time full reindex after an upgrade, without re-parsing on every run. Bump by
-/// exactly 1 in a future release whenever a schema/parse change requires existing indexes to be
-/// re-parsed; an upgrading user then reindexes once.
+/// On-disk compatibility generation, independent of package and parser versions. The upstream
+/// session-only release did not set `pragma user_version`, so its indexes read as `0`.
+/// [`Db::needs_backfill`] separately checks parser generation; compatibility promotion need not
+/// reparse sources or rebuild derived indexes.
 ///
 ///   1: message-level index — the first versioned schema, layered over the upstream session-only
 ///      schema (`sessions` + `transcripts` + a `sessions_fts` table dropped on open since 1.0.0rc2,
@@ -60,7 +58,10 @@ use crate::util::{
 ///      correlations are persisted for SQL-first behavioral analysis. Existing rows remain
 ///      `unknown` until their available provider source is reparsed; unavailable archive rows are
 ///      never guessed.
-pub const SCHEMA_VERSION: i64 = 5;
+///   6: metadata-only archive-preservation contract and positive reader/writer compatibility levels.
+pub const SCHEMA_VERSION: i64 = 6;
+pub(crate) const READER_COMPATIBILITY: i64 = 1;
+pub(crate) const WRITER_COMPATIBILITY: i64 = 1;
 const PARSER_SCHEMA_VERSION: i64 = 5;
 const PRE_FTS_PARSER_SCHEMA_VERSION: i64 = 3;
 /// Oldest on-disk generation that has every table and column required for correct reads. A
@@ -75,6 +76,7 @@ pub const MIN_READABLE_SCHEMA_VERSION: i64 = 2;
 pub(crate) enum SchemaState {
     Missing,
     Current,
+    ReaderOnly,
     Older {
         current: i64,
         required: i64,
@@ -102,6 +104,65 @@ pub(crate) enum SchemaState {
     RecoveryRequired {
         reason: String,
     },
+}
+
+/// Compatibility levels are positive SQLite integers, independent of package/parser versions.
+/// Legacy generations may omit them; generation 6 must carry both before any read or write.
+pub(crate) fn index_write_compatible(conn: &Connection) -> Result<bool> {
+    let generation: i64 = conn.query_row("pragma user_version", [], |row| row.get(0))?;
+    anyhow::ensure!((0..=SCHEMA_VERSION).contains(&generation),
+        "index uses schema generation {generation}, newer than this aise build supports ({SCHEMA_VERSION}); upgrade aise before opening it");
+    let has_metadata: bool = conn.query_row(
+        "select exists(select 1 from sqlite_schema where type='table' and name='index_metadata')",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut levels = [1, 1];
+    for (index, key) in [
+        "minimum_reader_compatibility",
+        "minimum_writer_compatibility",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let value = if has_metadata {
+            conn.query_row(
+                "select value from index_metadata where key=?1",
+                [key],
+                |row| row.get::<_, rusqlite::types::Value>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        levels[index] = match value {
+            Some(rusqlite::types::Value::Integer(level)) if level > 0 => level,
+            None if generation < 6 => 1,
+            value => {
+                let received = match value {
+                    Some(rusqlite::types::Value::Integer(level)) => level.to_string(),
+                    Some(value) => format!("{:?}", value.data_type()),
+                    None => "missing".to_string(),
+                };
+                bail!("index_metadata.{key} must be a positive integer, got {received} at schema generation {generation}; preserve the index and use a compatible aise build to restore its compatibility metadata");
+            }
+        };
+    }
+    anyhow::ensure!(levels[0] <= READER_COMPATIBILITY,
+        "index requires minimum_reader_compatibility={}, this build supports {READER_COMPATIBILITY}; upgrade aise before reading it", levels[0]);
+    Ok(levels[1] <= WRITER_COMPATIBILITY)
+}
+
+pub(crate) fn require_index_write_compatibility(conn: &Connection) -> Result<()> {
+    if !index_write_compatible(conn)? {
+        let required: i64 = conn.query_row(
+            "select value from index_metadata where key='minimum_writer_compatibility'",
+            [],
+            |row| row.get(0),
+        )?;
+        bail!("index requires minimum_writer_compatibility={required}, this build supports {WRITER_COMPATIBILITY}; queries remain available read-only; upgrade aise before maintenance");
+    }
+    Ok(())
 }
 
 impl SchemaState {
@@ -701,8 +762,40 @@ impl Db {
             implicit_index_maintenance: true,
             progress: None,
         };
-        db.init()?;
+        if !index_write_compatible(&db.conn)? {
+            db.configure_query_connection()?;
+            db.conn.pragma_update(None, "query_only", true)?;
+            let mut db = db;
+            db.implicit_index_maintenance = false;
+            return Ok(db);
+        }
+        db.configure_query_connection()?;
+        let generation = db.schema_version()?;
+        let legacy_maintenance = generation == 6 && db.conn.query_row(
+            "select not exists(select 1 from index_metadata where key=?1)
+                or exists(select 1 from sqlite_schema where name in ('idx_messages_session','idx_messages_role'))",
+            [SESSIONS_FTS_RETIRED_KEY], |row| row.get::<_, bool>(0))?;
+        if generation >= 5
+            && !legacy_maintenance
+            && crate::indexer::current_schema_layout_problem(&db.conn)?.is_none()
+        {
+            if generation == 5 {
+                db.with_open_writer_permit(path, || db.promote_compatibility())?;
+            }
+        } else {
+            db.with_open_writer_permit(path, || db.init())?;
+        }
         Ok(db)
+    }
+
+    fn configure_query_connection(&self) -> Result<()> {
+        self.conn.pragma_update(None, "foreign_keys", true)?;
+        self.conn.pragma_update(None, "temp_store", 2_i64)?;
+        self.conn
+            .pragma_update(None, "cache_size", -SQLITE_PAGE_CACHE_KIB)?;
+        self.conn
+            .pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
+        Ok(())
     }
 
     /// Open an existing index with SQLite-enforced read-only/query-only authority. This path
@@ -751,6 +844,7 @@ impl Db {
         })?;
         conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
         crate::sql_functions::register(&conn)?;
+        index_write_compatible(&conn)?;
         conn.pragma_update(None, "query_only", true)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "temp_store", 2_i64)?;
@@ -912,19 +1006,57 @@ impl Db {
         }
     }
 
+    fn with_open_writer_permit<T>(
+        &self,
+        path: &Path,
+        run: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut config = crate::config::Config::default();
+        config.index.db_path = Some(path.to_string_lossy().into_owned());
+        crate::indexer::with_index_update_lock(&config, run)
+    }
+
+    pub(crate) fn require_write_compatibility(&self) -> Result<()> {
+        require_index_write_compatibility(&self.conn)
+    }
+
+    pub(crate) fn write_compatible(&self) -> Result<bool> {
+        index_write_compatible(&self.conn)
+    }
+
     fn with_immediate_transaction<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.conn.execute_batch("begin immediate")?;
-        let result = f();
-        match result {
-            Ok(value) => {
-                self.conn.execute_batch("commit")?;
-                Ok(value)
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("rollback");
-                Err(err)
-            }
+        self.require_write_compatibility()?;
+        if !self.conn.is_autocommit() {
+            self.require_write_compatibility()?;
+            return f();
         }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        require_index_write_compatibility(&tx)?;
+        let value = f()?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Metadata-only promotion; callers hold the existing cross-process writer permit.
+    fn promote_compatibility(&self) -> Result<()> {
+        self.with_immediate_transaction(|| {
+            if self.schema_version()? != 5 {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                crate::indexer::current_schema_layout_problem(&self.conn)?.is_none(),
+                "schema generation 5 requires layout repair before compatibility promotion"
+            );
+            self.conn.execute_batch(
+                "insert into index_metadata(key,value) values
+                ('minimum_reader_compatibility',1), ('minimum_writer_compatibility',1)
+                on conflict(key) do nothing; pragma user_version=6;",
+            )?;
+            Ok(())
+        })
     }
 
     pub fn is_sqlite_busy_error(err: &anyhow::Error) -> bool {
@@ -964,31 +1096,33 @@ impl Db {
     }
 
     pub(crate) fn mark_auto_reindex_complete_at(&self, completed_at: DateTime<Utc>) -> Result<()> {
-        let completed_ms = completed_at.timestamp_millis();
-        let completed_ns = completed_at
-            .timestamp_nanos_opt()
-            .unwrap_or_else(|| completed_ms.saturating_mul(NANOSECONDS_PER_MILLISECOND));
-        let parser_contract = crate::source::provider_parse_contract_fingerprint();
-        self.conn.execute(
-            "insert into index_metadata (key, value) values
+        self.with_immediate_transaction(|| {
+            let completed_ms = completed_at.timestamp_millis();
+            let completed_ns = completed_at
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| completed_ms.saturating_mul(NANOSECONDS_PER_MILLISECOND));
+            let parser_contract = crate::source::provider_parse_contract_fingerprint();
+            self.conn.execute(
+                "insert into index_metadata (key, value) values
                  (?1, ?2), (?3, ?4), (?5, ?6), (?7, ?8), (?9, ?10), (?11, ?12)
              on conflict(key) do update set value = excluded.value",
-            params![
-                AUTO_REINDEX_COMPLETED_MS_KEY,
-                completed_ms,
-                AUTO_REINDEX_COMPLETED_NS_KEY,
-                completed_ns,
-                AUTO_REINDEX_PARSER_CONTRACT_KEYS[0],
-                parser_contract[0],
-                AUTO_REINDEX_PARSER_CONTRACT_KEYS[1],
-                parser_contract[1],
-                AUTO_REINDEX_PARSER_CONTRACT_KEYS[2],
-                parser_contract[2],
-                AUTO_REINDEX_PARSER_CONTRACT_KEYS[3],
-                parser_contract[3],
-            ],
-        )?;
-        Ok(())
+                params![
+                    AUTO_REINDEX_COMPLETED_MS_KEY,
+                    completed_ms,
+                    AUTO_REINDEX_COMPLETED_NS_KEY,
+                    completed_ns,
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[0],
+                    parser_contract[0],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[1],
+                    parser_contract[1],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[2],
+                    parser_contract[2],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[3],
+                    parser_contract[3],
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Read the timestamp and full parser-contract fingerprint in one bounded SQLite statement.
@@ -1049,17 +1183,31 @@ impl Db {
     }
 
     fn init(&self) -> Result<()> {
+        self.require_write_compatibility()?;
+        self.conn.execute_batch("pragma journal_mode=wal; pragma foreign_keys=on; pragma synchronous=normal; pragma temp_store=memory;")?;
+        self.with_immediate_transaction(|| self.init_layout())?;
+        let version = self.schema_version()?;
+        let problem = match version {
+            4 => crate::indexer::message_search_layout_problem(&self.conn)?,
+            5 | SCHEMA_VERSION => crate::indexer::current_schema_layout_problem(&self.conn)?,
+            _ => None,
+        };
+        if problem.is_some() && crate::indexer::base_data_intact(&self.conn)? {
+            self.migrate_message_search_schema_exclusive()?;
+        }
+        self.promote_compatibility()
+    }
+
+    fn init_layout(&self) -> Result<()> {
         self.conn.execute_batch(
             "
-            pragma journal_mode = wal;
-            pragma foreign_keys = on;
+
             -- Read-perf tuning for the analytics/search workload over a multi-GB index:
             -- queries like `corrections` fetch thousands of message rows by rowid (the
             -- role/ts index doesn't cover `content`), which is random I/O across the file.
             -- A larger page cache + memory-mapped reads + in-memory temp store cut that
             -- cost; synchronous=normal is the documented-safe durability level under WAL.
-            pragma synchronous = normal;
-            pragma temp_store = memory;
+
             create table if not exists sessions (
                 id text primary key,
                 provider text not null,
@@ -1311,10 +1459,9 @@ impl Db {
             // trigram hybrid that the self-heal path (see `SchemaState::RepairableLayout`) exists to
             // repair. Ordering alone previously kept this safe; the transaction also protects any
             // future reordering.
-            let tx = self.conn.unchecked_transaction()?;
-            crate::fts::install_target_message_search_indexes(&tx)?;
-            tx.execute_batch(&format!("pragma user_version = {SCHEMA_VERSION}"))?;
-            tx.commit()?;
+            crate::fts::install_target_message_search_indexes(&self.conn)?;
+            self.conn
+                .pragma_update(None, "user_version", PARSER_SCHEMA_VERSION)?;
         }
         let indexed_messages_exist: bool = self.conn.query_row(
             "select exists(select 1 from messages_fts_docsize)",
@@ -1354,25 +1501,6 @@ impl Db {
             "create virtual table if not exists messages_vocab
                  using fts5vocab('messages_fts', 'row');",
         )?;
-        // Self-enforce the v4 message-search layout on this writable open. `install_released_message_
-        // word_index` above uses `create trigger if not exists`, so on a database stamped current
-        // whose dual `messages_fts`+`messages_trigram` triggers were dropped (or whose FTS5 trigram
-        // tables are missing) it would otherwise silently leave word-only triggers and stop
-        // maintaining `messages_trigram`, making substring/fuzzy search return incomplete results
-        // with no error. Rebuilding from the intact `messages` rows here means a direct `Db::open`
-        // (embedder path) — not just `SessionSearch::open`'s coordinator — cannot leave a v4 index
-        // half-maintained. Only fires when the base rows a rebuild would read are present; the
-        // rebuild is idempotent, so a consistent layout costs one schema scan and no rebuild.
-        let schema_version = self.schema_version()?;
-        let message_search_layout_problem = match schema_version {
-            4 => crate::indexer::message_search_layout_problem(&self.conn)?,
-            SCHEMA_VERSION => crate::indexer::current_schema_layout_problem(&self.conn)?,
-            _ => None,
-        };
-        if message_search_layout_problem.is_some() && crate::indexer::base_data_intact(&self.conn)?
-        {
-            self.migrate_message_search_schema_exclusive()?;
-        }
         // Evolve an existing `files_seen` (a rebuildable cache) to carry the tail-parse
         // checkpoint columns. `create table if not exists` won't add columns to a table that
         // already exists, so add them idempotently; NULL on existing rows means "no checkpoint"
@@ -1418,8 +1546,9 @@ impl Db {
     }
 
     fn backfill_source_parse_versions(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "with source_versions as (
+        self.with_immediate_transaction(|| {
+            self.conn.execute_batch(
+                "with source_versions as (
                  select provider, source_path, min(parse_version) as parse_version
                  from sessions
                  group by provider, source_path
@@ -1433,8 +1562,9 @@ impl Db {
                    and source_versions.source_path = files_seen.source_path
              ), '')
              where parse_version = ''",
-        )?;
-        Ok(())
+            )?;
+            Ok(())
+        })
     }
 
     /// Ensure the custom [`crate::trigram_index`] base is built and current enough to serve as the
@@ -1581,6 +1711,7 @@ impl Db {
     /// large writes (the trigram rebuild, a big reindex) so the `-wal` file does not accumulate
     /// gigabytes. Best-effort: a concurrent reader can leave it partial, which is harmless.
     pub fn checkpoint_truncate(&self) -> Result<()> {
+        self.require_write_compatibility()?;
         // `wal_checkpoint` returns a row (busy, log, checkpointed); ignore it.
         self.conn
             .query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))
@@ -1612,14 +1743,16 @@ impl Db {
     /// rewrites the whole index, so it must never run on the per-command incremental path. The cost
     /// is in `messages_fts`, amortized over a rare full rebuild.
     pub fn optimize_fts(&self) -> Result<()> {
-        self.conn
-            .execute_batch("insert into messages_fts(messages_fts) values('optimize');")?;
-        if self.schema_version()? >= 4 {
-            self.conn.execute_batch(
-                "insert into messages_trigram(messages_trigram) values('optimize');",
-            )?;
-        }
-        Ok(())
+        self.with_immediate_transaction(|| {
+            self.conn
+                .execute_batch("insert into messages_fts(messages_fts) values('optimize');")?;
+            if self.schema_version()? >= 4 {
+                self.conn.execute_batch(
+                    "insert into messages_trigram(messages_trigram) values('optimize');",
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Reclaim free pages to the OS by rewriting the database file (`VACUUM`). Run AFTER
@@ -1628,13 +1761,13 @@ impl Db {
     /// an exclusive lock and needs up to ~2x the database size in free disk while it runs, and cannot
     /// run inside a transaction — `execute_batch` runs it in autocommit.
     pub fn vacuum(&self) -> Result<()> {
+        self.require_write_compatibility()?;
         self.conn.execute_batch("vacuum")?;
         Ok(())
     }
 
-    /// True when the on-disk `user_version` is behind [`SCHEMA_VERSION`], i.e. a new
-    /// schema generation has shipped and a one-time full reindex is needed to backfill
-    /// new tables/columns (the old rows were skipped by incremental indexing).
+    /// True when parser-derived rows need backfill. Generation 5 to 6 changes only compatibility
+    /// metadata and never requests source reads.
     pub fn needs_backfill(&self) -> Result<bool> {
         Ok(self.schema_version()? < PARSER_SCHEMA_VERSION)
     }
@@ -1643,7 +1776,7 @@ impl Db {
     /// are refreshed. Future schema generations fail closed because compatibility is unknown.
     pub fn schema_is_readable(&self) -> Result<bool> {
         Ok(match self.schema_state()? {
-            SchemaState::Current => true,
+            SchemaState::Current | SchemaState::ReaderOnly => true,
             SchemaState::Older { current, .. } => current >= MIN_READABLE_SCHEMA_VERSION,
             SchemaState::Missing
             | SchemaState::Newer { .. }
@@ -1656,11 +1789,14 @@ impl Db {
     pub(crate) fn schema_state(&self) -> Result<SchemaState> {
         match SchemaState::from_version(self.schema_version()?) {
             SchemaState::Current => {
+                let writable = self.write_compatible()?;
                 let providers = unknown_index_providers(&self.conn)?;
-                Ok(if providers.is_empty() {
-                    SchemaState::Current
-                } else {
+                Ok(if !providers.is_empty() {
                     SchemaState::UnknownProviders { providers }
+                } else if !writable {
+                    SchemaState::ReaderOnly
+                } else {
+                    SchemaState::Current
                 })
             }
             other => Ok(other),
@@ -1681,7 +1817,8 @@ impl Db {
         // Idempotent: if the database already owns the current layout there is nothing to rebuild.
         // This lets `init()` self-enforce a broken v4 open while a caller that ALSO requests the heal
         // (SessionSearch::open's coordinator) becomes a cheap no-op instead of a second full rebuild.
-        if schema_version == SCHEMA_VERSION
+        self.require_write_compatibility()?;
+        if schema_version >= 5
             && crate::indexer::current_schema_layout_problem(&self.conn)?.is_none()
         {
             return Ok(());
@@ -1707,9 +1844,10 @@ impl Db {
         let target_version = if schema_version == 4 {
             4
         } else {
-            SCHEMA_VERSION
+            schema_version.max(PARSER_SCHEMA_VERSION)
         };
-        crate::fts::migrate_message_search_schema_offline(&self.conn, target_version)
+        crate::fts::migrate_message_search_schema_offline(&self.conn, target_version)?;
+        self.promote_compatibility()
     }
 
     /// Stamp parser-derived rows after a full reindex without bypassing the schema-4 FTS gate.
@@ -1720,13 +1858,19 @@ impl Db {
     /// objects and stamps schema 5. This two-stage rule prevents a current stamp over missing
     /// trigram objects.
     pub fn mark_schema_current(&self) -> Result<()> {
-        let target = if self.schema_version()? >= 4 {
-            PARSER_SCHEMA_VERSION
-        } else {
-            PRE_FTS_PARSER_SCHEMA_VERSION
-        };
-        self.conn
-            .execute_batch(&format!("pragma user_version = {target}"))?;
+        self.with_immediate_transaction(|| {
+            let current = self.schema_version()?;
+            let target = if current >= 4 {
+                current.max(PARSER_SCHEMA_VERSION)
+            } else {
+                PRE_FTS_PARSER_SCHEMA_VERSION
+            };
+            self.conn.pragma_update(None, "user_version", target)?;
+            Ok(())
+        })?;
+        if self.schema_version()? >= 5 {
+            self.promote_compatibility()?;
+        }
         Ok(())
     }
 
@@ -1753,16 +1897,18 @@ impl Db {
     }
 
     pub(crate) fn clear_trigram_base(&self) -> Result<()> {
-        if self.schema_version()? >= 4 {
-            return Ok(());
-        }
-        self.conn.execute_batch(
-            "
+        self.with_immediate_transaction(|| {
+            if self.schema_version()? >= 4 {
+                return Ok(());
+            }
+            self.conn.execute_batch(
+                "
             delete from trigram_postings;
             delete from trigram_meta;
             ",
-        )?;
-        Ok(())
+            )?;
+            Ok(())
+        })
     }
 
     pub fn is_file_current(
@@ -1920,6 +2066,7 @@ impl Db {
         allow_append_optimization: bool,
         source_aliases: &[String],
     ) -> Result<()> {
+        self.require_write_compatibility()?;
         // IMMEDIATE takes the write lock before the first read, so another writer committing
         // between this transaction's reads and its first write cannot fail the upgrade with
         // SQLITE_BUSY, which the busy handler does not retry for a deferred transaction.
@@ -1927,6 +2074,7 @@ impl Db {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        require_index_write_compatibility(&tx)?;
         let session = &parsed.session;
         // Every path this source may have been indexed under: its own and its verified aliases.
         let source_paths: Vec<&str> = std::iter::once(session.source_path.as_str())
@@ -2149,8 +2297,9 @@ impl Db {
     /// Cost: one pass over `user` rows with a leading-prefix test, the same scan the former
     /// delete made, plus one row write per reclassified row.
     pub fn classify_injected_messages(&self) -> Result<usize> {
-        let updated = self.conn.execute(
-            "update messages set kind = 'harness_notice', authorship = 'harness' \
+        self.with_immediate_transaction(|| {
+            let updated = self.conn.execute(
+                "update messages set kind = 'harness_notice', authorship = 'harness' \
              where role = 'user' and authorship <> 'mixed' \
                and (kind <> 'harness_notice' or authorship <> 'harness') and (\
                  content like '<local-command-stdout>%' \
@@ -2158,9 +2307,10 @@ impl Db {
               or content like '<local-command-caveat>%' \
               or content like '<environment_context>%' \
               or content like '<turn_aborted>%')",
-            [],
-        )?;
-        Ok(updated)
+                [],
+            )?;
+            Ok(updated)
+        })
     }
 
     /// Former name of [`Db::classify_injected_messages`], which it now calls.
@@ -2215,17 +2365,19 @@ impl Db {
         tail_byte_offset: i64,
         prefix_fingerprint: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "update files_seen set tail_byte_offset = ?3, prefix_fingerprint = ?4
+        self.with_immediate_transaction(|| {
+            self.conn.execute(
+                "update files_seen set tail_byte_offset = ?3, prefix_fingerprint = ?4
              where provider = ?1 and source_path = ?2",
-            params![
-                provider.as_str(),
-                source_path,
-                tail_byte_offset,
-                prefix_fingerprint
-            ],
-        )?;
-        Ok(())
+                params![
+                    provider.as_str(),
+                    source_path,
+                    tail_byte_offset,
+                    prefix_fingerprint
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Append ONLY the new rows from an incremental tail parse to an already-indexed session, in
@@ -2243,6 +2395,7 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
+        self.require_write_compatibility()?;
         let session = &tail.session;
         // IMMEDIATE for the same reason as `upsert_session_with_mode`: the reads below precede
         // the first write.
@@ -2251,6 +2404,7 @@ impl Db {
             rusqlite::TransactionBehavior::Immediate,
         )?;
 
+        require_index_write_compatibility(&tx)?;
         // New messages and edits continue after the highest stored seq. Stored seqs can have
         // gaps (rows deleted without renumbering), so the row count is not the next free seq:
         // numbering from it reused existing seqs and left one (session_id, seq) naming two
@@ -3749,6 +3903,7 @@ impl Db {
     /// older aise gains it once, under the cross-process writer election, while WAL readers keep
     /// serving. Until then every count that needs it degrades to the row scan, never to an error.
     pub(crate) fn ensure_message_kind_index(&self) -> Result<bool> {
+        self.with_immediate_transaction(|| {
         if self.message_kind_index_exists()? {
             return Ok(false);
         }
@@ -3767,6 +3922,7 @@ impl Db {
             started.elapsed()
         ));
         Ok(true)
+            })
     }
 
     /// Determine whether the structurally filtered corpus reaches `threshold` without counting
@@ -13219,6 +13375,210 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_promotion_is_metadata_only_and_never_lowers_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let messages: Vec<String> = (0..5_000)
+            .map(|n| format!("generated archive message {n}"))
+            .collect();
+        db.replace_session(
+            &parsed_with_messages(
+                "claude:s1",
+                &messages.iter().map(String::as_str).collect::<Vec<_>>(),
+            ),
+            1,
+            100,
+        )
+        .unwrap();
+        db.conn.execute_batch("delete from index_metadata where key in ('minimum_reader_compatibility', 'minimum_writer_compatibility'); pragma user_version=5;").unwrap();
+        db.checkpoint_truncate().unwrap();
+        let counts = |conn: &Connection| -> (i64, i64, i64) {
+            conn.query_row(
+            "select (select count(*) from messages), (select count(*) from messages_fts_docsize), (select count(*) from messages_trigram_terms)",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+        };
+        let before = counts(&db.conn);
+        drop(db);
+        let started = Instant::now();
+        let promoted = Db::open(&path).unwrap();
+        let elapsed = started.elapsed();
+        let wal_bytes =
+            fs::metadata(path.with_extension("db-wal")).map_or(0, |metadata| metadata.len());
+        eprintln!(
+            "generation-5-to-6 promotion: messages=5000 elapsed_us={} wal_bytes={wal_bytes}",
+            elapsed.as_micros()
+        );
+        assert_eq!(promoted.schema_version().unwrap(), 6);
+        assert_eq!(counts(&promoted.conn), before);
+        assert_eq!(
+            promoted.conn.total_changes(),
+            2,
+            "only compatibility metadata may be inserted; source path is nonexistent"
+        );
+        promoted.mark_schema_current().unwrap();
+        assert_eq!(promoted.schema_version().unwrap(), 6);
+        assert!(!promoted.needs_backfill().unwrap());
+    }
+
+    #[test]
+    fn compatibility_future_low_level_open_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("create table future_evidence(value); insert into future_evidence values ('saved'); pragma user_version=7;").unwrap();
+        drop(conn);
+        let before = fs::read(&path).unwrap();
+        let error = Db::open(&path)
+            .err()
+            .expect("future generation must refuse")
+            .to_string();
+        assert!(error.contains("generation 7"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn compatibility_reader_only_and_long_lived_writers_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = Db::open(&path).unwrap();
+        writer
+            .replace_session(&parsed_with_messages("claude:s1", &["saved"]), 1, 100)
+            .unwrap();
+        writer.conn.execute_batch("insert or replace into index_metadata values ('minimum_writer_compatibility', 2); pragma user_version=6;").unwrap();
+        let reader = Db::open(&path).unwrap();
+        assert_eq!(reader.message_count().unwrap(), 1);
+        assert!(reader
+            .conn
+            .query_row("pragma query_only", [], |r| r.get::<_, bool>(0))
+            .unwrap());
+        assert!(!reader.implicit_index_maintenance);
+        let tail = crate::tail::TailParse {
+            new_messages: Vec::new(),
+            new_file_edits: Vec::new(),
+            session: parsed_with_messages("claude:s1", &["saved"]).session,
+            new_transcript: String::new(),
+            new_tail_offset: 0,
+            new_fingerprint: String::new(),
+        };
+        for db in [&reader, &writer] {
+            for result in [
+                db.init(),
+                db.promote_compatibility(),
+                db.clear_all(),
+                db.clear_trigram_base(),
+                db.backfill_source_parse_versions(),
+                db.migrate_message_search_schema_exclusive(),
+                db.ensure_message_kind_index().map(|_| ()),
+                db.append_tail(&tail, 2, 101),
+                db.mark_auto_reindex_complete(),
+                db.mark_schema_current(),
+                db.replace_session(&parsed_with_messages("claude:s1", &["replacement"]), 2, 101),
+                db.set_file_checkpoint(Provider::Claude, "/x", 1, "fingerprint"),
+                db.classify_injected_messages().map(|_| ()),
+                db.optimize_fts(),
+                db.vacuum(),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("minimum_writer_compatibility")
+                        && error.contains("2")
+                        && error.contains("1"),
+                    "{error}"
+                );
+            }
+        }
+        assert_eq!(reader.message_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn compatibility_generation_six_requires_valid_reader_and_writer_levels() {
+        for key in [
+            "minimum_reader_compatibility",
+            "minimum_writer_compatibility",
+        ] {
+            for value in [
+                None,
+                Some("0"),
+                Some("'malformed'"),
+                Some("-1"),
+                Some("zeroblob(4096)"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("index.db");
+                let db = Db::open(&path).unwrap();
+                db.conn.execute_batch("pragma user_version=6; insert or replace into index_metadata values ('minimum_reader_compatibility',1), ('minimum_writer_compatibility',1);").unwrap();
+                db.conn
+                    .execute("delete from index_metadata where key=?1", [key])
+                    .unwrap();
+                if let Some(value) = value {
+                    db.conn
+                        .execute_batch(&format!(
+                            "insert into index_metadata values ('{key}',{value})"
+                        ))
+                        .unwrap();
+                }
+                let error = Db::open(&path)
+                    .err()
+                    .expect("invalid level must refuse")
+                    .to_string();
+                assert!(error.contains(key), "{error}");
+                assert!(error.len() < 512, "invalid metadata errors must be bounded");
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_unsupported_reader_level_refuses_even_read_only_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "update index_metadata set value=2 where key='minimum_reader_compatibility'",
+            )
+            .unwrap();
+        let error = Db::open_existing_read_only_with_threads(&path, 100, NonZeroUsize::MIN)
+            .err()
+            .expect("unsupported reader must refuse")
+            .to_string();
+        assert!(
+            error.contains("minimum_reader_compatibility=2") && error.contains("supports 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn compatibility_prechecked_old_writer_can_still_write_after_promotion() {
+        // v1.0.0 checks readability before election and does not recheck inside the transaction.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        db.replace_session(&parsed_with_messages("claude:s1", &["archived"]), 1, 1)
+            .unwrap();
+        db.conn.execute_batch("pragma user_version=5; delete from index_metadata where key in ('minimum_reader_compatibility','minimum_writer_compatibility')").unwrap();
+        let old = Connection::open(&path).unwrap();
+        assert_eq!(
+            old.query_row("pragma user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        let promoted = Db::open(&path).unwrap();
+        assert_eq!(promoted.schema_version().unwrap(), 6);
+        promoted
+            .with_open_writer_permit(&path, || {
+                old.execute("delete from messages where session_id=?1", ["claude:s1"])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            promoted.message_count().unwrap(),
+            0,
+            "the stamp cannot revoke an already-open old writer; stop old processes before cutover"
+        );
+    }
+
+    #[test]
     fn mark_schema_current_preserves_the_v4_fts_gate_before_promoting_schema_5() {
         // Recurrence guard for the v4-stamped-but-broken hybrid schema. `mark_schema_current` runs
         // on the reindex fast path; it must NEVER stamp SCHEMA_VERSION over a database that has not
@@ -14404,7 +14764,9 @@ mod tests {
             parsed.session.provider_session_id = format!("allocation-{index}");
             parsed.session.source_path = format!("/allocation/{index}.jsonl");
             // Explicit fixture deletion creates free pages; parser upgrades cannot erase archives.
-            db.conn.execute("delete from sessions where id = ?1", [&id]).unwrap();
+            db.conn
+                .execute("delete from sessions where id = ?1", [&id])
+                .unwrap();
             db.replace_session(&parsed, 10 + index, 10 + index).unwrap();
         }
         db.optimize_fts().unwrap();

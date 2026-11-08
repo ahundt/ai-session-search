@@ -118,6 +118,10 @@ pub(crate) fn run(
     let mut elected = false;
 
     let result = (|| {
+        // A cold open initializes under the writer permit too; a known contender must not wait for it.
+        if update_lock_is_held(config)? {
+            return Ok(BackgroundRefreshOutcome::SkippedBusy);
+        }
         let app = SessionSearch::open(config.clone()).context("could not open the index")?;
         report.schema_generation_before = Some(app.database().schema_version()?);
         let elected_report = report.clone();
@@ -574,6 +578,7 @@ mod tests {
             failure_kind: None,
         };
         write_best_effort(&config, &active_report);
+        crate::db::Db::open(&config.db_path()).unwrap();
 
         let lock_path = crate::indexer::index_update_lock_path(&config.db_path());
         let mut lock = crate::indexer::open_index_update_lock(&lock_path).unwrap();
@@ -615,6 +620,25 @@ mod tests {
             "a contender that never owned the writer permit must not publish a receipt"
         );
         drop(guard);
+    }
+
+    #[test]
+    fn a_cold_refresh_contender_does_not_initialize_under_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().into_owned());
+        let mut lock = crate::indexer::open_index_update_lock(
+            &crate::indexer::index_update_lock_path(&config.db_path()),
+        )
+        .unwrap();
+        let _guard = lock.try_write().unwrap();
+        assert_eq!(
+            run(&config, BackgroundRefreshOrigin::Mcp, &|| false).unwrap(),
+            BackgroundRefreshOutcome::SkippedBusy
+        );
+        assert!(!config.db_path().exists());
+        assert!(!report_path(&config).exists());
     }
 
     #[test]
