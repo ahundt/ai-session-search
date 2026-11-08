@@ -106,6 +106,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    timestamp changed but whose content did not now takes 27 ms on a 20,000-message session,
    down from 1.65 s.
 
+### For contributors
+
+1. `Cargo.lock` takes the newest release of each dependency that is semver-compatible, builds
+   with the minimum supported Rust (1.88), and is at least 7 days old as of November 7, 2026,
+   the cooldown `.github/dependabot.yml` applies. Among them: `rmcp` 3.4.0 to 3.8.0, `tokio`
+   1.53.3 to 1.54.1, `pyo3` 0.29.2 to 0.29.3, `ureq` 3.4.2 to 3.5.0, and `uuid` 1.24.0 to
+   1.26.1. `jiff` stays at 0.2.39, which `main` already uses. `pyo3` 0.30 and `rusqlite` 0.41
+   fall outside the current version requirements; each needs its own change.
+2. The workspace uses Cargo's resolver 3, so `cargo update` selects only versions that build
+   with the declared `rust-version`.
+3. `dirs` 6.0.0 to 7.0.0. Its only source change moves Windows `preference_dir()` from Local to
+   Roaming AppData; aise calls `home_dir`, `config_dir`, `data_dir`, `data_local_dir`, and
+   `cache_dir`, which return the same paths, so existing configuration and indexes stay where
+   they are.
+4. `./run_ci_local.sh` now runs the required MSRV library-test build and API-consumer check
+   when the workspace's minimum Rust toolchain is installed. Otherwise it reports named skips
+   with the exact install command; contract tests keep the commands aligned with CI.
+
 ## [1.0.0] - 2026-11-05
 
 1.0.0 is the first stable release of AI Session Search. `aise` parses nine AI coding-agent session
