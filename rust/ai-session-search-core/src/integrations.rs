@@ -6378,6 +6378,8 @@ mod tests {
         );
     }
 
+    // Only the unix-gated layout test calls this; Windows CI denies dead code.
+    #[cfg(unix)]
     fn parse_integration_args<T: clap::Args>(arguments: Vec<std::ffi::OsString>) -> T {
         let matches = T::augment_args(clap::Command::new("aise"))
             .try_get_matches_from(
