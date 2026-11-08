@@ -3571,7 +3571,8 @@ mod tests {
         assert!(install_help.contains("run `aise doctor` to check readiness and freshness"));
         assert!(install_help.contains("pi, prime-agent"), "{install_help}");
         assert!(
-            install_help.contains("Pi and Prime Agent instead receive their native skill"),
+            install_help
+                .contains("Pi and Prime Agent also receive their native skill and MCP-first"),
             "{install_help}"
         );
 
