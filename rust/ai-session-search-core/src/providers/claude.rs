@@ -2721,8 +2721,8 @@ mod tests {
         use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
-        let root = temp.path().join("Claude/local-agent-mode-sessions");
-        let parent = root.join("install-id/account-id");
+        let root = temp.path().join("Claude").join("local-agent-mode-sessions");
+        let parent = root.join("install-id").join("account-id");
         let session_dir = parent.join("local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
