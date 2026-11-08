@@ -2468,7 +2468,7 @@ mod tests {
             )
             .unwrap();
         conn.execute(
-            "update messages set content = 'STALE_PREFIX' where session_id = 'claude:s1'",
+            "update messages set tool_name = 'STALE_PREFIX' where session_id = 'claude:s1'",
             [],
         )
         .unwrap();
@@ -2542,5 +2542,16 @@ mod tests {
             .map(|message| message.content)
             .collect::<Vec<_>>();
         assert_eq!(contents, ["first prompt", "second reply"]);
+        let tool: Option<String> = conn
+            .query_row(
+                "select tool_name from messages where session_id='claude:s1' and seq=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tool, None,
+            "the full parse must correct stale prefix metadata"
+        );
     }
 }

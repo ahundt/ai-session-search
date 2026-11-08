@@ -232,6 +232,13 @@ Installation, migration, repair, update, and uninstall operations must preserve 
 indexes, configuration, user edits, unrelated client settings, and uncommitted repository work.
 Destructive cleanup requires an exact target and explicit authorization.
 
+The index is a session-history archive. A source shrink or rewrite under the same parser retains
+stored messages and file edits absent from the new parse. A parser transition may correct message
+metadata only when every stored content occurrence and file-edit operation remains represented;
+otherwise refuse the session transaction atomically, including session identity and checkpoint
+updates. Content occurrences are counted, so repeated text cannot stand in for missing evidence.
+Preserve the prior index and sources until a parser can represent the archived evidence.
+
 ### REQ002-share-typed-contract
 
 Rust, Python, CLI, and MCP must route message search and deterministic capabilities through shared

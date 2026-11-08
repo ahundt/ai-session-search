@@ -98,8 +98,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    - a source that gets a new session id moves its rows to that id, skipping rows the id
      already holds. They used to be deleted with the old id.
 
-   A new parser version still replaces the session, because it may render the same message
-   differently. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
+   A new parser version may correct metadata when every stored message and file edit remains
+   represented. If the parse lacks archived evidence, aise refuses the session update and keeps
+   its prior transaction intact. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
    avoids took 1.65 s.
 
 8. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout

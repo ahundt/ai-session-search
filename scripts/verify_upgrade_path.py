@@ -39,6 +39,7 @@ import pathlib
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -169,8 +170,93 @@ def _client_arguments(clients: Sequence[str]) -> list[str]:
     return [argument for client in clients for argument in ("--client", client)]
 
 
+def archive_evidence(database: sqlite3.Connection) -> dict[str, bool]:
+    """Read the four synthetic archive markers after destructive source changes."""
+    messages = {row[0] for row in database.execute("select content from messages")}
+    return {
+        "shrink": "alpha" in messages,
+        "rewrite": "beta" in messages,
+        "file_edits": database.execute(
+            "select exists(select 1 from file_edits where new_content = 'saved file')"
+        ).fetchone()[0] == 1,
+        "injected_rows": "<turn_aborted>archive" in messages,
+    }
+
+
+def _archive_writer_evidence(command: Sequence[str], home: pathlib.Path) -> dict[str, bool]:
+    home.mkdir()
+    environment = isolated_environment(home)
+    config = pathlib.Path(environment["AI_SESSION_SEARCH_CONFIG"])
+    config.parent.mkdir(parents=True, exist_ok=True)
+    sources = home / "sources"
+    sources.mkdir()
+    config.write_text(
+        f"[providers.claude]\nenabled = true\npaths = [{json.dumps(str(sources))}]\n" +
+        "\n".join(f"[providers.{provider}]\nenabled = false" for provider in
+                  ("claude-desktop", "codex", "cursor", "antigravity", "pi",
+                   "prime-agent", "aistudio", "gemini-cli")), encoding="utf-8",
+    )
+    source = sources / "archive.jsonl"
+
+    def write_source(texts: Sequence[str], *, edit: bool = False) -> None:
+        records = [{"type": "user", "sessionId": "archive", "message": {
+            "role": "user", "content": [{"type": "text", "text": text}],
+        }} for text in texts]
+        if edit:
+            records.append({"type": "assistant", "sessionId": "archive", "message": {
+                "role": "assistant", "content": [{"type": "tool_use", "id": "write",
+                    "name": "Write", "input": {"file_path": str(home / "saved.txt"),
+                                                "content": "saved file"}}],
+            }})
+            records.append({"type": "user", "sessionId": "archive", "message": {
+                "role": "user", "content": [{"type": "tool_result", "tool_use_id": "write",
+                    "is_error": False, "content": "written"}],
+            }})
+        source.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    def reindex() -> None:
+        result = _run([*command, "reindex", "--full"], environment)
+        if result.returncode:
+            raise UpgradeCheckUnavailable(f"archive reindex failed: {result.stderr.strip()}")
+
+    write_source(["alpha", "beta"], edit=True)
+    reindex()
+    with sqlite3.connect(environment["AI_SESSION_SEARCH_DATABASE"]) as database:
+        database.execute("insert into messages(session_id, provider, seq, role, content) "
+                         "select id, provider, 99, 'user', '<turn_aborted>archive' from sessions limit 1")
+        seeded = archive_evidence(database)
+        if not all(seeded.values()):
+            raise UpgradeCheckUnavailable(f"archive writer did not seed every archive marker: {seeded}")
+    write_source(["beta"])
+    reindex()
+    write_source(["gamma"])
+    reindex()
+    with sqlite3.connect(environment["AI_SESSION_SEARCH_DATABASE"]) as database:
+        return archive_evidence(database)
+
+
+def check_archive_write_paths(old: Sequence[str], executable: pathlib.Path) -> list[str]:
+    """Compare historical and candidate writers in independent disposable indexes."""
+    if os.name == "nt":
+        raise UpgradeCheckUnavailable("historical archive writers require a disposable Unix home")
+    problems = []
+    with tempfile.TemporaryDirectory(prefix="aise-archive-") as directory:
+        for label, command, expected in (("1.0.0", old, False), ("candidate", [str(executable)], True)):
+            evidence = _archive_writer_evidence(command, pathlib.Path(directory).resolve() / label)
+            for name, retained in evidence.items():
+                if retained != expected:
+                    problems.append(f"{label} {name}: retained={retained}, expected {expected}")
+    return problems
+
+
 def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
     """Return the problems an upgrade from ``previous`` to ``executable`` leaves behind."""
+    if previous == "1.0.0":
+        archive_problems = check_archive_write_paths(
+            ["uvx", "--quiet", "--from", "ai-session-search==1.0.0", "aise"], executable,
+        )
+        if archive_problems:
+            return archive_problems
     home = pathlib.Path(tempfile.mkdtemp(prefix="aise-upgrade-")).resolve()
     cleanup = True
     try:
