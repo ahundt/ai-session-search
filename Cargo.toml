@@ -4,7 +4,7 @@ members = [
     "rust/ai-session-search-python",
     "tests/rust-api-consumer",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2021"
