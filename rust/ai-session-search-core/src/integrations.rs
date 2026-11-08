@@ -51,7 +51,7 @@ const CLAUDE_USER_MCP_FILE: &str = ".claude.json";
 /// Former aise global target. Claude documents `.mcp.json` only at the project root:
 /// https://code.claude.com/docs/en/claude-directory#choose-the-right-file
 const CLAUDE_SUPERSEDED_MCP_FILE: &str = ".mcp.json";
-/// Gemini v0.28.0+ and Codex share this root to avoid literal-path skill conflicts:
+/// Gemini v0.28.0+ and Codex share this root by default to avoid literal-path skill conflicts:
 /// https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillManager.ts#L71-L79
 const SHARED_SKILLS_PATH: &str = ".agents/skills";
 /// Former aise Gemini root, still read alongside the shared root:
@@ -637,8 +637,8 @@ impl ClientLayout {
         let codex = env.path("CODEX_HOME", home.join(".codex"));
         let agents = home.join(".agents");
         // https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/utils/paths.ts#L20-L26
-        // https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L50-L56
-        // Truthy alternative HOME, not a replacement for .gemini; Antigravity is independent.
+        // https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L54-L69
+        // Alternative home for both .gemini and .agents; Antigravity is independent.
         let gemini_home = env.path("GEMINI_CLI_HOME", home.clone());
         let gemini = gemini_home.join(".gemini");
         let antigravity = home.join(".gemini");
@@ -865,8 +865,7 @@ impl ClientLayout {
                     InstructionFormat::InlineBlock,
                     vec!["gemini", "agy"],
                 ),
-                // Aise shares Codex's actual-home link; config can select Gemini's relocated root.
-                vec![home.join(SHARED_SKILLS_PATH)],
+                vec![gemini_home.join(SHARED_SKILLS_PATH)],
                 vec![gemini.clone()],
                 vec!["gemini"],
             ),
@@ -6109,7 +6108,7 @@ mod tests {
                     McpClient::Gemini,
                     Some(".gemini/settings.json"),
                     Some(".gemini/GEMINI.md"),
-                    None,
+                    Some(".agents/skills"),
                 ),
                 (
                     "PI_CODING_AGENT_DIR",
@@ -6233,7 +6232,7 @@ mod tests {
                 if client == McpClient::Gemini {
                     assert_eq!(
                         skill_targets_for_layout(client, &layout)[0].discovery_links,
-                        [home
+                        [redirected
                             .join(SHARED_SKILLS_PATH)
                             .join(AI_SESSION_SEARCH_SKILL_NAME)]
                     );
@@ -6581,6 +6580,13 @@ mod tests {
                 .iter()
                 .flat_map(|target| &target.discovery_links)
                 .any(|path| path == &home.join("configured/codex/skills/ai-session-search")));
+            assert_eq!(
+                skill_targets_for_layout(McpClient::Gemini, &layout)[0].discovery_links,
+                [
+                    home.join("configured/gemini/skills/ai-session-search"),
+                    home.join("shared/gemini/ai-session-search")
+                ]
+            );
             arguments
                 .json_mcp_configs
                 .push(home.join("configured/codex/unused/../mcp"));
@@ -10289,6 +10295,114 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn gemini_redirected_links_survive_other_harness_uninstall() {
+        for legacy_manifest in [false, true] {
+            for removed_client in [McpClient::Gemini, McpClient::Codex] {
+                let dir = tempdir().unwrap();
+                let home = dir.path().join("home");
+                let gemini_home = dir.path().join("gemini-home");
+                let layout = ClientLayout::with_environment(
+                    home.clone(),
+                    dir.path().join("config"),
+                    ClientPlatform::Linux,
+                    &[("GEMINI_CLI_HOME", gemini_home.to_str().unwrap())],
+                )
+                .unwrap();
+                let receipt = home.join(".ai-session-search/transaction.json");
+                let codex = skill_targets_for_layout(McpClient::Codex, &layout);
+                let gemini = skill_targets_for_layout(McpClient::Gemini, &layout);
+                let codex_link = home.join(".agents/skills/ai-session-search");
+                let gemini_link = gemini_home.join(".agents/skills/ai-session-search");
+                assert_eq!(codex[0].discovery_links, std::slice::from_ref(&codex_link));
+                assert_eq!(
+                    gemini[0].discovery_links,
+                    std::slice::from_ref(&gemini_link)
+                );
+                assert_eq!(codex[0].discovery_clients, ["codex"]);
+                assert_eq!(gemini[0].discovery_clients, ["gemini"]);
+                let old = gemini_home.join(".gemini/skills/ai-session-search");
+                fs::create_dir_all(old.parent().unwrap()).unwrap();
+                create_directory_symlink(&gemini[0].root, &old).unwrap();
+                install_test_skills(&codex, &receipt);
+                install_test_skills(&gemini, &receipt);
+                assert!(fs::symlink_metadata(&old).is_err());
+                for link in [&codex_link, &gemini_link] {
+                    assert_eq!(fs::read_link(link).unwrap(), gemini[0].root);
+                }
+                let manifest_path = crate::skill_manifest::manifest_path(&receipt);
+                let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+                assert_eq!(
+                    manifest
+                        .installation(&gemini[0].root)
+                        .unwrap()
+                        .discovery_clients,
+                    ["codex", "gemini"]
+                );
+                if legacy_manifest {
+                    let mut json: Value =
+                        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+                    for installation in json["installations"].as_array_mut().unwrap() {
+                        installation
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("discovery_clients");
+                    }
+                    fs::write(&manifest_path, serde_json::to_string(&json).unwrap()).unwrap();
+                }
+                let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+                let (selected, removed_link, retained_link, retained_client) =
+                    if removed_client == McpClient::Gemini {
+                        (&gemini, &gemini_link, &codex_link, "codex")
+                    } else {
+                        (&codex, &codex_link, &gemini_link, "gemini")
+                    };
+                let removal =
+                    prepare_skill_discovery_uninstall(selected, &layout, &manifest).unwrap();
+                assert!(removal.file_targets.is_empty());
+                assert_eq!(
+                    removal.links_to_remove,
+                    [(removed_link.clone(), gemini[0].root.clone())]
+                );
+                let plan = preflight_uninstall(
+                    &[],
+                    &[],
+                    &removal.file_targets,
+                    selected,
+                    Some(&manifest_path),
+                    false,
+                )
+                .unwrap();
+                let links = removal
+                    .links_to_remove
+                    .into_iter()
+                    .map(|(path, expected)| SymlinkChange::remove(path, expected))
+                    .collect::<Vec<_>>();
+                execute_planned_transaction_with_links(
+                    &receipt,
+                    &plan.mutations,
+                    &links,
+                    |_, change| publish_symlink_change(change),
+                )
+                .unwrap();
+                assert!(fs::symlink_metadata(removed_link).is_err());
+                assert_eq!(fs::read_link(retained_link).unwrap(), gemini[0].root);
+                assert!(gemini[0].anchor().exists());
+                if !legacy_manifest {
+                    let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+                    assert_eq!(
+                        manifest
+                            .installation(&gemini[0].root)
+                            .unwrap()
+                            .discovery_clients,
+                        [retained_client]
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn gemini_install_uses_one_shared_discovery_link_and_reports_current() {
         let dir = tempdir().unwrap();
         let layout = ClientLayout::new(
@@ -10426,6 +10540,13 @@ mod tests {
         install_test_skills(&gemini, &receipt);
         let manifest_path = crate::skill_manifest::manifest_path(&receipt);
         let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert_eq!(
+            manifest
+                .installation(&codex[0].root)
+                .unwrap()
+                .discovery_clients,
+            ["codex", "gemini"]
+        );
         let partial = prepare_skill_discovery_uninstall(&gemini, &layout, &manifest).unwrap();
         assert!(partial.links_to_remove.is_empty());
         assert!(partial.file_targets.is_empty());

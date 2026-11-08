@@ -142,9 +142,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     user MCP configuration. Install writes `~/.claude.json` and removes aise entries from the old
     file; the post-upgrade refresh also moves an entry left there, preserving other content.
 
-19. Gemini CLI shares Codex's `~/.agents/skills/ai-session-search` link, avoiding a duplicate
-    skill warning at startup. Install and upgrade refresh remove untouched aise-owned entries
-    from `~/.gemini/skills/ai-session-search`; modified or foreign entries are preserved and reported.
+19. Gemini CLI uses `<gemini home>/.agents/skills/ai-session-search`, where Gemini home is
+    `GEMINI_CLI_HOME` or the real home; Codex keeps `~/.agents/skills/ai-session-search`.
+    Matching paths share one link, avoiding a duplicate skill warning; different paths get separate
+    links, and uninstalling either harness preserves the other's link. Install and upgrade refresh
+    remove untouched aise-owned entries from `<gemini home>/.gemini/skills/ai-session-search`;
+    modified or foreign entries are preserved and reported.
 
 ### Performance
 
