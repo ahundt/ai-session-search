@@ -54,6 +54,8 @@ enum BackgroundRefreshState {
     SkippedBusy,
     Cancelled,
     Failed,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,8 +81,15 @@ struct BackgroundRefreshReport {
     /// predates this field ignores it, and this build reads an older report as an unclassified
     /// failure. Long-lived server processes on one machine are commonly different builds, so a
     /// report either build can only half-read would break the running one.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_failure_kind")]
     failure_kind: Option<RefreshFailureKind>,
+}
+
+fn deserialize_failure_kind<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<RefreshFailureKind>, D::Error> {
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// A refresh failure cause that changes what the caller should do next.
@@ -308,6 +317,12 @@ fn refresh_status_from_report(
         BackgroundRefreshOrigin::Mcp => IndexRefreshTrigger::Mcp,
     });
     let (state, retry_after_ms, message, next_command) = match (report.state, report.failure_kind) {
+        (BackgroundRefreshState::Unknown, _) => (
+            IndexRefreshState::FailedWithRecovery,
+            None,
+            Some("The recorded index refresh state is unknown to this build; upgrade aise to interpret it.".into()),
+            Some("aise package update".into()),
+        ),
         (BackgroundRefreshState::Running, _) if running_lock_is_held => (
             IndexRefreshState::Indexing,
             Some(CONTENDED_RETRY_INTERVAL_MS),
@@ -486,6 +501,32 @@ fn storage_full_refresh_message(error: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_optional_failure_kind_keeps_the_report_usable() {
+        let report: BackgroundRefreshReport = serde_json::from_value(serde_json::json!({
+            "origin":"mcp", "state":"failed", "started_at":"2026-01-01T00:00:00Z",
+            "process_id":42, "failure_kind":"future_failure", "error":"future cause"
+        }))
+        .unwrap();
+        assert_eq!(report.failure_kind, None);
+        assert_eq!(
+            refresh_status_from_report(report, false).state,
+            IndexRefreshState::FailedWithRecovery
+        );
+    }
+
+    #[test]
+    fn unknown_refresh_state_never_reports_success() {
+        let report: BackgroundRefreshReport = serde_json::from_value(serde_json::json!({
+            "origin":"mcp", "state":"future_state", "started_at":"2026-01-01T00:00:00Z",
+            "process_id":42
+        }))
+        .unwrap();
+        let status = refresh_status_from_report(report, false);
+        assert_ne!(status.state, IndexRefreshState::Fresh);
+        assert!(status.message.unwrap().contains("unknown"));
+    }
 
     #[test]
     fn malformed_and_oversized_reports_are_bounded_failed_diagnostics() {

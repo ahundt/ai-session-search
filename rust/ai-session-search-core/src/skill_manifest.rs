@@ -56,6 +56,8 @@ pub(crate) struct InstalledSkillFile {
     pub(crate) relative_path: String,
     pub(crate) bytes: usize,
     pub(crate) sha256: String,
+    #[serde(flatten)]
+    extras: BTreeMap<String, serde_json::Value>,
 }
 
 /// One installed skill root and the exact files placed in it.
@@ -69,14 +71,17 @@ pub(crate) struct SkillInstallation {
     /// Harness users of discovery links to this package, including shared destinations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) discovery_clients: Vec<String>,
+    #[serde(flatten)]
+    extras: BTreeMap<String, serde_json::Value>,
 }
 
 /// Every skill root this machine has installed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct SkillInstallManifest {
     pub(crate) schema_version: u32,
     pub(crate) installations: Vec<SkillInstallation>,
+    #[serde(flatten)]
+    extras: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for SkillInstallManifest {
@@ -84,6 +89,7 @@ impl Default for SkillInstallManifest {
         Self {
             schema_version: SKILL_MANIFEST_SCHEMA_VERSION,
             installations: Vec::new(),
+            extras: BTreeMap::new(),
         }
     }
 }
@@ -202,11 +208,20 @@ impl SkillInstallManifest {
                     relative_path: relative_path.clone(),
                     bytes: content.len(),
                     sha256: sha256(content.as_bytes()),
+                    extras: self
+                        .installation(root)
+                        .and_then(|installation| installation.file(relative_path))
+                        .map(|file| file.extras.clone())
+                        .unwrap_or_default(),
                 })
                 .collect(),
             discovery_clients: self
                 .installation(root)
                 .map(|installation| installation.discovery_clients.clone())
+                .unwrap_or_default(),
+            extras: self
+                .installation(root)
+                .map(|installation| installation.extras.clone())
                 .unwrap_or_default(),
         };
         self.forget(root);
@@ -264,6 +279,67 @@ impl SkillInstallation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_manifest_rewrite_preserves_additive_fields_at_every_level() {
+        let root = Path::new("/fixture/skills");
+        let mut manifest = SkillInstallManifest::default();
+        manifest.record(root, &files());
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value["future_manifest"] = serde_json::json!({"saved":true});
+        value["installations"][0]["future_installation"] = serde_json::json!("saved");
+        value["installations"][0]["files"][0]["future_file"] = serde_json::json!([1, 2]);
+        let mut loaded: SkillInstallManifest = serde_json::from_value(value.clone()).unwrap();
+        loaded.record(root, &files());
+        assert_eq!(serde_json::to_value(loaded).unwrap(), value);
+    }
+
+    #[test]
+    fn format_current_old_current_manifest_rewrite_exposes_immutable_old_loss() {
+        // These shapes match v1.0.0: strict root, but nested unknown fields are discarded.
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldManifest {
+            schema_version: u32,
+            installations: Vec<OldInstallation>,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct OldInstallation {
+            root: EncodedPath,
+            installed_by_version: String,
+            files: Vec<OldFile>,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct OldFile {
+            relative_path: String,
+            bytes: usize,
+            sha256: String,
+        }
+
+        let mut manifest = SkillInstallManifest::default();
+        manifest.record(Path::new("/fixture/skills"), &files());
+        let mut new = serde_json::to_value(manifest).unwrap();
+        new["installations"][0]["installed_by_version"] = serde_json::json!("1.0.1");
+        new["future_manifest"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<OldManifest>(new.clone()).is_err());
+        new.as_object_mut().unwrap().remove("future_manifest");
+        new["installations"][0]["future_installation"] = serde_json::json!(true);
+        new["installations"][0]["files"][0]["future_file"] = serde_json::json!(true);
+        let old: OldManifest = serde_json::from_value(new).unwrap();
+        let rewritten: SkillInstallManifest =
+            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        let new_again = serde_json::to_value(rewritten).unwrap();
+        assert!(new_again["installations"][0]
+            .get("future_installation")
+            .is_none());
+        assert!(new_again["installations"][0]["files"][0]
+            .get("future_file")
+            .is_none());
+        assert_eq!(
+            new_again["installations"][0]["files"][0]["sha256"],
+            sha256(b"skill body")
+        );
+    }
 
     fn files() -> Vec<(String, &'static str)> {
         vec![

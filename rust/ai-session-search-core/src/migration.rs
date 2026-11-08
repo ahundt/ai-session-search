@@ -84,11 +84,19 @@ pub enum DatabaseMigrationPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseMigrationReceipt {
+    #[serde(default = "migration_format_version")]
+    pub format_version: u32,
     pub phase: DatabaseMigrationPhase,
     pub source: PathBuf,
     pub destination: PathBuf,
     pub snapshot_sha256: String,
     pub table_rows: BTreeMap<String, i64>,
+    #[serde(flatten)]
+    pub additional_fields: BTreeMap<String, serde_json::Value>,
+}
+
+const fn migration_format_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +226,8 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
     })?;
     let snapshot_sha256 = sha256_file(&staging.path)?;
     let prepared_receipt = DatabaseMigrationReceipt {
+        format_version: migration_format_version(),
+        additional_fields: BTreeMap::new(),
         phase: DatabaseMigrationPhase::Prepared,
         source: normalized_absolute(&options.source)?,
         destination: normalized_absolute(&options.destination)?,
@@ -262,6 +272,16 @@ pub fn verify_migration(receipt: &DatabaseMigrationReceipt) -> Result<()> {
 /// must agree before a state transition is performed.
 pub fn recover_database_migration(receipt_path: &Path) -> Result<DatabaseMigrationReceipt> {
     let prepared_path = staging_path(receipt_path, "prepared");
+    // Preflight every receipt before publishing or removing any recovery artifact.
+    for path in [
+        receipt_path.to_path_buf(),
+        prepared_path.clone(),
+        staging_path(receipt_path, "receipt"),
+    ] {
+        if entry_exists(&path)? {
+            load_receipt(&path)?;
+        }
+    }
     if entry_exists(receipt_path)? {
         let receipt = load_receipt(receipt_path)?;
         let mut source_lock = open_index_update_lock(&index_update_lock_path(&receipt.source))?;
@@ -312,10 +332,7 @@ pub fn recover_database_migration(receipt_path: &Path) -> Result<DatabaseMigrati
 
     let published = DatabaseMigrationReceipt {
         phase: DatabaseMigrationPhase::Published,
-        source: prepared.source.clone(),
-        destination: prepared.destination.clone(),
-        snapshot_sha256: prepared.snapshot_sha256.clone(),
-        table_rows: prepared.table_rows.clone(),
+        ..prepared.clone()
     };
     if entry_exists(&published.destination)? {
         let database_staging = staging_path(&published.destination, "database");
@@ -364,10 +381,7 @@ fn ensure_prepared_matches_published(
 ) -> Result<()> {
     let expected = DatabaseMigrationReceipt {
         phase: DatabaseMigrationPhase::Published,
-        source: prepared.source.clone(),
-        destination: prepared.destination.clone(),
-        snapshot_sha256: prepared.snapshot_sha256.clone(),
-        table_rows: prepared.table_rows.clone(),
+        ..prepared.clone()
     };
     if prepared.phase != DatabaseMigrationPhase::Prepared || expected != *published {
         bail!("prepared migration evidence conflicts with published receipt");
@@ -395,6 +409,13 @@ fn verify_migration_snapshot(receipt: &DatabaseMigrationReceipt, snapshot: &Path
 pub fn load_receipt(path: &Path) -> Result<DatabaseMigrationReceipt> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read migration receipt {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse migration receipt {}", path.display()))?;
+    if let Some(version) = value.get("format_version") {
+        if version.as_u64() != Some(u64::from(migration_format_version())) {
+            bail!("migration receipt {} format_version must be 1 (or absent for the existing format), got {version}; preserve the receipt and staging files and use an aise build that supports this format before recovery", path.display());
+        }
+    }
     serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse migration receipt {}", path.display()))
 }
@@ -741,6 +762,74 @@ fn write_receipt(path: &Path, receipt: &DatabaseMigrationReceipt) -> Result<()> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn format_unsupported_receipt_refuses_before_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let raw = r#"{"format_version":2,"phase":"future_phase"}"#;
+        fs::write(&receipt, raw).unwrap();
+        let error = recover_database_migration(&receipt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("format_version") && error.contains("2"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(receipt).unwrap(), raw);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn format_legacy_migration_receipt_preserves_additive_fields_on_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        fs::write(&receipt, r#"{"phase":"prepared","source":"source","destination":"destination","snapshot_sha256":"hash","table_rows":{},"future_evidence":{"saved":true}}"#).unwrap();
+        let loaded = load_receipt(&receipt).unwrap();
+        let rewrite = dir.path().join("rewritten.json");
+        write_receipt(&rewrite, &loaded).unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&rewrite).unwrap()).unwrap();
+        assert_eq!(rewritten["format_version"], 1);
+        assert_eq!(rewritten["future_evidence"]["saved"], true);
+    }
+
+    #[test]
+    fn format_receipt_keeps_duplicate_authority_fields_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipt.json");
+        fs::write(&path, r#"{"format_version":1,"phase":"prepared","source":"first","source":"second","destination":"destination","snapshot_sha256":"hash","table_rows":{}}"#).unwrap();
+        let error = load_receipt(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate field `source`"));
+    }
+
+    #[test]
+    fn format_recovery_preserves_additive_evidence_and_preflights_staged_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let _source = source_with_wal(&options.source);
+        let (mut prepared, snapshot) = prepare_interrupted_migration(&options, false);
+        prepared
+            .additional_fields
+            .insert("future_evidence".into(), serde_json::json!({"saved":true}));
+        let prepared_path = staging_path(&options.receipt, "prepared");
+        fs::write(&prepared_path, serde_json::to_vec(&prepared).unwrap()).unwrap();
+        let staged_receipt = staging_path(&options.receipt, "receipt");
+        fs::write(&staged_receipt, r#"{"format_version":2,"phase":"future"}"#).unwrap();
+        assert!(recover_database_migration(&options.receipt)
+            .unwrap_err()
+            .to_string()
+            .contains("format_version"));
+        assert!(snapshot.exists());
+        assert!(!options.destination.exists());
+        fs::remove_file(staged_receipt).unwrap();
+        let recovered = recover_database_migration(&options.receipt).unwrap();
+        assert_eq!(recovered.additional_fields, prepared.additional_fields);
+        assert_eq!(
+            load_receipt(&options.receipt).unwrap().additional_fields,
+            prepared.additional_fields
+        );
+    }
+
     fn options(dir: &Path) -> DatabaseMigrationOptions {
         DatabaseMigrationOptions::new(
             dir.join("legacy/index.db"),
@@ -788,6 +877,8 @@ mod tests {
                 .unwrap();
         }
         let prepared = DatabaseMigrationReceipt {
+            format_version: migration_format_version(),
+            additional_fields: BTreeMap::new(),
             phase: DatabaseMigrationPhase::Prepared,
             source: normalized_absolute(&options.source).unwrap(),
             destination: normalized_absolute(&options.destination).unwrap(),
