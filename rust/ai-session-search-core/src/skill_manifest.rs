@@ -66,6 +66,9 @@ pub(crate) struct SkillInstallation {
     /// `aise` version that performed the install, for diagnostics.
     pub(crate) installed_by_version: String,
     pub(crate) files: Vec<InstalledSkillFile>,
+    /// Harness users of discovery links to this package, including shared destinations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) discovery_clients: Vec<String>,
 }
 
 /// Every skill root this machine has installed.
@@ -201,6 +204,10 @@ impl SkillInstallManifest {
                     sha256: sha256(content.as_bytes()),
                 })
                 .collect(),
+            discovery_clients: self
+                .installation(root)
+                .map(|installation| installation.discovery_clients.clone())
+                .unwrap_or_default(),
         };
         self.forget(root);
         self.installations.push(installation);
