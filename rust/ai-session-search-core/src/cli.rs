@@ -742,7 +742,8 @@ enum ConfigCmd {
     /// Use `aise config init` to write this to disk, or `aise config file` for the path in use.
     Example,
     /// Write a starting config to the selected config path: the example with every setting but the
-    /// database and cache paths commented out.
+    /// database and cache paths commented out. Those paths use CLI/environment selections or
+    /// platform defaults; initialization does not read the destination file.
     ///
     /// Use `aise config example` to preview the contents first, or `aise config show` afterwards.
     Init(ConfigInitArgs),
@@ -973,7 +974,7 @@ fn execute(cli: Cli) -> Result<()> {
     if matches!(&cli.command, Commands::RefreshIndex) {
         return run_background_refresh_from_stdin();
     }
-    if refreshes_integrations_after_upgrade(&cli.command) {
+    if cli.harness_home.is_some() || refreshes_integrations_after_upgrade(&cli.command) {
         crate::integrations::validate_harness_home(cli.harness_home.as_deref())?;
     }
     let skip_release_notification = cli.skip_release_notification;
@@ -1010,13 +1011,16 @@ fn execute(cli: Cli) -> Result<()> {
             let resolved = resolve()?;
             let config_path = &resolved.config_path;
             let receipt = crate::integrations::default_transaction_receipt(config_path);
+            let prepare_index = !args.no_index_preparation;
             let outcome = crate::integrations::install_with_receipt(
                 args,
                 &receipt,
                 &resolved,
                 cli.harness_home.as_deref(),
             )?;
-            start_initial_indexing_after_integration_install(outcome, &resolved.config);
+            if prepare_index {
+                start_initial_indexing_after_integration_install(outcome, &resolved.config);
+            }
             return Ok(());
         }
         Commands::Integrations(IntegrationsCmd::Status(args)) => {
@@ -1079,10 +1083,8 @@ fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             ConfigCmd::Init(args) => {
-                write_config_example(
-                    &Config::selected_config_path(overrides.config_path.clone()),
-                    args.force,
-                )?;
+                let resolved = Config::resolve_for_initialization(overrides.clone())?;
+                write_config_example(&resolved.config_path, args.force, &resolved.config)?;
                 return Ok(());
             }
             ConfigCmd::Show(_) | ConfigCmd::Origins | ConfigCmd::Paths(_) => {}
@@ -1101,7 +1103,14 @@ fn execute(cli: Cli) -> Result<()> {
                 unreachable!("package status returned above, before the command dispatch")
             }
             PackageCmd::Check(args) => crate::update::run_package_check(&config, args.format),
-            PackageCmd::Update(args) => crate::update::run_package_update(&config, args.yes),
+            PackageCmd::Update(args) => crate::update::run_package_update(
+                &config,
+                args.yes,
+                &crate::integrations::selected_state_arguments(
+                    &resolved,
+                    cli.harness_home.as_deref(),
+                )?,
+            ),
         };
     }
     if let Commands::Db(cmd) = command {
@@ -1128,7 +1137,12 @@ fn execute(cli: Cli) -> Result<()> {
         let Commands::Skills(cmd) = command else {
             unreachable!("the match guard above established a skill management command")
         };
-        return crate::skills::run(&config, cmd, &receipt);
+        return crate::skills::run_with_harness_home(
+            &config,
+            cmd,
+            &receipt,
+            cli.harness_home.as_deref(),
+        );
     }
     if matches!(command, Commands::Dates) {
         println!("{}", crate::dates::format_reference());
@@ -1532,11 +1546,11 @@ fn validate_root_options(cli: &Cli) -> Result<()> {
         }
         Commands::Package(PackageCmd::Status(_)) => ("aise package status", NO_ROOT_OPTIONS),
         Commands::Package(PackageCmd::Check(_)) => ("aise package check", CONFIG_AND_CACHE),
-        Commands::Package(PackageCmd::Update(_)) => ("aise package update", CONFIG_AND_CACHE),
+        Commands::Package(PackageCmd::Update(_)) => ("aise package update", INTEGRATION_INPUTS),
         Commands::Mcp(_) => ("aise mcp serve", MCP_INPUTS),
         Commands::Config(ConfigCmd::File) => ("aise config file", CONFIG_FILE_ONLY),
         Commands::Config(ConfigCmd::Example) => ("aise config example", NO_ROOT_OPTIONS),
-        Commands::Config(ConfigCmd::Init(_)) => ("aise config init", CONFIG_FILE_ONLY),
+        Commands::Config(ConfigCmd::Init(_)) => ("aise config init", CONFIG_DATABASE_AND_CACHE),
         Commands::Config(ConfigCmd::Show(_)) => ("aise config show", CONFIG_INPUTS),
         Commands::Config(ConfigCmd::Origins) => ("aise config origins", CONFIG_INPUTS),
         Commands::Config(ConfigCmd::Paths(_)) => ("aise config paths", CONFIG_DATABASE_AND_CACHE),
@@ -1556,7 +1570,10 @@ fn validate_root_options(cli: &Cli) -> Result<()> {
         RootOption::ReleaseNotification,
         RootOption::HarnessHome,
     ] {
-        if option.is_present(cli) && !allowed.contains(&option) {
+        let unrelated_harness_home = option == RootOption::HarnessHome
+            && matches!(&cli.command,
+            Commands::Skills(cmd) if cmd.is_management() && !matches!(cmd, crate::skills::SkillsCmd::Update(_)));
+        if option.is_present(cli) && (!allowed.contains(&option) || unrelated_harness_home) {
             bail!(
                 "{} does not apply to `{command_name}`; remove it",
                 option.flag()
@@ -1615,7 +1632,9 @@ fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
     match cmd {
         ConfigCmd::File => println!("{}", resolved.config_path.display()),
         ConfigCmd::Example => print!("{}", crate::config::CONFIG_EXAMPLE_TOML),
-        ConfigCmd::Init(args) => write_config_example(&resolved.config_path, args.force)?,
+        ConfigCmd::Init(args) => {
+            write_config_example(&resolved.config_path, args.force, &resolved.config)?
+        }
         ConfigCmd::Show(args) => match args.format {
             ConfigOutputFormat::Toml => {
                 print!("{}", toml::to_string_pretty(&resolved.config)?)
@@ -1637,12 +1656,19 @@ fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
 /// user's file, so a default changed by a later release would never reach them and nothing would
 /// show which values they chose. Only the database and cache paths are written live, recording
 /// where the index is.
-fn initial_config_text() -> String {
-    let defaults = Config::default();
-    let db_path =
-        toml::Value::String(defaults.db_path().to_string_lossy().into_owned()).to_string();
-    let cache_dir =
-        toml::Value::String(defaults.cache_dir().to_string_lossy().into_owned()).to_string();
+fn initial_config_text(config: &Config) -> Result<String> {
+    let db_path = toml::Value::String(
+        std::path::absolute(config.db_path())?
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .to_string();
+    let cache_dir = toml::Value::String(
+        std::path::absolute(config.cache_dir())?
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .to_string();
     let mut text = String::with_capacity(crate::config::CONFIG_EXAMPLE_TOML.len() + 256);
     for line in crate::config::CONFIG_EXAMPLE_TOML.lines() {
         if line == "# db_path = \"/absolute/path/to/index.db\"" {
@@ -1661,7 +1687,7 @@ fn initial_config_text() -> String {
         }
         text.push('\n');
     }
-    text
+    Ok(text)
 }
 
 /// A TOML assignment, indented or not; comments and table headers are not settings.
@@ -1670,13 +1696,13 @@ fn is_setting_line(line: &str) -> bool {
     !body.is_empty() && !body.starts_with('#') && !body.starts_with('[') && body.contains('=')
 }
 
-fn write_config_example(path: &std::path::Path, force: bool) -> Result<()> {
+fn write_config_example(path: &std::path::Path, force: bool, config: &Config) -> Result<()> {
     let mode = if force {
         AtomicWriteMode::Replace
     } else {
         AtomicWriteMode::CreateNew
     };
-    let initialized = initial_config_text();
+    let initialized = initial_config_text(config)?;
     atomic_write_file(path, initialized.as_bytes(), mode).with_context(
         || {
             if force {
@@ -3589,6 +3615,11 @@ mod tests {
         );
 
         assert_root_options_apply(["aise", "search", "needle", "--config", "/tmp/config.toml"]);
+        assert_root_options_apply(["aise", "skills", "update", "--harness-home", "/tmp/harness"]);
+        assert_root_option_is_irrelevant(
+            ["aise", "skills", "list", "--harness-home", "/tmp/harness"],
+            "--harness-home",
+        );
         assert_root_option_is_irrelevant(
             ["aise", "package", "status", "--database", "/tmp/index.db"],
             "--database",
@@ -3695,7 +3726,7 @@ mod tests {
     fn config_init_leaves_every_setting_but_the_state_paths_commented() {
         // A file with live defaults froze them: 1.0.0rc2's printed `preview_lines = 30` kept
         // applying after the built-in default moved on. Only what a user uncomments may override.
-        let initialized = initial_config_text();
+        let initialized = initial_config_text(&Config::default()).unwrap();
         // Judged by what TOML reads, not by how lines look: the only values the file sets are
         // the state paths.
         fn leaves(table: &toml::Table, prefix: &str, into: &mut Vec<String>) {
@@ -3728,7 +3759,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        write_config_example(&path, false).unwrap();
+        write_config_example(&path, false, &Config::default()).unwrap();
         let initialized = fs::read_to_string(&path).unwrap();
         let parsed: crate::config::Config = toml::from_str(&initialized).unwrap();
         assert_eq!(parsed.db_path(), crate::config::Config::default().db_path());
@@ -3740,13 +3771,13 @@ mod tests {
         assert!(initialized.contains("\ncache_dir = "));
 
         fs::write(&path, "preserve until publication").unwrap();
-        assert!(write_config_example(&path, false).is_err());
+        assert!(write_config_example(&path, false, &Config::default()).is_err());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "preserve until publication"
         );
 
-        write_config_example(&path, true).unwrap();
+        write_config_example(&path, true, &Config::default()).unwrap();
         let replaced = fs::read_to_string(&path).unwrap();
         assert!(replaced.contains("\ndb_path = "));
         assert!(replaced.contains("\ncache_dir = "));

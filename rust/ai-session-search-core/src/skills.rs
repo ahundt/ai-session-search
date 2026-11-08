@@ -1290,6 +1290,15 @@ impl Row for crate::integrations::SkillWriteOutcome {
 /// Returns an error when a configured search path cannot be read, when two directories claim one
 /// skill name, when `show` names a skill that does not exist, or when output cannot be written.
 pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
+    run_with_harness_home(config, cmd, receipt_path, None)
+}
+
+pub(crate) fn run_with_harness_home(
+    config: &Config,
+    cmd: SkillsCmd,
+    receipt_path: &Path,
+    harness_home: Option<&Path>,
+) -> Result<()> {
     match cmd {
         SkillsCmd::List(args) => {
             let rows = summaries_at(config, Some(receipt_path))?;
@@ -1389,7 +1398,7 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
             Ok(())
         }
         SkillsCmd::Update(args) => {
-            let outcomes = crate::integrations::write_owned_skills(
+            let outcomes = crate::integrations::write_owned_skills_with_harness_home(
                 &args.skill_roots,
                 receipt_path,
                 args.dry_run,
@@ -1397,6 +1406,8 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
                 // during a routine command is exactly the surprise `restore` exists to make
                 // explicit instead.
                 false,
+                &config.integrations,
+                harness_home,
             )?;
             report_write_outcomes(
                 &outcomes,
@@ -1414,11 +1425,13 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
                     crate::corrections::EMBEDDED_POLICY_NAME
                 );
             }
-            let outcomes = crate::integrations::write_owned_skills(
+            let outcomes = crate::integrations::write_owned_skills_with_harness_home(
                 std::slice::from_ref(&args.skill_root),
                 receipt_path,
                 args.dry_run,
                 true,
+                &config.integrations,
+                harness_home,
             )?;
             report_write_outcomes(
                 &outcomes,

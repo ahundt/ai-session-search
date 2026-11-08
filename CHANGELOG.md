@@ -29,6 +29,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 4. `--harness-home PATH` and `AI_SESSION_SEARCH_HARNESS_HOME` select a separate home for harness
    files without changing application state. Exact integration destinations retain their
    existing precedence.
+5. `aise integrations install --no-index-preparation` installs integrations without starting
+   background indexing. Omission keeps the existing preparation behavior.
 
 ### Changed
 
@@ -156,6 +158,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     when a client starts the server without the installer's environment. Reinstall preserves
     the entry's environment and unknown fields, and refuses conflicting state selections before
     writing. Config-file database and cache settings remain editable without reinstalling.
+21. `aise config init` records CLI- or environment-selected database and cache paths instead
+    of platform defaults. `aise package update` passes state selections to the replacement
+    executable's skill refresh.
 
 ### Performance
 
@@ -200,6 +205,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    application and harness state and disabled transcript providers. Pytest sanitizes its
    environment before collection; Rust process tests use a per-test command factory. Demo homes
    are unique temporary directories.
+2. Temporary integration verifiers skip background index preparation. Historical upgrade
+   checks stop and wait for their process groups before removing temporary roots. Demo commands
+   use owned homes and an isolated Python launcher when the executable is a console script.
 
 ## [1.0.0] - 2026-11-05
 

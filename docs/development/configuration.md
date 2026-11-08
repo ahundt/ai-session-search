@@ -58,6 +58,7 @@ select application config, database, and cache separately. Harness environment v
 override the corresponding defaults beneath that home, `[integrations.paths]` still replaces
 those destinations, and exact CLI destination flags still add targets. Install, status,
 uninstall, and post-upgrade refresh use the same resolver.
+`aise skills update` uses that selected home and the configured integration paths as well.
 
 MCP registrations retain config, database, and cache selections made through CLI flags or
 environment variables as absolute command arguments. Values supplied by the config file remain
@@ -71,6 +72,10 @@ Five root CLI options feed the resolver: `--config`, `--database`, `--cache-dir`
 and `--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
 `AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and
 `AI_SESSION_SEARCH_INDEX_REFRESH`.
+
+`aise config init` records the selected database and cache as absolute paths, including CLI and
+environment overrides, even when the destination config does not exist yet. Other settings stay
+commented. `--force` replaces the destination without loading its old contents.
 
 Run `aise config show` to print the merged effective configuration. Run `aise config origins` to
 print the selected source for the config file, database, cache directory, worker threads, refresh

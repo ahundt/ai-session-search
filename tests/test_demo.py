@@ -38,6 +38,7 @@ Output files (gitignored):
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -145,6 +146,7 @@ enabled = false
 
 
 _MCP_DEMO_ROOTS = ExitStack()
+atexit.register(_MCP_DEMO_ROOTS.close)
 _DEMO_RUNTIME = tempfile.TemporaryDirectory(prefix="aise-demo-runtime-")
 DEMO_ENV = _demo_environment(
     DEMO_DIR,
@@ -1131,32 +1133,23 @@ def _run(
 
 
 def _mcp_demo_environment() -> dict[str, str]:
-    """Sandbox for the MCP act so a plain `aise integrations install` reveals nothing.
-
-    The act shows the real command a user runs, with no --no-* flags trimming it down, so
-    every destination it prints has to be relocated rather than suppressed. Three separate
-    roots leak the recording machine otherwise:
-
-    1. Client registrations resolve from HOME, so HOME points at a short throwaway dir.
-       Short matters: the platform temp dir on macOS is ~60 characters and wraps every row.
-    2. Executable aliases are created *beside* `aise`, so a copy of the executable goes in
-       the sandbox and leads PATH. That also fixes the path stored in client configs,
-       which defaults to the first `aise` on PATH.
-    3. Managed skills install under the app directory, which derives from the config file's
-       location, so the act gets its own config inside the sandbox.
-
-    The config keeps the demo's provider settings, otherwise the background index
-    preparation that install kicks off would walk the recording machine's real sessions.
-    """
+    """Own app and harness roots; keep aliases beside a sandbox executable."""
     home = Path(_MCP_DEMO_ROOTS.enter_context(tempfile.TemporaryDirectory(prefix="aise-demo-home-")))
 
     binary_dir = home / "bin"
     binary_dir.mkdir(parents=True, exist_ok=True)
     resolved = shutil.which("aise", path=DEMO_ENV.get("PATH", os.defpath))
     if resolved:
-        # Copy rather than symlink: aliases are created beside the resolved executable, and
-        # a symlink would resolve back to the real installation directory.
-        shutil.copy2(resolved, binary_dir / "aise")
+        destination = binary_dir / ("aise.exe" if os.name == "nt" else "aise")
+        if os.name != "nt" and Path(resolved).read_bytes().startswith(b"#!"):
+            destination.write_text(
+                "#!/bin/sh\nexec " + shlex.quote(sys.executable)
+                + " -c 'from ai_session_search.entrypoint import cli_main; cli_main()' \"$@\"\n",
+                encoding="utf-8",
+            )
+            destination.chmod(0o755)
+        else:
+            shutil.copy2(resolved, destination)
 
     app_dir = home / ".ai-session-search"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -1247,7 +1240,7 @@ def run_demo_acts() -> None:
     mcp_env = _mcp_demo_environment()
     section("Let your coding agent search this history — one MCP server, every client")
     pause(2.0)
-    _run("aise integrations install", env=mcp_env)
+    _run("aise integrations install --no-index-preparation", env=mcp_env)
     pause(5.0)
     _run("aise integrations status", env=mcp_env)
     pause(7.0)
@@ -1505,32 +1498,16 @@ def record(cast_file: Path = CAST_FILE, *, acts_flag: str = "--run-acts") -> Non
     if not PROJECTS_DIR.is_dir():
         raise RuntimeError("committed demo fixtures are missing; run --setup explicitly")
 
-    # Copy fixtures to a temp dir with timestamps shifted to be near today,
-    # so --since 3d in Act 2 always catches sessions regardless of re-record date.
-    # Committed fixture files are never modified; temp dir is cleaned up after.
-    dated_dir = create_dated_demo_dir()
-    print(f"Date-shifted fixtures in {dated_dir} (auto-cleaned after recording)")
-
     print(f"Recording to {cast_file} ...")
-
     cmd = shlex.join([sys.executable, str(Path(__file__).resolve()), *shlex.split(acts_flag)])
-    # Pass dated_dir via CLAUDE_CONFIG_DIR so run_demo_acts() uses shifted timestamps.
-    # DEMO_ENV respects this env var (see definition above) so all aise commands
-    # inside --run-acts will target the dated tmp dir, not the committed fixtures.
-    record_env = _demo_environment(dated_dir, dated_dir / ".aise-state")
-    try:
-        recorder_help = subprocess.run(
-            [asciinema, "rec", "--help"], check=True, capture_output=True, text=True
-        ).stdout
-        with _staged_output(cast_file) as staging:
-            subprocess.run(
-                _asciinema_record_args(asciinema, staging, cmd, recorder_help),
-                env=record_env,
-                check=True,
-            )
-    finally:
-        shutil.rmtree(dated_dir, ignore_errors=True)
-        print("Temp fixtures cleaned up")
+    recorder_help = subprocess.run(
+        [asciinema, "rec", "--help"], env=DEMO_ENV, check=True, capture_output=True, text=True
+    ).stdout
+    with _staged_output(cast_file) as staging:
+        subprocess.run(
+            _asciinema_record_args(asciinema, staging, cmd, recorder_help),
+            env=DEMO_ENV, check=True,
+        )
     print(f"Recording saved to {cast_file}")
 
 
@@ -1842,6 +1819,15 @@ class TestDemoFree:
     and can regenerate fixtures with: uv run python tests/test_demo.py --setup
     """
 
+    def test_mcp_demo_roots_are_owned_and_independent(self) -> None:
+        first = _mcp_demo_environment()
+        sentinel = Path(first["HOME"]) / "sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+        second = _mcp_demo_environment()
+        assert first["HOME"] != second["HOME"]
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+        assert first["AI_SESSION_SEARCH_DATABASE"] != second["AI_SESSION_SEARCH_DATABASE"]
+
     def test_recorder_arguments_support_asciinema_2_and_3(self) -> None:
         command = "python demo.py --run-acts"
         v2 = _asciinema_record_args("asciinema", Path("demo.cast"), command, "--cols --rows --env")
@@ -2106,7 +2092,7 @@ class TestDemoFree:
         """Run all default demo acts end-to-end and verify expected output."""
         result = subprocess.run(
             [sys.executable, str(Path(__file__)), "--test-acts"],
-            capture_output=True, timeout=120,
+            env=DEMO_ENV, capture_output=True, timeout=120,
             encoding="utf-8", errors="replace",
         )
         combined = (result.stdout or "") + (result.stderr or "")
@@ -2152,7 +2138,7 @@ class TestDemoFree:
         """Run all Post A demo acts end-to-end and verify expected output."""
         result = subprocess.run(
             [sys.executable, str(Path(__file__)), "--post", "a", "--test-acts"],
-            capture_output=True, timeout=120,
+            env=DEMO_ENV, capture_output=True, timeout=120,
             encoding="utf-8", errors="replace",
         )
         combined = (result.stdout or "") + (result.stderr or "")
@@ -2165,7 +2151,7 @@ class TestDemoFree:
         """Run all Post B demo acts (file recovery) end-to-end and verify expected output."""
         result = subprocess.run(
             [sys.executable, str(Path(__file__)), "--post", "b", "--test-acts"],
-            capture_output=True, timeout=120,
+            env=DEMO_ENV, capture_output=True, timeout=120,
             encoding="utf-8", errors="replace",
         )
         combined = (result.stdout or "") + (result.stderr or "")
@@ -2178,7 +2164,7 @@ class TestDemoFree:
         """Run all Post D demo acts (broader audience) end-to-end and verify expected output."""
         result = subprocess.run(
             [sys.executable, str(Path(__file__)), "--post", "d", "--test-acts"],
-            capture_output=True, timeout=120,
+            env=DEMO_ENV, capture_output=True, timeout=120,
             encoding="utf-8", errors="replace",
         )
         combined = (result.stdout or "") + (result.stderr or "")
@@ -2190,8 +2176,8 @@ class TestDemoFree:
 
 # ── Main entrypoint ────────────────────────────────────────────────────────────
 
-def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive CLI mode
-    global _TIMED
+def main() -> None:
+    global _TIMED, DEMO_ENV
 
     parser = argparse.ArgumentParser(
         description="ai_session_search demo recorder",
@@ -2252,10 +2238,14 @@ def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive C
 
     cfg = _POST_CONFIGS[post_id]
 
-    if args.run_acts:
-        # Called by asciinema — run acts with timing delays
-        _TIMED = True
-        cfg["acts_fn"]()
+    if args.run_acts or args.test_acts:
+        _TIMED = args.run_acts
+        dated_dir = create_dated_demo_dir()
+        try:
+            DEMO_ENV = _demo_environment(dated_dir, dated_dir / ".aise-state")
+            cfg["acts_fn"]()
+        finally:
+            shutil.rmtree(dated_dir)
 
     elif args.record:
         acts_flag = f"--post {post_id} --run-acts" if post_id else "--run-acts"
@@ -2284,17 +2274,6 @@ def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive C
         for proj_dir in PROJECTS_DIR.iterdir():
             sessions = list(proj_dir.glob("*.jsonl"))
             print(f"  {proj_dir.name}: {len(sessions)} session(s)")
-
-    elif args.test_acts:
-        # Run acts without timing delays, with date-shifted fixtures (for pytest).
-        dated_dir = create_dated_demo_dir()
-        try:
-            os.environ["CLAUDE_CONFIG_DIR"] = str(dated_dir)
-            global DEMO_ENV
-            DEMO_ENV = _demo_environment(dated_dir, dated_dir / ".aise-state")
-            cfg["acts_fn"]()
-        finally:
-            shutil.rmtree(dated_dir, ignore_errors=True)
 
     else:
         parser.print_help()

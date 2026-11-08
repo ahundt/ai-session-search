@@ -293,7 +293,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent also receive their native skill and MCP-first AGENTS.md guidance. Automatic paths follow harness environment variables; [integrations.paths.<surface>] overrides MCP configs, instruction files, or skill discovery roots. Config paths replace automatic endpoints; CLI path flags add targets. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills (Codex and Gemini), ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
+    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent also receive their native skill and MCP-first AGENTS.md guidance. Automatic paths follow harness environment variables; [integrations.paths.<surface>] overrides MCP configs, instruction files, or skill discovery roots. Config paths replace automatic endpoints; CLI path flags add targets. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills (Codex and Gemini), ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background unless --no-index-preparation is passed; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -318,6 +318,9 @@ pub struct IntegrationInstallArgs {
     /// Do not create the `aisearch` and `ai_session_search` executable aliases beside `aise`.
     #[arg(long)]
     pub no_aliases: bool,
+    /// Skip background index preparation after installation. Flag only; omit to start preparation.
+    #[arg(long)]
+    pub no_index_preparation: bool,
     #[command(flatten)]
     pub transaction: IntegrationTransactionArgs,
 }
@@ -624,6 +627,7 @@ impl ClientLayout {
         Self::from_environment(home, config, platform, environment)
     }
 
+    #[cfg(test)]
     fn discover() -> Result<Self> {
         Self::discover_with_home(None)
     }
@@ -1662,6 +1666,23 @@ pub(crate) fn install_with_receipt(
                 .contains_key("AI_SESSION_SEARCH_HARNESS_HOME"),
     )?);
     install_for_layout(args, default_receipt, &layout)
+}
+
+pub(crate) fn selected_state_arguments(
+    resolved: &crate::config::ResolvedConfig,
+    harness_home: Option<&Path>,
+) -> Result<Vec<String>> {
+    let layout = ClientLayout::discover_with_home(harness_home)?;
+    Ok(RegistrationState::from_resolved(
+        resolved,
+        &layout,
+        harness_home.is_some()
+            || layout
+                .environment
+                .values
+                .contains_key("AI_SESSION_SEARCH_HARNESS_HOME"),
+    )?
+    .arguments)
 }
 
 fn install_for_layout(
@@ -3769,11 +3790,29 @@ pub(crate) struct SkillWriteOutcome {
 ///
 /// Returns an error when a root cannot be planned for a reason that is not about ownership, when
 /// the transaction fails, or when `restore` names a root aise does not own.
-pub(crate) fn write_owned_skills(
+fn write_owned_skills(
     explicit_roots: &[PathBuf],
     receipt_path: &Path,
     dry_run: bool,
     overwrite_changed: bool,
+) -> Result<Vec<SkillWriteOutcome>> {
+    write_owned_skills_with_harness_home(
+        explicit_roots,
+        receipt_path,
+        dry_run,
+        overwrite_changed,
+        &IntegrationsConfig::default(),
+        None,
+    )
+}
+
+pub(crate) fn write_owned_skills_with_harness_home(
+    explicit_roots: &[PathBuf],
+    receipt_path: &Path,
+    dry_run: bool,
+    overwrite_changed: bool,
+    config: &IntegrationsConfig,
+    harness_home: Option<&Path>,
 ) -> Result<Vec<SkillWriteOutcome>> {
     let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
     let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
@@ -3785,7 +3824,7 @@ pub(crate) fn write_owned_skills(
     // resolving a home directory to answer it would make the command fail on a machine where HOME
     // is unset for a reason unrelated to what was asked.
     let mut targets: Vec<SkillTarget> = if explicit_roots.is_empty() {
-        let layout = ClientLayout::discover()?;
+        let layout = ClientLayout::discover_with_home(harness_home)?.with_config(config)?;
         McpClient::value_variants()
             .iter()
             .copied()
@@ -5401,6 +5440,20 @@ fn plan_upsert_json_server_with_state(
                 {
                     continue;
                 }
+                if key == "env" {
+                    if let Some(existing) = object
+                        .get(key)
+                        .and_then(|property| property.value())
+                        .and_then(|value| value.as_object())
+                    {
+                        for (name, value) in value.as_object().expect("validated environment") {
+                            if existing.get(name).is_none() {
+                                existing.append(name, jsonc_input(value));
+                            }
+                        }
+                        continue;
+                    }
+                }
                 match object.get(key) {
                     Some(field) => {
                         field.set_value(jsonc_input(value));
@@ -5470,6 +5523,9 @@ fn plan_upsert_codex_mcp_server(
         .transpose()?;
     let mut entry = json_server_entry(ConfigFormat::CodexToml, binary);
     merge_registration_arguments(path, old.as_ref(), &mut entry, state)?;
+    if let Some(environment) = old.as_ref().and_then(|old| old.get("env")) {
+        entry["env"] = environment.clone();
+    }
     let mut document = parse_codex_document(path, text)?;
     let servers = document
         .entry("mcp_servers")
@@ -5516,16 +5572,16 @@ fn plan_upsert_codex_mcp_server(
                 )
             })?;
         // The same keys `codex plugin marketplace add <dir>` writes for a local marketplace.
-        let mut entry = toml_edit::Table::new();
-        entry.insert("source_type", toml_edit::value("local"));
-        entry.insert("source", toml_edit::value(source));
-        marketplaces.insert(SERVER_NAME, toml_edit::Item::Table(entry));
+        let mut marketplace_entry = toml_edit::Table::new();
+        marketplace_entry.insert("source_type", toml_edit::value("local"));
+        marketplace_entry.insert("source", toml_edit::value(source));
+        marketplaces.insert(SERVER_NAME, toml_edit::Item::Table(marketplace_entry));
         for (file, content) in codex_marketplace_files(root, binary)? {
             if file.file_name().is_some_and(|name| name == ".mcp.json") {
                 mutations.extend(plan_upsert_json_server_with_state(
                     &file,
                     ConfigFormat::JsonMcpServers,
-                    json_server_entry(ConfigFormat::JsonMcpServers, binary),
+                    entry.clone(),
                     state,
                 )?);
                 continue;
@@ -6486,6 +6542,21 @@ mod tests {
         let kept: Value = serde_json::from_str(&fs::read_to_string(&plugin).unwrap()).unwrap();
         assert_eq!(kept["mcpServers"][SERVER_NAME]["env"]["TEAM"], "keep");
         assert_eq!(kept["mcpServers"][SERVER_NAME]["extension"], 42);
+        fs::remove_file(&plugin).unwrap();
+        let mut main: toml_edit::DocumentMut =
+            fs::read_to_string(&target.path).unwrap().parse().unwrap();
+        main["mcp_servers"][SERVER_NAME]["env"]["TEAM"] = toml_edit::value("main");
+        fs::write(&target.path, main.to_string()).unwrap();
+        let selected = target.registration.take();
+        publish_planned_mutations(&plan_upsert_target(&target, Path::new("/bin/aise")).unwrap())
+            .unwrap();
+        let refreshed: Value = serde_json::from_str(&fs::read_to_string(&plugin).unwrap()).unwrap();
+        assert_eq!(
+            refreshed["mcpServers"][SERVER_NAME]["args"],
+            kept["mcpServers"][SERVER_NAME]["args"]
+        );
+        assert_eq!(refreshed["mcpServers"][SERVER_NAME]["env"]["TEAM"], "main");
+        target.registration = selected;
         value["mcpServers"][SERVER_NAME]["env"]["AI_SESSION_SEARCH_DATABASE"] = json!("/conflict");
         fs::write(&plugin, serde_json::to_string(&value).unwrap()).unwrap();
         let before = fs::read_to_string(&target.path).unwrap();

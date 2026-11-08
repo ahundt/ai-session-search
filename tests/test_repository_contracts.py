@@ -935,11 +935,15 @@ def test_runtime_environment_rejects_poisoned_state(tmp_path, monkeypatch) -> No
     for name in names:
         if name and not name.startswith("#"):
             monkeypatch.setenv(name, str(production))
+    import runpy
+
     from scripts.benchmark_release import hermetic_environment
     from scripts.verify_upgrade_path import _environment as upgrade_environment
-    from tests.test_mcp_consolidation import _environment as mcp_environment
+    _demo_environment = runpy.run_path(str(ROOT / "tests/test_demo.py"))["_demo_environment"]
+    mcp_environment = runpy.run_path(str(ROOT / "tests/test_mcp_consolidation.py"))["_environment"]
     for builder in (environment, hermetic_environment, mcp_environment,
-                    lambda root: upgrade_environment(root, None)):
+                    lambda root: upgrade_environment(root, None),
+                    lambda root: _demo_environment(ROOT / "tests/aise-demo", root)):
         child_env = builder(tmp_path / builder.__name__)
         assert str(production) not in child_env.values()
     child_env = environment(tmp_path / "sandbox")
@@ -956,7 +960,9 @@ def test_runtime_environment_rejects_poisoned_state(tmp_path, monkeypatch) -> No
     import shutil
 
     from scripts.verify_installed_distribution import _verify_mcp_lifecycle
-    _verify_mcp_lifecycle(shutil.which("aise"), "aise", tmp_path, child_env, 30)
+    executable = shutil.which("aise")
+    assert executable is not None
+    _verify_mcp_lifecycle(executable, "aise", tmp_path, child_env, 30)
     assert sentinel.read_text() == "unchanged"
     assert list(production.iterdir()) == [sentinel]
 
