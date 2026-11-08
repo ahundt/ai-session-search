@@ -36,7 +36,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
-/// Help section the six root-level flags are grouped under.
+/// Help section shared by the root-level flags.
 ///
 /// Every one of them is `global = true`, so clap repeats them in EVERY subcommand's help, where
 /// it interleaves them alphabetically with that command's own options:
@@ -78,6 +78,10 @@ struct Cli {
     /// Explicit cache directory. Overrides AI_SESSION_SEARCH_CACHE_DIR and config.toml.
     #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING)]
     cache_dir: Option<PathBuf>,
+    /// Home directory for harness files. CLI overrides AI_SESSION_SEARCH_HARNESS_HOME.
+    /// Nonempty paths resolve from the working directory; omit for platform discovery.
+    #[arg(long, global = true, value_name = "PATH", help_heading = GLOBAL_OPTIONS_HEADING)]
+    harness_home: Option<PathBuf>,
     /// Worker threads, an integer 1 or greater. Overrides AI_SESSION_SEARCH_THREADS and
     /// config.toml.
     #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING, value_parser = parse_positive_usize)]
@@ -219,6 +223,7 @@ enum RootOption {
     ConfigFile,
     Database,
     CacheDirectory,
+    HarnessHome,
     WorkerThreads,
     IndexRefresh,
     ReleaseNotification,
@@ -230,6 +235,7 @@ impl RootOption {
             Self::ConfigFile => "--config",
             Self::Database => "--database",
             Self::CacheDirectory => "--cache-dir",
+            Self::HarnessHome => "--harness-home",
             Self::WorkerThreads => "--threads",
             Self::IndexRefresh => "--index-refresh",
             Self::ReleaseNotification => "--skip-release-notification",
@@ -241,6 +247,7 @@ impl RootOption {
             Self::ConfigFile => cli.config.is_some(),
             Self::Database => cli.database.is_some(),
             Self::CacheDirectory => cli.cache_dir.is_some(),
+            Self::HarnessHome => cli.harness_home.is_some(),
             Self::WorkerThreads => cli.threads.is_some(),
             Self::IndexRefresh => cli.index_refresh.is_some(),
             Self::ReleaseNotification => cli.skip_release_notification,
@@ -953,7 +960,8 @@ fn refreshes_integrations_after_upgrade(command: &Commands) -> bool {
             | IntegrationsCmd::Recover(_),
         )
         | Commands::Package(PackageCmd::Update(_))
-        | Commands::Migrate(_) => false,
+        | Commands::Migrate(_)
+        | Commands::Config(_) => false,
         Commands::Skills(crate::skills::SkillsCmd::Update(args)) => !args.dry_run,
         Commands::Skills(cmd) => !cmd.is_management(),
         _ => true,
@@ -964,6 +972,9 @@ fn execute(cli: Cli) -> Result<()> {
     validate_root_options(&cli)?;
     if matches!(&cli.command, Commands::RefreshIndex) {
         return run_background_refresh_from_stdin();
+    }
+    if refreshes_integrations_after_upgrade(&cli.command) {
+        crate::integrations::validate_harness_home(cli.harness_home.as_deref())?;
     }
     let skip_release_notification = cli.skip_release_notification;
     let overrides = ConfigOverrides {
@@ -983,6 +994,7 @@ fn execute(cli: Cli) -> Result<()> {
             crate::integrations::refresh_integrations_after_upgrade_and_report(
                 &resolved.config,
                 &resolved.config_path,
+                cli.harness_home.as_deref(),
             );
             resolved_early = Some(resolved);
         }
@@ -996,34 +1008,37 @@ fn execute(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Commands::Integrations(IntegrationsCmd::Install(args)) => {
             let resolved = resolve()?;
-            let config_path = resolved.config_path;
-            let receipt = crate::integrations::default_transaction_receipt(&config_path);
+            let config_path = &resolved.config_path;
+            let receipt = crate::integrations::default_transaction_receipt(config_path);
             let outcome = crate::integrations::install_with_receipt(
                 args,
                 &receipt,
-                &resolved.config.integrations,
+                &resolved,
+                cli.harness_home.as_deref(),
             )?;
             start_initial_indexing_after_integration_install(outcome, &resolved.config);
             return Ok(());
         }
         Commands::Integrations(IntegrationsCmd::Status(args)) => {
             let resolved = resolve()?;
-            let config_path = resolved.config_path;
-            let receipt = crate::integrations::default_transaction_receipt(&config_path);
+            let config_path = &resolved.config_path;
+            let receipt = crate::integrations::default_transaction_receipt(config_path);
             return crate::integrations::status_with_receipt(
                 args,
                 &receipt,
                 &resolved.config.integrations,
+                cli.harness_home.as_deref(),
             );
         }
         Commands::Integrations(IntegrationsCmd::Uninstall(args)) => {
             let resolved = resolve()?;
-            let config_path = resolved.config_path;
-            let receipt = crate::integrations::default_transaction_receipt(&config_path);
+            let config_path = &resolved.config_path;
+            let receipt = crate::integrations::default_transaction_receipt(config_path);
             return crate::integrations::uninstall_with_receipt(
                 args,
                 &receipt,
                 &resolved.config.integrations,
+                cli.harness_home.as_deref(),
             );
         }
         Commands::Integrations(IntegrationsCmd::Recover(args)) => {
@@ -1469,11 +1484,25 @@ fn validate_root_options(cli: &Cli) -> Result<()> {
         RootOption::WorkerThreads,
         RootOption::IndexRefresh,
     ];
+    const MCP_INPUTS: &[RootOption] = &[
+        RootOption::ConfigFile,
+        RootOption::Database,
+        RootOption::CacheDirectory,
+        RootOption::WorkerThreads,
+        RootOption::IndexRefresh,
+        RootOption::HarnessHome,
+    ];
     const CONFIG_AND_CACHE: &[RootOption] = &[RootOption::ConfigFile, RootOption::CacheDirectory];
     const CONFIG_DATABASE_AND_CACHE: &[RootOption] = &[
         RootOption::ConfigFile,
         RootOption::Database,
         RootOption::CacheDirectory,
+    ];
+    const INTEGRATION_INPUTS: &[RootOption] = &[
+        RootOption::ConfigFile,
+        RootOption::Database,
+        RootOption::CacheDirectory,
+        RootOption::HarnessHome,
     ];
     const CONFIG_FILE_ONLY: &[RootOption] = &[RootOption::ConfigFile];
     const DATABASE_COMMAND_INPUTS: &[RootOption] = &[RootOption::ConfigFile, RootOption::Database];
@@ -1484,18 +1513,19 @@ fn validate_root_options(cli: &Cli) -> Result<()> {
         RootOption::WorkerThreads,
         RootOption::IndexRefresh,
         RootOption::ReleaseNotification,
+        RootOption::HarnessHome,
     ];
     const NO_ROOT_OPTIONS: &[RootOption] = &[];
 
     let (command_name, allowed) = match &cli.command {
         Commands::Integrations(IntegrationsCmd::Install(_)) => {
-            ("aise integrations install", CONFIG_FILE_ONLY)
+            ("aise integrations install", INTEGRATION_INPUTS)
         }
         Commands::Integrations(IntegrationsCmd::Status(_)) => {
-            ("aise integrations status", CONFIG_FILE_ONLY)
+            ("aise integrations status", INTEGRATION_INPUTS)
         }
         Commands::Integrations(IntegrationsCmd::Uninstall(_)) => {
-            ("aise integrations uninstall", CONFIG_FILE_ONLY)
+            ("aise integrations uninstall", INTEGRATION_INPUTS)
         }
         Commands::Integrations(IntegrationsCmd::Recover(_)) => {
             ("aise integrations recover", CONFIG_FILE_ONLY)
@@ -1503,7 +1533,7 @@ fn validate_root_options(cli: &Cli) -> Result<()> {
         Commands::Package(PackageCmd::Status(_)) => ("aise package status", NO_ROOT_OPTIONS),
         Commands::Package(PackageCmd::Check(_)) => ("aise package check", CONFIG_AND_CACHE),
         Commands::Package(PackageCmd::Update(_)) => ("aise package update", CONFIG_AND_CACHE),
-        Commands::Mcp(_) => ("aise mcp serve", CONFIG_INPUTS),
+        Commands::Mcp(_) => ("aise mcp serve", MCP_INPUTS),
         Commands::Config(ConfigCmd::File) => ("aise config file", CONFIG_FILE_ONLY),
         Commands::Config(ConfigCmd::Example) => ("aise config example", NO_ROOT_OPTIONS),
         Commands::Config(ConfigCmd::Init(_)) => ("aise config init", CONFIG_FILE_ONLY),
@@ -1524,6 +1554,7 @@ fn validate_root_options(cli: &Cli) -> Result<()> {
         RootOption::WorkerThreads,
         RootOption::IndexRefresh,
         RootOption::ReleaseNotification,
+        RootOption::HarnessHome,
     ] {
         if option.is_present(cli) && !allowed.contains(&option) {
             bail!(
@@ -2486,7 +2517,6 @@ mod tests {
         for args in [
             &["integrations", "status"][..],
             &["mcp", "serve"],
-            &["config", "show"],
             &["package", "status"],
             &["dates"],
             &["list"],
@@ -2497,6 +2527,9 @@ mod tests {
         }
         for args in [
             &["integrations", "install"][..],
+            &["config", "show"],
+            &["config", "paths"],
+            &["config", "origins"],
             &["integrations", "uninstall"],
             &["package", "update"],
             &["skills", "update", "--dry-run"],

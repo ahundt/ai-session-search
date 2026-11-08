@@ -84,6 +84,15 @@ aise integrations install
 aise integrations status
 ```
 
+To register a development executable with isolated state, launch it with the environment builder
+in [Contributing](../../CONTRIBUTING.md#development-setup) and pass `--no-aliases --binary PATH`.
+The builder selects an isolated harness home as well as application state. To deliberately use a
+real harness, select its home with `--harness-home PATH` or pass an exact destination flag while
+keeping the separate application config, database, and cache. This changes that harness's named
+`ai-session-search` entry. Reinstall preserves its environment and unknown fields, and refuses
+conflicting state selections before writing. A bare development binary without the builder or
+explicit paths uses normal defaults.
+
 `aise integrations install` returns as soon as it has committed its own files; indexing continues
 in a separate background `aise` process, so you never wait on transcript discovery or parsing.
 Run `aise doctor` to check snapshot readiness, refresh progress, or exact recovery guidance. A dry

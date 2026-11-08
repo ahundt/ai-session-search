@@ -50,6 +50,23 @@ Integration destinations have a separate precedence rule: persistent
 `[integrations.paths.<surface>]` values replace harness environment defaults, and CLI path flags
 add extra targets. See [integration destinations](#integration-installer-destinations-and-selectors).
 
+`--harness-home PATH` selects the home used for automatic harness destinations. It overrides
+`AI_SESSION_SEARCH_HARNESS_HOME`; omission keeps platform discovery. Paths resolve from the
+working directory, with `~` expansion. Empty values or paths that remain relative are rejected:
+omit the setting for platform discovery or pass a directory. This selects harness files only;
+select application config, database, and cache separately. Harness environment variables still
+override the corresponding defaults beneath that home, `[integrations.paths]` still replaces
+those destinations, and exact CLI destination flags still add targets. Install, status,
+uninstall, and post-upgrade refresh use the same resolver.
+
+MCP registrations retain config, database, and cache selections made through CLI flags or
+environment variables as absolute command arguments. Values supplied by the config file remain
+in that file, so editing its database or cache selection takes effect on the next server start.
+An explicitly selected harness home also travels with the registration. Reinstall preserves
+unknown server fields and the user's `env` block, including in the Codex plugin `.mcp.json`.
+If an existing state argument or environment value conflicts with the intended selection,
+preflight refuses before writing and names the file, key, both values, and how to resolve it.
+
 Five root CLI options feed the resolver: `--config`, `--database`, `--cache-dir`, `--threads`,
 and `--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
 `AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and

@@ -26,6 +26,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    `[integrations.paths.<surface>]` paths for MCP configs, instructions, and skill discovery.
    Install, status, uninstall, and post-upgrade refresh share the resolved paths; existing CLI
    path flags continue to add extra targets.
+4. `--harness-home PATH` and `AI_SESSION_SEARCH_HARNESS_HOME` select a separate home for harness
+   files without changing application state. Exact integration destinations retain their
+   existing precedence.
 
 ### Changed
 
@@ -148,6 +151,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     links, and uninstalling either harness preserves the other's link. Install and upgrade refresh
     remove untouched aise-owned entries from `<gemini home>/.gemini/skills/ai-session-search`;
     modified or foreign entries are preserved and reported.
+
+20. MCP registrations retain explicitly selected config, database, cache, and harness paths
+    when a client starts the server without the installer's environment. Reinstall preserves
+    the entry's environment and unknown fields, and refuses conflicting state selections before
+    writing. Config-file database and cache settings remain editable without reinstalling.
 
 ### Performance
 
