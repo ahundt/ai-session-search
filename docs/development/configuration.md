@@ -242,14 +242,14 @@ destinations. Canonical skills and the Codex marketplace remain beside the selec
 
 | Environment | Automatic destination | Upstream evidence |
 | --- | --- | --- |
-| `CLAUDE_CONFIG_DIR=D` | Claude Code instructions and skills under `D`; MCP at `D/.claude.json`, with the `.mcp.json` compatibility file under `D`. Unset MCP remains `~/.claude.json`. Claude Desktop is independent. | [Claude directory](https://code.claude.com/docs/en/claude-directory) |
-| `CODEX_HOME=D` | Codex `D/config.toml` and `D/AGENTS.md`; skills remain `~/.agents/skills`. | [Codex home resolver, lines 11-22](https://github.com/openai/codex/blob/main/codex-rs/utils/home-dir/src/lib.rs#L11-L22), [skill discovery](https://learn.chatgpt.com/docs/build-skills) |
-| `GEMINI_CLI_HOME=D` | Gemini `D/.gemini`; Antigravity keeps its independent default. | [Home helper, lines 20-26](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts#L20-L26), [storage, lines 50-56](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/config/storage.ts#L50-L56) |
-| `PI_CODING_AGENT_DIR=D` | Pi uses tilde-expanded `D` directly. | [Pi config, lines 587-593](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/config.ts#L587-L593) |
-| `PRIME_AGENT_CODING_AGENT_DIR=D` | Prime uses tilde-expanded `D` directly. No Pi-variable fallback is applied to host discovery. | [Prime runtime, lines 50-59](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/prime-agent-runtime/src/rlm/mcp_base.py#L50-L59) |
-| `XDG_CONFIG_HOME=D` | OpenCode `D/opencode` and Kilo CLI `D/kilo` on every platform; fallback is `~/.config`, including macOS. Kilo extension storage is independent. | [xdg-basedir, lines 9-10](https://github.com/sindresorhus/xdg-basedir/blob/main/index.js#L9-L10), [OpenCode pinned implementation](https://github.com/anomalyco/opencode/blob/70881b2937fab1e425416659445875952730934a/packages/opencode/src/global/index.ts#L9), [Kilo storage](https://github.com/Kilo-Org/kilocode/blob/main/packages/kilo-jetbrains/README.md#dev-storage-isolation) |
-| Linux `FLATPAK_XDG_CONFIG_HOME=D` | Zed `D/zed`; otherwise `dirs::config_dir()/zed`, including its XDG handling. | [Zed paths, lines 111-129](https://github.com/zed-industries/zed/blob/main/crates/paths/src/paths.rs#L111-L129) |
-| `OPENCLAW_CONFIG_PATH`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME`, `OPENCLAW_PROFILE` | Explicit config path wins, then state directory + `openclaw.json`, then effective home + `.openclaw[-<profile>]/openclaw.json`. `default` selects the unsuffixed root. | [Config resolver, lines 222-231](https://github.com/openclaw/openclaw/blob/main/src/config/paths.ts#L222-L231), [state resolver, lines 20-49](https://github.com/openclaw/openclaw/blob/main/src/config/state-dir.ts#L20-L49), [profile rules](https://github.com/openclaw/openclaw/blob/main/src/cli/profile-utils.ts#L4-L33) |
+| `CLAUDE_CONFIG_DIR=D` | Claude Code instructions and skills under `D`; MCP at `D/.claude.json`, with the cleanup-only superseded `D/.mcp.json`. Unset MCP remains `~/.claude.json`. Claude Desktop is independent. | [Claude directory](https://code.claude.com/docs/en/claude-directory) |
+| `CODEX_HOME=D` | Codex `D/config.toml` and `D/AGENTS.md`; skills remain `~/.agents/skills`. | [Codex home resolver, lines 13-25](https://github.com/openai/codex/blob/d960b366941bf062adb4d43111e81b64507e8879/codex-rs/utils/home-dir/src/lib.rs#L13-L25), [skill discovery](https://learn.chatgpt.com/docs/build-skills) |
+| `GEMINI_CLI_HOME=D` | Gemini MCP and instructions use `D/.gemini`; aise keeps its shared skill link at `~/.agents/skills`. Antigravity is independent. | [Home helper, lines 20-26](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/utils/paths.ts#L20-L26), [storage, lines 50-56](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L50-L56) |
+| `PI_CODING_AGENT_DIR=D` | Pi uses tilde-expanded `D` directly for `mcp.json`, `AGENTS.md`, and `skills/`. | [Pi config, lines 629-636](https://github.com/earendil-works/pi/blob/c23b9ec1ef12a63573d739d4c294f81a377b7d57/packages/coding-agent/src/config.ts#L629-L636) |
+| `PRIME_AGENT_CODING_AGENT_DIR=D` | Prime uses tilde-expanded `D` directly for `settings.json`, `AGENTS.md`, and `skills/`. No Pi-variable fallback is applied to host discovery. | [Prime runtime, lines 56-66](https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/prime-agent-runtime/src/rlm/mcp_base.py#L56-L66) |
+| `XDG_CONFIG_HOME=D` | OpenCode `D/opencode` and Kilo CLI `D/kilo` on every platform; fallback is `~/.config`, including macOS. Kilo extension storage is independent. | [xdg-basedir, lines 9-10](https://github.com/sindresorhus/xdg-basedir/blob/4c068bce91132119b8590627ee51b70790551b80/index.js#L9-L10), [OpenCode pinned implementation](https://github.com/anomalyco/opencode/blob/70881b2937fab1e425416659445875952730934a/packages/opencode/src/global/index.ts#L9), [Kilo storage](https://github.com/Kilo-Org/kilocode/blob/b6a49d01c10d7e26c42a8a14b3441b7a1856c04c/packages/kilo-jetbrains/README.md#dev-storage-isolation) |
+| Linux `FLATPAK_XDG_CONFIG_HOME=D` | Zed `D/zed`; otherwise `dirs::config_dir()/zed`, including its XDG handling. | [Zed paths, lines 121-140](https://github.com/zed-industries/zed/blob/b5cd310b3b54dfc659fcc06453e6358843dfe216/crates/paths/src/paths.rs#L121-L140) |
+| `OPENCLAW_CONFIG_PATH`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME`, `OPENCLAW_PROFILE` | Explicit config path wins, then state directory + `openclaw.json`, then effective home + `.openclaw[-<profile>]/openclaw.json`. `default` selects the unsuffixed root. | [Config resolver, lines 226-246](https://github.com/openclaw/openclaw/blob/3651abf03ad802976e1a9a6fd46967ef96ef2e38/src/config/paths.ts#L226-L246), [state resolver, lines 20-49](https://github.com/openclaw/openclaw/blob/3651abf03ad802976e1a9a6fd46967ef96ef2e38/src/config/state-dir.ts#L20-L49), [profile rules](https://github.com/openclaw/openclaw/blob/3651abf03ad802976e1a9a6fd46967ef96ef2e38/src/cli/profile-utils.ts#L4-L33) |
 
 Empty environment values are unset, except Zed's Flatpak variable: upstream treats an explicitly
 empty value as a relative config root. For OpenClaw, aise trims whitespace and rejects malformed
@@ -258,12 +258,18 @@ working directory. Prime's upstream evidence covers runtime config access; host 
 has not been independently verified. OpenCode's cited implementation is pinned, and Kilo's root
 is documented upstream; these references do not establish conformance for every installed version.
 
+Aise keeps Gemini's shared skill link beside Codex's under the actual home directory, even when
+`GEMINI_CLI_HOME` is set. This is an aise policy: the pinned Gemini
+[agents-root resolver](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L63-L69)
+uses its [environment-aware home helper](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/utils/paths.ts#L23-L29),
+so that upstream build reads `D/.agents/skills`. Set Gemini's `skill_discovery_roots`
+to the actual path of that relocated `.agents/skills` directory.
+
 Persistent endpoint overrides are optional, with these concrete surface names and accepted fields:
 
 | Surfaces | Accepted fields |
 | --- | --- |
-| `claude-code`, `codex`, `gemini`, `antigravity` | `mcp_config`, `instruction_file`, `skill_discovery_roots` |
-| `pi`, `prime-agent` | `instruction_file`, `skill_discovery_roots` |
+| `claude-code`, `codex`, `gemini`, `antigravity`, `pi`, `prime-agent` | `mcp_config`, `instruction_file`, `skill_discovery_roots` |
 | `opencode` | `mcp_config`, `instruction_file` |
 | `claude-desktop`, `cursor`, `windsurf`, `vscode`, `zed`, `openclaw`, `kilocode`, `kilocode-extension` | `mcp_config` |
 

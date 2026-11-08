@@ -641,6 +641,20 @@ def test_internal_maintainer_skill_is_project_scoped_and_not_packaged() -> None:
     assert "maintain-ai-session-search" not in integrations
 
 
+def test_harness_environment_inventory_is_packaged_and_shared() -> None:
+    crate = ROOT / "rust/ai-session-search-core"
+    manifest = tomllib.loads((crate / "Cargo.toml").read_text(encoding="utf-8"))
+    assert "harness-environment.txt" in manifest["package"]["include"]
+    names = [line for line in (crate / "harness-environment.txt").read_text(encoding="utf-8").splitlines()
+             if line and not line.startswith("#")]
+    assert names and len(names) == len(set(names))
+    assert all(re.fullmatch(r"[A-Z][A-Z_]+", name) for name in names)
+    for relative in ("scripts/verify_upgrade_path.py", "tests/test_demo.py", "tests/test_mcp_consolidation.py"):
+        helper = (ROOT / relative).read_text(encoding="utf-8")
+        assert "harness-environment.txt" in helper
+        assert not any(f'"{name}"' in helper.split("HARNESS_ENVIRONMENT =", 1)[1].split(")\n\n", 1)[0] for name in names)
+
+
 def test_rust_crate_packages_the_release_benchmark_driver() -> None:
     """The published crate must retain the benchmark example used for RC comparisons."""
     manifest = tomllib.loads((ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8"))

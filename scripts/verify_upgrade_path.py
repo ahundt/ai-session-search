@@ -45,6 +45,13 @@ from collections.abc import Sequence
 
 from scripts.release_versions import PYTHON_RELEASE_VERSION, release_sort_key
 
+HARNESS_ENVIRONMENT = frozenset(
+    line.strip()
+    for line in (pathlib.Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/harness-environment.txt")
+    .read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+)
+
 PYPI_PROJECT_URL = "https://pypi.org/pypi/ai-session-search/json"
 # The oldest release an upgrade must work from without a manual step: the first one published.
 UPGRADE_FLOOR = "1.0.0rc1"
@@ -63,11 +70,7 @@ def _environment(home: pathlib.Path, executable_dir: pathlib.Path | None) -> dic
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("AI_SESSION_SEARCH_", "XDG_"))
-        and key not in {
-            "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR",
-            "PRIME_AGENT_CODING_AGENT_DIR", "FLATPAK_XDG_CONFIG_HOME", "OPENCLAW_CONFIG_PATH",
-            "OPENCLAW_STATE_DIR", "OPENCLAW_HOME", "OPENCLAW_PROFILE",
-        }
+        and key not in HARNESS_ENVIRONMENT
     }
     environment["HOME"] = str(home)
     environment["USERPROFILE"] = str(home)

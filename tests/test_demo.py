@@ -57,6 +57,13 @@ from typing import Final
 
 import pytest
 
+HARNESS_ENVIRONMENT = frozenset(
+    line.strip()
+    for line in (Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/harness-environment.txt")
+    .read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+)
+
 # Ensure stdout uses UTF-8 on Windows (cp1252 can't encode box-drawing chars).
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
@@ -1168,11 +1175,7 @@ def _mcp_demo_environment() -> dict[str, str]:
     return {
         **{
             key: value for key, value in DEMO_ENV.items()
-            if key not in {
-                "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR",
-                "PRIME_AGENT_CODING_AGENT_DIR", "FLATPAK_XDG_CONFIG_HOME", "OPENCLAW_CONFIG_PATH",
-                "OPENCLAW_STATE_DIR", "OPENCLAW_HOME", "OPENCLAW_PROFILE",
-            }
+            if key not in HARNESS_ENVIRONMENT
         },
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
