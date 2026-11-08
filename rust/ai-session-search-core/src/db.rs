@@ -6313,9 +6313,7 @@ fn store_parsed_messages(
         let boundary = &parsed.messages[(existing_count - 1) as usize];
         let stored_boundary = stored_message_keys(tx, &session.id, Some(boundary.seq))?;
         if let Some((id, keys)) = stored_boundary.first() {
-            if keys.all_columns == parsed_message_keys(boundary).all_columns
-                && message_parts_match(tx, *id, boundary)?
-            {
+            if *keys == parsed_message_keys(boundary) && message_parts_match(tx, *id, boundary)? {
                 insert_messages(
                     tx,
                     session,
@@ -6340,12 +6338,7 @@ fn store_parsed_messages(
         )?;
         return Ok(false);
     }
-    if same_parser
-        && stored
-            .iter()
-            .map(|(_, keys)| keys.all_columns)
-            .eq(parsed_keys.iter().map(|keys| keys.all_columns))
-    {
+    if same_parser && stored.iter().map(|(_, keys)| keys).eq(parsed_keys.iter()) {
         let mut same_parts = true;
         for ((id, _), message) in stored.iter().zip(&parsed.messages) {
             if !message_parts_match(tx, *id, message)? {
@@ -6427,7 +6420,7 @@ fn store_parsed_messages(
             matched[position] = true;
             // A parser upgrade can change part attribution without changing message columns.
             if !same_parser
-                || stored[position].1.all_columns != keys.all_columns
+                || stored[position].1.columns_without_seq != keys.columns_without_seq
                 || !message_parts_match(tx, stored[position].0, message)?
             {
                 update_message_row(tx, stored[position].0, session, message)?;
@@ -6605,12 +6598,16 @@ type RowDigest = [u8; 32];
 /// - `role_and_content` decides whether a parse still holds a stored message, so text a new
 ///   message shares with a stored message of another role is not taken for it.
 /// - `correlation` is the provider-native identity used first during parser-upgrade repair.
-/// - `all_columns` covers message columns; mixed-message parts are compared separately because
-///   provider structure can change attribution without changing the rendered content.
+/// - `seq` participates in complete-source equality but not in-place archive repair: retained
+///   rows keep their archive coordinates even when the source's sequence shifts after pruning.
+/// - `columns_without_seq` covers other message columns; mixed-message parts are compared
+///   separately because provider structure can change attribution without changing content.
+#[derive(PartialEq, Eq)]
 struct MessageKeys {
     role_and_content: RowDigest,
     correlation: Option<RowDigest>,
-    all_columns: RowDigest,
+    seq: i64,
+    columns_without_seq: RowDigest,
 }
 
 /// The stored message columns the archive keys read; `None` is SQL NULL.
@@ -6638,8 +6635,7 @@ impl MessageColumns<'_> {
         let mut role_and_content = FramedSha256::new(b"aise-archive-message-role-v1");
         role_and_content.update_optional_str(self.role);
         role_and_content.update_bytes(&content);
-        let mut all_columns = FramedSha256::new(b"aise-archive-message-row-v1");
-        all_columns.update_i64(self.seq);
+        let mut columns_without_seq = FramedSha256::new(b"aise-archive-message-columns-v1");
         for value in [
             self.role,
             self.kind,
@@ -6654,10 +6650,10 @@ impl MessageColumns<'_> {
             self.input_origin,
             self.record_relation,
         ] {
-            all_columns.update_optional_str(value);
+            columns_without_seq.update_optional_str(value);
         }
-        all_columns.update_u8(u8::from(self.is_compaction));
-        all_columns.update_bytes(&content);
+        columns_without_seq.update_u8(u8::from(self.is_compaction));
+        columns_without_seq.update_bytes(&content);
         let correlation = match self.correlation {
             [Some(authority), Some(scope), Some(id)] => {
                 let mut digest = FramedSha256::new(b"aise-archive-message-correlation-v1");
@@ -6671,7 +6667,8 @@ impl MessageColumns<'_> {
         MessageKeys {
             role_and_content: role_and_content.finish_bytes(),
             correlation,
-            all_columns: all_columns.finish_bytes(),
+            seq: self.seq,
+            columns_without_seq: columns_without_seq.finish_bytes(),
         }
     }
 }
@@ -16816,6 +16813,68 @@ mod tests {
             2,
             "only the rewritten and new messages were inserted"
         );
+    }
+
+    #[test]
+    fn unchanged_archive_refresh_does_not_rewrite_shifted_source_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:archive-noop", &["archived", "retained"]),
+            1,
+            100,
+        )
+        .unwrap();
+        let mut shortened = parsed_with_messages("claude:archive-noop", &["retained"]);
+        db.upsert_session(&shortened, 2, 90).unwrap();
+        db.conn
+            .execute_batch(
+                "create temp table message_updates(id integer);
+                 create temp trigger count_updates after update on messages begin
+                     insert into message_updates values (new.id); end;",
+            )
+            .unwrap();
+        let update_count = || {
+            db.conn
+                .query_row("select count(*) from temp.message_updates", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+
+        db.upsert_session(&shortened, 3, 90).unwrap();
+        assert_eq!(update_count(), 0, "the retained row's archive seq stays 1");
+
+        shortened.messages[0].provenance.authorship = crate::models::MessageAuthorship::Human;
+        db.upsert_session(&shortened, 4, 90).unwrap();
+        assert_eq!(update_count(), 1, "actual attribution changes still repair");
+        db.upsert_session(&shortened, 5, 90).unwrap();
+        assert_eq!(update_count(), 1, "the repaired row is unchanged afterward");
+        assert_eq!(
+            db.message_count().unwrap(),
+            2,
+            "archive-only input survives"
+        );
+    }
+
+    #[test]
+    fn complete_source_sequence_changes_are_not_an_unchanged_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = parsed_with_messages("claude:new-sequences", &["first", "second"]);
+        db.upsert_session(&parsed, 1, 100).unwrap();
+        parsed.messages[0].seq = 17;
+        parsed.messages[1].seq = 300;
+        db.upsert_session(&parsed, 2, 100).unwrap();
+        let rows: Vec<(i64, String)> = db
+            .conn
+            .prepare("select seq, content from messages order by seq")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, [(17, "first".into()), (300, "second".into())]);
     }
 
     #[test]
