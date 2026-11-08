@@ -31,6 +31,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    existing precedence.
 5. `aise integrations install --no-index-preparation` installs integrations without starting
    background indexing. Omission keeps the existing preparation behavior.
+6. `aise config check` validates settings without opening the index and exits nonzero on unknown
+   keys. Doctor and JSON index status list ignored ordinary keys with spelling suggestions.
 
 ### Changed
 
@@ -161,6 +163,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 21. `aise config init` records CLI- or environment-selected database and cache paths instead
     of platform defaults. `aise package update` passes state selections to the replacement
     executable's skill refresh.
+22. Configs with newer ordinary keys load on 1.0.1 and later. Interactive CLI commands name ignored
+    keys on stderr; MCP serving emits no unknown-key warnings. Provider source restrictions, search
+    scope, hard search budgets, and purpose/policy tables still reject unknown keys with recovery
+    guidance. The released 1.0.0 binary remains strict: automatic upgrades never add active keys to
+    an existing config, and `config init` keeps new defaults commented.
 
 ### Performance
 

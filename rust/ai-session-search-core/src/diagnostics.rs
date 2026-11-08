@@ -104,6 +104,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
 
     Ok(DiagnosticStatus {
         db_path: normalize_path(&config.db_path()),
+        unknown_config_keys: config.unknown_config_keys.clone(),
         index_status,
         discovery_warnings,
         providers,

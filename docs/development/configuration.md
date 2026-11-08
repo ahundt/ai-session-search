@@ -81,8 +81,32 @@ Run `aise config show` to print the merged effective configuration. Run `aise co
 print the selected source for the config file, database, cache directory, worker threads, refresh
 policy, search scope, `search_messages_limit`, `max_tool_result_chars`, and each overridden
 client-limit row.
-Unknown TOML keys and invalid bounded values fail at resolution, so a typo cannot sit in the file
-looking applied.
+Invalid known values fail at resolution. Ordinary tables accept unknown keys from newer releases;
+loading collects their dotted paths without printing. `aise doctor` lists them with nearby spelling
+suggestions, and its JSON status and MCP `get_index_status` expose `unknown_config_keys` entries with
+`path` and nullable `suggestion`. An empty array means no keys were ignored. Interactive CLI commands
+print one stderr line naming ignored keys; `aise mcp serve` prints no warnings about them on either
+stream.
+
+Run `aise config check` to validate settings without opening the index or changing the file. It exits
+nonzero for invalid settings or unknown keys, even though ordinary commands can use a file containing
+unknown ordinary keys. Correct a typo using the suggestion, or upgrade aise to apply a future setting.
+
+Access-restricting tables stay strict: `[providers]` and `[providers.<name>]` select source disables
+and paths; `[search.scope]` authorizes reads; `[search.budgets]` limits exposed page/context content.
+Versioned `[search.purposes.<name>]` bundles and their `.preferences` tables also stay strict to
+preserve future restrictions; their current settings remain overridable preferences.
+An unknown key there fails closed with its key, table, and instructions to correct it or upgrade aise.
+Future access restrictions must live in these strict namespaces so older binaries cannot ignore them.
+
+## Config compatibility when upgrading
+
+From 1.0.1 onward, newer ordinary config keys do not prevent an older binary from loading the file.
+Unknown access restrictions still require a binary that understands them. The released 1.0.0 binary
+remains strict, including ordinary tables. Automatic startup and upgrade refresh never add active
+keys to an existing config. `aise config init` keeps new defaults commented and refuses to replace
+an existing file unless explicitly forced; only the existing database/cache path settings are active.
+Manually activating a new key can therefore make that file incompatible with 1.0.0.
 
 ## Resolver and write contract
 
@@ -316,8 +340,9 @@ Omitted fields inherit automatic paths. Detection inspects the resolved director
 
 Relative config paths resolve from the config file's parent. A leading `~` expands to the captured
 home; `$VAR` and `%VAR%` stay literal. Empty strings fail with an error naming the key and surface.
-Unsupported components and unknown fields also report the accepted fields. Older aise versions reject these new keys;
-remove the tables before running an older binary against the same config.
+Unsupported known components report the accepted fields. Unknown fields and future surface names
+follow the ordinary-key diagnostics above. The released 1.0.0 binary rejects these new keys;
+automatic upgrades preserve existing config files without adding them.
 
 Earlier install destinations are not remembered after environment/config changes; use the previous
 settings or additive path flags to manage them until a versioned manifest migration exists.

@@ -1693,6 +1693,7 @@ pub struct ProviderHealth {
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticStatus {
     pub db_path: String,
+    pub unknown_config_keys: Vec<crate::config::UnknownConfigKey>,
     #[serde(flatten)]
     pub index_status: IndexStatus,
     pub discovery_warnings: Vec<crate::source::ProviderDiscoveryWarning>,

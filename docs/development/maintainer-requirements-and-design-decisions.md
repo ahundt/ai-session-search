@@ -589,6 +589,33 @@ install each published release's integrations and printed config from `UPGRADE_F
 `scripts/verify_upgrade_path.py` on, run the new executable, and fail when anything would need a
 manual step.
 
+Starting with 1.0.1, ordinary config tables tolerate unknown keys from newer releases. Serde's
+ignored-field tracking collects dotted paths on `Config::unknown_config_keys`; loading prints
+nothing. Suggestions use serialized typed fields and existing registries, without a parallel list
+of valid keys. Doctor's human/JSON status and MCP `get_index_status` report these diagnostics;
+interactive CLI commands emit one stderr line. `aise config check` validates without opening the
+index or refreshing integrations and fails on unknown keys. MCP serving emits no unknown-key
+warnings on stdout or stderr.
+
+The following access-restricting tables retain `deny_unknown_fields`:
+
+| Table | Serde types | Reason to fail closed |
+| --- | --- | --- |
+| `[providers]` | `ProvidersFile`, `ProvidersConfig` | An unrecognized provider name could bypass a source disable or path restriction. |
+| `[providers.<name>]` | `ProviderFile`, `ProviderConfig` | `enabled` and `paths` determine which transcript sources may be read. |
+| `[search.scope]` | `SearchScopeConfig` | Mode and trusted roots authorize reads across surfaces. |
+| `[search.budgets]` | `SearchBudgetConfig` | Hard page/context ceilings restrict exposed content. |
+| `[search.purposes.<name>]` | `PurposeDefinition` | A versioned purpose/policy bundle must not silently lose a future restriction. |
+| `[search.purposes.<name>.preferences]` | `MessagePurposePreferences` | Context/evidence defaults remain overridable; strict parsing preserves future restrictions. |
+
+Strict errors name the key and table and direct the user to correct the spelling or upgrade aise
+to honor a future setting. Future access restrictions belong under these strict namespaces.
+The released 1.0.0 binary remains strict everywhere. Automatic startup/upgrade paths must never
+write new active keys into an existing config; `config init` keeps new defaults commented and
+activates only the existing database/cache paths. Explicit config replacement remains an explicit
+user action. Config, CLI, and process-lifecycle tests cover tolerance, strict failures, diagnostics,
+MCP protocol-only initialization/tools-list, and preservation of existing config bytes.
+
 ## P2 — maintainer execution
 
 ### REQ026-reproduce-material-claims

@@ -733,6 +733,10 @@ struct ExportArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
+    /// Validate resolved settings without opening the index. Exit nonzero on invalid values or
+    /// unknown keys; report nearby spellings. Does not change the config file. `aise config show`
+    /// prints the settings that result.
+    Check,
     /// Print the selected config file path without reading or creating the file.
     ///
     /// Use `aise config show` for the resolved values, or `aise config paths` for every path consulted.
@@ -978,6 +982,10 @@ fn execute(cli: Cli) -> Result<()> {
         crate::integrations::validate_harness_home(cli.harness_home.as_deref())?;
     }
     let skip_release_notification = cli.skip_release_notification;
+    let warn_unknown_keys = !matches!(
+        cli.command,
+        Commands::Mcp(_) | Commands::Config(ConfigCmd::Check)
+    ) && std::io::IsTerminal::is_terminal(&std::io::stderr());
     let overrides = ConfigOverrides {
         config_path: cli.config,
         database_path: cli.database,
@@ -1002,9 +1010,18 @@ fn execute(cli: Cli) -> Result<()> {
     }
     // Commands below that need the configuration reuse this one rather than reading the file
     // again; when it failed to load, resolving again reports the error as the command always has.
-    let mut resolve = || match resolved_early.take() {
-        Some(resolved) => Ok(resolved),
-        None => Config::resolve(overrides.clone()),
+    let mut resolve = || -> Result<ResolvedConfig> {
+        let resolved = match resolved_early.take() {
+            Some(resolved) => resolved,
+            None => Config::resolve(overrides.clone())?,
+        };
+        if warn_unknown_keys && !resolved.config.unknown_config_keys.is_empty() {
+            eprintln!(
+                "aise: ignored config keys: {}; run `aise config check`",
+                unknown_config_keys_text(&resolved.config)
+            );
+        }
+        Ok(resolved)
     };
     let command = match cli.command {
         Commands::Integrations(IntegrationsCmd::Install(args)) => {
@@ -1087,7 +1104,7 @@ fn execute(cli: Cli) -> Result<()> {
                 write_config_example(&resolved.config_path, args.force, &resolved.config)?;
                 return Ok(());
             }
-            ConfigCmd::Show(_) | ConfigCmd::Origins | ConfigCmd::Paths(_) => {}
+            ConfigCmd::Check | ConfigCmd::Show(_) | ConfigCmd::Origins | ConfigCmd::Paths(_) => {}
         }
     }
 
@@ -1552,6 +1569,7 @@ fn validate_root_options(cli: &Cli) -> Result<()> {
         Commands::Config(ConfigCmd::Example) => ("aise config example", NO_ROOT_OPTIONS),
         Commands::Config(ConfigCmd::Init(_)) => ("aise config init", CONFIG_DATABASE_AND_CACHE),
         Commands::Config(ConfigCmd::Show(_)) => ("aise config show", CONFIG_INPUTS),
+        Commands::Config(ConfigCmd::Check) => ("aise config check", CONFIG_INPUTS),
         Commands::Config(ConfigCmd::Origins) => ("aise config origins", CONFIG_INPUTS),
         Commands::Config(ConfigCmd::Paths(_)) => ("aise config paths", CONFIG_DATABASE_AND_CACHE),
         Commands::Db(_) => ("aise db", DATABASE_COMMAND_INPUTS),
@@ -1628,8 +1646,24 @@ fn run_migration(command: MigrationCmd) -> Result<()> {
     Ok(())
 }
 
+fn unknown_config_keys_text(config: &Config) -> String {
+    config
+        .unknown_config_keys
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
     match cmd {
+        ConfigCmd::Check => {
+            if !resolved.config.unknown_config_keys.is_empty() {
+                anyhow::bail!("unknown config keys in {}: {}; correct the spelling or upgrade aise to use future settings",
+                    resolved.config_path.display(), unknown_config_keys_text(&resolved.config));
+            }
+            println!("Config OK: {}", resolved.config_path.display());
+        }
         ConfigCmd::File => println!("{}", resolved.config_path.display()),
         ConfigCmd::Example => print!("{}", crate::config::CONFIG_EXAMPLE_TOML),
         ConfigCmd::Init(args) => {
@@ -2221,6 +2255,12 @@ fn print_doctor(
     let status = &diagnostics.index_status;
     let health = &diagnostics.providers;
     let warnings = status.parser_health.parse_warnings;
+    if !config.unknown_config_keys.is_empty() {
+        println!(
+            "Ignored config keys: {}; run `aise config check`",
+            unknown_config_keys_text(config)
+        );
+    }
     println!("DB: {}", config.db_path().display());
     let allocation = db.storage_allocation()?;
     println!(
