@@ -388,6 +388,27 @@ Zed, OpenCode, Codex TOML, Claude Markdown, Gemini/Antigravity Markdown,
 `AGENTS.md`, and recovery receipt locations; those flags configure
 integrations, not package ownership.
 
+Integration destinations follow the harness's environment automatically, including `CODEX_HOME`,
+`CLAUDE_CONFIG_DIR`, `GEMINI_CLI_HOME`, the Pi/Prime agent directories, XDG roots, and OpenClaw's
+config/state/profile variables. For a persistent unusual location, set a concrete surface's paths
+in the aise config:
+
+```toml
+[integrations.paths.codex]
+mcp_config = "profiles/work/config.toml"
+instruction_file = "profiles/work/AGENTS.md"
+skill_discovery_roots = ["shared/skills"]
+
+[integrations.paths.openclaw]
+mcp_config = "/srv/openclaw/team.json5"
+```
+
+Config paths replace automatic endpoints; the existing repeatable CLI path flags add extra targets.
+Relative config paths resolve beside the aise config, and skill roots are parent directories under
+which aise creates an `ai-session-search` link. Install, status, uninstall, and post-upgrade refresh
+share these settings. See [configuration](configuration.md#integration-installer-destinations-and-selectors)
+for precedence, supported fields, upstream environment semantics, and historical-destination limits.
+
 Managed client configurations and MCP initialization use the descriptive
 `ai-session-search` server identity and the human-readable title **AI Session Search**, while the
 single executable remains `aise`. Reinstall atomically replaces the historical

@@ -523,22 +523,8 @@ fn absolutize_transaction_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn normalize_transaction_path(path: &Path) -> Result<PathBuf> {
-    use std::path::Component;
-
     let absolute = absolutize_transaction_path(path)?;
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-    Ok(normalized)
+    Ok(crate::util::normalize_absolute_path(&absolute))
 }
 
 fn absolutize_change(mut change: TextFileChange) -> Result<TextFileChange> {

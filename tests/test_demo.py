@@ -1166,7 +1166,14 @@ def _mcp_demo_environment() -> dict[str, str]:
     )
 
     return {
-        **DEMO_ENV,
+        **{
+            key: value for key, value in DEMO_ENV.items()
+            if key not in {
+                "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR",
+                "PRIME_AGENT_CODING_AGENT_DIR", "FLATPAK_XDG_CONFIG_HOME", "OPENCLAW_CONFIG_PATH",
+                "OPENCLAW_STATE_DIR", "OPENCLAW_HOME", "OPENCLAW_PROFILE",
+            }
+        },
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "AI_SESSION_SEARCH_CONFIG": str(sandbox_config),

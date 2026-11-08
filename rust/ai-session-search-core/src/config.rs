@@ -1005,14 +1005,143 @@ pub struct IntegrationsConfig {
     /// that nobody has edited, once, from the first CLI command or MCP server start. Edits are
     /// never rewritten.
     pub refresh_after_upgrade: bool,
+    /// Replace automatic endpoints per concrete harness surface. CLI path flags remain additive.
+    #[serde(deserialize_with = "deserialize_integration_paths")]
+    pub paths: BTreeMap<IntegrationSurface, IntegrationPathOverrides>,
 }
 
 impl Default for IntegrationsConfig {
     fn default() -> Self {
         Self {
             refresh_after_upgrade: true,
+            paths: BTreeMap::new(),
         }
     }
+}
+
+/// Concrete integration surfaces, including compatibility clients sharing one CLI selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum IntegrationSurface {
+    ClaudeCode,
+    ClaudeDesktop,
+    Codex,
+    Gemini,
+    Antigravity,
+    Pi,
+    PrimeAgent,
+    Cursor,
+    Windsurf,
+    Vscode,
+    Zed,
+    Opencode,
+    Openclaw,
+    Kilocode,
+    KilocodeExtension,
+}
+
+impl IntegrationSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::ClaudeDesktop => "claude-desktop",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
+            Self::Pi => "pi",
+            Self::PrimeAgent => "prime-agent",
+            Self::Cursor => "cursor",
+            Self::Windsurf => "windsurf",
+            Self::Vscode => "vscode",
+            Self::Zed => "zed",
+            Self::Opencode => "opencode",
+            Self::Openclaw => "openclaw",
+            Self::Kilocode => "kilocode",
+            Self::KilocodeExtension => "kilocode-extension",
+        }
+    }
+
+    fn accepted_fields(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode | Self::Codex | Self::Gemini | Self::Antigravity => {
+                &["mcp_config", "instruction_file", "skill_discovery_roots"]
+            }
+            Self::Pi | Self::PrimeAgent => &["instruction_file", "skill_discovery_roots"],
+            Self::Opencode => &["mcp_config", "instruction_file"],
+            _ => &["mcp_config"],
+        }
+    }
+}
+
+/// Optional endpoint categories; validation permits only components that the surface supports.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct IntegrationPathOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_config: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction_file: Option<String>,
+    /// Parent directories. The integration resolver appends the managed package name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_discovery_roots: Option<Vec<String>>,
+}
+
+impl IntegrationPathOverrides {
+    pub(crate) fn validate(&self, surface: IntegrationSurface) -> Result<()> {
+        let name = surface.as_str();
+        for (key, present, empty) in [
+            (
+                "mcp_config",
+                self.mcp_config.is_some(),
+                self.mcp_config.as_deref().is_some_and(str::is_empty),
+            ),
+            (
+                "instruction_file",
+                self.instruction_file.is_some(),
+                self.instruction_file.as_deref().is_some_and(str::is_empty),
+            ),
+            (
+                "skill_discovery_roots",
+                self.skill_discovery_roots.is_some(),
+                self.skill_discovery_roots
+                    .as_ref()
+                    .is_some_and(|roots| roots.iter().any(String::is_empty)),
+            ),
+        ] {
+            if present && !surface.accepted_fields().contains(&key) {
+                bail!(
+                    "unsupported integrations.paths.{name}.{key}; accepted fields for {name}: {}",
+                    surface.accepted_fields().join(", ")
+                );
+            }
+            if empty {
+                bail!("integrations.paths.{name}.{key} requires a nonempty path; remove the key to use automatic paths");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_integration_paths<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<IntegrationSurface, IntegrationPathOverrides>, D::Error> {
+    let raw = BTreeMap::<IntegrationSurface, toml::Value>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(surface, value)| {
+            let paths: IntegrationPathOverrides = value.try_into().map_err(|error| {
+                serde::de::Error::custom(format!(
+                    "integrations.paths.{}: {error}; accepted fields for {}: {}",
+                    surface.as_str(),
+                    surface.as_str(),
+                    surface.accepted_fields().join(", ")
+                ))
+            })?;
+            paths.validate(surface).map_err(serde::de::Error::custom)?;
+            Ok((surface, paths))
+        })
+        .collect()
 }
 
 fn default_true() -> bool {
@@ -1787,6 +1916,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        for (surface, paths) in &self.integrations.paths {
+            paths.validate(*surface)?;
+        }
         const FIX: &str = "edit the invalid value in the config file; run `aise config example` \
                            to view the defaults (`aise config init --force` replaces the entire file)";
         if self.search.default_limit == 0 {
@@ -2251,6 +2383,15 @@ fn anchor_toml_paths(
     has_database_config: bool,
     has_cache_config: bool,
 ) {
+    for paths in config.integrations.paths.values_mut() {
+        anchor_optional_path(&mut paths.mcp_config, config_parent);
+        anchor_optional_path(&mut paths.instruction_file, config_parent);
+        if let Some(roots) = &mut paths.skill_discovery_roots {
+            for root in roots {
+                *root = anchored_path(root, config_parent);
+            }
+        }
+    }
     if has_database_config {
         anchor_optional_path(&mut config.index.db_path, config_parent);
     }
@@ -2284,7 +2425,12 @@ fn anchor_optional_path(value: &mut Option<String>, config_parent: &std::path::P
 
 fn anchored_path(value: &str, config_parent: &std::path::Path) -> String {
     let path = std::path::Path::new(value);
-    if value.is_empty() || value == "~" || value.starts_with("~/") || path.is_absolute() {
+    if value.is_empty()
+        || value == "~"
+        || value.starts_with("~/")
+        || (cfg!(windows) && value.starts_with("~\\"))
+        || path.is_absolute()
+    {
         value.to_string()
     } else {
         config_parent.join(path).to_string_lossy().into_owned()
@@ -3149,6 +3295,152 @@ mod tests {
                 toml::from_str::<Config>(removed).is_err(),
                 "removed prerelease correction settings must fail instead of being ignored"
             );
+        }
+    }
+
+    #[test]
+    fn integration_path_tables_parse_anchor_and_preserve_old_configs() {
+        let old: Config =
+            toml::from_str("[integrations]\nrefresh_after_upgrade = false\n").unwrap();
+        assert!(!old.integrations.refresh_after_upgrade);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[integrations.paths.codex]
+mcp_config = "work/config.toml"
+instruction_file = "~/work/AGENTS.md"
+skill_discovery_roots = ["shared/skills", "$VAR/literal", "%VAR%/literal"]
+[integrations.paths.openclaw]
+mcp_config = "team.json5"
+[integrations.paths.kilocode]
+mcp_config = "kilo.jsonc"
+"#,
+        )
+        .unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(path),
+                ..ConfigOverrides::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&resolved.config).unwrap();
+        let paths = &value["integrations"]["paths"];
+        assert_eq!(
+            paths["codex"]["mcp_config"],
+            dir.path().join("work/config.toml").to_str().unwrap()
+        );
+        assert_eq!(paths["codex"]["instruction_file"], "~/work/AGENTS.md");
+        assert_eq!(
+            paths["codex"]["skill_discovery_roots"][0],
+            dir.path().join("shared/skills").to_str().unwrap()
+        );
+        assert_eq!(
+            paths["codex"]["skill_discovery_roots"][1],
+            dir.path().join("$VAR/literal").to_str().unwrap()
+        );
+        assert_eq!(
+            paths["codex"]["skill_discovery_roots"][2],
+            dir.path().join("%VAR%/literal").to_str().unwrap()
+        );
+        assert_eq!(
+            paths["openclaw"]["mcp_config"],
+            dir.path().join("team.json5").to_str().unwrap()
+        );
+        let round_trip: Config =
+            toml::from_str(&toml::to_string(&resolved.config).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(round_trip.integrations).unwrap(),
+            value["integrations"]
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            anchored_path(r"~\work\AGENTS.md", dir.path()),
+            r"~\work\AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn integration_path_tables_reject_typos_unsupported_fields_and_empty_paths() {
+        for (surface, key, value, accepted) in [
+            ("codex", "mcp_confg", "'file'", "mcp_config"),
+            ("cursor", "instruction_file", "'AGENTS.md'", "mcp_config"),
+            ("pi", "mcp_config", "'file.json'", "instruction_file"),
+            (
+                "opencode",
+                "skill_discovery_roots",
+                "['skills']",
+                "instruction_file",
+            ),
+            ("codex", "mcp_config", "''", "nonempty"),
+            ("pi", "skill_discovery_roots", "['']", "nonempty"),
+        ] {
+            let input = format!("[integrations.paths.{surface}]\n{key} = {value}\n");
+            let error = toml::from_str::<Config>(&input).unwrap_err().to_string();
+            assert!(
+                error.contains(surface) && error.contains(key) && error.contains(accepted),
+                "{error}"
+            );
+        }
+        let error = toml::from_str::<Config>("[integrations.paths.codez]\nmcp_config='x'\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("codez") && error.contains("codex"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn integration_path_tables_accept_only_the_components_each_surface_has() {
+        for (surface, fields) in [
+            (
+                "claude-code",
+                &["mcp_config", "instruction_file", "skill_discovery_roots"][..],
+            ),
+            (
+                "codex",
+                &["mcp_config", "instruction_file", "skill_discovery_roots"][..],
+            ),
+            (
+                "gemini",
+                &["mcp_config", "instruction_file", "skill_discovery_roots"][..],
+            ),
+            (
+                "antigravity",
+                &["mcp_config", "instruction_file", "skill_discovery_roots"][..],
+            ),
+            ("pi", &["instruction_file", "skill_discovery_roots"][..]),
+            (
+                "prime-agent",
+                &["instruction_file", "skill_discovery_roots"][..],
+            ),
+            ("opencode", &["mcp_config", "instruction_file"][..]),
+            ("claude-desktop", &["mcp_config"][..]),
+            ("cursor", &["mcp_config"][..]),
+            ("windsurf", &["mcp_config"][..]),
+            ("vscode", &["mcp_config"][..]),
+            ("zed", &["mcp_config"][..]),
+            ("openclaw", &["mcp_config"][..]),
+            ("kilocode", &["mcp_config"][..]),
+            ("kilocode-extension", &["mcp_config"][..]),
+        ] {
+            for field in ["mcp_config", "instruction_file", "skill_discovery_roots"] {
+                let value = if field == "skill_discovery_roots" {
+                    "[]"
+                } else {
+                    "'endpoint'"
+                };
+                let input = format!("[integrations.paths.{surface}]\n{field} = {value}\n");
+                assert_eq!(
+                    toml::from_str::<Config>(&input).is_ok(),
+                    fields.contains(&field),
+                    "{surface}.{field}"
+                );
+            }
         }
     }
 
