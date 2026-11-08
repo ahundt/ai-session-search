@@ -17,6 +17,154 @@ use std::os::unix::fs::PermissionsExt as _;
 mod support;
 use support::aise;
 
+#[test]
+fn harness_home_and_registration_keep_selected_state_outside_the_parent_home() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let harness = root.path().join("harness");
+    let database = root.path().join("selected.db");
+    let cache = root.path().join("selected-cache");
+    let output = aise(root.path())
+        .env_remove("CODEX_HOME")
+        .args([
+            "--harness-home",
+            harness.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--database",
+            database.to_str().unwrap(),
+            "--cache-dir",
+            cache.to_str().unwrap(),
+            "integrations",
+            "install",
+            "--client",
+            "codex",
+            "--no-skill",
+            "--no-instructions",
+            "--no-aliases",
+            "--binary",
+            env!("CARGO_BIN_EXE_aise"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = fs::read_to_string(harness.join(".codex/config.toml")).unwrap();
+    let entry: toml::Value = toml::from_str(&text).unwrap();
+    let args = entry["mcp_servers"]["ai-session-search"]["args"]
+        .as_array()
+        .unwrap();
+    for path in [&config, &database, &cache] {
+        assert!(
+            args.iter().any(|arg| arg.as_str() == path.to_str()),
+            "{text}"
+        );
+    }
+    let registered: Vec<_> = args.iter().map(|arg| arg.as_str().unwrap()).collect();
+    let output = aise(&root.path().join("launcher"))
+        .env_clear()
+        .args(
+            registered[..registered.len() - 2]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|pair| pair[0] != "--harness-home")
+                .flat_map(|pair| pair.iter().copied()),
+        )
+        .args(["config", "paths", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(paths["database"], serde_json::json!(database));
+    let mut child = aise(&root.path().join("mcp-launcher"))
+        .env_clear()
+        .args(&registered)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"isolated-registration\",\"version\":\"1\"}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("search_messages"));
+    assert!(!root.path().join(".codex/config.toml").exists());
+}
+
+#[test]
+fn registration_keeps_config_file_database_selection_editable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let target = root.path().join("mcp.json");
+    let output = aise(root.path())
+        .env_remove("AI_SESSION_SEARCH_DATABASE")
+        .env_remove("AI_SESSION_SEARCH_CACHE_DIR")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "integrations",
+            "install",
+            "--client",
+            "codex",
+            "--exclude-client",
+            "codex",
+            "--json-mcp-config",
+            target.to_str().unwrap(),
+            "--no-aliases",
+            "--no-skill",
+            "--no-instructions",
+            "--binary",
+            env!("CARGO_BIN_EXE_aise"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    let args = entry["mcpServers"]["ai-session-search"]["args"]
+        .as_array()
+        .unwrap();
+    assert!(!args
+        .iter()
+        .any(|arg| arg == "--database" || arg == "--cache-dir"));
+    let changed = root.path().join("changed.db");
+    let mut document: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    document["index"]["db_path"] = toml::Value::String(changed.to_str().unwrap().to_string());
+    fs::write(&config, toml::to_string_pretty(&document).unwrap()).unwrap();
+    let args: Vec<_> = args[..args.len() - 2]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|pair| pair[0] != "--harness-home")
+        .flatten()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    let output = aise(&root.path().join("launcher"))
+        .env_clear()
+        .args(&args)
+        .args(["config", "paths", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(paths["database"], serde_json::json!(changed));
+}
+
 #[cfg(unix)]
 #[test]
 fn integrations_use_config_paths_and_keep_cli_extras_through_the_lifecycle() {

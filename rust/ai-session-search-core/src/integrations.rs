@@ -463,6 +463,7 @@ struct ClientLayout {
     canonical_skill_root: PathBuf,
     surfaces: Vec<ClientSurface>,
     environment: LayoutEnvironment,
+    registration: Option<RegistrationState>,
 }
 
 #[derive(Debug, Clone)]
@@ -595,17 +596,39 @@ impl ClientLayout {
         home: Option<PathBuf>,
         config: Option<PathBuf>,
         platform: ClientPlatform,
+        environment: &LayoutEnvironment,
+        selected: Option<&Path>,
     ) -> Result<Self> {
-        let home = home.ok_or_else(missing_home_error)?;
-        let config = config.unwrap_or_else(|| match platform {
-            ClientPlatform::Macos => home.join("Library/Application Support"),
-            ClientPlatform::Linux => home.join(".config"),
-            ClientPlatform::Windows => home.join("AppData/Roaming"),
+        let selected = selected.or_else(|| {
+            environment
+                .values
+                .get("AI_SESSION_SEARCH_HARNESS_HOME")
+                .map(Path::new)
         });
-        Self::from_environment(home, config, platform, &LayoutEnvironment::capture()?)
+        let home = if let Some(path) = selected {
+            let resolved = environment.expanded(path, home.as_deref().unwrap_or(Path::new("")));
+            if path.as_os_str().is_empty() || !resolved.is_absolute() {
+                bail!("--harness-home / AI_SESSION_SEARCH_HARNESS_HOME must resolve to a nonempty absolute directory, got {:?}; omit the setting for platform discovery or pass a directory for harness files", path);
+            }
+            resolved
+        } else {
+            home.ok_or_else(missing_home_error)?
+        };
+        let config = config
+            .filter(|_| selected.is_none())
+            .unwrap_or_else(|| match platform {
+                ClientPlatform::Macos => home.join("Library/Application Support"),
+                ClientPlatform::Linux => home.join(".config"),
+                ClientPlatform::Windows => home.join("AppData/Roaming"),
+            });
+        Self::from_environment(home, config, platform, environment)
     }
 
     fn discover() -> Result<Self> {
+        Self::discover_with_home(None)
+    }
+
+    fn discover_with_home(selected: Option<&Path>) -> Result<Self> {
         let platform = if cfg!(target_os = "macos") {
             ClientPlatform::Macos
         } else if cfg!(windows) {
@@ -613,7 +636,13 @@ impl ClientLayout {
         } else {
             ClientPlatform::Linux
         };
-        Self::from_discovered_dirs(dirs::home_dir(), dirs::config_dir(), platform)
+        Self::from_discovered_dirs(
+            dirs::home_dir(),
+            dirs::config_dir(),
+            platform,
+            &LayoutEnvironment::capture()?,
+            selected,
+        )
     }
 
     /// The single defaults table for MCP, instruction, discovery, and detection destinations.
@@ -752,6 +781,7 @@ impl ClientLayout {
             detect_binaries: binaries,
             superseded_paths,
             codex_marketplace: None,
+            registration: None,
         };
         let json = |label, path: PathBuf, roots: Vec<PathBuf>, binaries: Vec<&'static str>| {
             mcp(
@@ -1101,8 +1131,16 @@ impl ClientLayout {
             home,
             surfaces,
             environment: env.clone(),
+            registration: None,
         })
     }
+}
+
+pub(crate) fn validate_harness_home(selected: Option<&Path>) -> Result<()> {
+    if selected.is_some() || std::env::var_os("AI_SESSION_SEARCH_HARNESS_HOME").is_some() {
+        ClientLayout::discover_with_home(selected)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1118,6 +1156,60 @@ struct Target {
     /// Root of aise's own Codex plugin marketplace, set on the Codex user-config target once the
     /// aise app directory is known. Codex desktop's Plugins list shows only marketplace plugins.
     codex_marketplace: Option<PathBuf>,
+    registration: Option<RegistrationState>,
+}
+
+#[derive(Debug, Clone)]
+struct RegistrationState {
+    arguments: Vec<String>,
+    intended: std::collections::BTreeMap<String, String>,
+}
+
+impl RegistrationState {
+    fn from_resolved(
+        resolved: &crate::config::ResolvedConfig,
+        layout: &ClientLayout,
+        selected_home: bool,
+    ) -> Result<Self> {
+        let mut state = Self {
+            arguments: Vec::new(),
+            intended: Default::default(),
+        };
+        for (flag, origin, path) in [
+            (
+                "--config",
+                resolved.origins.config.as_str(),
+                resolved.config_path.clone(),
+            ),
+            (
+                "--database",
+                resolved.origins.database.as_str(),
+                resolved.config.db_path(),
+            ),
+            (
+                "--cache-dir",
+                resolved.origins.cache.as_str(),
+                resolved.config.cache_dir(),
+            ),
+        ] {
+            let path = absolutize(&expand_tilde(&path)?)?;
+            let value = path.to_str().ok_or_else(|| anyhow!("MCP {flag} path {} is not valid UTF-8; pass a UTF-8 path before installing", path.display()))?.to_string();
+            state.intended.insert(flag.to_string(), value.clone());
+            if origin.starts_with("cli ") || origin.starts_with("environment ") {
+                state.arguments.extend([flag.to_string(), value]);
+            }
+        }
+        if selected_home {
+            let value = layout.home.to_str().ok_or_else(|| anyhow!("MCP --harness-home path {} is not valid UTF-8; pass a UTF-8 directory before installing", layout.home.display()))?.to_string();
+            state
+                .intended
+                .insert("--harness-home".to_string(), value.clone());
+            state
+                .arguments
+                .extend(["--harness-home".to_string(), value]);
+        }
+        Ok(state)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1555,13 +1647,21 @@ fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) -> Result<()> {
 pub(crate) fn install_with_receipt(
     args: IntegrationInstallArgs,
     default_receipt: &Path,
-    config: &IntegrationsConfig,
+    resolved: &crate::config::ResolvedConfig,
+    harness_home: Option<&Path>,
 ) -> Result<IntegrationInstallOutcome> {
-    install_for_layout(
-        args,
-        default_receipt,
-        &ClientLayout::discover()?.with_config(config)?,
-    )
+    let mut layout = ClientLayout::discover_with_home(harness_home)?
+        .with_config(&resolved.config.integrations)?;
+    layout.registration = Some(RegistrationState::from_resolved(
+        resolved,
+        &layout,
+        harness_home.is_some()
+            || layout
+                .environment
+                .values
+                .contains_key("AI_SESSION_SEARCH_HARNESS_HOME"),
+    )?);
+    install_for_layout(args, default_receipt, &layout)
 }
 
 fn install_for_layout(
@@ -1572,6 +1672,9 @@ fn install_for_layout(
     let (mut targets, instruction_targets, mut skill_targets) =
         args.targets
             .resolve(args.no_instructions, args.no_skill, layout)?;
+    for target in &mut targets {
+        target.registration = layout.registration.clone();
+    }
     rebase_automatic_skill_roots(&mut skill_targets, default_receipt);
     attach_codex_marketplace(&mut targets, default_receipt);
     if args.no_mcp {
@@ -1893,11 +1996,12 @@ pub(crate) fn status_with_receipt(
     args: IntegrationStatusArgs,
     default_receipt: &Path,
     config: &IntegrationsConfig,
+    harness_home: Option<&Path>,
 ) -> Result<()> {
     status_for_layout(
         args,
         default_receipt,
-        &ClientLayout::discover()?.with_config(config)?,
+        &ClientLayout::discover_with_home(harness_home)?.with_config(config)?,
     )
 }
 
@@ -2093,11 +2197,12 @@ pub(crate) fn uninstall_with_receipt(
     args: IntegrationUninstallArgs,
     default_receipt: &Path,
     config: &IntegrationsConfig,
+    harness_home: Option<&Path>,
 ) -> Result<()> {
     uninstall_for_layout(
         args,
         default_receipt,
-        &ClientLayout::discover()?.with_config(config)?,
+        &ClientLayout::discover_with_home(harness_home)?.with_config(config)?,
     )
 }
 
@@ -2820,6 +2925,7 @@ fn custom_targets(
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             })
         })
         .chain(vscode_configs.iter().map(|path| {
@@ -2831,6 +2937,7 @@ fn custom_targets(
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             })
         }))
         .chain(zed_configs.iter().map(|path| {
@@ -2842,6 +2949,7 @@ fn custom_targets(
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             })
         }))
         .chain(opencode_configs.iter().map(|path| {
@@ -2853,6 +2961,7 @@ fn custom_targets(
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             })
         }))
         .chain(codex_configs.iter().map(|path| {
@@ -2864,6 +2973,7 @@ fn custom_targets(
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             })
         }))
         .collect()
@@ -3868,11 +3978,12 @@ pub(crate) enum InstructionRefresh {
 pub(crate) fn refresh_integrations_after_upgrade(
     receipt_path: &Path,
     config: &IntegrationsConfig,
+    harness_home: Option<&Path>,
 ) -> Result<UpgradeRefresh> {
     refresh_integrations_for_version(
         receipt_path,
         env!("CARGO_PKG_VERSION"),
-        Some(&ClientLayout::discover()?.with_config(config)?),
+        Some(&ClientLayout::discover_with_home(harness_home)?.with_config(config)?),
     )
 }
 
@@ -4057,8 +4168,10 @@ fn refresh_superseded_mcp_entries(
                                 )
                             })
                 });
-        let existing_binary =
-            superseded_entry_command(&target).or_else(|| codex_entry_without_marketplace(&target));
+        let existing_binary = superseded_entry(&target)
+            .as_ref()
+            .and_then(entry_command)
+            .or_else(|| codex_entry_without_marketplace(&target));
         let binary = match existing_binary {
             Some(binary) => binary,
             None if was_cli_only
@@ -4106,8 +4219,8 @@ fn codex_entry_without_marketplace(target: &Target) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The executable named by an aise entry left in a superseded place or entry shape, if any.
-fn superseded_entry_command(target: &Target) -> Option<String> {
+/// An aise entry left in a superseded place or entry shape, including its state and extensions.
+fn superseded_entry(target: &Target) -> Option<Value> {
     let layout = json_server_layout(target.format)?;
     let read = |path: &Path| {
         let text = read_optional_utf8_regular_file(path).ok().flatten()?;
@@ -4117,14 +4230,14 @@ fn superseded_entry_command(target: &Target) -> Option<String> {
         let root = read(path)?;
         std::iter::once(layout.container)
             .chain(layout.superseded.iter().copied())
-            .find_map(|keys| owned_entry_command(&root, keys))
+            .find_map(|keys| owned_entry(&root, keys).cloned())
     });
     in_old_files.or_else(|| {
         let root = read(&target.path)?;
         layout
             .superseded
             .iter()
-            .find_map(|keys| owned_entry_command(&root, keys))
+            .find_map(|keys| owned_entry(&root, keys).cloned())
             .or_else(|| {
                 let entry = json_container(&root, layout.container)?.get(SERVER_NAME)?;
                 // Earlier aise omitted the transport tag. Repair only that known shape;
@@ -4132,24 +4245,29 @@ fn superseded_entry_command(target: &Target) -> Option<String> {
                 (entry.get("type").is_none()
                     && json_entry_is_current(entry, ConfigFormat::JsonMcpServers)
                     && !json_entry_is_current(entry, target.format))
-                .then(|| owned_entry_command(&root, layout.container))
+                .then(|| owned_entry(&root, layout.container).cloned())
                 .flatten()
             })
     })
 }
 
-/// The command of aise's entry under `keys`: a string, or the first element of a command array.
-fn owned_entry_command(root: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+fn entry_command(entry: &Value) -> Option<String> {
+    let command = entry.get("command")?;
+    command
+        .as_str()
+        .or_else(|| command.as_array()?.first()?.as_str())
+        .filter(|command| !command.is_empty())
+        .map(str::to_string)
+}
+
+fn owned_entry<'a>(root: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     let servers = json_container(root, keys)?;
     std::iter::once(SERVER_NAME)
         .chain(LEGACY_SERVER_NAMES)
         .find_map(|name| {
-            let command = servers.get(name)?.get("command")?;
-            command
-                .as_str()
-                .or_else(|| command.as_array()?.first()?.as_str())
-                .filter(|command| !command.is_empty())
-                .map(str::to_string)
+            servers
+                .get(name)
+                .filter(|entry| entry_command(entry).is_some())
         })
 }
 
@@ -4325,13 +4443,14 @@ fn record_refreshed_version(receipt_path: &Path, version: &str) {
 pub(crate) fn refresh_integrations_after_upgrade_and_report(
     config: &crate::config::Config,
     config_path: &Path,
+    harness_home: Option<&Path>,
 ) {
     if !config.integrations.refresh_after_upgrade {
         return;
     }
     let receipt = default_transaction_receipt(config_path);
     let version = env!("CARGO_PKG_VERSION");
-    match refresh_integrations_after_upgrade(&receipt, &config.integrations) {
+    match refresh_integrations_after_upgrade(&receipt, &config.integrations, harness_home) {
         Ok(UpgradeRefresh::NotNeeded | UpgradeRefresh::Deferred) => {}
         Ok(UpgradeRefresh::Checked {
             skills,
@@ -4870,6 +4989,114 @@ fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
     }
 }
 
+const STATE_OPTIONS: &[(&str, &str)] = &[
+    ("--config", "AI_SESSION_SEARCH_CONFIG"),
+    ("--database", "AI_SESSION_SEARCH_DATABASE"),
+    ("--cache-dir", "AI_SESSION_SEARCH_CACHE_DIR"),
+    ("--harness-home", "AI_SESSION_SEARCH_HARNESS_HOME"),
+];
+
+fn selected_arguments(args: &[Value]) -> Vec<(String, String)> {
+    let mut selected = Vec::new();
+    let mut args = args.iter().filter_map(Value::as_str);
+    while let Some(arg) = args.next() {
+        for (flag, _) in STATE_OPTIONS {
+            if arg == *flag {
+                if let Some(value) = args.next() {
+                    selected.push((flag.to_string(), value.to_string()));
+                }
+                break;
+            }
+            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                selected.push((flag.to_string(), value.to_string()));
+                break;
+            }
+        }
+    }
+    selected
+}
+
+fn merge_registration_arguments(
+    path: &Path,
+    old: Option<&Value>,
+    entry: &mut Value,
+    state: Option<&RegistrationState>,
+) -> Result<()> {
+    let intended = |flag: &str| state.and_then(|state| state.intended.get(flag));
+    let check = |key: &str, flag: &str, retained: &str| -> Result<()> {
+        if let Some(wanted) = intended(flag) {
+            if retained != wanted {
+                bail!("{} server {SERVER_NAME} key {key} retains {retained:?}, which conflicts with intended {flag} {wanted:?}; remove or align {key} in that file, then rerun `aise integrations install`", path.display());
+            }
+        }
+        Ok(())
+    };
+    if let Some(env) = old.and_then(|old| old.get("env")) {
+        let env = env.as_object().ok_or_else(|| {
+            anyhow!(
+                "{} server {SERVER_NAME} env must be an object; correct it before reinstalling",
+                path.display()
+            )
+        })?;
+        for (flag, expected_key) in STATE_OPTIONS {
+            for (key, retained) in env.iter().filter(|(key, _)| {
+                key.as_str() == *expected_key
+                    || (cfg!(windows) && key.eq_ignore_ascii_case(expected_key))
+            }) {
+                let retained = retained.as_str().ok_or_else(|| anyhow!("{} server {SERVER_NAME} env.{key} must be a path string; correct it before reinstalling", path.display()))?;
+                check(&format!("env.{key}"), flag, retained)?;
+            }
+        }
+    }
+    let old_args = old
+        .and_then(|old| {
+            old.get("args")
+                .or_else(|| old.get("command").filter(|value| value.is_array()))
+        })
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut selections = selected_arguments(old_args);
+    let entry_args = entry
+        .get("args")
+        .or_else(|| entry.get("command").filter(|value| value.is_array()))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for (flag, value) in selected_arguments(entry_args) {
+        if !selections.iter().any(|(existing, _)| existing == &flag) {
+            selections.push((flag, value));
+        }
+    }
+    let argument_key = if old.is_some_and(|old| old.get("args").is_some()) {
+        "args"
+    } else {
+        "command"
+    };
+    for (flag, retained) in &selections {
+        check(&format!("{argument_key} ({flag})"), flag, retained)?;
+    }
+    if let Some(state) = state {
+        for pair in state.arguments.as_chunks::<2>().0.iter() {
+            selections.retain(|(flag, _)| flag != &pair[0]);
+            selections.push((pair[0].clone(), pair[1].clone()));
+        }
+    }
+    let mut args: Vec<Value> = selections
+        .into_iter()
+        .flat_map(|(flag, value)| [Value::String(flag), Value::String(value)])
+        .collect();
+    args.extend([json!("mcp"), json!("serve")]);
+    if entry["command"].is_array() {
+        let binary = entry["command"][0].clone();
+        args.insert(0, binary);
+        entry["command"] = Value::Array(args);
+    } else {
+        entry["args"] = Value::Array(args);
+    }
+    Ok(())
+}
+
 /// The same client configuration at one of `target`'s superseded paths.
 fn superseded_targets(target: &Target) -> impl Iterator<Item = Target> + '_ {
     target.superseded_paths.iter().map(|path| Target {
@@ -4890,10 +5117,32 @@ fn plan_remove_superseded(target: &Target) -> Result<Vec<PlannedFileMutation>> {
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
     let binary = binary_config_value(binary)?;
     let mut mutations = match target.format {
-        ConfigFormat::CodexToml => {
-            plan_upsert_codex_mcp_server(&target.path, binary, target.codex_marketplace.as_deref())?
+        ConfigFormat::CodexToml => plan_upsert_codex_mcp_server(
+            &target.path,
+            binary,
+            target.codex_marketplace.as_deref(),
+            target.registration.as_ref(),
+        )?,
+        format => {
+            let previous = superseded_entry(target);
+            let mut entry = json_server_entry(format, binary);
+            merge_registration_arguments(
+                &target.path,
+                previous.as_ref(),
+                &mut entry,
+                target.registration.as_ref(),
+            )?;
+            if let Some(Value::Object(mut previous)) = previous {
+                previous.extend(entry.as_object().unwrap().clone());
+                entry = Value::Object(previous);
+            }
+            plan_upsert_json_server_with_state(
+                &target.path,
+                format,
+                entry,
+                target.registration.as_ref(),
+            )?
         }
-        format => plan_upsert_json_server(&target.path, format, json_server_entry(format, binary))?,
     };
     mutations.extend(plan_remove_superseded(target)?);
     Ok(mutations)
@@ -5097,29 +5346,73 @@ fn jsonc_content(root: &jsonc_parser::cst::CstRootNode) -> String {
     content
 }
 
+#[cfg(test)]
 fn plan_upsert_json_server(
     path: &Path,
     format: ConfigFormat,
     entry: Value,
 ) -> Result<Vec<PlannedFileMutation>> {
+    plan_upsert_json_server_with_state(path, format, entry, None)
+}
+
+fn plan_upsert_json_server_with_state(
+    path: &Path,
+    format: ConfigFormat,
+    mut entry: Value,
+    state: Option<&RegistrationState>,
+) -> Result<Vec<PlannedFileMutation>> {
     let layout = json_layout_for(format)?;
     let original = read_optional_utf8_regular_file(path)?;
-    parse_json_object_or_empty(path, original.as_deref(), layout.syntax)?;
+    let parsed = parse_json_object_or_empty(path, original.as_deref(), layout.syntax)?;
+    let old = json_container(&parsed, layout.container)
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .or_else(|| owned_entry(&parsed, layout.container))
+        .or_else(|| {
+            layout
+                .superseded
+                .iter()
+                .find_map(|keys| owned_entry(&parsed, keys))
+        });
+    merge_registration_arguments(path, old, &mut entry, state)?;
     let document = jsonc_document(path, original.as_deref(), layout.syntax)?;
     let root = document.object_value_or_set();
     clear_superseded_jsonc_servers(path, &root, &layout)?;
     let servers = jsonc_container(path, &root, layout.container, true)?
         .expect("create inserts every missing container");
+    if servers.get(SERVER_NAME).is_none() {
+        if let Some(Value::Object(mut previous)) = old.cloned() {
+            previous.extend(entry.as_object().unwrap().clone());
+            entry = Value::Object(previous);
+        }
+    }
     for legacy_name in LEGACY_SERVER_NAMES {
         if let Some(property) = servers.get(legacy_name) {
             property.remove();
         }
     }
-    let value = jsonc_input(&entry);
     match servers.get(SERVER_NAME) {
-        Some(property) => property.set_value(value),
+        Some(property) => {
+            let object = property.value().and_then(|value| value.as_object()).ok_or_else(|| anyhow!("{} server {SERVER_NAME} must be an object; back it up and remove that entry before reinstalling", path.display()))?;
+            for (key, value) in entry.as_object().expect("generated entry is an object") {
+                if json_container(&parsed, layout.container)
+                    .and_then(|servers| servers.get(SERVER_NAME))
+                    .and_then(|entry| entry.get(key))
+                    == Some(value)
+                {
+                    continue;
+                }
+                match object.get(key) {
+                    Some(field) => {
+                        field.set_value(jsonc_input(value));
+                    }
+                    None => {
+                        object.append(key, jsonc_input(value));
+                    }
+                }
+            }
+        }
         None => {
-            servers.append(SERVER_NAME, value);
+            servers.append(SERVER_NAME, jsonc_input(&entry));
         }
     }
     Ok(vec![planned_write(
@@ -5156,7 +5449,7 @@ fn plan_remove_json_server(path: &Path, format: ConfigFormat) -> Result<Vec<Plan
 fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
     let binary = binary_config_value(binary)?;
     publish_planned_mutations(&normalize_planned_mutations(plan_upsert_codex_mcp_server(
-        path, binary, None,
+        path, binary, None, None,
     )?)?)
 }
 
@@ -5164,9 +5457,19 @@ fn plan_upsert_codex_mcp_server(
     path: &Path,
     binary: &str,
     marketplace: Option<&Path>,
+    state: Option<&RegistrationState>,
 ) -> Result<Vec<PlannedFileMutation>> {
     let original = read_optional_utf8_regular_file(path)?;
     let text = original.as_deref().unwrap_or_default();
+    let parsed: toml::Value = toml::from_str(text)
+        .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
+    let old = parsed
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .map(serde_json::to_value)
+        .transpose()?;
+    let mut entry = json_server_entry(ConfigFormat::CodexToml, binary);
+    merge_registration_arguments(path, old.as_ref(), &mut entry, state)?;
     let mut document = parse_codex_document(path, text)?;
     let servers = document
         .entry("mcp_servers")
@@ -5178,15 +5481,21 @@ fn plan_upsert_codex_mcp_server(
                 path.display()
             )
         })?;
-    let mut server = toml_edit::Table::new();
-    server.insert("command", toml_edit::value(binary));
-    let mut args = toml_edit::Array::new();
-    args.extend(["mcp", "serve"]);
-    server.insert("args", toml_edit::value(args));
     for legacy_name in LEGACY_SERVER_NAMES {
         servers.remove(legacy_name);
     }
-    servers.insert(SERVER_NAME, toml_edit::Item::Table(server));
+    let server = servers.entry(SERVER_NAME).or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new())).as_table_like_mut()
+        .ok_or_else(|| anyhow!("{} server {SERVER_NAME} must be a table; back it up and remove that entry before reinstalling", path.display()))?;
+    server.insert("command", toml_edit::value(binary));
+    let mut args = toml_edit::Array::new();
+    args.extend(
+        entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap()),
+    );
+    server.insert("args", toml_edit::value(args));
     let mut mutations = Vec::new();
     if let Some(root) = marketplace {
         let source = root.to_str().ok_or_else(|| {
@@ -5212,6 +5521,15 @@ fn plan_upsert_codex_mcp_server(
         entry.insert("source", toml_edit::value(source));
         marketplaces.insert(SERVER_NAME, toml_edit::Item::Table(entry));
         for (file, content) in codex_marketplace_files(root, binary)? {
+            if file.file_name().is_some_and(|name| name == ".mcp.json") {
+                mutations.extend(plan_upsert_json_server_with_state(
+                    &file,
+                    ConfigFormat::JsonMcpServers,
+                    json_server_entry(ConfigFormat::JsonMcpServers, binary),
+                    state,
+                )?);
+                continue;
+            }
             let original = read_optional_utf8_regular_file(&file)?;
             mutations.push(planned_write(&file, &original, content));
         }
@@ -5454,6 +5772,7 @@ fn parse_json_object_or_empty(
     }
 }
 
+#[cfg(test)]
 fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
     value.and_then(Value::as_array).is_some_and(|items| {
         items.len() == expected.len()
@@ -5462,6 +5781,33 @@ fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
                 .zip(expected)
                 .all(|(item, expected)| item.as_str() == Some(*expected))
     })
+}
+
+fn mcp_serve_arguments(args: &[Value]) -> bool {
+    let mut remaining = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.as_str() else {
+            return false;
+        };
+        if STATE_OPTIONS.iter().any(|(flag, _)| arg == *flag) {
+            if !args
+                .next()
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            {
+                return false;
+            }
+        } else if STATE_OPTIONS.iter().any(|(flag, _)| {
+            arg.strip_prefix(&format!("{flag}="))
+                .is_some_and(|value| !value.is_empty())
+        }) {
+            continue;
+        } else {
+            remaining.push(arg);
+        }
+    }
+    remaining == ["mcp", "serve"]
 }
 
 fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
@@ -5475,10 +5821,9 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
                     .get("command")
                     .and_then(Value::as_array)
                     .is_some_and(|command| {
-                        command.len() == 3
+                        !command.is_empty()
                             && command[0].as_str().is_some_and(|value| !value.is_empty())
-                            && command[1].as_str() == Some("mcp")
-                            && command[2].as_str() == Some("serve")
+                            && mcp_serve_arguments(&command[1..])
                     })
         }
         ConfigFormat::JsonMcpServers
@@ -5498,7 +5843,10 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
             ) || entry.get("type").and_then(Value::as_str) == Some("stdio");
             command_is_set
                 && type_is_valid
-                && json_array_is_strings(entry.get("args"), &["mcp", "serve"])
+                && entry
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .is_some_and(|args| mcp_serve_arguments(args))
         }
         ConfigFormat::CodexToml => false,
     }
@@ -5551,9 +5899,16 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
                     .and_then(toml_edit::Item::as_value)
                     .and_then(toml_edit::Value::as_array)
                     .is_some_and(|items| {
-                        items.len() == 2
-                            && items.get(0).and_then(toml_edit::Value::as_str) == Some("mcp")
-                            && items.get(1).and_then(toml_edit::Value::as_str) == Some("serve")
+                        mcp_serve_arguments(
+                            &items
+                                .iter()
+                                .map(|item| {
+                                    item.as_str()
+                                        .map(|value| json!(value))
+                                        .unwrap_or(Value::Null)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
                     }) =>
         {
             "configured"
@@ -5988,6 +6343,191 @@ fn missing_home_error() -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_home_precedence_and_validation_cover_all_platform_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("production");
+        let home = dir.path().join("selected");
+        let cli = dir.path().join("cli");
+        for platform in [
+            ClientPlatform::Macos,
+            ClientPlatform::Linux,
+            ClientPlatform::Windows,
+        ] {
+            let mut environment = LayoutEnvironment {
+                values: [(
+                    "AI_SESSION_SEARCH_HARNESS_HOME".into(),
+                    home.clone().into_os_string(),
+                )]
+                .into(),
+                cwd: dir.path().to_path_buf(),
+            };
+            for selected in [None, Some(cli.as_path())] {
+                let layout = ClientLayout::from_discovered_dirs(
+                    Some(real.clone()),
+                    Some(real.join("config")),
+                    platform,
+                    &environment,
+                    selected,
+                )
+                .unwrap();
+                let expected = selected.unwrap_or(&home);
+                assert_eq!(layout.home, expected);
+                assert_eq!(
+                    targets_for_layout(McpClient::Codex, &layout)[0].path,
+                    expected.join(".codex/config.toml")
+                );
+            }
+            environment
+                .values
+                .insert("AI_SESSION_SEARCH_HARNESS_HOME".into(), "".into());
+            let error = ClientLayout::from_discovered_dirs(
+                Some(real.clone()),
+                None,
+                platform,
+                &environment,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("omit the setting") && error.contains("pass a directory"),
+                "{error}"
+            );
+            assert!(ClientLayout::from_discovered_dirs(
+                Some(real.clone()),
+                None,
+                platform,
+                &environment,
+                Some(&cli)
+            )
+            .is_ok());
+            environment.values.clear();
+            environment.cwd = PathBuf::from("relative");
+            assert!(ClientLayout::from_discovered_dirs(
+                None,
+                None,
+                platform,
+                &environment,
+                Some(Path::new("relative"))
+            )
+            .is_err());
+        }
+        assert!(!real.exists());
+    }
+
+    #[test]
+    fn registration_pins_explicit_origins_and_rejects_retained_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[index]\ndb_path='first.db'\ncache_dir='cache'\n").unwrap();
+        let resolved = crate::config::Config::resolve_with_environment(
+            crate::config::ConfigOverrides {
+                config_path: Some(config.clone()),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .unwrap();
+        let layout = ClientLayout::new(
+            dir.path().to_path_buf(),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let state = RegistrationState::from_resolved(&resolved, &layout, false).unwrap();
+        assert_eq!(
+            state.arguments,
+            [
+                "--config".to_string(),
+                config.to_string_lossy().into_owned()
+            ]
+        );
+        let path = dir.path().join("mcp.json");
+        let original = r#"{"mcpServers":{"ai-session-search":{"command":"old","args":["mcp","serve"],"env":{"AI_SESSION_SEARCH_DATABASE":"/conflict","TEAM":"keep"},"timeout":42}}}"#;
+        fs::write(&path, original).unwrap();
+        let error = plan_upsert_json_server_with_state(
+            &path,
+            ConfigFormat::JsonMcpServers,
+            json_server_entry(ConfigFormat::JsonMcpServers, "new"),
+            Some(&state),
+        )
+        .unwrap_err()
+        .to_string();
+        for expected in [
+            path.to_str().unwrap(),
+            "env.AI_SESSION_SEARCH_DATABASE",
+            "/conflict",
+            "first.db",
+            "remove or align",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let mut old = json!({"command":"old","args":["--database=/conflict","mcp","serve"]});
+        let mut entry = json_server_entry(ConfigFormat::OpenCode, "new");
+        assert!(merge_registration_arguments(&path, Some(&old), &mut entry, Some(&state)).is_err());
+        old["args"] = json!(["--config", config, "mcp", "serve"]);
+        merge_registration_arguments(&path, Some(&old), &mut entry, Some(&state)).unwrap();
+        assert!(json_entry_is_current(&entry, ConfigFormat::OpenCode));
+        let mut target = targets_for_layout(McpClient::Codex, &layout).remove(0);
+        let marketplace = dir.path().join("marketplace");
+        target.codex_marketplace = Some(marketplace.clone());
+        target.registration = Some(state);
+        publish_planned_mutations(&plan_upsert_target(&target, Path::new("/bin/aise")).unwrap())
+            .unwrap();
+        let plugin = marketplace.join("plugins/ai-session-search/.mcp.json");
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&plugin).unwrap()).unwrap();
+        value["mcpServers"][SERVER_NAME]["env"] = json!({"TEAM":"keep"});
+        value["mcpServers"][SERVER_NAME]["extension"] = json!(42);
+        fs::write(&plugin, serde_json::to_string(&value).unwrap()).unwrap();
+        publish_planned_mutations(&plan_upsert_target(&target, Path::new("/bin/aise")).unwrap())
+            .unwrap();
+        let kept: Value = serde_json::from_str(&fs::read_to_string(&plugin).unwrap()).unwrap();
+        assert_eq!(kept["mcpServers"][SERVER_NAME]["env"]["TEAM"], "keep");
+        assert_eq!(kept["mcpServers"][SERVER_NAME]["extension"], 42);
+        value["mcpServers"][SERVER_NAME]["env"]["AI_SESSION_SEARCH_DATABASE"] = json!("/conflict");
+        fs::write(&plugin, serde_json::to_string(&value).unwrap()).unwrap();
+        let before = fs::read_to_string(&target.path).unwrap();
+        let plugin_before = fs::read_to_string(&plugin).unwrap();
+        let error = plan_upsert_target(&target, Path::new("/bin/other"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(plugin.to_str().unwrap())
+                && error.contains("env.AI_SESSION_SEARCH_DATABASE"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&target.path).unwrap(), before);
+        assert_eq!(fs::read_to_string(&plugin).unwrap(), plugin_before);
+    }
+
+    #[test]
+    fn reinstall_preserves_server_environment_and_extensions() {
+        let root = tempfile::tempdir().unwrap();
+        let json_path = root.path().join("mcp.json");
+        fs::write(&json_path, r#"{"mcpServers":{"ai-session-search":{"command":"old","args":["mcp","serve"],"env":{"TEAM":"keep"},"timeout":42}}}"#).unwrap();
+        upsert_json_mcp_server(
+            &json_path,
+            json_server_entry(ConfigFormat::JsonMcpServers, "new"),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"][SERVER_NAME]["env"]["TEAM"], "keep");
+        assert_eq!(value["mcpServers"][SERVER_NAME]["timeout"], 42);
+        let toml_path = root.path().join("config.toml");
+        fs::write(&toml_path, "[mcp_servers.ai-session-search]\ncommand='old'\nargs=['mcp','serve']\ntimeout=42\n[mcp_servers.ai-session-search.env]\nTEAM='keep'\n").unwrap();
+        upsert_codex_mcp_server(&toml_path, Path::new("new")).unwrap();
+        let value: toml::Value = toml::from_str(&fs::read_to_string(toml_path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcp_servers"][SERVER_NAME]["env"]["TEAM"].as_str(),
+            Some("keep")
+        );
+        assert_eq!(
+            value["mcp_servers"][SERVER_NAME]["timeout"].as_integer(),
+            Some(42)
+        );
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -6070,6 +6610,7 @@ mod tests {
             .filter(|token| {
                 token.contains('_') && token.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
             })
+            .chain(["AI_SESSION_SEARCH_HARNESS_HOME"])
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             captured, referenced,
@@ -6918,6 +7459,7 @@ mod tests {
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
             codex_marketplace: None,
+            registration: None,
         };
         assert_eq!(status_target(&target).unwrap(), "not configured");
 
@@ -7282,6 +7824,11 @@ mod tests {
             None,
             Some(PathBuf::from("/tmp/config")),
             ClientPlatform::Linux,
+            &LayoutEnvironment {
+                values: Default::default(),
+                cwd: PathBuf::from("/isolated"),
+            },
+            None,
         )
         .unwrap_err();
 
@@ -7391,6 +7938,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Path::new("/bin/aise"),
         )
@@ -7404,6 +7952,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Path::new("/bin/aise"),
         )
@@ -7449,6 +7998,7 @@ mod tests {
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
             codex_marketplace: None,
+            registration: None,
         };
         assert_eq!(status_target(&target).unwrap(), "stale");
 
@@ -7457,7 +8007,7 @@ mod tests {
         let data: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             data["mcp"]["servers"][SERVER_NAME],
-            json!({"type": "local", "command": ["/bin/aise", "mcp", "serve"]})
+            json!({"type": "local", "command": ["/bin/aise", "mcp", "serve"], "enabled": true})
         );
         assert!(data["mcp"].get(SERVER_NAME).is_none(), "flat entry moved");
         assert_eq!(data["mcp"]["user-server"]["command"][0], "user");
@@ -7483,6 +8033,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Target {
                 label: "vscode",
@@ -7492,6 +8043,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Target {
                 label: "zed",
@@ -7501,6 +8053,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Target {
                 label: "opencode",
@@ -7510,6 +8063,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Target {
                 label: "codex",
@@ -7519,6 +8073,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
         ];
 
@@ -7558,6 +8113,7 @@ mod tests {
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
             codex_marketplace: Some(root.clone()),
+            registration: None,
         };
         assert_eq!(status_target(&target).unwrap(), "not configured");
 
@@ -7798,6 +8354,7 @@ mod tests {
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
             codex_marketplace: None,
+            registration: None,
         };
         let binary = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/aise-\xff".to_vec()));
 
@@ -11343,6 +11900,7 @@ mod tests {
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
             codex_marketplace: None,
+            registration: None,
         };
 
         assert!(!target_detected(&target));
@@ -11361,6 +11919,7 @@ mod tests {
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
             codex_marketplace: None,
+            registration: None,
         };
 
         assert!(target_detected(&target));
@@ -11427,6 +11986,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Target {
                 label: "antigravity cli",
@@ -11436,6 +11996,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Target {
                 label: "antigravity legacy",
@@ -11445,6 +12006,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
             Target {
                 label: "opencode",
@@ -11454,6 +12016,7 @@ mod tests {
                 detect_binaries: Vec::new(),
                 superseded_paths: Vec::new(),
                 codex_marketplace: None,
+                registration: None,
             },
         ];
 
@@ -11505,6 +12068,7 @@ mod tests {
             detect_binaries: Vec::new(),
             superseded_paths: Vec::new(),
             codex_marketplace: None,
+            registration: None,
         }
     }
 
