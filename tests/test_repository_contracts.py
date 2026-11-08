@@ -649,10 +649,8 @@ def test_harness_environment_inventory_is_packaged_and_shared() -> None:
              if line and not line.startswith("#")]
     assert names and len(names) == len(set(names))
     assert all(re.fullmatch(r"[A-Z][A-Z_]+", name) for name in names)
-    for relative in ("scripts/verify_upgrade_path.py", "tests/test_demo.py", "tests/test_mcp_consolidation.py"):
-        helper = (ROOT / relative).read_text(encoding="utf-8")
-        assert "harness-environment.txt" in helper
-        assert not any(f'"{name}"' in helper.split("HARNESS_ENVIRONMENT =", 1)[1].split(")\n\n", 1)[0] for name in names)
+    from scripts.verify_harness_discovery import HARNESS_ENVIRONMENT
+    assert HARNESS_ENVIRONMENT == set(names)
 
 
 def test_rust_crate_packages_the_release_benchmark_driver() -> None:
@@ -924,17 +922,43 @@ def test_contributing_lists_the_release_headings_the_gate_enforces() -> None:
     assert f"{listed}, or `{NOTES_HEADINGS[-1]}`, in that order" in contributing
 
 
-def test_tests_never_run_aise_against_the_developers_real_state() -> None:
-    # Any aise command may run the post-upgrade skill refresh, which writes beside the resolved
-    # config file. A direct `cargo test` or `pytest` resolved the real ~/.ai-session-search and
-    # wrote there. Rust process tests spawn aise only through the isolated `aise()` builder, and
-    # every Python test gets its own config from tests/conftest.py.
-    process_tests = (ROOT / "rust/ai-session-search-core/tests/process_lifecycle.rs").read_text(encoding="utf-8")
-    assert process_tests.count('Command::new(env!("CARGO_BIN_EXE_aise"))') == 1, (
-        "spawn the binary with aise(), which isolates config and home, not Command::new"
+def test_runtime_environment_rejects_poisoned_state(tmp_path, monkeypatch) -> None:
+    from scripts.verify_harness_discovery import environment
+
+    production = tmp_path / "production"
+    production.mkdir()
+    sentinel = production / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    names = (ROOT / "rust/ai-session-search-core/harness-environment.txt").read_text().splitlines()
+    names += ["AI_SESSION_SEARCH_FUTURE_PATH", "OPENCLAW_FUTURE_PATH", "XDG_FUTURE_PATH",
+              "AI_SESSION_SEARCH_DATABASE", "AI_SESSION_SEARCH_CONFIG", "AI_SESSION_SEARCH_CACHE_DIR"]
+    for name in names:
+        if name and not name.startswith("#"):
+            monkeypatch.setenv(name, str(production))
+    from scripts.benchmark_release import hermetic_environment
+    from scripts.verify_upgrade_path import _environment as upgrade_environment
+    from tests.test_mcp_consolidation import _environment as mcp_environment
+    for builder in (environment, hermetic_environment, mcp_environment,
+                    lambda root: upgrade_environment(root, None)):
+        child_env = builder(tmp_path / builder.__name__)
+        assert str(production) not in child_env.values()
+    child_env = environment(tmp_path / "sandbox")
+    assert str(production) not in child_env.values()
+    config = tomllib.loads(Path(child_env["AI_SESSION_SEARCH_CONFIG"]).read_text())
+    assert all(not provider["enabled"] for provider in config["providers"].values())
+    assert config["skills"]["search_paths"] == []
+    subprocess.run(
+        [sys.executable, "-c", "import os; from ai_session_search import native; "
+         "s = native.SessionSearch(os.environ['AI_SESSION_SEARCH_DATABASE']); "
+         "assert s.list_sessions(native.SessionQuery(limit=1)) == []"],
+        env=child_env, check=True, capture_output=True, timeout=30,
     )
-    conftest = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
-    assert "autouse=True" in conftest and "AI_SESSION_SEARCH_CONFIG" in conftest
+    import shutil
+
+    from scripts.verify_installed_distribution import _verify_mcp_lifecycle
+    _verify_mcp_lifecycle(shutil.which("aise"), "aise", tmp_path, child_env, 30)
+    assert sentinel.read_text() == "unchanged"
+    assert list(production.iterdir()) == [sentinel]
 
 
 def test_the_upgrade_check_gates_verify_without_signing_rights() -> None:

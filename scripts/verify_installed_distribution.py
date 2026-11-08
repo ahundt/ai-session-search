@@ -19,6 +19,11 @@ import threading
 import time
 from typing import Any
 
+if not __package__:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from scripts.verify_harness_discovery import environment as isolated_environment
+
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
 MCP_PROTOCOL_VERSION = "2025-11-25"
 EXPECTED_COMMANDS = {
@@ -546,14 +551,15 @@ from pathlib import Path
 import ai_session_search._native as native
 print(Path(native.__file__).resolve())
 """
-    completed = _run_command(
-        sys.executable,
-        pathlib.Path(sys.executable).name,
-        ("-c", code),
-        source_root,
-        os.environ.copy(),
-        command_timeout_seconds,
-    )
+    with tempfile.TemporaryDirectory(prefix="aise-import-") as temporary:
+        completed = _run_command(
+            sys.executable,
+            pathlib.Path(sys.executable).name,
+            ("-c", code),
+            source_root,
+            isolated_environment(pathlib.Path(temporary)),
+            command_timeout_seconds,
+        )
     _require_success(pathlib.Path(sys.executable).name, ("-c", code), completed)
     lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
     if not lines:
@@ -611,11 +617,15 @@ def verify(
         config_path = root / "config" / "config.toml"
         config_path.parent.mkdir(parents=True)
         config_path.write_text("", encoding="utf-8")
-        os.environ["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
-        os.environ["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
-        verify_empty_native_index(root / "index.db")
-
-        environment = os.environ.copy()
+        environment = isolated_environment(root)
+        original_environment = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(environment)
+            verify_empty_native_index(root / "index.db")
+        finally:
+            os.environ.clear()
+            os.environ.update(original_environment)
         verify_configuration_contract(
             executable,
             executable_name,

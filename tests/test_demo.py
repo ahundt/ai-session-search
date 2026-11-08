@@ -50,19 +50,14 @@ import tempfile
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final
 
 import pytest
 
-HARNESS_ENVIRONMENT = frozenset(
-    line.strip()
-    for line in (Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/harness-environment.txt")
-    .read_text(encoding="utf-8").splitlines()
-    if line.strip() and not line.startswith("#")
-)
+from scripts.verify_harness_discovery import environment as isolated_environment
 
 # Ensure stdout uses UTF-8 on Windows (cp1252 can't encode box-drawing chars).
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -141,7 +136,7 @@ enabled = false
         encoding="utf-8",
     )
     return {
-        **os.environ,
+        **isolated_environment(state_root, config=config_path),
         "CLAUDE_CONFIG_DIR": str(claude_root),
         "AI_SESSION_SEARCH_CONFIG": str(config_path),
         "AI_SESSION_SEARCH_CACHE_DIR": str(state_root / "cache"),
@@ -149,9 +144,10 @@ enabled = false
     }
 
 
+_MCP_DEMO_ROOTS = ExitStack()
 _DEMO_RUNTIME = tempfile.TemporaryDirectory(prefix="aise-demo-runtime-")
 DEMO_ENV = _demo_environment(
-    Path(os.environ.get("CLAUDE_CONFIG_DIR", str(DEMO_DIR))),
+    DEMO_DIR,
     Path(_DEMO_RUNTIME.name),
 )
 
@@ -1152,9 +1148,7 @@ def _mcp_demo_environment() -> dict[str, str]:
     The config keeps the demo's provider settings, otherwise the background index
     preparation that install kicks off would walk the recording machine's real sessions.
     """
-    base = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
-    home = base / "aise-demo-home"
-    shutil.rmtree(home, ignore_errors=True)
+    home = Path(_MCP_DEMO_ROOTS.enter_context(tempfile.TemporaryDirectory(prefix="aise-demo-home-")))
 
     binary_dir = home / "bin"
     binary_dir.mkdir(parents=True, exist_ok=True)
@@ -1173,10 +1167,7 @@ def _mcp_demo_environment() -> dict[str, str]:
     )
 
     return {
-        **{
-            key: value for key, value in DEMO_ENV.items()
-            if key not in HARNESS_ENVIRONMENT
-        },
+        **isolated_environment(home, config=sandbox_config),
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "AI_SESSION_SEARCH_CONFIG": str(sandbox_config),

@@ -7,48 +7,15 @@ use std::io::Write as _;
 // `read_to_string` call sits in a `#[cfg(unix)]` test, so those two traits are dead on Windows.
 #[cfg(unix)]
 use std::io::{BufRead as _, Read as _};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 #[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
-/// The built `aise`, kept away from the developer's real state.
-///
-/// Any command may run the post-upgrade skill refresh, which reads and writes beside the resolved
-/// config file, and several commands read the home directory. `run_ci_local.sh` and CI export an
-/// isolated config, but a direct `cargo test` does not, and a spawned `aise` would then resolve
-/// the real `~/.ai-session-search`. Every spawn starts here with an empty config and a home of its
-/// own; a test's `--config`, `.env("HOME", ..)`, or `.env("AI_SESSION_SEARCH_CONFIG", ..)`
-/// replaces them.
-fn aise() -> Command {
-    static STATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    let state = STATE.get_or_init(|| tempfile::tempdir().unwrap()).path();
-    let home = state.join("home");
-    let config = state.join("config/config.toml");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(config.parent().unwrap()).unwrap();
-    if !config.exists() {
-        fs::write(&config, "").unwrap();
-    }
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aise"));
-    for key in include_str!("../harness-environment.txt")
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
-        command.env_remove(key);
-    }
-    command
-        .env("AI_SESSION_SEARCH_CONFIG", &config)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("APPDATA", home.join("AppData/Roaming"))
-        .env("LOCALAPPDATA", home.join("AppData/Local"));
-    command
-}
+mod support;
+use support::aise;
 
 #[cfg(unix)]
 #[test]
@@ -69,7 +36,7 @@ skill_discovery_roots = ["configured/skills"]
     fs::write(&config, &text).unwrap();
     let extra = root.path().join("extra.toml");
     let run = |args: &[&str]| {
-        aise()
+        aise(root.path())
             .env("HOME", &home)
             .env("CODEX_HOME", root.path().join("env-codex"))
             .env("AI_SESSION_SEARCH_CONFIG", &config)
@@ -177,7 +144,7 @@ fn integration_recovery_uses_its_receipt_when_ordinary_config_is_invalid() {
         .unwrap(),
     )
     .unwrap();
-    let recovered = aise()
+    let recovered = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -195,7 +162,7 @@ fn integration_recovery_uses_its_receipt_when_ordinary_config_is_invalid() {
     );
     assert_eq!(fs::read_to_string(&target).unwrap(), "before");
     assert!(!receipt.exists());
-    let status = aise()
+    let status = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -280,7 +247,7 @@ fn isolated_integration_install(
     fs::create_dir_all(&home).unwrap();
     let codex_config = home.join(".codex").join("config.toml");
     let executable = env!("CARGO_BIN_EXE_aise");
-    let mut command = aise();
+    let mut command = aise(root);
     command
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -317,7 +284,7 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
     let home = root.path().join("home");
     fs::create_dir_all(&home).unwrap();
 
-    let output = aise()
+    let output = aise(root.path())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .args([
@@ -353,7 +320,7 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
         .iter()
         .all(|descriptor| descriptor["rule"].is_string() && descriptor["message"].is_string()));
 
-    let mcp_output = aise()
+    let mcp_output = aise(root.path())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .args([
@@ -501,7 +468,7 @@ fn integration_install_with_no_selected_components_does_not_start_indexing() {
     let config = write_disabled_provider_config(root.path());
     let home = root.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let output = aise()
+    let output = aise(root.path())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("PATH", "")
@@ -566,7 +533,7 @@ fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let output = aise()
+    let output = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -611,7 +578,7 @@ fn the_registration_environment_sets_the_result_ceiling_of_the_server_it_launche
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
 
-    let output = aise()
+    let output = aise(root.path())
         .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", "12345")
         .args([
             "--config",
@@ -651,7 +618,7 @@ fn an_unusable_registration_ceiling_names_the_variable_and_its_accepted_range() 
     let config = write_disabled_provider_config(root.path());
 
     for unusable in ["0", "-1", "not-a-number"] {
-        let output = aise()
+        let output = aise(root.path())
             .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", unusable)
             .args([
                 "--config",
@@ -695,7 +662,7 @@ fn config_origins_explains_both_release_critical_mcp_bounds() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
 
-    let output = aise()
+    let output = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -731,7 +698,7 @@ fn inferred_skill_execution_uses_the_indexed_read_lifecycle_and_structured_repor
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let output = aise()
+    let output = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -777,8 +744,8 @@ fn inferred_skill_execution_uses_the_indexed_read_lifecycle_and_structured_repor
 fn skill_run_json_can_bound_classified_message_delivery() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
-    Command::new(executable)
+
+    aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap();
@@ -796,7 +763,7 @@ fn skill_run_json_can_bound_classified_message_delivery() {
     .unwrap();
     drop(conn);
 
-    let output = Command::new(executable)
+    let output = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -860,7 +827,7 @@ fn explicit_skill_path_runs_its_adjacent_typed_capability() {
     )
     .unwrap();
 
-    let output = aise()
+    let output = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -917,7 +884,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
     }
     let path = std::env::join_paths([&first, &second]).unwrap();
 
-    let config_output = aise()
+    let config_output = aise(root.path())
         .args(isolated_config_paths_args(root.path()))
         .env("PATH", &path)
         .output()
@@ -947,7 +914,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
         "{config_stdout}"
     );
 
-    let package_output = aise()
+    let package_output = aise(root.path())
         .args(["package", "status"])
         .env("PATH", &path)
         .output()
@@ -991,7 +958,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
 
     let mut config_json_args = isolated_config_paths_args(root.path());
     config_json_args.extend(["--format".into(), "json".into()]);
-    let config_json_output = aise()
+    let config_json_output = aise(root.path())
         .args(config_json_args)
         .env("PATH", &path)
         .output()
@@ -1024,7 +991,7 @@ fn config_paths_and_package_status_keep_separate_concepts() {
         ])
     );
 
-    let package_json_output = aise()
+    let package_json_output = aise(root.path())
         .args(["package", "status", "--format", "json"])
         .env("PATH", &path)
         .env("HTTPS_PROXY", "http://127.0.0.1:1")
@@ -1046,8 +1013,8 @@ fn config_paths_and_package_status_keep_separate_concepts() {
 #[test]
 fn short_reader_pipeline_never_prints_a_broken_pipe_panic() {
     let root = tempfile::tempdir().unwrap();
-    let executable = env!("CARGO_BIN_EXE_aise");
-    let mut child = Command::new(executable)
+
+    let mut child = aise(root.path())
         .args(isolated_config_paths_args(root.path()))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1074,9 +1041,8 @@ fn short_reader_pipeline_never_prints_a_broken_pipe_panic() {
 fn explicit_reindex_makes_a_new_empty_index_immediately_readable() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
 
-    let reindex = Command::new(executable)
+    let reindex = aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap();
@@ -1086,7 +1052,7 @@ fn explicit_reindex_makes_a_new_empty_index_immediately_readable() {
         String::from_utf8_lossy(&reindex.stderr)
     );
 
-    let list = Command::new(executable)
+    let list = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1110,9 +1076,8 @@ fn explicit_reindex_makes_a_new_empty_index_immediately_readable() {
 fn cli_full_reindex_promotes_v3_and_releases_exclusive_database_lock() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
 
-    let create = Command::new(executable)
+    let create = aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap();
@@ -1136,7 +1101,7 @@ fn cli_full_reindex_promotes_v3_and_releases_exclusive_database_lock() {
     .unwrap();
     drop(conn);
 
-    let promote = Command::new(executable)
+    let promote = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1188,10 +1153,9 @@ fn cli_full_reindex_promotes_v3_and_releases_exclusive_database_lock() {
 fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
 
     // Build an empty but healthy v4 index (creates messages_trigram + triggers).
-    let create = Command::new(executable)
+    let create = aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap();
@@ -1237,7 +1201,7 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
     drop(conn);
 
     // Writable search must self-heal and return the needle (no existing-only).
-    let search = Command::new(executable)
+    let search = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1309,8 +1273,8 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
 fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
-    let create = Command::new(executable)
+
+    let create = aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap();
@@ -1379,7 +1343,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         if field == "tool-argument" {
             args.extend(["--argument-path", "/cmd"]);
         }
-        let output = Command::new(executable).args(&args).output().unwrap();
+        let output = aise(root.path()).args(&args).output().unwrap();
         assert!(
             output.status.success(),
             "{field}/{mode}: {}",
@@ -1407,7 +1371,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         );
     }
 
-    let explained = Command::new(executable)
+    let explained = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1433,7 +1397,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(explain_stderr.contains("[explain]"), "{explain_stderr}");
     assert!(!explain_stderr.contains("[origins]"), "{explain_stderr}");
 
-    let full_receipt = Command::new(executable)
+    let full_receipt = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1462,7 +1426,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(full_stderr.contains("[origins]"), "{full_stderr}");
     assert!(full_stderr.contains("\"receipt_level\""), "{full_stderr}");
 
-    let first_page = Command::new(executable)
+    let first_page = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1487,7 +1451,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(first_stderr.contains("--offset 1"), "{first_stderr}");
     assert!(first_stderr.contains("--all-results"), "{first_stderr}");
 
-    let omitted_limit = Command::new(executable)
+    let omitted_limit = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1514,7 +1478,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(omitted_response["page"]["limit"].is_null());
     assert!(omitted_response["page"]["next_offset"].is_null());
 
-    let final_page = Command::new(executable)
+    let final_page = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1539,7 +1503,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     let final_stderr = String::from_utf8(final_page.stderr).unwrap();
     assert!(!final_stderr.contains("--offset 2"), "{final_stderr}");
 
-    let invalid = Command::new(executable)
+    let invalid = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1559,7 +1523,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(invalid.stdout.is_empty());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid regex"));
 
-    let ignored_argument_path = Command::new(executable)
+    let ignored_argument_path = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1582,7 +1546,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(String::from_utf8_lossy(&ignored_argument_path.stderr)
         .contains("argument_path requires field='tool_argument'"));
 
-    let jsonl = Command::new(executable)
+    let jsonl = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1636,7 +1600,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             && record.get("content_extent").is_none()
     }));
 
-    let context_plain = Command::new(executable)
+    let context_plain = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1680,7 +1644,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         "a row first observed as future context must be marked when it becomes a later anchor: {context_rows:?}"
     );
 
-    let materialized_context_plain = Command::new(executable)
+    let materialized_context_plain = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1713,8 +1677,8 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
 fn killing_active_read_only_query_releases_connection_and_preserves_writer_progress() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
-    let create = Command::new(executable)
+
+    let create = aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap();
@@ -1731,7 +1695,7 @@ fn killing_active_read_only_query_releases_connection_and_preserves_writer_progr
     .unwrap();
     drop(conn);
 
-    let mut child = Command::new(executable)
+    let mut child = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1783,8 +1747,8 @@ fn killing_active_read_only_query_releases_connection_and_preserves_writer_progr
 fn one_two_four_and_eight_cli_readers_return_identical_json_pages() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
-    assert!(Command::new(executable)
+
+    assert!(aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap()
@@ -1803,7 +1767,7 @@ fn one_two_four_and_eight_cli_readers_return_identical_json_pages() {
     drop(conn);
 
     let run = || {
-        Command::new(executable)
+        aise(root.path())
             .args([
                 "--config",
                 config.to_str().unwrap(),
@@ -1859,8 +1823,8 @@ fn one_two_four_and_eight_cli_readers_return_identical_json_pages() {
 fn a_reader_answers_while_another_process_holds_the_index_writer_lock() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
-    assert!(Command::new(executable)
+
+    assert!(aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap()
@@ -1893,7 +1857,7 @@ fn a_reader_answers_while_another_process_holds_the_index_writer_lock() {
         .write()
         .expect("nothing else holds the writer lock yet");
 
-    let mut reader = Command::new(executable)
+    let mut reader = aise(root.path())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1954,7 +1918,7 @@ fn a_reader_answers_while_another_process_holds_the_index_writer_lock() {
 fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
-    let executable = env!("CARGO_BIN_EXE_aise");
+
     let provider_bin = root.path().join("provider-bin");
     fs::create_dir_all(&provider_bin).unwrap();
     let codex = provider_bin.join("codex");
@@ -1966,7 +1930,7 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
         std::iter::once(provider_bin).chain(std::env::split_paths(&inherited_path)),
     )
     .unwrap();
-    let create = Command::new(executable)
+    let create = aise(root.path())
         .args(["--config", config.to_str().unwrap(), "reindex"])
         .output()
         .unwrap();
@@ -1983,7 +1947,7 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     .unwrap();
     drop(conn);
 
-    let mut child = Command::new(executable)
+    let mut child = aise(root.path())
         .env("PATH", provider_path)
         .args([
             "--config",
@@ -2026,7 +1990,7 @@ fn a_registration_ceiling_is_enforced_by_the_server_it_launched() {
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let mut child = aise()
+    let mut child = aise(root.path())
         .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", "1")
         .args(["--config", config.to_str().unwrap(), "mcp", "serve"])
         .stdin(Stdio::piped())
@@ -2083,8 +2047,8 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
-    let executable = env!("CARGO_BIN_EXE_aise");
-    let mut child = Command::new(executable)
+
+    let mut child = aise(root.path())
         .args(["--config", config.to_str().unwrap(), "mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2178,7 +2142,8 @@ fn skills_config(root: &std::path::Path) -> std::path::PathBuf {
 #[test]
 fn every_leaf_command_names_another_command() {
     fn help_of(path: &[&str]) -> String {
-        let output = aise().args(path).arg("--help").output().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let output = aise(root.path()).args(path).arg("--help").output().unwrap();
         assert!(
             output.status.success(),
             "`aise {} --help` failed: {}",
@@ -2282,7 +2247,8 @@ fn every_leaf_command_names_another_command() {
 #[test]
 fn value_taking_flags_state_a_default_or_what_omission_does() {
     fn help_of(path: &[&str]) -> String {
-        let output = aise().args(path).arg("--help").output().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let output = aise(root.path()).args(path).arg("--help").output().unwrap();
         String::from_utf8(output.stdout)
             .unwrap()
             .split("Shared options (parsed globally")
@@ -2424,7 +2390,8 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
 /// Dynamic capability help is ordinary successful help, not an operational failure.
 #[test]
 fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
-    let output = aise()
+    let root = tempfile::tempdir().unwrap();
+    let output = aise(root.path())
         .args(["skills", "corrections", "--help"])
         .env(
             "AI_SESSION_SEARCH_CONFIG",
@@ -2472,7 +2439,7 @@ fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
     );
     let config = skills_config(root.path());
 
-    let output = aise()
+    let output = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2534,7 +2501,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
     );
     let config = skills_config(root.path());
 
-    let valid = aise()
+    let valid = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2559,7 +2526,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
         "success must SAY it succeeded; an empty report reads as a broken command"
     );
 
-    let listed = aise()
+    let listed = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2590,7 +2557,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
     assert_eq!(team["package_version"], serde_json::json!("0.2.0"));
     assert_eq!(team["capability_sha256"].as_str().map(str::len), Some(64));
 
-    let built_in_show = aise()
+    let built_in_show = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2617,7 +2584,7 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
     );
 
     // And the selected catalog name reaches the typed capability execution path.
-    let execution = aise()
+    let execution = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2647,7 +2614,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
     let output_dir = root.path().join("skills");
     let skill_root = output_dir.join("my-rules");
 
-    let dry = aise()
+    let dry = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2668,7 +2635,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         "--dry-run must write nothing, and this is the assertion that proves it"
     );
 
-    let created = aise()
+    let created = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2696,7 +2663,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         "a scaffold is the caller's, so it must carry no managed marker"
     );
 
-    let again = aise()
+    let again = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2713,7 +2680,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         "creating over an existing directory could overwrite the caller's own files"
     );
 
-    let validated = aise()
+    let validated = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2729,7 +2696,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         String::from_utf8_lossy(&validated.stderr)
     );
 
-    let execution = aise()
+    let execution = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2759,7 +2726,7 @@ fn skill_run_json_names_selector_resolution_and_output_even_when_matches_are_emp
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
 
-    let output = aise()
+    let output = aise(root.path())
         .args([
             "--config",
             &config.display().to_string(),
@@ -2839,7 +2806,7 @@ fn skills_update_works_with_a_config_outside_the_default_location() {
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(&config, "").unwrap();
     let run = |args: &[&str]| {
-        aise()
+        aise(root.path())
             .env("HOME", &home)
             .env("AI_SESSION_SEARCH_CONFIG", &config)
             .env("AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION", "1")

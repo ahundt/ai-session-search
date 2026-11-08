@@ -55,6 +55,8 @@ use ai_session_search::service::MessageService;
 use ai_session_search::{MessageQuery, MessageSearchRequest, MessageTarget, RequestedExtent};
 use serde_json::{json, Value};
 
+mod support;
+
 const FIXTURE: &str = include_str!("fixtures/search_surface_parity.json");
 
 type Ids = Vec<(i64, String)>;
@@ -62,7 +64,6 @@ type Ids = Vec<(i64, String)>;
 struct Fixture {
     _dir: tempfile::TempDir,
     db_path: PathBuf,
-    home: PathBuf,
     config: PathBuf,
     spec: Value,
 }
@@ -74,7 +75,8 @@ fn fixture() -> Fixture {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(&config, "").unwrap();
+    let _ = support::aise(dir.path());
+    std::fs::copy(dir.path().join("isolated-config.toml"), &config).unwrap();
 
     let role = |name: &str| match name {
         "user" => Role::User,
@@ -177,7 +179,6 @@ fn fixture() -> Fixture {
     Fixture {
         _dir: dir,
         db_path,
-        home,
         config,
         spec,
     }
@@ -290,14 +291,9 @@ fn service_search(f: &Fixture, surface: SearchSurface, search: &Search) -> anyho
 }
 
 fn aise(f: &Fixture) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aise"));
+    let mut command = support::aise(f._dir.path());
     command
         .env("AI_SESSION_SEARCH_CONFIG", &f.config)
-        .env("HOME", &f.home)
-        .env("USERPROFILE", &f.home)
-        .env("XDG_CONFIG_HOME", f.home.join(".config"))
-        .env("APPDATA", f.home.join("AppData/Roaming"))
-        .env("LOCALAPPDATA", f.home.join("AppData/Local"))
         .arg("--database")
         .arg(&f.db_path);
     command

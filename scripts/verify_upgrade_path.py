@@ -44,13 +44,7 @@ import urllib.request
 from collections.abc import Sequence
 
 from scripts.release_versions import PYTHON_RELEASE_VERSION, release_sort_key
-
-HARNESS_ENVIRONMENT = frozenset(
-    line.strip()
-    for line in (pathlib.Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/harness-environment.txt")
-    .read_text(encoding="utf-8").splitlines()
-    if line.strip() and not line.startswith("#")
-)
+from scripts.verify_harness_discovery import environment as isolated_environment
 
 PYPI_PROJECT_URL = "https://pypi.org/pypi/ai-session-search/json"
 # The oldest release an upgrade must work from without a manual step: the first one published.
@@ -66,15 +60,7 @@ _POSSIBLE_CLIENTS = re.compile(r"\[possible values: ([^\]]+)\]")
 
 
 def _environment(home: pathlib.Path, executable_dir: pathlib.Path | None) -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("AI_SESSION_SEARCH_", "XDG_"))
-        and key not in HARNESS_ENVIRONMENT
-    }
-    environment["HOME"] = str(home)
-    environment["USERPROFILE"] = str(home)
-    environment["AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION"] = "1"
+    environment = isolated_environment(home)
     if executable_dir is not None:
         environment["PATH"] = f"{executable_dir}{os.pathsep}{environment.get('PATH', '')}"
     return environment

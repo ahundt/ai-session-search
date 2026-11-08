@@ -42,6 +42,28 @@ uv sync --locked --all-extras
 uv run maturin develop --uv        # build the native extension into the venv
 ```
 
+Launch development commands with the shared runtime environment builder. It selects separate
+config, database, cache, provider, skill, and harness roots. Keep the temporary directory alive
+until the command and its children exit:
+
+```bash
+uv run python - <<'PY'
+import subprocess
+import tempfile
+from pathlib import Path
+from scripts.verify_harness_discovery import environment
+
+with tempfile.TemporaryDirectory(prefix="aise-dev-") as temporary:
+    subprocess.run(["target/debug/aise", "config", "paths"],
+                   env=environment(Path(temporary)), check=True)
+PY
+```
+
+For persistent development state, pass a dedicated directory for this checkout to `environment`.
+Tests use this builder before collection and for each test; Rust process tests use
+`tests/support::aise` with a per-test temporary root. A bare development binary without this
+builder or explicit paths uses the normal production defaults.
+
 Focused checks while iterating:
 
 ```bash

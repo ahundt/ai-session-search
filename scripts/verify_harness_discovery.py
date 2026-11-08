@@ -71,7 +71,27 @@ def exit_code(statuses: Sequence[str]) -> int:
     return 0 if "passed" in statuses else 2
 
 
-def environment(home: pathlib.Path) -> dict[str, str]:
+HARNESS_ENVIRONMENT = frozenset(
+    line.strip()
+    for line in (pathlib.Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/harness-environment.txt")
+    .read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+)
+PROVIDERS = ("claude", "claude-desktop", "codex", "cursor", "antigravity",
+             "pi", "prime-agent", "aistudio", "gemini-cli")
+
+
+def environment(home: pathlib.Path, *, config: pathlib.Path | None = None) -> dict[str, str]:
+    """Build isolated runtime state; callers own the root until their children exit."""
+    home = home.resolve()
+    config = (config or home / "aise/config.toml").resolve()
+    config.parent.mkdir(parents=True, exist_ok=True)
+    if not config.exists() or not config.read_text(encoding="utf-8").strip():
+        config.write_text(
+            "[skills]\nsearch_paths = []\n" + "\n".join(
+                f"[providers.{provider}]\nenabled = false\npaths = []" for provider in PROVIDERS
+            ), encoding="utf-8",
+        )
     # An allowlist keeps API keys, auth tokens, and harness-specific overrides out of the proof.
     result = {key: value for key, value in os.environ.items() if key.upper() in {
         "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR",
@@ -85,13 +105,24 @@ def environment(home: pathlib.Path) -> dict[str, str]:
         "XDG_DATA_HOME": str(home / ".local/share"),
         "XDG_STATE_HOME": str(home / ".local/state"),
         "CODEX_HOME": str(home / ".codex"),
+        "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+        "GEMINI_CLI_HOME": str(home / "gemini"),
+        "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+        "PRIME_AGENT_CODING_AGENT_DIR": str(home / ".prime/agent"),
+        "FLATPAK_XDG_CONFIG_HOME": str(home / ".config"),
+        "OPENCLAW_CONFIG_PATH": str(home / ".openclaw/openclaw.json"),
+        "OPENCLAW_STATE_DIR": str(home / ".openclaw"),
+        "OPENCLAW_HOME": str(home),
+        "OPENCLAW_PROFILE": "aise-isolated",
         "OPENCODE_CONFIG": str(home / ".config/opencode/opencode.json"),
-        "AI_SESSION_SEARCH_CONFIG": str(home / "aise/config.toml"),
+        "AI_SESSION_SEARCH_CONFIG": str(config),
         "AI_SESSION_SEARCH_DATABASE": str(home / "index.db"),
         "AI_SESSION_SEARCH_CACHE_DIR": str(home / "cache"),
+        "AI_SESSION_SEARCH_HARNESS_HOME": str(home),
         "AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION": "1",
         "NO_COLOR": "1", "CI": "true",
     })
+    assert HARNESS_ENVIRONMENT <= result.keys()
     return result
 
 
@@ -145,7 +176,7 @@ def verify(executable: pathlib.Path, *, windows: bool) -> int:
         home = pathlib.Path(temporary).resolve()
         env = environment(home)
         config = pathlib.Path(env["AI_SESSION_SEARCH_CONFIG"])
-        config.parent.mkdir(parents=True)
+        config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text("\n".join(
             f"[providers.{provider}]\nenabled = false"
             for provider in ("claude", "claude-desktop", "codex", "cursor", "antigravity",
