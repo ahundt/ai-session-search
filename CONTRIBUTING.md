@@ -80,14 +80,20 @@ tests, and public-API doctests, the release executable and its MCP schema, the
 exact wheel and source distribution install pathways, and workflow syntax when
 `actionlint` is installed.
 
+It also runs the `rust-msrv` job's library-test build and API-consumer check when the minimum
+toolchain from `[workspace.package] rust-version` in `Cargo.toml` is installed. Both use the
+gate's target directory. A missing toolchain reports both checks as skipped and the exact
+`rustup toolchain install` command. Repository contract tests compare these commands with CI
+and its toolchain pin with the manifest.
+
 The hosted operating-system and Python matrices stay CI-owned. CI also runs the
 Rust portability suite on macOS and Windows, the Cargo registry/path/Git install
 pathways, `cargo deny check advisories licenses sources bans`, an offline
 `zizmor` workflow-security audit, and `actionlint` at a pinned version, so a
 workflow syntax error blocks the merge even when the local run skipped it.
 
-If you develop on macOS or Windows, you can run the same gate against Linux, and
-the MSRV check at its pinned toolchain, without waiting for CI:
+If you develop on macOS or Windows, you can run the same gate and the MSRV check
+against Linux without waiting for CI:
 
 ```bash
 ./scripts/linux_container_gate.sh                     # ./run_ci_local.sh on Linux

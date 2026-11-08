@@ -6,10 +6,13 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -1145,6 +1148,61 @@ def test_msrv_job_compiles_library_tests() -> None:
     msrv_job = workflow.split("  rust-msrv:\n", 1)[1].split("\n  rust-portability:", 1)[0]
 
     assert "cargo test -p ai-session-search --lib --locked --no-run" in msrv_job
+
+
+def test_local_gate_msrv_commands_match_the_required_ci_job() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    job = workflow.split("  rust-msrv:\n", 1)[1].split("\n  rust-portability:", 1)[0]
+    script = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+    assert "run_rust_msrv_checks() {" in script, "the local gate omits rust-msrv"
+    body = script.split("run_rust_msrv_checks() {\n", 1)[1].split("\n}\n", 1)[0]
+    hosted = re.findall(r"^      - run: (cargo .+)$", job, re.MULTILINE)
+    local = re.findall(r'cargo \+"\$msrv" (.+)$', body, re.MULTILINE)
+    assert [f"cargo {command}" for command in local] == hosted
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    version = workspace["workspace"]["package"]["rust-version"]
+    toolchain = version if version.count(".") == 2 else f"{version}.0"
+    assert f"toolchain: {toolchain}\n" in job
+    assert "\nrun_rust_msrv_checks\n" in script
+    assert "CARGO_TARGET_DIR" not in body
+
+
+@pytest.mark.parametrize("version", ["1.77", "1.77.0"])
+@pytest.mark.parametrize("installed,failed_command", [(False, ""), (True, ""), (True, "test"), (True, "check")])
+@pytest.mark.skipif(sys.platform == "win32", reason="the shell-function harness uses POSIX executable paths")
+def test_local_gate_msrv_runs_or_reports_an_actionable_skip(tmp_path: Path, version: str, installed: bool, failed_command: str) -> None:
+    script = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+    functions = "\n".join(f"{name}() {{\n" + script.split(f"{name}() {{\n", 1)[1].split("\n}\n", 1)[0] + "\n}" for name in ("step", "run_rust_msrv_checks"))
+    (tmp_path / "Cargo.toml").write_text(f'[workspace.package]\nrust-version = "{version}"\n', encoding="utf-8")
+    completed = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+set -uo pipefail
+RED= GREEN= YELLOW= BOLD= NC= FAILED_COUNT=0 PASSED_COUNT=0 SKIPPED_COUNT=0 FAILED_NAMES=
+uv() {{ shift 3; {shlex.quote(sys.executable)} "$@"; }}
+rustup() {{ [ "$*" = 'run 1.77.0 rustc --version' ] && {str(installed).lower()}; }}
+cargo() {{ printf 'cargo %s\n' "$*"; [ "${{2:-}}" != '{failed_command}' ]; }}
+{functions}
+run_rust_msrv_checks
+printf 'counts=%s,%s,%s\n' "$PASSED_COUNT" "$FAILED_COUNT" "$SKIPPED_COUNT"
+""",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    if installed:
+        assert "cargo +1.77.0 test -p ai-session-search --lib --locked --no-run" in completed.stdout
+        assert "cargo +1.77.0 check -p ai-session-search-api-consumer --lib --locked" in completed.stdout
+        assert f"counts={1 if failed_command else 2},{1 if failed_command else 0},0" in completed.stdout
+    else:
+        assert "SKIPPED: Rust MSRV 1.77.0" in completed.stdout
+        assert "rustup toolchain install 1.77.0 --profile minimal" in completed.stdout
+        assert "cargo +" not in completed.stdout
+        assert "counts=0,0,2" in completed.stdout
 
 
 # These three scripts import `scripts.release_versions`, so the repository root must be on

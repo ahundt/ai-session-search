@@ -39,6 +39,13 @@ manifests, dependencies, or tags before packaging starts.
 | Native archives | Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64 |
 | Rust | The workspace MSRV plus current stable Rust |
 
+`./run_ci_local.sh` runs both `rust-msrv` commands on the host when the minimum Rust toolchain
+declared by `[workspace.package] rust-version` in `Cargo.toml` is installed. It reuses the gate's
+target directory. Otherwise it reports both checks as skipped and the exact `rustup toolchain install`
+command, as it does for missing policy tools. `tests/test_repository_contracts.py` compares the
+local commands with the `rust-msrv` steps in `ci.yml` and its toolchain pin with the manifest.
+The container wrapper's `msrv` mode remains available for Linux coverage.
+
 Every pull request runs the complete Rust workspace and static-analysis gate on Linux, plus
 `cargo test -p ai-session-search --all-targets --locked` on native macOS and Windows runners.
 This exercises platform-specific filesystem, process, executable-discovery, installer, and path
