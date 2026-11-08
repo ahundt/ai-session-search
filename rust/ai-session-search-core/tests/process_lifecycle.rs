@@ -33,6 +33,20 @@ fn aise() -> Command {
         fs::write(&config, "").unwrap();
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_aise"));
+    for key in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "GEMINI_CLI_HOME",
+        "PI_CODING_AGENT_DIR",
+        "PRIME_AGENT_CODING_AGENT_DIR",
+        "FLATPAK_XDG_CONFIG_HOME",
+        "OPENCLAW_CONFIG_PATH",
+        "OPENCLAW_STATE_DIR",
+        "OPENCLAW_HOME",
+        "OPENCLAW_PROFILE",
+    ] {
+        command.env_remove(key);
+    }
     command
         .env("AI_SESSION_SEARCH_CONFIG", &config)
         .env("HOME", &home)
@@ -41,6 +55,166 @@ fn aise() -> Command {
         .env("APPDATA", home.join("AppData/Roaming"))
         .env("LOCALAPPDATA", home.join("AppData/Local"));
     command
+}
+
+#[cfg(unix)]
+#[test]
+fn integrations_use_config_paths_and_keep_cli_extras_through_the_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(
+        r#"
+[integrations.paths.codex]
+mcp_config = "configured/codex.toml"
+instruction_file = "configured/AGENTS.md"
+skill_discovery_roots = ["configured/skills"]
+"#,
+    );
+    fs::write(&config, &text).unwrap();
+    let extra = root.path().join("extra.toml");
+    let run = |args: &[&str]| {
+        aise()
+            .env("HOME", &home)
+            .env("CODEX_HOME", root.path().join("env-codex"))
+            .env("AI_SESSION_SEARCH_CONFIG", &config)
+            .env("AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION", "1")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let installed = run(&[
+        "integrations",
+        "install",
+        "--client",
+        "codex",
+        "--no-aliases",
+        "--binary",
+        env!("CARGO_BIN_EXE_aise"),
+        "--codex-config",
+        extra.to_str().unwrap(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let destination = root.path().join("configured/codex.toml");
+    assert!(
+        destination.is_file(),
+        "configured endpoint must replace the environment-derived target"
+    );
+    assert!(extra.is_file(), "CLI paths remain extra targets");
+    assert!(!root.path().join("env-codex/config.toml").exists());
+    assert!(!home.join(".codex/config.toml").exists());
+    let instruction = root.path().join("configured/AGENTS.md");
+    let skill = root.path().join("configured/skills/ai-session-search");
+    assert!(instruction.is_file() && skill.join("SKILL.md").is_file());
+    let status = run(&[
+        "integrations",
+        "status",
+        "--client",
+        "codex",
+        "--no-aliases",
+        "--format",
+        "json",
+        "--codex-config",
+        extra.to_str().unwrap(),
+    ]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let entries = status["integrations"].as_array().unwrap();
+    for path in [&destination, &instruction, &skill] {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["path"] == path.to_str().unwrap() && entry["current"] == true),
+            "{status}"
+        );
+    }
+    let uninstalled = run(&[
+        "integrations",
+        "uninstall",
+        "--client",
+        "codex",
+        "--keep-aliases",
+        "--codex-config",
+        extra.to_str().unwrap(),
+    ]);
+    assert!(
+        uninstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstalled.stderr)
+    );
+    assert!(!skill.exists());
+    assert!(!fs::read_to_string(&destination)
+        .unwrap()
+        .contains("[mcp_servers.ai-session-search]"));
+    assert!(!fs::read_to_string(&extra)
+        .unwrap()
+        .contains("[mcp_servers.ai-session-search]"));
+}
+
+#[test]
+fn integration_recovery_uses_its_receipt_when_ordinary_config_is_invalid() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        "[integrations.paths.cursor]\ninstruction_file='unsupported'\n",
+    )
+    .unwrap();
+    let target = root.path().join("interrupted.txt");
+    fs::write(&target, "after").unwrap();
+    let receipt = root.path().join("receipt.json");
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2, "phase": "prepared", "changes": [{
+                "path": {"encoding": "utf8", "units": target},
+                "before": {"text": "before"}, "after": {"text": "after"}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let recovered = aise()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "integrations",
+            "recover",
+            "--transaction-receipt",
+            receipt.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+    assert!(!receipt.exists());
+    let status = aise()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "integrations",
+            "status",
+            "--no-aliases",
+        ])
+        .output()
+        .unwrap();
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr)
+        .contains("integrations.paths.cursor.instruction_file"));
 }
 
 /// Every caller is a `#[cfg(unix)]` test, so this is dead on Windows.
@@ -371,31 +545,25 @@ fn integration_install_with_no_selected_components_does_not_start_indexing() {
 }
 
 #[test]
-fn integration_install_preserves_success_when_initial_indexing_is_postponed() {
+fn integration_install_rejects_invalid_config_before_writing() {
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("invalid-config.toml");
     fs::write(&config, "this is not valid TOML = [").unwrap();
 
     let output = isolated_integration_install(root.path(), &config, false);
     assert!(
-        output.status.success(),
-        "a post-install indexing failure must not roll back valid integration files: {}",
+        !output.status.success(),
+        "ordinary integration commands must validate configuration before writing: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        root.path().join("home/.codex/config.toml").is_file(),
-        "the successfully installed integration must remain in place"
+        !root.path().join("home/.codex/config.toml").exists(),
+        "invalid configuration must leave integration destinations untouched"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains(
-            "integration installation succeeded, but session index preparation could not start"
-        ),
-        "the warning must distinguish installed integrations from postponed indexing: {stderr}"
-    );
-    assert!(
-        stderr.contains("Fix the configuration") && stderr.contains("aise reindex"),
-        "the warning must give the smallest recovery action: {stderr}"
+        stderr.contains("failed to parse config file") && stderr.contains("invalid-config.toml"),
+        "the error must identify the invalid configuration: {stderr}"
     );
 }
 

@@ -995,21 +995,36 @@ fn execute(cli: Cli) -> Result<()> {
     };
     let command = match cli.command {
         Commands::Integrations(IntegrationsCmd::Install(args)) => {
-            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let resolved = resolve()?;
+            let config_path = resolved.config_path;
             let receipt = crate::integrations::default_transaction_receipt(&config_path);
-            let outcome = crate::integrations::install_with_receipt(args, &receipt)?;
-            start_initial_indexing_after_integration_install(outcome, overrides, &config_path);
+            let outcome = crate::integrations::install_with_receipt(
+                args,
+                &receipt,
+                &resolved.config.integrations,
+            )?;
+            start_initial_indexing_after_integration_install(outcome, &resolved.config);
             return Ok(());
         }
         Commands::Integrations(IntegrationsCmd::Status(args)) => {
-            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let resolved = resolve()?;
+            let config_path = resolved.config_path;
             let receipt = crate::integrations::default_transaction_receipt(&config_path);
-            return crate::integrations::status_with_receipt(args, &receipt);
+            return crate::integrations::status_with_receipt(
+                args,
+                &receipt,
+                &resolved.config.integrations,
+            );
         }
         Commands::Integrations(IntegrationsCmd::Uninstall(args)) => {
-            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let resolved = resolve()?;
+            let config_path = resolved.config_path;
             let receipt = crate::integrations::default_transaction_receipt(&config_path);
-            return crate::integrations::uninstall_with_receipt(args, &receipt);
+            return crate::integrations::uninstall_with_receipt(
+                args,
+                &receipt,
+                &resolved.config.integrations,
+            );
         }
         Commands::Integrations(IntegrationsCmd::Recover(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
@@ -1761,25 +1776,13 @@ fn spawn_background_refresh(
 
 fn start_initial_indexing_after_integration_install(
     outcome: crate::integrations::IntegrationInstallOutcome,
-    overrides: ConfigOverrides,
-    config_path: &std::path::Path,
+    config: &Config,
 ) {
     if !outcome.should_start_initial_indexing() {
         return;
     }
-    let resolved = match Config::resolve(overrides) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            eprintln!(
-                "aise: integration installation succeeded, but session index preparation could not start because configuration {} could not be resolved: {error:#}. \
-                 The installed integration files were preserved. Fix the configuration and run `aise reindex`; verify readiness with `aise doctor`.",
-                config_path.display()
-            );
-            return;
-        }
-    };
     if let Err(error) = spawn_background_refresh(
-        &resolved.config,
+        config,
         crate::background_refresh::BackgroundRefreshOrigin::IntegrationInstall,
     ) {
         eprintln!(

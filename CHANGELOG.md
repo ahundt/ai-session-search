@@ -22,6 +22,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    keeps serving the tools, and the plugin shares its name, so Codex runs one server. Upgrading
    adds the plugin to an existing Codex install; uninstall removes the marketplace, the plugin
    and Codex's record of installing it.
+3. Integration destinations honor harness environment variables and optional
+   `[integrations.paths.<surface>]` paths for MCP configs, instructions, and skill discovery.
+   Install, status, uninstall, and post-upgrade refresh share the resolved paths; existing CLI
+   path flags continue to add extra targets.
 
 ### Changed
 

@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 
+use crate::config::{IntegrationSurface, IntegrationsConfig};
 use crate::text_file_transaction::{
     apply_symlink_change_after, execute_text_file_and_symlink_transaction_with,
     publish_symlink_change, recover_text_file_transaction, recovery_guidance,
@@ -459,13 +460,14 @@ enum ClientPlatform {
 #[derive(Debug, Clone)]
 struct ClientLayout {
     home: PathBuf,
+    canonical_skill_root: PathBuf,
     surfaces: Vec<ClientSurface>,
     environment: LayoutEnvironment,
 }
 
 #[derive(Debug, Clone)]
 struct ClientSurface {
-    name: &'static str,
+    name: IntegrationSurface,
     client: McpClient,
     mcp: Vec<Target>,
     instruction: Option<InstructionTarget>,
@@ -522,11 +524,12 @@ impl LayoutEnvironment {
     }
 
     fn absolute(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
+        let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.cwd.join(path)
-        }
+        };
+        crate::util::normalize_absolute_path(&absolute)
     }
 
     fn expanded(&self, path: &Path, home: &Path) -> PathBuf {
@@ -536,6 +539,44 @@ impl LayoutEnvironment {
 }
 
 impl ClientLayout {
+    fn with_config(mut self, config: &IntegrationsConfig) -> Result<Self> {
+        for surface in &mut self.surfaces {
+            let Some(paths) = config.paths.get(&surface.name) else {
+                continue;
+            };
+            paths.validate(surface.name)?;
+            let resolve = |path: &str| self.environment.expanded(Path::new(path), &self.home);
+            if let Some(path) = &paths.mcp_config {
+                // One explicit endpoint replaces compatibility/superseded paths of this surface.
+                surface.mcp.truncate(1);
+                let target = &mut surface.mcp[0];
+                target.path = resolve(path);
+                target.detect_paths = target
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .into_iter()
+                    .collect();
+                target.superseded_paths.clear();
+            }
+            if let Some(path) = &paths.instruction_file {
+                if let Some(target) = &mut surface.instruction {
+                    target.path = resolve(path);
+                    target.detect_paths = target
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .into_iter()
+                        .collect();
+                }
+            }
+            if let Some(roots) = &paths.skill_discovery_roots {
+                surface.skill_roots = roots.iter().map(|path| resolve(path)).collect();
+                surface.detect_paths = surface.skill_roots.clone();
+            }
+        }
+        Ok(self)
+    }
     #[cfg(test)]
     fn new(home: PathBuf, config: PathBuf, platform: ClientPlatform) -> Self {
         Self::with_environment(home, config, platform, &[]).unwrap()
@@ -745,7 +786,7 @@ impl ClientLayout {
                 mcp,
                 instruction,
                 skill_roots,
-                retired_skill_roots: if name == "gemini" {
+                retired_skill_roots: if name == IntegrationSurface::Gemini {
                     vec![home.join(GEMINI_RETIRED_SKILLS_PATH)]
                 } else {
                     Vec::new()
@@ -758,7 +799,7 @@ impl ClientLayout {
         let agy_legacy = antigravity.join("antigravity");
         let surfaces = vec![
             surface(
-                "claude-code",
+                IntegrationSurface::ClaudeCode,
                 McpClient::Claude,
                 vec![mcp(
                     "claude code modern",
@@ -780,7 +821,7 @@ impl ClientLayout {
                 vec!["claude"],
             ),
             surface(
-                "claude-desktop",
+                IntegrationSurface::ClaudeDesktop,
                 McpClient::Claude,
                 vec![json(
                     "claude desktop",
@@ -794,7 +835,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "codex",
+                IntegrationSurface::Codex,
                 McpClient::Codex,
                 vec![mcp(
                     "codex",
@@ -816,7 +857,7 @@ impl ClientLayout {
                 vec!["codex"],
             ),
             surface(
-                "gemini",
+                IntegrationSurface::Gemini,
                 McpClient::Gemini,
                 vec![json(
                     "gemini",
@@ -836,7 +877,7 @@ impl ClientLayout {
                 vec!["gemini"],
             ),
             surface(
-                "antigravity",
+                IntegrationSurface::Antigravity,
                 McpClient::Antigravity,
                 vec![
                     json(
@@ -870,7 +911,7 @@ impl ClientLayout {
                 vec!["agy"],
             ),
             surface(
-                "pi",
+                IntegrationSurface::Pi,
                 McpClient::Pi,
                 vec![mcp(
                     "pi",
@@ -892,7 +933,7 @@ impl ClientLayout {
                 vec!["pi"],
             ),
             surface(
-                "prime-agent",
+                IntegrationSurface::PrimeAgent,
                 McpClient::PrimeAgent,
                 vec![mcp(
                     "prime-agent",
@@ -914,7 +955,7 @@ impl ClientLayout {
                 vec!["prime-agent"],
             ),
             surface(
-                "cursor",
+                IntegrationSurface::Cursor,
                 McpClient::Cursor,
                 vec![mcp(
                     "cursor",
@@ -930,7 +971,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "windsurf",
+                IntegrationSurface::Windsurf,
                 McpClient::Windsurf,
                 vec![json(
                     "windsurf",
@@ -944,7 +985,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "vscode",
+                IntegrationSurface::Vscode,
                 McpClient::Vscode,
                 vec![mcp(
                     "vscode",
@@ -960,7 +1001,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "zed",
+                IntegrationSurface::Zed,
                 McpClient::Zed,
                 vec![mcp(
                     "zed",
@@ -982,7 +1023,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "opencode",
+                IntegrationSurface::Opencode,
                 McpClient::Opencode,
                 vec![mcp(
                     "opencode",
@@ -1004,7 +1045,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "openclaw",
+                IntegrationSurface::Openclaw,
                 McpClient::Openclaw,
                 vec![mcp(
                     "openclaw",
@@ -1024,7 +1065,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "kilocode",
+                IntegrationSurface::Kilocode,
                 McpClient::Kilocode,
                 vec![mcp(
                     "kilocode",
@@ -1040,7 +1081,7 @@ impl ClientLayout {
                 vec![],
             ),
             surface(
-                "kilocode-extension",
+                IntegrationSurface::KilocodeExtension,
                 McpClient::Kilocode,
                 vec![json(
                     "kilocode legacy vscode extension",
@@ -1063,6 +1104,7 @@ impl ClientLayout {
                 .len()
         );
         Ok(Self {
+            canonical_skill_root: home.join(".ai-session-search/skills"),
             home,
             surfaces,
             environment: env.clone(),
@@ -1342,6 +1384,9 @@ fn assemble_selected_targets_for_layout(
             )?)
             .collect::<Vec<_>>()
     };
+    for target in &mut instruction_targets {
+        target.path = layout.environment.absolute(&target.path);
+    }
     dedupe_instruction_targets(&mut instruction_targets)?;
     let mut skill_targets = if selection.no_skill {
         Vec::new()
@@ -1354,6 +1399,12 @@ fn assemble_selected_targets_for_layout(
             .chain(custom_skill_targets(selection.skill_roots)?)
             .collect::<Vec<_>>()
     };
+    for target in &mut skill_targets {
+        target.root = layout.environment.absolute(&target.root);
+        for link in &mut target.discovery_links {
+            *link = layout.environment.absolute(link);
+        }
+    }
     dedupe_skill_targets(&mut skill_targets)?;
     Ok((targets, instruction_targets, skill_targets))
 }
@@ -1511,8 +1562,13 @@ fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) -> Result<()> {
 pub(crate) fn install_with_receipt(
     args: IntegrationInstallArgs,
     default_receipt: &Path,
+    config: &IntegrationsConfig,
 ) -> Result<IntegrationInstallOutcome> {
-    install_for_layout(args, default_receipt, &ClientLayout::discover()?)
+    install_for_layout(
+        args,
+        default_receipt,
+        &ClientLayout::discover()?.with_config(config)?,
+    )
 }
 
 fn install_for_layout(
@@ -1843,8 +1899,13 @@ fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
 pub(crate) fn status_with_receipt(
     args: IntegrationStatusArgs,
     default_receipt: &Path,
+    config: &IntegrationsConfig,
 ) -> Result<()> {
-    status_for_layout(args, default_receipt, &ClientLayout::discover()?)
+    status_for_layout(
+        args,
+        default_receipt,
+        &ClientLayout::discover()?.with_config(config)?,
+    )
 }
 
 fn status_for_layout(
@@ -2038,8 +2099,13 @@ fn ensure_no_pending_transaction(receipt: &Path) -> Result<()> {
 pub(crate) fn uninstall_with_receipt(
     args: IntegrationUninstallArgs,
     default_receipt: &Path,
+    config: &IntegrationsConfig,
 ) -> Result<()> {
-    uninstall_for_layout(args, default_receipt, &ClientLayout::discover()?)
+    uninstall_for_layout(
+        args,
+        default_receipt,
+        &ClientLayout::discover()?.with_config(config)?,
+    )
 }
 
 fn uninstall_for_layout(
@@ -2564,7 +2630,7 @@ fn instruction_detected(target: &InstructionTarget) -> bool {
 }
 
 fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<SkillTarget> {
-    let canonical_root = layout.home.join(".ai-session-search").join("skills");
+    let canonical_root = &layout.canonical_skill_root;
     layout
         .surfaces
         .iter()
@@ -3796,11 +3862,14 @@ pub(crate) enum InstructionRefresh {
 ///
 /// Returns an error when the manifest cannot be read, a root cannot be planned for a reason that is
 /// not about ownership, or the transaction fails for a reason other than lock contention.
-pub(crate) fn refresh_integrations_after_upgrade(receipt_path: &Path) -> Result<UpgradeRefresh> {
+pub(crate) fn refresh_integrations_after_upgrade(
+    receipt_path: &Path,
+    config: &IntegrationsConfig,
+) -> Result<UpgradeRefresh> {
     refresh_integrations_for_version(
         receipt_path,
         env!("CARGO_PKG_VERSION"),
-        ClientLayout::discover().ok().as_ref(),
+        Some(&ClientLayout::discover()?.with_config(config)?),
     )
 }
 
@@ -4259,7 +4328,7 @@ pub(crate) fn refresh_integrations_after_upgrade_and_report(
     }
     let receipt = default_transaction_receipt(config_path);
     let version = env!("CARGO_PKG_VERSION");
-    match refresh_integrations_after_upgrade(&receipt) {
+    match refresh_integrations_after_upgrade(&receipt, &config.integrations) {
         Ok(UpgradeRefresh::NotNeeded | UpgradeRefresh::Deferred) => {}
         Ok(UpgradeRefresh::Checked {
             skills,
@@ -6281,6 +6350,165 @@ mod tests {
             )
             .unwrap();
         T::from_arg_matches(&matches).unwrap()
+    }
+
+    #[test]
+    fn configured_endpoints_replace_categories_and_keep_their_native_formats() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        for platform in [
+            ClientPlatform::Macos,
+            ClientPlatform::Linux,
+            ClientPlatform::Windows,
+        ] {
+            let automatic = ClientLayout::with_environment(
+                home.clone(),
+                home.join("native"),
+                platform,
+                &[
+                    ("CODEX_HOME", "env-codex"),
+                    ("GEMINI_CLI_HOME", "env-gemini"),
+                ],
+            )
+            .unwrap();
+            let mut text = String::new();
+            for surface in &automatic.surfaces {
+                let name = surface.name.as_str();
+                text.push_str(&format!("[paths.{name}]\n"));
+                if !surface.mcp.is_empty() {
+                    text.push_str(&format!("mcp_config = '~/configured/{name}/mcp'\n"));
+                }
+                if surface.instruction.is_some() {
+                    text.push_str(&format!(
+                        "instruction_file = '~/configured/{name}/instructions.md'\n"
+                    ));
+                }
+                if !surface.skill_roots.is_empty() {
+                    text.push_str(&format!("skill_discovery_roots = ['~/configured/{name}/skills', '~/shared/{name}']\n"));
+                }
+            }
+            let config: IntegrationsConfig = toml::from_str(&text).unwrap();
+            let layout = automatic.clone().with_config(&config).unwrap();
+            assert_eq!(
+                config.paths.len(),
+                layout.surfaces.len(),
+                "config surfaces match the current client table"
+            );
+            for (before, after) in automatic.surfaces.iter().zip(&layout.surfaces) {
+                let root = home.join("configured").join(after.name.as_str());
+                if let Some(target) = after.mcp.first() {
+                    assert_eq!(
+                        after.mcp.len(),
+                        1,
+                        "one endpoint replaces compatibility files"
+                    );
+                    assert_eq!(target.path, root.join("mcp"));
+                    assert_eq!(target.format, before.mcp[0].format);
+                    assert_eq!(target.detect_paths, [root.clone()]);
+                    assert!(target.superseded_paths.is_empty());
+                }
+                if let Some(target) = &after.instruction {
+                    assert_eq!(target.path, root.join("instructions.md"));
+                    assert_eq!(target.detect_paths, [root.clone()]);
+                }
+                if !after.skill_roots.is_empty() {
+                    assert_eq!(
+                        after.skill_roots,
+                        [
+                            root.join("skills"),
+                            home.join("shared").join(after.name.as_str())
+                        ]
+                    );
+                    assert_eq!(after.detect_paths, after.skill_roots);
+                }
+            }
+            let extra = home.join("extra.toml");
+            let mut arguments = IntegrationTargetsArgs {
+                clients: CONCRETE_CLIENTS.to_vec(),
+                codex_configs: vec![extra.clone()],
+                ..Default::default()
+            };
+            let (targets, _, skills) = arguments.resolve(false, false, &layout).unwrap();
+            assert!(targets.iter().any(|target| target.path == extra));
+            assert!(!targets.iter().any(|target| target.path
+                == automatic
+                    .surfaces
+                    .iter()
+                    .find(|surface| surface.name == IntegrationSurface::Codex)
+                    .unwrap()
+                    .mcp[0]
+                    .path));
+            assert!(skills
+                .iter()
+                .flat_map(|target| &target.discovery_links)
+                .any(|path| path == &home.join("configured/codex/skills/ai-session-search")));
+            arguments
+                .json_mcp_configs
+                .push(home.join("configured/codex/unused/../mcp"));
+            assert!(arguments
+                .resolve(false, false, &layout)
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible config formats"));
+        }
+        let automatic = ClientLayout::new(home.clone(), home.join("native"), ClientPlatform::Linux);
+        let config: IntegrationsConfig =
+            toml::from_str("[paths.codex]\nskill_discovery_roots=[]\n").unwrap();
+        let layout = automatic.with_config(&config).unwrap();
+        assert!(skill_targets_for_layout(McpClient::Codex, &layout).is_empty());
+        assert!(
+            !all_standard_discovery_links(&layout, &AI_SESSION_SEARCH_SKILL_PACKAGE)
+                .contains(&home.join(".agents/skills/ai-session-search"))
+        );
+    }
+
+    #[test]
+    fn configured_openclaw_and_kilo_paths_preserve_shapes_during_refresh_and_removal() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let config: IntegrationsConfig = toml::from_str("[paths.openclaw]\nmcp_config='~/team/claw.json5'\n[paths.kilocode]\nmcp_config='~/team/kilo.jsonc'\n").unwrap();
+        let layout = ClientLayout::new(home.clone(), home.join("native"), ClientPlatform::Linux)
+            .with_config(&config)
+            .unwrap();
+        let claw = targets_for_layout(McpClient::Openclaw, &layout).remove(0);
+        fs::create_dir_all(claw.path.parent().unwrap()).unwrap();
+        fs::write(
+            &claw.path,
+            "{ // team\n mcpServers: { aise: { command: '/bin/aise', args: ['mcp','serve'] } } }\n",
+        )
+        .unwrap();
+        let receipt = dir.path().join("aise/receipt.json");
+        assert_eq!(
+            refresh_superseded_mcp_entries(&receipt, &layout, || panic!(
+                "preserve the registered executable"
+            ))
+            .unwrap(),
+            [claw.path.clone()]
+        );
+        assert_eq!(status_target(&claw).unwrap(), "configured");
+        let value: Value = jsonc_parser::parse_to_serde_value(
+            &fs::read_to_string(&claw.path).unwrap(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(value["mcp"]["servers"][SERVER_NAME]["command"], "/bin/aise");
+        assert!(value["mcpServers"].get(SERVER_NAME).is_none());
+        let kilo = targets_for_layout(McpClient::Kilocode, &layout).remove(0);
+        upsert_target(&kilo, Path::new("/bin/aise")).unwrap();
+        let value: Value = jsonc_parser::parse_to_serde_value(
+            &fs::read_to_string(&kilo.path).unwrap(),
+            &jsonc_parse_options(JsonSyntax::Jsonc),
+        )
+        .unwrap();
+        assert_eq!(value["mcp"][SERVER_NAME]["type"], "local");
+        assert_eq!(
+            value["mcp"][SERVER_NAME]["command"],
+            json!(["/bin/aise", "mcp", "serve"])
+        );
+        for target in [claw, kilo] {
+            assert!(remove_target(&target).unwrap());
+            assert_eq!(status_target(&target).unwrap(), "not configured");
+        }
     }
 
     #[cfg(unix)]

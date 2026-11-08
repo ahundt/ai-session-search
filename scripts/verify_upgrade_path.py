@@ -63,6 +63,11 @@ def _environment(home: pathlib.Path, executable_dir: pathlib.Path | None) -> dic
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("AI_SESSION_SEARCH_", "XDG_"))
+        and key not in {
+            "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR",
+            "PRIME_AGENT_CODING_AGENT_DIR", "FLATPAK_XDG_CONFIG_HOME", "OPENCLAW_CONFIG_PATH",
+            "OPENCLAW_STATE_DIR", "OPENCLAW_HOME", "OPENCLAW_PROFILE",
+        }
     }
     environment["HOME"] = str(home)
     environment["USERPROFILE"] = str(home)

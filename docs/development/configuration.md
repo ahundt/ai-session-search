@@ -46,6 +46,10 @@ From highest to lowest precedence:
 3. TOML configuration value.
 4. Typed Rust and platform default.
 
+Integration destinations have a separate precedence rule: persistent
+`[integrations.paths.<surface>]` values replace harness environment defaults, and CLI path flags
+add extra targets. See [integration destinations](#integration-installer-destinations-and-selectors).
+
 Five root CLI options feed the resolver: `--config`, `--database`, `--cache-dir`, `--threads`,
 and `--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
 `AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and
@@ -227,6 +231,70 @@ Install, status, uninstall, and recover take their transaction receipt from the 
 path, so `--config` and `AI_SESSION_SEARCH_CONFIG` send recovery where the install wrote, without
 loading the session index. Pointing either elsewhere gives that invocation its own receipt,
 keeping a throwaway install separate from your real one.
+Install, status, and uninstall load and validate that configuration; an invalid configuration
+stops them before writes. Recovery uses only the receipt and still works when the ordinary
+configuration is invalid.
+
+Automatic destinations use **`[integrations.paths]` > harness environment > platform defaults**.
+Home, platform directories, working directory, and environment are captured once per layout.
+Install, status, uninstall, and the post-upgrade MCP/instruction refresh use the same resolved
+destinations. Canonical skills and the Codex marketplace remain beside the selected aise config.
+
+| Environment | Automatic destination | Upstream evidence |
+| --- | --- | --- |
+| `CLAUDE_CONFIG_DIR=D` | Claude Code instructions and skills under `D`; MCP at `D/.claude.json`, with the `.mcp.json` compatibility file under `D`. Unset MCP remains `~/.claude.json`. Claude Desktop is independent. | [Claude directory](https://code.claude.com/docs/en/claude-directory) |
+| `CODEX_HOME=D` | Codex `D/config.toml` and `D/AGENTS.md`; skills remain `~/.agents/skills`. | [Codex home resolver, lines 11-22](https://github.com/openai/codex/blob/main/codex-rs/utils/home-dir/src/lib.rs#L11-L22), [skill discovery](https://learn.chatgpt.com/docs/build-skills) |
+| `GEMINI_CLI_HOME=D` | Gemini `D/.gemini`; Antigravity keeps its independent default. | [Home helper, lines 20-26](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts#L20-L26), [storage, lines 50-56](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/config/storage.ts#L50-L56) |
+| `PI_CODING_AGENT_DIR=D` | Pi uses tilde-expanded `D` directly. | [Pi config, lines 587-593](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/config.ts#L587-L593) |
+| `PRIME_AGENT_CODING_AGENT_DIR=D` | Prime uses tilde-expanded `D` directly. No Pi-variable fallback is applied to host discovery. | [Prime runtime, lines 50-59](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/prime-agent-runtime/src/rlm/mcp_base.py#L50-L59) |
+| `XDG_CONFIG_HOME=D` | OpenCode `D/opencode` and Kilo CLI `D/kilo` on every platform; fallback is `~/.config`, including macOS. Kilo extension storage is independent. | [xdg-basedir, lines 9-10](https://github.com/sindresorhus/xdg-basedir/blob/main/index.js#L9-L10), [OpenCode pinned implementation](https://github.com/anomalyco/opencode/blob/70881b2937fab1e425416659445875952730934a/packages/opencode/src/global/index.ts#L9), [Kilo storage](https://github.com/Kilo-Org/kilocode/blob/main/packages/kilo-jetbrains/README.md#dev-storage-isolation) |
+| Linux `FLATPAK_XDG_CONFIG_HOME=D` | Zed `D/zed`; otherwise `dirs::config_dir()/zed`, including its XDG handling. | [Zed paths, lines 111-129](https://github.com/zed-industries/zed/blob/main/crates/paths/src/paths.rs#L111-L129) |
+| `OPENCLAW_CONFIG_PATH`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME`, `OPENCLAW_PROFILE` | Explicit config path wins, then state directory + `openclaw.json`, then effective home + `.openclaw[-<profile>]/openclaw.json`. `default` selects the unsuffixed root. | [Config resolver, lines 222-231](https://github.com/openclaw/openclaw/blob/main/src/config/paths.ts#L222-L231), [state resolver, lines 20-49](https://github.com/openclaw/openclaw/blob/main/src/config/state-dir.ts#L20-L49), [profile rules](https://github.com/openclaw/openclaw/blob/main/src/cli/profile-utils.ts#L4-L33) |
+
+Empty environment values are unset, except Zed's Flatpak variable: upstream treats an explicitly
+empty value as a relative config root. For OpenClaw, aise trims whitespace and rejects malformed
+profile names; the other variables retain whitespace. Relative environment paths use the captured
+working directory. Prime's upstream evidence covers runtime config access; host instruction/skill discovery
+has not been independently verified. OpenCode's cited implementation is pinned, and Kilo's root
+is documented upstream; these references do not establish conformance for every installed version.
+
+Persistent endpoint overrides are optional, with these concrete surface names and accepted fields:
+
+| Surfaces | Accepted fields |
+| --- | --- |
+| `claude-code`, `codex`, `gemini`, `antigravity` | `mcp_config`, `instruction_file`, `skill_discovery_roots` |
+| `pi`, `prime-agent` | `instruction_file`, `skill_discovery_roots` |
+| `opencode` | `mcp_config`, `instruction_file` |
+| `claude-desktop`, `cursor`, `windsurf`, `vscode`, `zed`, `openclaw`, `kilocode`, `kilocode-extension` | `mcp_config` |
+
+```toml
+[integrations.paths.codex]
+mcp_config = "profiles/work/config.toml"
+instruction_file = "~/work/AGENTS.md"
+skill_discovery_roots = ["shared/skills", "/srv/agent-skills"]
+
+[integrations.paths.openclaw]
+mcp_config = "/srv/openclaw/team.json5"
+
+[integrations.paths.kilocode]
+mcp_config = "/srv/kilo/team.jsonc"
+```
+
+Each field replaces only its category. `mcp_config` replaces that surface's automatic MCP files,
+including compatibility and superseded locations, while retaining its native format. For example,
+OpenClaw keeps JSON5 `mcp.servers` and Kilo CLI keeps JSONC `mcp`. `skill_discovery_roots` lists parent
+directories: aise appends `/ai-session-search` to each; `[]` disables that surface's discovery links.
+Omitted fields inherit automatic paths. Detection inspects the resolved directories; use an explicit
+`--client` to install before they exist.
+
+Relative config paths resolve from the config file's parent. A leading `~` expands to the captured
+home; `$VAR` and `%VAR%` stay literal. Empty strings fail with an error naming the key and surface.
+Unsupported components and unknown fields also report the accepted fields. Older aise versions reject these new keys;
+remove the tables before running an older binary against the same config.
+
+Earlier install destinations are not remembered after environment/config changes; use the previous
+settings or additive path flags to manage them until a versioned manifest migration exists.
+This feature adds no replacing CLI flags, transcript-root changes, or Windows Zed casing correction.
 
 Omitting `--client` selects every detected client. Repeated `--client` values form an explicit
 include set; repeated `--exclude-client` values subtract from that set.
@@ -234,7 +302,8 @@ include set; repeated `--exclude-client` values subtract from that set.
 Custom destinations are format-specific: `--json-mcp-config`, `--vscode-config`, `--zed-config`,
 `--opencode-config`, `--codex-config`, `--claude-md`, `--gemini-md`, and `--agents-md`. All are
 repeatable and pass through the same preflight, transaction, status, recovery, and uninstall
-path.
+path. They add targets alongside the automatic ones. Selecting the same normalized destination
+with incompatible formats fails preflight before any write.
 
 Exact custom skill destinations use repeatable `--skill-root DIR` (the directory, not a file
 inside it); uninstall preserves them with `--keep-skill`, refuses to remove a directory without

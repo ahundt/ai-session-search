@@ -113,6 +113,25 @@ pub(crate) fn expand_tilde_with_home(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
+/// Normalize `.` and `..` in an already absolute destination without following symlinks.
+pub(crate) fn normalize_absolute_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 pub fn normalize_path(path: &Path) -> String {
     let rendered = path.to_string_lossy();
     #[cfg(windows)]

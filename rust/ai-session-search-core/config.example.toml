@@ -34,6 +34,18 @@ request_timeout_ms = 1000
 # edited is left alone and reported once. It runs when the install included the skill.
 refresh_after_upgrade = true
 
+# Automatic integration endpoints: these settings replace their category; CLI path flags add extras.
+# Paths resolve from this file's parent. A leading ~ expands; $VAR and %VAR% stay literal.
+# See docs/development/configuration.md for each surface's accepted fields and environment defaults.
+# [integrations.paths.codex]
+# mcp_config = "profiles/work/config.toml"
+# instruction_file = "profiles/work/AGENTS.md"
+# skill_discovery_roots = ["shared/skills"] # parent directories; aise appends /ai-session-search
+# [integrations.paths.openclaw]
+# mcp_config = "profiles/openclaw.json5"
+# [integrations.paths.kilocode]
+# mcp_config = "profiles/kilo.jsonc"
+
 [index]
 # Optional explicit state paths. Relative values resolve from ~/.ai-session-search/.
 # Unset, they follow the platform data/cache defaults; set db_path to reuse an existing database

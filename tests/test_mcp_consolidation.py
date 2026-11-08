@@ -140,7 +140,10 @@ def test_python_console_install_starts_the_canonical_refresh_child(tmp_path: Pat
         ],
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")},
+        env={
+            **_environment(tmp_path), "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"), "XDG_CONFIG_HOME": str(home / ".config"),
+        },
         timeout=MCP_PROCESS_TIMEOUT_SECONDS,
     )
     assert result.returncode == 0, result.stderr
@@ -199,7 +202,14 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     if not config_path.exists():
         config_path.write_text("", encoding="utf-8")
     return {
-        **os.environ,
+        **{
+            key: value for key, value in os.environ.items()
+            if key not in {
+                "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR",
+                "PRIME_AGENT_CODING_AGENT_DIR", "FLATPAK_XDG_CONFIG_HOME", "OPENCLAW_CONFIG_PATH",
+                "OPENCLAW_STATE_DIR", "OPENCLAW_HOME", "OPENCLAW_PROFILE",
+            }
+        },
         "AI_SESSION_SEARCH_CONFIG": str(config_path),
         "AI_SESSION_SEARCH_CACHE_DIR": str(tmp_path / "cache"),
     }
@@ -258,13 +268,27 @@ def test_the_first_python_mcp_start_after_an_upgrade_refreshes_installed_integra
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "AI_SESSION_SEARCH_DATABASE": str(tmp_path / "index.db"),
+        "CODEX_HOME": str(tmp_path / "env-codex"),
     }
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[integrations.paths.codex]\ninstruction_file = "configured/AGENTS.md"\n'
+        'skill_discovery_roots = ["configured/skills"]\n', encoding="utf-8",
+    )
     installed = subprocess.run(
         [executable, "integrations", "install", "--client", "codex", "--binary", executable,
-         "--no-aliases", "--no-mcp", "--no-instructions"],
+         "--no-aliases", "--no-mcp"],
         capture_output=True, text=True, env=environment, timeout=MCP_PROCESS_TIMEOUT_SECONDS,
     )
     assert installed.returncode == 0, installed.stderr
+    instruction = tmp_path / "configured/AGENTS.md"
+    assert instruction.is_file()
+    current = instruction.read_text(encoding="utf-8")
+    earlier = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range."
+    lines = current.splitlines()
+    start = lines.index("<!-- aise-instructions v1 -->")
+    end = lines.index("<!-- /aise-instructions -->")
+    instruction.write_text("\n".join([*lines[:start + 1], earlier, *lines[end:]]) + "\n", encoding="utf-8")
     marker = tmp_path / "integrations-refreshed-version"
     assert not marker.exists()
 
@@ -275,6 +299,9 @@ def test_the_first_python_mcp_start_after_an_upgrade_refreshes_installed_integra
 
     assert json.loads(served.stdout)["id"] == 1, "stdout must stay pure JSON-RPC"
     assert marker.is_file(), served.stderr
+    assert instruction.read_text(encoding="utf-8") == current
+    assert (tmp_path / "configured/skills/ai-session-search/SKILL.md").is_file()
+    assert not (tmp_path / "env-codex/AGENTS.md").exists()
 
 
 def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> None:
