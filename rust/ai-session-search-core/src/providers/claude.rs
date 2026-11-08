@@ -2018,7 +2018,7 @@ mod tests {
                 &reparsed,
                 generation,
                 generation,
-                &[initial.session.source_path.clone()],
+                std::slice::from_ref(&initial.session.source_path),
                 false,
             )
             .unwrap();
