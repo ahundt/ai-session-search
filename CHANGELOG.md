@@ -120,6 +120,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    Roaming AppData; aise calls `home_dir`, `config_dir`, `data_dir`, `data_local_dir`, and
    `cache_dir`, which return the same paths, so existing configuration and indexes stay where
    they are.
+4. `./run_ci_local.sh` now runs the required MSRV library-test build and API-consumer check
+   when the workspace's minimum Rust toolchain is installed. Otherwise it reports named skips
+   with the exact install command; contract tests keep the commands aligned with CI.
 
 ## [1.0.0] - 2026-11-05
 

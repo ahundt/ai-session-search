@@ -298,6 +298,32 @@ build_rust_documentation() {
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 }
 
+# tests/test_repository_contracts.py keeps these commands aligned with CI's rust-msrv job.
+run_rust_msrv_checks() {
+    local msrv
+    msrv="$(uv run --no-project python -c '
+import tomllib
+from pathlib import Path
+version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["rust-version"]
+print(version if version.count(".") == 2 else f"{version}.0")
+')" || {
+        step "Read workspace Rust MSRV" false
+        return
+    }
+    # Probe without installing a missing toolchain.
+    if command -v rustup >/dev/null 2>&1 && RUSTUP_AUTO_INSTALL=0 rustup run "$msrv" rustc --version >/dev/null 2>&1; then
+        step "Rust MSRV $msrv library test build" \
+            cargo +"$msrv" test -p ai-session-search --lib --locked --no-run
+        step "Rust MSRV $msrv API consumer" \
+            cargo +"$msrv" check -p ai-session-search-api-consumer --lib --locked
+    else
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 2))
+        printf '\n%bSKIPPED: Rust MSRV %s toolchain is not installed (2 checks)%b\n' "$YELLOW" "$msrv" "$NC"
+        printf 'The rust-msrv CI job runs both checks and blocks the merge. Install the toolchain:\n'
+        printf '  rustup toolchain install %s --profile minimal\n' "$msrv"
+    fi
+}
+
 build_and_verify_python_artifacts() {
     local output="$STATE_ROOT/dist"
     mkdir -p "$output"
@@ -504,6 +530,7 @@ step "Rust Clippy" cargo clippy --workspace --all-targets --all-features --locke
 step "Rust tests" cargo test --workspace --all-targets --all-features --locked
 step "Rust public API doctests" cargo test -p ai-session-search -p ai-session-search-api-consumer --doc --all-features --locked
 step "Rust documentation" build_rust_documentation
+run_rust_msrv_checks
 step "Rust crate packaging" package_rust_crate
 step "Release executable and MCP schema" build_and_verify_release_executable
 step "Python artifacts and install pathways" build_and_verify_python_artifacts
