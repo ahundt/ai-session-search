@@ -6018,11 +6018,7 @@ fn insert_messages<'a>(
              input_delivery_state, input_origin, record_relation)
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )?;
-    let mut part_stmt = tx.prepare(
-        "insert into message_content_parts
-            (message_id, ordinal, start_char, end_char, authorship, origin)
-         values (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
+    let mut part_stmt = tx.prepare(INSERT_MESSAGE_PARTS_SQL)?;
     for (seq, message) in rows {
         if let Err(detail) = message.provenance.validate(&message.content) {
             bail!(
@@ -6054,16 +6050,11 @@ fn insert_messages<'a>(
             message.provenance.record_relation.as_str(),
         ])?;
         let message_id = tx.last_insert_rowid();
-        for part in &message.provenance.content_parts {
-            part_stmt.execute(params![
-                message_id,
-                i64::from(part.ordinal),
-                i64::try_from(part.start_char).context("content-part start exceeds SQLite i64")?,
-                i64::try_from(part.end_char).context("content-part end exceeds SQLite i64")?,
-                part.authorship.as_str(),
-                part.origin.as_str(),
-            ])?;
-        }
+        insert_message_parts(
+            &mut part_stmt,
+            message_id,
+            &message.provenance.content_parts,
+        )?;
     }
     Ok(())
 }
@@ -6117,13 +6108,25 @@ fn update_message_row(
         "delete from message_content_parts where message_id = ?1",
         params![message_id],
     )?;
-    let mut part_stmt = tx.prepare(
-        "insert into message_content_parts
-            (message_id, ordinal, start_char, end_char, authorship, origin)
-         values (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
-    for part in &message.provenance.content_parts {
-        part_stmt.execute(params![
+    let mut part_stmt = tx.prepare(INSERT_MESSAGE_PARTS_SQL)?;
+    insert_message_parts(
+        &mut part_stmt,
+        message_id,
+        &message.provenance.content_parts,
+    )
+}
+
+const INSERT_MESSAGE_PARTS_SQL: &str = "insert into message_content_parts
+    (message_id, ordinal, start_char, end_char, authorship, origin)
+    values (?1, ?2, ?3, ?4, ?5, ?6)";
+
+fn insert_message_parts(
+    statement: &mut rusqlite::Statement<'_>,
+    message_id: i64,
+    parts: &[crate::models::MessageContentPart],
+) -> Result<()> {
+    for part in parts {
+        statement.execute(params![
             message_id,
             i64::from(part.ordinal),
             i64::try_from(part.start_char).context("content-part start exceeds SQLite i64")?,
@@ -6133,6 +6136,37 @@ fn update_message_row(
         ])?;
     }
     Ok(())
+}
+
+// Parts depend on provider structure as well as text; unchanged columns do not prove unchanged
+// attribution. Empty parts need no lookup; mixed rows cost one indexed seek plus O(parts) reads.
+fn message_parts_match(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: i64,
+    message: &crate::models::Message,
+) -> Result<bool> {
+    if message.provenance.content_parts.is_empty() {
+        return Ok(true);
+    }
+    let mut statement = tx.prepare_cached(
+        "select ordinal, start_char, end_char, authorship, origin from message_content_parts
+         where message_id = ?1 order by ordinal",
+    )?;
+    let mut rows = statement.query([message_id])?;
+    for part in &message.provenance.content_parts {
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        if row.get::<_, i64>(0)? != i64::from(part.ordinal)
+            || row.get::<_, i64>(1)? != i64::try_from(part.start_char)?
+            || row.get::<_, i64>(2)? != i64::try_from(part.end_char)?
+            || row.get_ref(3)?.as_str()? != part.authorship.as_str()
+            || row.get_ref(4)?.as_str()? != part.origin.as_str()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(rows.next()?.is_none())
 }
 
 /// Write a session's transcript row.
@@ -6243,14 +6277,15 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 ///   that boundary row is compared, so a caller passing `allow_append_optimization` asserts its
 ///   sources are append-only.
 /// - Unchanged: under the same parser, a parse whose rows equal the stored rows writes nothing.
-/// - Replace: under the same parser, a parse that holds every stored message (same role and
-///   content) replaces the rows, so an ordinary reclassification can use the source sequence.
+/// - Replace: under the same parser, a parse that holds every stored identity (role/content for
+///   legacy rows) replaces the rows, so an ordinary reclassification can use the source sequence.
 /// - Reconcile: a parser upgrade repairs each matched source row in place (native identity first,
 ///   legacy role/content second), retains archive-only rows, and appends parse-only rows after the
 ///   highest stored sequence. The same reconciliation path handles a same-parser shrink or rewrite
 ///   without deleting archive history.
 ///
-/// O(stored + parsed rows and bytes) time off the append path; O(rows) memory for 32-byte keys.
+/// Key work is O(stored + parsed rows and bytes), with O(rows) memory for 32-byte keys.
+/// Mixed-row equality additionally performs the indexed checks in [`message_parts_match`].
 fn store_parsed_messages(
     tx: &rusqlite::Transaction<'_>,
     parsed: &ParsedSession,
@@ -6277,18 +6312,19 @@ fn store_parsed_messages(
         // "continue") at that position cannot pass for it after an archive keep.
         let boundary = &parsed.messages[(existing_count - 1) as usize];
         let stored_boundary = stored_message_keys(tx, &session.id, Some(boundary.seq))?;
-        if stored_boundary
-            .first()
-            .is_some_and(|(_, keys)| keys.all_columns == parsed_message_keys(boundary).all_columns)
-        {
-            insert_messages(
-                tx,
-                session,
-                parsed.messages[existing_count as usize..]
-                    .iter()
-                    .map(|m| (m.seq, m)),
-            )?;
-            return Ok(false);
+        if let Some((id, keys)) = stored_boundary.first() {
+            if keys.all_columns == parsed_message_keys(boundary).all_columns
+                && message_parts_match(tx, *id, boundary)?
+            {
+                insert_messages(
+                    tx,
+                    session,
+                    parsed.messages[existing_count as usize..]
+                        .iter()
+                        .map(|m| (m.seq, m)),
+                )?;
+                return Ok(false);
+            }
         }
     }
     let stored = stored_message_keys(tx, &session.id, None)?;
@@ -6310,12 +6346,25 @@ fn store_parsed_messages(
             .map(|(_, keys)| keys.all_columns)
             .eq(parsed_keys.iter().map(|keys| keys.all_columns))
     {
-        return Ok(false);
+        let mut same_parts = true;
+        for ((id, _), message) in stored.iter().zip(&parsed.messages) {
+            if !message_parts_match(tx, *id, message)? {
+                same_parts = false;
+                break;
+            }
+        }
+        if same_parts {
+            return Ok(false);
+        }
     }
     if same_parser
         && covers_every_stored_key(
-            stored.iter().map(|(_, keys)| keys.role_and_content),
-            parsed_keys.iter().map(|keys| keys.role_and_content),
+            stored
+                .iter()
+                .map(|(_, keys)| keys.correlation.unwrap_or(keys.role_and_content)),
+            parsed_keys
+                .iter()
+                .map(|keys| keys.correlation.unwrap_or(keys.role_and_content)),
         )
     {
         tx.execute(
@@ -6377,7 +6426,10 @@ fn store_parsed_messages(
         if let Some(position) = position {
             matched[position] = true;
             // A parser upgrade can change part attribution without changing message columns.
-            if !same_parser || stored[position].1.all_columns != keys.all_columns {
+            if !same_parser
+                || stored[position].1.all_columns != keys.all_columns
+                || !message_parts_match(tx, stored[position].0, message)?
+            {
                 update_message_row(tx, stored[position].0, session, message)?;
             }
         } else {
@@ -6422,66 +6474,15 @@ fn store_parsed_file_edits(
     {
         return Ok(());
     }
-    if !same_parser
-        && covers_every_stored_key(
-            stored.iter().map(|(_, _, keys)| keys.edit),
-            parsed_keys.iter().map(|keys| keys.edit),
-        )
-    {
+    if covers_every_stored_key(
+        stored.iter().map(|(_, _, keys)| keys.edit),
+        parsed_keys.iter().map(|keys| keys.edit),
+    ) {
         tx.execute(
             "delete from file_edits where session_id = ?1",
             params![session.id],
         )?;
         insert_file_edits(tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
-        return Ok(());
-    }
-    if !same_parser {
-        let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
-        for (position, (_, _, keys)) in stored.iter().enumerate() {
-            positions.entry(keys.edit).or_default().push_back(position);
-        }
-        let mut matched = vec![false; stored.len()];
-        let mut inserts = Vec::new();
-        let mut update = tx.prepare(
-            "update file_edits set ts = ?1, tool = ?2, file_path = ?3, file_name = ?4,
-             new_content = ?5, edits_json = ?6 where id = ?7",
-        )?;
-        for (edit, keys) in parsed.file_edits.iter().zip(&parsed_keys) {
-            let position = positions.get_mut(&keys.edit).and_then(|queue| {
-                while let Some(position) = queue.pop_front() {
-                    if !matched[position] {
-                        return Some(position);
-                    }
-                }
-                None
-            });
-            if let Some(position) = position {
-                matched[position] = true;
-                if stored[position].2.all_columns != keys.all_columns {
-                    let edits_json = serialize_edits_json(edit)?;
-                    update.execute(params![
-                        edit.ts.map(stored_timestamp),
-                        edit.tool,
-                        edit.file_path,
-                        edit.file_name,
-                        edit.new_content,
-                        edits_json,
-                        stored[position].0,
-                    ])?;
-                }
-            } else {
-                inserts.push(edit);
-            }
-        }
-        let next_seq = next_file_edit_seq(tx, &session.id)?;
-        insert_file_edits(
-            tx,
-            session,
-            inserts
-                .into_iter()
-                .enumerate()
-                .map(|(offset, edit)| (next_seq + offset as i64, edit)),
-        )?;
         return Ok(());
     }
     let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
@@ -6496,6 +6497,26 @@ fn store_parsed_file_edits(
                 .and_then(|queue| queue.pop_front())
         })
         .collect();
+    if !same_parser {
+        let mut update = tx.prepare(
+            "update file_edits set ts = ?1, tool = ?2, file_path = ?3, file_name = ?4,
+             new_content = ?5, edits_json = ?6 where id = ?7",
+        )?;
+        for (edit, position) in parsed.file_edits.iter().zip(&matched) {
+            if let Some(position) = position {
+                let edits_json = serialize_edits_json(edit)?;
+                update.execute(params![
+                    edit.ts.map(stored_timestamp),
+                    edit.tool,
+                    edit.file_path,
+                    edit.file_name,
+                    edit.new_content,
+                    edits_json,
+                    stored[*position].0,
+                ])?;
+            }
+        }
+    }
     // (stored position to precede or follow, 0 = parse-only before 1 = stored, tiebreak index).
     let mut order: Vec<(usize, u8, usize)> = (0..stored.len()).map(|j| (j, 1, j)).collect();
     let mut next_retained = stored.len();
@@ -6584,8 +6605,8 @@ type RowDigest = [u8; 32];
 /// - `role_and_content` decides whether a parse still holds a stored message, so text a new
 ///   message shares with a stored message of another role is not taken for it.
 /// - `correlation` is the provider-native identity used first during parser-upgrade repair.
-/// - `all_columns` covers every stored column except the content parts, which the parser derives from
-///   the content; equal `all_columns` sequences mean the parse would write exactly what is stored.
+/// - `all_columns` covers message columns; mixed-message parts are compared separately because
+///   provider structure can change attribution without changing the rendered content.
 struct MessageKeys {
     role_and_content: RowDigest,
     correlation: Option<RowDigest>,
@@ -16799,6 +16820,20 @@ mod tests {
 
     #[test]
     fn a_parser_upgrade_repairs_only_changed_content_parts_in_place() {
+        assert_content_part_repair(true, true);
+    }
+
+    #[test]
+    fn a_same_parser_refresh_repairs_only_changed_content_parts() {
+        assert_content_part_repair(false, false);
+    }
+
+    #[test]
+    fn a_same_parser_refresh_repairs_content_parts_beside_archived_rows() {
+        assert_content_part_repair(false, true);
+    }
+
+    fn assert_content_part_repair(parser_upgrade: bool, retain_archive: bool) {
         use crate::models::{
             ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageContentPart,
         };
@@ -16822,13 +16857,23 @@ mod tests {
                 origin: ContentPartOrigin::QuotedContent,
             },
         ];
-        db.upsert_session(&parsed, 1, 1).unwrap();
+        let mut initial = parsed.clone();
+        if retain_archive {
+            initial.messages.push(archive_message(
+                1,
+                "archive-only",
+                crate::models::MessageKind::Conversation,
+            ));
+        }
+        db.upsert_session(&initial, 1, 1).unwrap();
         let message_id: i64 = db
             .conn
-            .query_row("select id from messages", [], |r| r.get(0))
+            .query_row("select id from messages where seq = 0", [], |r| r.get(0))
             .unwrap();
 
-        parsed.session.parse_version = "parts-v2".into();
+        if parser_upgrade {
+            parsed.session.parse_version = "parts-v2".into();
+        }
         parsed.messages[0].provenance.content_parts[0].authorship =
             ContentPartAuthorship::Generated;
         parsed.messages[0].provenance.content_parts[0].origin = ContentPartOrigin::QuotedContent;
@@ -16851,7 +16896,10 @@ mod tests {
                 (message_id, "human".into())
             ]
         );
-        assert_eq!(db.message_count().unwrap(), 1);
+        assert_eq!(
+            db.message_count().unwrap(),
+            if retain_archive { 2 } else { 1 }
+        );
     }
 
     #[test]
@@ -17440,6 +17488,47 @@ mod tests {
     }
 
     #[test]
+    fn a_same_parser_rewrite_keeps_independent_identified_messages_with_equal_text() {
+        use crate::models::{MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind};
+        let message = |seq, id: &str| {
+            let mut message =
+                archive_message(seq, "same submitted input", MessageKind::Conversation);
+            message.provenance.correlation_identity = Some(MessageCorrelationIdentity {
+                authority: MessageCorrelationAuthority::Anthropic,
+                scope: "rewrite-inputs".into(),
+                id: id.into(),
+            });
+            message
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(vec![message(0, "a"), message(1, "b")], Vec::new()),
+            1,
+            1,
+        )
+        .unwrap();
+        let rewritten = archive_session(vec![message(0, "b"), message(1, "c")], Vec::new());
+        for generation in [2, 3] {
+            db.upsert_session(&rewritten, generation, generation)
+                .unwrap();
+            let ids: Vec<String> = db
+                .conn
+                .prepare("select correlation_id from messages order by seq, id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                ids,
+                ["a", "b", "c"],
+                "text equality cannot replace source event identity"
+            );
+        }
+    }
+
+    #[test]
     fn source_alias_reconciliation_preserves_same_text_messages_with_distinct_identities() {
         use crate::models::{
             MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind::Conversation,
@@ -17896,6 +17985,15 @@ mod tests {
 
     #[test]
     fn a_new_edit_before_a_retained_edit_replays_in_source_order() {
+        assert_new_edit_replay_order(false);
+    }
+
+    #[test]
+    fn a_parser_upgrade_preserves_edit_replay_order_and_repairs_metadata() {
+        assert_new_edit_replay_order(true);
+    }
+
+    fn assert_new_edit_replay_order(parser_upgrade: bool) {
         // A rewrite drops the first Write and adds another Write before a retained Edit. Replay
         // must apply the new Write before the Edit, or the Write resets the file afterwards.
         use crate::models::MessageKind::Conversation;
@@ -17935,15 +18033,16 @@ mod tests {
             1,
         )
         .unwrap();
-        db.upsert_session(
-            &archive_session(
-                vec![archive_message(0, "summary", Conversation)],
-                vec![write("v0"), delta],
-            ),
-            2,
-            2,
-        )
-        .unwrap();
+        let mut rewritten = archive_session(
+            vec![archive_message(0, "summary", Conversation)],
+            vec![write("v0"), delta],
+        );
+        if parser_upgrade {
+            rewritten.session.parse_version = "v2".into();
+            rewritten.file_edits[1].ts = Some("2026-11-07T00:00:00Z".parse().unwrap());
+        }
+        db.upsert_session(&rewritten, 2, 2).unwrap();
+        db.upsert_session(&rewritten, 3, 3).unwrap();
         let replay: Vec<(i64, String)> = db
             .file_edits_for("f.rs", None)
             .unwrap()
@@ -17965,10 +18064,73 @@ mod tests {
             .into_iter()
             .map(|(_, _, edit)| edit)
             .collect();
+        assert_eq!(edits.last().unwrap().ts, rewritten.file_edits[1].ts);
         assert_eq!(
             crate::files::reconstruct(&edits, edits.len()).as_deref(),
             Some("w0")
         );
+    }
+
+    #[test]
+    fn a_parser_upgrade_interleaves_new_edits_with_retained_edits() {
+        let edit = |seq, old: &str, new: &str| FileEdit {
+            seq,
+            ts: None,
+            tool: if old.is_empty() { "Write" } else { "Edit" }.into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: old.is_empty().then(|| new.into()),
+            edits: if old.is_empty() {
+                Vec::new()
+            } else {
+                vec![EditOp {
+                    old: old.into(),
+                    new: new.into(),
+                    replace_all: false,
+                }]
+            },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                Vec::new(),
+                vec![edit(0, "", "v1"), edit(1, "v", "w"), edit(2, "w", "x")],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut upgraded = archive_session(
+            Vec::new(),
+            vec![
+                edit(0, "", "v0"),
+                edit(1, "v", "w"),
+                edit(2, "0", "9"),
+                edit(3, "w", "x"),
+                edit(4, "9", "2"),
+            ],
+        );
+        upgraded.session.parse_version = "v2".into();
+        for generation in [2, 3] {
+            db.upsert_session(&upgraded, generation, generation)
+                .unwrap();
+            let edits: Vec<_> = db
+                .file_edits_for("f.rs", None)
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, edit)| edit)
+                .collect();
+            assert_eq!(
+                edits.len(),
+                6,
+                "archive-only Write survives; refresh is idempotent"
+            );
+            assert_eq!(
+                crate::files::reconstruct(&edits, edits.len()).as_deref(),
+                Some("x2")
+            );
+        }
     }
 
     #[test]
