@@ -516,7 +516,11 @@ pub(crate) fn run_package_check(config: &Config, format: ReportOutputFormat) -> 
     }
 }
 
-pub(crate) fn run_package_update(config: &Config, skip_confirmation: bool) -> Result<()> {
+pub(crate) fn run_package_update(
+    config: &Config,
+    skip_confirmation: bool,
+    state_arguments: &[String],
+) -> Result<()> {
     let report = package_check_report(config)?;
     print_package_check_report(&report)?;
     if !report.newer_release_available {
@@ -547,7 +551,7 @@ pub(crate) fn run_package_update(config: &Config, skip_confirmation: bool) -> Re
     }
     let replacement_executable = background_child_executable()
         .context("could not identify the aise executable that must refresh owned skills")?;
-    execute_update_command(argv, environment, &replacement_executable)
+    execute_update_command(argv, environment, &replacement_executable, state_arguments)
 }
 
 fn package_check_report(config: &Config) -> Result<PackageCheckReport> {
@@ -851,6 +855,7 @@ fn execute_update_command(
     argv: &[String],
     environment: &BTreeMap<String, String>,
     replacement_executable: &Path,
+    state_arguments: &[String],
 ) -> Result<()> {
     let (program, args) = argv
         .split_first()
@@ -866,24 +871,26 @@ fn execute_update_command(
             "update command `{rendered}` exited with {status}; the detected package manager remains the owner, so fix its reported error and rerun the same command"
         );
     }
+    let refresh_argv: Vec<_> = std::iter::once(replacement_executable.display().to_string())
+        .chain(state_arguments.iter().cloned())
+        .chain(["skills".to_string(), "update".to_string()])
+        .collect();
+    let refresh_command = render_command(&refresh_argv)?;
     let refresh_status = Command::new(replacement_executable)
+        .args(state_arguments)
         .args(["skills", "update"])
         .status()
         .with_context(|| {
             format!(
-                "update command `{rendered}` completed, but the updated executable {} could not \
-                 start `skills update`; the package is updated, so run `{} skills update` after \
-                 repairing that executable",
-                replacement_executable.display(),
-                replacement_executable.display()
+                "update command `{rendered}` completed, but `{refresh_command}` could not start; \
+                 the package is updated, so repair that executable and rerun `{refresh_command}`"
             )
         })?;
     if !refresh_status.success() {
         bail!(
-            "update command `{rendered}` completed, but `{} skills update` exited with \
+            "update command `{rendered}` completed, but `{refresh_command}` exited with \
              {refresh_status}; the package is updated and user-owned skill files were preserved, \
-             so resolve the reported skill error and rerun that exact command",
-            replacement_executable.display()
+             so resolve the reported skill error and rerun that exact command"
         );
     }
     println!(
@@ -1546,12 +1553,22 @@ mod tests {
             &[manager.display().to_string()],
             &BTreeMap::new(),
             &replacement,
+            &[
+                "--config".to_string(),
+                temp.path().join("config.toml").display().to_string(),
+                "--database".to_string(),
+                temp.path().join("index.db").display().to_string(),
+                "--cache-dir".to_string(),
+                temp.path().join("cache").display().to_string(),
+                "--harness-home".to_string(),
+                temp.path().join("home").display().to_string(),
+            ],
         )
         .unwrap();
 
         assert_eq!(
             fs::read_to_string(refresh_log).unwrap(),
-            "skills\nupdate\n",
+            format!("--config\n{}\n--database\n{}\n--cache-dir\n{}\n--harness-home\n{}\nskills\nupdate\n", temp.path().join("config.toml").display(), temp.path().join("index.db").display(), temp.path().join("cache").display(), temp.path().join("home").display()),
             "the newly installed executable must refresh recorded skill roots without discovering new integration targets"
         );
     }

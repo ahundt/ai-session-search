@@ -101,6 +101,11 @@ configuration resolution or process launch prevents preparation, the valid integ
 remain installed and the command prints the exact configuration path plus `aise reindex` and
 `aise doctor` recovery steps.
 
+`aise integrations install --no-index-preparation` commits integration files without starting an
+indexer. Use this flag for temporary verification roots; run `aise reindex` synchronously with the
+same selected state when the check needs an index. Package-update skill refreshes retain the
+selected config, database, cache, and harness home when they launch the replacement executable.
+
 To install the executable and configure detected clients in one go, chain them with `&&`:
 
 ```bash

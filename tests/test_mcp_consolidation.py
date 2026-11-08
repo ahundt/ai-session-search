@@ -268,7 +268,7 @@ def test_the_first_python_mcp_start_after_an_upgrade_refreshes_installed_integra
     )
     installed = subprocess.run(
         [executable, "integrations", "install", "--client", "codex", "--binary", executable,
-         "--no-aliases", "--no-mcp"],
+         "--no-aliases", "--no-index-preparation", "--no-mcp"],
         capture_output=True, text=True, env=environment, timeout=MCP_PROCESS_TIMEOUT_SECONDS,
     )
     assert installed.returncode == 0, installed.stderr

@@ -64,6 +64,10 @@ Tests use this builder before collection and for each test; Rust process tests u
 `tests/support::aise` with a per-test temporary root. A bare development binary without this
 builder or explicit paths uses the normal production defaults.
 
+Temporary integration checks pass `--no-index-preparation` and run `aise reindex` synchronously
+with the same environment if indexing is required. The historical upgrade verifier owns a process
+group for each command and stops its remaining children before removing their home.
+
 Focused checks while iterating:
 
 ```bash

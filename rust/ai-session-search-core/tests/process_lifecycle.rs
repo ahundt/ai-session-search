@@ -17,6 +17,140 @@ use std::os::unix::fs::PermissionsExt as _;
 mod support;
 use support::aise;
 
+#[cfg(unix)]
+#[test]
+fn skills_update_keeps_legacy_link_retirement_inside_the_selected_harness_home() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let production = root.path().join("production");
+    let selected = root.path().join("development");
+    let run = |args: &[&str]| {
+        let mut command = aise(root.path());
+        for key in include_str!("../harness-environment.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            command.env_remove(key);
+        }
+        command
+            .env("HOME", &production)
+            .env("USERPROFILE", &production)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--harness-home",
+                selected.to_str().unwrap(),
+            ])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let installed = run(&[
+        "integrations",
+        "install",
+        "--client",
+        "claude",
+        "--no-mcp",
+        "--no-aliases",
+        "--no-instructions",
+        "--no-index-preparation",
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    for home in [&production, &selected] {
+        let link = home.join(".claude/skills/corrections");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(root.path().join("skills/corrections"), link).unwrap();
+    }
+    let updated = run(&["skills", "update"]);
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    assert!(
+        production.join(".claude/skills/corrections").is_symlink(),
+        "manual skill refresh escaped the selected harness home"
+    );
+    assert!(!selected.join(".claude/skills/corrections").is_symlink());
+}
+
+#[test]
+fn config_init_records_selected_state_before_the_destination_exists() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("new/config.toml");
+    let database = root.path().join("selected/index.db");
+    let cache = root.path().join("selected/cache");
+    let output = aise(root.path())
+        .env("AI_SESSION_SEARCH_THREADS", "invalid")
+        .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", "invalid")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--database",
+            database.to_str().unwrap(),
+            "--cache-dir",
+            cache.to_str().unwrap(),
+            "config",
+            "init",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: ai_session_search::config::Config =
+        toml::from_str(&fs::read_to_string(config).unwrap()).unwrap();
+    assert_eq!(parsed.db_path(), database);
+    assert_eq!(parsed.cache_dir(), cache);
+    assert!(!database.exists() && !cache.exists());
+}
+
+#[test]
+fn integration_install_can_commit_without_starting_index_preparation() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let target = root.path().join("mcp.json");
+    let output = aise(root.path())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "integrations",
+            "install",
+            "--client",
+            "codex",
+            "--exclude-client",
+            "codex",
+            "--json-mcp-config",
+            target.to_str().unwrap(),
+            "--no-skill",
+            "--no-instructions",
+            "--no-aliases",
+            "--binary",
+            env!("CARGO_BIN_EXE_aise"),
+            "--no-index-preparation",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(target.is_file());
+    assert!(!root.path().join("index.db").exists());
+    assert!(!root
+        .path()
+        .join("cache/background-refresh-status.json")
+        .exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("started session index preparation"));
+}
+
 #[test]
 fn harness_home_and_registration_keep_selected_state_outside_the_parent_home() {
     let root = tempfile::tempdir().unwrap();
@@ -42,6 +176,7 @@ fn harness_home_and_registration_keep_selected_state_outside_the_parent_home() {
             "--no-skill",
             "--no-instructions",
             "--no-aliases",
+            "--no-index-preparation",
             "--binary",
             env!("CARGO_BIN_EXE_aise"),
         ])
@@ -118,6 +253,7 @@ fn registration_keeps_config_file_database_selection_editable() {
             "--json-mcp-config",
             target.to_str().unwrap(),
             "--no-aliases",
+            "--no-index-preparation",
             "--no-skill",
             "--no-instructions",
             "--binary",
@@ -199,6 +335,7 @@ skill_discovery_roots = ["configured/skills"]
         "--client",
         "codex",
         "--no-aliases",
+        "--no-index-preparation",
         "--binary",
         env!("CARGO_BIN_EXE_aise"),
         "--codex-config",

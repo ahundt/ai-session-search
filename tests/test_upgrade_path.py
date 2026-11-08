@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +15,63 @@ from pytest import MonkeyPatch
 
 from scripts import verify_upgrade_path
 from scripts.verify_upgrade_path import problems_in_status
+
+
+@pytest.mark.skipif(os.name == "nt", reason="historical upgrades require a disposable Windows profile")
+def test_upgrade_command_terminates_and_waits_for_background_children(tmp_path: Path) -> None:
+    stopped = tmp_path / "stopped"
+    child = (
+        "import signal,sys,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, lambda *_: (Path(sys.argv[1]).write_text('stopped'), sys.exit(0))); "
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    parent = (
+        "import subprocess,sys; "
+        "p=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]], "
+        "stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True); "
+        "assert p.stdout.readline().strip() == 'ready'; print(p.pid)"
+    )
+    result = verify_upgrade_path._run(
+        [sys.executable, "-c", parent, child, str(stopped)],
+        verify_upgrade_path._environment(tmp_path, None),
+    )
+    assert result.returncode == 0, result.stderr
+    pid = int(result.stdout.strip())
+    try:
+        assert stopped.read_text() == "stopped"
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.parametrize("stuck", [False, True])
+def test_upgrade_root_cleanup_depends_on_child_shutdown(tmp_path: Path, monkeypatch: MonkeyPatch, stuck: bool) -> None:
+    root = tmp_path / "upgrade"
+    monkeypatch.setattr(verify_upgrade_path.tempfile, "mkdtemp", lambda **_: str(root))
+
+    def fail(*_):
+        error = verify_upgrade_path.BackgroundChildrenAlive if stuck else verify_upgrade_path.UpgradeCheckUnavailable
+        raise error("test failure")
+
+    monkeypatch.setattr(verify_upgrade_path, "_run", fail)
+    try:
+        with pytest.raises(verify_upgrade_path.UpgradeCheckUnavailable) as caught:
+            verify_upgrade_path.check_upgrade("1.0.1", tmp_path / "aise")
+        assert root.exists() == stuck
+        if stuck:
+            assert str(root) in str(caught.value)
+    finally:
+        if root.exists():
+            shutil.rmtree(root)
+
+
+def test_historical_environment_uses_compatible_vocabulary_and_fake_unix_roots(tmp_path: Path) -> None:
+    environment = verify_upgrade_path._environment(tmp_path, None)
+    assert Path(environment["AI_SESSION_SEARCH_CONFIG"]).read_text() == "[index]\n"
+    assert environment["HOME"] == str(tmp_path)
+    assert not (verify_upgrade_path.HARNESS_ENVIRONMENT & environment.keys())
 
 
 def _status(*entries: dict[str, object]) -> str:

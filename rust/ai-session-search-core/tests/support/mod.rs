@@ -2,14 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 
 pub fn aise(root: &Path) -> Command {
-    command(root, std::env::vars_os())
+    command(
+        root,
+        std::ffi::OsStr::new(env!("CARGO_BIN_EXE_aise")),
+        std::env::vars_os(),
+    )
 }
 
-fn command(root: &Path, inherited: impl Iterator<Item = (OsString, OsString)>) -> Command {
+fn command(
+    root: &Path,
+    program: &std::ffi::OsStr,
+    inherited: impl Iterator<Item = (OsString, OsString)>,
+) -> Command {
     let config = root.join("isolated-config.toml");
     let mut text = String::from("[skills]\nsearch_paths = []\n");
     for provider in [
@@ -28,11 +37,13 @@ fn command(root: &Path, inherited: impl Iterator<Item = (OsString, OsString)>) -
         ));
     }
     std::fs::create_dir_all(root).unwrap();
-    std::fs::write(&config, text).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aise"));
+    let mut staged = tempfile::NamedTempFile::new_in(root).unwrap();
+    staged.write_all(text.as_bytes()).unwrap();
+    staged.persist(&config).unwrap();
+    let mut command = Command::new(program);
     command.env_clear().envs(inherited.filter(|(key, _)| {
         matches!(
-            key.to_str(),
+            key.to_str().map(str::to_ascii_uppercase).as_deref(),
             Some(
                 "PATH"
                     | "SYSTEMROOT"
@@ -71,7 +82,52 @@ fn command(root: &Path, inherited: impl Iterator<Item = (OsString, OsString)>) -
 }
 
 #[test]
+fn execution_allowlist_accepts_windows_environment_casing() {
+    let root = tempfile::tempdir().unwrap();
+    let child = command(
+        root.path(),
+        std::ffi::OsStr::new(env!("CARGO_BIN_EXE_aise")),
+        [
+            ("SystemRoot".into(), "system".into()),
+            ("Path".into(), "bin".into()),
+        ]
+        .into_iter(),
+    );
+    for (key, value) in [("SystemRoot", "system"), ("Path", "bin")] {
+        assert!(child.get_envs().any(|(name, selected)| name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(key)
+            && selected == Some(std::ffi::OsStr::new(value))));
+    }
+}
+
+#[test]
 fn poisoned_environment_cannot_escape_the_owned_root() {
+    const STAGE: &str = "AISE_TEST_ENV_STAGE";
+    const ROOT: &str = "AISE_TEST_ENV_ROOT";
+    const TEST: &str = "support::poisoned_environment_cannot_escape_the_owned_root";
+    if let Some(stage) = std::env::var_os(STAGE) {
+        let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let production = root.parent().unwrap().join("production");
+        if stage == "probe" {
+            assert!(std::env::vars_os().all(|(_, value)| value != production.as_os_str()));
+        } else {
+            let executable = std::env::current_exe().unwrap();
+            let output = command(&root, executable.as_os_str(), std::env::vars_os())
+                .env(STAGE, "probe")
+                .env(ROOT, &root)
+                .args(["--exact", TEST, "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let production = root.path().join("production");
     std::fs::create_dir(&production).unwrap();
@@ -88,14 +144,21 @@ fn poisoned_environment_cannot_escape_the_owned_root() {
             "AI_SESSION_SEARCH_CACHE_DIR",
         ])
         .filter(|line| !line.is_empty() && !line.starts_with('#'));
-    let mut child = command(
-        &root.path().join("sandbox"),
-        names.map(|name| (OsString::from(name), production.as_os_str().to_owned())),
+    let sandbox = root.path().join("sandbox");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .envs(names.map(|name| (name, production.as_os_str())))
+        .env(STAGE, "parent")
+        .env(ROOT, &sandbox)
+        .args(["--exact", TEST, "--nocapture"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(child
-        .get_envs()
-        .all(|(_, value)| value != Some(production.as_os_str())));
-    assert!(child
+    assert!(aise(&sandbox)
         .args(["config", "paths", "--format", "json"])
         .output()
         .unwrap()

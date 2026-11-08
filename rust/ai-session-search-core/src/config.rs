@@ -1616,6 +1616,33 @@ impl Config {
         overrides: ConfigOverrides,
         environment: ConfigEnvironment,
     ) -> Result<ResolvedConfig> {
+        Self::resolve_with_environment_inner(overrides, environment, false)
+    }
+
+    pub(crate) fn resolve_for_initialization(overrides: ConfigOverrides) -> Result<ResolvedConfig> {
+        let ConfigEnvironment {
+            config_path,
+            database_path,
+            cache_dir,
+            ..
+        } = ConfigEnvironment::capture();
+        Self::resolve_with_environment_inner(
+            overrides,
+            ConfigEnvironment {
+                config_path,
+                database_path,
+                cache_dir,
+                ..Default::default()
+            },
+            true,
+        )
+    }
+
+    fn resolve_with_environment_inner(
+        overrides: ConfigOverrides,
+        environment: ConfigEnvironment,
+        initializing: bool,
+    ) -> Result<ResolvedConfig> {
         let (config_path, config_origin, explicit_config_path) =
             if let Some(path) = overrides.config_path {
                 (expand_override_path(path), "cli --config".to_string(), true)
@@ -1632,7 +1659,12 @@ impl Config {
                     false,
                 )
             };
-        let raw = read_config_text(&config_path, explicit_config_path)?;
+        // Initialization creates or explicitly replaces this file, including an invalid old file.
+        let raw = if initializing {
+            String::new()
+        } else {
+            read_config_text(&config_path, explicit_config_path)?
+        };
         let document: toml::Value = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
         let mut config: Config = match without_superseded_names(&document) {

@@ -37,13 +37,17 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from collections.abc import Sequence
 
 from scripts.release_versions import PYTHON_RELEASE_VERSION, release_sort_key
+from scripts.verify_harness_discovery import HARNESS_ENVIRONMENT
 from scripts.verify_harness_discovery import environment as isolated_environment
 
 PYPI_PROJECT_URL = "https://pypi.org/pypi/ai-session-search/json"
@@ -60,14 +64,46 @@ _POSSIBLE_CLIENTS = re.compile(r"\[possible values: ([^\]]+)\]")
 
 
 def _environment(home: pathlib.Path, executable_dir: pathlib.Path | None) -> dict[str, str]:
-    environment = isolated_environment(home)
+    config = home / "aise/config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    if not config.exists():
+        # Historical schemas reject newer provider names; Unix defaults stay under the fake home.
+        config.write_text("[index]\n", encoding="utf-8")
+    environment = isolated_environment(home, config=config)
+    for key in HARNESS_ENVIRONMENT:
+        environment.pop(key, None)
     if executable_dir is not None:
         environment["PATH"] = f"{executable_dir}{os.pathsep}{environment.get('PATH', '')}"
     return environment
 
 
 def _run(argv: Sequence[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, env=environment, capture_output=True, text=True, check=False)
+    with subprocess.Popen(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=os.name != "nt") as process:
+        try:
+            stdout, stderr = process.communicate()
+            return subprocess.CompletedProcess(argv, process.wait(), stdout, stderr)
+        finally:
+            if os.name != "nt":
+                _stop_process_group(process)
+
+
+def _stop_process_group(process: subprocess.Popen[str]) -> None:
+    group = process.pid
+    for termination in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, termination)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            process.poll()
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.01)
+    raise BackgroundChildrenAlive(f"background process group {group} did not exit after SIGKILL")
 
 
 def _published() -> dict[str, object]:
@@ -88,6 +124,10 @@ def published_versions_since(floor: str) -> list[str]:
 
 class UpgradeCheckUnavailable(Exception):
     """The earlier release could not be installed or run, so nothing about the upgrade is known."""
+
+
+class BackgroundChildrenAlive(UpgradeCheckUnavailable):
+    """Temporary roots must survive until the owned process group exits."""
 
 
 def problems_in_status(status: str) -> list[str]:
@@ -128,10 +168,9 @@ def _client_arguments(clients: Sequence[str]) -> list[str]:
 
 def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
     """Return the problems an upgrade from ``previous`` to ``executable`` leaves behind."""
-    # The earlier release's install starts indexing in the background, which may still be writing
-    # into the temporary home when the check finishes.
-    with tempfile.TemporaryDirectory(prefix="aise-upgrade-", ignore_cleanup_errors=True) as directory:
-        home = pathlib.Path(directory).resolve()
+    home = pathlib.Path(tempfile.mkdtemp(prefix="aise-upgrade-")).resolve()
+    cleanup = True
+    try:
         old = ["uvx", "--quiet", "--from", f"ai-session-search=={previous}", "aise"]
         old_environment = _environment(home, None)
         install_help = _run([*old, "integrations", "install", "--help"], old_environment)
@@ -140,7 +179,8 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
             raise UpgradeCheckUnavailable(
                 f"{previous} could not list the harnesses it supports: {install_help.stderr.strip()}"
             )
-        installed = _run([*old, "integrations", "install", *_client_arguments(clients)], old_environment)
+        preparation = ["--no-index-preparation"] if "--no-index-preparation" in install_help.stdout else []
+        installed = _run([*old, "integrations", "install", *preparation, *_client_arguments(clients)], old_environment)
         # Failing to download or run the earlier release says nothing about the upgrade, and
         # reporting it as "needs a manual step" would send the reader after a bug that is not there.
         if installed.returncode != 0:
@@ -175,6 +215,13 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
         return [
             line.replace(str(home), "~") for line in problems_in_status(status.stdout)
         ]
+
+    except BackgroundChildrenAlive as error:
+        cleanup = False
+        raise UpgradeCheckUnavailable(f"{error}; preserved temporary home {home}; stop that group before removing it") from error
+    finally:
+        if cleanup:
+            shutil.rmtree(home)
 
 
 def _versions_to_check(requested: list[str] | None, since: str) -> list[str] | None:

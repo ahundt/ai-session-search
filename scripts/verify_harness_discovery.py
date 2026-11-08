@@ -130,7 +130,7 @@ def install_command(
     executable: pathlib.Path, home: pathlib.Path, clients: Sequence[str], *, windows: bool,
 ) -> list[str]:
     argv = [str(executable), "integrations", "install", "--no-aliases", "--binary", str(executable),
-            "--no-instructions", "--no-skill"]
+            "--no-instructions", "--no-skill", "--no-index-preparation"]
     if windows:
         # Custom config flags are additive; this empty selection prevents real-profile writes.
         argv += ["--client", "codex", "--exclude-client", "codex"]
@@ -171,8 +171,7 @@ def verify(executable: pathlib.Path, *, windows: bool) -> int:
             available[name] = command
     if not available:
         return exit_code(statuses)
-    # The install starts best-effort background indexing; Windows may briefly hold files open.
-    with tempfile.TemporaryDirectory(prefix="aise-harness-", ignore_cleanup_errors=True) as temporary:
+    with tempfile.TemporaryDirectory(prefix="aise-harness-") as temporary:
         home = pathlib.Path(temporary).resolve()
         env = environment(home)
         config = pathlib.Path(env["AI_SESSION_SEARCH_CONFIG"])
