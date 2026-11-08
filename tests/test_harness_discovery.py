@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
 from pathlib import Path
 
@@ -203,3 +204,15 @@ def test_windows_names_the_codex_plugin_check_as_skipped(
     assert verifier.verify(tmp_path / "aise.exe", windows=True) == 0
     assert ["plugin", "list"] not in [argv[1:] for argv in calls]
     assert "codex plugins: skipped" in capsys.readouterr().out
+
+
+def test_main_prints_harness_output_the_console_encoding_cannot_represent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Windows runners write stdout as cp1252; OpenCode's `mcp list` draws boxes with U+250C.
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr("sys.stdout", stream)
+    monkeypatch.setattr(verifier, "verify", lambda executable, *, windows: print("┌ ok") or 0)
+    assert verifier.main(["--executable", str(tmp_path / "aise")]) == 0
+    stream.flush()
+    assert b"ok" in stream.buffer.getvalue()
