@@ -35,6 +35,7 @@ import pathlib
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Sequence
 
@@ -174,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--executable", required=True, type=pathlib.Path)
     args = parser.parse_args(argv)
+    # Harness CLIs print box-drawing characters that a Windows cp1252 console cannot encode;
+    # escape them rather than crash after the check has already run.
+    sys.stdout.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
     return verify(args.executable.resolve(), windows=os.name == "nt")
 
 
