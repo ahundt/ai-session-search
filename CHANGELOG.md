@@ -16,6 +16,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
    and deletes nothing. See Fixed item 6.
 
+### Changed
+
+1. Duration shorthand reads `m` as minutes and `M` or `mo` as months, as humantime and systemd
+   do. `--since 1m` meant 30 days and now means 1 minute; write `--since 1M` for a month.
+   Months and years now step back calendar months, so `1M` from March 31 starts on the last
+   day of February instead of March 1.
+2. Timestamps have one machine form and one for people. JSON output, MCP results and the Python
+   binding end in `Z` (`2026-11-07T20:31:22.663Z`), the form chrono's serde,
+   JavaScript and Python 3.12 read; `messages`, `files`, analytics and parts of MCP used to write
+   `+00:00`. Tables and `aise show` print local time with its offset
+   (`2026-11-07T15:31:22.663-05:00`), which can be pasted into `--since`. Stored timestamps are
+   unchanged.
+3. A date or time without an offset is read in your local time zone, as
+   [EDTF](https://www.loc.gov/standards/datetime/) and ISO 8601 define it. At 8 pm in New York,
+   `--when yesterday` and `--when 2026-11-07` now mean your day, not the UTC day. `TZ` overrides
+   the system zone. To read one value in another zone, append the zone in
+   [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) form: `--since '2026-01-15[Europe/Berlin]'`.
+   CLI flags, MCP `since`/`until`/`when` and the Python `DateRange` accept the same strings, and
+   `reference_time` takes that form too. Days that daylight saving shortens or lengthens are
+   covered, and a time a clock change skips or repeats resolves as
+   [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) specifies. `aise dates` shows the zone in
+   use.
+4. Durations also accept ISO 8601 (`P1M`, `PT2H`), compound (`1y6M`, `1d12h`) and spelled-out
+   (`2 weeks`) forms; `3 days ago` still selects that whole day. EDTF open intervals
+   (`2026-01/..`, `../2026-03`) select everything after or before a date, and a space may
+   separate date and time (`2026-01-15 14:30`), as RFC 3339 allows.
+
 ### Deprecated
 
 1. `Db::purge_injected_messages`: it now relabels through `Db::classify_injected_messages`
@@ -56,6 +83,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    A new parser version still replaces the session, because it may render the same message
    differently. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
    avoids took 1.65 s.
+
+8. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout
+   as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so it missed
+   everything Codex wrote after its last read of such a session. The compressed file is now the
+   same source as its plain form, and the session keeps its id and stored messages. A `.zst`
+   that cannot be decompressed is a warned parse failure for a session not yet indexed. For an
+   indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
+   `aise doctor`, and reads the file again on the next refresh.
 
 ### Performance
 

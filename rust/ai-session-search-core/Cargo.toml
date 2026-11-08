@@ -35,7 +35,11 @@ fd-lock = "4.0"
 file-id = "0.2.3"
 fuzzy-matcher = "0.3"
 ignore = "0.4"
-interim = { version = "0.2.1", features = ["chrono_0_4"] }
+interim = { version = "0.2.1", features = ["chrono_0_4", "jiff_0_2"] }
+# IANA time zones for date input without an offset: reads the system tz database (TZ env,
+# /etc/localtime; bundled on Windows) and resolves daylight-saving gaps and folds with RFC 5545's
+# "compatible" rule. chrono leaves gaps to the caller and chrono-tz embeds a database snapshot.
+jiff = "0.2.38"
 linkify = "0.11"
 nucleo-matcher = "0.3.1"
 # `unstable-rendered-line-info` gates `Paragraph::line_count`, which the preview uses to bound
@@ -67,6 +71,7 @@ toml_edit = "0.25.12"
 ureq = { version = "3.3", default-features = false, features = ["json", "platform-verifier", "rustls"], optional = true }
 url = "2.5"
 yaml-rust2 = { version = "0.13", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 
 [features]
 default = ["release-check"]

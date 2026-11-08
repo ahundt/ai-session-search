@@ -927,6 +927,9 @@ pub fn render_posix_shell_command(parts: &[String]) -> Result<String> {
         .map_err(|error| anyhow!("cannot render POSIX shell command: {error}"))
 }
 
+/// Read a timestamp from a harness's files: RFC 3339, or a bare `YYYY-MM-DD` date read as
+/// midnight UTC. Timestamps the index stored itself are read with [`parse_stored_timestamp`].
+#[allow(clippy::disallowed_methods)]
 pub fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
@@ -939,8 +942,67 @@ pub fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
         })
 }
 
+// The Unix-time pathways clippy.toml names; every other conversion calls one of these.
+#[allow(clippy::disallowed_methods)]
 pub fn parse_unix_seconds(value: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(value, 0)
+}
+
+#[allow(clippy::disallowed_methods)]
+pub fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_millis(value)
+}
+
+/// Nanoseconds since the Unix epoch, including negative values before it.
+#[allow(clippy::disallowed_methods)]
+pub fn parse_unix_nanos(value: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(
+        value.div_euclid(1_000_000_000),
+        value.rem_euclid(1_000_000_000) as u32,
+    )
+}
+
+/// Read timestamp text the index stored with [`stored_timestamp`]. Strict RFC 3339: a value the
+/// writer cannot produce, such as a bare date, reads as `None` instead of a guessed instant.
+#[allow(clippy::disallowed_methods)]
+pub fn parse_stored_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
+/// The text form of a timestamp stored in the index: RFC 3339 in UTC, offset written `+00:00`.
+///
+/// SQL filters and orderings compare these strings directly (`ts >= ?`), which equals time order
+/// only because every stored value shares this one offset; write stored timestamps through this
+/// function so they all do. Read them back with [`parse_stored_timestamp`].
+#[allow(clippy::disallowed_methods)]
+pub fn stored_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339()
+}
+
+/// Timestamp text for people reading a table or terminal: RFC 3339 in the local time zone with
+/// its offset (`2026-11-07T15:31:22.663-05:00`). It names the same instant as
+/// [`display_timestamp`] and can be passed back to `--since`; JSON and other machine output use
+/// [`display_timestamp`].
+pub fn display_local_timestamp(value: DateTime<Utc>) -> String {
+    let nanos = i32::try_from(value.timestamp_subsec_nanos()).unwrap_or(0);
+    match jiff::Timestamp::new(value.timestamp(), nanos) {
+        Ok(instant) => {
+            let offset = crate::dates::local_time_zone().to_offset(instant);
+            instant.display_with_offset(offset).to_string()
+        }
+        Err(_) => display_timestamp(value),
+    }
+}
+
+/// The text form of a timestamp shown to people or emitted in JSON output: RFC 3339 in UTC with
+/// a `Z` suffix, exactly what chrono's serde writes for the `DateTime` fields of output structs,
+/// so every surface shows one format. Stored text keeps `+00:00` (see [`stored_timestamp`]),
+/// because `Z` sorts after `.` and would break text ordering across fraction lengths.
+#[allow(clippy::disallowed_methods)]
+pub fn display_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 pub fn preview_from_text(value: &str) -> String {
@@ -1687,9 +1749,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
 
 /// Convert a file mtime in nanoseconds-since-epoch to a UTC datetime.
 pub fn datetime_from_mtime_ns(mtime_ns: i64) -> Option<DateTime<Utc>> {
-    let secs = mtime_ns.div_euclid(1_000_000_000);
-    let nanos = mtime_ns.rem_euclid(1_000_000_000) as u32;
-    DateTime::from_timestamp(secs, nanos)
+    parse_unix_nanos(mtime_ns)
 }
 
 /// Widen a session's observed start to include `timestamp`, keeping the earliest seen.
@@ -1756,8 +1816,8 @@ pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
             let reversal = format!(
                 "session '{}' has created_at {} after updated_at {}; the span was stored in order",
                 session.id,
-                created_at.to_rfc3339(),
-                updated_at.to_rfc3339()
+                display_timestamp(created_at),
+                display_timestamp(updated_at)
             );
             session.created_at = Some(updated_at);
             session.updated_at = Some(created_at);
@@ -1780,8 +1840,8 @@ pub fn validate_session_date_order(session: &SessionRecord) -> anyhow::Result<()
         (Some(created_at), Some(updated_at)) => anyhow::bail!(
             "session '{}' has created_at {} after updated_at {}; provider timestamp normalization must produce an ordered known span",
             session.id,
-            created_at.to_rfc3339(),
-            updated_at.to_rfc3339()
+            display_timestamp(created_at),
+            display_timestamp(updated_at)
         ),
         _ => anyhow::bail!(
             "session '{}' has no complete date span after mtime fallback; verify the source file timestamp and provider parser",
@@ -2049,6 +2109,87 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stored_timestamps_are_utc_text_whose_order_is_time_order() {
+        let at = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            stored_timestamp(at("2026-01-02T03:04:05Z")),
+            "2026-01-02T03:04:05+00:00"
+        );
+        assert_eq!(
+            stored_timestamp(at("2026-01-02T08:04:05.123+05:00")),
+            "2026-01-02T03:04:05.123+00:00"
+        );
+        let instants = [
+            at("2026-01-02T03:04:05Z"),
+            at("2026-01-02T03:04:05.000001Z"),
+            at("2026-01-02T03:04:05.5Z"),
+            at("2026-01-02T03:04:05.123Z"),
+            at("2026-01-02T03:04:06Z"),
+            at("2025-12-31T23:59:59.999Z"),
+        ];
+        let mut by_text: Vec<String> = instants.iter().copied().map(stored_timestamp).collect();
+        by_text.sort();
+        let mut by_time = instants.to_vec();
+        by_time.sort();
+        assert_eq!(
+            by_text,
+            by_time
+                .into_iter()
+                .map(stored_timestamp)
+                .collect::<Vec<_>>()
+        );
+        for instant in instants {
+            assert_eq!(
+                parse_stored_timestamp(&stored_timestamp(instant)),
+                Some(instant)
+            );
+        }
+    }
+
+    #[test]
+    fn local_display_names_the_same_instant_with_the_local_offset() {
+        let instant = parse_stored_timestamp("2026-11-07T20:31:22.663Z").unwrap();
+        let text = display_local_timestamp(instant);
+        // Whatever the machine's zone, the text carries an explicit offset and reads back to the
+        // same instant, so it can be pasted into --since.
+        assert!(!text.ends_with('Z') || crate::dates::local_time_zone() == jiff::tz::TimeZone::UTC);
+        assert_eq!(parse_stored_timestamp(&text), Some(instant));
+        assert!(text.starts_with("2026-11-0"));
+    }
+
+    #[test]
+    fn displayed_timestamps_match_what_serde_writes_for_the_same_instant() {
+        // JSON built from serde-derived structs and text formatted for output must agree, so a
+        // caller reading `aise list` and `aise messages search` sees one timestamp format.
+        for text in [
+            "2026-06-25T12:00:00Z",
+            "2026-06-25T12:00:00.5Z",
+            "2026-06-25T12:00:00.123456Z",
+            "2026-06-25T12:00:00.123456789Z",
+        ] {
+            let instant = parse_stored_timestamp(text).unwrap();
+            assert_eq!(
+                serde_json::to_value(instant).unwrap(),
+                serde_json::Value::String(display_timestamp(instant))
+            );
+        }
+    }
+
+    #[test]
+    fn stored_timestamp_reader_accepts_only_what_the_writer_produces() {
+        // Harness input may be a bare date; stored text never is, so the stored reader treats
+        // one as malformed rather than guessing midnight UTC.
+        assert_eq!(parse_stored_timestamp("2026-01-02"), None);
+        assert_eq!(parse_stored_timestamp(""), None);
+        assert!(parse_datetime("2026-01-02").is_some());
+        // Every RFC 3339 instant still reads, whatever offset an older writer used.
+        assert_eq!(
+            parse_stored_timestamp("2026-01-02T01:00:00+01:00"),
+            parse_stored_timestamp("2026-01-02T00:00:00+00:00")
+        );
+    }
 
     /// Serializes tests that install a stub search path, so a second install never replaces a
     /// first one that is still in use and the first's cleanup never clears the second's.

@@ -318,18 +318,25 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
 @pytest.mark.parametrize(
     ("expression", "expected_since", "expected_until"),
     [
-        ("2026-01", "2026-01-01T00:00:00+00:00", "2026-01-31T23:59:59.999999999+00:00"),
-        ("2024-02", "2024-02-01T00:00:00+00:00", "2024-02-29T23:59:59.999999999+00:00"),
-        ("202X", "2020-01-01T00:00:00+00:00", "2029-12-31T23:59:59.999999999+00:00"),
-        ("2026-01-X5", "2026-01-05T00:00:00+00:00", "2026-01-25T23:59:59.999999999+00:00"),
-        ("2026-01-15T14", "2026-01-15T14:00:00+00:00", "2026-01-15T14:59:59.999999999+00:00"),
-        ("2026-01/2026-03", "2026-01-01T00:00:00+00:00", "2026-03-31T23:59:59.999999999+00:00"),
+        ("2026-01", "2026-01-01T00:00:00Z", "2026-01-31T23:59:59.999999999Z"),
+        ("2024-02", "2024-02-01T00:00:00Z", "2024-02-29T23:59:59.999999999Z"),
+        ("202X", "2020-01-01T00:00:00Z", "2029-12-31T23:59:59.999999999Z"),
+        ("2026-01-X5", "2026-01-05T00:00:00Z", "2026-01-25T23:59:59.999999999Z"),
+        ("2026-01-15T14", "2026-01-15T14:00:00Z", "2026-01-15T14:59:59.999999999Z"),
+        ("2026-01/2026-03", "2026-01-01T00:00:00Z", "2026-03-31T23:59:59.999999999Z"),
         (
             "2026-07-06T22:53:22.358-04:00",
-            "2026-07-07T02:53:22.358+00:00",
-            "2026-07-07T02:53:22.358+00:00",
+            "2026-07-07T02:53:22.358Z",
+            "2026-07-07T02:53:22.358Z",
         ),
-        ("7d", "2026-06-08T12:00:00+00:00", "2026-06-15T12:00:00+00:00"),
+        ("7d", "2026-06-08T12:00:00Z", "2026-06-15T12:00:00Z"),
+        ("2d", "2026-06-13T12:00:00Z", "2026-06-15T12:00:00Z"),
+        ("2h", "2026-06-15T10:00:00Z", "2026-06-15T12:00:00Z"),
+        ("30m", "2026-06-15T11:30:00Z", "2026-06-15T12:00:00Z"),
+        ("30min", "2026-06-15T11:30:00Z", "2026-06-15T12:00:00Z"),
+        ("1M", "2026-05-15T12:00:00Z", "2026-06-15T12:00:00Z"),
+        ("1mo", "2026-05-15T12:00:00Z", "2026-06-15T12:00:00Z"),
+        ("1y", "2025-06-15T12:00:00Z", "2026-06-15T12:00:00Z"),
     ],
 )
 def test_native_date_resolution_uses_canonical_rust_semantics(
@@ -342,11 +349,31 @@ def test_native_date_resolution_uses_canonical_rust_semantics(
     assert (resolved.since, resolved.until) == (expected_since, expected_until)
 
 
+def test_native_date_resolution_reads_zones_from_values_and_reference_times() -> None:
+    def resolve(when: str, reference_time: str) -> tuple[str | None, str | None]:
+        resolved = native.DateRange(when=when).resolve_bounds(reference_time=reference_time)
+        return (resolved.since, resolved.until)
+
+    new_york_nov_7 = ("2026-11-07T05:00:00Z", "2026-11-08T04:59:59.999999999Z")
+    # An RFC 9557 reference time names the zone values without an offset are read in.
+    assert resolve("today", "2026-11-08T01:00:00Z[America/New_York]") == new_york_nov_7
+    # An RFC 3339 reference keeps its offset as the zone.
+    assert resolve("2026-11-07", "2026-11-07T20:00:00-05:00") == new_york_nov_7
+    # A trailing zone on the value overrides it.
+    assert resolve("2026-11-07[America/New_York]", "2026-11-07T20:00:00Z") == new_york_nov_7
+    # EDTF open intervals leave a side unbounded.
+    assert resolve("2026-01/..", "2026-06-15T12:00:00Z") == ("2026-01-01T00:00:00Z", None)
+    with pytest.raises(ValueError, match="RFC 9557"):
+        native.DateRange(when="today").resolve_bounds(reference_time="2026-06-15")
+    with pytest.raises(ValueError):
+        resolve("2026-11-07T14:30:00+01:00[America/New_York]", "2026-11-07T20:00:00Z")
+
+
 def test_native_date_resolution_supports_independent_bounds() -> None:
     resolved = native.DateRange(since="2026-01", until="2026-03").resolve_bounds(reference_time="2026-06-15T12:00:00Z")
 
-    assert resolved.since == "2026-01-01T00:00:00+00:00"
-    assert resolved.until == "2026-03-31T23:59:59.999999999+00:00"
+    assert resolved.since == "2026-01-01T00:00:00Z"
+    assert resolved.until == "2026-03-31T23:59:59.999999999Z"
 
 
 def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:

@@ -400,9 +400,15 @@ impl From<SessionRecord> for NativeSessionRecord {
             summary: session.summary,
             cwd: session.cwd,
             repo_root: session.repo_root,
-            created_at: session.created_at.map(|value| value.to_rfc3339()),
-            updated_at: session.updated_at.map(|value| value.to_rfc3339()),
-            last_message_at: session.last_message_at.map(|value| value.to_rfc3339()),
+            created_at: session
+                .created_at
+                .map(ai_session_search::util::display_timestamp),
+            updated_at: session
+                .updated_at
+                .map(ai_session_search::util::display_timestamp),
+            last_message_at: session
+                .last_message_at
+                .map(ai_session_search::util::display_timestamp),
             preview_text: session.preview_text,
             source_path: session.source_path,
             message_count: session.message_count,
@@ -1516,8 +1522,12 @@ impl From<ai_session_search::models::SessionTimeProfile> for NativeSessionTimePr
             messages: profile.messages,
             timestamped_messages: profile.timestamped_messages,
             undated_messages: profile.undated_messages,
-            first_timestamp: profile.first_timestamp.map(|value| value.to_rfc3339()),
-            last_timestamp: profile.last_timestamp.map(|value| value.to_rfc3339()),
+            first_timestamp: profile
+                .first_timestamp
+                .map(ai_session_search::util::display_timestamp),
+            last_timestamp: profile
+                .last_timestamp
+                .map(ai_session_search::util::display_timestamp),
             observed_span_seconds: profile.observed_span_seconds,
             max_message_gap_seconds: profile.max_message_gap_seconds,
             tool_calls: profile.tool_calls,
@@ -1617,7 +1627,9 @@ impl From<FileEditSummary> for NativeFileEditSummary {
             file_name: summary.file_name,
             edits: summary.edits,
             sessions: summary.sessions,
-            last_edited: summary.last_edited.map(|value| value.to_rfc3339()),
+            last_edited: summary
+                .last_edited
+                .map(ai_session_search::util::display_timestamp),
         }
     }
 }
@@ -1648,7 +1660,7 @@ impl From<FileVersion> for NativeFileVersion {
             provider: version.provider.as_str().to_string(),
             version: version.version,
             tool: version.tool,
-            timestamp: version.ts.map(|value| value.to_rfc3339()),
+            timestamp: version.ts.map(ai_session_search::util::display_timestamp),
             lines: version.lines,
             file_path: version.file_path,
         }
@@ -1925,7 +1937,7 @@ impl From<ai_session_search::models::MessageClassificationMatch>
             session_id: hit.session_id,
             message_seq: hit.message_seq,
             provider: hit.provider.as_str().to_string(),
-            timestamp: hit.ts.map(|value| value.to_rfc3339()),
+            timestamp: hit.ts.map(ai_session_search::util::display_timestamp),
             policy_name: hit.policy_name,
             category: hit.category,
             matched_text: hit.matched_text,
@@ -2216,8 +2228,8 @@ struct ResolvedDateRange {
 impl From<ai_session_search::dates::Bounds> for ResolvedDateRange {
     fn from((since, until): ai_session_search::dates::Bounds) -> Self {
         Self {
-            since: since.map(|value| value.to_rfc3339()),
-            until: until.map(|value| value.to_rfc3339()),
+            since: since.map(ai_session_search::util::display_timestamp),
+            until: until.map(ai_session_search::util::display_timestamp),
         }
     }
 }
@@ -2259,21 +2271,14 @@ impl DateRange {
 
     /// Resolve all expressions through the canonical Rust date parser.
     ///
-    /// `reference_time` is optional in normal use and exists so callers can make
-    /// relative expressions deterministic in tests and reproducible workflows.
+    /// Values without an offset are read in the local time zone (`TZ` or the system zone).
+    /// `reference_time` fixes "now" for reproducible results: an RFC 3339 timestamp, whose offset
+    /// becomes the zone, or an RFC 9557 one naming a zone, such as
+    /// `2026-06-15T12:00:00[America/New_York]`.
     #[pyo3(signature = (*, reference_time=None))]
     fn resolve_bounds(&self, reference_time: Option<&str>) -> PyResult<ResolvedDateRange> {
         let bounds = match reference_time {
-            Some(value) => {
-                let now = chrono::DateTime::parse_from_rfc3339(value)
-                    .map(|value| value.with_timezone(&chrono::Utc))
-                    .map_err(|_| {
-                        PyValueError::new_err(format!(
-                            "reference_time must be an RFC 3339 timestamp, got {value:?}"
-                        ))
-                    })?;
-                self.dates.resolve(now)
-            }
+            Some(value) => self.dates.resolve_at(value),
             None => self.dates.resolve_now(),
         }
         .map_err(value_error)?;
@@ -3600,7 +3605,7 @@ impl From<MessageHit> for NativeMessageHit {
             seq: hit.seq,
             role: hit.role.as_str().to_string(),
             kind: hit.kind.as_str().to_string(),
-            timestamp: hit.ts.map(|value| value.to_rfc3339()),
+            timestamp: hit.ts.map(ai_session_search::util::display_timestamp),
             tool_name: hit.tool_name,
             tool_call_id: hit.tool_call_id,
             fuzzy_score: hit.fuzzy_score,
@@ -4113,8 +4118,12 @@ impl From<IndexRefreshStatus> for NativeIndexRefreshStatus {
             started_by: status
                 .started_by
                 .map(|trigger| trigger.as_str().to_string()),
-            started_at: status.started_at.map(|value| value.to_rfc3339()),
-            finished_at: status.finished_at.map(|value| value.to_rfc3339()),
+            started_at: status
+                .started_at
+                .map(ai_session_search::util::display_timestamp),
+            finished_at: status
+                .finished_at
+                .map(ai_session_search::util::display_timestamp),
             files_discovered: status.files_discovered,
             files_processed: status.files_processed,
             sessions_updated: status.sessions_updated,
@@ -4132,7 +4141,7 @@ impl From<IndexReadinessStatus> for NativeIndexReadinessStatus {
             last_successful_refresh_at: status
                 .snapshot
                 .last_successful_refresh_at
-                .map(|value| value.to_rfc3339()),
+                .map(ai_session_search::util::display_timestamp),
             refresh: status.refresh.into(),
         }
     }

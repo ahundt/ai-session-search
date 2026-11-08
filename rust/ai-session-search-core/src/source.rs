@@ -244,16 +244,58 @@ impl<R: Read> Read for CancellationReader<'_, R> {
     }
 }
 
+/// Whether `path` names zstd-compressed JSONL (`*.jsonl.zst`), the form Codex compresses a
+/// rollout idle for 7 days into. Such a source is always read whole through
+/// [`open_source_reader`]: its byte offsets are not JSONL offsets, so it is never tail-parsed.
+/// Compares `OsStr` components, so a file name that is not valid UTF-8 still matches.
+pub(crate) fn is_compressed_jsonl(path: &std::path::Path) -> bool {
+    use std::ffi::OsStr;
+    path.extension() == Some(OsStr::new("zst"))
+        && path
+            .file_stem()
+            .and_then(|stem| std::path::Path::new(stem).extension())
+            == Some(OsStr::new("jsonl"))
+}
+
+/// Open a session source for reading its JSONL records, decompressing `*.jsonl.zst` as it is
+/// read so every parser sees the plain records either way. libzstd decodes every frame of the
+/// stream, skips skippable frames, and fails the read on a frame whose stored checksum differs
+/// from its content (Codex writes frames without one). The decoder itself holds at most one
+/// frame window, which libzstd caps at 2^27 bytes (128 MiB) by default, plus its input buffer;
+/// time is O(compressed + decompressed bytes). The parser reading from it holds what it holds
+/// for a plain file of the decompressed size, including each whole line, so a small compressed
+/// file can need as much memory as its much larger plain form.
+pub(crate) fn open_source_reader(path: &std::path::Path) -> Result<Box<dyn std::io::Read>> {
+    let file = std::fs::File::open(path)?;
+    if is_compressed_jsonl(path) {
+        return Ok(Box::new(ZstdErrorContext(
+            zstd::stream::read::Decoder::new(file)?,
+        )));
+    }
+    Ok(Box::new(file))
+}
+
+/// Names the operation in a decompression error: libzstd alone reports, for example, only
+/// "Unknown frame descriptor", which reads as a JSONL problem in a parse warning.
+struct ZstdErrorContext<R>(R);
+
+impl<R: Read> Read for ZstdErrorContext<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("zstd decompression failed: {error}"))
+        })
+    }
+}
+
 fn parse_jsonl_until(
     source: &SourceFile,
     should_cancel: &dyn Fn() -> bool,
     parse: impl FnOnce(
-        BufReader<CancellationReader<'_, std::fs::File>>,
+        BufReader<CancellationReader<'_, Box<dyn std::io::Read>>>,
     ) -> Result<crate::models::ParsedSession>,
 ) -> Result<crate::models::ParsedSession> {
-    let file = std::fs::File::open(&source.path)?;
     parse(BufReader::new(CancellationReader {
-        inner: file,
+        inner: open_source_reader(&source.path)?,
         should_cancel,
     }))
 }
@@ -330,6 +372,31 @@ impl DiscoveryResult {
             if seen.insert(source_identity(&source)) {
                 self.sources.push(source);
             }
+        }
+    }
+}
+
+impl ProviderDiscoveryWarning {
+    /// An indexed source that could not be read on this refresh. Its stored rows are kept and the
+    /// next refresh reads it again, so the warning says which file failed and why.
+    pub(crate) fn refresh_failed(
+        provider: Provider,
+        path: &std::path::Path,
+        error: &anyhow::Error,
+    ) -> Self {
+        let verification_command = "aise doctor --format json".to_string();
+        Self {
+            provider,
+            path: normalize_path(path),
+            operation: "refresh".to_string(),
+            message: format!("{error:#}"),
+            readable_sources_preserved: true,
+            guidance: format!(
+                "The rows indexed from this file's last successful read were kept, and the next \
+                 refresh reads it again. Replace or remove the file if it stays unreadable; run \
+                 `{verification_command}` to verify discovery status."
+            ),
+            verification_command,
         }
     }
 }
@@ -441,6 +508,74 @@ fn canonical_unique_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_compressed(bytes: &[u8]) -> std::io::Result<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl.zst");
+        std::fs::write(&path, bytes).unwrap();
+        let mut text = String::new();
+        open_source_reader(&path)
+            .map_err(std::io::Error::other)?
+            .read_to_string(&mut text)?;
+        Ok(text)
+    }
+
+    fn frame_with_checksum(text: &str) -> Vec<u8> {
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.include_checksum(true).unwrap();
+        std::io::Write::write_all(&mut encoder, text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn a_compressed_source_reads_every_frame_and_skips_skippable_frames() {
+        // A stream may hold several frames, and skippable frames between them carry no text.
+        let mut bytes = zstd::encode_all(&b"{\"a\":1}\n"[..], 1).unwrap();
+        bytes.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(b"pad");
+        bytes.extend(frame_with_checksum("{\"b\":2}\n"));
+        assert_eq!(read_compressed(&bytes).unwrap(), "{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn a_compressed_source_fails_on_a_damaged_checksum_or_a_truncated_stream() {
+        let text = "{\"a\":1}\n".repeat(100);
+        let intact = frame_with_checksum(&text);
+        assert_eq!(read_compressed(&intact).unwrap(), text);
+
+        // The text still decodes; only the stored checksum, the frame's last four bytes, is off.
+        let mut damaged = intact.clone();
+        *damaged.last_mut().unwrap() ^= 0x01;
+        assert!(
+            read_compressed(&damaged).is_err(),
+            "a checksum mismatch fails the read"
+        );
+
+        let truncated = &intact[..intact.len() / 2];
+        assert!(
+            read_compressed(truncated).is_err(),
+            "a truncated frame fails the read"
+        );
+    }
+
+    #[test]
+    fn only_jsonl_zst_names_are_compressed_sources() {
+        for (name, compressed) in [
+            ("rollout.jsonl.zst", true),
+            ("rollout.jsonl", false),
+            ("notes.zst", false),
+            ("rollout.json.zst", false),
+            (".jsonl.zst", false),
+            ("dir.jsonl.zst/file", false),
+        ] {
+            assert_eq!(
+                is_compressed_jsonl(std::path::Path::new(name)),
+                compressed,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn provider_parse_stops_inside_a_large_source_when_cancelled() {

@@ -89,9 +89,11 @@ aise files history src/app.py
 aise files extract src/app.py --restore
 ```
 
-`aise COMMAND --help` documents every parameter and default. Date bounds accept ISO, EDTF,
-durations, and common natural-language forms; `aise dates` lists each accepted family with
-examples.
+`aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
+[EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,
+read in your local time zone unless the value names an offset or a trailing
+[RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) zone such as `[Europe/Berlin]`;
+`aise dates` lists each accepted family with examples.
 
 ## MCP server
 

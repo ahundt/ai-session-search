@@ -78,14 +78,16 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
 
 ## 4. Filters that apply everywhere
 
-- **Time.** Periods and relative days are UTC. Session list/search/export/analysis date filters
-  intersect the inclusive query period with each known indexed span from `created_at` through
+- **Time.** Values without an offset are local time (`TZ` or the system zone); a trailing
+  [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) zone, as in `2026-01-15[Europe/Berlin]`,
+  reads one value in another zone. Session list/search/export/analysis date filters intersect
+  the inclusive query period with each known indexed span from `created_at` through
   `updated_at`: `since` tests the span end, `until` tests the span start, and `when` tests both.
   An exact RFC 3339 value is a zero-width period. A span records first and last known activity
   and may contain gaps. Message, file, and event-analytics dates test each event timestamp; for
   an exact event boundary pass a timestamp with `Z` or an explicit offset, and fractional seconds
-  are preserved for same-second ordering. Forms: `7d`, `yesterday`, `2026-01`, RFC 3339;
-  `aise dates` is the reference.
+  are preserved for same-second ordering. Forms: `7d`, `yesterday`, `2026-01`, `2026-01/..`,
+  RFC 3339; `aise dates` is the reference.
 - **Path.** `--path` (and MCP `path_prefix`) matches the exact directory and its
   component-boundary descendants and leaves lexical siblings such as `project-other` out.
 - **Session class.** A run spawned by another session is indexed as a session of its own with

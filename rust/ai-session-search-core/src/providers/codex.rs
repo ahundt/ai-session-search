@@ -18,8 +18,9 @@ use crate::models::{
 use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
     apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, parse_datetime, parse_unix_seconds,
-    preview_from_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    minimal_record, normalize_path, observe_session_end, parse_datetime, parse_unix_millis,
+    parse_unix_seconds, preview_from_text, truncate_for_display, RawMessage,
+    UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -74,7 +75,8 @@ impl CodexAdapter {
             roots,
             metadata,
             sidecar_warnings,
-            id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$").expect("valid regex"),
+            id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl(?:\.zst)?$")
+                .expect("valid regex"),
         }
     }
 
@@ -90,9 +92,32 @@ impl CodexAdapter {
     pub(crate) fn discover_with_warnings(&self) -> ProviderDiscovery {
         let mut files = Vec::new();
         let walked = walk_roots(&self.roots, None);
-        for entry in walked.entries {
+        // Codex writes the compressed copy and then deletes the plain file, so both can exist for
+        // a moment; the plain file is then the newer, authoritative copy. Deciding from this one
+        // walk keeps exactly one of the two. If Codex deletes the plain file after the walk, its
+        // read fails, the stored session stays as it was, and the next refresh finds the `.zst`.
+        let walked_plain_rollouts: std::collections::HashSet<&Path> = walked
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .collect();
+        let shadowed_by_plain: Vec<bool> = walked
+            .entries
+            .iter()
+            .map(|entry| {
+                crate::source::is_compressed_jsonl(&entry.path)
+                    && rollout_sibling(&entry.path)
+                        .is_some_and(|plain| walked_plain_rollouts.contains(plain.as_path()))
+            })
+            .collect();
+        for (entry, shadowed_by_plain) in walked.entries.into_iter().zip(shadowed_by_plain) {
             let path = &entry.path;
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            let compressed = crate::source::is_compressed_jsonl(path);
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") && !compressed {
+                continue;
+            }
+            if shadowed_by_plain {
                 continue;
             }
             let mtime_ns = entry
@@ -133,8 +158,8 @@ impl CodexAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        let file = std::fs::File::open(path)?;
-        self.parse_reader(std::io::BufReader::new(file), path)
+        let reader = crate::source::open_source_reader(path)?;
+        self.parse_reader(std::io::BufReader::new(reader), path)
     }
 
     /// Parse codex session lines from any reader. `parse_inner` calls this over the file; the
@@ -706,6 +731,18 @@ fn is_codex_injected_context(text: &str) -> bool {
         || head.starts_with("<turn_aborted")
 }
 
+/// The other form of the same rollout: `x.jsonl` for `x.jsonl.zst`, and the reverse. The two are
+/// one source, so the index keeps one session for them whichever form is on disk.
+pub(crate) fn rollout_sibling(path: &Path) -> Option<PathBuf> {
+    if crate::source::is_compressed_jsonl(path) {
+        Some(path.with_extension(""))
+    } else if path.extension() == Some(std::ffi::OsStr::new("jsonl")) {
+        Some(path.with_extension("jsonl.zst"))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn codex_home_from_session_root(root: &Path) -> PathBuf {
     root.parent().unwrap_or(root).to_path_buf()
 }
@@ -877,10 +914,6 @@ fn thread_columns(conn: &Connection) -> Result<Vec<String>> {
     Ok(columns)
 }
 
-fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
-    DateTime::<Utc>::from_timestamp_millis(value)
-}
-
 fn load_index_titles(path: &Path) -> Result<SidecarLoad<HashMap<String, String>>> {
     // Lossy decode so a stray non-UTF-8 byte in the index sidecar never aborts codex indexing.
     let bytes = fs::read(path)?;
@@ -938,6 +971,76 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rollout_name_that_is_not_utf8_is_still_recognized_and_paired() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let compressed = Path::new(OsStr::from_bytes(b"/x/rollout-\xff.jsonl.zst"));
+        let plain = Path::new(OsStr::from_bytes(b"/x/rollout-\xff.jsonl"));
+        assert!(crate::source::is_compressed_jsonl(compressed));
+        assert_eq!(super::rollout_sibling(compressed).as_deref(), Some(plain));
+        assert_eq!(super::rollout_sibling(plain).as_deref(), Some(compressed));
+        assert_eq!(super::rollout_sibling(Path::new("/x/notes.txt")), None);
+    }
+
+    #[test]
+    fn a_compressed_rollout_is_discovered_and_parses_like_its_plain_bytes() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let plain = write_rollout(&root, session_id, "/rollout", "compressed prompt");
+        let adapter = CodexAdapter::new(vec![root.clone()]);
+        let from_plain = adapter.parse(&adapter.discover()[0]);
+
+        let bytes = fs::read(&plain).unwrap();
+        let compressed = plain.with_extension("jsonl.zst");
+        fs::write(&compressed, zstd::encode_all(bytes.as_slice(), 1).unwrap()).unwrap();
+        // While both forms exist the plain file wins; then Codex deletes it.
+        assert_eq!(adapter.discover().len(), 1);
+        assert_eq!(adapter.discover()[0].path, plain);
+        fs::remove_file(&plain).unwrap();
+
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path, compressed);
+        let from_compressed = adapter.parse(&sources[0]);
+        assert_eq!(from_compressed.session.parse_warning, None);
+        assert_eq!(from_compressed.session.id, from_plain.session.id);
+        let contents = |parsed: &crate::models::ParsedSession| {
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(contents(&from_compressed), contents(&from_plain));
+    }
+
+    #[test]
+    fn a_corrupt_compressed_rollout_is_a_warned_parse_failure() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let path =
+            root.join("rollout-2026-08-04T00-00-00-019efd97-d602-7922-89dd-467272106505.jsonl.zst");
+        fs::write(&path, b"not a zstd stream at all").unwrap();
+        let adapter = CodexAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        assert!(
+            parsed
+                .session
+                .parse_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("zstd")),
+            "{:?}",
+            parsed.session.parse_warning
+        );
+        assert!(parsed.messages.is_empty());
     }
 
     #[test]

@@ -51,6 +51,10 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 uv run ruff check . && uv run mypy ai_session_search tests
 ```
 
+[`clippy.toml`](clippy.toml) lists calls that must go through a shared helper, such as parsing
+and formatting timestamps. Clippy names the helper to use when it rejects one; a deliberate
+exception carries `#[allow(clippy::disallowed_methods)]` with a comment saying why.
+
 ## The gate your change must pass
 
 ```bash

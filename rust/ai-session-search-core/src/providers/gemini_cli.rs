@@ -464,22 +464,19 @@ mod tests {
     #[test]
     fn derives_timestamp_from_supported_filename_precisions() {
         let cases = [
-            ("session-2026-02-23-id.json", "2026-02-23T00:00:00+00:00"),
-            (
-                "session-2026-02-23T04-07-id.json",
-                "2026-02-23T04:07:00+00:00",
-            ),
+            ("session-2026-02-23-id.json", "2026-02-23T00:00:00Z"),
+            ("session-2026-02-23T04-07-id.json", "2026-02-23T04:07:00Z"),
             (
                 "session-2026-02-23T04-07-09-id.json",
-                "2026-02-23T04:07:09+00:00",
+                "2026-02-23T04:07:09Z",
             ),
         ];
 
         for (filename, expected) in cases {
             assert_eq!(
-                timestamp_from_filename(Path::new(filename))
-                    .unwrap()
-                    .to_rfc3339(),
+                crate::util::display_timestamp(
+                    timestamp_from_filename(Path::new(filename)).unwrap()
+                ),
                 expected
             );
         }
