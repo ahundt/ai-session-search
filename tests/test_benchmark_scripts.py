@@ -333,7 +333,7 @@ def test_generated_fixture_reindex_cannot_reach_the_running_user_s_transcripts()
         "the fixture reindex must run with an explicit environment; inheriting the caller's HOME "
         "lets any provider the config does not disable read the running user's transcripts"
     )
-    assert '"HOME"' in reindex
+    assert "isolated_environment(fixture_dir, config=config)" in reindex
     assert "fixture_dir" in reindex
 
 
@@ -1486,6 +1486,6 @@ def test_every_measured_case_runs_with_an_owned_config_and_home(tmp_path: Path) 
 
     assert environment["HOME"] == str(tmp_path / "sandbox")
     assert environment["AI_SESSION_SEARCH_CONFIG"] == str(tmp_path / "sandbox" / "config.toml")
-    assert (tmp_path / "sandbox" / "config.toml").read_text(encoding="utf-8") == ""
+    assert "enabled = false" in (tmp_path / "sandbox" / "config.toml").read_text(encoding="utf-8")
     source = (ROOT / "scripts" / "benchmark_release.py").read_text(encoding="utf-8")
     assert "environment=hermetic_environment(sandbox)" in source

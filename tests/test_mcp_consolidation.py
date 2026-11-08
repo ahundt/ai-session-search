@@ -15,13 +15,7 @@ import pytest
 
 from ai_session_search import native
 from ai_session_search._native import _run_cli_command
-
-HARNESS_ENVIRONMENT = frozenset(
-    line.strip()
-    for line in (Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/harness-environment.txt")
-    .read_text(encoding="utf-8").splitlines()
-    if line.strip() and not line.startswith("#")
-)
+from scripts.verify_harness_discovery import environment as isolated_environment
 
 MCP_PROCESS_TIMEOUT_SECONDS = 10
 BACKGROUND_REFRESH_TIMEOUT_SECONDS = 30
@@ -139,6 +133,10 @@ def test_python_console_install_starts_the_canonical_refresh_child(tmp_path: Pat
             "install",
             "--client",
             "codex",
+            "--exclude-client",
+            "codex",
+            "--codex-config",
+            str(home / ".codex/config.toml"),
             "--binary",
             executable,
             "--no-aliases",
@@ -205,17 +203,7 @@ def _command(*args: str) -> list[str]:
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
-    config_path = tmp_path / "config.toml"
-    if not config_path.exists():
-        config_path.write_text("", encoding="utf-8")
-    return {
-        **{
-            key: value for key, value in os.environ.items()
-            if key not in HARNESS_ENVIRONMENT
-        },
-        "AI_SESSION_SEARCH_CONFIG": str(config_path),
-        "AI_SESSION_SEARCH_CACHE_DIR": str(tmp_path / "cache"),
-    }
+    return isolated_environment(tmp_path, config=tmp_path / "config.toml")
 
 
 def _initialize_request(request_id: int = 1) -> str:

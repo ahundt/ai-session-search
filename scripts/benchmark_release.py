@@ -21,6 +21,11 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar, TypedDict
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.verify_harness_discovery import environment as isolated_environment
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "benchmarks" / "release_manifest.json"
 TIER_ORDER = {"smoke": 0, "subsystem": 1, "release": 2}
@@ -202,7 +207,8 @@ def generate_fixture(
         [str(binary), "--config", str(config), "reindex"],
         cwd=fixture_dir,
         check=True,
-        env={**os.environ, "HOME": str(fixture_dir), "USERPROFILE": str(fixture_dir)},
+        env={**isolated_environment(fixture_dir, config=config),
+             "AI_SESSION_SEARCH_DATABASE": str(database.resolve())},
     )
     connection = sqlite3.connect(database)
     try:
@@ -451,23 +457,7 @@ def hermetic_environment(sandbox: Path) -> dict[str, str]:
     setting changed the measurement, and any aise command may refresh the installed skill beside
     that config. The TUI client builds the same sandbox for its own process.
     """
-    config = sandbox / "config.toml"
-    sandbox.mkdir(parents=True, exist_ok=True)
-    config.touch()
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("AI_SESSION_SEARCH_", "XDG_"))
-    }
-    environment.update(
-        {
-            "HOME": str(sandbox),
-            "USERPROFILE": str(sandbox),
-            "XDG_CONFIG_HOME": str(sandbox / "xdg"),
-            "AI_SESSION_SEARCH_CONFIG": str(config),
-        }
-    )
-    return environment
+    return isolated_environment(sandbox, config=sandbox / "config.toml")
 
 
 def sample_process(

@@ -188,6 +188,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 4. `./run_ci_local.sh` now runs the required MSRV library-test build and API-consumer check
    when the workspace's minimum Rust toolchain is installed. Otherwise it reports named skips
    with the exact install command; contract tests keep the commands aligned with CI.
+5. Python tests and runtime verifiers share an allowlisted environment builder with temporary
+   application and harness state and disabled transcript providers. Pytest sanitizes its
+   environment before collection; Rust process tests use a per-test command factory. Demo homes
+   are unique temporary directories.
 
 ## [1.0.0] - 2026-11-05
 

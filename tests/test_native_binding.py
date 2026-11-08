@@ -7,7 +7,6 @@ import ast
 import hashlib
 import inspect
 import json
-import os
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +16,7 @@ from pathlib import Path
 import pytest
 
 import ai_session_search
+from scripts.verify_harness_discovery import environment as isolated_environment
 
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
@@ -2408,12 +2408,7 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
     command += ["--", case["query"]]
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    environment = {
-        **os.environ,
-        "AI_SESSION_SEARCH_CONFIG": str(config),
-        "HOME": str(home),
-        "XDG_CONFIG_HOME": str(home / ".config"),
-    }
+    environment = isolated_environment(tmp_path, config=config)
     return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=environment, timeout=120)
 
 
@@ -2494,7 +2489,7 @@ def _parity_entry_point_read(database: Path, spec: dict, selector: list[str], tm
         "existing-only",
         "--skip-release-notification",
     ]
-    environment = {**os.environ, "AI_SESSION_SEARCH_CONFIG": str(config), "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")}
+    environment = isolated_environment(tmp_path, config=config)
     result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=environment, timeout=120)
     assert result.returncode == 0, result.stderr
     return [(row["seq"], row["role"]) for row in json.loads(result.stdout)]

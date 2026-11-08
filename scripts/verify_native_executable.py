@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import pathlib
 import sys
 import tempfile
@@ -16,6 +15,7 @@ if not __package__:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from scripts import verify_installed_distribution as installed_verifier
+from scripts.verify_harness_discovery import environment as isolated_environment
 
 
 def verify(executable: pathlib.Path, timeout_seconds: float) -> None:
@@ -30,9 +30,7 @@ def verify(executable: pathlib.Path, timeout_seconds: float) -> None:
         config_path = root / "config" / "config.toml"
         config_path.parent.mkdir(parents=True)
         config_path.write_text("", encoding="utf-8")
-        environment = os.environ.copy()
-        environment["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
-        environment["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
+        environment = isolated_environment(root)
         installed_verifier.verify_configuration_contract(
             str(executable),
             executable.name,

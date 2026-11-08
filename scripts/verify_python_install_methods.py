@@ -17,6 +17,11 @@ import sys
 import tempfile
 import urllib.parse
 
+if not __package__:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from scripts.verify_harness_discovery import environment as isolated_environment
+
 DEFAULT_INSTALL_TIMEOUT_SECONDS = 180.0
 FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 
@@ -102,7 +107,7 @@ def _verify_with_python(
     _run(
         [str(python), str(verifier), "--source-root", str(source_root)],
         root=root,
-        environment=environment,
+        environment={**isolated_environment(root / "runtime"), "PATH": environment["PATH"]},
         timeout_seconds=timeout_seconds,
     )
 
