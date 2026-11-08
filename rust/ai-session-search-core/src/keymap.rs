@@ -429,8 +429,7 @@ impl KeyBindings {
             .map(|(action, _)| *action)
     }
 
-    /// Reject a table that cannot be operated: an unknown spelling is already refused while
-    /// parsing, so what is left is one chord meaning two things in one mode, and no way out.
+    /// Reject a table with conflicting chords or no way out.
     pub(crate) fn validate(&self) -> Result<()> {
         // A list rather than a map: crossterm's key types are not ordered, the table holds
         // tens of chords, and the scan keeps the message deterministic in action order.
@@ -513,9 +512,12 @@ impl Default for KeyBindings {
 impl<'de> Deserialize<'de> for KeyBindings {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         // Start from the defaults so a table naming one action does not silently unbind the
-        // other eighteen. `TuiAction` deserializes from a closed set, so an action nobody
-        // implements is refused here rather than accepted and ignored.
-        let overrides = BTreeMap::<TuiAction, Vec<KeyChord>>::deserialize(deserializer)?;
+        // other eighteen. Future action names follow ordinary config-key diagnostics.
+        let overrides: BTreeMap<TuiAction, Vec<KeyChord>> =
+            crate::config::deserialize_config_entries(
+                deserializer,
+                crate::config::parse_config_key,
+            )?;
         let mut bindings = Self::default();
         for (action, chords) in overrides {
             bindings.bind(action, chords);
@@ -755,11 +757,11 @@ mod tests {
     }
 
     #[test]
-    fn an_action_nobody_implements_is_refused_rather_than_ignored() {
-        let error = toml::from_str::<KeyBindings>("teleport = [\"t\"]")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("teleport"), "{error}");
+    fn a_future_action_keeps_existing_bindings_and_is_reported_by_config() {
+        let config: crate::config::Config =
+            toml::from_str("[ui.keys]\nteleport = [\"t\"]").unwrap();
+        assert_eq!(config.ui.keys, KeyBindings::default());
+        assert_eq!(config.unknown_config_keys[0].path, "ui.keys.teleport");
     }
 
     #[test]

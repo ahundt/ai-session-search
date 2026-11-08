@@ -2385,6 +2385,132 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
     );
 }
 
+#[test]
+fn future_config_keys_keep_mcp_protocol_only_and_stderr_empty() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("\n[ui]\npreview_body_linse = 9\n[mcp]\nfuture_transport = true\n");
+    fs::write(&config, &text).unwrap();
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+    let mut child = aise(root.path())
+        .env("AI_SESSION_SEARCH_CONFIG", &config)
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for request in [
+        serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "protocolVersion":"2025-11-25", "capabilities":{},
+            "clientInfo":{"name":"config-forward-compat", "version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
+        serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+            "name":"get_index_status", "arguments":{}}}),
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success());
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[0]["id"], 1);
+    assert!(responses[1]["result"]["tools"].is_array());
+    let status = &responses[2]["result"]["structuredContent"];
+    assert_eq!(
+        status["unknown_config_keys"][1]["path"],
+        "ui.preview_body_linse"
+    );
+    assert_eq!(
+        status["unknown_config_keys"][1]["suggestion"],
+        "ui.preview_body_lines"
+    );
+    assert_eq!(fs::read_to_string(config).unwrap(), text);
+}
+
+#[test]
+fn config_diagnostics_report_typos_without_rewriting_the_file() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("\n[ui]\npreview_body_linse = 9\n");
+    fs::write(&config, &text).unwrap();
+    for args in [
+        vec!["doctor"],
+        vec!["doctor", "--format", "json"],
+        vec!["config", "check"],
+    ] {
+        let output = aise(root.path())
+            .env("AI_SESSION_SEARCH_CONFIG", &config)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            args[0] == "doctor",
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(report.contains("ui.preview_body_linse"), "{report}");
+        assert!(report.contains("ui.preview_body_lines"), "{report}");
+        if args.contains(&"json") {
+            let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                status["unknown_config_keys"][0]["path"],
+                "ui.preview_body_linse"
+            );
+            assert_eq!(
+                status["unknown_config_keys"][0]["suggestion"],
+                "ui.preview_body_lines"
+            );
+        }
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+    }
+}
+
+#[test]
+fn config_check_never_opens_the_index_or_refreshes_integrations() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let original = fs::read_to_string(&config).unwrap();
+    for (suffix, success) in [("\n[ui]\npreview_body_linse=9\n", false), ("", true)] {
+        let text = format!("{original}{suffix}");
+        fs::write(&config, &text).unwrap();
+        let output = aise(root.path())
+            .env("AI_SESSION_SEARCH_CONFIG", &config)
+            .args(["config", "check"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root.path().join("index.db").exists());
+        assert!(!root.path().join("integrations-refreshed-version").exists());
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+    }
+}
+
 /// Write a minimal standard-shaped skill directory under `root/skills/<name>/`.
 fn write_test_skill(
     root: &std::path::Path,

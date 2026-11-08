@@ -118,6 +118,9 @@ pub struct Config {
     pub release_notifications: ReleaseNotificationConfig,
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    /// Ignored ordinary config keys; loading is silent on every surface.
+    #[serde(skip)]
+    pub unknown_config_keys: Vec<UnknownConfigKey>,
 }
 
 /// Per-invocation configuration overrides. `None` preserves lower-precedence sources.
@@ -199,8 +202,25 @@ pub struct ResolvedConfig {
     pub origins: ConfigOrigins,
 }
 
+/// An ordinary key ignored by this binary, with a nearby spelling when one is known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnknownConfigKey {
+    pub path: String,
+    pub suggestion: Option<String>,
+}
+
+impl fmt::Display for UnknownConfigKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.path)?;
+        if let Some(suggestion) = &self.suggestion {
+            write!(f, " (did you mean {suggestion:?}?)")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct ConfigFile {
     providers: Option<ProvidersFile>,
     index: Option<IndexConfig>,
@@ -218,6 +238,7 @@ struct ConfigFile {
 }
 
 #[derive(Debug, Default, Deserialize)]
+// Strict: a misspelled provider table could otherwise bypass a source disable or path restriction.
 #[serde(default, deny_unknown_fields)]
 struct ProvidersFile {
     claude: Option<ProviderFile>,
@@ -235,6 +256,7 @@ struct ProvidersFile {
 }
 
 #[derive(Debug, Default, Deserialize)]
+// Strict: enabled/paths determine which transcript sources may be read.
 #[serde(default, deny_unknown_fields)]
 struct ProviderFile {
     enabled: Option<bool>,
@@ -332,11 +354,142 @@ impl<'de> Deserialize<'de> for Config {
     where
         D: Deserializer<'de>,
     {
-        Ok(ConfigFile::deserialize(deserializer)?.into_config())
+        let mut ignored = Vec::new();
+        let mut collect = |path: serde_ignored::Path<'_>| {
+            fn components(path: &serde_ignored::Path<'_>, out: &mut Vec<String>) {
+                use serde_ignored::Path;
+                match path {
+                    Path::Root => {}
+                    Path::Map { parent, key } => {
+                        components(parent, out);
+                        out.push(key.clone());
+                    }
+                    Path::Seq { parent, index } => {
+                        components(parent, out);
+                        out.push(index.to_string());
+                    }
+                    Path::Some { parent }
+                    | Path::NewtypeStruct { parent }
+                    | Path::NewtypeVariant { parent } => components(parent, out),
+                }
+            }
+            let mut keys = Vec::new();
+            components(&path, &mut keys);
+            ignored.push(keys);
+        };
+        let file: ConfigFile = serde_path_to_error::deserialize(serde_ignored::Deserializer::new(
+            deserializer,
+            &mut collect,
+        ))
+        .map_err(|error| {
+            let recovery = if error.inner().to_string().contains("unknown field") {
+                "; correct the key or upgrade aise to honor this setting"
+            } else {
+                ""
+            };
+            serde::de::Error::custom(format!(
+                "config table [{}]: {}{recovery}",
+                error.path(),
+                error.inner()
+            ))
+        })?;
+        let mut config = file.into_config();
+        if !ignored.is_empty() {
+            // Serde owns membership; serialized typed fields and the existing row registry own
+            // suggestions. No second list of valid config keys can drift from the parser.
+            let mut known = serde_json::to_value(&config).map_err(serde::de::Error::custom)?;
+            known["mcp"]["client_limits"] = crate::mcp_schema_budget::declared_limit_names()
+                .into_iter()
+                .map(|name| (name.to_string(), serde_json::Value::Null))
+                .collect();
+            for surface in <IntegrationSurface as clap::ValueEnum>::value_variants() {
+                known["integrations"]["paths"][surface.as_str()] = surface
+                    .accepted_fields()
+                    .iter()
+                    .map(|name| (name.to_string(), serde_json::Value::Null))
+                    .collect();
+            }
+            config.unknown_config_keys = ignored
+                .into_iter()
+                .map(|keys| {
+                    let (key, parents) = keys.split_last().expect("ignored field has a key");
+                    let key_chars = key.chars().count();
+                    let table = parents.iter().try_fold(&known, |table, key| table.get(key));
+                    let suggestion =
+                        table
+                            .and_then(serde_json::Value::as_object)
+                            .and_then(|table| {
+                                table
+                                    .keys()
+                                    .filter(|candidate| {
+                                        candidate.chars().count().abs_diff(key_chars) <= 2
+                                    })
+                                    .map(|candidate| {
+                                        (strsim::levenshtein(key, candidate), candidate)
+                                    })
+                                    .filter(|(distance, _)| *distance <= 2)
+                                    .min()
+                                    .map(|(_, candidate)| {
+                                        parents
+                                            .iter()
+                                            .map(String::as_str)
+                                            .chain([candidate.as_str()])
+                                            .collect::<Vec<_>>()
+                                            .join(".")
+                                    })
+                            });
+                    UnknownConfigKey {
+                        path: keys.join("."),
+                        suggestion,
+                    }
+                })
+                .collect();
+            config
+                .unknown_config_keys
+                .sort_by(|left, right| left.path.cmp(&right.path));
+        }
+        Ok(config)
     }
 }
 
+/// Enum-keyed ordinary tables must also ignore future names through Serde's ignored-field hook.
+pub(crate) fn deserialize_config_entries<'de, D, K: Ord, V: Deserialize<'de>>(
+    deserializer: D,
+    parse_key: fn(&str) -> Option<K>,
+) -> std::result::Result<BTreeMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct Entries<K, V>(fn(&str) -> Option<K>, std::marker::PhantomData<V>);
+    impl<'de, K: Ord, V: Deserialize<'de>> serde::de::Visitor<'de> for Entries<K, V> {
+        type Value = BTreeMap<K, V>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a config table")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut entries = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if let Some(key) = (self.0)(&key) {
+                    entries.insert(key, map.next_value()?);
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_map(Entries(parse_key, std::marker::PhantomData))
+}
+
+pub(crate) fn parse_config_key<K: serde::de::DeserializeOwned>(key: &str) -> Option<K> {
+    K::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(key)).ok()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
+// Strict: provider names select source disables and path restrictions, matching ProvidersFile.
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ProvidersConfig {
@@ -361,6 +514,7 @@ pub struct ProvidersConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+// Strict: source enabled/paths restrictions must be understood, matching ProviderFile.
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ProviderConfig {
@@ -395,7 +549,7 @@ impl std::str::FromStr for IndexRefresh {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct IndexConfig {
     pub db_path: Option<String>,
@@ -418,7 +572,7 @@ pub struct IndexConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct UiConfig {
     /// Lines of transcript body in the preview. 1.0.0rc2 spelled it `preview_lines`, and a
@@ -470,7 +624,7 @@ pub struct UiConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct SearchConfig {
     #[serde(default = "default_limit")]
@@ -495,7 +649,7 @@ pub struct SearchConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct MessageSearchConfig {
     /// Optional shared positive page size. `None` preserves current CLI, MCP, Python, and Rust
@@ -509,7 +663,7 @@ pub struct MessageSearchConfig {
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct MessageContextDefaults {
     pub context_before: Option<usize>,
@@ -517,6 +671,7 @@ pub struct MessageContextDefaults {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+// Strict: hard page/context ceilings restrict how much content can be exposed.
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SearchBudgetConfig {
@@ -538,6 +693,7 @@ pub enum SearchScopeMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+// Strict: scope mode and trusted roots authorize reads across every search surface.
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SearchScopeConfig {
@@ -563,6 +719,7 @@ pub enum SearchOperation {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+// Strict: versioned purpose/policy bundles must not silently lose a future restriction.
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct PurposeDefinition {
@@ -573,6 +730,7 @@ pub struct PurposeDefinition {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+// Strict: purpose preferences bound exposed context/evidence; future restrictions must be understood.
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct MessagePurposePreferences {
@@ -594,7 +752,7 @@ pub struct MessagePurposePreferences {
 /// `(recency_max_days - age_days).max(0) * recency_weight`, and `current_repo_bonus` is
 /// added when a session's repo matches the current one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct ScoringConfig {
     #[serde(default = "default_title_score")]
@@ -623,7 +781,7 @@ pub struct ScoringConfig {
 
 /// Analytics defaults and overrides (`[analytics]` in config.toml).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct AnalyticsConfig {
     /// `planning`: when non-empty, restricts the count to slash commands whose token
@@ -658,7 +816,7 @@ pub struct AnalyticsConfig {
 /// A skill is a standard Agent Skills directory. Deterministic capabilities are declared by
 /// adjacent, strictly parsed metadata; `aise` does not execute instructions from `SKILL.md`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct SkillsConfig {
     /// Directories to scan for skills, each either a skill directory or a directory containing
@@ -678,14 +836,14 @@ pub struct SkillsConfig {
 
 /// Defaults for typed deterministic capabilities.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct CapabilitiesConfig {
     pub message_classification: MessageClassificationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct MessageClassificationConfig {
     /// Default native CLI and Python result count. `0` means every match.
@@ -698,7 +856,7 @@ pub struct MessageClassificationConfig {
 /// auto-detect from the host (`std::thread::available_parallelism`), so it adapts to any
 /// machine with no configuration. See [`Config::resolve_threads`] for the override chain.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct PerformanceConfig {
     /// Worker threads for parallel scans. `0` = auto (all available cores); `1` = sequential.
@@ -820,7 +978,7 @@ impl<'de> Deserialize<'de> for McpReadConcurrency {
 /// only when the MCP client omits the matching parameter; explicit tool arguments still win. They
 /// matter because MCP responses are usually copied straight into an agent's context window.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct McpConfig {
     /// Maximum tool calls per MCP server process that may hold independent read-only SQLite
@@ -906,16 +1064,15 @@ pub struct McpConfig {
     /// client that has since moved sets the new number here instead of waiting for a release
     /// built against it.
     ///
-    /// An unknown row name is rejected rather than ignored, so a typo cannot silently leave the
-    /// shipped budget in force while appearing to change it.
-    #[serde(default)]
+    /// Unknown future row names are ignored and reported with the other ordinary config keys.
+    #[serde(default, deserialize_with = "deserialize_client_limits")]
     pub client_limits: BTreeMap<String, usize>,
 }
 
 /// Internal MCP presentation budgets (`[mcp.internal]`). These exist to keep tool descriptions
 /// concise while still giving agents enough live schema context to form valid SQL.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct McpInternalConfig {
     /// Number of schema objects shown in the `query_session_index` tool description.
@@ -928,7 +1085,7 @@ pub struct McpInternalConfig {
 
 /// CLI defaults (`[cli]`). These affect command-line behavior only when the flag is omitted.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct CliConfig {
     /// Default `aise show --transcript-lines`: positive=head, negative=tail, 0=entire transcript.
@@ -958,7 +1115,7 @@ pub struct CliConfig {
 /// separate `mcp.query_timeout_ms` availability guard because its synchronous tool lifecycle is
 /// distinct. Neither configuration affects indexed search APIs such as `search_messages`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct DbConfig {
     /// Default maximum rows for read-only SQL. `0` means unlimited and can produce huge output.
@@ -975,7 +1132,7 @@ pub const DEFAULT_RELEASE_NOTIFICATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
 /// Stable-release notification defaults (`[release_notifications]`).
 /// Explicit `aise package check|update` requests remain available when notifications are disabled.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct ReleaseNotificationConfig {
     /// Check for an applicable release after ordinary interactive CLI output.
@@ -998,7 +1155,7 @@ impl Default for ReleaseNotificationConfig {
 
 /// Installed-integration upkeep (`[integrations]`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct IntegrationsConfig {
     /// After aise changes version, rewrite installed skill files and instruction blocks it wrote
@@ -1020,7 +1177,9 @@ impl Default for IntegrationsConfig {
 }
 
 /// Concrete integration surfaces, including compatibility clients sharing one CLI selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum IntegrationSurface {
@@ -1078,7 +1237,7 @@ impl IntegrationSurface {
 
 /// Optional endpoint categories; validation permits only components that the surface supports.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct IntegrationPathOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1129,21 +1288,22 @@ impl IntegrationPathOverrides {
 fn deserialize_integration_paths<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<IntegrationSurface, IntegrationPathOverrides>, D::Error> {
-    let raw = BTreeMap::<IntegrationSurface, toml::Value>::deserialize(deserializer)?;
-    raw.into_iter()
-        .map(|(surface, value)| {
-            let paths: IntegrationPathOverrides = value.try_into().map_err(|error| {
-                serde::de::Error::custom(format!(
-                    "integrations.paths.{}: {error}; accepted fields for {}: {}",
-                    surface.as_str(),
-                    surface.as_str(),
-                    surface.accepted_fields().join(", ")
-                ))
-            })?;
-            paths.validate(surface).map_err(serde::de::Error::custom)?;
-            Ok((surface, paths))
-        })
-        .collect()
+    let paths: BTreeMap<IntegrationSurface, IntegrationPathOverrides> =
+        deserialize_config_entries(deserializer, parse_config_key)?;
+    for (surface, paths) in &paths {
+        paths.validate(*surface).map_err(serde::de::Error::custom)?;
+    }
+    Ok(paths)
+}
+
+fn deserialize_client_limits<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, usize>, D::Error> {
+    deserialize_config_entries(deserializer, |key| {
+        crate::mcp_schema_budget::declared_limit_names()
+            .contains(&key)
+            .then(|| key.to_owned())
+    })
 }
 
 fn default_true() -> bool {
@@ -1419,6 +1579,7 @@ impl Default for Config {
             db: DbConfig::default(),
             release_notifications: ReleaseNotificationConfig::default(),
             integrations: IntegrationsConfig::default(),
+            unknown_config_keys: Vec::new(),
         }
     }
 }
@@ -1976,8 +2137,7 @@ impl Config {
         if self.ui.provider_label_width == 0 {
             bail!("ui.provider_label_width must be greater than zero; {FIX}");
         }
-        // The vocabulary's own rules: one chord meaning two things in a mode, and a table
-        // with no way out. Parsing already refused an unknown spelling.
+        // Known bindings must leave a usable exit and avoid conflicting chords.
         self.ui.keys.validate()?;
         if !(10..=90).contains(&self.ui.list_pane_percent) {
             bail!("ui.list_pane_percent must be between 10 and 90 inclusive; {FIX}");
@@ -2762,8 +2922,6 @@ mod tests {
             "[search.message-search]\ndefault_limit = 0\n",
             "[search.message-search]\nmatch_evidence_max_chars = 0\n",
             "[search.budgets]\nmax_context_neighbors_per_hit = 0\n",
-            "[search.message-search.context]\nmessages_before = 2\n",
-            "[search.message-search.context]\nmessages_after = 2\n",
             "[search.budgets]\nmax_results_per_page = 10\n",
             "[search.budgets]\nmax_context_messages = 10\n",
             "[search.budgets]\ntimeout_ms = 5000\n",
@@ -2960,12 +3118,14 @@ mod tests {
     }
 
     #[test]
-    fn performance_rejects_removed_custom_trigram_tuning() {
+    fn performance_reports_removed_custom_trigram_tuning() {
         for key in ["regex_prefilter_min_corpus", "trigram_rebuild_delta"] {
-            let error = toml::from_str::<Config>(&format!("[performance]\n{key} = 10000\n"))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("unknown field"), "{key}: {error}");
+            let config =
+                toml::from_str::<Config>(&format!("[performance]\n{key} = 10000\n")).unwrap();
+            assert_eq!(
+                config.unknown_config_keys[0].path,
+                format!("performance.{key}")
+            );
         }
     }
 
@@ -3213,16 +3373,17 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_rejects_noncanonical_field_names() {
+    fn mcp_config_reports_noncanonical_ordinary_field_names() {
         for config in [
             "[mcp]\nmessage_search_limit = 11\n",
             "[mcp]\nschema_summary_tables = 12\n",
             "[mcp]\nschema_summary_columns = 13\n",
-            "[search.budgets]\nmax_response_bytes = 1024\n",
             "[mcp]\nmax_response_bytes = 1024\n",
         ] {
-            assert!(toml::from_str::<Config>(config).is_err());
+            let parsed: Config = toml::from_str(config).unwrap();
+            assert_eq!(parsed.unknown_config_keys.len(), 1, "{config}");
         }
+        assert!(toml::from_str::<Config>("[search.budgets]\nmax_response_bytes = 1024\n").is_err());
     }
 
     #[test]
@@ -3253,7 +3414,7 @@ mod tests {
     }
 
     #[test]
-    fn release_notification_names_are_exact_and_old_update_names_are_rejected() {
+    fn release_notification_names_are_exact_and_old_update_names_are_reported() {
         let cfg: Config = toml::from_str(
             r#"
             [release_notifications]
@@ -3273,10 +3434,8 @@ mod tests {
             "[release_notifications]\npassive_check_interval_hours = 12\n",
             "[release_notifications]\npassive_request_timeout_ms = 750\n",
         ] {
-            assert!(
-                toml::from_str::<Config>(stale_config).is_err(),
-                "stale release-notification name unexpectedly parsed: {stale_config}"
-            );
+            let parsed: Config = toml::from_str(stale_config).unwrap();
+            assert_eq!(parsed.unknown_config_keys.len(), 1, "{stale_config}");
         }
     }
 
@@ -3289,13 +3448,13 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_rejects_unknown_keys() {
-        // deny_unknown_fields: a typo must be named, not silently ignored, or a user who wrote
-        // `search_path` would get the embedded default and no indication why.
-        let err = toml::from_str::<Config>("[skills]\nsearch_path = []\n")
-            .expect_err("a misspelled key must be rejected")
-            .to_string();
-        assert!(err.contains("search_path"), "{err}");
+    fn skills_section_reports_unknown_keys_with_suggestions() {
+        let config = toml::from_str::<Config>("[skills]\nsearch_path = []\n").unwrap();
+        assert_eq!(config.unknown_config_keys[0].path, "skills.search_path");
+        assert_eq!(
+            config.unknown_config_keys[0].suggestion.as_deref(),
+            Some("skills.search_paths")
+        );
     }
 
     #[test]
@@ -3325,10 +3484,8 @@ mod tests {
             "[mcp]\nfind_corrections_limit = 11\n",
             "[skills]\nenabled = [\"mine\"]\n",
         ] {
-            assert!(
-                toml::from_str::<Config>(removed).is_err(),
-                "removed prerelease correction settings must fail instead of being ignored"
-            );
+            let parsed: Config = toml::from_str(removed).unwrap();
+            assert_eq!(parsed.unknown_config_keys.len(), 1, "{removed}");
         }
     }
 
@@ -3398,9 +3555,8 @@ mcp_config = "kilo.jsonc"
     }
 
     #[test]
-    fn integration_path_tables_reject_typos_unsupported_fields_and_empty_paths() {
+    fn integration_path_tables_reject_unsupported_known_fields_and_empty_paths() {
         for (surface, key, value, accepted) in [
-            ("codex", "mcp_confg", "'file'", "mcp_config"),
             ("cursor", "instruction_file", "'AGENTS.md'", "mcp_config"),
             (
                 "opencode",
@@ -3418,12 +3574,15 @@ mcp_config = "kilo.jsonc"
                 "{error}"
             );
         }
-        let error = toml::from_str::<Config>("[integrations.paths.codez]\nmcp_config='x'\n")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("codez") && error.contains("codex"),
-            "{error}"
+        let config =
+            toml::from_str::<Config>("[integrations.paths.codez]\nmcp_config='x'\n").unwrap();
+        assert_eq!(
+            config.unknown_config_keys[0].path,
+            "integrations.paths.codez"
+        );
+        assert_eq!(
+            config.unknown_config_keys[0].suggestion.as_deref(),
+            Some("integrations.paths.codex")
         );
     }
 
@@ -4120,6 +4279,129 @@ mcp_config = "kilo.jsonc"
         )
         .unwrap();
         assert_eq!(resolved.config.ui.preview_body_lines, 12);
+    }
+
+    #[test]
+    fn ordinary_future_config_keys_load_without_changing_known_values() {
+        let cfg: Config = toml::from_str(
+            "future_setting = true\n[ui]\npreview_body_lines = 12\npreview_body_linse = 9\n\
+             [mcp]\nfuture_transport = { enabled = true }\n",
+        )
+        .expect("ordinary keys from a newer config must load");
+        assert_eq!(cfg.ui.preview_body_lines, 12);
+        assert_eq!(
+            cfg.unknown_config_keys
+                .iter()
+                .map(|key| key.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "future_setting",
+                "mcp.future_transport",
+                "ui.preview_body_linse"
+            ]
+        );
+        assert_eq!(
+            cfg.unknown_config_keys[2].suggestion.as_deref(),
+            Some("ui.preview_body_lines")
+        );
+        assert!(serde_json::to_value(&cfg)
+            .unwrap()
+            .get("unknown_config_keys")
+            .is_none());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        fs::write(&path, "[ui]\npreview_body_linse = 9\n").unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(path),
+                ..ConfigOverrides::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.config.unknown_config_keys[0],
+            cfg.unknown_config_keys[2]
+        );
+    }
+
+    #[test]
+    fn ordinary_nested_tables_report_future_fields_from_the_serde_model() {
+        for table in [
+            "index",
+            "ui",
+            "ui.keys",
+            "search",
+            "search.scoring",
+            "search.message-search",
+            "search.message-search.context",
+            "analytics",
+            "skills",
+            "capabilities",
+            "capabilities.message_classification",
+            "performance",
+            "mcp",
+            "mcp.internal",
+            "mcp.client_limits",
+            "cli",
+            "db",
+            "release_notifications",
+            "integrations",
+            "integrations.paths",
+            "integrations.paths.codex",
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[{table}]\nfuture_field = {{ nested = true }}\n"))
+                    .unwrap_or_else(|error| panic!("{table}: {error}"));
+            assert_eq!(
+                config.unknown_config_keys[0].path,
+                format!("{table}.future_field")
+            );
+            config.validate().unwrap();
+        }
+        for (input, suggestion) in [
+            (
+                "[integrations.paths.codex]\nmcp_confg = 'x'\n",
+                "integrations.paths.codex.mcp_config",
+            ),
+            (
+                "[mcp.client_limits]\ncodex-input-schema-byte = 7000\n",
+                "mcp.client_limits.codex-input-schema-bytes",
+            ),
+        ] {
+            let config: Config = toml::from_str(input).unwrap();
+            assert_eq!(
+                config.unknown_config_keys[0].suggestion.as_deref(),
+                Some(suggestion)
+            );
+        }
+    }
+
+    #[test]
+    fn strict_config_errors_name_the_key_table_and_recovery() {
+        for (table, key, prefix) in [
+            ("providers", "future_provider", ""),
+            ("providers.claude", "enabeld", ""),
+            ("search.scope", "rootz", ""),
+            ("search.budgets", "max_hit_per_page", ""),
+            (
+                "search.purposes.audit",
+                "future_restriction",
+                "version = 1\noperation = 'message-search'\n",
+            ),
+            (
+                "search.purposes.audit.preferences",
+                "future_restriction",
+                "",
+            ),
+        ] {
+            let error = toml::from_str::<Config>(&format!("[{table}]\n{prefix}{key} = true\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains(table), "{error}");
+            assert!(error.contains("upgrade aise"), "{error}");
+        }
     }
 
     #[test]

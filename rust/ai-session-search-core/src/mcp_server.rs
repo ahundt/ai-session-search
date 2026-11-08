@@ -3189,6 +3189,15 @@ fn get_index_status_output_schema() -> Value {
         "type": "object",
         "properties": {
             "db_path": { "type": "string", "description": "Resolved SQLite index path used by this server process." },
+            "unknown_config_keys": {
+                "type": "array", "description": "Ignored ordinary config keys; correct typos or upgrade aise to use future settings.",
+                "items": {
+                    "type": "object", "properties": {
+                        "path": { "type": "string", "description": "Dotted path of an ignored config key." },
+                        "suggestion": { "type": ["string", "null"], "description": "Nearby known dotted path, or null when no close spelling exists." }
+                    }, "required": ["path", "suggestion"], "additionalProperties": false
+                }
+            },
             "parser_health": parser_health_output_schema(),
             "repairable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Indexed sessions whose source file is discoverable and can be reparsed." },
             "unavailable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Retained indexed sessions whose original source file is unavailable; reindexing cannot recreate them." },
@@ -3198,7 +3207,7 @@ fn get_index_status_output_schema() -> Value {
             "discovery_warnings": { "type": "array", "description": "Non-fatal provider traversal or metadata-sidecar failures. Readable sources remain available.", "items": discovery_warning_output_schema() },
             "providers": { "type": "array", "description": "Discovery, parser, index, and resume status for every supported provider.", "items": provider_health_output_schema() }
         },
-        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "readiness", "discovery_warnings", "providers"],
+        "required": ["db_path", "unknown_config_keys", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "readiness", "discovery_warnings", "providers"],
         "additionalProperties": false
     })
 }
@@ -11882,6 +11891,7 @@ mod tests {
         let config = config_for_fixture(&dir);
         let response = call_tool("get_index_status", json!({}), &config, &db);
         let status = &response["result"]["structuredContent"];
+        assert_eq!(status["unknown_config_keys"], json!([]));
         assert_eq!(
             status["parser_health"]["expected_schema_version"],
             crate::db::SCHEMA_VERSION
@@ -13514,6 +13524,7 @@ mod tests {
         );
         for required in [
             "db_path",
+            "unknown_config_keys",
             "parser_health",
             "repairable_stale_sessions",
             "unavailable_stale_sessions",

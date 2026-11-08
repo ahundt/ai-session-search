@@ -224,8 +224,8 @@ schema_summary_columns = 12
 # What each MCP client accepts before it truncates or drops what the server sends. Every row
 # ships with the value measured from that client's own source at a pinned version, recorded in
 # docs/development/mcp-client-limits-and-measured-evidence.md, so this table is only for a client
-# that has since moved. Set a row by the name `aise mcp schema-budget` reports; an unknown name
-# is rejected rather than ignored, so a typo cannot leave the shipped budget quietly in force.
+# that has since moved. Set a row by the name `aise mcp schema-budget` reports. Unknown config
+# row names are ignored; `aise doctor` and `aise config check` report them with spelling suggestions.
 #
 # A config file is per machine while these numbers are per client, so an MCP registration can
 # instead set its own in its `env` block:
