@@ -836,6 +836,11 @@ class MessageScope:
 class MessageSearchRequest:
     """Canonical message predicates, match window, presentation, extent, purpose, and receipt.
 
+    ``content_authorship="human"`` searches original human regions only, including mixed
+    messages. Omission or ``"any"`` searches complete content. Human requires ``field="content"``.
+    Role filters intersect; omit role to include human tool answers. Views/context can contain
+    nonhuman text; match coordinates remain relative to the original content.
+
     The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
     arguments use an RFC 6901 ``argument_path``. ``tool_name_contains`` is an additional
     case-insensitive substring filter on canonical ``tool_name``, independent of ``field``.
@@ -845,6 +850,7 @@ class MessageSearchRequest:
     request explicitly and conflicts with ``limit``. MCP separately uses a bounded default.
     """
 
+    content_authorship: Literal["any", "human"] | None
     scope: MessageScope
     role: _MessageRole | None
     kind: _MessageKind | None
@@ -879,6 +885,7 @@ class MessageSearchRequest:
         kind: _MessageKind | None = None,
         kinds: list[_MessageKind] | None = None,
         field: _SearchField = "content",
+        content_authorship: Literal["any", "human"] | None = None,
         argument_path: str | None = None,
         seq_from: int | None = None,
         seq_to: int | None = None,
@@ -1003,6 +1010,7 @@ class FileQuery:
 class MessageHit:
     """One indexed message with canonical session, role, kind, tool, and content fields."""
 
+    provenance: dict[str, object] | None
     session_id: str
     provider: str
     seq: int
@@ -1026,6 +1034,7 @@ class _MessageSearchEffectiveRequest(TypedDict):
     query: NotRequired[str]
     query_mode: NotRequired[_MessageQueryMode]
     target: _MessageSearchTarget
+    content_authorship: Literal["any", "human"]
     provider_scope: dict[str, object]
     extent: dict[str, object]
     match_window: NotRequired[_MatchWindow]
@@ -1039,6 +1048,7 @@ class _MessageSearchMessageRef(TypedDict):
     message_seq: int
 
 class _MessageSearchMessageMetadata(TypedDict):
+    provenance: NotRequired[dict[str, object]]
     provider: _ProviderId
     role: str
     kind: _MessageKind

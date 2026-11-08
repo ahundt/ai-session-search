@@ -605,6 +605,7 @@ const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-descri
 #[command(group(
     ArgGroup::new("search_request")
         .args([
+            "content_authorship",
             "positional_query",
             "query_arg",
             "role",
@@ -661,6 +662,11 @@ pub struct MessageSearchArgs {
         allow_hyphen_values = true
     )]
     pub query_arg: Option<String>,
+    /// Regions allowed to match: any (default) searches complete content; human searches only
+    /// original human regions. Human requires --field content. Omit --role to include human tool
+    /// answers. Context and content views may contain nonhuman text.
+    #[arg(help_heading = FILTER_HEADING, long, value_enum)]
+    pub content_authorship: Option<crate::models::ContentAuthorshipSelection>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
     /// slash (human-entered commands), or compaction. Omit for every role.
     #[arg(help_heading = FILTER_HEADING, long = "role", value_enum)]
@@ -1152,6 +1158,9 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         } else {
             RequestedExtent::page(args.limit, args.offset)?
         });
+    if let Some(selection) = args.content_authorship {
+        builder = builder.content_authorship(selection);
+    }
     if let Some(role) = args.role {
         builder = builder.role(role);
     }
@@ -1926,6 +1935,7 @@ mod tests {
 
     fn sample_hit(seq: i64, content: &str) -> MessageHit {
         MessageHit {
+            provenance: None,
             session_id: "claude:s1".to_string(),
             provider: Provider::Claude,
             seq,
@@ -2521,6 +2531,7 @@ mod tests {
     #[test]
     fn structured_context_rows_reuse_complete_message_hit_metadata() {
         let hit = MessageHit {
+            provenance: None,
             session_id: "codex:context-contract".to_string(),
             provider: Provider::Codex,
             seq: 7,

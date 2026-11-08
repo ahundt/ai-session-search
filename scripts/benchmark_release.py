@@ -256,8 +256,8 @@ def generate_fixture(
                 if role == "tool":
                     content = json.dumps({"tool_name": tool_name, "args": {"cmd": content}})
                 connection.execute(
-                    "insert into messages (session_id, provider, seq, role, ts, tool_name, kind, content) values (?, 'codex', ?, ?, ?, ?, ?, ?)",
-                    (session_id, sequence, role, timestamp, tool_name, kind, content),
+                    "insert into messages (session_id, provider, seq, role, ts, tool_name, kind, content, authorship, record_relation) values (?, 'codex', ?, ?, ?, ?, ?, ?, ?, 'original')",
+                    (session_id, sequence, role, timestamp, tool_name, kind, content, "human" if role == "user" else "agent"),
                 )
                 if role in {"user", "assistant"}:
                     transcript_lines.append(f"[{timestamp}] {role}\n{content}")

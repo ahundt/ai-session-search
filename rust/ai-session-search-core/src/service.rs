@@ -2696,6 +2696,7 @@ impl<'db> MessageService<'db> {
         let session_id = resolved_session.map(|session| session.id);
         let normalize = |value: &str| crate::util::normalize_path_prefix(value);
         let resolved_predicates = ResolvedMessagePredicates {
+            content_authorship: predicates.content_authorship(),
             role: predicates.role(),
             kinds: predicates.kinds().map(<[_]>::to_vec),
             providers: predicates.providers().map(<[_]>::to_vec),
@@ -2750,6 +2751,11 @@ impl<'db> MessageService<'db> {
             },
             receipt,
             origins: MessageSearchOrigins {
+                content_authorship: if predicates.content_authorship_is_explicit() {
+                    ValueOrigin::Explicit
+                } else {
+                    ValueOrigin::TypedDefault
+                },
                 result_extent: limit_origin,
                 context_messages_before: context_before_origin,
                 context_messages_after: context_after_origin,

@@ -89,6 +89,13 @@ aise files history src/app.py
 aise files extract src/app.py --restore
 ```
 
+To find human input across storage roles, use
+`aise messages search "correction" --content-authorship human` and omit `--role`.
+This includes attributable human regions in interactive tool answers and queued Claude input.
+Matching stays within original human regions; returned views and context may contain surrounding
+generated text. Queue submission does not prove delivery; inspect the returned provenance.
+The default `--content-authorship any` preserves complete-content search.
+
 `aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
 [EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,
 read in your local time zone unless the value names an offset or a trailing

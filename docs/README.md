@@ -51,6 +51,7 @@ Search indexed AI-session messages while separating result selection, context, p
 
 | Canonical parameter | Accepted values | Omission semantics |
 | --- | --- | --- |
+| `content_authorship` | `any`, `human` | `typed_default` |
 | `query_mode` | `literal`, `regex`, `fuzzy` | `typed_default` |
 | `field` | `content`, `tool_name`, `tool_argument` | `typed_default` |
 | `role` | `user`, `assistant`, `tool`, `slash`, `compaction` | `all_eligible` |
@@ -65,6 +66,7 @@ Search indexed AI-session messages while separating result selection, context, p
 
 ### Executable conflict rules
 
+- `human_content_requires_content_field` — content_authorship=human requires field=content; use content_authorship=any for tool fields.
 - `detail_owns_presentation_budgets` — detail conflicts with lines_per_message, field_view, and match_view; omit detail to compose custom presentation budgets.
 - `sequence_requires_session` — sequence bounds require one session.
 - `kinds_must_remain_satisfiable` — the selected kinds exclude every message class, so nothing can match.

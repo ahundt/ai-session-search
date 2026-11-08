@@ -12,6 +12,28 @@ the [configuration guide](configuration.md).
 
 ## Python
 
+For historical human input across storage roles, pass
+`MessageSearchRequest(content_authorship="human")` without a role filter. `human` searches
+only structurally attributed human regions of source-original messages, including mixed tool
+answers; omitted or `"any"` searches complete content. Human selection requires `field="content"`.
+All other filters intersect normally. Matches retain original Unicode-scalar coordinates and
+cannot bridge generated regions. Views and context can still contain nonhuman text. Human
+results include provenance, with queue delivery uncertainty kept explicit. In Rust, use
+`MessageSearchRequest::builder(...).content_authorship(ContentAuthorshipSelection::Human)`;
+the enum lives in `ai_session_search::models`.
+
+Claude queue operations in older transcripts lack identities linking submission, removal and
+delivery. Queued input therefore remains `submitted`, with `input_origin=queued`; matching text
+in a later user message does not prove identity. Human-content search returns the evidence,
+while recurrence and correction analytics exclude queued-origin records to avoid counting
+unverified delivery copies twice. Direct messages and structurally linked interactive answers
+remain eligible for those analytics.
+
+Recurrence analytics retain their existing projection that joins human fragments within a
+message. Their query coordinates and phrase grouping describe that projection. Message search
+with `content_authorship="human"` instead matches contiguous original regions and reports source
+coordinates; it never joins across generated gaps.
+
 `SessionSearch` owns the configuration, the database handle, and the worker
 pool. Query objects are immutable mirrors of the Rust request types, so one you
 build is safe to reuse.

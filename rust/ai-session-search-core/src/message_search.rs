@@ -15,6 +15,7 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::hashing::FramedSha256;
+use crate::models::ContentAuthorshipSelection;
 use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField, SessionMeta};
 use crate::refs::MessageRef;
 
@@ -667,6 +668,7 @@ impl RequestedTimeRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct MessagePredicates {
+    content_authorship: Option<ContentAuthorshipSelection>,
     role: Option<Role>,
     kinds: Option<Vec<MessageKind>>,
     providers: Option<Vec<Provider>>,
@@ -685,6 +687,7 @@ pub struct MessagePredicates {
 impl Default for MessagePredicates {
     fn default() -> Self {
         Self {
+            content_authorship: None,
             role: None,
             kinds: None,
             providers: None,
@@ -703,6 +706,12 @@ impl Default for MessagePredicates {
 }
 
 impl MessagePredicates {
+    pub fn content_authorship(&self) -> ContentAuthorshipSelection {
+        self.content_authorship.unwrap_or_default()
+    }
+    pub const fn content_authorship_is_explicit(&self) -> bool {
+        self.content_authorship.is_some()
+    }
     pub const fn role(&self) -> Option<Role> {
         self.role
     }
@@ -848,6 +857,7 @@ impl SearchSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageSearchParameter {
+    ContentAuthorship,
     Query,
     QueryMode,
     Field,
@@ -881,6 +891,7 @@ pub enum MessageSearchParameter {
 impl MessageSearchParameter {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ContentAuthorship => "content_authorship",
             Self::Query => "query",
             Self::QueryMode => "query_mode",
             Self::Field => "field",
@@ -1028,6 +1039,7 @@ pub enum ValueOriginKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageSearchRule {
+    HumanContentRequiresContentField,
     DetailOwnsPresentationBudgets,
     SequenceRequiresSession,
     KindsMustRemainSatisfiable,
@@ -1041,6 +1053,7 @@ pub enum MessageSearchRule {
 
 impl MessageSearchRule {
     pub const ALL: &'static [Self] = &[
+        Self::HumanContentRequiresContentField,
         Self::DetailOwnsPresentationBudgets,
         Self::SequenceRequiresSession,
         Self::KindsMustRemainSatisfiable,
@@ -1054,6 +1067,7 @@ impl MessageSearchRule {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::HumanContentRequiresContentField => "human_content_requires_content_field",
             Self::DetailOwnsPresentationBudgets => "detail_owns_presentation_budgets",
             Self::SequenceRequiresSession => "sequence_requires_session",
             Self::KindsMustRemainSatisfiable => "kinds_must_remain_satisfiable",
@@ -1070,6 +1084,7 @@ impl MessageSearchRule {
 
     pub const fn message(self) -> &'static str {
         match self {
+            Self::HumanContentRequiresContentField => "content_authorship=human requires field=content; use content_authorship=any for tool fields",
             Self::DetailOwnsPresentationBudgets => {
                 "detail conflicts with lines_per_message, field_view, and match_view; omit detail to compose custom presentation budgets"
             }
@@ -1204,6 +1219,9 @@ impl MessageSearchParameterRegistry {
             surfaces: SearchSurface::ALL,
         };
         let parameters = vec![
+            parameter(MessageSearchParameter::ContentAuthorship,
+                "Allowed content authorship.",
+                enum_domain(serialized_variants::<ContentAuthorshipSelection>()), MessageSearchOmission::TypedDefault),
             parameter(
                 MessageSearchParameter::Query,
                 "Text to match.",
@@ -1212,31 +1230,31 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::QueryMode,
-                "How query is matched.",
+                "Matching mode.",
                 enum_domain(serialized_variants::<MessageSearchMode>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Field,
-                "Which field to match.",
+                "Match field.",
                 enum_domain(serialized_variants::<SearchField>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::ArgumentPath,
-                "RFC 6901 pointer into tool arguments; needs field=tool_argument",
+                "Tool-args RFC 6901 pointer; field=tool_argument.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::Role,
-                "Author role.",
+                "Storage role.",
                 enum_domain(serialized_variants::<Role>()),
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::Kinds,
-                "Message classes to return.",
+                "Message classes.",
                 set_domain(serialized_variants::<MessageKind>()),
                 MessageSearchOmission::TypedDefault,
             ),
@@ -1253,19 +1271,19 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::SessionId,
-                "One session by ID or prefix.",
+                "Session ID/prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::WorkspacePathPrefix,
-                "Match cwd or repo-root prefix.",
+                "cwd/repo-root prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::TranscriptPathPrefix,
-                "Match transcript-path prefix.",
+                "Transcript-path prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
@@ -1307,7 +1325,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::ToolNameContains,
-                "Substring in the tool name.",
+                "Tool name substring.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
@@ -1349,7 +1367,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::FieldView,
-                "Character budget for the field.",
+                "Field character budget.",
                 MessageSearchParameterDomain::FieldView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1369,7 +1387,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::MatchView,
-                "Character budget around the match.",
+                "Match character budget.",
                 MessageSearchParameterDomain::MatchView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1470,6 +1488,7 @@ pub enum ValueOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageSearchOrigins {
+    pub(crate) content_authorship: ValueOrigin,
     pub(crate) result_extent: ValueOrigin,
     pub(crate) context_messages_before: ValueOrigin,
     pub(crate) context_messages_after: ValueOrigin,
@@ -1483,6 +1502,9 @@ pub struct MessageSearchOrigins {
 }
 
 impl MessageSearchOrigins {
+    pub fn content_authorship(&self) -> &ValueOrigin {
+        &self.content_authorship
+    }
     pub fn result_extent(&self) -> &ValueOrigin {
         &self.result_extent
     }
@@ -1539,6 +1561,7 @@ pub enum ResolvedExtent {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMessagePredicates {
+    pub(crate) content_authorship: ContentAuthorshipSelection,
     pub(crate) role: Option<Role>,
     pub(crate) kinds: Option<Vec<MessageKind>>,
     pub(crate) providers: Option<Vec<Provider>>,
@@ -1716,6 +1739,7 @@ impl ResolvedRequestPresentation {
 /// present so a caller can interpret result and presentation extent without conversational state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedMessageSearchRequest {
+    content_authorship: ContentAuthorshipSelection,
     #[serde(skip_serializing_if = "Option::is_none")]
     query: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1732,8 +1756,13 @@ pub struct ResolvedMessageSearchRequest {
 }
 
 impl ResolvedMessageSearchRequest {
+    pub const fn content_authorship(&self) -> ContentAuthorshipSelection {
+        self.content_authorship
+    }
+
     pub(crate) fn from_plan(plan: &MessageSearchPlan) -> Result<Self, MessageSearchError> {
         Ok(Self {
+            content_authorship: plan.retrieval.predicates.content_authorship,
             query: plan.retrieval.query.text().map(str::to_owned),
             query_mode: plan.retrieval.query.mode().map(ResolvedQueryMode::from),
             target: plan.retrieval.target.clone(),
@@ -2774,7 +2803,9 @@ struct SemanticMessageRef<'a> {
 }
 
 #[derive(Serialize)]
-struct SemanticMessageMetadata {
+struct SemanticMessageMetadata<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<&'a crate::models::MessageProvenance>,
     provider: Provider,
     role: Role,
     kind: MessageKind,
@@ -2899,6 +2930,7 @@ impl Serialize for SemanticResult<'_> {
         map.serialize_entry(
             "message_metadata",
             &SemanticMessageMetadata {
+                provenance: hit.message.provenance.as_deref(),
                 provider: hit.message.provider,
                 role: hit.message.role,
                 kind: hit.message.kind,
@@ -3014,6 +3046,7 @@ impl Serialize for SemanticContextMessage<'_> {
         map.serialize_entry(
             "message_metadata",
             &SemanticMessageMetadata {
+                provenance: None,
                 provider: message.provider,
                 role: message.role,
                 kind: message.kind,
@@ -3155,6 +3188,11 @@ impl MessageSearchRequest {
     }
 
     fn validate(&self) -> Result<(), MessageSearchError> {
+        if self.predicates.content_authorship() == ContentAuthorshipSelection::Human
+            && self.target.field != SearchField::Content
+        {
+            return Err(MessageSearchRule::HumanContentRequiresContentField.error());
+        }
         if self.presentation.detail.is_some()
             && (self.presentation.message_lines.is_some()
                 || self.presentation.field_view.is_some()
@@ -3220,6 +3258,10 @@ pub struct MessageSearchRequestBuilder {
 }
 
 impl MessageSearchRequestBuilder {
+    pub fn content_authorship(mut self, selection: ContentAuthorshipSelection) -> Self {
+        self.request.predicates.content_authorship = Some(selection);
+        self
+    }
     pub fn role(mut self, role: Role) -> Self {
         self.request.predicates.role = Some(role);
         self
@@ -3435,6 +3477,48 @@ pub(crate) fn selected_message_field_parts<'a>(
     }
 }
 
+/// Borrow eligible source regions in one scalar pass: O(B + P) time, O(P) range memory.
+pub(crate) fn matching_content_regions(hit: &crate::models::MessageHit) -> Vec<(usize, &str)> {
+    let Some(provenance) = &hit.provenance else {
+        return vec![(0, &hit.content)];
+    };
+    if provenance.authorship == crate::models::MessageAuthorship::Human {
+        return vec![(0, &hit.content)];
+    }
+    let ranges = provenance
+        .content_parts
+        .iter()
+        .filter(|part| part.authorship == crate::models::ContentPartAuthorship::Human);
+    let mut regions = Vec::new();
+    let mut chars = hit.content.char_indices();
+    let mut scalar = 0;
+    let mut byte = 0;
+    for part in ranges {
+        let (start, end) = (part.start_char, part.end_char);
+        while scalar < start {
+            if let Some((i, c)) = chars.next() {
+                byte = i + c.len_utf8();
+                scalar += 1;
+            } else {
+                return regions;
+            }
+        }
+        let start_byte = byte;
+        while scalar < end {
+            if let Some((i, c)) = chars.next() {
+                byte = i + c.len_utf8();
+                scalar += 1;
+            } else {
+                return regions;
+            }
+        }
+        if start < end {
+            regions.push((start, &hit.content[start_byte..byte]));
+        }
+    }
+    regions
+}
+
 #[cfg(test)]
 pub(crate) fn attach_match_evidence(
     query: &MessageQuery,
@@ -3471,7 +3555,22 @@ pub(crate) fn attach_match_evidence_cancellable(
                         message.seq
                     )
                 })?;
-                let evidence = prepared.build(&selected, match_view).ok_or_else(|| {
+                let evidence = if message.provenance.is_some() {
+                    let mut selected_evidence = None;
+                    let mut best_score = None;
+                    for (offset, region) in matching_content_regions(&message) {
+                        if let Some(mut evidence) = prepared.build(region, match_view) {
+                            let score = prepared.score(region);
+                            if selected_evidence.is_none() || score > best_score {
+                                evidence.field_start_char += offset;
+                                evidence.field_total_chars = selected.chars().count();
+                                selected_evidence = Some(evidence);
+                                best_score = score;
+                            }
+                        }
+                    }
+                    selected_evidence
+                } else { prepared.build(&selected, match_view) }.ok_or_else(|| {
                     anyhow::anyhow!(
                         "message-search match evidence disagrees with {:?} membership for {} sequence {}",
                         target.field(),
@@ -3825,6 +3924,21 @@ impl PreparedMatchEvidence {
                 indices: Vec::new(),
             },
         })
+    }
+
+    fn score(&mut self, selected: &str) -> Option<u32> {
+        match self {
+            Self::Fuzzy {
+                pattern,
+                matcher,
+                utf32_buf,
+                ..
+            } => {
+                utf32_buf.clear();
+                pattern.score(Utf32Str::new(selected, utf32_buf), matcher)
+            }
+            _ => None,
+        }
     }
 
     fn build(
@@ -4258,6 +4372,7 @@ mod tests {
 
     fn hit(content: impl Into<String>) -> crate::models::MessageHit {
         crate::models::MessageHit {
+            provenance: None,
             session_id: "claude:evidence".into(),
             provider: Provider::Claude,
             seq: 7,
@@ -4269,6 +4384,74 @@ mod tests {
             fuzzy_score: None,
             content: content.into(),
         }
+    }
+
+    #[test]
+    fn human_evidence_uses_original_coordinates_for_each_match_mode() {
+        let mut message = hit("needle wrapper éneedle gap tail");
+        message.provenance = Some(Box::new(crate::models::MessageProvenance {
+            authorship: crate::models::MessageAuthorship::Mixed,
+            content_parts: [
+                (0, 15, false),
+                (15, 22, true),
+                (22, 27, false),
+                (27, 31, true),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(ordinal, (start_char, end_char, human))| crate::models::MessageContentPart {
+                    ordinal: ordinal as u32,
+                    start_char,
+                    end_char,
+                    authorship: if human {
+                        crate::models::ContentPartAuthorship::Human
+                    } else {
+                        crate::models::ContentPartAuthorship::Generated
+                    },
+                    origin: crate::models::ContentPartOrigin::Unknown,
+                },
+            )
+            .collect(),
+            ..Default::default()
+        }));
+        for query in [
+            MessageQuery::literal("needle").unwrap(),
+            MessageQuery::regex("^éneedle$").unwrap(),
+            MessageQuery::fuzzy("ndl").unwrap(),
+        ] {
+            let hits = attach_match_evidence(
+                &query,
+                &MessageTarget::content(),
+                MatchViewBudget::MinimalSpan,
+                vec![message.clone()],
+            )
+            .unwrap();
+            let evidence = hits[0].match_evidence().unwrap();
+            assert!(evidence.field_start_char >= 15);
+            assert_eq!(evidence.field_total_chars, 31);
+            assert!(!evidence.view_text.contains("wrapper"));
+            if let Some(occurrence) = hits[0].literal_match() {
+                assert_eq!(occurrence.field_start_char, 16);
+                assert_eq!(occurrence.field_end_char_exclusive, 22);
+                assert_eq!(occurrence.text, "needle");
+            }
+        }
+        let zero_width = attach_match_evidence(
+            &MessageQuery::regex("^é").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message.clone()],
+        )
+        .unwrap();
+        assert_eq!(zero_width[0].match_evidence().unwrap().field_start_char, 15);
+        assert!(attach_match_evidence(
+            &MessageQuery::literal("needle gap tail").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message]
+        )
+        .is_err());
     }
 
     #[test]

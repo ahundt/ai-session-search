@@ -17,6 +17,9 @@
     "content_prefix": "bulk row"
   },
   "cases": [
+    {"name": "human literal excludes assistant copies", "mode": "literal", "query": "twin needle", "content_authorship": "human", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
+    {"name": "human regex excludes assistant copies", "mode": "regex", "query": "twin needle", "content_authorship": "human", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
+    {"name": "human fuzzy excludes assistant copies", "mode": "fuzzy", "query": "twin needle", "content_authorship": "human", "limit": 10, "expected": [[3, "user"], [4, "user"]]},
     {"name": "cherokee found by its own uppercase spelling", "mode": "literal", "query": "ᏣᎳᎩ", "limit": 10, "expected": [[0, "user"]]},
     {"name": "cherokee found by its lowercase spelling", "mode": "literal", "query": "ꮳꮃꭹ", "limit": 10, "expected": [[0, "user"]]},
     {"name": "cherokee regex by its exact spelling", "mode": "regex", "query": "ᏣᎳᎩ", "limit": 10, "expected": [[0, "user"]]},

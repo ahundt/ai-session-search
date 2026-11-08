@@ -17,9 +17,9 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::models::{
-    FileEdit, Message, MessageAuthorship, MessageContentPart, MessageCorrelationAuthority,
-    MessageCorrelationIdentity, MessageKind, MessageProvenance, MessageRecordRelation,
-    ParsedSession, Provider, Role, SessionRecord,
+    FileEdit, InputDeliveryState, Message, MessageAuthorship, MessageContentPart,
+    MessageCorrelationAuthority, MessageCorrelationIdentity, MessageInputOrigin, MessageKind,
+    MessageProvenance, MessageRecordRelation, ParsedSession, Provider, Role, SessionRecord,
 };
 
 /// Source bytes a cooperative scan may cross before it re-checks cancellation.
@@ -1361,6 +1361,18 @@ impl RawMessage {
         self
     }
 
+    /// Attach provider evidence about an input queue lifecycle without implying model receipt.
+    pub fn with_input_delivery_state(mut self, state: InputDeliveryState) -> Self {
+        self.provenance.input_delivery_state = Some(state);
+        self
+    }
+
+    /// Attach the typed source of an input record (conversation, queue, or interactive answer).
+    pub fn with_input_origin(mut self, origin: MessageInputOrigin) -> Self {
+        self.provenance.input_origin = Some(origin);
+        self
+    }
+
     /// Attach whether this record is the provider's original event or a known replay.
     pub fn with_record_relation(mut self, relation: MessageRecordRelation) -> Self {
         self.provenance.record_relation = relation;
@@ -1735,8 +1747,8 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v4",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v4",
+        Provider::Claude => "claude-v5",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v5",
         Provider::Codex => "codex-v5",
         Provider::Cursor => "cursor-v4",
         Provider::Antigravity => "antigravity-v3",

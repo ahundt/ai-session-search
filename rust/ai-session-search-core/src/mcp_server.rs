@@ -2589,12 +2589,13 @@ fn search_origins_output_schema() -> Value {
             "field_view": origin.clone(),
             "match_view": origin.clone(),
             "receipt_level": origin.clone(),
+            "content_authorship": origin.clone(),
             "result_order": origin
         },
         "required": [
             "result_extent", "context_messages_before", "context_messages_after", "includes",
             "detail", "lines_per_message", "field_view", "match_view", "receipt_level",
-            "result_order"
+            "result_order", "content_authorship"
         ],
         "additionalProperties": false
     })
@@ -2929,7 +2930,19 @@ fn search_messages_output_schema() -> Value {
             "properties": {
                 "provider": { "type": "string", "enum": crate::source::PROVIDERS },
                 "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
-                "kind": { "type": "string", "enum": message_kind_values() }
+                "kind": { "type": "string", "enum": message_kind_values() },
+                "provenance": {
+                    "type":"object", "additionalProperties":false,
+                    "required":["authorship","record_relation","correlation_identity","content_parts","input_delivery_state","input_origin"],
+                    "properties": {
+                        "authorship":{"type":"string","enum":["human","agent","harness","generated","mixed","unknown"]},
+                        "record_relation":{"type":"string","enum":["original","mirror","unknown"]},
+                        "input_origin":{"type":["string","null"],"enum":["direct_conversation","queued","interactive_answer","unknown",null]},
+                        "input_delivery_state":{"type":["string","null"],"enum":["submitted","delivered","cancelled","unknown",null]},
+                        "correlation_identity":{"type":["object","null"],"additionalProperties":false,"required":["authority","scope","id"],"properties":{"authority":{"type":"string"},"scope":{"type":"string"},"id":{"type":"string"}}},
+                        "content_parts":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["ordinal","start_char","end_char","authorship","origin"],"properties":{"ordinal":{"type":"integer","minimum":0},"start_char":{"type":"integer","minimum":0},"end_char":{"type":"integer","minimum":0},"authorship":{"type":"string"},"origin":{"type":"string"}}}}
+                    }
+                }
             },
             "required": ["provider", "role", "kind"],
             "additionalProperties": false
@@ -3050,6 +3063,7 @@ fn search_messages_output_schema() -> Value {
                         "required": ["field"],
                         "additionalProperties": false
                     },
+                    "content_authorship": { "type": "string", "enum": <crate::models::ContentAuthorshipSelection as clap::ValueEnum>::value_variants() },
                     "provider_scope": {
                         "type": "object",
                         "properties": {
@@ -3118,7 +3132,7 @@ fn search_messages_output_schema() -> Value {
                     "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] }
                 },
                 "required": [
-                    "target", "provider_scope", "extent", "context", "presentation", "include",
+                    "target", "content_authorship", "provider_scope", "extent", "context", "presentation", "include",
                     "receipt_level"
                 ],
                 "additionalProperties": false
@@ -3344,6 +3358,7 @@ fn message_search_mcp_fields(parameter: MessageSearchParameter) -> &'static [&'s
     match parameter {
         MessageSearchParameter::Query => &["query"],
         MessageSearchParameter::QueryMode => &["query_mode"],
+        MessageSearchParameter::ContentAuthorship => &["content_authorship"],
         MessageSearchParameter::Field => &["field"],
         MessageSearchParameter::ArgumentPath => &["argument_path"],
         MessageSearchParameter::Role => &["role"],
@@ -3449,6 +3464,11 @@ enum McpFieldRole {
 /// `advertised_and_projected_field_sets_agree` asserts the two tables describe the same set, so
 /// neither can gain a field the other does not know about.
 const MESSAGE_SEARCH_MCP_FIELDS: &[(&str, MessageSearchParameter, McpFieldRole)] = &[
+    (
+        "content_authorship",
+        MessageSearchParameter::ContentAuthorship,
+        McpFieldRole::Canonical,
+    ),
     (
         "query",
         MessageSearchParameter::Query,
@@ -3666,14 +3686,12 @@ fn render_message_search_field_description(
         McpFieldRole::OneValueAlias { plural } => {
             format!("One value; conflicts with {plural}.")
         }
-        McpFieldRole::ContextBefore => format!(
-            "Preceding neighbours per hit; omit for {}.",
-            context.messages_before()
-        ),
-        McpFieldRole::ContextAfter => format!(
-            "Following neighbours per hit; omit for {}.",
-            context.messages_after()
-        ),
+        McpFieldRole::ContextBefore => {
+            format!("Neighbours before; omit for {}.", context.messages_before())
+        }
+        McpFieldRole::ContextAfter => {
+            format!("Neighbours after; omit for {}.", context.messages_after())
+        }
         // "fuzzy search does not support all_results" and "sequence bounds require one session"
         // are two of the nine validator rules, and `message_search_tool_description` renders all
         // nine verbatim. A reader holding the parameter list holds the tool description too, so
@@ -3687,7 +3705,7 @@ fn render_message_search_field_description(
         McpFieldRole::TimePeriod => {
             "One period, both bounds; conflicts with since and until.".to_owned()
         }
-        McpFieldRole::PurposeVersion => "Purpose bundle version; required with purpose.".to_owned(),
+        McpFieldRole::PurposeVersion => "Required purpose version.".to_owned(),
         McpFieldRole::Canonical => {
             // A handful of fields need a number the registry does not carry, because the value is
             // this surface's planner-resolved policy rather than the parameter's semantics. Read
@@ -3757,7 +3775,7 @@ fn render_message_search_field_description(
                 // A mode rather than a value, so it is worded without "omit for" and stays out
                 // of the tool description's omitted-values sentence, which lists values.
                 (_, MessageSearchOmission::QuerylessSearch) => {
-                    "without it every message the filters allow is eligible.".to_owned()
+                    "without it all eligible messages.".to_owned()
                 }
                 // A defaulted parameter must name its default value in the text, not just in the
                 // keyword. `default` is one of the six keywords both Codex and VS Code delete
@@ -3805,27 +3823,19 @@ fn message_search_tool_description(config: &Config, input_schema: &Value) -> Str
         .expect("validated MCP configuration resolves a queryless message-search request");
     let registry = specification.registry();
     let mut text = String::from(
-        "Find exact message evidence across local AI session history. structuredContent is \
-         authoritative: effective_request states the resolved request and budgets, results carry \
-         message_ref plus field and match views with exact literal coordinates, and \
-         page.next_offset is the next offset when more results exist. Expand one hit with \
-         get_session(session_id, message_seq).\n",
+        "Search local messages. structuredContent is authoritative; effective_request states choices; \
+         results carry message_ref, views and literal coordinates. \
+         page.next_offset is the next offset; expand with get_session(session_id, message_seq).\n",
     );
-    // Only what `enum` cannot say. The six message classes and nine provider slugs already
-    // travel as accepted values on their own parameters, and restating them here would be a
-    // second copy of a list the model already has, free to drift from it. Literal-mode semantics
-    // and the time examples are here because the CLI states them in its own help and a model
-    // may have no shell to run `aise dates`.
     text.push_str(
-        "Omitting a filter leaves it unapplied. harness_notice (the harness's own text, not a \
-         person's) is the one class omitted when kinds is omitted. query_mode literal is a \
-         case-insensitive substring (punctuation significant), regex is Rust regex, fuzzy is a \
-         bounded fuzzy match. since/until/when take an RFC 3339 instant or a relative form such \
-         as 7d, yesterday, or 2026-01. receipt_level summary explains how the search was \
-         planned; full adds each value's origin. lines_per_message (line window first) and \
-         field_view/match_view (character budgets in Unicode scalars) change presentation only, \
-         never matching, order, count, context, or includes.\n",
+        "Omitting a filter leaves it unapplied. harness_notice (harness output) is the one class omitted when kinds is omitted. \
+         literal: case-insensitive substring, punctuation significant; regex uses Rust regex; \
+         fuzzy is bounded. since/until/when accept RFC 3339 or relative dates (7d, yesterday, 2026-01). \
+         receipt_level summary explains how the search was planned; full adds each value's origin. lines_per_message runs before \
+         field_view/match_view; views use Unicode scalars and preserve \
+         matches, order, count, context and includes.\n",
     );
+    text.push_str("human matches original human regions, including mixed tool answers; omit role for all roles. Views/context can contain nonhuman text. Queue submission does not prove delivery.\n");
     text.push_str(&omitted_values_sentence(input_schema));
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {
@@ -3987,6 +3997,11 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         context_schema.remove("default");
     }
 
+    set_schema_default(
+        properties,
+        "content_authorship",
+        json!(crate::models::ContentAuthorshipSelection::default()),
+    );
     match configured.extent() {
         ResolvedRequestExtent::Page { limit, offset } => {
             set_schema_default(properties, "limit", json!(limit));
@@ -4301,6 +4316,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
                         "kind": { "type": "string", "enum": message_kind_values() },
                         "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
+                        "content_authorship": { "type": "string", "enum": <crate::models::ContentAuthorshipSelection as clap::ValueEnum>::value_variants(), "default": "any" },
                         "argument_path": { "type": "string" },
                         "providers": provider_set_schema(&provider_values),
                         "tool_name_contains": { "type": "string" },
@@ -6203,6 +6219,11 @@ fn tool_search_messages_cancellable(
     let mut builder = MessageSearchRequest::builder(query, target)
         .time(RequestedTimeRange::new(since, until).map_err(|error| error.to_string())?)
         .include_compaction(mcp_bool_arg(args, "include_compaction", true));
+    if let Some(selection) =
+        parse_opt_enum::<crate::models::ContentAuthorshipSelection>(args, "content_authorship")?
+    {
+        builder = builder.content_authorship(selection);
+    }
     // `kinds` is the single class-selection mechanism; `kind` is its one-value alias. Do not
     // reintroduce per-class booleans here: one was tried and reverted because it duplicated
     // this parameter and self-cancelled against it. See models.rs MessageFilters::kinds.
@@ -7500,6 +7521,44 @@ mod tests {
     /// null, so a schema that renames a field or forgets that one is optional makes a correct
     /// response fail validation at the caller with no server-side symptom to debug from.
     #[test]
+    fn human_content_results_conform_to_the_closed_schema_with_provenance() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        db.execute_batch_for_test(
+            "insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin)
+             values (9001,'claude:test1','claude',90,'tool','tool_result','prefix humanneedle suffix','mixed','original','interactive_answer');
+             insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin)
+             values (9001,0,0,7,'generated','tool_payload'),
+                    (9001,1,7,18,'human','direct_input'),
+                    (9001,2,18,25,'generated','tool_payload');"
+        ).unwrap();
+        let out = search_messages_value(
+            &json!({"query":"humanneedle","content_authorship":"human","receipt_level":"full"}),
+            &config,
+            &db,
+        );
+        assert_eq!(out["page"]["returned"], 1);
+        assert_eq!(
+            out["results"][0]["message_metadata"]["provenance"]["input_origin"],
+            "interactive_answer"
+        );
+        assert_eq!(
+            out["results"][0]["match"]["literal_occurrence"]["field_start_char"],
+            7
+        );
+        let schema = search_messages_output_schema();
+        let mut violations = Vec::new();
+        output_schema_violations(&out, &schema, "structuredContent", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        let excluded = search_messages_value(
+            &json!({"query":"prefix","content_authorship":"human"}),
+            &config,
+            &db,
+        );
+        assert_eq!(excluded["page"]["returned"], 0);
+    }
+
+    #[test]
     fn search_messages_output_schema_matches_every_key_and_type_the_runtime_emits() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -7649,7 +7708,10 @@ mod tests {
             .unwrap()["inputSchema"]["properties"]["query"]["description"]
             .as_str()
             .unwrap();
-        assert!(query.contains("without it every message"), "{query}");
+        assert!(
+            query.contains("without it all eligible messages"),
+            "{query}"
+        );
     }
 
     /// A `oneOf` failure names every accepted shape, because a client that dropped `oneOf`
@@ -8615,7 +8677,7 @@ mod tests {
         }
         // What `enum` cannot say about them is said once, in the channel every client forwards.
         assert!(
-            tool_doc.contains("harness_notice (the harness's own text, not a person's)"),
+            tool_doc.contains("harness_notice (harness output)"),
             "the one class whose meaning a token cannot carry is glossed: {tool_doc}"
         );
     }
@@ -8648,6 +8710,10 @@ mod tests {
             ("providers", check::<crate::models::Provider>),
             ("role", check::<crate::models::Role>),
             ("field", check::<crate::models::SearchField>),
+            (
+                "content_authorship",
+                check::<crate::models::ContentAuthorshipSelection>,
+            ),
             ("index_refresh", check::<crate::config::IndexRefresh>),
         ];
         // Advertised vocabularies with no Rust enum behind them: each is matched inline by the
@@ -13689,8 +13755,8 @@ mod tests {
         // what keeps three copies from drifting apart.
         let tool_doc = search_messages["description"].as_str().unwrap();
         for required in [
-            "lines_per_message (line window first)",
-            "never matching, order, count, context, or includes",
+            "lines_per_message runs before field_view/match_view",
+            "preserve matches, order, count, context and includes",
             "detail conflicts with lines_per_message, field_view, and match_view",
         ] {
             assert!(
@@ -13717,7 +13783,7 @@ mod tests {
         );
         // Which regex dialect and how bounded the fuzzy match is are facts an enum token cannot
         // carry, so they are stated once in the channel every client forwards whole.
-        for required in ["regex is Rust regex", "bounded fuzzy match"] {
+        for required in ["regex uses Rust regex", "fuzzy is bounded"] {
             assert!(
                 tool_doc.contains(required),
                 "missing {required:?} from tool.description: {tool_doc}"
@@ -14320,7 +14386,7 @@ mod tests {
         );
         assert_eq!(
             registry.rules().len(),
-            9,
+            10,
             "the conflict-rule count changed; tool.description renders them verbatim and its \
              2,048-character ceiling is budgeted against this count"
         );
@@ -14362,7 +14428,7 @@ mod tests {
             advertised.difference(&accepted).collect::<Vec<_>>(),
             accepted.difference(&advertised).collect::<Vec<_>>()
         );
-        assert_eq!(advertised.len(), 37, "{advertised:?}");
+        assert_eq!(advertised.len(), 38, "{advertised:?}");
 
         // `offset` is the field an earlier design proposed hiding. It cannot be hidden: the
         // response tells callers to send it back, so concealing it would publish an instruction

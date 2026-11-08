@@ -673,13 +673,13 @@ mod tests {
     #[test]
     fn parser_contract_fingerprint_changes_with_membership_order_or_version() {
         let baseline = provider_parse_contract_fingerprint_from([
-            (Provider::Claude, "claude-v4"),
+            (Provider::Claude, "claude-v5"),
             (Provider::Codex, "codex-v5"),
         ]);
         assert_ne!(
             baseline,
             provider_parse_contract_fingerprint_from([
-                (Provider::Claude, "claude-v5"),
+                (Provider::Claude, "claude-v4"),
                 (Provider::Codex, "codex-v5"),
             ])
         );
@@ -687,7 +687,7 @@ mod tests {
             baseline,
             provider_parse_contract_fingerprint_from([
                 (Provider::Codex, "codex-v5"),
-                (Provider::Claude, "claude-v4"),
+                (Provider::Claude, "claude-v5"),
             ])
         );
     }

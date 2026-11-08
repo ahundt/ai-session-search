@@ -21,6 +21,36 @@ import ai_session_search
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
+def test_human_content_selection_changes_membership_and_preserves_coordinates(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    search = native.SessionSearch(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+            values ('claude:human', 'claude', 'human', '', '/human', 'test', 'test');
+            insert into messages(id, session_id, provider, seq, role, kind, content, authorship, record_relation)
+            values (1, 'claude:human', 'claude', 0, 'tool', 'tool_result', 'needle generated', 'generated', 'original'),
+                   (2, 'claude:human', 'claude', 1, 'tool', 'tool_result', 'needle wrapper éneedle', 'mixed', 'original');
+            insert into message_content_parts(message_id, ordinal, start_char, end_char, authorship, origin)
+            values (2, 0, 0, 15, 'generated', 'tool_payload'),
+                   (2, 1, 15, 22, 'human', 'direct_input');
+        """)
+    response = search.search_messages("needle", native.MessageSearchRequest(content_authorship="human", limit=1, receipt_level="full"))
+    assert len(response.results) == 1
+    result = response.results[0]
+    assert result["message_ref"]["message_seq"] == 1
+    assert result["match"]["literal_occurrence"]["field_start_char"] == 16
+    assert result["message_metadata"]["provenance"]["authorship"] == "mixed"
+    assert response.effective_request["content_authorship"] == "human"
+    assert response.receipt["parameter_origins"]["content_authorship"] == {"source": "explicit"}
+    assert len(search.search_messages("needle").results) == 2
+    assert search.search_messages("needle", native.MessageSearchRequest(content_authorship="human", role="user")).results == []
+    with pytest.raises(ValueError, match="content_authorship"):
+        search.search_messages("needle", native.MessageSearchRequest(content_authorship="human", field="tool_name"))
+    with pytest.raises(ValueError, match="any or human"):
+        native.MessageSearchRequest(content_authorship="person")
+
+
 def test_message_search_request_exposes_only_final_presentation_and_include_controls() -> None:
     parameters = inspect.signature(native.MessageSearchRequest).parameters
     for name in ("detail", "field_view", "match_view", "include"):
@@ -115,6 +145,7 @@ def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp
         ],
     }
     assert [descriptor["rule"] for descriptor in registry["rules"]] == [
+        "human_content_requires_content_field",
         "detail_owns_presentation_budgets",
         "sequence_requires_session",
         "kinds_must_remain_satisfiable",
@@ -2342,6 +2373,7 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
             "insert into messages (session_id, provider, seq, role, kind, content, tool_name) values (?, 'claude', ?, ?, ?, ?, ?)",
             [(session, seq, role, kind, content, tool_name) for seq, role, content, tool_name, kind in rows],
         )
+        connection.execute("update messages set authorship=case when role='user' then 'human' else 'agent' end, record_relation='original'")
         connection.commit()
     finally:
         connection.close()
@@ -2371,6 +2403,7 @@ def _binding_search(database: Path, spec: dict, case: dict, offset: int = 0, lim
         all_results=case.get("all_results", False),
         match_window=case.get("match_window"),
         field=case.get("field", "content"),
+        content_authorship=case.get("content_authorship"),
     )
     return native.SessionSearch(database).search_messages(case["query"], request, query_mode=case["mode"])
 
@@ -2397,6 +2430,8 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
         str(offset),
     ]
     limit = limit if limit is not None else case.get("limit")
+    if case.get("content_authorship"):
+        command += ["--content-authorship", case["content_authorship"]]
     if case.get("field"):
         command += ["--field", case["field"].replace("_", "-")]
     if case.get("all_results"):

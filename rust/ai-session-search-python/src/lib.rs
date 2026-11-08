@@ -2751,6 +2751,7 @@ impl MessageScope {
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageSearchRequest {
+    content_authorship: Option<ai_session_search::models::ContentAuthorshipSelection>,
     scope: MessageScope,
     role: Option<Role>,
     kind: Option<MessageKind>,
@@ -2790,17 +2791,25 @@ struct MessageSearchRequest {
 
 #[pymethods]
 impl MessageSearchRequest {
+    #[getter]
+    fn content_authorship(&self) -> Option<&'static str> {
+        self.content_authorship.map(|v| match v {
+            ai_session_search::models::ContentAuthorshipSelection::Any => "any",
+            ai_session_search::models::ContentAuthorshipSelection::Human => "human",
+        })
+    }
     #[new]
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", content_authorship=None, argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None))]
     fn new(
         scope: Option<MessageScope>,
         role: Option<&str>,
         kind: Option<&str>,
         kinds: Option<Vec<String>>,
         field: &str,
+        content_authorship: Option<&str>,
         argument_path: Option<String>,
         seq_from: Option<i64>,
         seq_to: Option<i64>,
@@ -2877,6 +2886,10 @@ impl MessageSearchRequest {
             })
             .transpose()?;
         Ok(Self {
+            content_authorship: content_authorship
+                .map(str::parse)
+                .transpose()
+                .map_err(PyValueError::new_err)?,
             scope: scope.unwrap_or_default(),
             role: role
                 .map(str::parse)
@@ -3069,6 +3082,7 @@ impl MessageSearchRequest {
 impl Default for MessageSearchRequest {
     fn default() -> Self {
         Self {
+            content_authorship: None,
             scope: MessageScope::default(),
             role: None,
             kind: None,
@@ -3117,6 +3131,9 @@ impl MessageSearchRequest {
             } else {
                 CoreRequestedExtent::page(self.limit, self.offset).map_err(value_error)?
             });
+        if let Some(selection) = self.content_authorship {
+            builder = builder.content_authorship(selection);
+        }
         if let Some(value) = self.role {
             builder = builder.role(value);
         }
@@ -3557,6 +3574,7 @@ impl FileQuery {
 /// One indexed message with canonical session, role, kind, tool, and content fields.
 #[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
+    provenance: Option<ai_session_search::models::MessageProvenance>,
     #[pyo3(get)]
     session_id: String,
     #[pyo3(get)]
@@ -3583,6 +3601,10 @@ struct NativeMessageHit {
 #[pymethods]
 impl NativeMessageHit {
     #[getter]
+    fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        json_compatible(py, &self.provenance)
+    }
+    #[getter]
     fn refs(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeMessageRef>>> {
         self.refs
             .iter()
@@ -3600,6 +3622,7 @@ impl NativeMessageHit {
 impl From<MessageHit> for NativeMessageHit {
     fn from(hit: MessageHit) -> Self {
         Self {
+            provenance: hit.provenance.map(|value| *value),
             session_id: hit.session_id,
             provider: hit.provider.as_str().to_string(),
             seq: hit.seq,

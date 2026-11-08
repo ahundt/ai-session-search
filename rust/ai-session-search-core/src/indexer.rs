@@ -244,6 +244,8 @@ pub(crate) fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Resu
         "correlation_authority",
         "correlation_scope",
         "correlation_id",
+        "input_delivery_state",
+        "input_origin",
     ]
     .into_iter()
     .filter(|column| !columns.contains(*column))
@@ -1182,6 +1184,23 @@ enum TailOutcome {
     Cancelled,
 }
 
+/// Read the Claude parser's conservative marker that special records need a full reparse.
+fn claude_tail_requires_full_parse(
+    provider: Provider,
+    session: &crate::models::SessionRecord,
+) -> bool {
+    if !matches!(provider, Provider::Claude | Provider::ClaudeDesktop) {
+        return false;
+    }
+    session
+        .raw_metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|metadata| metadata.get("requires_full_parse_for_tail").cloned())
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 /// Try to incrementally append only the bytes appended to a session file since its last
 /// checkpoint, reusing that provider's real parser (`parse_slice`) over the appended slice
 /// ([`crate::tail`]). The preconditions (a stored checkpoint, no truncation, an unchanged file
@@ -1211,9 +1230,6 @@ where
     else {
         return Ok(TailOutcome::FullParse);
     };
-    if source.provider == Provider::ClaudeDesktop {
-        return Ok(TailOutcome::FullParse);
-    }
     // Truncation / copytruncate: the file is now shorter than where we parsed to → re-read whole.
     if offset <= 0 || source.size_bytes <= offset {
         return Ok(TailOutcome::FullParse);
@@ -1228,6 +1244,9 @@ where
             // the bounded tail overlap. Never insert child rows under a fallback ID: re-read the
             // complete source so parent replacement and child publication stay one transaction.
             if expected_session_id != Some(tail.session.id.as_str()) {
+                return Ok(TailOutcome::FullParse);
+            }
+            if claude_tail_requires_full_parse(source.provider, &tail.session) {
                 return Ok(TailOutcome::FullParse);
             }
             // Fills the tail's volatile end for `append_tail`; the tail's `created_at` is never
@@ -1286,6 +1305,7 @@ mod tests {
             "a later reopen must not checkpoint concurrently appended bytes the parser may not have read"
         );
     }
+
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1310,6 +1330,225 @@ mod tests {
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
         config
+    }
+
+    fn claude_overlap_padding(session_id: &str) -> String {
+        let mut initial = format!(
+            r#"{{"sessionId":"{session_id}","type":"user","message":{{"role":"user","content":"first prompt"}}}}
+"#
+        );
+        let progress = format!(
+            r#"{{"sessionId":"{session_id}","type":"assistant","message":{{"role":"assistant","content":"{}"}}}}
+"#,
+            "x".repeat(1024)
+        );
+        while initial.len() <= crate::tail::OVERLAP_BYTES as usize + crate::tail::FINGERPRINT_LEN {
+            initial.push_str(&progress);
+        }
+        initial
+    }
+
+    #[test]
+    fn ordinary_claude_append_keeps_incremental_tail_fast_path() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let source = claude_root.join("session.jsonl");
+        std::fs::write(
+            &source,
+            format!("{{\"sessionId\":\"ordinary-tail\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"first prompt\"}}}}\n{}", claude_overlap_padding("ordinary-tail")),
+        )
+        .unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let initial_count = db.message_count().unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                br#"{"sessionId":"ordinary-tail","type":"assistant","message":{"role":"assistant","content":"ordinary reply"}}
+"#,
+            )
+            .unwrap();
+
+        let adapters = ProviderSet::new(&config);
+        let source_file = adapters
+            .discover_enabled(&config)
+            .sources
+            .into_iter()
+            .next()
+            .unwrap();
+        let (offset, fingerprint) = db
+            .file_checkpoint(
+                Provider::Claude,
+                &normalize_path(&source_file.path),
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap()
+            .expect("initial indexing writes a tail checkpoint");
+        assert!(
+            crate::tail::fingerprint_matches(&source, &fingerprint).unwrap(),
+            "append preserves the source head"
+        );
+        let parsed_tail = crate::tail::tail_parse(&source, offset, |reader, path| {
+            adapters.claude.parse_reader(reader, path)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed_tail.session.id, "claude:ordinary-tail");
+        let outcome = try_tail(
+            &source_file,
+            &normalize_path(&source_file.path),
+            Some("claude:ordinary-tail"),
+            &db,
+            &|| false,
+            |reader, path| adapters.claude.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(matches!(outcome, TailOutcome::Appended));
+        assert_eq!(db.message_count().unwrap(), initial_count + 1);
+    }
+
+    #[test]
+    fn ask_user_answer_beyond_overlap_forces_full_parse_and_preserves_attribution() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let source = claude_root.join("session.jsonl");
+        let initial = concat!(
+            r#"{"sessionId":"ask-tail","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-tail-1","name":"AskUserQuestion","input":{}}]}}"#,
+            "\n"
+        ).to_owned() + &claude_overlap_padding("ask-tail");
+        std::fs::write(&source, initial).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                br#"{"sessionId":"ask-tail","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-tail-1","content":"Your questions have been answered: \"choice\"=\"human answer\"."}]},"toolUseResult":{"answers":{"choice":"human answer"}}}
+"#,
+            )
+            .unwrap();
+
+        let adapters = ProviderSet::new(&config);
+        let source_file = adapters
+            .discover_enabled(&config)
+            .sources
+            .into_iter()
+            .next()
+            .unwrap();
+        let outcome = try_tail(
+            &source_file,
+            &normalize_path(&source_file.path),
+            Some("claude:ask-tail"),
+            &db,
+            &|| false,
+            |reader, path| adapters.claude.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(matches!(outcome, TailOutcome::FullParse));
+        reindex(&config, &db, false, None).unwrap();
+        let messages = db
+            .search_messages(
+                "human answer",
+                &crate::models::MessageFilters {
+                    content_authorship: crate::models::ContentAuthorshipSelection::Human,
+                    session_id: Some("claude:ask-tail".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content.contains("human answer"))
+            .expect("full parse preserved the structured answer");
+        assert_eq!(
+            answer.provenance.as_ref().unwrap().authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(
+            answer.provenance.as_ref().unwrap().input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+    }
+
+    #[test]
+    fn queue_state_beyond_overlap_forces_full_parse_and_preserves_warning() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let source = claude_root.join("session.jsonl");
+        std::fs::write(&source, claude_overlap_padding("queue-tail")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                br#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-tail","timestamp":"2026-06-17T00:00:00Z","content":"queued tail correction"}
+"#,
+            )
+            .unwrap();
+
+        let adapters = ProviderSet::new(&config);
+        let source_file = adapters
+            .discover_enabled(&config)
+            .sources
+            .into_iter()
+            .next()
+            .unwrap();
+        let outcome = try_tail(
+            &source_file,
+            &normalize_path(&source_file.path),
+            Some("claude:queue-tail"),
+            &db,
+            &|| false,
+            |reader, path| adapters.claude.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(matches!(outcome, TailOutcome::FullParse));
+        reindex(&config, &db, false, None).unwrap();
+        let messages = db
+            .search_messages(
+                "queued tail correction",
+                &crate::models::MessageFilters {
+                    content_authorship: crate::models::ContentAuthorshipSelection::Human,
+                    session_id: Some("claude:queue-tail".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let queued = messages
+            .iter()
+            .find(|message| message.content == "queued tail correction")
+            .expect("full parse preserved queue input");
+        assert_eq!(
+            queued.provenance.as_ref().unwrap().input_delivery_state,
+            Some(crate::models::InputDeliveryState::Submitted)
+        );
+        let warning = db
+            .resolve_session("claude:queue-tail")
+            .unwrap()
+            .session
+            .parse_warning
+            .unwrap();
+        assert!(warning.contains("queue delivery, cancellation"));
     }
 
     #[test]
@@ -2447,13 +2686,13 @@ mod tests {
         let claude_root = dir.path().join("claude");
         std::fs::create_dir_all(&claude_root).unwrap();
         let session_file = claude_root.join("session.jsonl");
-        let line = |role: &str, content: &str| {
+        let line = |id: &str, role: &str, content: &str| {
             format!(
-                "{{\"sessionId\":\"s1\",\"type\":\"{role}\",\
+                "{{\"uuid\":\"{id}\",\"sessionId\":\"s1\",\"type\":\"{role}\",\
                  \"message\":{{\"role\":\"{role}\",\"content\":\"{content}\"}}}}\n"
             )
         };
-        std::fs::write(&session_file, line("user", "first prompt")).unwrap();
+        std::fs::write(&session_file, line("event-1", "user", "first prompt")).unwrap();
 
         let config = config_with_single_claude_fixture(&db_path, &claude_root);
         let db = Db::open(&db_path).unwrap();
@@ -2496,7 +2735,7 @@ mod tests {
             .append(true)
             .open(&session_file)
             .unwrap()
-            .write_all(line("assistant", "second reply").as_bytes())
+            .write_all(line("event-2", "assistant", "second reply").as_bytes())
             .unwrap();
         let adapters = ProviderSet::new(&config);
         let source_file = adapters

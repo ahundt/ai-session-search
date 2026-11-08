@@ -47,6 +47,77 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
 }
 
 #[test]
+fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
+    use ai_session_search::message_search::SearchSurface;
+    use ai_session_search::service::MessageService;
+    use ai_session_search::{
+        ContentAuthorshipSelection, MessageQuery, MessageSearchRequest, MessageTarget,
+    };
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let events = [
+        json!({"type":"assistant","sessionId":"historical-input","timestamp":"2026-06-16T20:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"question-1","name":"AskUserQuestion","input":{"questions":[]}}]}}),
+        json!({"type":"user","sessionId":"historical-input","uuid":"answer-1","timestamp":"2026-06-16T20:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"question-1","content":"User has answered your questions: \"Quality?\"=\"reticule correction\". You can now continue."}]},"toolUseResult":{"answers":{"Quality?":"reticule correction"}}}),
+        json!({"type":"queue-operation","operation":"enqueue","sessionId":"historical-input","timestamp":"2026-06-16T20:02:00Z","content":"liquid correction"}),
+        json!({"type":"queue-operation","operation":"enqueue","sessionId":"historical-input","timestamp":"2026-06-16T20:03:00Z","content":"vision correction"}),
+        json!({"type":"queue-operation","operation":"popAll","sessionId":"historical-input","timestamp":"2026-06-16T20:04:00Z","content":"vision correction"}),
+        json!({"type":"assistant","sessionId":"historical-input","timestamp":"2026-06-16T20:05:00Z","message":{"role":"assistant","content":"quoted correction"}}),
+    ];
+    let text = events
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(projects.join("historical-input.jsonl"), text).unwrap();
+    let config = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&config.db_path()).unwrap();
+    indexer::reindex(&config, &db, true, None).unwrap();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    let request = || {
+        MessageSearchRequest::builder(
+            MessageQuery::literal("correction").unwrap(),
+            MessageTarget::content(),
+        )
+        .content_authorship(ContentAuthorshipSelection::Human)
+        .build()
+        .unwrap()
+    };
+    let response = service.search(request()).unwrap();
+    assert_eq!(response.hits().len(), 3);
+    assert_eq!(
+        response
+            .hits()
+            .iter()
+            .filter(|hit| hit.message.role == Role::Tool)
+            .count(),
+        1
+    );
+    for hit in response.hits() {
+        assert!(hit.message.ts.is_some());
+        let provenance = hit.message.provenance.as_ref().unwrap();
+        assert!(provenance.correlation_identity.is_some());
+        let occurrence = hit.literal_match().unwrap();
+        assert_eq!(
+            hit.message
+                .content
+                .chars()
+                .skip(occurrence.field_start_char)
+                .take(occurrence.field_end_char_exclusive - occurrence.field_start_char)
+                .collect::<String>(),
+            "correction"
+        );
+    }
+    indexer::reindex(&config, &db, true, None).unwrap();
+    assert_eq!(
+        service.search(request()).unwrap().hits().len(),
+        3,
+        "refresh must not multiply queue evidence"
+    );
+}
+
+#[test]
 fn messages_role_counts_match_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");

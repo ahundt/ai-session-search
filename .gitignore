@@ -82,7 +82,8 @@ test_results*.xml
 .DS_Store
 
 # Project
-target/
+# Build output may be a symlink to a worktree cache.
+target
 
 # `run_ci_local.sh` preserves a concurrently modified native module beside the one it builds,
 # as `_native.abi3.so.local-ci-conflict.<pid>`. `*.so` above does not match it, because `.so` is

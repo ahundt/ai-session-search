@@ -17,6 +17,14 @@ App/IDE/CLI share `antigravity`. Cloud-only account history is outside this loca
 
 ## 1. Start
 
+For “my earlier messages/corrections”, prefer `content_authorship="human"` on `search_messages`
+or CLI `--content-authorship human`, without `role=user`: interactive human answers can have
+tool role. The default `any` searches complete content. Human selection requires `field=content`;
+context/views may still contain generated text. Inspect returned provenance: a queued submission
+does not prove delivery. If exact searches are empty, check effective role/date/path filters,
+try a bounded cross-role search, locate the original session from the note's references, and read
+the surrounding events. Keep original input, quoted edits and compaction summaries distinct.
+
 ```sh
 aise --version
 aise doctor
