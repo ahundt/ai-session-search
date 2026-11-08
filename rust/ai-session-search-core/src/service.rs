@@ -974,7 +974,7 @@ impl SessionSearch {
     }
 
     fn open_with_access_inputs_and_runtime(
-        config: Config,
+        mut config: Config,
         access_inputs: TrustedAccessInputs,
         runtime: Option<Arc<ExecutionRuntime>>,
     ) -> Result<Self> {
@@ -997,6 +997,7 @@ impl SessionSearch {
                 )
             }
             SchemaState::Missing | SchemaState::Current | SchemaState::Older { .. } => {}
+            SchemaState::ReaderOnly => { config.index.refresh = IndexRefresh::ExistingOnly; }
             SchemaState::Newer { current, supported } => anyhow::bail!(
                 "index {} uses schema generation {current}, newer than this aise build supports ({supported}); upgrade aise before opening it",
                 config.db_path().display()
@@ -1013,29 +1014,8 @@ impl SessionSearch {
                     config.db_path().display()
                 )
             }
-            SchemaState::RepairableLayout { .. } => {
-                // Elect one cross-process writer, re-inspect under the lock (a peer process may have
-                // already healed it), and rebuild the derived message-search indexes online from the
-                // intact base rows via the atomic exclusive migration. Then fall through to the
-                // normal open below against the now-current schema.
-                let heal_threads = NonZeroUsize::new(config.resolve_threads())
-                    .expect("Config::resolve_threads always returns at least one");
-                let heal_busy_timeout = config.index.busy_timeout_ms;
-                crate::indexer::with_index_update_lock(&config, || {
-                    if matches!(
-                        IndexCoordinator::new(&config).inspect_schema()?,
-                        SchemaState::RepairableLayout { .. }
-                    ) {
-                        let db = Db::open_with_threads(
-                            &config.db_path(),
-                            heal_busy_timeout,
-                            heal_threads,
-                        )?;
-                        db.migrate_message_search_schema_exclusive()?;
-                    }
-                    Ok(())
-                })?;
-            }
+            // Db::open elects the initializer and rechecks compatibility before repairing.
+            SchemaState::RepairableLayout { .. } => {}
             SchemaState::RecoveryRequired { reason } => anyhow::bail!(
                 "index {} requires offline recovery: {reason}; stop AISE processes, then run `aise reindex --full`",
                 config.db_path().display()
@@ -1080,6 +1060,7 @@ impl SessionSearch {
         let refresh = config.index.refresh;
         config.index.refresh = IndexRefresh::BeforeQuery;
         let mut app = Self::open(config)?;
+        app.db.require_write_compatibility()?;
         app.config.index.refresh = refresh;
         Ok(app)
     }
@@ -1309,6 +1290,42 @@ mod execution_runtime_tests {
                 "{refresh:?}: reindex is the command that fails; advising it is circular: {error}"
             );
         }
+    }
+
+    #[test]
+    fn compatibility_reader_only_service_suppresses_refresh_and_refuses_explicit_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Db::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "update index_metadata set value=2 where key='minimum_writer_compatibility'",
+            [],
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(path.to_string_lossy().into_owned());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().into_owned());
+        let app = SessionSearch::open(config.clone()).unwrap();
+        assert_eq!(app.config().index.refresh, IndexRefresh::ExistingOnly);
+        assert_eq!(app.database().message_count().unwrap(), 0);
+        assert_eq!(
+            indexer::refresh_index_opportunistically(app.config(), app.database(), None).unwrap(),
+            indexer::AutoReindexOutcome::SkippedFresh
+        );
+        let error = app.index().refresh().unwrap_err().to_string();
+        assert!(
+            error.contains("minimum_writer_compatibility=2") && error.contains("supports 1"),
+            "{error}"
+        );
+        let error = SessionSearch::open_for_maintenance(config)
+            .err()
+            .expect("maintenance must refuse")
+            .to_string();
+        assert!(
+            error.contains("minimum_writer_compatibility=2") && error.contains("supports 1"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2159,6 +2176,7 @@ impl<'app> IndexService<'app> {
     }
 
     pub fn refresh(&self) -> Result<AutoReindexOutcome> {
+        self.db.require_write_compatibility()?;
         indexer::refresh_index_opportunistically(self.config, self.db, None)
     }
 

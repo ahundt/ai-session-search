@@ -155,6 +155,7 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
                 options.source.display()
             )
         })?;
+    crate::db::require_index_write_compatibility(&source)?;
     let source_rows = core_table_rows(&source)?;
     {
         let mut destination = Connection::open(&staging.path).with_context(|| {
@@ -671,11 +672,12 @@ fn validate_integrity(connection: &Connection) -> Result<()> {
 /// The offline rebuild leaves the connection in WAL mode; the caller's immediately-following
 /// `journal_mode = delete` conversion folds it back into the self-contained staging file.
 fn ensure_migrated_index_is_current(conn: &Connection, path: &Path) -> Result<()> {
+    crate::db::require_index_write_compatibility(conn)?;
     let version: i64 = conn.query_row("pragma user_version", [], |row| row.get(0))?;
     // Schema 4 is the first generation that claims the released FTS-derived layout. Schema 5
     // retains that layout and adds parser-derived provenance. Heal either claimed FTS generation,
     // but do not fabricate schema-5 provenance while copying a v4 archive.
-    if !matches!(version, 4 | crate::db::SCHEMA_VERSION) {
+    if !matches!(version, 4 | 5 | crate::db::SCHEMA_VERSION) {
         return Ok(());
     }
     // A current stamp with a consistent layout is already publishable.

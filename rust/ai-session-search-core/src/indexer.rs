@@ -113,8 +113,10 @@ impl<'a> IndexCoordinator<'a> {
             .with_context(|| format!("failed to open index {} read-only", path.display()))?;
         match conn.query_row("pragma user_version", [], |row| row.get::<_, i64>(0)) {
             Ok(version) if version == SCHEMA_VERSION => {
+                let writable = crate::db::index_write_compatible(&conn)?;
                 match current_schema_layout_problem(&conn)? {
                     Some(reason) => {
+                        crate::db::require_index_write_compatibility(&conn)?;
                         let detail = format!(
                             "{} has a current version stamp but {reason}",
                             path.display()
@@ -133,7 +135,11 @@ impl<'a> IndexCoordinator<'a> {
                     None => {
                         let providers = crate::db::unknown_index_providers(&conn)?;
                         Ok(if providers.is_empty() {
-                            SchemaState::Current
+                            if writable {
+                                SchemaState::Current
+                            } else {
+                                SchemaState::ReaderOnly
+                            }
                         } else {
                             SchemaState::UnknownProviders { providers }
                         })
@@ -425,7 +431,8 @@ fn auto_reindex_after_election(
 /// True when parser/schema backfill is required or the ordinary content-refresh interval elapsed.
 /// Schema work always wins over a recent content timestamp.
 pub(crate) fn auto_refresh_is_due(db: &Db, interval_ms: u64) -> Result<bool> {
-    Ok(db.needs_backfill()? || !db.auto_reindex_is_fresh(interval_ms)?)
+    Ok(db.write_compatible()?
+        && (db.needs_backfill()? || !db.auto_reindex_is_fresh(interval_ms)?))
 }
 
 /// Refresh implicit read paths without making index-lock infrastructure a read dependency.
@@ -671,6 +678,7 @@ fn explicit_reindex_with_writer_permit(
     requested_full: bool,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<ExplicitReindexOutcome> {
+    db.require_write_compatibility()?;
     let effective_full = requested_full || db.needs_backfill()?;
     let (files_seen, sessions_updated, discovery_warnings) =
         match reindex_until(config, db, effective_full, progress, &|| false)? {
@@ -2023,6 +2031,7 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let config = config_with_no_providers(&db_path);
         let db = Db::open(&db_path).unwrap();
+        std::fs::remove_file(index_update_lock_path(&db_path)).unwrap();
         db.mark_schema_current().unwrap();
         std::fs::create_dir(index_update_lock_path(&db_path)).unwrap();
 
@@ -2043,6 +2052,7 @@ mod tests {
         drop(Db::open(&db_path).unwrap());
         force_legacy_parser_layout(&db_path, 1);
         let db = Db::open(&db_path).unwrap();
+        std::fs::remove_file(index_update_lock_path(&db_path)).unwrap();
         let lock_path = index_update_lock_path(&db_path);
 
         let error = prepare_index_for_read(&config, &db).unwrap_err();
@@ -2153,6 +2163,7 @@ mod tests {
         let mut config = config_with_no_providers(&db_path);
         config.index.refresh = IndexRefresh::ExistingOnly;
         let db = Db::open(&db_path).unwrap();
+        std::fs::remove_file(index_update_lock_path(&db_path)).unwrap();
         rusqlite::Connection::open(&db_path)
             .unwrap()
             .pragma_update(None, "user_version", 2)
@@ -2169,6 +2180,7 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let config = config_with_no_providers(&db_path);
         let db = Db::open(&db_path).unwrap();
+        std::fs::remove_file(index_update_lock_path(&db_path)).unwrap();
         rusqlite::Connection::open(&db_path)
             .unwrap()
             .pragma_update(None, "user_version", crate::db::SCHEMA_VERSION + 1)
@@ -2241,6 +2253,7 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let config = config_with_no_providers(&db_path);
         let db = Db::open(&db_path).unwrap();
+        std::fs::remove_file(index_update_lock_path(&db_path)).unwrap();
         db.mark_schema_current().unwrap();
         let target = dir.path().join("unrelated");
         std::fs::write(&target, b"preserve me").unwrap();
@@ -2263,6 +2276,7 @@ mod tests {
         drop(Db::open(&db_path).unwrap());
         force_legacy_parser_layout(&db_path, 1);
         let db = Db::open(&db_path).unwrap();
+        std::fs::remove_file(index_update_lock_path(&db_path)).unwrap();
         std::fs::create_dir(index_update_lock_path(&db_path)).unwrap();
 
         let err = refresh_index_opportunistically(&config, &db, None).unwrap_err();

@@ -88,6 +88,7 @@ pub(crate) fn migrate_message_search_schema_offline(
     conn: &Connection,
     target_version: i64,
 ) -> Result<()> {
+    crate::db::require_index_write_compatibility(conn)?;
     let locking_mode: String =
         conn.query_row("pragma locking_mode=exclusive", [], |row| row.get(0))?;
     anyhow::ensure!(
@@ -112,6 +113,7 @@ pub(crate) fn migrate_message_search_schema_offline(
     let migration = (|| -> Result<()> {
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Exclusive)?;
+        crate::db::require_index_write_compatibility(&tx)?;
         install_target_message_search_indexes(&tx)?;
         tx.execute_batch(
             "insert into messages_fts(messages_fts) values ('rebuild');
