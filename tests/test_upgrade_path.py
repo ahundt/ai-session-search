@@ -173,3 +173,15 @@ def test_a_release_that_cannot_be_downloaded_is_not_reported_as_an_upgrade_failu
     assert verify_upgrade_path._check_all(["1.0.0rc2"], Path("aise")) == 2
     error = capsys.readouterr().err
     assert "not an upgrade failure" in error and "needs a manual step" not in error
+
+
+def test_archive_fixture_checks_shrink_rewrite_edits_and_injected_rows() -> None:
+    import sqlite3
+
+    with sqlite3.connect(":memory:") as database:
+        database.executescript("create table messages(content text); create table file_edits(new_content text);")
+        database.executemany("insert into messages values (?)", [("alpha",), ("beta",), ("<turn_aborted>archive",)])
+        database.execute("insert into file_edits values ('saved file')")
+        assert verify_upgrade_path.archive_evidence(database) == {
+            "shrink": True, "rewrite": True, "file_edits": True, "injected_rows": True,
+        }

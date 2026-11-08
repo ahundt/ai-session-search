@@ -1953,6 +1953,15 @@ impl Db {
                 break;
             }
         }
+        if previous_parse_version.is_none() {
+            previous_parse_version = tx
+                .query_row(
+                    "select parse_version from sessions where id=?1",
+                    [&session.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+        }
         let same_parser = previous_parse_version.as_deref() == Some(session.parse_version.as_str());
         // A complete source parse represents one canonical session. Parser improvements or
         // mutable sidecar metadata can change the provider session ID, and a verified alias can
@@ -6090,12 +6099,12 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 ///   that boundary row is compared, so a caller passing `allow_append_optimization` asserts its
 ///   sources are append-only.
 /// - Unchanged: under the same parser, a parse whose rows equal the stored rows writes nothing.
-/// - Replace: a parser change, or a parse that holds every stored message (same role and
-///   content), replaces the rows, so a parser upgrade can reclassify them.
+/// - Replace: a parse that holds every stored message replaces the rows. A parser transition
+///   may correct metadata only while preserving every stored content occurrence.
 /// - Keep: otherwise the harness compacted, rewrote or pruned its transcript. The index is the
 ///   archive, so stored rows stay, and parse messages no stored row of the same role and content
-///   accounts for are appended after the highest stored seq. Content cannot tell a re-rendered
-///   message from a removed one across parser versions, which is why only the same parser keeps.
+///   accounts for are appended after the highest stored seq. A parser transition that lacks
+///   stored evidence is refused, rolling back the session transaction.
 ///
 /// O(stored + parsed rows and bytes) time off the append path; O(rows) memory for 32-byte keys.
 fn store_parsed_messages(
@@ -6147,6 +6156,19 @@ fn store_parsed_messages(
             .eq(parsed_keys.iter().map(|keys| keys.all_columns))
     {
         return Ok(false);
+    }
+    if !same_parser {
+        anyhow::ensure!(
+            covers_every_stored_key(
+                stored.iter().map(|(_, keys)| keys.content),
+                parsed_keys.iter().map(|keys| keys.content),
+            ),
+            "parser transition to {:?} for session {} would discard stored message evidence; \
+             the session transaction is unchanged; retain the index and source files and use \
+             an aise parser that represents all archived content before retrying",
+            session.parse_version,
+            session.id
+        );
     }
     if !same_parser
         || covers_every_stored_key(
@@ -6205,12 +6227,19 @@ fn store_parsed_file_edits(
     {
         return Ok(());
     }
-    if !same_parser
-        || covers_every_stored_key(
-            stored.iter().map(|(_, _, keys)| keys.edit),
-            parsed_keys.iter().map(|keys| keys.edit),
-        )
-    {
+    let covers_edits = covers_every_stored_key(
+        stored.iter().map(|(_, _, keys)| keys.edit),
+        parsed_keys.iter().map(|keys| keys.edit),
+    );
+    anyhow::ensure!(
+        same_parser || covers_edits,
+        "parser transition to {:?} for session {} would discard stored file-edit evidence; \
+         the session transaction is unchanged; retain the index and source files and use \
+         an aise parser that represents all archived edits before retrying",
+        session.parse_version,
+        session.id
+    );
+    if covers_edits {
         tx.execute(
             "delete from file_edits where session_id = ?1",
             params![session.id],
@@ -6307,6 +6336,7 @@ type RowDigest = [u8; 32];
 /// - `all_columns` covers every stored column except the content parts, which the parser derives from
 ///   the content; equal `all_columns` sequences mean the parse would write exactly what is stored.
 struct MessageKeys {
+    content: RowDigest,
     role_and_content: RowDigest,
     all_columns: RowDigest,
 }
@@ -6353,6 +6383,7 @@ impl MessageColumns<'_> {
         all_columns.update_u8(u8::from(self.is_compaction));
         all_columns.update_bytes(&content);
         MessageKeys {
+            content,
             role_and_content: role_and_content.finish_bytes(),
             all_columns: all_columns.finish_bytes(),
         }
@@ -13072,7 +13103,7 @@ mod tests {
             tool_name: None,
             tool_call_id: None,
             is_compaction: false,
-            content: "replacement".into(),
+            content: "obsolete".into(),
             provenance: crate::models::MessageProvenance::default(),
         }];
         db.upsert_session(&current, 2, 2).unwrap();
@@ -13084,7 +13115,7 @@ mod tests {
                 .source_path,
             source.to_string_lossy()
         );
-        assert!(db
+        assert!(!db
             .search_messages("obsolete", &MessageFilters::default())
             .unwrap()
             .is_empty());
@@ -14372,9 +14403,8 @@ mod tests {
             let mut parsed = parsed_with_messages(&id, &[&content]);
             parsed.session.provider_session_id = format!("allocation-{index}");
             parsed.session.source_path = format!("/allocation/{index}.jsonl");
-            // A new parser version: replacing rows a re-parse by the same parser no longer holds
-            // would delete archived history, so only a parser upgrade replaces them.
-            parsed.session.parse_version = "allocation-parser-v2".into();
+            // Explicit fixture deletion creates free pages; parser upgrades cannot erase archives.
+            db.conn.execute("delete from sessions where id = ?1", [&id]).unwrap();
             db.replace_session(&parsed, 10 + index, 10 + index).unwrap();
         }
         db.optimize_fts().unwrap();
@@ -17005,7 +17035,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_parser_version_replaces_rows_even_when_the_append_boundary_matches() {
+    fn a_new_parser_version_refuses_missing_evidence_even_when_the_append_boundary_matches() {
         use crate::models::MessageKind::Conversation;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -17030,14 +17060,59 @@ mod tests {
             Vec::new(),
         );
         upgraded.session.parse_version = "v2".into();
-        db.upsert_session(&upgraded, 2, 2).unwrap();
+        let error = db.upsert_session(&upgraded, 2, 2).unwrap_err().to_string();
+        assert!(error.contains("parser transition"), "{error}");
         assert_eq!(
             session_rows(&db, "codex:archive"),
-            [
-                row(0, "user", "x"),
-                row(1, "user", "b"),
-                row(2, "user", "c")
-            ]
+            [row(0, "user", "a"), row(1, "user", "b"),]
+        );
+        let version: String = db
+            .conn
+            .query_row(
+                "select parse_version from files_seen where source_path = '/x/archive.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version, "v1",
+            "the earlier metadata writes must roll back too"
+        );
+    }
+
+    #[test]
+    fn a_new_parser_version_refuses_missing_file_edit_evidence_atomically() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let original = archive_session(
+            vec![archive_message(0, "a", Conversation)],
+            vec![FileEdit {
+                seq: 0,
+                tool: "Write".into(),
+                file_path: "/x/file".into(),
+                file_name: "file".into(),
+                new_content: Some("saved".into()),
+                edits: Vec::new(),
+                ts: None,
+            }],
+        );
+        db.upsert_session(&original, 1, 1).unwrap();
+        let mut upgraded = original.clone();
+        upgraded.session.parse_version = "v2".into();
+        upgraded
+            .messages
+            .push(archive_message(1, "new", Conversation));
+        upgraded.file_edits.clear();
+        let error = db.upsert_session(&upgraded, 2, 2).unwrap_err().to_string();
+        assert!(error.contains("file-edit evidence"), "{error}");
+        assert_eq!(session_rows(&db, "codex:archive"), [row(0, "user", "a")]);
+        assert_eq!(
+            db.conn
+                .query_row("select count(*) from file_edits", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 
