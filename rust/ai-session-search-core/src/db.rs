@@ -6376,7 +6376,8 @@ fn store_parsed_messages(
             });
         if let Some(position) = position {
             matched[position] = true;
-            if stored[position].1.all_columns != keys.all_columns {
+            // A parser upgrade can change part attribution without changing message columns.
+            if !same_parser || stored[position].1.all_columns != keys.all_columns {
                 update_message_row(tx, stored[position].0, session, message)?;
             }
         } else {
@@ -16794,6 +16795,63 @@ mod tests {
             2,
             "only the rewritten and new messages were inserted"
         );
+    }
+
+    #[test]
+    fn a_parser_upgrade_repairs_only_changed_content_parts_in_place() {
+        use crate::models::{
+            ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageContentPart,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = parsed_with_messages("claude:parts-upgrade", &["ab"]);
+        parsed.messages[0].provenance.authorship = MessageAuthorship::Mixed;
+        parsed.messages[0].provenance.content_parts = vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 1,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 1,
+                end_char: 2,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::QuotedContent,
+            },
+        ];
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        let message_id: i64 = db
+            .conn
+            .query_row("select id from messages", [], |r| r.get(0))
+            .unwrap();
+
+        parsed.session.parse_version = "parts-v2".into();
+        parsed.messages[0].provenance.content_parts[0].authorship =
+            ContentPartAuthorship::Generated;
+        parsed.messages[0].provenance.content_parts[0].origin = ContentPartOrigin::QuotedContent;
+        parsed.messages[0].provenance.content_parts[1].authorship = ContentPartAuthorship::Human;
+        parsed.messages[0].provenance.content_parts[1].origin = ContentPartOrigin::DirectInput;
+        db.upsert_session(&parsed, 2, 2).unwrap();
+        db.upsert_session(&parsed, 3, 3).unwrap();
+        let parts: Vec<(i64, String)> = db
+            .conn
+            .prepare("select message_id, authorship from message_content_parts order by ordinal")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            parts,
+            [
+                (message_id, "generated".into()),
+                (message_id, "human".into())
+            ]
+        );
+        assert_eq!(db.message_count().unwrap(), 1);
     }
 
     #[test]
