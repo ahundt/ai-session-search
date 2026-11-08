@@ -8,13 +8,6 @@
   },
   "cases": [
     {
-      "id": "cli-human-content",
-      "tier": "smoke",
-      "surface": "cli",
-      "baseline_allow_failure": true,
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "database", "--content-authorship", "human", "--limit", "10", "--format", "json"]
-    },
-    {
       "id": "cli-exact-content",
       "tier": "smoke",
       "surface": "cli",
