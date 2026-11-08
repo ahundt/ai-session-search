@@ -160,11 +160,20 @@ The `ai-session-search/` package contains general harness guidance in `SKILL.md`
 `recover-prior-work-with-evidence.md`, and `search-costs-and-receipts.md`.
 
 Harness-native discovery links point to the canonical package from `~/.claude/skills/` (Claude
-Code CLI/Desktop), `~/.agents/skills/` (ChatGPT Codex desktop and Codex CLI/IDE),
-`~/.gemini/skills/` (Gemini), `~/.gemini/config/skills/` (Antigravity App/IDE),
+Code CLI/Desktop), `~/.agents/skills/` (ChatGPT Codex desktop, Codex CLI/IDE, and Gemini CLI),
+`~/.gemini/config/skills/` (Antigravity App/IDE),
 `~/.gemini/antigravity-cli/skills/` (Antigravity CLI), `~/.pi/agent/skills/` (Pi), and
 `~/.prime/agent/skills/` (Prime Agent). Pi and Prime also read `~/.agents/skills/`, but their
 native links make explicit installs and lifecycle status independent of Codex detection.
+
+Gemini CLI has read `~/.agents/skills/` since [v0.28.0](https://github.com/google-gemini/gemini-cli/releases/tag/v0.28.0)
+([upstream change](https://github.com/google-gemini/gemini-cli/commit/ad8796b02db3cbb34c8318b53b7b0fc5113e264b)).
+Its loader retains alias paths and warns when the same name appears at different paths, even
+when both links point to one package. Install and the post-upgrade refresh retire an untouched,
+aise-owned `~/.gemini/skills/ai-session-search` link or copy; foreign or modified entries stay
+in place and are reported. The shared link remains until its last installed harness is
+uninstalled. Older Gemini versions do not discover the shared skill; their MCP and `GEMINI.md`
+integrations remain available. Automatic skill installation targets Gemini CLI v0.28.0 and newer.
 
 Pi's and Prime's own CLIs accept a repeatable `--skill PATH`, and their `--no-skills` only
 disables discovery, so an explicit path stays active. Selecting several harnesses keeps every

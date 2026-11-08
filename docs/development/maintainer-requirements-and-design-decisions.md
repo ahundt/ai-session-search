@@ -468,11 +468,23 @@ Do not claim end-to-end support from a configured JSON key or an MCP handshake a
 | Claude Code | `~/.claude.json`; `~/.claude/.mcp.json` is superseded cleanup only | `~/.claude/skills` | `~/.claude/CLAUDE.md` |
 | Claude Desktop local agent | platform Claude `claude_desktop_config.json` | shared Claude behavior where supported | Claude guidance |
 | ChatGPT Codex desktop and Codex CLI/IDE | shared `~/.codex/config.toml` | `~/.agents/skills` | `~/.codex/AGENTS.md` |
-| Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/skills` | `~/.gemini/GEMINI.md` |
+| Gemini CLI v0.28.0+ | `~/.gemini/settings.json` | shared `~/.agents/skills`; owned `~/.gemini/skills/ai-session-search` is retired | `~/.gemini/GEMINI.md` |
 | Antigravity App/IDE/current CLI | `~/.gemini/config/mcp_config.json` | App/IDE: `~/.gemini/config/skills`; CLI: `~/.gemini/antigravity-cli/skills` | shared `~/.gemini/GEMINI.md` |
 | Antigravity compatibility | `~/.gemini/antigravity-cli/settings.json`; `~/.gemini/antigravity/mcp_config.json` | tested compatibility roots only | no duplicate instruction file |
 | Pi coding agent | `~/.pi/agent/mcp.json`, strict JSON `mcpServers` (Pi 0.99.0+) | `~/.pi/agent/skills` | `~/.pi/agent/AGENTS.md` |
 | Prime Agent | `~/.prime/agent/settings.json`, strict JSON `mcpServers` with `type: "stdio"` | `~/.prime/agent/skills` | `~/.prime/agent/AGENTS.md` |
+
+Gemini's shared root was added by [ad8796b](https://github.com/google-gemini/gemini-cli/commit/ad8796b02db3cbb34c8318b53b7b0fc5113e264b)
+and shipped in [v0.28.0](https://github.com/google-gemini/gemini-cli/releases/tag/v0.28.0).
+At [62bab5b, also main when checked](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillManager.ts#L71-L79),
+Gemini reads both roots and [compares literal locations](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillManager.ts#L124-L148);
+the [loader retains the alias path](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillLoader.ts#L154-L212).
+Installing links in both roots therefore warns even when their targets match. Share Codex's
+link, record its installed harness users in the skill manifest, and release it only with the
+last user. Install and upgrade refresh retire only provably owned legacy links or untouched
+copies, preserving and reporting edited or foreign entries. No Gemini minimum was previously
+specified; automatic skill discovery now requires v0.28.0+, while older Gemini retains MCP
+and managed instructions.
 
 Pi and Prime Agent also discover `~/.agents/skills`, but each explicit selector installs one link in
 its harness-native root. This avoids coupling their installation to Codex detection and keeps

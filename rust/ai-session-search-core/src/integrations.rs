@@ -50,6 +50,12 @@ const CLAUDE_USER_MCP_FILE: &str = ".claude.json";
 /// Former aise global target. Claude documents `.mcp.json` only at the project root:
 /// https://code.claude.com/docs/en/claude-directory#choose-the-right-file
 const CLAUDE_SUPERSEDED_MCP_PATH: &str = ".claude/.mcp.json";
+/// Gemini v0.28.0+ and Codex share this root to avoid literal-path skill conflicts:
+/// https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillManager.ts#L71-L79
+const SHARED_SKILLS_PATH: &str = ".agents/skills";
+/// Former aise Gemini root, still read alongside the shared root:
+/// https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L142-L148
+const GEMINI_RETIRED_SKILLS_PATH: &str = ".gemini/skills";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
@@ -282,7 +288,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent also receive their native skill and MCP-first AGENTS.md guidance. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills, ~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
+    after_help = "Default install configures executable aliases plus each detected harness's supported integrations. MCP-capable clients receive the local stdio server; Pi and Prime Agent also receive their native skill and MCP-first AGENTS.md guidance. Supported selectors: Claude Code/Desktop, ChatGPT Codex desktop and CLI/IDE, Gemini, Antigravity App/IDE/CLI, Pi, Prime Agent, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, OpenCode and OpenClaw mcp.servers.ai-session-search, or Kilo mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys, and entries in places a client no longer reads, without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills, ~/.agents/skills (Codex and Gemini), ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills, ~/.pi/agent/skills, and ~/.prime/agent/skills. Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -572,6 +578,9 @@ struct SkillTarget {
     /// These are deliberately separate from `root`: `root` lives in the platform config
     /// namespace and is owned by aise, while these paths live in harness-owned namespaces.
     discovery_links: Vec<PathBuf>,
+    /// Superseded harness entries, removable only through the normal ownership checks.
+    retired_discovery_links: Vec<PathBuf>,
+    discovery_clients: Vec<String>,
     detect_paths: Vec<PathBuf>,
     detect_binaries: Vec<&'static str>,
 }
@@ -924,6 +933,16 @@ fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) -> Result<()> {
                         deduped[index].discovery_links.push(link);
                     }
                 }
+                for link in target.retired_discovery_links {
+                    if !deduped[index].retired_discovery_links.contains(&link) {
+                        deduped[index].retired_discovery_links.push(link);
+                    }
+                }
+                for client in target.discovery_clients {
+                    if !deduped[index].discovery_clients.contains(&client) {
+                        deduped[index].discovery_clients.push(client);
+                    }
+                }
                 for path in target.detect_paths {
                     if !deduped[index].detect_paths.contains(&path) {
                         deduped[index].detect_paths.push(path);
@@ -1018,6 +1037,12 @@ pub(crate) fn install_with_receipt(
         .map(|(link, expected)| SymlinkChange::remove(link.clone(), expected.clone()))
         .collect::<Vec<_>>();
     planned_discovery_links.extend(plan_install_skill_discovery_links(&skill_targets)?);
+    let (retired_entries, retired_directories) = retired_discovery_outcomes(
+        &skill_targets,
+        &skill_manifest,
+        &planned_discovery_links,
+        args.dry_run,
+    )?;
     let changed_discovery_paths = planned_discovery_links
         .iter()
         .map(|change| change.path.clone())
@@ -1046,6 +1071,7 @@ pub(crate) fn install_with_receipt(
             |_, change| publish_install_skill_discovery_link(change, &skill_targets),
         )?;
         prune_retired_skill_directories(&retired_skill_roots);
+        prune_emptied_skill_directories(&retired_directories);
     }
     if let Some(guard) = alias_guard {
         guard.commit();
@@ -1100,6 +1126,18 @@ pub(crate) fn install_with_receipt(
             );
         }
     }
+    for outcome in retired_entries {
+        println!(
+            "{}{} {}{}",
+            if args.dry_run { "dry-run: " } else { "" },
+            outcome.action,
+            outcome.root,
+            outcome
+                .problem
+                .map(|problem| format!(": {problem}"))
+                .unwrap_or_default()
+        );
+    }
     for ((target, file_changed), link_changes) in skill_targets
         .into_iter()
         .zip(skill_file_changes)
@@ -1152,6 +1190,13 @@ pub(crate) fn install_with_receipt(
 fn plan_install_skill_discovery_links(targets: &[SkillTarget]) -> Result<Vec<SymlinkChange>> {
     let mut changes = Vec::new();
     for target in targets {
+        for link in &target.retired_discovery_links {
+            if fs::symlink_metadata(link).is_ok_and(|metadata| metadata.file_type().is_symlink())
+                && fs::read_link(link)? == target.root
+            {
+                changes.push(SymlinkChange::remove(link.clone(), target.root.clone()));
+            }
+        }
         for link in &target.discovery_links {
             match snapshot_symlink_image(link)
                 .with_context(|| format!("inspect skill discovery entry {}", link.display()))?
@@ -1475,7 +1520,14 @@ pub(crate) fn uninstall_with_receipt(
     } else {
         append_retired_sibling_skill_targets(&mut skill_targets)?;
     }
-    let discovery_uninstall = prepare_skill_discovery_uninstall(&skill_targets)?;
+    let released_skill_targets = skill_targets.clone();
+    let discovery_uninstall = prepare_skill_discovery_uninstall(
+        &skill_targets,
+        &ClientLayout::discover()?,
+        &crate::skill_manifest::load_manifest(&crate::skill_manifest::manifest_path(
+            default_receipt,
+        ))?,
+    )?;
     let discovery_link_changes = discovery_uninstall
         .links_to_remove
         .iter()
@@ -1493,6 +1545,7 @@ pub(crate) fn uninstall_with_receipt(
         &targets,
         &instruction_targets,
         &skill_targets,
+        &released_skill_targets,
         Some(&crate::skill_manifest::manifest_path(default_receipt)),
         args.force_full_cleanup,
     )?;
@@ -1627,6 +1680,13 @@ fn append_retired_sibling_skill_targets(skill_targets: &mut Vec<SkillTarget>) ->
                 root,
                 package: &RETIRED_SKILL_PACKAGE,
                 discovery_links,
+                retired_discovery_links: target
+                    .retired_discovery_links
+                    .iter()
+                    .filter_map(|link| link.parent())
+                    .map(|parent| parent.join(RETIRED_SKILL_PACKAGE_NAME))
+                    .collect(),
+                discovery_clients: target.discovery_clients.clone(),
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
             })
@@ -1645,16 +1705,54 @@ struct SkillDiscoveryUninstall {
 
 fn prepare_skill_discovery_uninstall(
     selected_targets: &[SkillTarget],
+    layout: &ClientLayout,
+    manifest: &crate::skill_manifest::ManifestState,
 ) -> Result<SkillDiscoveryUninstall> {
     let mut plan = SkillDiscoveryUninstall::default();
-    let layout = ClientLayout::discover()?;
     for target in selected_targets {
         if target.discovery_links.is_empty() {
             plan.file_targets.push(target.clone());
             continue;
         }
 
-        for link in &target.discovery_links {
+        let mut clients = manifest
+            .installation(&target.root)
+            .map(|entry| entry.discovery_clients.clone())
+            .unwrap_or_default();
+        // Older manifests lack users. Infer only the two formerly distinct, owned links.
+        if clients.is_empty() {
+            for (client, root) in [
+                ("codex", SHARED_SKILLS_PATH),
+                ("gemini", GEMINI_RETIRED_SKILLS_PATH),
+            ] {
+                if fs::read_link(layout.home.join(root).join(target.package.name))
+                    .is_ok_and(|destination| destination == target.root)
+                {
+                    clients.push(client.to_string());
+                }
+            }
+        }
+        clients.retain(|client| !target.discovery_clients.contains(client));
+        let retained_links = CONCRETE_CLIENTS
+            .into_iter()
+            .filter(|client| {
+                clients
+                    .iter()
+                    .any(|name| client.to_possible_value().unwrap().get_name() == name)
+            })
+            .flat_map(|client| skill_targets_for_layout(client, layout))
+            .flat_map(|other| other.discovery_links)
+            .collect::<Vec<_>>();
+
+        for link in target
+            .discovery_links
+            .iter()
+            .chain(&target.retired_discovery_links)
+        {
+            if retained_links.contains(link) {
+                plan.notices.push(format!("preserved shared skill discovery link {} because another installed harness uses it", link.display()));
+                continue;
+            }
             match fs::symlink_metadata(link) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -1688,10 +1786,15 @@ fn prepare_skill_discovery_uninstall(
             }
         }
 
-        let selected = &target.discovery_links;
+        let selected = target
+            .discovery_links
+            .iter()
+            .chain(&target.retired_discovery_links)
+            .cloned()
+            .collect::<Vec<_>>();
         let another_owned_link =
-            another_owned_discovery_link(&layout, target.package, selected, &target.root)?;
-        if another_owned_link {
+            another_owned_discovery_link(layout, target.package, &selected, &target.root)?;
+        if another_owned_link || !clients.is_empty() {
             plan.notices.push(format!(
                 "preserved canonical skill package {} because another harness still links to it",
                 target.root.display()
@@ -1766,8 +1869,8 @@ fn all_standard_discovery_links(
 ) -> Vec<PathBuf> {
     [
         layout.home.join(".claude").join("skills"),
-        layout.home.join(".agents").join("skills"),
-        layout.home.join(".gemini").join("skills"),
+        layout.home.join(SHARED_SKILLS_PATH),
+        layout.home.join(GEMINI_RETIRED_SKILLS_PATH),
         layout.home.join(".gemini").join("config").join("skills"),
         layout
             .home
@@ -2147,14 +2250,12 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
             vec!["claude"],
         ),
         McpClient::Codex => (
-            vec![layout.home.join(".agents").join("skills")],
+            vec![layout.home.join(SHARED_SKILLS_PATH)],
             vec![layout.home.join(".codex"), layout.home.join(".agents")],
             vec!["codex"],
         ),
         McpClient::Gemini => (
-            // Gemini CLI's native user location. It also accepts ~/.agents/skills, but using the
-            // harness-native directory makes ownership and uninstall expectations unsurprising.
-            vec![layout.home.join(".gemini").join("skills")],
+            vec![layout.home.join(SHARED_SKILLS_PATH)],
             vec![layout.home.join(".gemini")],
             vec!["gemini"],
         ),
@@ -2194,6 +2295,17 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
                 .discovery_links
                 .extend(discovery_roots.iter().map(|root| root.join(package.name)));
             target
+                .discovery_clients
+                .push(client.to_possible_value().unwrap().get_name().to_string());
+            if client == McpClient::Gemini {
+                target.retired_discovery_links.push(
+                    layout
+                        .home
+                        .join(GEMINI_RETIRED_SKILLS_PATH)
+                        .join(package.name),
+                );
+            }
+            target
         })
         .collect()
 }
@@ -2219,6 +2331,8 @@ fn skill_target_for_package(
         root,
         package,
         discovery_links: Vec::new(),
+        retired_discovery_links: Vec::new(),
+        discovery_clients: Vec::new(),
         detect_paths,
         detect_binaries,
     }
@@ -2454,6 +2568,9 @@ fn preflight_install(
         let migration = plan_migrate_discovery_copies(target, manifest_path)?;
         mutations.extend(migration.mutations);
         retired_skill_roots.extend(migration.retired_roots);
+        let retired = plan_retire_discovery_entries(target, &skill_manifest)?;
+        mutations.extend(retired.mutations);
+        retired_skill_roots.extend(retired.retired_roots);
         if manifest_path.is_some() {
             mutations.extend(plan_retire_removed_managed_skill_files(
                 target,
@@ -2565,6 +2682,15 @@ fn plan_record_skill_manifest(
         manifest.forget(root);
     }
     for target in skill_targets {
+        // Before this field existed, a shared link could only have been installed for Codex.
+        let legacy_codex = state
+            .installation(&target.root)
+            .is_none_or(|entry| entry.discovery_clients.is_empty())
+            && target.discovery_links.iter().any(|link| {
+                link.parent()
+                    .is_some_and(|root| root.ends_with(SHARED_SKILLS_PATH))
+                    && fs::read_link(link).is_ok_and(|destination| destination == target.root)
+            });
         let files = target
             .package
             .files
@@ -2572,6 +2698,24 @@ fn plan_record_skill_manifest(
             .map(|file| (file.relative_path.to_string(), file.content))
             .collect::<Vec<_>>();
         manifest.record(&target.root, &files);
+        let installation = manifest
+            .installations
+            .iter_mut()
+            .find(|entry| {
+                entry
+                    .root
+                    .to_path_buf()
+                    .is_ok_and(|root| root == target.root)
+            })
+            .unwrap();
+        installation
+            .discovery_clients
+            .extend(target.discovery_clients.iter().cloned());
+        if legacy_codex {
+            installation.discovery_clients.push("codex".to_string());
+        }
+        installation.discovery_clients.sort();
+        installation.discovery_clients.dedup();
     }
     let original = read_optional_utf8_regular_file(manifest_path)?;
     mutations.push(planned_write(manifest_path, &original, manifest.to_json()?));
@@ -2626,6 +2770,8 @@ fn plan_retire_sibling_package(
                 root: root.clone(),
                 package: &AI_SESSION_SEARCH_SKILL_PACKAGE,
                 discovery_links: Vec::new(),
+                retired_discovery_links: Vec::new(),
+                discovery_clients: Vec::new(),
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
             };
@@ -2703,6 +2849,117 @@ fn plan_retire_sibling_discovery_links(
 struct SkillDiscoveryMigration {
     mutations: Vec<PlannedFileMutation>,
     retired_roots: Vec<PathBuf>,
+    notices: Vec<(PathBuf, String)>,
+}
+
+/// Retire obsolete copies using uninstall's marker, manifest, digest, and extra-file checks.
+fn plan_retire_discovery_entries(
+    target: &SkillTarget,
+    manifest: &crate::skill_manifest::ManifestState,
+) -> Result<SkillDiscoveryMigration> {
+    let mut migration = SkillDiscoveryMigration::default();
+    for link in &target.retired_discovery_links {
+        match fs::symlink_metadata(link) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect retired skill entry {}", link.display()))
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if fs::read_link(link)? != target.root {
+                    migration.notices.push((
+                        link.clone(),
+                        format!(
+                            "preserved foreign or modified skill discovery link {}",
+                            link.display()
+                        ),
+                    ));
+                }
+            }
+            Ok(_) => {
+                let mut legacy = target.clone();
+                legacy.root = link.clone();
+                legacy.discovery_links.clear();
+                legacy.retired_discovery_links.clear();
+                match plan_remove_skill_file(&legacy, manifest, false) {
+                    Ok(removal) if removal.preserved.is_empty() => {
+                        migration.mutations.extend(removal.mutations);
+                        migration.retired_roots.push(link.clone());
+                    }
+                    Ok(removal) => migration.notices.push((
+                        link.clone(),
+                        format!(
+                            "preserved modified skill directory {}: {}",
+                            link.display(),
+                            removal.preserved.join("; ")
+                        ),
+                    )),
+                    Err(error) => migration.notices.push((
+                        link.clone(),
+                        format!("preserved skill directory {}: {error:#}", link.display()),
+                    )),
+                }
+            }
+        }
+    }
+    Ok(migration)
+}
+
+fn retired_discovery_outcomes(
+    targets: &[SkillTarget],
+    manifest: &crate::skill_manifest::ManifestState,
+    links: &[SymlinkChange],
+    dry_run: bool,
+) -> Result<(Vec<SkillWriteOutcome>, Vec<PathBuf>)> {
+    let mut outcomes = Vec::new();
+    let mut directories = Vec::new();
+    for target in targets {
+        let retired = plan_retire_discovery_entries(target, manifest)?;
+        for root in retired.retired_roots {
+            let mut legacy = target.clone();
+            legacy.root = root.clone();
+            directories.extend(managed_skill_directories(&legacy));
+            outcomes.push(SkillWriteOutcome {
+                label: target.label.to_string(),
+                root: root.display().to_string(),
+                action: if dry_run {
+                    "would remove retired discovery copy"
+                } else {
+                    "removed retired discovery copy"
+                }
+                .to_string(),
+                problem: None,
+                changed: !dry_run,
+            });
+        }
+        for (root, problem) in retired.notices {
+            outcomes.push(SkillWriteOutcome {
+                label: target.label.to_string(),
+                root: root.display().to_string(),
+                action: "preserved retired discovery entry".to_string(),
+                problem: Some(problem),
+                changed: false,
+            });
+        }
+        for link in links.iter().filter(|change| {
+            change.after == SymlinkImage::Absent
+                && target.retired_discovery_links.contains(&change.path)
+        }) {
+            outcomes.push(SkillWriteOutcome {
+                label: target.label.to_string(),
+                root: link.path.display().to_string(),
+                action: if dry_run {
+                    "would remove retired discovery link"
+                } else {
+                    "removed retired discovery link"
+                }
+                .to_string(),
+                problem: None,
+                changed: !dry_run,
+            });
+        }
+    }
+    Ok((outcomes, directories))
 }
 
 /// Replace an older copied harness package only when it is provably untouched.
@@ -2819,12 +3076,22 @@ fn plan_historical_skill_split(
 fn plan_forget_skill_manifest(
     manifest_path: &Path,
     skill_targets: &[SkillTarget],
+    released_targets: &[SkillTarget],
 ) -> Result<Vec<PlannedFileMutation>> {
     let Some(original) = read_optional_utf8_regular_file(manifest_path)? else {
         return Ok(Vec::new());
     };
     let state = crate::skill_manifest::load_manifest(manifest_path)?;
     let mut manifest = state.writable_manifest(manifest_path)?;
+    for installation in &mut manifest.installations {
+        for target in released_targets {
+            if installation.root.to_path_buf()? == target.root {
+                installation
+                    .discovery_clients
+                    .retain(|client| !target.discovery_clients.contains(client));
+            }
+        }
+    }
     for target in skill_targets {
         manifest.forget(&target.root);
     }
@@ -2897,6 +3164,7 @@ fn preflight_uninstall(
     targets: &[Target],
     instruction_targets: &[InstructionTarget],
     skill_targets: &[SkillTarget],
+    released_targets: &[SkillTarget],
     manifest_path: Option<&Path>,
     force_full_cleanup: bool,
 ) -> Result<UninstallPlan> {
@@ -2936,8 +3204,12 @@ fn preflight_uninstall(
             .filter(|(_, preserved)| preserved.is_empty())
             .map(|(target, _)| target.clone())
             .collect();
-        if !removed.is_empty() {
-            mutations.extend(plan_forget_skill_manifest(path, &removed)?);
+        if !removed.is_empty() || !released_targets.is_empty() {
+            mutations.extend(plan_forget_skill_manifest(
+                path,
+                &removed,
+                released_targets,
+            )?);
         }
     }
     Ok(UninstallPlan {
@@ -3102,6 +3374,10 @@ pub(crate) fn write_owned_skills(
         targets.extend(custom_skill_targets(&recorded_roots)?);
     } else {
         targets.extend(custom_skill_targets(explicit_roots)?);
+    }
+    // Updating package bytes must not claim a newly detected harness as an installed user.
+    for target in &mut targets {
+        target.discovery_clients.clear();
     }
     dedupe_skill_targets(&mut targets)?;
 
@@ -3289,11 +3565,19 @@ fn refresh_integrations_for_version(
     // back. `aise integrations install` restores it on request.
     roots.retain(|root| root.is_dir());
     let outcome = (|| {
-        let skills = if roots.is_empty() {
+        let mut skills = match layout {
+            Some(layout) => refresh_gemini_skill_discovery(receipt_path, layout)?,
+            None => Vec::new(),
+        };
+        // Migration may retire recorded copies and add the canonical package.
+        roots =
+            manifest_recorded_skill_roots(&crate::skill_manifest::load_manifest(&manifest_path)?)?;
+        roots.retain(|root| root.is_dir());
+        skills.extend(if roots.is_empty() {
             Vec::new()
         } else {
             write_owned_skills(&roots, receipt_path, false, false)?
-        };
+        });
         let (instructions, mcp) = match layout {
             Some(layout) => {
                 // Register newly supported MCP before replacing the old CLI-only ownership proof.
@@ -3330,6 +3614,66 @@ fn refresh_integrations_for_version(
         instructions,
         mcp,
     })
+}
+
+/// Only an owned legacy Gemini entry authorizes moving discovery during an upgrade.
+fn refresh_gemini_skill_discovery(
+    receipt: &Path,
+    layout: &ClientLayout,
+) -> Result<Vec<SkillWriteOutcome>> {
+    let manifest_path = crate::skill_manifest::manifest_path(receipt);
+    let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
+    let mut targets = skill_targets_for_layout(McpClient::Gemini, layout);
+    rebase_automatic_skill_roots(&mut targets, receipt);
+    let mut outcomes = Vec::new();
+    for target in targets {
+        let retired = plan_retire_discovery_entries(&target, &manifest)?;
+        let owned_link = target
+            .retired_discovery_links
+            .iter()
+            .any(|link| fs::read_link(link).is_ok_and(|destination| destination == target.root));
+        if owned_link && !target.root.is_dir() && retired.retired_roots.is_empty() {
+            outcomes.push(SkillWriteOutcome {
+                label: target.label.to_string(),
+                root: target.retired_discovery_links[0].display().to_string(),
+                action: "preserved retired discovery link".to_string(),
+                problem: Some(format!(
+                    "canonical package {} is missing; upgrade will not reinstall a deleted skill",
+                    target.root.display()
+                )),
+                changed: false,
+            });
+            continue;
+        }
+        if !owned_link && retired.retired_roots.is_empty() {
+            outcomes.extend(retired_discovery_outcomes(&[target], &manifest, &[], false)?.0);
+            continue;
+        }
+        let targets = [target];
+        let mutations =
+            preflight_install(&[], &[], &targets, Path::new("aise"), Some(&manifest_path))?;
+        let links = plan_install_skill_discovery_links(&targets)?;
+        let (retired_outcomes, directories) =
+            retired_discovery_outcomes(&targets, &manifest, &links, false)?;
+        execute_planned_transaction_with_links(receipt, &mutations, &links, |_, change| {
+            publish_install_skill_discovery_link(change, &targets)
+        })?;
+        prune_emptied_skill_directories(&directories);
+        outcomes.extend(retired_outcomes);
+        for change in links
+            .iter()
+            .filter(|change| change.after != SymlinkImage::Absent)
+        {
+            outcomes.push(SkillWriteOutcome {
+                label: "app".to_string(),
+                root: change.path.display().to_string(),
+                action: "linked skill discovery entry".to_string(),
+                problem: None,
+                changed: true,
+            });
+        }
+    }
+    Ok(outcomes)
 }
 
 /// Move every aise MCP entry an earlier release wrote where its client no longer reads it: a
@@ -3814,6 +4158,8 @@ fn prune_retired_skill_directories(roots: &[PathBuf]) {
             root: root.clone(),
             package: &RETIRED_SKILL_PACKAGE,
             discovery_links: Vec::new(),
+            retired_discovery_links: Vec::new(),
+            discovery_clients: Vec::new(),
             detect_paths: Vec::new(),
             detect_binaries: Vec::new(),
         };
@@ -8609,6 +8955,7 @@ mod tests {
             &[],
             &[],
             std::slice::from_ref(&claude),
+            &[],
             Some(&manifest_path),
             false,
         )
@@ -8629,6 +8976,7 @@ mod tests {
             &[],
             &[],
             std::slice::from_ref(&codex),
+            &[],
             Some(&manifest_path),
             false,
         )
@@ -8766,7 +9114,7 @@ mod tests {
         );
         assert_eq!(
             gemini[0].discovery_links[0],
-            PathBuf::from("/home/test/.gemini/skills/ai-session-search")
+            PathBuf::from("/home/test/.agents/skills/ai-session-search")
         );
         assert_eq!(
             antigravity[0].discovery_links[0],
@@ -8786,6 +9134,411 @@ mod tests {
             PathBuf::from("/home/test/.prime/agent/skills/ai-session-search")
         );
         assert!(skill_targets_for_layout(McpClient::Opencode, &layout).is_empty());
+    }
+
+    #[cfg(unix)]
+    fn install_test_skills(targets: &[SkillTarget], receipt: &Path) -> Vec<SymlinkChange> {
+        let manifest = crate::skill_manifest::manifest_path(receipt);
+        let mutations =
+            preflight_install(&[], &[], targets, Path::new("aise"), Some(&manifest)).unwrap();
+        let links = plan_install_skill_discovery_links(targets).unwrap();
+        let (_, directories) = retired_discovery_outcomes(
+            targets,
+            &crate::skill_manifest::load_manifest(&manifest).unwrap(),
+            &links,
+            false,
+        )
+        .unwrap();
+        execute_planned_transaction_with_links(receipt, &mutations, &links, |_, change| {
+            publish_install_skill_discovery_link(change, targets)
+        })
+        .unwrap();
+        prune_emptied_skill_directories(&directories);
+        links
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_install_retires_owned_copy_but_preserves_and_reports_foreign_or_modified_entries() {
+        for kind in [
+            "copy",
+            "edited-copy",
+            "extra-file",
+            "foreign-copy",
+            "foreign-link",
+        ] {
+            let dir = tempdir().unwrap();
+            let layout = ClientLayout::new(
+                dir.path().join("home"),
+                dir.path().join("config"),
+                ClientPlatform::Linux,
+            );
+            let targets = skill_targets_for_layout(McpClient::Gemini, &layout);
+            let receipt = layout.home.join(".ai-session-search/transaction.json");
+            let old = layout
+                .home
+                .join(GEMINI_RETIRED_SKILLS_PATH)
+                .join(AI_SESSION_SEARCH_SKILL_NAME);
+            let mut legacy = skill_target("legacy", old.clone(), vec![], vec![]);
+            legacy.retired_discovery_links.clear();
+            if kind == "foreign-link" {
+                fs::create_dir_all(old.parent().unwrap()).unwrap();
+                create_directory_symlink(&dir.path().join("foreign"), &old).unwrap();
+            } else if kind == "foreign-copy" {
+                fs::create_dir_all(&old).unwrap();
+                fs::write(old.join("SKILL.md"), "my skill").unwrap();
+            } else {
+                install_test_skills(&[legacy], &receipt);
+                if kind == "edited-copy" {
+                    fs::write(old.join("SKILL.md"), "my skill").unwrap();
+                }
+                if kind == "extra-file" {
+                    fs::write(old.join("custom.txt"), "my file").unwrap();
+                }
+            }
+            let manifest = crate::skill_manifest::load_manifest(
+                &crate::skill_manifest::manifest_path(&receipt),
+            )
+            .unwrap();
+            let links = plan_install_skill_discovery_links(&targets).unwrap();
+            let (outcomes, _) =
+                retired_discovery_outcomes(&targets, &manifest, &links, true).unwrap();
+            assert!(
+                fs::symlink_metadata(&old).is_ok(),
+                "dry-run preserves {kind}"
+            );
+            if kind == "copy" {
+                assert!(outcomes
+                    .iter()
+                    .any(|outcome| outcome.action == "would remove retired discovery copy"));
+            } else {
+                assert!(
+                    outcomes.iter().any(|outcome| outcome.problem.is_some()),
+                    "{kind}: {outcomes:?}"
+                );
+            }
+            install_test_skills(&targets, &receipt);
+            assert_eq!(fs::symlink_metadata(&old).is_ok(), kind != "copy", "{kind}");
+            assert!(
+                status_skill_discovery_link(
+                    &layout
+                        .home
+                        .join(SHARED_SKILLS_PATH)
+                        .join(AI_SESSION_SEARCH_SKILL_NAME),
+                    &targets[0].root
+                )
+                .unwrap()
+                .1
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_install_uses_one_shared_discovery_link_and_reports_current() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let targets = skill_targets_for_layout(McpClient::Gemini, &layout);
+        let receipt = layout.home.join(".ai-session-search/transaction.json");
+        install_test_skills(&targets, &receipt);
+        let shared = layout.home.join(".agents/skills/ai-session-search");
+        assert_eq!(targets[0].discovery_links, vec![shared.clone()]);
+        assert!(
+            status_skill_discovery_link(&shared, &targets[0].root)
+                .unwrap()
+                .1
+        );
+        let manifest =
+            crate::skill_manifest::load_manifest(&crate::skill_manifest::manifest_path(&receipt))
+                .unwrap();
+        assert_eq!(
+            status_skill_file(&targets[0], &manifest).unwrap(),
+            "configured"
+        );
+        assert!(!layout
+            .home
+            .join(".gemini/skills/ai-session-search")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_install_retires_owned_legacy_link_and_dry_run_plans_both_paths() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let targets = skill_targets_for_layout(McpClient::Gemini, &layout);
+        let receipt = layout.home.join(".ai-session-search/transaction.json");
+        let old = layout.home.join(".gemini/skills/ai-session-search");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        create_directory_symlink(&targets[0].root, &old).unwrap();
+        let planned = plan_install_skill_discovery_links(&targets).unwrap();
+        assert!(planned
+            .iter()
+            .any(|change| change.path == old && change.after == SymlinkImage::Absent));
+        assert!(planned
+            .iter()
+            .any(|change| change.path == layout.home.join(".agents/skills/ai-session-search")));
+        assert!(
+            fs::symlink_metadata(&old).is_ok(),
+            "planning must not mutate the old link"
+        );
+        install_test_skills(&targets, &receipt);
+        assert!(fs::symlink_metadata(old).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_upgrade_retires_owned_link_or_copy_and_keeps_modified_entries() {
+        for kind in ["link", "copy", "edited-copy", "foreign-link"] {
+            let dir = tempdir().unwrap();
+            let layout = ClientLayout::new(
+                dir.path().join("home"),
+                dir.path().join("config"),
+                ClientPlatform::Linux,
+            );
+            let target = skill_targets_for_layout(McpClient::Gemini, &layout).remove(0);
+            let receipt = layout.home.join(".ai-session-search/transaction.json");
+            let old = layout.home.join(".gemini/skills/ai-session-search");
+            let mut legacy = target.clone();
+            legacy.discovery_links.clear();
+            legacy.retired_discovery_links.clear();
+            legacy.discovery_clients.clear();
+            if kind.contains("copy") {
+                legacy.root = old.clone();
+            }
+            install_test_skills(&[legacy], &receipt);
+            if kind == "link" || kind == "foreign-link" {
+                fs::create_dir_all(old.parent().unwrap()).unwrap();
+                let destination = if kind == "link" {
+                    target.root.clone()
+                } else {
+                    dir.path().join("foreign")
+                };
+                create_directory_symlink(&destination, &old).unwrap();
+            }
+            if kind == "edited-copy" {
+                fs::write(old.join("SKILL.md"), "my skill").unwrap();
+            }
+            let UpgradeRefresh::Checked { skills, .. } =
+                refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap()
+            else {
+                panic!("refresh must run");
+            };
+            if kind == "link" || kind == "copy" {
+                assert!(fs::symlink_metadata(&old).is_err(), "{kind}");
+                assert!(
+                    status_skill_discovery_link(
+                        &layout.home.join(".agents/skills/ai-session-search"),
+                        &target.root
+                    )
+                    .unwrap()
+                    .1,
+                    "{kind}"
+                );
+            } else {
+                assert!(fs::symlink_metadata(&old).is_ok(), "{kind}");
+                assert!(
+                    skills
+                        .iter()
+                        .any(|outcome| outcome.root == old.display().to_string()
+                            && outcome.problem.is_some()),
+                    "preservation must be reported: {skills:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_shared_link_survives_partial_uninstall_and_last_user_removes_it() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let receipt = layout.home.join(".ai-session-search/transaction.json");
+        let gemini = skill_targets_for_layout(McpClient::Gemini, &layout);
+        let codex = skill_targets_for_layout(McpClient::Codex, &layout);
+        install_test_skills(&codex, &receipt);
+        install_test_skills(&gemini, &receipt);
+        let manifest_path = crate::skill_manifest::manifest_path(&receipt);
+        let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        let partial = prepare_skill_discovery_uninstall(&gemini, &layout, &manifest).unwrap();
+        assert!(partial.links_to_remove.is_empty());
+        assert!(partial.file_targets.is_empty());
+        let plan = preflight_uninstall(
+            &[],
+            &[],
+            &partial.file_targets,
+            &gemini,
+            Some(&manifest_path),
+            false,
+        )
+        .unwrap();
+        execute_planned_transaction(&receipt, &plan.mutations).unwrap();
+        let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert_eq!(
+            manifest
+                .installation(&codex[0].root)
+                .unwrap()
+                .discovery_clients,
+            vec!["codex"]
+        );
+        let last_codex = prepare_skill_discovery_uninstall(&codex, &layout, &manifest).unwrap();
+        assert_eq!(last_codex.links_to_remove.len(), 1);
+        let plan = preflight_uninstall(
+            &[],
+            &[],
+            &last_codex.file_targets,
+            &codex,
+            Some(&manifest_path),
+            false,
+        )
+        .unwrap();
+        let links = last_codex
+            .links_to_remove
+            .into_iter()
+            .map(|(path, expected)| SymlinkChange::remove(path, expected))
+            .collect::<Vec<_>>();
+        execute_planned_transaction_with_links(&receipt, &plan.mutations, &links, |_, change| {
+            publish_symlink_change(change)
+        })
+        .unwrap();
+        assert!(fs::symlink_metadata(&codex[0].discovery_links[0]).is_err());
+        assert!(!codex[0].anchor().exists());
+        // Reinstall Gemini to exercise removing both selectors in one transaction too.
+        install_test_skills(&codex, &receipt);
+        install_test_skills(&gemini, &receipt);
+        let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        let mut both = gemini;
+        both.extend(codex);
+        dedupe_skill_targets(&mut both).unwrap();
+        let last = prepare_skill_discovery_uninstall(&both, &layout, &manifest).unwrap();
+        assert_eq!(last.links_to_remove.len(), 1);
+        let plan = preflight_uninstall(
+            &[],
+            &[],
+            &last.file_targets,
+            &both,
+            Some(&manifest_path),
+            false,
+        )
+        .unwrap();
+        let links = last
+            .links_to_remove
+            .into_iter()
+            .map(|(path, expected)| SymlinkChange::remove(path, expected))
+            .collect::<Vec<_>>();
+        execute_planned_transaction_with_links(&receipt, &plan.mutations, &links, |_, change| {
+            publish_symlink_change(change)
+        })
+        .unwrap();
+        assert!(!layout
+            .home
+            .join(".agents/skills/ai-session-search")
+            .exists());
+        assert!(!both[0].anchor().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_upgrade_does_not_reinstall_a_deleted_canonical_skill() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let receipt = layout.home.join(".ai-session-search/transaction.json");
+        let target = skill_targets_for_layout(McpClient::Gemini, &layout).remove(0);
+        let old = &target.retired_discovery_links[0];
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        create_directory_symlink(&target.root, old).unwrap();
+        let mut manifest = crate::skill_manifest::SkillInstallManifest::default();
+        manifest.record(&target.root, &[]);
+        let path = crate::skill_manifest::manifest_path(&receipt);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, manifest.to_json().unwrap()).unwrap();
+        refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap();
+        assert!(!target.root.exists());
+        assert!(fs::symlink_metadata(old).is_ok());
+        assert!(fs::symlink_metadata(&target.discovery_links[0]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_package_refresh_preserves_shared_users_without_claiming_new_ones() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let receipt = layout.home.join(".ai-session-search/transaction.json");
+        let targets = skill_targets_for_layout(McpClient::Gemini, &layout);
+        install_test_skills(&targets, &receipt);
+        write_owned_skills(&[targets[0].root.clone()], &receipt, false, false).unwrap();
+        let manifest =
+            crate::skill_manifest::load_manifest(&crate::skill_manifest::manifest_path(&receipt))
+                .unwrap();
+        assert_eq!(
+            manifest
+                .installation(&targets[0].root)
+                .unwrap()
+                .discovery_clients,
+            vec!["gemini"]
+        );
+        let removal = prepare_skill_discovery_uninstall(&targets, &layout, &manifest).unwrap();
+        assert_eq!(removal.links_to_remove.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_migration_retains_codex_from_a_manifest_without_client_records() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Linux,
+        );
+        let receipt = layout.home.join(".ai-session-search/transaction.json");
+        let targets = skill_targets_for_layout(McpClient::Gemini, &layout);
+        let mut legacy = targets[0].clone();
+        legacy.discovery_links.clear();
+        legacy.retired_discovery_links.clear();
+        legacy.discovery_clients.clear();
+        install_test_skills(&[legacy], &receipt);
+        for link in targets[0]
+            .discovery_links
+            .iter()
+            .chain(&targets[0].retired_discovery_links)
+        {
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            create_directory_symlink(&targets[0].root, link).unwrap();
+        }
+        refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap();
+        let manifest =
+            crate::skill_manifest::load_manifest(&crate::skill_manifest::manifest_path(&receipt))
+                .unwrap();
+        assert_eq!(
+            manifest
+                .installation(&targets[0].root)
+                .unwrap()
+                .discovery_clients,
+            vec!["codex", "gemini"]
+        );
+        let removal = prepare_skill_discovery_uninstall(&targets, &layout, &manifest).unwrap();
+        assert!(removal.links_to_remove.is_empty());
+        assert!(removal.file_targets.is_empty());
     }
 
     #[test]
@@ -8890,7 +9643,7 @@ mod tests {
         for target in targets {
             assert_eq!(
                 target.discovery_links.len(),
-                7,
+                6,
                 "{} must remain discoverable from all selected harnesses",
                 target.package.name
             );
@@ -9659,7 +10412,7 @@ mod tests {
             test_target(second.clone(), ConfigFormat::JsonMcpServers),
         ];
 
-        let error = preflight_uninstall(&targets, &[], &[], None, false).unwrap_err();
+        let error = preflight_uninstall(&targets, &[], &[], &[], None, false).unwrap_err();
 
         assert!(error.to_string().contains("must contain a JSON object"));
         assert_eq!(fs::read_to_string(first).unwrap(), first_original);
