@@ -248,7 +248,6 @@ struct CargoInstallRecord {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NativeArchiveReceipt {
     schema_version: u32,
     package: String,
@@ -1699,6 +1698,31 @@ mod tests {
             panic!("native archives must not be overwritten without a verified download")
         };
         assert!(message.contains("verify") && message.contains("--replace"));
+    }
+
+    #[test]
+    fn format_native_receipt_accepts_additive_metadata_but_rejects_incompatible_ownership() {
+        let dir = TempDir::new().unwrap();
+        let executable = dir.path().join("aise");
+        write_executable(&executable);
+        let digest = crate::hashing::sha256(&fs::read(&executable).unwrap());
+        let receipt = dir.path().join("aise-native-install.json");
+        let mut value = serde_json::json!({"schema_version":1,"package":"ai-session-search",
+            "archive_version":"1.0.1","target":"fixture","executable_sha256":digest,
+            "metadata":{"future_hint":"retained owner evidence"}});
+        fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(native_archive_receipt(&executable).is_some());
+        value["schema_version"] = serde_json::json!(2);
+        fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(native_archive_receipt(&executable).is_none());
+        value["schema_version"] = serde_json::json!(1);
+        value["package"] = serde_json::json!("different-owner");
+        fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(native_archive_receipt(&executable).is_none());
+        value["package"] = serde_json::json!("ai-session-search");
+        value["executable_sha256"] = serde_json::json!("0".repeat(64));
+        fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(native_archive_receipt(&executable).is_none());
     }
 
     #[test]

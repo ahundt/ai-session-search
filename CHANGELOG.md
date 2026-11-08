@@ -31,6 +31,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    existing precedence.
 5. `aise integrations install --no-index-preparation` installs integrations without starting
    background indexing. Omission keeps the existing preparation behavior.
+6. `aise config check` validates settings without opening the index and exits nonzero on unknown
+   keys. Doctor and JSON index status list ignored ordinary keys with spelling suggestions.
+7. Migration receipts carry `format_version=1`; receipts without a version remain readable.
+   Unsupported formats refuse before recovery changes any artifact, and supported rewrites preserve
+   additive fields.
+8. Skill manifests preserve additive fields at every level. A 1.0.0 reader still rejects unknown
+   top-level fields and drops unknown nested fields on rewrite; 1.0.1 cannot recover discarded fields.
+9. Background refresh reports stay readable when an optional failure kind is unfamiliar; an unknown
+   refresh state stays explicitly unrecognized.
+10. Native-archive ownership checks tolerate additive receipt metadata while continuing to require
+   the supported schema, package identity, and executable hash.
 
 ### Changed
 
@@ -58,13 +69,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    (`2 weeks`) forms; `3 days ago` still selects that whole day. EDTF open intervals
    (`2026-01/..`, `../2026-03`) select everything after or before a date, and a space may
    separate date and time (`2026-01-15 14:30`), as RFC 3339 allows.
-
-4. `aise config check` validates settings without opening the index and exits nonzero on unknown
-   keys. Doctor and JSON index status list ignored ordinary keys with spelling suggestions.
-
-### Changed
-
-1. Index generation 6 protects archived messages and file edits from older writers. Healthy
+5. Index generation 6 protects archived messages and file edits from older writers. Healthy
    generation-5 indexes receive a metadata-only promotion; it does not reread transcripts or rebuild
    FTS indexes. Stop running aise processes (restart harnesses) before upgrading an index used by
    1.0.0: an already-open old writer can still erase retained history. New 1.0.0 data opens refuse

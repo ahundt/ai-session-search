@@ -482,6 +482,18 @@ A skill directory is removable only when every owned byte matches the recorded m
 was changed or an unknown file exists, preserve the entire directory and report why. Force cleanup
 requires one exact skill root and explicit destructive intent.
 
+Supported durable formats preserve additive unknown metadata on rewrite. Skill manifests retain
+unknown fields at the root, installation, and file-record levels; `schema_version` gates changes to
+ownership meaning. Migration receipts write `format_version=1`, accept an absent version as the
+existing format, and reject unsupported versions before publishing or removing recovery artifacts.
+Native install receipts may ignore additive metadata but still require the supported schema,
+package identity, target/version evidence, and executable hash; unknown metadata grants no authority.
+
+The immutable 1.0.0 skill-manifest reader rejects unknown top-level keys and silently drops unknown
+nested keys on rewrite. A 1.0.1 reader cannot restore fields an older writer already discarded.
+Background status is weaker evidence: unknown optional failure details become unclassified, while
+an unknown refresh state remains unknown and must never be reported as successful.
+
 ### REQ019-verify-each-harness
 
 Treat these as separate verification layers:
