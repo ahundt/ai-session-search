@@ -480,11 +480,11 @@ At [62bab5b, also main when checked](https://github.com/google-gemini/gemini-cli
 Gemini reads both roots and [compares literal locations](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillManager.ts#L124-L148);
 the [loader retains the alias path](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/skills/skillLoader.ts#L154-L212).
 Installing links in both roots therefore warns even when their targets match. Share Codex's
-link, record its installed harness users in the skill manifest, and release it only with the
-last user. Install and upgrade refresh retire only provably owned legacy links or untouched
-copies, preserving and reporting edited or foreign entries. No Gemini minimum was previously
-specified; automatic skill discovery now requires v0.28.0+, while older Gemini retains MCP
-and managed instructions.
+link when their resolved paths match, record its installed harness users in the skill manifest,
+and release it only with the last user. Install and upgrade refresh retire only provably owned
+legacy links or untouched copies, preserving and reporting edited or foreign entries. No Gemini
+minimum was previously specified; automatic skill discovery now requires v0.28.0+, while older
+Gemini retains MCP and managed instructions.
 
 Pi and Prime Agent also discover `~/.agents/skills`, but each explicit selector installs one link in
 its harness-native root. This avoids coupling their installation to Codex detection and keeps

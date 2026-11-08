@@ -244,7 +244,7 @@ destinations. Canonical skills and the Codex marketplace remain beside the selec
 | --- | --- | --- |
 | `CLAUDE_CONFIG_DIR=D` | Claude Code instructions and skills under `D`; MCP at `D/.claude.json`, with the cleanup-only superseded `D/.mcp.json`. Unset MCP remains `~/.claude.json`. Claude Desktop is independent. | [Claude directory](https://code.claude.com/docs/en/claude-directory) |
 | `CODEX_HOME=D` | Codex `D/config.toml` and `D/AGENTS.md`; skills remain `~/.agents/skills`. | [Codex home resolver, lines 13-25](https://github.com/openai/codex/blob/d960b366941bf062adb4d43111e81b64507e8879/codex-rs/utils/home-dir/src/lib.rs#L13-L25), [skill discovery](https://learn.chatgpt.com/docs/build-skills) |
-| `GEMINI_CLI_HOME=D` | Gemini MCP and instructions use `D/.gemini`; aise keeps its shared skill link at `~/.agents/skills`. Antigravity is independent. | [Home helper, lines 20-26](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/utils/paths.ts#L20-L26), [storage, lines 50-56](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L50-L56) |
+| `GEMINI_CLI_HOME=D` | Gemini MCP, instructions, and retired skill cleanup use `D/.gemini`; skill discovery uses `D/.agents/skills`. Antigravity is independent. | [Home helper, lines 20-28](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/utils/paths.ts#L20-L28), [storage, lines 54-69](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L54-L69) |
 | `PI_CODING_AGENT_DIR=D` | Pi uses tilde-expanded `D` directly for `mcp.json`, `AGENTS.md`, and `skills/`. | [Pi config, lines 629-636](https://github.com/earendil-works/pi/blob/c23b9ec1ef12a63573d739d4c294f81a377b7d57/packages/coding-agent/src/config.ts#L629-L636) |
 | `PRIME_AGENT_CODING_AGENT_DIR=D` | Prime uses tilde-expanded `D` directly for `settings.json`, `AGENTS.md`, and `skills/`. No Pi-variable fallback is applied to host discovery. | [Prime runtime, lines 56-66](https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/prime-agent-runtime/src/rlm/mcp_base.py#L56-L66) |
 | `XDG_CONFIG_HOME=D` | OpenCode `D/opencode` and Kilo CLI `D/kilo` on every platform; fallback is `~/.config`, including macOS. Kilo extension storage is independent. | [xdg-basedir, lines 9-10](https://github.com/sindresorhus/xdg-basedir/blob/4c068bce91132119b8590627ee51b70790551b80/index.js#L9-L10), [OpenCode pinned implementation](https://github.com/anomalyco/opencode/blob/70881b2937fab1e425416659445875952730934a/packages/opencode/src/global/index.ts#L9), [Kilo storage](https://github.com/Kilo-Org/kilocode/blob/b6a49d01c10d7e26c42a8a14b3441b7a1856c04c/packages/kilo-jetbrains/README.md#dev-storage-isolation) |
@@ -258,12 +258,11 @@ working directory. Prime's upstream evidence covers runtime config access; host 
 has not been independently verified. OpenCode's cited implementation is pinned, and Kilo's root
 is documented upstream; these references do not establish conformance for every installed version.
 
-Aise keeps Gemini's shared skill link beside Codex's under the actual home directory, even when
-`GEMINI_CLI_HOME` is set. This is an aise policy: the pinned Gemini
-[agents-root resolver](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/config/storage.ts#L63-L69)
-uses its [environment-aware home helper](https://github.com/google-gemini/gemini-cli/blob/62bab5b232c15b925d31e655ce844ab939c882b7/packages/core/src/utils/paths.ts#L23-L29),
-so that upstream build reads `D/.agents/skills`. Set Gemini's `skill_discovery_roots`
-to the actual path of that relocated `.agents/skills` directory.
+With `GEMINI_CLI_HOME` unset, Gemini uses the real home. Codex and Gemini share one discovery
+link when their resolved paths match; `discovery_clients` records both installed harnesses.
+Different paths get separate links, and uninstalling either harness preserves the other's link
+and canonical package. `skill_discovery_roots` in `[integrations.paths.gemini]` replaces Gemini's
+automatic discovery roots.
 
 Persistent endpoint overrides are optional, with these concrete surface names and accepted fields:
 
