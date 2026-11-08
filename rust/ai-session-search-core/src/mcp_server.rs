@@ -3835,7 +3835,7 @@ fn message_search_tool_description(config: &Config, input_schema: &Value) -> Str
          field_view/match_view; views use Unicode scalars and preserve \
          matches, order, count, context and includes.\n",
     );
-    text.push_str("human matches original human regions, including mixed tool answers; omit role for all roles. Views/context can contain nonhuman text. Queue submission does not prove delivery.\n");
+    text.push_str("content_authorship=human matches original human regions across roles; omit role for tool answers. Views/context may contain nonhuman text. Queue submission does not prove delivery.\n");
     text.push_str(&omitted_values_sentence(input_schema));
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {

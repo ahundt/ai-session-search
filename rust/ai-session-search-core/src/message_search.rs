@@ -1220,7 +1220,7 @@ impl MessageSearchParameterRegistry {
         };
         let parameters = vec![
             parameter(MessageSearchParameter::ContentAuthorship,
-                "Allowed content authorship.",
+                "Content regions to match: any searches complete content; human searches original human regions across storage roles.",
                 enum_domain(serialized_variants::<ContentAuthorshipSelection>()), MessageSearchOmission::TypedDefault),
             parameter(
                 MessageSearchParameter::Query,
@@ -1230,19 +1230,19 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::QueryMode,
-                "Matching mode.",
+                "How query is matched.",
                 enum_domain(serialized_variants::<MessageSearchMode>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Field,
-                "Match field.",
+                "Which field to match.",
                 enum_domain(serialized_variants::<SearchField>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::ArgumentPath,
-                "Tool-args RFC 6901 pointer; field=tool_argument.",
+                "RFC 6901 pointer into tool arguments; needs field=tool_argument",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
@@ -1254,7 +1254,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::Kinds,
-                "Message classes.",
+                "Message classes to return.",
                 set_domain(serialized_variants::<MessageKind>()),
                 MessageSearchOmission::TypedDefault,
             ),
@@ -1271,19 +1271,19 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::SessionId,
-                "Session ID/prefix.",
+                "One session by ID or prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::WorkspacePathPrefix,
-                "cwd/repo-root prefix.",
+                "Match cwd or repo-root prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::TranscriptPathPrefix,
-                "Transcript-path prefix.",
+                "Match transcript-path prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
@@ -1325,7 +1325,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::ToolNameContains,
-                "Tool name substring.",
+                "Substring in the tool name.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
@@ -1367,7 +1367,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::FieldView,
-                "Field character budget.",
+                "Character budget for the field.",
                 MessageSearchParameterDomain::FieldView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1387,7 +1387,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::MatchView,
-                "Match character budget.",
+                "Character budget around the match.",
                 MessageSearchParameterDomain::MatchView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -3558,19 +3558,28 @@ pub(crate) fn attach_match_evidence_cancellable(
                 let evidence = if message.provenance.is_some() {
                     let mut selected_evidence = None;
                     let mut best_score = None;
+                    let field_total_chars = selected.chars().count();
                     for (offset, region) in matching_content_regions(&message) {
-                        if let Some(mut evidence) = prepared.build(region, match_view) {
-                            let score = prepared.score(region);
-                            if selected_evidence.is_none() || score > best_score {
+                        check_active()?;
+                        if let Some((score, mut evidence)) = prepared.build(region, match_view) {
+                            if best_score.is_none_or(|best| score > best) {
                                 evidence.field_start_char += offset;
-                                evidence.field_total_chars = selected.chars().count();
+                                evidence.field_total_chars = field_total_chars;
                                 selected_evidence = Some(evidence);
-                                best_score = score;
+                                best_score = Some(score);
+                            }
+                            if !matches!(query, MessageQuery::Fuzzy(_)) {
+                                break;
                             }
                         }
                     }
                     selected_evidence
-                } else { prepared.build(&selected, match_view) }.ok_or_else(|| {
+                } else {
+                    prepared
+                        .build(&selected, match_view)
+                        .map(|(_, evidence)| evidence)
+                };
+                let evidence = evidence.ok_or_else(|| {
                     anyhow::anyhow!(
                         "message-search match evidence disagrees with {:?} membership for {} sequence {}",
                         target.field(),
@@ -3926,26 +3935,11 @@ impl PreparedMatchEvidence {
         })
     }
 
-    fn score(&mut self, selected: &str) -> Option<u32> {
-        match self {
-            Self::Fuzzy {
-                pattern,
-                matcher,
-                utf32_buf,
-                ..
-            } => {
-                utf32_buf.clear();
-                pattern.score(Utf32Str::new(selected, utf32_buf), matcher)
-            }
-            _ => None,
-        }
-    }
-
     fn build(
         &mut self,
         selected: &str,
         match_view: MatchViewBudget,
-    ) -> Option<MessageMatchEvidence> {
+    ) -> Option<(u32, MessageMatchEvidence)> {
         let field_total_chars = selected.chars().count();
         match self {
             Self::All => None,
@@ -3956,12 +3950,9 @@ impl PreparedMatchEvidence {
                     field_total_chars,
                     std::slice::from_ref(&range),
                 );
-                Some(character_evidence(
-                    selected,
-                    field_total_chars,
-                    maximum,
-                    vec![range],
-                    false,
+                Some((
+                    0,
+                    character_evidence(selected, field_total_chars, maximum, vec![range], false),
                 ))
             }
             Self::Regex(regex) => {
@@ -3975,11 +3966,9 @@ impl PreparedMatchEvidence {
                             max_chars.get().min(field_total_chars.max(1))
                         }
                     };
-                    Some(boundary_evidence(
-                        selected,
-                        field_total_chars,
-                        maximum,
-                        start,
+                    Some((
+                        0,
+                        boundary_evidence(selected, field_total_chars, maximum, start),
                     ))
                 } else {
                     let range = FieldCharRange {
@@ -3991,12 +3980,15 @@ impl PreparedMatchEvidence {
                         field_total_chars,
                         std::slice::from_ref(&range),
                     );
-                    Some(character_evidence(
-                        selected,
-                        field_total_chars,
-                        maximum,
-                        vec![range],
-                        false,
+                    Some((
+                        0,
+                        character_evidence(
+                            selected,
+                            field_total_chars,
+                            maximum,
+                            vec![range],
+                            false,
+                        ),
                     ))
                 }
             }
@@ -4009,7 +4001,7 @@ impl PreparedMatchEvidence {
                 utf32_buf.clear();
                 indices.clear();
                 let matcher_input = Utf32Str::new(selected, utf32_buf);
-                pattern.indices(matcher_input, matcher, indices)?;
+                let score = pattern.indices(matcher_input, matcher, indices)?;
                 let matcher_unit_ranges = scalar_ranges_by_matcher_unit(selected, matcher_input);
                 let ranges = indices
                     .iter()
@@ -4017,12 +4009,9 @@ impl PreparedMatchEvidence {
                     .collect::<Option<Vec<_>>>()?;
                 let ranges = coalesce_character_ranges(ranges);
                 let maximum = match_view_max_chars(match_view, field_total_chars, &ranges);
-                Some(character_evidence(
-                    selected,
-                    field_total_chars,
-                    maximum,
-                    ranges,
-                    true,
+                Some((
+                    score,
+                    character_evidence(selected, field_total_chars, maximum, ranges, true),
                 ))
             }
         }
@@ -4452,6 +4441,47 @@ mod tests {
             vec![message]
         )
         .is_err());
+    }
+
+    #[test]
+    fn human_fuzzy_evidence_selects_the_best_original_region() {
+        use crate::models::{
+            ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageContentPart,
+            MessageProvenance,
+        };
+        let mut message = hit("n-----d-----l|ndl");
+        message.provenance = Some(Box::new(MessageProvenance {
+            authorship: MessageAuthorship::Mixed,
+            content_parts: [(0, 13, true), (13, 14, false), (14, 17, true)]
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(ordinal, (start_char, end_char, human))| MessageContentPart {
+                        ordinal: ordinal as u32,
+                        start_char,
+                        end_char,
+                        authorship: if human {
+                            ContentPartAuthorship::Human
+                        } else {
+                            ContentPartAuthorship::Generated
+                        },
+                        origin: ContentPartOrigin::Unknown,
+                    },
+                )
+                .collect(),
+            ..Default::default()
+        }));
+        let hits = attach_match_evidence(
+            &MessageQuery::fuzzy("ndl").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message],
+        )
+        .unwrap();
+        let evidence = hits[0].match_evidence().unwrap();
+        assert_eq!(evidence.field_start_char, 14);
+        assert_eq!(evidence.view_text, "ndl");
+        assert_eq!(evidence.field_total_chars, 17);
     }
 
     #[test]

@@ -15,6 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
    and deletes nothing. See Fixed item 6.
+2. `messages search --content-authorship human` and the matching Rust, Python and MCP option
+   search original human regions across storage roles, including structured interactive answers.
+   The default `any` searches complete content. Omit the role filter to include human tool answers;
+   returned views and context can still contain generated text.
 
 ### Changed
 
@@ -80,9 +84,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    - a source that gets a new session id moves its rows to that id, skipping rows the id
      already holds. They used to be deleted with the old id.
 
-   A new parser version still replaces the session, because it may render the same message
-   differently. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
-   avoids took 1.65 s.
+   Parser upgrades also retain archive-only messages and file edits while repairing identifiable
+   source rows. A prior same-parser measurement on a 20,000-message session took 43 ms for the
+   kept reindex; the full replacement it avoided took 1.65 s.
 
 8. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout
    as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so it missed
@@ -91,6 +95,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    that cannot be decompressed is a warned parse failure for a session not yet indexed. For an
    indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
    `aise doctor`, and reads the file again on the next refresh.
+9. Claude queued submissions and structurally attributable `AskUserQuestion` answers are
+   searchable. Queued input remains marked submitted because the source does not prove delivery.
+   Independent same-text submissions survive source rewrites, and parser upgrades preserve
+   file-edit replay order.
 
 ### Performance
 

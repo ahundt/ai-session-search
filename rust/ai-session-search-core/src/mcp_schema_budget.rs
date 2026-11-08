@@ -581,10 +581,9 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    // Measured with `aise mcp schema-budget --ledger`: human-content selection adds one field;
-    // shorter shared descriptions retain their defaults and move role/view details to the tool
-    // description. 297 bytes remain below Codex's description-deletion cliff.
-    ("search_messages", 4_703, 10),
+    // Human-content selection and restored parameter prose measure 4,885 bytes after Codex
+    // normalization, leaving 115 bytes before it silently deletes every parameter description.
+    ("search_messages", 4_885, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
     // and `all_results` say "omit for" like every other property so the tool description's
     // omitted-values sentence can read them back. 279 bytes of headroom remain before Codex's
@@ -2248,31 +2247,20 @@ mod tests {
 
     #[test]
     fn warning_only_rows_start_after_the_inclusive_limit() {
-        let config = crate::config::Config::default();
         let margin = all_limits()
             .find(|limit| limit.name == "codex-input-schema-margin")
             .expect("Codex margin rule");
-        let mut tool = crate::mcp_server::advertised_tools(&config)
-            .as_array()
-            .expect("tools list")
-            .iter()
-            .find(|tool| tool["name"] == "search_messages")
-            .cloned()
-            .expect("search_messages tool");
-        let mut at_limit = None;
-        for _ in 0..=margin.budget {
-            let (measured, _) = measure(margin, &tool, margin.budget);
-            if measured == margin.budget {
-                at_limit = Some(tool.clone());
-                break;
-            }
-            let description = tool["inputSchema"]["properties"]["query"]["description"]
-                .as_str()
-                .expect("query description");
-            tool["inputSchema"]["properties"]["query"]["description"] =
-                json!(format!("{description}x"));
-        }
-        let at_limit = at_limit.expect("the margin rule should have a reachable exact boundary");
+        let mut at_limit = minimal_tool();
+        let (measured, _) = measure(margin, &at_limit, margin.budget);
+        let padding = margin
+            .budget
+            .checked_sub(measured)
+            .expect("fixture below margin");
+        let description = at_limit["inputSchema"]["properties"]["query"]["description"]
+            .as_str()
+            .expect("query description");
+        at_limit["inputSchema"]["properties"]["query"]["description"] =
+            json!(format!("{description}{}", "x".repeat(padding)));
         let exact = evaluate(
             std::slice::from_ref(&at_limit),
             &ClientLimitOverrides::new(),

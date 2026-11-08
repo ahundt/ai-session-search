@@ -169,7 +169,7 @@ Codex measures separately and never charges against the 5,000:
 `run_skill_capability`'s figure includes the restored parameter documentation described
 above; the streamlining alone had taken it to 4,191 before the discarded facts were
 put back. Those are the figures at the time of that fix; the current ones are pinned in
-`EMITTED_ARTIFACT_CEILINGS` (`search_messages` 4,703 after human-content selection and
+`EMITTED_ARTIFACT_CEILINGS` (`search_messages` 4,885 after human-content selection and
 `run_skill_capability` 4,721 after default-keyword removal, with the reason for each move
 recorded beside the entry) and
 re-measured by `aise mcp schema-budget` on every gate run.

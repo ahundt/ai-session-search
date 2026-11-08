@@ -152,6 +152,7 @@ impl ClaudeAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let source_kind = ClaudeSourceKind::from_path(path);
+        let source_path = normalize_path(path);
         let desktop = match source_kind {
             ClaudeSourceKind::CodeJsonl => ClaudeDesktopMetadata::default(),
             ClaudeSourceKind::DesktopLocalAgent => claude_desktop_metadata(path),
@@ -202,8 +203,6 @@ impl ClaudeAdapter {
         // tool_use_id -> tool name, so a later tool_result (which references the call by
         // id, not name) can be tagged with the tool it came from.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
-        // AskUserQuestion answers are recorded as tool results, but their structured answer
-        // values are human input. Keep the call identity so arbitrary tool output is not promoted.
         let mut queue_operation_counts: HashMap<String, usize> = HashMap::new();
         let mut queue_occurrences: HashMap<String, usize> = HashMap::new();
         let mut requires_full_parse_for_tail = false;
@@ -272,10 +271,8 @@ impl ClaudeAdapter {
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty());
 
-            // Claude Code records queued input as standalone lifecycle events. The enqueue is
-            // the source event; popAll/dequeue are delivery echoes and must not become duplicate
-            // messages. A missing provider id is intentional: repeated identical submissions are
-            // retained as separate rows rather than deduplicated by text.
+            // Only enqueue records a submission; other queue operations establish neither a
+            // new input nor a link proving delivery. Keep repeated submissions independently.
             if value.get("type").and_then(Value::as_str) == Some("queue-operation") {
                 requires_full_parse_for_tail = true;
                 let operation = value
@@ -325,7 +322,7 @@ impl ClaudeAdapter {
                                 raw_message = raw_message.with_correlation_identity(
                                     MessageCorrelationIdentity {
                                         authority: MessageCorrelationAuthority::SourceLocal,
-                                        scope: format!("claude_queue:{}", normalize_path(path)),
+                                        scope: format!("claude_queue:{source_path}"),
                                         id: format!("{identity_key}#{occurrence_id}"),
                                     },
                                 );
@@ -583,7 +580,7 @@ impl ClaudeAdapter {
         let mut raw_metadata = json!({
             "line_count": line_count,
             "valid_record_count": valid_record_count,
-            "session_path": normalize_path(path),
+            "session_path": source_path,
         });
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
@@ -659,7 +656,7 @@ impl ClaudeAdapter {
             updated_at,
             last_message_at: updated_at,
             preview_text: preview,
-            source_path: normalize_path(path),
+            source_path,
             message_count: Some(messages.len() as i64),
             parse_version: source_kind.parse_version().to_string(),
             raw_metadata_json,
@@ -1934,6 +1931,52 @@ mod tests {
     }
 
     #[test]
+    fn shortening_identical_queued_inputs_keeps_both_archived_submissions() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("queue-repeats.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-repeats","timestamp":"2026-06-16T20:58:02Z","content":"repeated queued input"}"#;
+        std::fs::write(&path, format!("{record}\n{record}\n")).unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        let initial = adapter.parse(&adapter.discover()[0]);
+        db.upsert_session(&initial, 1, 1).unwrap();
+        std::fs::write(&path, format!("{record}\n")).unwrap();
+        let shortened = adapter.parse(&adapter.discover()[0]);
+        assert!(shortened
+            .session
+            .parse_warning
+            .as_deref()
+            .unwrap()
+            .contains("structurally unresolved"));
+        // With no provider identity these identical events cannot be distinguished after a
+        // rewrite. The archive keeps both submissions without inventing a delivery outcome.
+        let filters = crate::models::MessageFilters {
+            content_authorship: crate::models::ContentAuthorshipSelection::Human,
+            ..Default::default()
+        };
+        for generation in [2, 3] {
+            db.upsert_session(&shortened, generation, generation)
+                .unwrap();
+            let hits = db
+                .search_messages("repeated queued input", &filters)
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            let provenance: Vec<_> = hits
+                .iter()
+                .map(|hit| hit.provenance.as_deref().unwrap())
+                .collect();
+            assert_ne!(
+                provenance[0].correlation_identity,
+                provenance[1].correlation_identity
+            );
+            assert!(provenance
+                .iter()
+                .all(|p| p.input_delivery_state
+                    == Some(crate::models::InputDeliveryState::Submitted)));
+        }
+    }
+
+    #[test]
     fn ask_user_answer_without_wrapper_is_whole_human() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("answer-session.jsonl");
@@ -2691,6 +2734,18 @@ mod tests {
             "claude-desktop-local-agent-v5"
         );
         assert_eq!(parsed.session.message_count, Some(4));
+        let metadata: serde_json::Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            metadata["session_path"],
+            crate::util::normalize_path(&session_dir.join("audit.jsonl"))
+        );
+        assert_eq!(
+            metadata["metadata_path"],
+            crate::util::normalize_path(
+                &parent.join("local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json")
+            )
+        );
         let event_ids: Vec<Option<&str>> = parsed
             .messages
             .iter()

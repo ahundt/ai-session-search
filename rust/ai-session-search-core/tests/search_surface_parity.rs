@@ -261,6 +261,7 @@ fn service_search(f: &Fixture, surface: SearchSurface, search: &Search) -> anyho
     let config = Config::default();
     let service = MessageService::new(&config, &db, surface);
     let query = match search.mode.as_str() {
+        _ if search.query.is_empty() => MessageQuery::All,
         "literal" => MessageQuery::literal(&search.query)?,
         "regex" => MessageQuery::regex(&search.query)?,
         "fuzzy" => MessageQuery::fuzzy(&search.query)?,

@@ -17,6 +17,7 @@
     "content_prefix": "bulk row"
   },
   "cases": [
+    {"name": "human queryless page excludes assistant copies", "mode": "literal", "query": "", "content_authorship": "human", "limit": 7, "expected": [[0, "user"], [1, "user"], [2, "user"], [3, "user"], [4, "user"], [5, "user"], [100, "user"]]},
     {"name": "human literal excludes assistant copies", "mode": "literal", "query": "twin needle", "content_authorship": "human", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
     {"name": "human regex excludes assistant copies", "mode": "regex", "query": "twin needle", "content_authorship": "human", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
     {"name": "human fuzzy excludes assistant copies", "mode": "fuzzy", "query": "twin needle", "content_authorship": "human", "limit": 10, "expected": [[3, "user"], [4, "user"]]},
