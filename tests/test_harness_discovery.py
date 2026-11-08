@@ -90,6 +90,10 @@ def test_verifier_reports_each_harness_and_checks_commands(
         assert home.is_dir() and env["HOME"] == str(home)
         if "install" in argv:
             return subprocess.CompletedProcess(argv, 0, "installed", "")
+        if argv[1:] == ["plugin", "list"]:
+            # A healthy install lists the plugin record, not only the server name.
+            return subprocess.CompletedProcess(
+                argv, returncode, output.replace(verifier.SERVER_NAME, verifier.CODEX_PLUGIN_ID), "")
         return subprocess.CompletedProcess(argv, returncode, output, "")
 
     monkeypatch.setattr(verifier.shutil, "which", lambda name: f"/bin/{name}" if available else None)
@@ -99,8 +103,8 @@ def test_verifier_reports_each_harness_and_checks_commands(
     for name in verifier.HARNESSES:
         assert f"{name}: {'skipped' if not available else 'passed' if expected == 0 else 'failed'}" in printed
     if available:
-        assert len(calls) == 5
-        assert all(argv[1:] == ["mcp", "list"] for argv in calls[1:])
+        assert [argv[1:] for argv in calls[1:]] == [
+            ["mcp", "list"], ["plugin", "list"], ["mcp", "list"], ["mcp", "list"], ["mcp", "list"]]
     else:
         assert calls == []
 
@@ -155,3 +159,47 @@ def test_launch_failure_prints_command_and_reason(tmp_path: Path, capsys: pytest
     printed = capsys.readouterr().out
     assert "missing-cli" in printed and "mcp list" in printed
     assert "No such file" in printed or "cannot find" in printed
+
+
+@pytest.mark.parametrize(("returncode", "output", "expected"), [
+    (0, "ai-session-search@ai-session-search  installed", "passed"),
+    (0, "No plugins installed", "failed"),
+    (1, "ai-session-search@ai-session-search", "failed"),
+    # The marketplace name alone is not the installed plugin record.
+    (0, "marketplace ai-session-search", "failed"),
+])
+def test_codex_plugin_listing_requires_the_aise_plugin(
+    returncode: int, output: str, expected: str,
+) -> None:
+    result = subprocess.CompletedProcess(["codex", "plugin", "list"], returncode, output, "")
+    assert verifier.classify_codex_plugin(result) == expected
+
+
+def test_posix_codex_check_fails_when_the_plugin_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    def run(argv: list[str], home: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["plugin", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "No plugins installed", "")
+        return subprocess.CompletedProcess(argv, 0, "ai-session-search", "")
+
+    monkeypatch.setattr(verifier.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
+    monkeypatch.setattr(verifier, "run_command", run)
+    assert verifier.verify(tmp_path / "aise", windows=False) == 1
+    assert "codex plugins: failed" in capsys.readouterr().out
+
+
+def test_windows_names_the_codex_plugin_check_as_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], home: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "ai-session-search", "")
+
+    monkeypatch.setattr(verifier.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
+    monkeypatch.setattr(verifier, "run_command", run)
+    assert verifier.verify(tmp_path / "aise.exe", windows=True) == 0
+    assert ["plugin", "list"] not in [argv[1:] for argv in calls]
+    assert "codex plugins: skipped" in capsys.readouterr().out

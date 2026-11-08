@@ -12,6 +12,10 @@
 4. Run each CLI's `mcp list`, printing its exact argv and output. Require exit status zero and
    the server name, including Gemini's Disabled state in an untrusted directory. Discovery
    does not prove permission to invoke tools or successful AI requests.
+5. On Linux and macOS, also run `codex plugin list` and require the installed
+   `ai-session-search@ai-session-search` plugin record, which is what lists aise in the Codex
+   desktop Plugins page. Windows uses an explicit --codex-config, which registers no marketplace,
+   so that check is a named skip there.
 
 Windows cannot redirect aise's known-folder home API with HOME/USERPROFILE. There, select then
 exclude Codex to suppress ALL native targets, add only explicit --codex-config/--opencode-config
@@ -39,6 +43,8 @@ SERVER_NAME = "ai-session-search"
 # Markers the CLIs print beside a listed server that will not start: Claude Code shows
 # "✗ Failed to connect" and still exits 0, so the name alone does not prove discovery.
 FAILURE_MARKERS = ("fail", "error", "✗", "✘")
+# The plugin record `aise integrations install` creates for its own Codex marketplace.
+CODEX_PLUGIN_ID = f"{SERVER_NAME}@{SERVER_NAME}"
 
 
 def classify(result: subprocess.CompletedProcess[str]) -> str:
@@ -50,6 +56,12 @@ def classify(result: subprocess.CompletedProcess[str]) -> str:
     listed = [line.lower() for line in lines if SERVER_NAME in line]
     healthy = any(not any(marker in line for marker in FAILURE_MARKERS) for line in listed)
     return "passed" if result.returncode == 0 and healthy else "failed"
+
+
+def classify_codex_plugin(result: subprocess.CompletedProcess[str]) -> str:
+    """Passed only when `codex plugin list` succeeds and lists the installed aise plugin record."""
+    listed = CODEX_PLUGIN_ID in result.stdout + "\n" + result.stderr
+    return "passed" if result.returncode == 0 and listed else "failed"
 
 
 def exit_code(statuses: Sequence[str]) -> int:
@@ -146,6 +158,15 @@ def verify(executable: pathlib.Path, *, windows: bool) -> int:
             status = classify(run_command([command, "mcp", "list"], home, env))
             statuses.append(status)
             print(f"{name}: {status}")
+            if name != "codex":
+                continue
+            if windows:
+                print("codex plugins: skipped (an explicit --codex-config registers no marketplace)")
+                statuses.append("skipped")
+                continue
+            status = classify_codex_plugin(run_command([command, "plugin", "list"], home, env))
+            statuses.append(status)
+            print(f"codex plugins: {status}")
     return exit_code(statuses)
 
 
