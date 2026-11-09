@@ -18,7 +18,10 @@
     {"seq": 56, "role": "user", "content": "purpose token", "provenance": {"authorship": "human", "record_relation": "mirror", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}},
     {"seq": 60, "role": "user", "content": "\u0000nul needle é"},
     {"seq": 61, "role": "tool", "kind": "tool_result", "content": "generated\u0000nul needle é", "provenance": {"authorship": "mixed", "record_relation": "original", "correlation_identity": null, "input_origin": "interactive_answer", "input_delivery_state": null, "content_parts": [{"ordinal": 0, "start_char": 0, "end_char": 9, "authorship": "generated", "origin": "tool_payload"}, {"ordinal": 1, "start_char": 9, "end_char": 22, "authorship": "unknown", "origin": "direct_input"}]}},
-    {"seq": 62, "role": "assistant", "content": "\u0000nul needle é"}
+    {"seq": 62, "role": "assistant", "content": "\u0000nul needle é"},
+    {"seq": 63, "role": "user", "content": ""},
+    {"seq": 64, "role": "tool", "kind": "tool_result", "content": "", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": "interactive_answer", "input_delivery_state": null, "content_parts": []}},
+    {"seq": 65, "role": "assistant", "content": ""}
   ],
   "bulk": {
     "first_seq": 100,
@@ -27,6 +30,8 @@
     "content_prefix": "bulk row"
   },
   "cases": [
+    {"name": "empty user inputs retain zero-width regex membership across roles", "mode": "regex", "query": "^$", "input_scope": "user_input", "all_results": true, "expected": [[63, "user"], [64, "tool"]]},
+    {"name": "default zero-width regex keeps empty assistant rows", "mode": "regex", "query": "^$", "all_results": true, "expected": [[63, "user"], [64, "tool"], [65, "assistant"]]},
     {"name": "user content after NUL is searchable across roles", "mode": "literal", "query": "nul needle", "input_scope": "user_input", "all_results": true, "expected": [[60, "user"], [61, "tool"]]},
     {"name": "user regex preserves NUL and Unicode regions", "mode": "regex", "query": "nul needle é$", "input_scope": "user_input", "all_results": true, "expected": [[60, "user"], [61, "tool"]]},
     {"name": "escaped NUL regex has a safe trigram prefilter", "mode": "regex", "query": "\\x00nul needle", "input_scope": "user_input", "all_results": true, "expected": [[60, "user"], [61, "tool"]]},

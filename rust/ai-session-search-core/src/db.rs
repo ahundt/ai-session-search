@@ -3797,9 +3797,9 @@ impl Db {
     /// denominator every receipt reports. Only receipts and the fuzzy tool-name planner call
     /// this; the search hot path probes [`Db::filtered_corpus_reaches`] instead.
     ///
-    /// For input_scope=user_input, eligibility also reads message emptiness and indexed parts;
-    /// its worst case is O(F + P) row/part reads, where P is eligible content parts. The empty
-    /// text comparison uses SQLite's stored byte length and does not scan NUL-terminated text.
+    /// For input_scope=user_input, eligibility also reads indexed provenance and parts;
+    /// its worst case is O(F + P) row/part reads, where P is eligible content parts.
+    /// Whole-input eligibility does not read message content, including for empty inputs.
     /// Cost for the default any selection: index-only. The class predicate defaults to `kind != 'harness_notice'`, and no
     /// index answers a `!=` without visiting rows, so this is computed as
     /// `count(every class) - count(only the excluded classes)`. The first term is served by the
@@ -6075,7 +6075,7 @@ fn append_message_filters_with_class(
     if filters.input_scope == crate::models::MessageInputScope::UserInput {
         sql.push_str(" and m.record_relation != 'mirror' and ((");
         sql.push_str(WHOLE_USER_INPUT_SQL);
-        sql.push_str(" and m.content != '') or (m.authorship='mixed' and exists (select 1 from message_content_parts p where p.message_id=m.id and ");
+        sql.push_str(") or (m.authorship='mixed' and exists (select 1 from message_content_parts p where p.message_id=m.id and ");
         sql.push_str(USER_INPUT_PART_SQL);
         sql.push_str(" and p.end_char > p.start_char)))");
     }
@@ -9071,6 +9071,81 @@ mod tests {
                 expected.len()
             );
         }
+    }
+
+    #[test]
+    fn empty_recorded_user_input_remains_queryless_and_zero_width_searchable() {
+        use crate::config::Config;
+        use crate::message_search::{
+            MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+        };
+        use crate::models::MessageInputScope;
+        use crate::service::MessageService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch(
+            "insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+             values ('claude:empty-input','claude','empty-input','','/empty-input','test','test');
+             insert into messages(session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin)
+             values ('claude:empty-input','claude',0,'user','conversation','','human','original',null),
+                    ('claude:empty-input','claude',1,'tool','tool_result','','unknown','original','interactive_answer'),
+                    ('claude:empty-input','claude',2,'user','conversation','','agent','original','direct_conversation'),
+                    ('claude:empty-input','claude',3,'user','conversation','','human','mirror',null),
+                    ('claude:empty-input','claude',4,'user','conversation','present','human','original',null);"
+        ).unwrap();
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+        for (query, expected) in [
+            (MessageQuery::All, vec![0, 1, 4]),
+            (MessageQuery::regex("^$").unwrap(), vec![0, 1]),
+            (MessageQuery::regex("^").unwrap(), vec![0, 1, 4]),
+        ] {
+            let response = service
+                .search(
+                    MessageSearchRequest::builder(query, MessageTarget::content())
+                        .input_scope(MessageInputScope::UserInput)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                response
+                    .hits()
+                    .iter()
+                    .map(|hit| hit.message.seq)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for hit in response
+                .hits()
+                .iter()
+                .filter(|hit| hit.message.content.is_empty())
+            {
+                if let Some(evidence) = hit.match_evidence() {
+                    assert_eq!(evidence.field_total_chars, 0);
+                    assert_eq!(evidence.field_start_char, 0);
+                    assert!(evidence.view_text.is_empty());
+                }
+            }
+        }
+        let filters = MessageFilters {
+            input_scope: MessageInputScope::UserInput,
+            ..Default::default()
+        };
+        assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 3);
+        assert_eq!(
+            db.search_messages(
+                "^$",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Regex,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            4
+        );
     }
 
     #[test]
