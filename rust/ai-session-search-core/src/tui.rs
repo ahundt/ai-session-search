@@ -4570,7 +4570,7 @@ mod tests {
     #[test]
     fn oversized_real_transcript_scoring_observes_mid_scan_cancellation() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
         let mut parsed = session("claude:oversized");
         parsed.transcript_text = "x".repeat(16 * 1024 * 1024);
         db.upsert_session(&parsed, 0, 0).unwrap();

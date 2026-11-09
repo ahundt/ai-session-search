@@ -8,7 +8,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/ahundt/ai-session-search"
 homepage = "https://github.com/ahundt/ai-session-search"

@@ -1186,6 +1186,13 @@ impl SessionSearch {
         &self.db
     }
 
+    pub(crate) fn install_query_cancellation(
+        &mut self,
+        cancellation: &crate::db::QueryCancellation,
+    ) -> Result<()> {
+        self.db.install_query_cancellation(cancellation)
+    }
+
     /// Install a frontend-specific progress sink.
     pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.db.set_progress_reporter(reporter);

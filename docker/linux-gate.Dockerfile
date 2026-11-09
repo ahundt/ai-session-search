@@ -16,7 +16,7 @@
 # and install pathways, but not the dependency-advisory gate.
 FROM ubuntu:24.04
 
-# `stable` matches the `rust`, `rust-portability`, and `rust-install` CI jobs. Pass 1.88.0 to
+# `stable` matches the `rust`, `rust-portability`, and `rust-install` CI jobs. Pass 1.89.0 to
 # reproduce the `msrv` job, which is the one hosted check a local macOS gate cannot approximate.
 ARG RUST_TOOLCHAIN=stable
 # Required, and supplied by scripts/linux_container_gate.sh from .github/workflows/ci.yml, so a

@@ -8,7 +8,7 @@ the binding surface and the tests that must exercise it.
 
 ## Setup
 
-Rust 1.88 or newer, CPython 3.12 through 3.14 with the standard GIL (3.12 is the floor;
+Rust 1.89 or newer, CPython 3.12 through 3.14 with the standard GIL (3.12 is the floor;
 3.12–3.14 are what CI tests), and uv.
 
 ```bash
@@ -41,7 +41,7 @@ on any host that runs containers:
 
 ```bash
 ./scripts/linux_container_gate.sh                        # ./run_ci_local.sh on Linux
-./scripts/linux_container_gate.sh --rust 1.88.0 msrv     # the two commands the msrv job runs
+./scripts/linux_container_gate.sh --rust 1.89.0 msrv     # the two commands the msrv job runs
 ./scripts/linux_container_gate.sh bench-tui              # registered TUI cases on Linux
 ./scripts/linux_container_gate.sh --platform linux/amd64 # emulated; the default is the host arch
 ```
