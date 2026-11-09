@@ -126,12 +126,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### For contributors
 
-1. `Cargo.lock` takes the newest release of each dependency that is semver-compatible, builds
-   with the minimum supported Rust (1.88), and is at least 7 days old as of November 7, 2026,
-   the cooldown `.github/dependabot.yml` applies. Among them: `rmcp` 3.4.0 to 3.9.0, `tokio`
+1. The November 7, 2026 dependency refresh selected semver-compatible releases that build
+   with Rust 1.88 and were at least 7 days old, matching the cooldown in
+   `.github/dependabot.yml`. Among them: `rmcp` 3.4.0 to 3.8.0, `tokio`
    1.53.3 to 1.54.1, `pyo3` 0.29.2 to 0.29.3, `ureq` 3.4.2 to 3.5.0, and `uuid` 1.24.0 to
    1.26.1. `jiff` stays at 0.2.39, which `main` already uses. `pyo3` 0.30 and `rusqlite` 0.41
    fall outside the current version requirements; each needs its own change.
+   A later security update selects `rmcp` 3.9.0 to resolve RUSTSEC-2026-0462 while retaining
+   Rust 1.88 support.
 2. The workspace uses Cargo's resolver 3, so `cargo update` selects only versions that build
    with the declared `rust-version`.
 3. `dirs` 6.0.0 to 7.0.0. Its only source change moves Windows `preference_dir()` from Local to
