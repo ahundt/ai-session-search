@@ -50,9 +50,7 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
 fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     use ai_session_search::message_search::SearchSurface;
     use ai_session_search::service::MessageService;
-    use ai_session_search::{
-        ContentAuthorshipSelection, MessageQuery, MessageSearchRequest, MessageTarget,
-    };
+    use ai_session_search::{MessageInputScope, MessageQuery, MessageSearchRequest, MessageTarget};
     use serde_json::json;
 
     let dir = tempfile::tempdir().unwrap();
@@ -80,17 +78,30 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
             MessageQuery::literal("correction").unwrap(),
             MessageTarget::content(),
         )
-        .content_authorship(selection)
+        .input_scope(selection)
         .build()
         .unwrap()
     };
     let response = service
-        .search(request(ContentAuthorshipSelection::Human))
+        .search(request(MessageInputScope::UserInput))
         .unwrap();
-    assert_eq!(response.hits().len(), 1);
-    let complete = service
-        .search(request(ContentAuthorshipSelection::Any))
-        .unwrap();
+    assert_eq!(
+        response.hits().len(),
+        3,
+        "input-focused retrieval must retain submitted inputs with unknown senders"
+    );
+    for queued in ["liquid correction", "vision correction"] {
+        let hit = response
+            .hits()
+            .iter()
+            .find(|hit| hit.message.content == queued)
+            .expect("recorded queue input remains findable");
+        assert_eq!(
+            hit.message.provenance.as_ref().unwrap().authorship,
+            ai_session_search::models::MessageAuthorship::Unknown
+        );
+    }
+    let complete = service.search(request(MessageInputScope::Any)).unwrap();
     assert_eq!(complete.hits().len(), 4);
     for queued in ["liquid correction", "vision correction"] {
         assert_eq!(
@@ -128,7 +139,7 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     indexer::reindex(&config, &db, true, None).unwrap();
     assert_eq!(
         service
-            .search(request(ContentAuthorshipSelection::Any))
+            .search(request(MessageInputScope::Any))
             .unwrap()
             .hits()
             .len(),
@@ -137,11 +148,89 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     );
     assert_eq!(
         service
-            .search(request(ContentAuthorshipSelection::Human))
+            .search(request(MessageInputScope::UserInput))
             .unwrap()
             .hits()
             .len(),
-        1
+        3
+    );
+}
+
+#[test]
+fn user_input_search_preserves_nul_and_unicode_in_prompts_and_answers() {
+    use ai_session_search::message_search::SearchSurface;
+    use ai_session_search::service::MessageService;
+    use ai_session_search::{MessageInputScope, MessageQuery, MessageSearchRequest, MessageTarget};
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let answer = "\0évidence 🦀";
+    let events = [
+        json!({"type":"user","sessionId":"nul-input","uuid":"direct","message":{"role":"user","content":answer}}),
+        json!({"type":"assistant","sessionId":"nul-input","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-nul","name":"AskUserQuestion","input":{}}]}}),
+        json!({"type":"user","sessionId":"nul-input","uuid":"answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-nul","content":format!("generated wrapper: {answer}")}]},"toolUseResult":{"response":answer}}),
+        json!({"type":"assistant","sessionId":"nul-input","message":{"role":"assistant","content":answer}}),
+    ];
+    let text = events
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(projects.join("nul-input.jsonl"), text).unwrap();
+    let config = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&config.db_path()).unwrap();
+    indexer::reindex(&config, &db, true, None).unwrap();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    for query in [
+        MessageQuery::literal("évidence").unwrap(),
+        MessageQuery::literal("\0évidence").unwrap(),
+        MessageQuery::regex("évidence 🦀$").unwrap(),
+        MessageQuery::regex("\\x00évidence").unwrap(),
+    ] {
+        let request = MessageSearchRequest::builder(query, MessageTarget::content())
+            .input_scope(MessageInputScope::UserInput)
+            .build()
+            .unwrap();
+        let response = service.search(request).unwrap();
+        assert_eq!(
+            response.hits().len(),
+            2,
+            "direct and mixed user content after NUL must remain findable"
+        );
+        assert!(response
+            .hits()
+            .iter()
+            .any(|hit| hit.message.role == Role::Tool));
+        assert!(response
+            .hits()
+            .iter()
+            .all(|hit| hit.message.role != Role::Assistant));
+    }
+    for (query, match_mode) in [
+        ("", MessageSearchMode::Literal),
+        ("évidence", MessageSearchMode::Literal),
+        ("évd", MessageSearchMode::Fuzzy),
+    ] {
+        let filters = MessageFilters {
+            input_scope: MessageInputScope::UserInput,
+            match_mode,
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(db.search_messages(query, &filters).unwrap().len(), 2);
+    }
+    assert_eq!(
+        db.search_messages("évidence", &MessageFilters::default())
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        db.search_messages("\0évidence", &MessageFilters::default())
+            .unwrap()
+            .len(),
+        3
     );
 }
 

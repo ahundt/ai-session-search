@@ -8,7 +8,17 @@
     {"seq": 3, "role": "user", "content": "twin needle"},
     {"seq": 3, "role": "assistant", "content": "twin needle"},
     {"seq": 4, "role": "user", "content": "twin needle"},
-    {"seq": 5, "role": "user", "content": "nothing relevant here"}
+    {"seq": 5, "role": "user", "content": "nothing relevant here"},
+    {"seq": 50, "role": "user", "content": "purpose token", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": "queued", "input_delivery_state": "submitted", "content_parts": []}},
+    {"seq": 51, "role": "user", "content": "purpose token", "provenance": {"authorship": "human", "record_relation": "original", "correlation_identity": null, "input_origin": "direct_conversation", "input_delivery_state": null, "content_parts": []}},
+    {"seq": 52, "role": "tool", "kind": "tool_result", "content": "purpose token wrapper épurpose token tail purpose token", "provenance": {"authorship": "mixed", "record_relation": "original", "correlation_identity": null, "input_origin": "interactive_answer", "input_delivery_state": null, "content_parts": [{"ordinal": 0, "start_char": 0, "end_char": 22, "authorship": "generated", "origin": "harness_context"}, {"ordinal": 1, "start_char": 22, "end_char": 36, "authorship": "unknown", "origin": "direct_input"}, {"ordinal": 2, "start_char": 36, "end_char": 55, "authorship": "generated", "origin": "tool_payload"}]}},
+    {"seq": 53, "role": "assistant", "content": "purpose token"},
+    {"seq": 54, "role": "tool", "kind": "tool_result", "content": "purpose token", "provenance": {"authorship": "generated", "record_relation": "original", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}},
+    {"seq": 55, "role": "user", "content": "purpose token", "provenance": {"authorship": "agent", "record_relation": "original", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}},
+    {"seq": 56, "role": "user", "content": "purpose token", "provenance": {"authorship": "human", "record_relation": "mirror", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}},
+    {"seq": 60, "role": "user", "content": "\u0000nul needle é"},
+    {"seq": 61, "role": "tool", "kind": "tool_result", "content": "generated\u0000nul needle é", "provenance": {"authorship": "mixed", "record_relation": "original", "correlation_identity": null, "input_origin": "interactive_answer", "input_delivery_state": null, "content_parts": [{"ordinal": 0, "start_char": 0, "end_char": 9, "authorship": "generated", "origin": "tool_payload"}, {"ordinal": 1, "start_char": 9, "end_char": 22, "authorship": "unknown", "origin": "direct_input"}]}},
+    {"seq": 62, "role": "assistant", "content": "\u0000nul needle é"}
   ],
   "bulk": {
     "first_seq": 100,
@@ -17,10 +27,16 @@
     "content_prefix": "bulk row"
   },
   "cases": [
-    {"name": "human queryless page excludes assistant copies", "mode": "literal", "query": "", "content_authorship": "human", "limit": 7, "expected": [[0, "user"], [1, "user"], [2, "user"], [3, "user"], [4, "user"], [5, "user"], [100, "user"]]},
-    {"name": "human literal excludes assistant copies", "mode": "literal", "query": "twin needle", "content_authorship": "human", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
-    {"name": "human regex excludes assistant copies", "mode": "regex", "query": "twin needle", "content_authorship": "human", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
-    {"name": "human fuzzy excludes assistant copies", "mode": "fuzzy", "query": "twin needle", "content_authorship": "human", "limit": 10, "expected": [[3, "user"], [4, "user"]]},
+    {"name": "user content after NUL is searchable across roles", "mode": "literal", "query": "nul needle", "input_scope": "user_input", "all_results": true, "expected": [[60, "user"], [61, "tool"]]},
+    {"name": "user regex preserves NUL and Unicode regions", "mode": "regex", "query": "nul needle é$", "input_scope": "user_input", "all_results": true, "expected": [[60, "user"], [61, "tool"]]},
+    {"name": "escaped NUL regex has a safe trigram prefilter", "mode": "regex", "query": "\\x00nul needle", "input_scope": "user_input", "all_results": true, "expected": [[60, "user"], [61, "tool"]]},
+    {"name": "escaped NUL regex preserves default complete content", "mode": "regex", "query": "\\x00nul needle", "all_results": true, "expected": [[60, "user"], [61, "tool"], [62, "assistant"]]},
+    {"name": "user fuzzy preserves NUL and excludes assistant echoes", "mode": "fuzzy", "query": "nul needle", "input_scope": "user_input", "limit": 10, "expected": [[60, "user"], [61, "tool"]]},
+    {"name": "default content after NUL retains assistant echoes", "mode": "literal", "query": "nul needle", "all_results": true, "expected": [[60, "user"], [61, "tool"], [62, "assistant"]]},
+    {"name": "user-input queryless page excludes assistant copies", "mode": "literal", "query": "", "input_scope": "user_input", "limit": 7, "expected": [[0, "user"], [1, "user"], [2, "user"], [3, "user"], [4, "user"], [5, "user"], [50, "user"]]},
+    {"name": "user-input literal excludes assistant copies", "mode": "literal", "query": "twin needle", "input_scope": "user_input", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
+    {"name": "user-input regex excludes assistant copies", "mode": "regex", "query": "twin needle", "input_scope": "user_input", "all_results": true, "expected": [[3, "user"], [4, "user"]]},
+    {"name": "user-input fuzzy excludes assistant copies", "mode": "fuzzy", "query": "twin needle", "input_scope": "user_input", "limit": 10, "expected": [[3, "user"], [4, "user"]]},
     {"name": "cherokee found by its own uppercase spelling", "mode": "literal", "query": "ᏣᎳᎩ", "limit": 10, "expected": [[0, "user"]]},
     {"name": "cherokee found by its lowercase spelling", "mode": "literal", "query": "ꮳꮃꭹ", "limit": 10, "expected": [[0, "user"]]},
     {"name": "cherokee regex by its exact spelling", "mode": "regex", "query": "ᏣᎳᎩ", "limit": 10, "expected": [[0, "user"]]},
@@ -34,7 +50,13 @@
     {"name": "tool name literal keeps tied calls and results in the total order", "mode": "literal", "field": "tool_name", "query": "bash", "all_results": true, "expected": "tool_twins"},
     {"name": "tool name regex keeps the same order", "mode": "regex", "field": "tool_name", "query": "^Bash$", "all_results": true, "expected": "tool_twins"},
     {"name": "tool name fuzzy ranks equal scores in the total order", "mode": "fuzzy", "field": "tool_name", "query": "bash", "limit": 20, "expected": "tool_twins"},
-    {"name": "tool name latest window boundary inside a tied pair", "mode": "literal", "field": "tool_name", "query": "bash", "limit": 3, "match_window": "latest", "in_session": true, "expected": [[304, "tool"], [305, "assistant"], [305, "tool"]]}
+    {"name": "tool name latest window boundary inside a tied pair", "mode": "literal", "field": "tool_name", "query": "bash", "limit": 3, "match_window": "latest", "in_session": true, "expected": [[304, "tool"], [305, "assistant"], [305, "tool"]]},
+    {"name": "literal selects input purpose including unknown queued sender", "mode": "literal", "query": "purpose token", "input_scope": "user_input", "all_results": true, "expected": [[50, "user"], [51, "user"], [52, "tool"]]},
+    {"name": "regex selects input purpose including unknown queued sender", "mode": "regex", "query": "purpose token", "input_scope": "user_input", "all_results": true, "expected": [[50, "user"], [51, "user"], [52, "tool"]]},
+    {"name": "fuzzy selects input purpose including unknown queued sender", "mode": "fuzzy", "query": "purpose token", "input_scope": "user_input", "limit": 10, "expected": [[50, "user"], [51, "user"], [52, "tool"]]},
+    {"name": "default scope preserves generated and mirrored sources", "mode": "literal", "query": "purpose token", "all_results": true, "expected": [[50, "user"], [51, "user"], [52, "tool"], [53, "assistant"], [54, "tool"], [55, "user"], [56, "user"]]},
+    {"name": "input scope cannot match across a generated boundary", "mode": "literal", "query": "wrapper épurpose", "input_scope": "user_input", "all_results": true, "expected": []},
+    {"name": "input scope excludes generated suffix match", "mode": "literal", "query": "tail purpose token", "input_scope": "user_input", "all_results": true, "expected": []}
   ],
   "page_walks": [
     {"name": "literal pages of one across a tie", "mode": "literal", "query": "twin needle", "page": 1, "expected": [[3, "user"], [3, "assistant"], [4, "user"]]},
@@ -55,20 +77,40 @@
     {"name": "the newest three rows cut inside a tied pair", "limit": 3, "expected": [[304, "tool"], [305, "assistant"], [305, "tool"]]}
   ],
   "deliberate_differences": {
-    "omitted_limit": {"requirement": "REQ003-preserve-surface-semantics", "query": "bulk row", "all_surfaces_but_mcp": 20, "mcp_default_page": 15},
-    "fuzzy_rejects_all_results": {"requirement": "REQ003-preserve-surface-semantics", "query": "twin needle"}
+    "omitted_limit": {
+      "requirement": "REQ003-preserve-surface-semantics",
+      "query": "bulk row",
+      "all_surfaces_but_mcp": 20,
+      "mcp_default_page": 15
+    },
+    "fuzzy_rejects_all_results": {
+      "requirement": "REQ003-preserve-surface-semantics",
+      "query": "twin needle"
+    }
   },
   "twins": {
     "first_seq": 200,
     "pairs": 40,
     "content": "pair needle",
-    "roles": ["user", "assistant"]
+    "roles": [
+      "user",
+      "assistant"
+    ]
   },
   "tool_twins": {
     "first_seq": 300,
     "pairs": 6,
     "tool_name": "Bash",
     "content": "shell call",
-    "rows": [["assistant", "tool_call"], ["tool", "tool_result"]]
+    "rows": [
+      [
+        "assistant",
+        "tool_call"
+      ],
+      [
+        "tool",
+        "tool_result"
+      ]
+    ]
   }
 }

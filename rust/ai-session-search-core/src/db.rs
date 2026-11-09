@@ -22,10 +22,11 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use crate::hashing::FramedSha256;
 use crate::message_search::selected_message_field_parts;
 use crate::models::{
-    AnalysisRequest, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery,
-    MessageClassificationMatch, MessageFilters, MessageHit, MessageSearchMode, ParsedSession,
-    ParserHealth, PlanningCount, Provider, ProviderParserHealth, Role, SearchExplain, SearchField,
-    SearchFilters, SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
+    AnalysisRequest, ContentPartAuthorship, ContentPartOrigin, EditOp, FileCrossRef, FileEdit,
+    FileEditSummary, FileQuery, Message, MessageAuthorship, MessageClassificationMatch,
+    MessageContentPart, MessageFilters, MessageHit, MessageSearchMode, ParsedSession, ParserHealth,
+    PlanningCount, Provider, ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters,
+    SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
@@ -206,6 +207,23 @@ pub(crate) enum SourceFileRefreshState {
     ChangedSameParser,
     ChangedParser,
     New,
+}
+
+/// One physical receipt belonging to a proven provider migration family. The canonical session
+/// still owns one logical row, while every member keeps its own freshness stamp. A family member
+/// is never treated as a session alias: doing so deletes the receipt and causes reindex
+/// oscillation when the two on-disk forms are both present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceFamilyStamp {
+    pub(crate) source_path: String,
+    pub(crate) mtime_ns: i64,
+    pub(crate) size_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeminiFamilyIdentity {
+    pub(crate) canonical_session_id: String,
+    pub(crate) native_session_id: String,
 }
 
 struct PreparedMessageQuery {
@@ -1866,6 +1884,59 @@ impl Db {
         Ok(rows)
     }
 
+    /// Load canonical sessions for all recorded Gemini family members once per reindex.
+    /// Family receipts intentionally outlive a removed native member, so ordinary source-path
+    /// reconciliation cannot discover this relationship. Conflicting session IDs for one path
+    /// are omitted instead of guessing which archive is authoritative.
+    pub(crate) fn gemini_family_sessions_by_path(
+        &self,
+    ) -> Result<HashMap<String, GeminiFamilyIdentity>> {
+        let mut result = HashMap::<String, Option<GeminiFamilyIdentity>>::new();
+        let mut statement = self.conn.prepare(
+            "select id, raw_metadata_json from sessions where provider = ?1 and raw_metadata_json is not null",
+        )?;
+        let mut rows = statement.query(params![Provider::GeminiCli.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            let Some(family) = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|metadata| metadata.get("gemini_migration_family").cloned())
+            else {
+                continue;
+            };
+            let Some(native_session_id) = family
+                .get("native_session_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            else {
+                continue;
+            };
+            let identity = GeminiFamilyIdentity {
+                canonical_session_id: id,
+                native_session_id: native_session_id.to_string(),
+            };
+            for key in ["predecessor_json", "successor_jsonl"] {
+                let Some(path) = family.get(key).and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let canonical = result
+                    .entry(path.to_string())
+                    .or_insert_with(|| Some(identity.clone()));
+                if canonical
+                    .as_ref()
+                    .is_some_and(|existing| existing != &identity)
+                {
+                    *canonical = None;
+                }
+            }
+        }
+        Ok(result
+            .into_iter()
+            .filter_map(|(path, id)| id.map(|id| (path, id)))
+            .collect())
+    }
+
     pub(crate) fn exact_session_source_path(&self, id: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -1890,7 +1961,7 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
-        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true, &[])
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true, &[], &[])
     }
 
     /// Persist a full parse of a session's source without the append shortcut, comparing every
@@ -1910,7 +1981,7 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
-        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, false, &[])
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, false, &[], &[])
     }
 
     pub(crate) fn upsert_session_reconciling_sources(
@@ -1927,6 +1998,28 @@ impl Db {
             size_bytes,
             allow_append_optimization,
             source_aliases,
+            &[],
+        )
+    }
+
+    /// Persist one canonical Gemini session while recording every physical JSON/JSONL family
+    /// member in the same transaction. The member paths are freshness receipts, not aliases, so
+    /// the predecessor remains available to prove the migration on the next refresh.
+    pub(crate) fn upsert_session_reconciling_family(
+        &self,
+        parsed: &ParsedSession,
+        mtime_ns: i64,
+        size_bytes: i64,
+        family_members: &[SourceFamilyStamp],
+        allow_append_optimization: bool,
+    ) -> Result<()> {
+        self.upsert_session_with_mode(
+            parsed,
+            mtime_ns,
+            size_bytes,
+            allow_append_optimization,
+            &[],
+            family_members,
         )
     }
 
@@ -1937,6 +2030,7 @@ impl Db {
         size_bytes: i64,
         allow_append_optimization: bool,
         source_aliases: &[String],
+        family_members: &[SourceFamilyStamp],
     ) -> Result<()> {
         // IMMEDIATE takes the write lock before the first read, so another writer committing
         // between this transaction's reads and its first write cannot fail the upgrade with
@@ -1959,7 +2053,11 @@ impl Db {
         // replaces it. Content identifies a message only while the parser that rendered it is
         // unchanged; see `store_parsed_messages`.
         let mut previous_parse_version: Option<String> = None;
-        for path in &source_paths {
+        for path in source_paths.iter().copied().chain(
+            family_members
+                .iter()
+                .map(|member| member.source_path.as_str()),
+        ) {
             previous_parse_version = tx
                 .query_row(
                     "select parse_version from files_seen where provider = ?1 and source_path = ?2",
@@ -1972,6 +2070,33 @@ impl Db {
             }
         }
         let same_parser = previous_parse_version.as_deref() == Some(session.parse_version.as_str());
+        let persisted_family_metadata = if family_members.is_empty() {
+            None
+        } else {
+            tx.query_row(
+                "select raw_metadata_json from sessions where id = ?1",
+                params![session.id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        };
+        let raw_metadata_json = match (
+            session.raw_metadata_json.as_deref(),
+            persisted_family_metadata.as_deref(),
+        ) {
+            (Some(current), Some(previous))
+                if !serde_json::from_str::<serde_json::Value>(current)
+                    .ok()
+                    .and_then(|metadata| metadata.get("gemini_migration_family").cloned())
+                    .is_some() =>
+            {
+                Some(previous.to_string())
+            }
+            (Some(current), _) => Some(current.to_string()),
+            (None, Some(previous)) => Some(previous.to_string()),
+            (None, None) => None,
+        };
         // A complete source parse represents one canonical session. Parser improvements or
         // mutable sidecar metadata can change the provider session ID, and a verified alias can
         // move the source path. Earlier identities for this provider and source are retired
@@ -2085,13 +2210,44 @@ impl Db {
                 session.source_path,
                 session.message_count,
                 session.parse_version,
-                session.raw_metadata_json,
+                raw_metadata_json,
                 session.parse_warning,
                 session.discovery_source,
                 session.parent_session_id,
                 session.agent_label,
             ],
         )?;
+        // Family receipts are deliberately separate from source_aliases. The predecessor has no
+        // tail checkpoint: only the canonical JSONL member may use the append-only fast path.
+        for member in family_members {
+            if member.source_path == session.source_path {
+                continue;
+            }
+            tx.execute(
+                "
+                insert into files_seen (
+                    provider, source_path, mtime_ns, size_bytes, last_indexed_at,
+                    content_hash, parse_version, tail_byte_offset, prefix_fingerprint
+                )
+                values (?1, ?2, ?3, ?4, ?5, null, ?6, null, null)
+                on conflict(provider, source_path) do update set
+                    mtime_ns = excluded.mtime_ns,
+                    size_bytes = excluded.size_bytes,
+                    last_indexed_at = excluded.last_indexed_at,
+                    parse_version = excluded.parse_version,
+                    tail_byte_offset = null,
+                    prefix_fingerprint = null
+                ",
+                params![
+                    session.provider.as_str(),
+                    member.source_path,
+                    member.mtime_ns,
+                    member.size_bytes,
+                    stored_timestamp(Utc::now()),
+                    session.parse_version,
+                ],
+            )?;
+        }
         // Move each retired identity's stored rows to the replacement session, then retire the
         // identity; rows the replacement already holds go with it through the cascade.
         for retired in &retired_ids {
@@ -2120,8 +2276,14 @@ impl Db {
                 session.parse_version,
             ],
         )?;
-        let kept_messages_missing_from_parse =
-            store_parsed_messages(&tx, parsed, allow_append_optimization, same_parser)?;
+        let kept_messages_missing_from_parse = store_parsed_messages(
+            &tx,
+            parsed,
+            allow_append_optimization,
+            same_parser,
+            !family_members.is_empty(),
+            family_members.len() == 1,
+        )?;
         store_parsed_file_edits(&tx, parsed, same_parser)?;
         if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
@@ -2553,7 +2715,7 @@ impl Db {
             ResolvedExtent::AllResults { offset } => (0, offset),
         };
         let filters = MessageFilters {
-            content_authorship: plan.predicates.content_authorship,
+            input_scope: plan.predicates.input_scope,
             role: plan.predicates.role,
             kinds: plan.predicates.kinds.clone(),
             field: Some(plan.target.field()),
@@ -2687,7 +2849,7 @@ impl Db {
         };
         let page_index_hint =
             self.ordered_page_index_hint(filters, order, content_prefilter.as_deref())?;
-        let ranges = human_provenance_projection(filters);
+        let ranges = input_provenance_projection(filters);
         let mut sql = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges} \
              from messages m{page_index_hint} where 1 = 1",
@@ -2896,7 +3058,7 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         self.validate_access_scope()?;
         filters.validate(query)?;
-        self.validate_content_authorship_layout(filters)?;
+        self.validate_input_scope_layout(filters)?;
         let field = filters.field.unwrap_or(SearchField::Content);
         if filters.match_mode != MessageSearchMode::Fuzzy {
             let prepared =
@@ -2947,7 +3109,7 @@ impl Db {
             );
         }
 
-        let ranges = human_provenance_projection(filters);
+        let ranges = input_provenance_projection(filters);
         let mut sql = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges} \
              from messages m where 1 = 1",
@@ -2986,7 +3148,12 @@ impl Db {
             if fuzzy_batch_is_full(batch.len(), batch_bytes) {
                 batch_bytes = 0;
                 let scored = self.runtime.install(|| {
-                    score_fuzzy_message_hits(&pattern, &query_lower, std::mem::take(&mut batch))
+                    score_fuzzy_message_hits(
+                        &pattern,
+                        &query_lower,
+                        std::mem::take(&mut batch),
+                        filters.input_scope,
+                    )
                 })?;
                 matched += scored.len() as i64;
                 top.extend(scored);
@@ -2996,9 +3163,9 @@ impl Db {
             }
         }
         if !batch.is_empty() {
-            let scored = self
-                .runtime
-                .install(|| score_fuzzy_message_hits(&pattern, &query_lower, batch))?;
+            let scored = self.runtime.install(|| {
+                score_fuzzy_message_hits(&pattern, &query_lower, batch, filters.input_scope)
+            })?;
             matched += scored.len() as i64;
             top.extend(scored);
         }
@@ -3025,7 +3192,7 @@ impl Db {
     ) -> Result<MessageBatchVisitOutcome> {
         self.validate_access_scope()?;
         filters.validate(query)?;
-        self.validate_content_authorship_layout(filters)?;
+        self.validate_input_scope_layout(filters)?;
         anyhow::ensure!(
             filters.match_mode != MessageSearchMode::Fuzzy,
             "batched exhaustive traversal supports literal, regex, and queryless searches; pass a finite limit to the bounded fuzzy search"
@@ -3616,10 +3783,10 @@ impl Db {
             .map_err(Into::into)
     }
 
-    fn validate_content_authorship_layout(&self, filters: &MessageFilters) -> Result<()> {
-        if filters.content_authorship == crate::models::ContentAuthorshipSelection::Human {
+    fn validate_input_scope_layout(&self, filters: &MessageFilters) -> Result<()> {
+        if filters.input_scope == crate::models::MessageInputScope::UserInput {
             if let Some(problem) = crate::indexer::current_schema_layout_problem(&self.conn)? {
-                bail!("human-content search requires current provenance storage: {problem}; run `aise reindex` to upgrade the index, or pass content_authorship=any to search the readable stored content");
+                bail!("user-input search requires current provenance storage: {problem}; run `aise reindex` to upgrade the index, or pass input_scope=any to search the readable stored content");
             }
         }
         Ok(())
@@ -3630,8 +3797,9 @@ impl Db {
     /// denominator every receipt reports. Only receipts and the fuzzy tool-name planner call
     /// this; the search hot path probes [`Db::filtered_corpus_reaches`] instead.
     ///
-    /// For content_authorship=human, eligibility also reads message lengths and indexed parts;
-    /// its worst case is O(F + P) row/part reads, where P is human content parts.
+    /// For input_scope=user_input, eligibility also reads message emptiness and indexed parts;
+    /// its worst case is O(F + P) row/part reads, where P is eligible content parts. The empty
+    /// text comparison uses SQLite's stored byte length and does not scan NUL-terminated text.
     /// Cost for the default any selection: index-only. The class predicate defaults to `kind != 'harness_notice'`, and no
     /// index answers a `!=` without visiting rows, so this is computed as
     /// `count(every class) - count(only the excluded classes)`. The first term is served by the
@@ -5849,41 +6017,42 @@ fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Opti
 }
 
 /// Project eligible ranges without changing the source content or row identity.
-fn human_provenance_projection(filters: &MessageFilters) -> &'static str {
-    if filters.content_authorship != crate::models::ContentAuthorshipSelection::Human {
-        return "";
+const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')))";
+const USER_INPUT_PART_SQL: &str = "((p.authorship in ('human','unknown') and p.origin='direct_input') or (p.authorship='human' and p.origin in ('quoted_content','unknown')))";
+
+const MESSAGE_CONTENT_PARTS_JSON: &str = "(select json_group_array(json_object(
+    'ordinal',ordinal,'start_char',start_char,'end_char',end_char,
+    'authorship',authorship,'origin',origin))
+    from (select ordinal,start_char,end_char,authorship,origin
+        from message_content_parts where message_id=m.id order by ordinal))";
+
+fn input_provenance_projection(filters: &MessageFilters) -> String {
+    if filters.input_scope != crate::models::MessageInputScope::UserInput {
+        return String::new();
     }
-    ", json_object(
+    format!(", json_object(
         'authorship', m.authorship,
         'record_relation', m.record_relation,
         'correlation_identity', case when m.correlation_id is null then null else
             json_object('authority',m.correlation_authority,'scope',m.correlation_scope,'id',m.correlation_id) end,
         'input_delivery_state', m.input_delivery_state,
         'input_origin', m.input_origin,
-        'content_parts', json((
-            select json_group_array(json_object('ordinal',ordinal,'start_char',start_char,
-                'end_char',end_char,'authorship',authorship,'origin',origin))
-            from (select ordinal,start_char,end_char,authorship,origin
-                from message_content_parts where message_id=m.id order by ordinal)
-        ))
-    ) as source_provenance"
+        'content_parts', json({MESSAGE_CONTENT_PARTS_JSON})
+    ) as source_provenance")
 }
 
 fn append_content_match(sql: &mut String, filters: &MessageFilters, regex: bool) {
-    if filters.content_authorship == crate::models::ContentAuthorshipSelection::Human {
-        sql.push_str(" and exists (select 1 from (select m.content as fragment where m.authorship='human' union all select substr(m.content,p.start_char+1,p.end_char-p.start_char) from message_content_parts p where p.message_id=m.id and p.authorship='human') where ");
-        sql.push_str(if regex {
-            "rust_regexp(?, fragment))"
-        } else {
-            "unicode_lower_contains(fragment, ?))"
-        });
+    sql.push_str(if regex {
+        " and rust_regexp(?, m.content"
     } else {
-        sql.push_str(if regex {
-            " and rust_regexp(?, m.content)"
-        } else {
-            " and unicode_lower_contains(m.content, ?)"
-        });
+        " and unicode_lower_contains(m.content, ?"
+    });
+    if filters.input_scope == crate::models::MessageInputScope::UserInput {
+        sql.push_str(", case when m.authorship='mixed' then ");
+        sql.push_str(MESSAGE_CONTENT_PARTS_JSON);
+        sql.push_str(" else null end");
     }
+    sql.push(')');
 }
 
 fn append_message_filters(
@@ -5903,8 +6072,12 @@ fn append_message_filters_with_class(
     class: ClassSelection<'_>,
 ) {
     use rusqlite::types::Value;
-    if filters.content_authorship == crate::models::ContentAuthorshipSelection::Human {
-        sql.push_str(" and m.record_relation = 'original' and ((m.authorship = 'human' and length(m.content) > 0) or (m.authorship = 'mixed' and exists (select 1 from message_content_parts p where p.message_id=m.id and p.authorship='human' and p.end_char > p.start_char)))");
+    if filters.input_scope == crate::models::MessageInputScope::UserInput {
+        sql.push_str(" and m.record_relation != 'mirror' and ((");
+        sql.push_str(WHOLE_USER_INPUT_SQL);
+        sql.push_str(" and m.content != '') or (m.authorship='mixed' and exists (select 1 from message_content_parts p where p.message_id=m.id and ");
+        sql.push_str(USER_INPUT_PART_SQL);
+        sql.push_str(" and p.end_char > p.start_char)))");
     }
     if let Some(role) = filters.role {
         sql.push_str(" and m.role = ?");
@@ -6313,6 +6486,8 @@ fn store_parsed_messages(
     parsed: &ParsedSession,
     allow_append_optimization: bool,
     same_parser: bool,
+    preserve_family_sequences: bool,
+    preserve_family_history: bool,
 ) -> Result<bool> {
     let session = &parsed.session;
     let existing_count: i64 = tx.query_row(
@@ -6373,6 +6548,7 @@ fn store_parsed_messages(
         }
     }
     if same_parser
+        && !preserve_family_sequences
         && covers_every_stored_key(
             stored
                 .iter()
@@ -6413,6 +6589,31 @@ fn store_parsed_messages(
         }
     }
     let mut matched = vec![false; stored.len()];
+    // Upgrade-only relation matching repairs changed rendering without treating a call ID
+    // as event identity. Ambiguous relations on either side remain separate archive rows.
+    let mut legacy_tool_results = HashMap::<RowDigest, (usize, Option<usize>)>::new();
+    if !same_parser
+        && session.parse_version == crate::util::provider_parse_version(session.provider)
+    {
+        for (position, (_, keys)) in stored.iter().enumerate() {
+            if let Some(key) = keys.tool_result_relation {
+                let entry = legacy_tool_results.entry(key).or_default();
+                entry.0 += 1;
+                if keys.correlation.is_none() {
+                    entry.1 = Some(position);
+                }
+            }
+        }
+        let mut parsed_relations = HashMap::<RowDigest, usize>::new();
+        for keys in &parsed_keys {
+            if let Some(key) = keys.tool_result_relation {
+                *parsed_relations.entry(key).or_default() += 1;
+            }
+        }
+        legacy_tool_results.retain(|key, (count, position)| {
+            *count == 1 && position.is_some() && parsed_relations.get(key) == Some(&1)
+        });
+    }
     let mut unseen = Vec::new();
     for (message, keys) in parsed.messages.iter().zip(&parsed_keys) {
         let position = keys
@@ -6425,6 +6626,12 @@ fn store_parsed_messages(
                     }
                 }
                 None
+            })
+            .or_else(|| {
+                keys.tool_result_relation
+                    .and_then(|key| legacy_tool_results.get(&key))
+                    .and_then(|(_, position)| *position)
+                    .filter(|position| !matched[*position])
             })
             .or_else(|| {
                 stored_by_role_and_content
@@ -6441,6 +6648,22 @@ fn store_parsed_messages(
         if let Some(position) = position {
             matched[position] = true;
             // A parser upgrade can change part attribution without changing message columns.
+            if preserve_family_history
+                && same_parser
+                && keys.correlation.is_some()
+                && stored[position].1.correlation == keys.correlation
+                && stored[position].1.columns_without_seq != keys.columns_without_seq
+            {
+                if let Some(merged) = merge_family_input_row(tx, stored[position].0, message)? {
+                    if stored[position].1.columns_without_seq
+                        != parsed_message_keys(&merged).columns_without_seq
+                        || !message_parts_match(tx, stored[position].0, &merged)?
+                    {
+                        update_message_row(tx, stored[position].0, session, &merged)?;
+                    }
+                    continue;
+                }
+            }
             if !same_parser
                 || stored[position].1.columns_without_seq != keys.columns_without_seq
                 || !message_parts_match(tx, stored[position].0, message)?
@@ -6460,6 +6683,160 @@ fn store_parsed_messages(
             .map(|(offset, message)| (next_seq + offset as i64, message)),
     )?;
     Ok(matched.iter().any(|matched| !matched))
+}
+
+/// Union structurally attributed fragments only within the same proven native family event.
+/// Existing multiplicities are consumed once; newly observed fragments retain their native order
+/// and classification. O(B + P) expected time and O(B + P) memory for B bytes and P parts, including
+/// the resulting canonical text. Reads one row and its parts; unchanged unions perform no writes.
+fn merge_family_input_row(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: i64,
+    incoming: &Message,
+) -> Result<Option<Message>> {
+    if incoming.provenance.content_parts.is_empty() && !incoming.provenance.is_whole_user_input() {
+        return Ok(None);
+    }
+    let (same_event_shape, old_input_origin): (bool, Option<String>) = tx.query_row(
+        "select role is ?2 and ts is ?3 and tool_name is ?4 and kind is ?5
+           and tool_call_id is ?6 and is_compaction = ?7 and record_relation is ?8, input_origin
+         from messages where id = ?1",
+        params![
+            message_id,
+            incoming.role.as_str(),
+            incoming.ts.map(stored_timestamp),
+            incoming.tool_name,
+            incoming.kind.as_str(),
+            incoming.tool_call_id,
+            incoming.is_compaction,
+            incoming.provenance.record_relation.as_str()
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if !same_event_shape {
+        return Ok(None);
+    }
+    let Some((old_content, old_parts)) = stored_message_content_parts(tx, message_id)? else {
+        return Ok(None);
+    };
+    if old_parts.is_empty() {
+        return Ok(None);
+    }
+    let mut held = HashMap::new();
+    for (part, text) in crate::util::content_part_regions(&old_content, &old_parts)? {
+        *held
+            .entry((part.authorship, part.origin, text))
+            .or_insert(0usize) += 1;
+    }
+    let whole = [MessageContentPart {
+        ordinal: 0,
+        start_char: 0,
+        end_char: incoming.content.chars().count(),
+        authorship: if incoming.provenance.authorship == MessageAuthorship::Human {
+            ContentPartAuthorship::Human
+        } else {
+            ContentPartAuthorship::Unknown
+        },
+        origin: ContentPartOrigin::DirectInput,
+    }];
+    let incoming_parts = if incoming.provenance.content_parts.is_empty() {
+        &whole[..]
+    } else {
+        &incoming.provenance.content_parts
+    };
+    let mut novel = Vec::new();
+    for (part, text) in crate::util::content_part_regions(&incoming.content, incoming_parts)? {
+        match held.get_mut(&(part.authorship, part.origin, text)) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => novel.push((part, text)),
+        }
+    }
+    let mut cursor = old_content.chars().count();
+    let mut merged = incoming.clone();
+    merged.content = old_content;
+    merged.provenance.authorship = MessageAuthorship::Mixed;
+    // A partial rendering's missing origin does not erase a previously recorded input channel.
+    merged.provenance.input_origin = incoming.provenance.input_origin.or(old_input_origin
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?);
+    merged.provenance.content_parts = old_parts;
+    for (part, text) in novel {
+        let parts = &mut merged.provenance.content_parts;
+        merged.content.push('\n');
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char: cursor,
+            end_char: cursor + 1,
+            authorship: ContentPartAuthorship::Generated,
+            origin: ContentPartOrigin::ToolPayload,
+        });
+        cursor += 1;
+        let end = cursor + text.chars().count();
+        merged.content.push_str(text);
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char: cursor,
+            end_char: end,
+            authorship: part.authorship,
+            origin: part.origin,
+        });
+        cursor = end;
+    }
+    Ok(Some(merged))
+}
+
+fn stored_message_content_parts(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: i64,
+) -> Result<Option<(String, Vec<MessageContentPart>)>> {
+    let Some(content) = tx
+        .query_row(
+            "select content from messages where id = ?1",
+            [message_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut statement = tx.prepare(
+        "select ordinal, start_char, end_char, authorship, origin
+         from message_content_parts where message_id = ?1 order by ordinal",
+    )?;
+    let parts = statement
+        .query_map([message_id], |row| {
+            let authorship: String = row.get(3)?;
+            let origin: String = row.get(4)?;
+            Ok(MessageContentPart {
+                ordinal: row.get::<_, i64>(0)?.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "ordinal".to_string(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?,
+                start_char: row.get::<_, i64>(1)?.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        1,
+                        "start_char".to_string(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?,
+                end_char: row.get::<_, i64>(2)?.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        2,
+                        "end_char".to_string(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?,
+                authorship: ContentPartAuthorship::from_db_str(&authorship),
+                origin: ContentPartOrigin::from_db_str(&origin),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some((content, parts)))
 }
 
 /// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
@@ -6628,6 +7005,7 @@ type RowDigest = [u8; 32];
 struct MessageKeys {
     role_and_content: RowDigest,
     correlation: Option<RowDigest>,
+    tool_result_relation: Option<RowDigest>,
     seq: i64,
     columns_without_seq: RowDigest,
 }
@@ -6689,6 +7067,9 @@ impl MessageColumns<'_> {
         MessageKeys {
             role_and_content: role_and_content.finish_bytes(),
             correlation,
+            tool_result_relation: (self.kind == Some("tool_result"))
+                .then(|| tool_result_relation_key(self.tool_name, self.tool_call_id))
+                .flatten(),
             seq: self.seq,
             columns_without_seq: columns_without_seq.finish_bytes(),
         }
@@ -6699,7 +7080,7 @@ impl MessageColumns<'_> {
 fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
     let ts = message.ts.map(stored_timestamp);
     let correlation = message.provenance.correlation_identity.as_ref();
-    MessageColumns {
+    let mut keys = MessageColumns {
         seq: message.seq,
         role: Some(message.role.as_str()),
         kind: Some(message.kind.as_str()),
@@ -6721,7 +7102,33 @@ fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
         record_relation: Some(message.provenance.record_relation.as_str()),
         content: &message.content,
     }
-    .keys()
+    .keys();
+    if message.kind == crate::models::MessageKind::Conversation
+        && message.role == crate::models::Role::User
+        && message.provenance.authorship == crate::models::MessageAuthorship::Mixed
+        && message
+            .provenance
+            .content_parts
+            .iter()
+            .any(|part| part.origin == crate::models::ContentPartOrigin::ToolPayload)
+    {
+        keys.tool_result_relation = tool_result_relation_key(
+            message.tool_name.as_deref(),
+            message.tool_call_id.as_deref(),
+        );
+    }
+    keys
+}
+
+fn tool_result_relation_key(name: Option<&str>, call_id: Option<&str>) -> Option<RowDigest> {
+    let (name, call_id) = (
+        name.filter(|value| !value.is_empty())?,
+        call_id.filter(|value| !value.is_empty())?,
+    );
+    let mut digest = FramedSha256::new(b"aise-archive-tool-result-relation-v1");
+    digest.update_bytes(name.as_bytes());
+    digest.update_bytes(call_id.as_bytes());
+    Some(digest.finish_bytes())
 }
 
 /// A session's stored message rows as (row id, keys) in (seq, id) order, or only the rows at
@@ -7302,19 +7709,22 @@ fn score_fuzzy_message_hits(
     pattern: &Pattern,
     query_lower: &str,
     hits: Vec<(usize, MessageHit)>,
+    input_scope: crate::models::MessageInputScope,
 ) -> Vec<ScoredFuzzyHit> {
     let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
     hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
             |(matcher, utf32_buf), (ordinal, mut hit)| {
-                let (score, exact_phrase) = if hit.provenance.is_none() {
+                let (score, exact_phrase) = if input_scope == crate::models::MessageInputScope::Any
+                {
                     let score = pattern.score(Utf32Str::new(&hit.content, utf32_buf), matcher);
                     let exact_phrase =
                         score.is_some() && exact_phrase_needle.contains(&hit.content);
                     (score, exact_phrase)
                 } else {
-                    let regions = crate::message_search::matching_content_regions(&hit);
+                    let regions =
+                        crate::message_search::matching_content_regions(&hit, input_scope);
                     let score = regions
                         .iter()
                         .filter_map(|(_, text)| {
@@ -8528,8 +8938,144 @@ mod tests {
     }
 
     #[test]
+    fn user_content_sql_and_rust_agree_on_source_and_region_eligibility() {
+        use crate::models::{
+            ContentPartAuthorship as A, ContentPartOrigin as O, MessageContentPart,
+            MessageInputOrigin as I, MessageInputScope, MessageProvenance,
+            MessageRecordRelation as R,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+            values ('claude:eligibility','claude','eligibility','','/eligibility','test','test')").unwrap();
+        let mut expected = Vec::new();
+        let mut seq = 0i64;
+        let mut insert = |provenance: MessageProvenance, eligible: bool| {
+            let content = if provenance.content_parts.is_empty() {
+                "needle"
+            } else {
+                "needle|generated"
+            };
+            provenance.validate(content).unwrap();
+            assert_eq!(
+                provenance.record_relation != R::Mirror
+                    && (provenance.is_whole_user_input()
+                        || provenance
+                            .content_parts
+                            .iter()
+                            .any(MessageContentPart::is_user_input)),
+                eligible
+            );
+            db.conn.execute("insert into messages(session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin)
+                values ('claude:eligibility','claude',?1,'tool','tool_result',?2,?3,?4,?5)",
+                params![seq, content, provenance.authorship.as_str(), provenance.record_relation.as_str(), provenance.input_origin.map(I::as_str)]).unwrap();
+            let id = db.conn.last_insert_rowid();
+            for part in &provenance.content_parts {
+                db.conn.execute("insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin)
+                    values (?1,?2,?3,?4,?5,?6)", params![id,part.ordinal,i64::try_from(part.start_char).unwrap(),i64::try_from(part.end_char).unwrap(),part.authorship.as_str(),part.origin.as_str()]).unwrap();
+            }
+            if eligible {
+                expected.push(seq);
+            }
+            seq += 1;
+        };
+        for (authorship, user, unknown) in [
+            (MessageAuthorship::Human, true, false),
+            (MessageAuthorship::Unknown, false, true),
+            (MessageAuthorship::Agent, false, false),
+            (MessageAuthorship::Harness, false, false),
+            (MessageAuthorship::Generated, false, false),
+        ] {
+            for (input_origin, positive) in [
+                (None, false),
+                (Some(I::Unknown), false),
+                (Some(I::DirectConversation), true),
+                (Some(I::Queued), true),
+                (Some(I::InteractiveAnswer), true),
+            ] {
+                for record_relation in [R::Original, R::Unknown, R::Mirror] {
+                    insert(
+                        MessageProvenance {
+                            authorship,
+                            input_origin,
+                            record_relation,
+                            ..Default::default()
+                        },
+                        record_relation != R::Mirror && (user || (unknown && positive)),
+                    );
+                }
+            }
+        }
+        for authorship in [A::Human, A::Unknown, A::Agent, A::Harness] {
+            for origin in [
+                O::DirectInput,
+                O::QuotedContent,
+                O::Unknown,
+                O::HarnessContext,
+                O::GeneratedSummary,
+                O::ToolPayload,
+            ] {
+                for record_relation in [R::Original, R::Unknown, R::Mirror] {
+                    let eligible = record_relation != R::Mirror
+                        && match origin {
+                            O::DirectInput => matches!(authorship, A::Human | A::Unknown),
+                            O::QuotedContent | O::Unknown => authorship == A::Human,
+                            _ => false,
+                        };
+                    insert(
+                        MessageProvenance {
+                            authorship: MessageAuthorship::Mixed,
+                            record_relation,
+                            content_parts: vec![
+                                MessageContentPart {
+                                    ordinal: 0,
+                                    start_char: 0,
+                                    end_char: 6,
+                                    authorship,
+                                    origin,
+                                },
+                                MessageContentPart {
+                                    ordinal: 1,
+                                    start_char: 6,
+                                    end_char: 16,
+                                    authorship: A::Generated,
+                                    origin: O::ToolPayload,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        eligible,
+                    );
+                }
+            }
+        }
+        for (query, match_mode) in [
+            ("needle", MessageSearchMode::Literal),
+            ("^needle$", MessageSearchMode::Regex),
+            ("ndl", MessageSearchMode::Fuzzy),
+            ("", MessageSearchMode::Literal),
+        ] {
+            let filters = MessageFilters {
+                input_scope: MessageInputScope::UserInput,
+                match_mode,
+                limit: 1000,
+                ..Default::default()
+            };
+            let hits = db.search_messages(query, &filters).unwrap();
+            let mut actual = hits.iter().map(|hit| hit.seq).collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{match_mode:?} {query:?}");
+            assert_eq!(
+                db.filtered_corpus_count(&filters).unwrap() as usize,
+                expected.len()
+            );
+        }
+    }
+
+    #[test]
     fn human_content_selection_preserves_source_spans_and_filters_before_paging() {
-        use crate::models::ContentAuthorshipSelection;
+        use crate::models::MessageInputScope;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn.execute_batch(
@@ -8546,7 +9092,7 @@ mod tests {
                     (902, 3, 27, 31, 'human', 'direct_input');"
         ).unwrap();
         let filters = MessageFilters {
-            content_authorship: ContentAuthorshipSelection::Human,
+            input_scope: MessageInputScope::UserInput,
             limit: 1,
             ..Default::default()
         };
@@ -13499,10 +14045,11 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.mark_schema_current().unwrap();
         db.conn
-            .execute_batch(
+            .execute(
                 "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, parse_warning, discovery_source) values
-                 ('claude:current','claude','current','','/a','claude-v6',null,'jsonl'),
+                 ('claude:current','claude','current','','/a',?1,null,'jsonl'),
                  ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl');",
+                [crate::util::provider_parse_version(Provider::Claude)],
             )
             .unwrap();
         db.conn
@@ -13524,12 +14071,154 @@ mod tests {
             .iter()
             .find(|item| item.provider == Provider::Claude)
             .unwrap();
-        assert_eq!(claude.expected_parse_version, "claude-v6");
+        assert_eq!(
+            claude.expected_parse_version,
+            crate::util::provider_parse_version(Provider::Claude)
+        );
         assert_eq!((claude.current_sessions, claude.stale_sessions), (1, 1));
         assert_eq!(
             db.stale_session_sources().unwrap(),
             vec![(Provider::Claude, "/b".to_string())]
         );
+    }
+
+    #[test]
+    fn unique_legacy_tool_result_upgrade_keeps_row_identity_and_rolls_back() {
+        use crate::models::{ContentPartAuthorship, ContentPartOrigin, MessageContentPart};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut old = crate::util::minimal_record(
+            Provider::Codex,
+            Path::new("/fixture/answer.jsonl"),
+            String::new(),
+        );
+        old.session.parse_version = "codex-v5".into();
+        old.messages = crate::util::to_messages_with_tools(vec![
+            crate::util::RawMessage::tool_result_with_name(
+                Some("request_user_input".into()),
+                "raw output".into(),
+                Some("call-1"),
+                None,
+            ),
+        ]);
+        db.upsert_session(&old, 1, 1).unwrap();
+        let row_id: i64 = db
+            .conn
+            .query_row("select id from messages", [], |row| row.get(0))
+            .unwrap();
+        let mut current = old.clone();
+        current.session.parse_version = crate::util::provider_parse_version(Provider::Codex).into();
+        current.messages[0].content = "raw output\nanswer α".into();
+        current.messages[0].provenance.authorship = crate::models::MessageAuthorship::Mixed;
+        current.messages[0].provenance.content_parts = vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 11,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::ToolPayload,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 11,
+                end_char: 19,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+        ];
+        db.conn.execute_batch("create trigger fail_answer_upgrade before update on messages begin select raise(abort, 'fixture upgrade failure'); end;").unwrap();
+        assert!(db.upsert_session(&current, 2, 2).is_err());
+        assert_eq!(db.message_count().unwrap(), 1);
+        let version: String = db
+            .conn
+            .query_row("select parse_version from sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, "codex-v5");
+        db.conn
+            .execute_batch("drop trigger fail_answer_upgrade;")
+            .unwrap();
+        for stamp in [2, 3] {
+            db.upsert_session(&current, stamp, stamp).unwrap();
+            assert_eq!(db.message_count().unwrap(), 1);
+            assert_eq!(
+                db.conn
+                    .query_row("select id from messages", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                row_id
+            );
+        }
+        assert_eq!(
+            db.search_messages(
+                "answer α",
+                &MessageFilters {
+                    input_scope: crate::models::MessageInputScope::UserInput,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_tool_result_upgrade_preserves_ambiguous_and_conflicting_events() {
+        for case in [
+            "stored duplicate",
+            "parsed duplicate",
+            "native conflict",
+            "missing relation",
+            "tool call",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
+            let mut old = crate::util::minimal_record(
+                Provider::Codex,
+                Path::new("/fixture/legacy-result.jsonl"),
+                String::new(),
+            );
+            old.session.parse_version = "codex-v5".into();
+            old.messages = crate::util::to_messages_with_tools(vec![
+                crate::util::RawMessage::tool_result_with_name(
+                    Some("request_user_input".into()),
+                    "old output".into(),
+                    Some("call-1"),
+                    None,
+                ),
+            ]);
+            let mut current = old.clone();
+            current.session.parse_version =
+                crate::util::provider_parse_version(Provider::Codex).into();
+            current.messages[0].content = "old output\nnew answer".into();
+            match case {
+                "stored duplicate" => old.messages.push(old.messages[0].clone()),
+                "parsed duplicate" => current.messages.push(current.messages[0].clone()),
+                "native conflict" => {
+                    old.messages[0].provenance.correlation_identity =
+                        Some(crate::models::MessageCorrelationIdentity {
+                            authority: crate::models::MessageCorrelationAuthority::OpenAi,
+                            scope: "codex:fixture".into(),
+                            id: "old-event".into(),
+                        });
+                    current.messages[0].provenance.correlation_identity =
+                        Some(crate::models::MessageCorrelationIdentity {
+                            authority: crate::models::MessageCorrelationAuthority::OpenAi,
+                            scope: "codex:fixture".into(),
+                            id: "new-event".into(),
+                        });
+                }
+                "missing relation" => current.messages[0].tool_call_id = None,
+                "tool call" => old.messages[0].kind = crate::models::MessageKind::ToolCall,
+                _ => unreachable!(),
+            }
+            db.upsert_session(&old, 1, 1).unwrap();
+            db.upsert_session(&current, 2, 2).unwrap();
+            assert_eq!(
+                db.message_count().unwrap(),
+                i64::try_from(old.messages.len() + current.messages.len()).unwrap(),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -16728,6 +17417,34 @@ mod tests {
             messages,
             file_edits: Vec::new(),
         }
+    }
+
+    #[test]
+    fn gemini_family_map_keeps_three_way_path_conflicts_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for index in 0..3 {
+            let mut parsed = parsed_with_messages(&format!("gemini-cli:family-{index}"), &[]);
+            parsed.session.provider = Provider::GeminiCli;
+            parsed.session.source_path = format!("/fixture/{index}.jsonl");
+            parsed.session.raw_metadata_json = Some(
+                serde_json::json!({
+                    "gemini_migration_family": {
+                        "native_session_id":format!("native-{index}"),
+                    "predecessor_json":"/fixture/shared.json",
+                        "successor_jsonl":parsed.session.source_path
+                    }
+                })
+                .to_string(),
+            );
+            db.upsert_session(&parsed, 0, 0).unwrap();
+        }
+        let families = db.gemini_family_sessions_by_path().unwrap();
+        assert!(
+            !families.contains_key("/fixture/shared.json"),
+            "a third claimant cannot restore an ambiguous mapping"
+        );
+        assert_eq!(families.len(), 3);
     }
 
     #[test]

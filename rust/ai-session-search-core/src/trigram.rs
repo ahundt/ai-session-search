@@ -258,13 +258,14 @@ fn fts5_leaves_uppercase_unfolded(lowercase: char) -> bool {
 ///
 /// A row containing the literal contains every trigram of it, so requiring them all selects a
 /// SUPERSET of matching rows (non-adjacent occurrences are fine; the caller verifies). That holds
-/// only for trigrams FTS5 tokenizes the same way on both sides, so three kinds of position are
+/// only for trigrams FTS5 tokenizes the same way on both sides, so unsafe positions are
 /// left out, and the trigrams of every remaining run of at least three characters are required:
 ///
 /// - a grapheme whose lowercase spans several scalars (U+0130 lowercases to `i` + U+0307), which
 ///   FTS5 folds one scalar at a time;
 /// - a lowercase form whose uppercase FTS5 does not fold to it ([`FTS5_UNFOLDED_LOWERCASE`]);
 /// - a leading U+0307, which a stored U+0130 can supply as the second half of its fold.
+/// - NUL, which terminates FTS5 query strings; usable runs on either side remain selective.
 ///
 /// A final `i` can be supplied by a stored U+0130 too, which FTS5 keeps as itself, so the
 /// trigram ending there becomes two alternatives, one spelled with each. Leaving it out instead
@@ -283,11 +284,12 @@ fn literal_to_trigrams(text: &str) -> Option<Vec<Vec<String>>> {
     let mut chars: Vec<(char, bool)> = Vec::with_capacity(lowercase.len());
     for grapheme in lowercase.graphemes(true) {
         let expands = grapheme.chars().count() > 1;
-        chars.extend(
-            grapheme
-                .chars()
-                .map(|c| (c, !expands && !fts5_leaves_uppercase_unfolded(c))),
-        );
+        chars.extend(grapheme.chars().map(|c| {
+            (
+                c,
+                c != '\0' && !expands && !fts5_leaves_uppercase_unfolded(c),
+            )
+        }));
     }
     if let Some(first) = chars.first_mut() {
         if first.0 == '\u{307}' {
@@ -367,6 +369,16 @@ fn seq_to_groups(seq: &Seq) -> Option<(usize, Vec<Vec<String>>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_is_not_rendered_into_fts_queries_but_safe_runs_stay_indexed() {
+        for pattern in ["\0abc", r"\x00abc", "abc\0def"] {
+            let prefilter = trigram_prefilter(pattern).unwrap();
+            assert!(!prefilter.contains('\0'));
+            assert!(prefilter.contains("abc"));
+        }
+        assert!(trigram_prefilter("a\0b").is_none());
+    }
 
     /// Parse the `"..."`-quoted terms back out of an OR query (test helper).
     fn quoted_literals(query: &str) -> Vec<String> {

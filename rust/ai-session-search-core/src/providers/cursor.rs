@@ -149,6 +149,27 @@ impl CursorAdapter {
                 );
                 super::claude::collect_tool_use_names(message, &mut tool_use_names);
                 super::claude::append_tool_use_messages(message, updated_at, &mut messages);
+                if role == "user" {
+                    if let Some(mixed) = super::claude::claude_mixed_user_content(
+                        message,
+                        &value,
+                        spawned.is_some(),
+                        &tool_use_names,
+                        false,
+                        None,
+                    ) {
+                        let (raw_message, transcript_text) = mixed.into_raw_message(updated_at);
+                        messages.push(raw_message);
+                        if !transcript_text.is_empty() {
+                            transcript_lines.push(format_transcript_line(
+                                "user",
+                                updated_at,
+                                &transcript_text,
+                            ));
+                        }
+                        continue;
+                    }
+                }
                 if role == "user" && super::claude::is_tool_result(message) {
                     let output = extract_text(message);
                     let output = output.trim();
@@ -590,6 +611,170 @@ mod tests {
         // Tool payloads stay out of the human transcript.
         assert!(!parsed.transcript_text.contains("edit applied"));
         assert!(!parsed.transcript_text.contains("ApplyPatch"));
+    }
+
+    #[test]
+    fn mixed_cursor_user_blocks_keep_direct_input_and_tool_output_separate() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        let session_id = "22222222-3333-4444-5555-666666666666";
+        let dir = root
+            .join("Users-x-proj")
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &path,
+            concat!(
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"tu_read","name":"Read","input":{}}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"direct cursor input 🦀"},{"type":"tool_result","tool_use_id":"tu_read","content":"generated tool output"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = CursorAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let message = parsed
+            .messages
+            .iter()
+            .find(|message| message.role == crate::models::Role::User)
+            .expect("mixed user record remains one conversation row");
+        assert_eq!(
+            message.content,
+            "direct cursor input 🦀\ngenerated tool output"
+        );
+        assert_eq!(
+            message.provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert!(message.provenance.content_parts.iter().any(|part| {
+            part.authorship == crate::models::ContentPartAuthorship::Human
+                && part.origin == crate::models::ContentPartOrigin::DirectInput
+        }));
+        assert!(message.provenance.content_parts.iter().any(|part| {
+            part.authorship == crate::models::ContentPartAuthorship::Generated
+                && part.origin == crate::models::ContentPartOrigin::ToolPayload
+        }));
+        message.provenance.validate(&message.content).unwrap();
+        assert!(parsed.transcript_text.contains("direct cursor input 🦀"));
+        assert!(!parsed.transcript_text.contains("generated tool output"));
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        let mut old = parsed.clone();
+        old.session.parse_version = "cursor-v4".into();
+        let old_mixed = old
+            .messages
+            .iter_mut()
+            .find(|message| message.role == crate::models::Role::User)
+            .unwrap();
+        old_mixed.role = crate::models::Role::Tool;
+        old_mixed.kind = crate::models::MessageKind::ToolResult;
+        old_mixed.provenance.authorship = crate::models::MessageAuthorship::Generated;
+        old_mixed.provenance.content_parts.clear();
+        old_mixed.provenance.input_origin = None;
+        db.upsert_session(&old, 0, 0).unwrap();
+        let stored = rusqlite::Connection::open(temp.path().join("index.db")).unwrap();
+        let old_id: i64 = stored
+            .query_row(
+                "select id from messages where kind='tool_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let new_id: i64 = stored
+            .query_row("select id from messages where role='user'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            old_id, new_id,
+            "mixed-role upgrade retains the original message reference"
+        );
+        assert_eq!(
+            db.message_count().unwrap(),
+            i64::try_from(parsed.messages.len()).unwrap()
+        );
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        for (query, expected) in [("direct cursor input 🦀", 1), ("generated tool output", 0)] {
+            let request = crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(query).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .input_scope(crate::models::MessageInputScope::UserInput)
+            .build()
+            .unwrap();
+            assert_eq!(service.search(request).unwrap().hits().len(), expected);
+        }
+    }
+
+    #[test]
+    fn cursor_does_not_promote_claude_native_tool_use_result_fields() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        let session_id = "33333333-4444-5555-6666-777777777777";
+        let dir = root
+            .join("Users-x-proj")
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &path,
+            concat!(
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"ask-cursor","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"ask-cursor","content":"The user responded: cursor wrapper"}]},"tool_use_result":{"response":"cursor native answer"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let adapter = CursorAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        assert!(parsed
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("cursor native answer")));
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| message.content.contains("cursor wrapper")));
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let request = |query| {
+            crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(query).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .input_scope(crate::models::MessageInputScope::UserInput)
+            .build()
+            .unwrap()
+        };
+        assert!(service
+            .search(request("cursor native answer"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert!(service
+            .search(request("cursor wrapper"))
+            .unwrap()
+            .hits()
+            .is_empty());
     }
 
     #[test]

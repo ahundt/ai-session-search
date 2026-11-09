@@ -1055,6 +1055,40 @@ pub fn extract_text(value: &Value) -> String {
     parts.join("\n")
 }
 
+/// Borrow ordered scalar regions in O(B + P) time and O(P) range memory, for B content bytes
+/// and P selected parts. Invalid or overlapping ranges fail rather than clamping to source text.
+pub(crate) fn content_part_regions<'a>(
+    content: &'a str,
+    parts: impl IntoIterator<Item = &'a MessageContentPart>,
+) -> Result<Vec<(&'a MessageContentPart, &'a str)>> {
+    let mut regions = Vec::new();
+    let mut chars = content.char_indices();
+    let (mut scalar, mut byte) = (0, 0);
+    for part in parts {
+        anyhow::ensure!(
+            part.start_char >= scalar && part.end_char > part.start_char,
+            "content parts must have ordered nonempty scalar ranges"
+        );
+        while scalar < part.start_char {
+            let (index, character) = chars
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("content part starts beyond message content"))?;
+            byte = index + character.len_utf8();
+            scalar += 1;
+        }
+        let start_byte = byte;
+        while scalar < part.end_char {
+            let (index, character) = chars
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("content part ends beyond message content"))?;
+            byte = index + character.len_utf8();
+            scalar += 1;
+        }
+        regions.push((part, &content[start_byte..byte]));
+    }
+    Ok(regions)
+}
+
 pub fn substantive_text(value: &str) -> bool {
     let normalized = value.trim();
     if normalized.is_empty() {
@@ -1366,6 +1400,12 @@ impl RawMessage {
         self
     }
 
+    /// Retain a single native tool relation on a mixed conversation record without changing its kind.
+    pub(crate) fn with_tool_call_id(mut self, id: Option<String>) -> Self {
+        self.tool_call_id = id;
+        self
+    }
+
     /// Attach provider evidence about an input queue lifecycle without implying model receipt.
     pub fn with_input_delivery_state(mut self, state: InputDeliveryState) -> Self {
         self.provenance.input_delivery_state = Some(state);
@@ -1578,6 +1618,13 @@ where
                     inferred
                 }
             });
+            if provenance.input_origin.is_none()
+                && provenance.authorship == MessageAuthorship::Human
+                && matches!(normalized, Role::User | Role::Slash)
+                && matches!(kind, MessageKind::Conversation | MessageKind::Unknown)
+            {
+                provenance.input_origin = Some(MessageInputOrigin::DirectConversation);
+            }
             if let Some((authority, id)) = raw.native_event_identity {
                 let scope = correlation_scope.expect(
                     "provider-native event identity requires to_messages_with_tools_in_scope",
@@ -1609,6 +1656,33 @@ mod role_classification_tests {
     use crate::models::{
         MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind, MessageRecordRelation,
     };
+
+    #[test]
+    fn content_part_regions_preserve_scalars_and_reject_invalid_ranges() {
+        use crate::models::{ContentPartAuthorship, ContentPartOrigin};
+        let content = "é🦀e\u{301}\nx";
+        let part = |ordinal, start_char, end_char| MessageContentPart {
+            ordinal,
+            start_char,
+            end_char,
+            authorship: ContentPartAuthorship::Unknown,
+            origin: ContentPartOrigin::DirectInput,
+        };
+        let parts = [part(0, 0, 2), part(1, 3, 6)];
+        let regions = content_part_regions(content, &parts).unwrap();
+        assert_eq!(
+            regions.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+            ["é🦀", "\u{301}\nx"]
+        );
+        assert!(content_part_regions(content, &[]).unwrap().is_empty());
+        for invalid in [
+            vec![part(0, 0, 7)],
+            vec![part(0, 2, 2)],
+            vec![part(0, 0, 3), part(1, 2, 4)],
+        ] {
+            assert!(content_part_regions(content, &invalid).is_err());
+        }
+    }
 
     #[test]
     fn explicit_authorship_survives_session_evidence() {
@@ -1683,6 +1757,13 @@ mod role_classification_tests {
                     MessageAuthorship::Generated,
                 ]
             );
+            let origin = (expected == MessageAuthorship::Human)
+                .then_some(MessageInputOrigin::DirectConversation);
+            assert_eq!(messages[0].provenance.input_origin, origin);
+            assert_eq!(messages[1].provenance.input_origin, origin);
+            assert!(messages[2..]
+                .iter()
+                .all(|message| message.provenance.input_origin.is_none()));
         }
     }
 
@@ -1919,15 +2000,15 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v6",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v6",
-        Provider::Codex => "codex-v5",
-        Provider::Cursor => "cursor-v4",
-        Provider::Antigravity => "antigravity-v3",
-        Provider::Pi => "pi-v3",
-        Provider::PrimeAgent => "prime-agent-v1",
+        Provider::Claude => "claude-v7",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v7",
+        Provider::Codex => "codex-v6",
+        Provider::Cursor => "cursor-v5",
+        Provider::Antigravity => "antigravity-v4",
+        Provider::Pi => "pi-v4",
+        Provider::PrimeAgent => "prime-agent-v2",
         Provider::AiStudio => "aistudio-v3",
-        Provider::GeminiCli => "gemini-cli-v4",
+        Provider::GeminiCli => "gemini-cli-v5",
     }
 }
 

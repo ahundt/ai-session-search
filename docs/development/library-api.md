@@ -12,28 +12,25 @@ the [configuration guide](configuration.md).
 
 ## Python
 
-For historical human input across storage roles, pass
-`MessageSearchRequest(content_authorship="human")` without a role filter. `human` searches
-only structurally attributed human regions of source-original messages, including mixed tool
-answers; omitted or `"any"` searches complete content. Human selection requires `field="content"`.
-All other filters intersect normally. Matches retain original Unicode-scalar coordinates and
-cannot bridge generated regions. Views and context can still contain nonhuman text. Human
-results include provenance. In Rust, use
-`MessageSearchRequest::builder(...).content_authorship(ContentAuthorshipSelection::Human)`;
+For historical user input across storage roles, pass
+`MessageSearchRequest(input_scope="user_input")` without a role filter. This selects recorded
+prompts, queued submissions and linked answer regions; omitted or `"any"` searches complete
+content. User-input selection requires `field="content"`. Other filters intersect normally.
+Match coordinates count Unicode scalars in indexed message content and cannot bridge generated
+regions. Views and context may still include generated text. Results include source provenance. In Rust, use
+`MessageSearchRequest::builder(...).input_scope(MessageInputScope::UserInput)`;
 the enum lives in `ai_session_search::models`.
 
-Claude queue operations in older transcripts lack a per-item author receipt and identities
-linking submission, removal and delivery. They are stored as `authorship=unknown`,
-`input_origin=queued`, and `input_delivery_state=submitted`. Recover them with the default
-`content_authorship="any"` without a role filter; human-only search excludes them. Matching text
-in a later user message does not prove identity. Recurrence and correction analytics exclude
-queued-origin records to avoid counting unverified delivery copies twice. Direct messages and
-structurally linked interactive answers remain eligible for those analytics.
+Legacy Claude queue operations lack per-item sender receipts and links proving delivery. They
+remain `authorship=unknown`, `input_origin=queued`, and `input_delivery_state=submitted`, while
+`input_scope="user_input"` still finds the recorded submission. Matching a later message by text
+alone does not prove identity. Recurrence/correction analytics keep their stricter attribution
+rules and exclude unverified queue copies; their existing behavior is unchanged.
 
 Recurrence analytics retain their existing projection that joins human fragments within a
 message. Their query coordinates and phrase grouping describe that projection. Message search
-with `content_authorship="human"` instead matches contiguous original regions and reports source
-coordinates; it never joins across generated gaps.
+with `input_scope="user_input"` instead matches contiguous original regions and reports
+coordinates within the indexed message; it never joins across generated gaps.
 
 `SessionSearch` owns the configuration, the database handle, and the worker
 pool. Query objects are immutable mirrors of the Rust request types, so one you

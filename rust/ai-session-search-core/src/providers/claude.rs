@@ -306,10 +306,26 @@ impl ClaudeAdapter {
                             observe_session_end(&mut updated_at, timestamp);
                             let mut raw_message =
                                 RawMessage::message("user", content.clone(), timestamp, None)
-                                    // Legacy queue rows carry no sender or per-item origin.
-                                    .with_authorship(MessageAuthorship::Unknown)
-                                    .with_input_delivery_state(InputDeliveryState::Submitted)
-                                    .with_input_origin(MessageInputOrigin::Queued);
+                                    .with_input_delivery_state(InputDeliveryState::Submitted);
+                            // Legacy queue rows carry no sender or per-item origin. If a future
+                            // producer includes the SDK's native origin, preserve it: a known
+                            // generated/unclassified row must not become UserInput merely because
+                            // queue delivery is known, while direct/channel/scheduled input keeps
+                            // the queue origin and its submitted lifecycle evidence.
+                            match claude_native_message_semantics(&value) {
+                                Some(semantics) => {
+                                    raw_message = raw_message.with_authorship(semantics.authorship);
+                                    if semantics.input_origin.is_some() {
+                                        raw_message = raw_message
+                                            .with_input_origin(MessageInputOrigin::Queued);
+                                    }
+                                }
+                                None => {
+                                    raw_message = raw_message
+                                        .with_authorship(MessageAuthorship::Unknown)
+                                        .with_input_origin(MessageInputOrigin::Queued);
+                                }
+                            }
                             if let Some(event_id) = event_id {
                                 raw_message = raw_message.with_native_event_identity(
                                     MessageCorrelationAuthority::Anthropic,
@@ -343,14 +359,17 @@ impl ClaudeAdapter {
                 continue;
             }
 
-            if value
-                .get("toolUseResult")
-                .and_then(Value::as_object)
-                .and_then(|result| result.get("answers"))
-                .is_some_and(Value::is_object)
-            {
+            if claude_tool_use_result(&value).is_some_and(|result| {
+                result.get("answers").is_some_and(Value::is_object)
+                    || result.get("response").is_some_and(Value::is_string)
+            }) {
                 requires_full_parse_for_tail = true;
             }
+
+            // Claude Code and Claude Desktop SDK user records carry this optional, structural
+            // origin metadata on the outer record. Absence is intentionally left unresolved so
+            // the legacy session-level evidence below remains unchanged.
+            let native_semantics = claude_native_message_semantics(&value);
 
             let mut role = value
                 .get("type")
@@ -360,7 +379,6 @@ impl ClaudeAdapter {
             let mut tool_result = false;
             let mut tool_name: Option<String> = None;
             let mut tool_call_id: Option<String> = None;
-            let mut ask_user_tool_result = false;
             let mut mixed_user_content = None;
 
             if let Some(message) = value.get("message") {
@@ -371,8 +389,14 @@ impl ClaudeAdapter {
                     .or(role);
                 text = extract_text(message);
                 if role.as_deref() == Some("user") {
-                    mixed_user_content =
-                        claude_mixed_user_content(message, &value, subagent, &tool_use_names);
+                    mixed_user_content = claude_mixed_user_content(
+                        message,
+                        &value,
+                        subagent,
+                        &tool_use_names,
+                        true,
+                        native_semantics,
+                    );
                 }
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
@@ -390,22 +414,6 @@ impl ClaudeAdapter {
                         tool_name = tool_use_names.get(id).cloned();
                     }
                 }
-                ask_user_tool_result = message
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|block| {
-                            block.get("type").and_then(Value::as_str) == Some("tool_result")
-                                && block
-                                    .get("tool_use_id")
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|id| {
-                                        tool_use_names
-                                            .get(id)
-                                            .is_some_and(|name| is_ask_user_tool_name(name))
-                                    })
-                        })
-                    });
             } else if let Some(message) = value.get("content").and_then(Value::as_str) {
                 text = message.to_string();
             }
@@ -444,15 +452,7 @@ impl ClaudeAdapter {
                     if let Some(mixed) = mixed_user_content {
                         observe_session_start(&mut created_at, timestamp);
                         observe_session_end(&mut updated_at, timestamp);
-                        let mut raw_message =
-                            RawMessage::message("user", mixed.content, timestamp, None);
-                        if let Some(parts) = mixed.parts {
-                            raw_message = raw_message.with_content_parts(parts);
-                        }
-                        if mixed.has_interactive_answer {
-                            raw_message = raw_message
-                                .with_input_origin(MessageInputOrigin::InteractiveAnswer);
-                        }
+                        let (mut raw_message, transcript_text) = mixed.into_raw_message(timestamp);
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::Anthropic,
@@ -460,11 +460,11 @@ impl ClaudeAdapter {
                             );
                         }
                         messages.push(raw_message);
-                        if !mixed.transcript_text.is_empty() {
+                        if !transcript_text.is_empty() {
                             transcript_lines.push(format_transcript_line(
                                 "user",
                                 timestamp,
-                                &mixed.transcript_text,
+                                &transcript_text,
                             ));
                         }
                         continue;
@@ -490,27 +490,12 @@ impl ClaudeAdapter {
                         continue;
                     }
                     if tool_result {
-                        let answer_attribution = if ask_user_tool_result && !subagent {
-                            interactive_answer_attribution(&value, &text)
-                        } else {
-                            None
-                        };
                         let mut raw_message = RawMessage::tool_result_with_name(
                             tool_name,
                             text,
                             tool_call_id.as_deref(),
                             timestamp,
                         );
-                        if let Some(attribution) = answer_attribution {
-                            raw_message = match attribution {
-                                InteractiveAnswerAttribution::WholeHuman => raw_message
-                                    .with_authorship(MessageAuthorship::Human)
-                                    .with_input_origin(MessageInputOrigin::InteractiveAnswer),
-                                InteractiveAnswerAttribution::Mixed(parts) => raw_message
-                                    .with_content_parts(parts)
-                                    .with_input_origin(MessageInputOrigin::InteractiveAnswer),
-                            };
-                        }
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::Anthropic,
@@ -522,12 +507,21 @@ impl ClaudeAdapter {
                     }
                     observe_session_start(&mut created_at, timestamp);
                     observe_session_end(&mut updated_at, timestamp);
+                    let is_user_role = role.as_deref() == Some("user");
                     let mut raw_message = RawMessage::message(
                         role.unwrap_or_default(),
                         text.clone(),
                         timestamp,
                         None,
                     );
+                    if is_user_role {
+                        if let Some(semantics) = native_semantics {
+                            raw_message = raw_message.with_authorship(semantics.authorship);
+                            if let Some(origin) = semantics.input_origin {
+                                raw_message = raw_message.with_input_origin(origin);
+                            }
+                        }
+                    }
                     if let Some(event_id) = event_id {
                         raw_message = raw_message.with_native_event_identity(
                             MessageCorrelationAuthority::Anthropic,
@@ -698,18 +692,185 @@ impl ClaudeAdapter {
     }
 }
 
-struct ClaudeMixedUserContent {
+pub(crate) struct ClaudeMixedUserContent {
     content: String,
     parts: Option<Vec<MessageContentPart>>,
     transcript_text: String,
     has_interactive_answer: bool,
+    has_direct_text: bool,
+    native_authorship: Option<MessageAuthorship>,
+    native_input_origin: Option<MessageInputOrigin>,
+    tool_name: Option<String>,
+    tool_call_id: Option<String>,
 }
 
-fn claude_mixed_user_content(
+impl ClaudeMixedUserContent {
+    pub(crate) fn into_raw_message(self, timestamp: Option<DateTime<Utc>>) -> (RawMessage, String) {
+        let has_parts = self.parts.is_some();
+        let mut raw = if self.has_direct_text {
+            RawMessage::message("user", self.content, timestamp, self.tool_name)
+                .with_tool_call_id(self.tool_call_id)
+        } else {
+            RawMessage::tool_result_with_name(
+                self.tool_name,
+                self.content,
+                self.tool_call_id.as_deref(),
+                timestamp,
+            )
+        };
+        if let Some(parts) = self.parts {
+            raw = raw.with_content_parts(parts);
+        }
+        if self.has_interactive_answer {
+            raw = raw.with_input_origin(MessageInputOrigin::InteractiveAnswer);
+            if !has_parts {
+                raw =
+                    raw.with_authorship(self.native_authorship.unwrap_or(MessageAuthorship::Human));
+            }
+        } else if self.has_direct_text {
+            if let Some(origin) = self.native_input_origin {
+                raw = raw.with_input_origin(origin);
+            }
+            if !has_parts {
+                if let Some(authorship) = self.native_authorship {
+                    raw = raw.with_authorship(authorship);
+                }
+            }
+        }
+        (raw, self.transcript_text)
+    }
+}
+
+/// Exact source-native fields from Claude's SDK user-message envelope. This stays private: the
+/// public model already has the authorship/origin vocabulary needed by search and persistence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClaudeNativeMessageSemantics {
+    authorship: MessageAuthorship,
+    content_authorship: ContentPartAuthorship,
+    content_origin: ContentPartOrigin,
+    input_origin: Option<MessageInputOrigin>,
+    allow_interactive_answers: bool,
+}
+
+fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageSemantics> {
+    if let Some(is_synthetic) = value.get("isSynthetic") {
+        match is_synthetic.as_bool() {
+            Some(true) => {
+                return Some(ClaudeNativeMessageSemantics {
+                    authorship: MessageAuthorship::Generated,
+                    content_authorship: ContentPartAuthorship::Generated,
+                    content_origin: ContentPartOrigin::GeneratedSummary,
+                    input_origin: None,
+                    allow_interactive_answers: false,
+                });
+            }
+            Some(false) => {}
+            None => {
+                return Some(ClaudeNativeMessageSemantics {
+                    authorship: MessageAuthorship::Unknown,
+                    content_authorship: ContentPartAuthorship::Unknown,
+                    content_origin: ContentPartOrigin::Unknown,
+                    input_origin: None,
+                    allow_interactive_answers: false,
+                });
+            }
+        }
+    }
+
+    // SDK streams can interleave child messages in a main-session log. These fields identify
+    // that child context; a missing origin must not inherit the main session's input fallback.
+    if value.get("origin").is_none()
+        && value.get("type").and_then(Value::as_str) == Some("user")
+        && ["agent_id", "parent_tool_use_id"].iter().any(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        })
+    {
+        return Some(ClaudeNativeMessageSemantics {
+            authorship: MessageAuthorship::Agent,
+            content_authorship: ContentPartAuthorship::Agent,
+            content_origin: ContentPartOrigin::DirectInput,
+            input_origin: None,
+            allow_interactive_answers: false,
+        });
+    }
+    let origin = value.get("origin")?;
+    let Some(origin) = origin.as_object() else {
+        return Some(ClaudeNativeMessageSemantics {
+            authorship: MessageAuthorship::Unknown,
+            content_authorship: ContentPartAuthorship::Unknown,
+            content_origin: ContentPartOrigin::Unknown,
+            input_origin: None,
+            allow_interactive_answers: false,
+        });
+    };
+    let kind = origin.get("kind").and_then(Value::as_str);
+    let direct_input = match kind {
+        Some("human") | Some("channel") => true,
+        Some("task-notification") => {
+            origin.get("subkind").and_then(Value::as_str) == Some("scheduled-trigger")
+        }
+        _ => false,
+    };
+    let (authorship, content_authorship) = match kind {
+        Some("human") => (MessageAuthorship::Human, ContentPartAuthorship::Human),
+        Some("channel") | Some("task-notification") if direct_input => {
+            (MessageAuthorship::Unknown, ContentPartAuthorship::Unknown)
+        }
+        Some("peer") | Some("coordinator") => {
+            (MessageAuthorship::Agent, ContentPartAuthorship::Agent)
+        }
+        Some("task-notification")
+            if origin.get("subkind").and_then(Value::as_str) == Some("peer-send-message") =>
+        {
+            (MessageAuthorship::Agent, ContentPartAuthorship::Agent)
+        }
+        Some("task-notification") => (
+            MessageAuthorship::Generated,
+            ContentPartAuthorship::Generated,
+        ),
+        Some("auto-continuation") | Some("unclassified") => (
+            MessageAuthorship::Generated,
+            ContentPartAuthorship::Generated,
+        ),
+        _ => (MessageAuthorship::Unknown, ContentPartAuthorship::Unknown),
+    };
+    let content_origin = match kind {
+        Some("human") | Some("channel") | Some("task-notification") if direct_input => {
+            ContentPartOrigin::DirectInput
+        }
+        Some("auto-continuation") | Some("unclassified") | Some("task-notification") => {
+            ContentPartOrigin::GeneratedSummary
+        }
+        Some("peer") | Some("coordinator") => ContentPartOrigin::DirectInput,
+        _ => ContentPartOrigin::Unknown,
+    };
+    Some(ClaudeNativeMessageSemantics {
+        authorship,
+        content_authorship,
+        content_origin,
+        input_origin: direct_input.then_some(MessageInputOrigin::DirectConversation),
+        allow_interactive_answers: direct_input,
+    })
+}
+
+/// Claude Code uses camelCase while the SDK's documented user/replay envelope uses snake_case.
+/// Keep this translation in one accessor so tail markers, attribution, and rendering agree.
+fn claude_tool_use_result(value: &Value) -> Option<&Value> {
+    value
+        .get("toolUseResult")
+        .or_else(|| value.get("tool_use_result"))
+}
+
+pub(crate) fn claude_mixed_user_content(
     message: &Value,
     value: &Value,
     subagent: bool,
     tool_use_names: &HashMap<String, String>,
+    decode_native_answers: bool,
+    native_semantics: Option<ClaudeNativeMessageSemantics>,
 ) -> Option<ClaudeMixedUserContent> {
     let blocks = message.get("content")?.as_array()?;
     let has_tool_result = blocks
@@ -719,51 +880,112 @@ fn claude_mixed_user_content(
         block.get("type").and_then(Value::as_str) != Some("tool_result")
             && !extract_text(block).trim().is_empty()
     });
-    if !(has_tool_result && has_direct_text) {
+    if !has_tool_result {
         return None;
     }
 
-    let direct_authorship = if subagent {
-        ContentPartAuthorship::Agent
-    } else {
-        ContentPartAuthorship::Human
-    };
+    let direct_authorship = native_semantics
+        .map(|semantics| semantics.content_authorship)
+        .unwrap_or_else(|| {
+            if subagent {
+                ContentPartAuthorship::Agent
+            } else {
+                ContentPartAuthorship::Human
+            }
+        });
+    let direct_origin = native_semantics
+        .map(|semantics| semantics.content_origin)
+        .unwrap_or(ContentPartOrigin::DirectInput);
     let mut content = String::new();
     let mut content_chars = 0;
     let mut parts: Vec<MessageContentPart> = Vec::new();
     let mut transcript_parts = Vec::new();
     let mut has_interactive_answer = false;
+    let mut tool_result_count = 0;
+    let mut tool_name = None;
+    let mut tool_call_id = None;
+    let allow_interactive_answers = decode_native_answers
+        && native_semantics
+            .map(|semantics| semantics.allow_interactive_answers)
+            .unwrap_or(!subagent);
+    let interactive_results = blocks
+        .iter()
+        .filter(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| tool_use_names.get(id))
+                    .is_some_and(|name| is_ask_user_tool_name(name))
+        })
+        .count();
     for block in blocks {
-        let text = extract_text(block);
-        let text = text.trim();
+        let is_tool_result = block.get("type").and_then(Value::as_str) == Some("tool_result");
+        if is_tool_result {
+            tool_result_count += 1;
+            if tool_result_count == 1 {
+                tool_call_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                tool_name = tool_call_id
+                    .as_deref()
+                    .and_then(|id| tool_use_names.get(id))
+                    .cloned();
+            } else {
+                // One aggregate record may contain several independent results. A first
+                // call's id/name would misdescribe the other blocks, so keep the row's
+                // content but clear the ambiguous tool metadata.
+                tool_call_id = None;
+                tool_name = None;
+            }
+        }
+        let text = extract_text(block).trim().to_owned();
+        let linked_answer = is_tool_result
+            && allow_interactive_answers
+            && interactive_results == 1
+            && block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .and_then(|id| tool_use_names.get(id))
+                .is_some_and(|name| is_ask_user_tool_name(name));
+        let (text, attributed_answer) = if linked_answer {
+            interactive_answer_content(
+                value,
+                text,
+                native_semantics
+                    .map(|semantics| semantics.content_authorship)
+                    .unwrap_or(ContentPartAuthorship::Human),
+            )
+        } else {
+            (text, None)
+        };
         if text.is_empty() {
             continue;
         }
-        let is_tool_result = block.get("type").and_then(Value::as_str) == Some("tool_result");
         if !content.is_empty() {
             content.push('\n');
+            let separator_start = content_chars;
             content_chars += 1;
-            if let Some(previous) = parts.last_mut() {
+            if let Some(previous) = parts.last_mut().filter(|part| {
+                part.authorship == ContentPartAuthorship::Generated
+                    && part.origin == ContentPartOrigin::ToolPayload
+            }) {
                 previous.end_char += 1;
+            } else {
+                parts.push(content_part(
+                    parts.len() as u32,
+                    separator_start,
+                    content_chars,
+                    ContentPartAuthorship::Generated,
+                    ContentPartOrigin::ToolPayload,
+                ));
             }
         }
         let start_char = content_chars;
-        content.push_str(text);
+        content.push_str(&text);
         content_chars += text.chars().count();
         let end_char = content_chars;
-        let attributed_answer = if is_tool_result && !subagent {
-            block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .filter(|id| {
-                    tool_use_names
-                        .get(*id)
-                        .is_some_and(|name| is_ask_user_tool_name(name))
-                })
-                .and_then(|_| interactive_answer_attribution(value, text))
-        } else {
-            None
-        };
         if attributed_answer.is_some() {
             has_interactive_answer = true;
         }
@@ -786,13 +1008,20 @@ fn claude_mixed_user_content(
                 }
             }
         } else if is_tool_result {
-            parts.push(MessageContentPart {
-                ordinal: parts.len() as u32,
-                start_char,
-                end_char,
-                authorship: ContentPartAuthorship::Generated,
-                origin: ContentPartOrigin::ToolPayload,
-            });
+            if let Some(previous) = parts.last_mut().filter(|part| {
+                part.authorship == ContentPartAuthorship::Generated
+                    && part.origin == ContentPartOrigin::ToolPayload
+            }) {
+                previous.end_char = end_char;
+            } else {
+                parts.push(content_part(
+                    parts.len() as u32,
+                    start_char,
+                    end_char,
+                    ContentPartAuthorship::Generated,
+                    ContentPartOrigin::ToolPayload,
+                ));
+            }
         } else {
             transcript_parts.push(text.to_string());
             parts.push(MessageContentPart {
@@ -800,9 +1029,12 @@ fn claude_mixed_user_content(
                 start_char,
                 end_char,
                 authorship: direct_authorship,
-                origin: ContentPartOrigin::DirectInput,
+                origin: direct_origin,
             });
         }
+    }
+    if content.is_empty() {
+        return None;
     }
     // One linear pass over the retained partitions avoids fabricating `Mixed` when a structural
     // block (such as a tool reference) has no searchable text. No text or part is copied here.
@@ -817,6 +1049,11 @@ fn claude_mixed_user_content(
         parts: has_distinct_authorship.then_some(parts),
         transcript_text: transcript_parts.join("\n"),
         has_interactive_answer,
+        has_direct_text,
+        native_authorship: native_semantics.map(|semantics| semantics.authorship),
+        native_input_origin: native_semantics.and_then(|semantics| semantics.input_origin),
+        tool_name,
+        tool_call_id,
     })
 }
 
@@ -1173,6 +1410,125 @@ enum InteractiveAnswerAttribution {
     Mixed(Vec<MessageContentPart>),
 }
 
+/// Keep native answers findable even when the display omits them. Existing wrapper bytes stay
+/// generated; only unrepresented decoded values are appended, with generated separators.
+/// With A answers, B display bytes and N native payload bytes: expected O(N + A*B + A log A)
+/// time, O(N + B + A) peak state and O(B + T + A) retained output for T answer bytes.
+fn interactive_answer_content(
+    value: &Value,
+    mut content: String,
+    answer_authorship: ContentPartAuthorship,
+) -> (String, Option<InteractiveAnswerAttribution>) {
+    let attribution = interactive_answer_attribution(value, &content, answer_authorship);
+    let mut parts = match attribution {
+        Some(InteractiveAnswerAttribution::WholeHuman) => vec![content_part(
+            0,
+            0,
+            content.chars().count(),
+            answer_authorship,
+            ContentPartOrigin::DirectInput,
+        )],
+        Some(InteractiveAnswerAttribution::Mixed(parts)) => parts,
+        None if !content.is_empty() => vec![content_part(
+            0,
+            0,
+            content.chars().count(),
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        )],
+        None => Vec::new(),
+    };
+    let mut represented = HashMap::<String, usize>::new();
+    for part in parts
+        .iter()
+        .filter(|part| part.authorship == answer_authorship)
+    {
+        let text = content
+            .chars()
+            .skip(part.start_char)
+            .take(part.end_char - part.start_char)
+            .collect();
+        *represented.entry(text).or_default() += 1;
+    }
+    let result = claude_tool_use_result(value);
+    let values: Vec<&str> = if let Some(response) = result
+        .and_then(|result| result.get("response"))
+        .and_then(Value::as_str)
+    {
+        vec![response]
+    } else {
+        let order: HashMap<&str, usize> = result
+            .and_then(|result| result.get("questions"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, question)| {
+                question
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .map(|question| (question, index))
+            })
+            .collect();
+        let mut answers: Vec<_> = result
+            .and_then(|result| result.get("answers"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|answers| answers.iter())
+            .filter_map(|(question, answer)| {
+                answer.as_str().map(|answer| (question.as_str(), answer))
+            })
+            .collect();
+        answers
+            .sort_by_cached_key(|(question, _)| order.get(question).copied().unwrap_or(usize::MAX));
+        answers.into_iter().map(|(_, answer)| answer).collect()
+    };
+    let mut cursor = content.chars().count();
+    for answer in values.into_iter().filter(|answer| !answer.is_empty()) {
+        if let Some(count) = represented.get_mut(answer) {
+            if *count > 0 {
+                *count -= 1;
+                continue;
+            }
+        }
+        if !content.is_empty() {
+            content.push('\n');
+            parts.push(content_part(
+                parts.len() as u32,
+                cursor,
+                cursor + 1,
+                ContentPartAuthorship::Generated,
+                ContentPartOrigin::ToolPayload,
+            ));
+            cursor += 1;
+        }
+        content.push_str(answer);
+        let end = cursor + answer.chars().count();
+        parts.push(content_part(
+            parts.len() as u32,
+            cursor,
+            end,
+            answer_authorship,
+            ContentPartOrigin::DirectInput,
+        ));
+        cursor = end;
+    }
+    let has_input = parts
+        .iter()
+        .any(|part| part.authorship == answer_authorship);
+    let has_generated = parts
+        .iter()
+        .any(|part| part.authorship == ContentPartAuthorship::Generated);
+    let attribution = if !has_input {
+        None
+    } else if has_generated {
+        Some(InteractiveAnswerAttribution::Mixed(parts))
+    } else {
+        Some(InteractiveAnswerAttribution::WholeHuman)
+    };
+    (content, attribution)
+}
+
 /// Attribute a tool-result wrapper using only the structured answer values belonging to an
 /// earlier AskUserQuestion call. Unknown wrapper text remains generated; absent or unmappable
 /// answers return `None` so the normal tool-result classification remains unchanged.
@@ -1182,11 +1538,39 @@ enum InteractiveAnswerAttribution {
 fn interactive_answer_attribution(
     value: &Value,
     content: &str,
+    answer_authorship: ContentPartAuthorship,
 ) -> Option<InteractiveAnswerAttribution> {
-    let answers = value
-        .get("toolUseResult")
-        .and_then(|result| result.get("answers"))
-        .and_then(Value::as_object)?;
+    let result = claude_tool_use_result(value)?;
+    if let Some(response) = result.get("response").and_then(Value::as_str) {
+        if response.is_empty() {
+            return None;
+        }
+        if content == response {
+            return Some(InteractiveAnswerAttribution::WholeHuman);
+        }
+        const PREFIX: &str = "The user responded: ";
+        if content.strip_prefix(PREFIX) != Some(response) {
+            return None;
+        }
+        let start = PREFIX.chars().count();
+        return Some(InteractiveAnswerAttribution::Mixed(vec![
+            content_part(
+                0,
+                0,
+                start,
+                ContentPartAuthorship::Generated,
+                ContentPartOrigin::ToolPayload,
+            ),
+            content_part(
+                1,
+                start,
+                content.chars().count(),
+                answer_authorship,
+                ContentPartOrigin::DirectInput,
+            ),
+        ]));
+    }
+    let answers = result.get("answers").and_then(Value::as_object)?;
     if answers.len() == 1 {
         if let Some(answer) = answers.values().next().and_then(Value::as_str) {
             if !answer.is_empty() && content == answer {
@@ -1629,6 +2013,11 @@ mod tests {
         );
         assert_eq!(message.content, "before α\noutput β\nafter γ");
         assert_eq!(
+            message.provenance.content_parts[0].end_char,
+            "before α".chars().count(),
+            "inserted separators are generated, not part of the submitted text"
+        );
+        assert_eq!(
             message
                 .provenance
                 .content_parts
@@ -1645,9 +2034,10 @@ mod tests {
             .provenance
             .validate(&message.content)
             .expect("mixed parts exactly cover the Unicode-scalar content");
-        assert!(
-            message.tool_call_id.is_none(),
-            "one mixed record cannot use one tool-call id as the identity of all parts"
+        assert_eq!(
+            message.tool_call_id.as_deref(),
+            Some("tool-1"),
+            "a single tool relation is retained independently of the source event identity"
         );
         assert!(parsed.transcript_text.contains("before α"));
         assert!(parsed.transcript_text.contains("after γ"));
@@ -1741,7 +2131,121 @@ mod tests {
     }
 
     #[test]
-    fn interactive_answer_matching_requires_unique_structured_wrapper_pair() {
+    fn aggregate_tool_results_attribute_answers_to_the_matching_block_only() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("aggregate-answer-session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"aggregate-answer","message":{"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{}},{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"Your questions have been answered: \"Quality?\"=\"yes\"."},{"type":"tool_result","tool_use_id":"ask-1","content":"yes"}]},"toolUseResult":{"answers":{"Quality?":"yes"}}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"The user responded: freeform α\ncontinue"}]},"toolUseResult":{"response":"freeform α\ncontinue"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"native only α"},{"type":"tool_result","tool_use_id":"ask-1","content":"answer recorded"}]},"toolUseResult":{"response":"native only α"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"stored elsewhere"}]},"toolUseResult":{"questions":[{"question":"z"},{"question":"a"}],"answers":{"a":"α answer","z":"z answer"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.kind == crate::models::MessageKind::ToolResult)
+            .expect("aggregate tool-result row remains one source record");
+        let human_parts: Vec<_> = answer
+            .provenance
+            .content_parts
+            .iter()
+            .filter(|part| part.authorship == crate::models::ContentPartAuthorship::Human)
+            .collect();
+        assert_eq!(human_parts.len(), 1);
+        assert!(
+            human_parts[0].start_char
+                > "Your questions have been answered: \"Quality?\"=\"yes\"."
+                    .chars()
+                    .count()
+        );
+        let text: String = answer
+            .content
+            .chars()
+            .skip(human_parts[0].start_char)
+            .take(human_parts[0].end_char - human_parts[0].start_char)
+            .collect();
+        assert_eq!(text, "yes");
+        answer.provenance.validate(&answer.content).unwrap();
+
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let user_input = |query| {
+            crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(query).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .input_scope(crate::models::MessageInputScope::UserInput)
+            .build()
+            .unwrap()
+        };
+        assert_eq!(service.search(user_input("yes")).unwrap().hits().len(), 1);
+        assert_eq!(
+            service
+                .search(user_input("freeform α\ncontinue"))
+                .unwrap()
+                .hits()
+                .len(),
+            1
+        );
+        assert!(service
+            .search(user_input("The user responded:"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert_eq!(
+            service
+                .search(user_input("native only α"))
+                .unwrap()
+                .hits()
+                .len(),
+            1
+        );
+        assert!(service
+            .search(user_input("answer recorded"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| message.content == "stored elsewhere\nz answer\nα answer"));
+        for query in ["z answer", "α answer"] {
+            assert_eq!(service.search(user_input(query)).unwrap().hits().len(), 1);
+        }
+        assert!(service
+            .search(user_input("z answer\nα answer"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert!(service
+            .search(user_input("Quality?"))
+            .unwrap()
+            .hits()
+            .is_empty());
+    }
+
+    #[test]
+    fn interactive_answers_keep_native_values_when_display_is_ambiguous() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("answer-safety-session.jsonl");
         std::fs::write(
@@ -1784,9 +2288,16 @@ mod tests {
         assert_eq!(answer_text, "yes");
         assert_eq!(
             answers[1].provenance.authorship,
-            crate::models::MessageAuthorship::Generated
+            crate::models::MessageAuthorship::Mixed
         );
-        assert!(answers[1].provenance.content_parts.is_empty());
+        assert_eq!(answers[1].content, "\"q\"=\"yes\" and \"q\"=\"yes\"\nyes");
+        let native_answer = answers[1].provenance.content_parts.last().unwrap();
+        assert_eq!(
+            native_answer.authorship,
+            crate::models::ContentPartAuthorship::Human
+        );
+        assert_eq!(native_answer.end_char - native_answer.start_char, 3);
+        assert!(native_answer.start_char > "\"q\"=\"yes\" and \"q\"=\"yes\"".chars().count());
     }
 
     #[test]
@@ -1904,8 +2415,308 @@ mod tests {
     }
 
     #[test]
+    fn native_origins_override_session_fallback_without_hiding_any_content() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("native-origins.jsonl");
+        let phrase = "same native-origin phrase";
+        let records = [
+            format!(
+                r#"{{"type":"user","uuid":"human","sessionId":"native","agent_id":"child-with-explicit-human","origin":{{"kind":"human"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"channel","sessionId":"native","origin":{{"kind":"channel","server":"slack"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"scheduled","sessionId":"native","origin":{{"kind":"task-notification","subkind":"scheduled-trigger"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"peer","sessionId":"native","origin":{{"kind":"peer","agent_id":"worker"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"synthetic","sessionId":"native","isSynthetic":true,"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"task-peer","sessionId":"native","origin":{{"kind":"task-notification","subkind":"peer-send-message"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"peer-mixed","sessionId":"native","origin":{{"kind":"peer","agent_id":"worker"}},"message":{{"role":"user","content":[{{"type":"text","text":"{phrase}"}},{{"type":"tool_result","tool_use_id":"unknown","content":"generated peer output"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"malformed","sessionId":"native","origin":[],"message":{{"role":"user","content":[{{"type":"text","text":"{phrase}"}},{{"type":"tool_result","content":"generated ambiguous output"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"legacy","sessionId":"native","agent_id":"","parent_tool_use_id":null,"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"sdk-child","session_id":"native","agent_id":"child-task","parent_tool_use_id":"spawn-call","message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"sdk-child-parent-only","session_id":"native","parent_tool_use_id":"spawn-call","message":{{"role":"user","content":[{{"type":"text","text":"{phrase}"}},{{"type":"tool_result","tool_use_id":"unknown","content":"generated child output"}}]}}}}"#
+            ),
+        ];
+        std::fs::write(&path, records.join("\n") + "\n").unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let message = |id: &str| {
+            parsed
+                .messages
+                .iter()
+                .find(|message| {
+                    message
+                        .provenance
+                        .correlation_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.id == id)
+                })
+                .unwrap_or_else(|| panic!("missing native event {id}"))
+        };
+        assert_eq!(
+            message("human").provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        assert_eq!(
+            message("channel").provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        assert_eq!(
+            message("scheduled").provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        for id in ["human", "channel", "scheduled"] {
+            assert_eq!(
+                message(id).provenance.input_origin,
+                Some(crate::models::MessageInputOrigin::DirectConversation),
+                "{id} is structurally an intended inbound input"
+            );
+        }
+        assert_eq!(
+            message("peer").provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        assert_eq!(
+            message("synthetic").provenance.authorship,
+            crate::models::MessageAuthorship::Generated
+        );
+        assert_eq!(
+            message("task-peer").provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        assert_eq!(
+            message("peer-mixed").provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(message("peer-mixed").provenance.input_origin, None);
+        assert_eq!(
+            message("malformed").provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(message("malformed").provenance.input_origin, None);
+        assert!(message("malformed")
+            .provenance
+            .content_parts
+            .iter()
+            .all(|part| {
+                part.authorship != crate::models::ContentPartAuthorship::Unknown
+                    || part.origin == crate::models::ContentPartOrigin::Unknown
+            }));
+        assert_eq!(
+            message("sdk-child").provenance.authorship,
+            crate::models::MessageAuthorship::Agent,
+            "SDK interleaved child input cannot inherit root fallback"
+        );
+        assert_eq!(
+            message("sdk-child-parent-only").provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert!(message("sdk-child-parent-only")
+            .provenance
+            .content_parts
+            .iter()
+            .all(|part| part.authorship != crate::models::ContentPartAuthorship::Human));
+        assert_eq!(
+            message("legacy").provenance.authorship,
+            crate::models::MessageAuthorship::Human,
+            "missing native fields retain the existing session-level fallback"
+        );
+
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let request = |scope| {
+            crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(phrase).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .input_scope(scope)
+            .build()
+            .unwrap()
+        };
+        assert_eq!(
+            service
+                .search(request(crate::models::MessageInputScope::UserInput))
+                .unwrap()
+                .hits()
+                .len(),
+            4,
+            "human, channel, scheduled, and legacy rows are intended input"
+        );
+        assert_eq!(
+            service
+                .search(request(crate::models::MessageInputScope::Any))
+                .unwrap()
+                .hits()
+                .len(),
+            records.len(),
+            "native exclusions affect UserInput only; Any keeps every exact row"
+        );
+    }
+
+    #[test]
+    fn explicit_non_user_queue_origin_does_not_override_legacy_queue_semantics() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("queue-native-origin.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"queue-operation","operation":"enqueue","uuid":"generated-queue","sessionId":"queue-native","origin":{"kind":"unclassified"},"timestamp":"2026-06-17T00:00:00Z","content":"generated queue text"}"#,
+                "\n",
+                r#"{"type":"queue-operation","operation":"enqueue","uuid":"legacy-queue","sessionId":"queue-native","timestamp":"2026-06-17T00:00:01Z","content":"legacy queue text"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let generated = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "generated queue text")
+            .unwrap();
+        assert_eq!(
+            generated.provenance.authorship,
+            crate::models::MessageAuthorship::Generated
+        );
+        assert_eq!(generated.provenance.input_origin, None);
+        assert_eq!(
+            generated.provenance.input_delivery_state,
+            Some(crate::models::InputDeliveryState::Submitted)
+        );
+        let legacy = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "legacy queue text")
+            .unwrap();
+        assert_eq!(
+            legacy.provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        assert_eq!(
+            legacy.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::Queued)
+        );
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let request = |query| {
+            crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(query).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .input_scope(crate::models::MessageInputScope::UserInput)
+            .build()
+            .unwrap()
+        };
+        assert!(service
+            .search(request("generated queue text"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert_eq!(
+            service
+                .search(request("legacy queue text"))
+                .unwrap()
+                .hits()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn desktop_sdk_snake_case_answers_and_native_origin_are_retained() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("local-agent-mode-sessions");
+        let session_dir = root.join("install/account/local_desktop-native");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("audit.jsonl"),
+            concat!(
+                r#"{"type":"assistant","session_id":"desktop-native","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-desktop","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"desktop-freeform","session_id":"desktop-native","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-desktop","content":"The user responded: freeform desktop"}]},"tool_use_result":{"response":"freeform desktop"}}"#,
+                "\n",
+                r#"{"type":"assistant","session_id":"desktop-native","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-desktop-structured","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"desktop-structured","session_id":"desktop-native","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-desktop-structured","content":"Your questions have been answered: \"Deploy?\"=\"yes\"."}]},"tool_use_result":{"questions":[{"question":"Deploy?"}],"answers":{"Deploy?":"yes"}}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"desktop-peer","session_id":"desktop-native","origin":{"kind":"peer","agent_id":"worker"},"message":{"role":"user","content":"desktop peer context"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("freeform desktop"))
+            .expect("snake_case SDK answer remains indexed");
+        assert_eq!(
+            answer.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+        assert!(answer.provenance.content_parts.iter().any(|part| {
+            part.authorship == crate::models::ContentPartAuthorship::Human
+                && part.origin == crate::models::ContentPartOrigin::DirectInput
+        }));
+        let structured = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("yes"))
+            .expect("snake_case structured answer remains indexed");
+        assert_eq!(
+            structured.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+        let peer = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "desktop peer context")
+            .expect("Desktop peer record remains searchable in Any");
+        assert_eq!(
+            peer.provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        assert_eq!(peer.provenance.input_origin, None);
+    }
+
+    #[test]
     fn queue_upgrade_repairs_archived_authorship_without_losing_submissions() {
-        use crate::models::{ContentAuthorshipSelection, MessageAuthorship, MessageFilters};
+        use crate::models::{MessageAuthorship, MessageFilters, MessageInputScope};
 
         for (relative, old_version, provider) in [
             ("project/input.jsonl", "claude-v5", Provider::Claude),
@@ -1933,7 +2744,7 @@ mod tests {
             let db = crate::db::Db::open(&db_path).unwrap();
             db.upsert_session(&old, 1, 1).unwrap();
             let human = MessageFilters {
-                content_authorship: ContentAuthorshipSelection::Human,
+                input_scope: MessageInputScope::UserInput,
                 ..Default::default()
             };
             assert_eq!(db.search_messages("queue input", &human).unwrap().len(), 2);
@@ -1948,10 +2759,7 @@ mod tests {
                         .len(),
                     2
                 );
-                assert!(db
-                    .search_messages("queue input", &human)
-                    .unwrap()
-                    .is_empty());
+                assert_eq!(db.search_messages("queue input", &human).unwrap().len(), 2);
             }
             let stored = rusqlite::Connection::open(db_path).unwrap();
             let unknown: i64 = stored.query_row("select count(*) from messages where authorship='unknown' and input_origin='queued' and input_delivery_state='submitted'", [], |row| row.get(0)).unwrap();
@@ -2015,16 +2823,18 @@ mod tests {
         // With no provider identity these identical events cannot be distinguished after a
         // rewrite. The archive keeps both submissions without inventing a delivery outcome.
         let filters = crate::models::MessageFilters {
-            content_authorship: crate::models::ContentAuthorshipSelection::Human,
+            input_scope: crate::models::MessageInputScope::UserInput,
             ..Default::default()
         };
         for generation in [2, 3] {
             db.upsert_session(&shortened, generation, generation)
                 .unwrap();
-            assert!(db
-                .search_messages("repeated queued input", &filters)
-                .unwrap()
-                .is_empty());
+            assert_eq!(
+                db.search_messages("repeated queued input", &filters)
+                    .unwrap()
+                    .len(),
+                2
+            );
             assert_eq!(
                 db.search_messages("repeated queued input", &Default::default())
                     .unwrap()
@@ -2838,7 +3648,7 @@ mod tests {
         );
         assert_eq!(
             parsed.session.parse_version,
-            "claude-desktop-local-agent-v6"
+            crate::util::provider_parse_version(Provider::ClaudeDesktop)
         );
         assert_eq!(parsed.session.message_count, Some(4));
         let metadata: serde_json::Value =

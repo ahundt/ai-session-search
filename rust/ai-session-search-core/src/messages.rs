@@ -605,7 +605,7 @@ const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-descri
 #[command(group(
     ArgGroup::new("search_request")
         .args([
-            "content_authorship",
+            "input_scope",
             "positional_query",
             "query_arg",
             "role",
@@ -662,11 +662,11 @@ pub struct MessageSearchArgs {
         allow_hyphen_values = true
     )]
     pub query_arg: Option<String>,
-    /// Regions allowed to match: any (default) searches complete content; human searches only
-    /// original human regions. Human requires --field content. Omit --role to include human tool
-    /// answers. Context and content views may contain nonhuman text.
+    /// Content to match: any (default) searches complete content; user_input searches recorded
+    /// prompts, queued submissions and answers. Requires --field content; omit --role to include
+    /// tool answers. Sender/delivery can be unknown; views/context may include generated text.
     #[arg(help_heading = FILTER_HEADING, long, value_enum)]
-    pub content_authorship: Option<crate::models::ContentAuthorshipSelection>,
+    pub input_scope: Option<crate::models::MessageInputScope>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
     /// slash (human-entered commands), or compaction. Omit for every role.
     #[arg(help_heading = FILTER_HEADING, long = "role", value_enum)]
@@ -1158,8 +1158,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         } else {
             RequestedExtent::page(args.limit, args.offset)?
         });
-    if let Some(selection) = args.content_authorship {
-        builder = builder.content_authorship(selection);
+    if let Some(selection) = args.input_scope {
+        builder = builder.input_scope(selection);
     }
     if let Some(role) = args.role {
         builder = builder.role(role);

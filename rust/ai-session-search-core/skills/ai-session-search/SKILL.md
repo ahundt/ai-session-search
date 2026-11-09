@@ -17,14 +17,14 @@ App/IDE/CLI share `antigravity`. Cloud-only account history is outside this loca
 
 ## 1. Start
 
-For “my earlier messages/corrections”, prefer `content_authorship="human"` on `search_messages`
-or CLI `--content-authorship human`, without `role=user`: interactive human answers can have
-tool role. The default `any` searches complete content. Human selection requires `field=content`;
-context/views may still contain generated text. Legacy Claude queue records do not identify the
-author: use the default `any` without a role filter to recover them; submission does not prove
-delivery. If exact searches are empty, check effective role/date/path/authorship filters,
-try a bounded cross-role search, locate the original session from the note's references, and read
-the surrounding events. Keep original input, quoted edits and compaction summaries distinct.
+For “my earlier messages/corrections”, use `input_scope="user_input"` on `search_messages`
+or CLI `--input-scope user_input`, without `role=user`: answers can have tool role. It finds
+recorded prompts, queued submissions and linked answers without searching generated output.
+The default `any` searches complete content. User-input selection requires `field=content`;
+views/context can include generated text. Provenance distinguishes source and sender/delivery
+uncertainty; a queued submission need not have reached the model. If exact searches are empty,
+check effective role/date/path/input-scope filters, try a bounded all-content search, locate the
+session from the note's references, and inspect surrounding events. Preserve source distinctions.
 
 ```sh
 aise --version

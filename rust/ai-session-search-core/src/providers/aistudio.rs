@@ -118,6 +118,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_user_chunks_are_retrieved_separately_from_model_echoes() {
+        use crate::message_search::{
+            MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+        };
+        use crate::models::MessageInputScope;
+        let parsed = AiStudioAdapter::new(vec![]).parse_raw(
+            Path::new("/tmp/native-input.json"),
+            r#"{"chunkedPrompt":{"chunks":[{"role":"user","text":"find α input"},{"role":"model","text":"find α input"},{"role":"user","text":"find α input"}]}}"#.into(),
+        ).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&directory.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+        let request = |scope| {
+            MessageSearchRequest::builder(
+                MessageQuery::literal("find α input").unwrap(),
+                MessageTarget::content(),
+            )
+            .input_scope(scope)
+            .build()
+            .unwrap()
+        };
+        for _ in 0..2 {
+            let input = service
+                .search(request(MessageInputScope::UserInput))
+                .unwrap();
+            assert_eq!(
+                input
+                    .hits()
+                    .iter()
+                    .map(|hit| hit.message.seq)
+                    .collect::<Vec<_>>(),
+                vec![0, 2]
+            );
+            assert_eq!(
+                service
+                    .search(request(MessageInputScope::Any))
+                    .unwrap()
+                    .hits()
+                    .len(),
+                3
+            );
+            db.upsert_session(&parsed, 0, 0).unwrap();
+        }
+    }
+
+    #[test]
     fn discovers_json_and_markdown_and_normalizes_roles() {
         let dir = tempfile::tempdir().unwrap();
         let json = dir.path().join("chat.json");

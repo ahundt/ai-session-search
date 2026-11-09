@@ -15,7 +15,7 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::hashing::FramedSha256;
-use crate::models::ContentAuthorshipSelection;
+use crate::models::MessageInputScope;
 use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField, SessionMeta};
 use crate::refs::MessageRef;
 
@@ -668,7 +668,7 @@ impl RequestedTimeRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct MessagePredicates {
-    content_authorship: Option<ContentAuthorshipSelection>,
+    input_scope: Option<MessageInputScope>,
     role: Option<Role>,
     kinds: Option<Vec<MessageKind>>,
     providers: Option<Vec<Provider>>,
@@ -687,7 +687,7 @@ pub struct MessagePredicates {
 impl Default for MessagePredicates {
     fn default() -> Self {
         Self {
-            content_authorship: None,
+            input_scope: None,
             role: None,
             kinds: None,
             providers: None,
@@ -706,11 +706,11 @@ impl Default for MessagePredicates {
 }
 
 impl MessagePredicates {
-    pub fn content_authorship(&self) -> ContentAuthorshipSelection {
-        self.content_authorship.unwrap_or_default()
+    pub fn input_scope(&self) -> MessageInputScope {
+        self.input_scope.unwrap_or_default()
     }
-    pub const fn content_authorship_is_explicit(&self) -> bool {
-        self.content_authorship.is_some()
+    pub const fn input_scope_is_explicit(&self) -> bool {
+        self.input_scope.is_some()
     }
     pub const fn role(&self) -> Option<Role> {
         self.role
@@ -857,7 +857,7 @@ impl SearchSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageSearchParameter {
-    ContentAuthorship,
+    InputScope,
     Query,
     QueryMode,
     Field,
@@ -891,7 +891,7 @@ pub enum MessageSearchParameter {
 impl MessageSearchParameter {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ContentAuthorship => "content_authorship",
+            Self::InputScope => "input_scope",
             Self::Query => "query",
             Self::QueryMode => "query_mode",
             Self::Field => "field",
@@ -1039,7 +1039,7 @@ pub enum ValueOriginKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageSearchRule {
-    HumanContentRequiresContentField,
+    InputScopeRequiresContentField,
     DetailOwnsPresentationBudgets,
     SequenceRequiresSession,
     KindsMustRemainSatisfiable,
@@ -1053,7 +1053,7 @@ pub enum MessageSearchRule {
 
 impl MessageSearchRule {
     pub const ALL: &'static [Self] = &[
-        Self::HumanContentRequiresContentField,
+        Self::InputScopeRequiresContentField,
         Self::DetailOwnsPresentationBudgets,
         Self::SequenceRequiresSession,
         Self::KindsMustRemainSatisfiable,
@@ -1067,7 +1067,7 @@ impl MessageSearchRule {
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::HumanContentRequiresContentField => "human_content_requires_content_field",
+            Self::InputScopeRequiresContentField => "input_scope_requires_content_field",
             Self::DetailOwnsPresentationBudgets => "detail_owns_presentation_budgets",
             Self::SequenceRequiresSession => "sequence_requires_session",
             Self::KindsMustRemainSatisfiable => "kinds_must_remain_satisfiable",
@@ -1084,7 +1084,7 @@ impl MessageSearchRule {
 
     pub const fn message(self) -> &'static str {
         match self {
-            Self::HumanContentRequiresContentField => "content_authorship=human requires field=content; use content_authorship=any for tool fields",
+            Self::InputScopeRequiresContentField => "input_scope=user_input requires field=content; use input_scope=any for tool fields",
             Self::DetailOwnsPresentationBudgets => {
                 "detail conflicts with lines_per_message, field_view, and match_view; omit detail to compose custom presentation budgets"
             }
@@ -1219,9 +1219,9 @@ impl MessageSearchParameterRegistry {
             surfaces: SearchSurface::ALL,
         };
         let parameters = vec![
-            parameter(MessageSearchParameter::ContentAuthorship,
-                "Content regions to match: any searches complete content; human searches original human regions across storage roles.",
-                enum_domain(serialized_variants::<ContentAuthorshipSelection>()), MessageSearchOmission::TypedDefault),
+            parameter(MessageSearchParameter::InputScope,
+                "Content: any (default) searches all text; user_input searches recorded prompts, queues and interactive answers.",
+                enum_domain(serialized_variants::<MessageInputScope>()), MessageSearchOmission::TypedDefault),
             parameter(
                 MessageSearchParameter::Query,
                 "Text to match.",
@@ -1488,7 +1488,7 @@ pub enum ValueOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageSearchOrigins {
-    pub(crate) content_authorship: ValueOrigin,
+    pub(crate) input_scope: ValueOrigin,
     pub(crate) result_extent: ValueOrigin,
     pub(crate) context_messages_before: ValueOrigin,
     pub(crate) context_messages_after: ValueOrigin,
@@ -1502,8 +1502,8 @@ pub struct MessageSearchOrigins {
 }
 
 impl MessageSearchOrigins {
-    pub fn content_authorship(&self) -> &ValueOrigin {
-        &self.content_authorship
+    pub fn input_scope(&self) -> &ValueOrigin {
+        &self.input_scope
     }
     pub fn result_extent(&self) -> &ValueOrigin {
         &self.result_extent
@@ -1561,7 +1561,7 @@ pub enum ResolvedExtent {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMessagePredicates {
-    pub(crate) content_authorship: ContentAuthorshipSelection,
+    pub(crate) input_scope: MessageInputScope,
     pub(crate) role: Option<Role>,
     pub(crate) kinds: Option<Vec<MessageKind>>,
     pub(crate) providers: Option<Vec<Provider>>,
@@ -1739,7 +1739,7 @@ impl ResolvedRequestPresentation {
 /// present so a caller can interpret result and presentation extent without conversational state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedMessageSearchRequest {
-    content_authorship: ContentAuthorshipSelection,
+    input_scope: MessageInputScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     query: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1756,13 +1756,13 @@ pub struct ResolvedMessageSearchRequest {
 }
 
 impl ResolvedMessageSearchRequest {
-    pub const fn content_authorship(&self) -> ContentAuthorshipSelection {
-        self.content_authorship
+    pub const fn input_scope(&self) -> MessageInputScope {
+        self.input_scope
     }
 
     pub(crate) fn from_plan(plan: &MessageSearchPlan) -> Result<Self, MessageSearchError> {
         Ok(Self {
-            content_authorship: plan.retrieval.predicates.content_authorship,
+            input_scope: plan.retrieval.predicates.input_scope,
             query: plan.retrieval.query.text().map(str::to_owned),
             query_mode: plan.retrieval.query.mode().map(ResolvedQueryMode::from),
             target: plan.retrieval.target.clone(),
@@ -3188,10 +3188,10 @@ impl MessageSearchRequest {
     }
 
     fn validate(&self) -> Result<(), MessageSearchError> {
-        if self.predicates.content_authorship() == ContentAuthorshipSelection::Human
+        if self.predicates.input_scope() == MessageInputScope::UserInput
             && self.target.field != SearchField::Content
         {
-            return Err(MessageSearchRule::HumanContentRequiresContentField.error());
+            return Err(MessageSearchRule::InputScopeRequiresContentField.error());
         }
         if self.presentation.detail.is_some()
             && (self.presentation.message_lines.is_some()
@@ -3258,8 +3258,8 @@ pub struct MessageSearchRequestBuilder {
 }
 
 impl MessageSearchRequestBuilder {
-    pub fn content_authorship(mut self, selection: ContentAuthorshipSelection) -> Self {
-        self.request.predicates.content_authorship = Some(selection);
+    pub fn input_scope(mut self, selection: MessageInputScope) -> Self {
+        self.request.predicates.input_scope = Some(selection);
         self
     }
     pub fn role(mut self, role: Role) -> Self {
@@ -3478,61 +3478,51 @@ pub(crate) fn selected_message_field_parts<'a>(
 }
 
 /// Borrow eligible source regions in one scalar pass: O(B + P) time, O(P) range memory.
-pub(crate) fn matching_content_regions(hit: &crate::models::MessageHit) -> Vec<(usize, &str)> {
+pub(crate) fn matching_content_regions(
+    hit: &crate::models::MessageHit,
+    scope: MessageInputScope,
+) -> Vec<(usize, &str)> {
+    if scope == MessageInputScope::Any {
+        return vec![(0, &hit.content)];
+    }
     let Some(provenance) = &hit.provenance else {
-        return vec![(0, &hit.content)];
+        return Vec::new();
     };
-    if provenance.authorship == crate::models::MessageAuthorship::Human {
+    if provenance.record_relation == crate::models::MessageRecordRelation::Mirror {
+        return Vec::new();
+    }
+    if provenance.is_whole_user_input() {
         return vec![(0, &hit.content)];
     }
-    let ranges = provenance
-        .content_parts
-        .iter()
-        .filter(|part| part.authorship == crate::models::ContentPartAuthorship::Human);
-    let mut regions = Vec::new();
-    let mut chars = hit.content.char_indices();
-    let mut scalar = 0;
-    let mut byte = 0;
-    for part in ranges {
-        let (start, end) = (part.start_char, part.end_char);
-        while scalar < start {
-            if let Some((i, c)) = chars.next() {
-                byte = i + c.len_utf8();
-                scalar += 1;
-            } else {
-                return regions;
-            }
-        }
-        let start_byte = byte;
-        while scalar < end {
-            if let Some((i, c)) = chars.next() {
-                byte = i + c.len_utf8();
-                scalar += 1;
-            } else {
-                return regions;
-            }
-        }
-        if start < end {
-            regions.push((start, &hit.content[start_byte..byte]));
-        }
-    }
-    regions
+    crate::util::content_part_regions(
+        &hit.content,
+        provenance
+            .content_parts
+            .iter()
+            .filter(|part| part.is_user_input()),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(part, text)| (part.start_char, text))
+    .collect()
 }
 
 #[cfg(test)]
 pub(crate) fn attach_match_evidence(
+    input_scope: MessageInputScope,
     query: &MessageQuery,
     target: &MessageTarget,
     match_view: MatchViewBudget,
     hits: Vec<crate::models::MessageHit>,
 ) -> anyhow::Result<Vec<MessageSearchHit>> {
-    attach_match_evidence_cancellable(query, target, match_view, hits, || Ok(()))
+    attach_match_evidence_cancellable(query, target, match_view, input_scope, hits, || Ok(()))
 }
 
 pub(crate) fn attach_match_evidence_cancellable(
     query: &MessageQuery,
     target: &MessageTarget,
     match_view: MatchViewBudget,
+    input_scope: MessageInputScope,
     hits: Vec<crate::models::MessageHit>,
     mut check_active: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<MessageSearchHit>> {
@@ -3555,11 +3545,11 @@ pub(crate) fn attach_match_evidence_cancellable(
                         message.seq
                     )
                 })?;
-                let evidence = if message.provenance.is_some() {
+                let evidence = if input_scope == MessageInputScope::UserInput {
                     let mut selected_evidence = None;
                     let mut best_score = None;
                     let field_total_chars = selected.chars().count();
-                    for (offset, region) in matching_content_regions(&message) {
+                    for (offset, region) in matching_content_regions(&message, input_scope) {
                         check_active()?;
                         if let Some((score, mut evidence)) = prepared.build(region, match_view) {
                             if best_score.is_none_or(|best| score > best) {
@@ -4410,6 +4400,7 @@ mod tests {
             MessageQuery::fuzzy("ndl").unwrap(),
         ] {
             let hits = attach_match_evidence(
+                MessageInputScope::UserInput,
                 &query,
                 &MessageTarget::content(),
                 MatchViewBudget::MinimalSpan,
@@ -4427,6 +4418,7 @@ mod tests {
             }
         }
         let zero_width = attach_match_evidence(
+            MessageInputScope::UserInput,
             &MessageQuery::regex("^é").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MinimalSpan,
@@ -4434,7 +4426,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(zero_width[0].match_evidence().unwrap().field_start_char, 15);
+        let complete = attach_match_evidence(
+            MessageInputScope::Any,
+            &MessageQuery::literal("needle").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            complete[0].literal_match().unwrap().field_start_char,
+            0,
+            "provenance must not narrow the default all-content mode"
+        );
         assert!(attach_match_evidence(
+            MessageInputScope::UserInput,
             &MessageQuery::literal("needle gap tail").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MinimalSpan,
@@ -4472,6 +4478,7 @@ mod tests {
             ..Default::default()
         }));
         let hits = attach_match_evidence(
+            MessageInputScope::UserInput,
             &MessageQuery::fuzzy("ndl").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MinimalSpan,
@@ -4558,6 +4565,7 @@ mod tests {
         let command = format!("{}Trash{}", "x".repeat(855), "y".repeat(400));
         let content = serde_json::json!({"args": {"command": command}}).to_string();
         let evidence = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::literal("trash").unwrap(),
             &MessageTarget::tool_argument("/command").unwrap(),
             MatchViewBudget::MaxChars {
@@ -4584,6 +4592,7 @@ mod tests {
             &query,
             &target,
             MatchViewBudget::MinimalSpan,
+            MessageInputScope::Any,
             source_hits.clone(),
             || {
                 evidence_checks += 1;
@@ -4597,9 +4606,14 @@ mod tests {
             .to_string()
             .contains("injected evidence cancellation"));
 
-        let mut hits =
-            attach_match_evidence(&query, &target, MatchViewBudget::MinimalSpan, source_hits)
-                .unwrap();
+        let mut hits = attach_match_evidence(
+            MessageInputScope::Any,
+            &query,
+            &target,
+            MatchViewBudget::MinimalSpan,
+            source_hits,
+        )
+        .unwrap();
         let presentation = ResolvedMessagePresentation {
             include_refs: false,
             message_lines: LineWindow::Full,
@@ -4630,6 +4644,7 @@ mod tests {
         let literal = "Needle".repeat(80);
         let content = format!("prefix {literal} suffix");
         let hits = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::literal(literal.to_lowercase()).unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MaxChars {
@@ -4659,6 +4674,7 @@ mod tests {
             MessageQuery::regex(r"(?:Needle){80}").unwrap(),
         ] {
             let hits = attach_match_evidence(
+                MessageInputScope::Any,
                 &query,
                 &MessageTarget::content(),
                 MatchViewBudget::MinimalSpan,
@@ -4669,6 +4685,7 @@ mod tests {
         }
 
         let fuzzy = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::fuzzy("tst").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MinimalSpan,
@@ -4678,6 +4695,7 @@ mod tests {
         assert_eq!(fuzzy[0].match_evidence().unwrap().view_text, "test");
 
         let boundary = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::regex(r"(?m)^").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MinimalSpan,
@@ -4868,6 +4886,7 @@ mod tests {
     #[test]
     fn regex_zero_width_and_fuzzy_matches_have_typed_markers() {
         let regex = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::regex(r"(?m)^").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MaxChars {
@@ -4882,6 +4901,7 @@ mod tests {
         ));
 
         let fuzzy = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::fuzzy("tst").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MaxChars {
@@ -4945,6 +4965,7 @@ mod tests {
             ),
         ] {
             let fuzzy = attach_match_evidence(
+                MessageInputScope::Any,
                 &MessageQuery::fuzzy("tst").unwrap(),
                 &MessageTarget::content(),
                 MatchViewBudget::MaxChars {
@@ -4965,6 +4986,7 @@ mod tests {
     #[test]
     fn queryless_hits_omit_evidence_without_projecting_selected_fields() {
         let hits = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::All,
             &MessageTarget::tool_argument("/missing").unwrap(),
             MatchViewBudget::MaxChars {

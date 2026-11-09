@@ -15,9 +15,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
    and deletes nothing. See Fixed item 6.
-2. `messages search --content-authorship human` and the matching Rust, Python and MCP option
-   search original human regions across storage roles, including structured interactive answers.
-   The default `any` searches complete content. Omit the role filter to include human tool answers;
+2. `messages search --input-scope user_input` and the matching Rust, Python and MCP option
+   search recorded prompts, queued submissions and interactive answers across storage roles.
+   The default `any` searches complete content. Omit the role filter to include tool answers;
    returned views and context can still contain generated text.
 
 ### Changed
@@ -96,10 +96,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
    `aise doctor`, and reads the file again on the next refresh.
 9. Claude queued submissions and structurally attributable `AskUserQuestion` answers are
-   searchable. Legacy queue records have unknown authorship and require the default complete-content
-   search; human-only search excludes them. They remain submitted because the source does not prove delivery.
+   searchable. Input-focused search includes legacy queue submissions while keeping their sender unknown.
+   They remain submitted because the source does not prove delivery.
    Independent same-text submissions survive source rewrites, and parser upgrades preserve
    file-edit replay order.
+10. User-input message searches preserve NUL-containing prompts and answers, Unicode match
+    coordinates, and boundaries between user content and generated text. Literal and regex
+    queries containing NUL use the safe portions of the trigram prefilter.
+11. Gemini CLI native JSONL history retains original user prompts when context patches replace
+    their current content. Legacy JSON/JSONL migrations retain archived inputs and message
+    references without counting the same native event again on refresh.
+12. Native input regions in Codex, Cursor, Antigravity and Pi/Prime records retain their source
+    distinctions from generated context and command output. Correlated Codex answers in known
+    spawned sessions follow the existing agent-attribution convention.
 
 ### Performance
 

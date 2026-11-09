@@ -836,10 +836,10 @@ class MessageScope:
 class MessageSearchRequest:
     """Canonical message predicates, match window, presentation, extent, purpose, and receipt.
 
-    ``content_authorship="human"`` searches original human regions only, including mixed
-    messages. Omission or ``"any"`` searches complete content. Human requires ``field="content"``.
-    Role filters intersect; omit role to include human tool answers. Views/context can contain
-    nonhuman text; match coordinates remain relative to the original content.
+    ``input_scope="user_input"`` searches recorded prompts, queued submissions and answer
+    regions across roles. Omission or ``"any"`` searches complete content. User input requires
+    ``field="content"``; omit role to include tool answers. Sender/delivery uncertainty remains
+    in provenance. Views/context may include generated text; coordinates refer to indexed message content.
 
     The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
     arguments use an RFC 6901 ``argument_path``. ``tool_name_contains`` is an additional
@@ -850,7 +850,7 @@ class MessageSearchRequest:
     request explicitly and conflicts with ``limit``. MCP separately uses a bounded default.
     """
 
-    content_authorship: Literal["any", "human"] | None
+    input_scope: Literal["any", "user_input"] | None
     scope: MessageScope
     role: _MessageRole | None
     kind: _MessageKind | None
@@ -885,7 +885,7 @@ class MessageSearchRequest:
         kind: _MessageKind | None = None,
         kinds: list[_MessageKind] | None = None,
         field: _SearchField = "content",
-        content_authorship: Literal["any", "human"] | None = None,
+        input_scope: Literal["any", "user_input"] | None = None,
         argument_path: str | None = None,
         seq_from: int | None = None,
         seq_to: int | None = None,
@@ -1034,7 +1034,7 @@ class _MessageSearchEffectiveRequest(TypedDict):
     query: NotRequired[str]
     query_mode: NotRequired[_MessageQueryMode]
     target: _MessageSearchTarget
-    content_authorship: Literal["any", "human"]
+    input_scope: Literal["any", "user_input"]
     provider_scope: dict[str, object]
     extent: dict[str, object]
     match_window: NotRequired[_MatchWindow]

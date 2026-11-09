@@ -61,12 +61,25 @@ pub(super) fn parsed_session_from_raw(
     metadata: SnapshotMetadata<'_>,
     raw_messages: Vec<RawMessage>,
 ) -> ParsedSession {
-    let correlation_scope = format!("{}:{}", provider.as_str(), metadata.provider_session_id);
-    let messages = normalize_raw_messages_with_evidence(
+    parsed_session_from_raw_with_evidence(
+        provider,
+        path,
+        metadata,
         raw_messages,
-        Some(&correlation_scope),
         UserRoleAuthorshipEvidence::HumanInputEvent,
-    );
+    )
+}
+
+pub(super) fn parsed_session_from_raw_with_evidence(
+    provider: Provider,
+    path: &Path,
+    metadata: SnapshotMetadata<'_>,
+    raw_messages: Vec<RawMessage>,
+    evidence: UserRoleAuthorshipEvidence,
+) -> ParsedSession {
+    let correlation_scope = format!("{}:{}", provider.as_str(), metadata.provider_session_id);
+    let messages =
+        normalize_raw_messages_with_evidence(raw_messages, Some(&correlation_scope), evidence);
     // The transcript is what session search ranks; it carries the conversation, as it does for
     // every other provider, and leaves tool traffic to message search.
     let transcript_text = messages

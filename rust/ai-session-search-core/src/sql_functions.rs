@@ -4,7 +4,7 @@
 use anyhow::Result;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
-use rusqlite::functions::FunctionFlags;
+use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::Connection;
 use std::sync::Mutex;
 
@@ -20,45 +20,75 @@ fn unicode_lower_contains_value(needle: &UnicodeLowerNeedle, value: &str) -> boo
     needle.contains(value)
 }
 
+/// Verify whole content or user-provided regions without SQLite's NUL-terminated substr.
+/// For B content bytes and P parts, range traversal is O(B + P), with O(P) temporary metadata
+/// and borrowed slices. No content copies or repeated prefix scans; the matcher adds its own cost.
+fn matches_content(
+    context: &Context<'_>,
+    content_arg: usize,
+    mut matches: impl FnMut(&str) -> bool,
+) -> rusqlite::Result<bool> {
+    let value = context.get_raw(content_arg);
+    if value == rusqlite::types::ValueRef::Null {
+        return Ok(false);
+    }
+    let content = value.as_str()?;
+    if context.len() == 2 || context.get_raw(2) == rusqlite::types::ValueRef::Null {
+        return Ok(matches(content));
+    }
+    let Ok(parts): Result<Vec<crate::models::MessageContentPart>, _> =
+        serde_json::from_str(context.get_raw(2).as_str()?)
+    else {
+        return Ok(false);
+    };
+    // Invalid regions cannot supply evidence, matching the fuzzy/evidence path. Full-content
+    // search remains available without inventing or clamping a user-provided region.
+    let Ok(regions) = crate::util::content_part_regions(
+        content,
+        parts.iter().filter(|part| part.is_user_input()),
+    ) else {
+        return Ok(false);
+    };
+    Ok(regions.into_iter().any(|(_, region)| matches(region)))
+}
+
 /// Register the deterministic scalar functions shared by every query connection.
 pub(crate) fn register(conn: &Connection) -> Result<()> {
-    conn.create_scalar_function(
-        "unicode_lower_contains",
-        2,
-        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
-        |context| {
-            type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
-            // The query is constant across a statement; cache its streaming matcher once. This
-            // preserves `fold_caseless(haystack).contains(...)` semantics, expansions included,
-            // without allocating a folded copy of every candidate row. The bound argument is
-            // already folded by the caller, so both sides share one rule.
-            let lowercase_query = context.get_or_create_aux(1, |value| -> Result<_, BoxError> {
-                Ok(UnicodeLowerNeedle::from_lowered(value.as_str()?))
-            })?;
-            match context.get_raw(0) {
-                rusqlite::types::ValueRef::Null => Ok(false),
-                value => Ok(unicode_lower_contains_value(
-                    &lowercase_query,
-                    value.as_str()?,
-                )),
-            }
-        },
-    )?;
-    conn.create_scalar_function(
-        "rust_regexp",
-        2,
-        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
-        |context| {
-            type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
-            let regex = context.get_or_create_aux(0, |value| -> Result<_, BoxError> {
-                Ok(regex::Regex::new(value.as_str()?)?)
-            })?;
-            match context.get_raw(1) {
-                rusqlite::types::ValueRef::Null => Ok(false),
-                value => Ok(regex.is_match(value.as_str()?)),
-            }
-        },
-    )?;
+    // The optional third argument selects mixed-message regions; ordinary searches keep the
+    // existing two-argument path and never load or serialize part metadata.
+    for arity in [2, 3] {
+        conn.create_scalar_function(
+            "unicode_lower_contains",
+            arity,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+                // The query is constant across a statement; cache its streaming matcher once. This
+                // preserves `fold_caseless(haystack).contains(...)` semantics, expansions included,
+                // without allocating a folded copy of every candidate row. The bound argument is
+                // already folded by the caller, so both sides share one rule.
+                let lowercase_query =
+                    context.get_or_create_aux(1, |value| -> Result<_, BoxError> {
+                        Ok(UnicodeLowerNeedle::from_lowered(value.as_str()?))
+                    })?;
+                matches_content(context, 0, |content| {
+                    unicode_lower_contains_value(&lowercase_query, content)
+                })
+            },
+        )?;
+        conn.create_scalar_function(
+            "rust_regexp",
+            arity,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+                let regex = context.get_or_create_aux(0, |value| -> Result<_, BoxError> {
+                    Ok(regex::Regex::new(value.as_str()?)?)
+                })?;
+                matches_content(context, 1, |content| regex.is_match(content))
+            },
+        )?;
+    }
     conn.create_scalar_function(
         "rust_json_pointer",
         2,
@@ -131,6 +161,95 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_content_matching_keeps_nul_unicode_and_separate_user_regions() {
+        use crate::models::{ContentPartAuthorship, ContentPartOrigin, MessageContentPart};
+
+        let conn = Connection::open_in_memory().unwrap();
+        register(&conn).unwrap();
+        let content = "\0é|generated|🦀";
+        let parts = [
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 2,
+                authorship: ContentPartAuthorship::Unknown,
+                origin: ContentPartOrigin::DirectInput,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 2,
+                end_char: 13,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::ToolPayload,
+            },
+            MessageContentPart {
+                ordinal: 2,
+                start_char: 13,
+                end_char: 14,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+        ];
+        let encoded = serde_json::to_string(&parts).unwrap();
+        for (query, expected) in [
+            ("\0é", true),
+            ("🦀", true),
+            ("generated", false),
+            ("é🦀", false),
+        ] {
+            let actual: bool = conn
+                .query_row(
+                    "select unicode_lower_contains(?1, ?2, ?3)",
+                    rusqlite::params![content, query, encoded],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "{query:?}");
+        }
+        for (query, expected) in [
+            ("^🦀$", true),
+            ("^\\x00é$", true),
+            ("generated", false),
+            ("é.*🦀", false),
+        ] {
+            let actual: bool = conn
+                .query_row(
+                    "select rust_regexp(?1, ?2, ?3)",
+                    rusqlite::params![query, content, encoded],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "{query:?}");
+        }
+        let unrestricted: bool = conn
+            .query_row(
+                "select unicode_lower_contains(?1, 'generated', null)",
+                [content],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(unrestricted);
+        let no_regions: bool = conn
+            .query_row("select rust_regexp('', ?1, '[]')", [content], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!no_regions);
+        let invalid = serde_json::to_string(&[MessageContentPart {
+            end_char: 100,
+            ..parts[0].clone()
+        }])
+        .unwrap();
+        assert!(!conn
+            .query_row(
+                "select unicode_lower_contains(?1, 'é', ?2)",
+                rusqlite::params![content, invalid],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+    }
 
     #[test]
     fn unicode_lower_contains_streams_lowercase_expansions_without_a_haystack_copy() {

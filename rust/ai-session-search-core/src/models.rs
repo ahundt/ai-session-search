@@ -519,6 +519,23 @@ pub struct MessageContentPart {
     pub origin: ContentPartOrigin,
 }
 
+impl MessageContentPart {
+    pub(crate) fn is_user_input(&self) -> bool {
+        match self.origin {
+            ContentPartOrigin::DirectInput => matches!(
+                self.authorship,
+                ContentPartAuthorship::Human | ContentPartAuthorship::Unknown
+            ),
+            ContentPartOrigin::QuotedContent | ContentPartOrigin::Unknown => {
+                self.authorship == ContentPartAuthorship::Human
+            }
+            ContentPartOrigin::HarnessContext
+            | ContentPartOrigin::GeneratedSummary
+            | ContentPartOrigin::ToolPayload => false,
+        }
+    }
+}
+
 /// Closed authority for an event identity. `SourceLocal` identifies a reference derived from
 /// a local transcript, rather than an ID supplied by its provider.
 ///
@@ -728,6 +745,19 @@ pub struct MessageProvenance {
 }
 
 impl MessageProvenance {
+    pub(crate) fn is_whole_user_input(&self) -> bool {
+        self.authorship == MessageAuthorship::Human
+            || (self.authorship == MessageAuthorship::Unknown
+                && matches!(
+                    self.input_origin,
+                    Some(
+                        MessageInputOrigin::DirectConversation
+                            | MessageInputOrigin::Queued
+                            | MessageInputOrigin::InteractiveAnswer
+                    )
+                ))
+    }
+
     /// Validate in one pass: `O(S)` time and `O(1)` additional memory for `S` content parts.
     pub fn validate(&self, content: &str) -> Result<(), String> {
         if let Some(identity) = &self.correlation_identity {
@@ -1180,19 +1210,28 @@ pub struct SearchHit {
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum ContentAuthorshipSelection {
+pub enum MessageInputScope {
     #[default]
     Any,
-    Human,
+    #[value(name = "user_input")]
+    UserInput,
 }
-impl std::str::FromStr for ContentAuthorshipSelection {
+impl MessageInputScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::UserInput => "user_input",
+        }
+    }
+}
+impl std::str::FromStr for MessageInputScope {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "any" => Ok(Self::Any),
-            "human" => Ok(Self::Human),
+            "user_input" => Ok(Self::UserInput),
             _ => Err(format!(
-                "content_authorship must be any or human, got {value:?}; pass human to match original human text or any to search complete content"
+                "input_scope must be any or user_input, got {value:?}; pass user_input to match recorded user input or any to search complete content"
             )),
         }
     }
@@ -1203,7 +1242,7 @@ impl std::str::FromStr for ContentAuthorshipSelection {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MessageFilters {
-    pub content_authorship: ContentAuthorshipSelection,
+    pub input_scope: MessageInputScope,
     pub role: Option<Role>,
     /// Which semantic message classes to return. `None` selects the default set
     /// ([`MessageKind::default_search_set`]): every class except `HarnessNotice`, which is
@@ -1292,10 +1331,10 @@ impl MessageFilters {
     /// `query` is interpreted according to [`MessageFilters::match_mode`].
     pub fn validate(&self, query: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.content_authorship != ContentAuthorshipSelection::Human
+            self.input_scope != MessageInputScope::UserInput
                 || self.field.unwrap_or(SearchField::Content) == SearchField::Content,
             "{}",
-            crate::message_search::MessageSearchRule::HumanContentRequiresContentField.message()
+            crate::message_search::MessageSearchRule::InputScopeRequiresContentField.message()
         );
         use anyhow::{bail, ensure};
 
@@ -1425,7 +1464,7 @@ impl MessageFilters {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageHit {
-    /// Source attribution supplied for human-content searches.
+    /// Source attribution supplied for input-scoped searches, including unknown senders.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Box<MessageProvenance>>,
     pub session_id: String,

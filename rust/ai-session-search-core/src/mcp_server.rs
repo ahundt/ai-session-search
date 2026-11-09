@@ -2589,13 +2589,13 @@ fn search_origins_output_schema() -> Value {
             "field_view": origin.clone(),
             "match_view": origin.clone(),
             "receipt_level": origin.clone(),
-            "content_authorship": origin.clone(),
+            "input_scope": origin.clone(),
             "result_order": origin
         },
         "required": [
             "result_extent", "context_messages_before", "context_messages_after", "includes",
             "detail", "lines_per_message", "field_view", "match_view", "receipt_level",
-            "result_order", "content_authorship"
+            "result_order", "input_scope"
         ],
         "additionalProperties": false
     })
@@ -3063,7 +3063,7 @@ fn search_messages_output_schema() -> Value {
                         "required": ["field"],
                         "additionalProperties": false
                     },
-                    "content_authorship": { "type": "string", "enum": <crate::models::ContentAuthorshipSelection as clap::ValueEnum>::value_variants() },
+                    "input_scope": { "type": "string", "enum": <crate::models::MessageInputScope as clap::ValueEnum>::value_variants() },
                     "provider_scope": {
                         "type": "object",
                         "properties": {
@@ -3132,7 +3132,7 @@ fn search_messages_output_schema() -> Value {
                     "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] }
                 },
                 "required": [
-                    "target", "content_authorship", "provider_scope", "extent", "context", "presentation", "include",
+                    "target", "input_scope", "provider_scope", "extent", "context", "presentation", "include",
                     "receipt_level"
                 ],
                 "additionalProperties": false
@@ -3358,7 +3358,7 @@ fn message_search_mcp_fields(parameter: MessageSearchParameter) -> &'static [&'s
     match parameter {
         MessageSearchParameter::Query => &["query"],
         MessageSearchParameter::QueryMode => &["query_mode"],
-        MessageSearchParameter::ContentAuthorship => &["content_authorship"],
+        MessageSearchParameter::InputScope => &["input_scope"],
         MessageSearchParameter::Field => &["field"],
         MessageSearchParameter::ArgumentPath => &["argument_path"],
         MessageSearchParameter::Role => &["role"],
@@ -3465,8 +3465,8 @@ enum McpFieldRole {
 /// neither can gain a field the other does not know about.
 const MESSAGE_SEARCH_MCP_FIELDS: &[(&str, MessageSearchParameter, McpFieldRole)] = &[
     (
-        "content_authorship",
-        MessageSearchParameter::ContentAuthorship,
+        "input_scope",
+        MessageSearchParameter::InputScope,
         McpFieldRole::Canonical,
     ),
     (
@@ -3835,7 +3835,7 @@ fn message_search_tool_description(config: &Config, input_schema: &Value) -> Str
          field_view/match_view; views use Unicode scalars and preserve \
          matches, order, count, context and includes.\n",
     );
-    text.push_str("content_authorship=human matches original human regions across roles; omit role for tool answers. Views/context may contain nonhuman text. Queue submission does not prove delivery.\n");
+    text.push_str("input_scope=user_input matches recorded inputs across roles, including queues and tool answers. Views/context may contain generated text. Provenance states sender/delivery uncertainty.\n");
     text.push_str(&omitted_values_sentence(input_schema));
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {
@@ -3999,8 +3999,8 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
 
     set_schema_default(
         properties,
-        "content_authorship",
-        json!(crate::models::ContentAuthorshipSelection::default()),
+        "input_scope",
+        json!(crate::models::MessageInputScope::default()),
     );
     match configured.extent() {
         ResolvedRequestExtent::Page { limit, offset } => {
@@ -4316,7 +4316,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
                         "kind": { "type": "string", "enum": message_kind_values() },
                         "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
-                        "content_authorship": { "type": "string", "enum": <crate::models::ContentAuthorshipSelection as clap::ValueEnum>::value_variants(), "default": "any" },
+                        "input_scope": { "type": "string", "enum": <crate::models::MessageInputScope as clap::ValueEnum>::value_variants(), "default": "any" },
                         "argument_path": { "type": "string" },
                         "providers": provider_set_schema(&provider_values),
                         "tool_name_contains": { "type": "string" },
@@ -6220,9 +6220,9 @@ fn tool_search_messages_cancellable(
         .time(RequestedTimeRange::new(since, until).map_err(|error| error.to_string())?)
         .include_compaction(mcp_bool_arg(args, "include_compaction", true));
     if let Some(selection) =
-        parse_opt_enum::<crate::models::ContentAuthorshipSelection>(args, "content_authorship")?
+        parse_opt_enum::<crate::models::MessageInputScope>(args, "input_scope")?
     {
-        builder = builder.content_authorship(selection);
+        builder = builder.input_scope(selection);
     }
     // `kinds` is the single class-selection mechanism; `kind` is its one-value alias. Do not
     // reintroduce per-class booleans here: one was tried and reverted because it duplicated
@@ -7533,7 +7533,7 @@ mod tests {
                     (9001,2,18,25,'generated','tool_payload');"
         ).unwrap();
         let out = search_messages_value(
-            &json!({"query":"humanneedle","content_authorship":"human","receipt_level":"full"}),
+            &json!({"query":"humanneedle","input_scope":"user_input","receipt_level":"full"}),
             &config,
             &db,
         );
@@ -7551,7 +7551,7 @@ mod tests {
         output_schema_violations(&out, &schema, "structuredContent", &mut violations);
         assert!(violations.is_empty(), "{violations:?}");
         let excluded = search_messages_value(
-            &json!({"query":"prefix","content_authorship":"human"}),
+            &json!({"query":"prefix","input_scope":"user_input"}),
             &config,
             &db,
         );
@@ -8710,10 +8710,7 @@ mod tests {
             ("providers", check::<crate::models::Provider>),
             ("role", check::<crate::models::Role>),
             ("field", check::<crate::models::SearchField>),
-            (
-                "content_authorship",
-                check::<crate::models::ContentAuthorshipSelection>,
-            ),
+            ("input_scope", check::<crate::models::MessageInputScope>),
             ("index_refresh", check::<crate::config::IndexRefresh>),
         ];
         // Advertised vocabularies with no Rust enum behind them: each is matched inline by the

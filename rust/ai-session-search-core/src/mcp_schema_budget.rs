@@ -581,9 +581,9 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    // Human-content selection and restored parameter prose measure 4,885 bytes after Codex
-    // normalization, leaving 115 bytes before it silently deletes every parameter description.
-    ("search_messages", 4_885, 10),
+    // Input-purpose selection measures 4,878 bytes after Codex normalization, leaving 122 bytes
+    // before it silently deletes every parameter description.
+    ("search_messages", 4_878, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
     // and `all_results` say "omit for" like every other property so the tool description's
     // omitted-values sentence can read them back. 279 bytes of headroom remain before Codex's

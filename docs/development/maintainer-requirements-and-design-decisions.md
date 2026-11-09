@@ -491,15 +491,27 @@ canonical records rather than adapter-specific response models.
 Do not add a second parser for an opaque or duplicative database without evidence that it contains
 unique supported data.
 
-Authorship for a user turn comes from structural evidence: a per-message origin marker where the
-format has one (Antigravity's `USER_EXPLICIT`), otherwise the session's own start (Claude, Codex,
-Cursor, Pi: a session nothing spawned is a person's, a spawned run's user turns are the caller's
-delegation). Google AI Studio and Gemini CLI store one person-started chat per file with no spawn
-concept, so their user turns resolve to human by that same session-level evidence; the Gemini CLI
-adapter first sets aside the `functionResponse` echoes the API writes as user turns and records
-`toolCalls` as tool-call and tool-result rows and `warning`/`info`/`error` turns as harness
-notices, so no generated text is left in a user row to be called human. Both parse versions moved
-(`aistudio-v3`, `gemini-cli-v4`) so an existing index reparses those files at its next refresh.
+Input retrieval follows recorded source and purpose. `MessageInputScope::UserInput` selects
+prompts, queued submissions and linked interactive-answer regions across storage roles. Explicit
+native provenance takes precedence over session fallback; generated tool output, harness context,
+delegation and known mirrors do not satisfy that selection. Default `Any` and other filters keep
+their existing behavior. A queued submission can have an unknown sender and delivery outcome
+while its input purpose is known; retain that uncertainty instead of hiding the submission.
+
+Authorship retains the existing structural conventions: Antigravity's `USER_EXPLICIT` marks Human;
+ordinary root-session user turns resolve to Human and known spawned-run delegation to Agent.
+Native per-part metadata and explicit Unknown override those defaults. Interactive results keep
+their tool role and source event identity; content partitions distinguish input from generated
+wrappers. Canonical decoded answers retain the original searchable payload and generated
+separators cannot join separate answers into a matching phrase. Parser-version changes must
+repair identifiable old rows without deleting archive-only inputs or multiplying events.
+
+Gemini CLI supports legacy JSON and native JSONL history, including explicit subagent evidence,
+generated `functionResponse` echoes, tool calls/results and harness notices. Rewind, masking and
+removal cannot erase original input from the append log. Google AI Studio JSON chunks distinguish
+user from model content. Its legacy Markdown path preserves the existing whole-document role
+convention; the format cannot establish individual turn boundaries, so do not infer them from
+prose or headings.
 
 Adding a provider variant is an index-compatibility event even when the schema generation does not
 move: Prime Agent shipped at generation 5, so a `1.0.0rc1` executable opening an index that a later
