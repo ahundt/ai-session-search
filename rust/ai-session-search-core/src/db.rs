@@ -3798,7 +3798,7 @@ impl Db {
     /// this; the search hot path probes [`Db::filtered_corpus_reaches`] instead.
     ///
     /// For input_scope=user_input, eligibility also reads indexed provenance and parts;
-    /// its worst case is O(F + P) row/part reads, where P is eligible content parts.
+    /// its worst case is O(F + P) row/part reads, where P is the content parts examined.
     /// Whole-input eligibility does not read message content, including for empty inputs.
     /// Cost for the default any selection: index-only. The class predicate defaults to `kind != 'harness_notice'`, and no
     /// index answers a `!=` without visiting rows, so this is computed as
