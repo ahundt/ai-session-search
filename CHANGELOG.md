@@ -128,7 +128,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 1. `Cargo.lock` takes the newest release of each dependency that is semver-compatible, builds
    with the minimum supported Rust (1.88), and is at least 7 days old as of November 7, 2026,
-   the cooldown `.github/dependabot.yml` applies. Among them: `rmcp` 3.4.0 to 3.8.0, `tokio`
+   the cooldown `.github/dependabot.yml` applies. Among them: `rmcp` 3.4.0 to 3.9.0, `tokio`
    1.53.3 to 1.54.1, `pyo3` 0.29.2 to 0.29.3, `ureq` 3.4.2 to 3.5.0, and `uuid` 1.24.0 to
    1.26.1. `jiff` stays at 0.2.39, which `main` already uses. `pyo3` 0.30 and `rusqlite` 0.41
    fall outside the current version requirements; each needs its own change.
