@@ -2388,8 +2388,12 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
                 [(message_id, part["ordinal"], part["start_char"], part["end_char"], part["authorship"], part["origin"]) for part in provenance["content_parts"]],
             )
         connection.commit()
+        # Fixture inserts use Python's SQLite, whose older trigram tokenizer stops at NUL.
+        # Rebuild the derived index with the product's bundled SQLite before testing parity.
+        connection.execute("drop table messages_trigram")
     finally:
         connection.close()
+    native.SessionSearch(database)
     return database, spec
 
 
