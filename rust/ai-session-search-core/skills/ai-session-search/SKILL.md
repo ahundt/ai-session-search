@@ -180,7 +180,7 @@ aise list --parent-session claude:7e745098-c299-4cf5-bdbe-5cdb1fb5a62d
 aise messages search "foreign key" --workspace-path ~/source/project --limit 20 --context 2
 aise messages search 'timeout|lock|busy' --query-mode regex --limit 20 --lines-per-message 4
 aise messages search "approximate remembered wording" --query-mode fuzzy --limit 20
-aise messages search misunderstood --role user --when 14d --limit 20 --context 2
+aise messages search misunderstood --input-scope user_input --when 14d --limit 20 --context 2
 aise messages search "CANNOT STOP" --kinds harness-notice --when 2d --limit 20
 aise messages search exec --field tool-name --query-mode fuzzy --limit 20
 aise messages search "cargo test" --field tool-argument --argument-path /cmd --limit 20
