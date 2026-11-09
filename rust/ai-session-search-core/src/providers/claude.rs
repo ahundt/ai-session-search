@@ -991,11 +991,11 @@ pub(crate) fn claude_mixed_user_content(
         }
         if let Some(attribution) = attributed_answer {
             match attribution {
-                InteractiveAnswerAttribution::WholeHuman => parts.push(MessageContentPart {
+                InteractiveAnswerAttribution::Whole => parts.push(MessageContentPart {
                     ordinal: parts.len() as u32,
                     start_char,
                     end_char,
-                    authorship: ContentPartAuthorship::Human,
+                    authorship: direct_authorship,
                     origin: ContentPartOrigin::DirectInput,
                 }),
                 InteractiveAnswerAttribution::Mixed(local_parts) => {
@@ -1406,7 +1406,7 @@ fn is_ask_user_tool_name(name: &str) -> bool {
 }
 
 enum InteractiveAnswerAttribution {
-    WholeHuman,
+    Whole,
     Mixed(Vec<MessageContentPart>),
 }
 
@@ -1421,7 +1421,7 @@ fn interactive_answer_content(
 ) -> (String, Option<InteractiveAnswerAttribution>) {
     let attribution = interactive_answer_attribution(value, &content, answer_authorship);
     let mut parts = match attribution {
-        Some(InteractiveAnswerAttribution::WholeHuman) => vec![content_part(
+        Some(InteractiveAnswerAttribution::Whole) => vec![content_part(
             0,
             0,
             content.chars().count(),
@@ -1524,7 +1524,7 @@ fn interactive_answer_content(
     } else if has_generated {
         Some(InteractiveAnswerAttribution::Mixed(parts))
     } else {
-        Some(InteractiveAnswerAttribution::WholeHuman)
+        Some(InteractiveAnswerAttribution::Whole)
     };
     (content, attribution)
 }
@@ -1546,7 +1546,7 @@ fn interactive_answer_attribution(
             return None;
         }
         if content == response {
-            return Some(InteractiveAnswerAttribution::WholeHuman);
+            return Some(InteractiveAnswerAttribution::Whole);
         }
         const PREFIX: &str = "The user responded: ";
         if content.strip_prefix(PREFIX) != Some(response) {
@@ -1574,7 +1574,7 @@ fn interactive_answer_attribution(
     if answers.len() == 1 {
         if let Some(answer) = answers.values().next().and_then(Value::as_str) {
             if !answer.is_empty() && content == answer {
-                return Some(InteractiveAnswerAttribution::WholeHuman);
+                return Some(InteractiveAnswerAttribution::Whole);
             }
         }
     }
@@ -1623,7 +1623,7 @@ fn interactive_answer_attribution(
             parts.len() as u32,
             start_char,
             end_char,
-            ContentPartAuthorship::Human,
+            answer_authorship,
             ContentPartOrigin::DirectInput,
         ));
         cursor = end;
@@ -1638,19 +1638,19 @@ fn interactive_answer_attribution(
             ContentPartOrigin::ToolPayload,
         ));
     }
-    let has_human = parts
+    let has_input = parts
         .iter()
-        .any(|part| part.authorship == ContentPartAuthorship::Human);
+        .any(|part| part.authorship == answer_authorship);
     let has_generated = parts
         .iter()
         .any(|part| part.authorship == ContentPartAuthorship::Generated);
-    if !has_human {
+    if !has_input {
         return None;
     }
     if has_generated {
         Some(InteractiveAnswerAttribution::Mixed(parts))
     } else {
-        Some(InteractiveAnswerAttribution::WholeHuman)
+        Some(InteractiveAnswerAttribution::Whole)
     }
 }
 
@@ -2412,6 +2412,129 @@ mod tests {
         let warning = parsed.session.parse_warning.as_deref().unwrap();
         assert!(warning.contains("skipped 1 malformed JSONL record"));
         assert!(warning.contains("queue delivery, cancellation"));
+    }
+
+    #[test]
+    fn interactive_answers_preserve_channel_and_scheduled_sender_uncertainty() {
+        use crate::message_search::{
+            MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+        };
+        use crate::models::{ContentPartAuthorship, MessageAuthorship, MessageInputScope};
+        use serde_json::json;
+
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        for path in [
+            temp.path().join("origin-answer.jsonl"),
+            temp.path()
+                .join("local-agent-mode-sessions/install/account/local_origin/audit.jsonl"),
+        ] {
+            for (origin, expected_author) in [
+                (json!({"kind":"human"}), ContentPartAuthorship::Human),
+                (
+                    json!({"kind":"channel","server":"slack"}),
+                    ContentPartAuthorship::Unknown,
+                ),
+                (
+                    json!({"kind":"task-notification","subkind":"scheduled-trigger"}),
+                    ContentPartAuthorship::Unknown,
+                ),
+            ] {
+                for (display, prefix) in [
+                    (
+                        "Your questions have been answered: \"Q\"=\"answer marker\".",
+                        "",
+                    ),
+                    ("answer marker", ""),
+                    ("answer marker", "direct preamble"),
+                ] {
+                    let mut blocks = Vec::new();
+                    if !prefix.is_empty() {
+                        blocks.push(json!({"type":"text","text":prefix}));
+                    }
+                    blocks
+                        .push(json!({"type":"tool_result","tool_use_id":"ask","content":display}));
+                    let input = [
+                    json!({"type":"assistant","sessionId":"origin-answer","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask","name":"AskUserQuestion","input":{}}]}}),
+                    json!({"type":"user","sessionId":"origin-answer","uuid":"answer","origin":origin,"message":{"role":"user","content":blocks},"toolUseResult":{"answers":{"Q":"answer marker"}}}),
+                ].into_iter().map(|value| value.to_string()).collect::<Vec<_>>().join("\n");
+                    let parsed = adapter
+                        .parse_reader(std::io::Cursor::new(input), &path)
+                        .unwrap();
+                    let answer = parsed
+                        .messages
+                        .iter()
+                        .find(|message| {
+                            message
+                                .provenance
+                                .correlation_identity
+                                .as_ref()
+                                .is_some_and(|identity| identity.id == "answer")
+                        })
+                        .unwrap();
+                    let expected = if prefix.is_empty() {
+                        display.to_string()
+                    } else {
+                        format!("{prefix}\n{display}")
+                    };
+                    assert_eq!(
+                        answer.content, expected,
+                        "native answer must appear exactly once: {origin}"
+                    );
+                    if answer.provenance.authorship == MessageAuthorship::Mixed {
+                        let input_parts: Vec<_> = answer
+                            .provenance
+                            .content_parts
+                            .iter()
+                            .filter(|part| {
+                                part.origin == crate::models::ContentPartOrigin::DirectInput
+                            })
+                            .collect();
+                        assert!(!input_parts.is_empty());
+                        assert!(
+                            input_parts
+                                .iter()
+                                .all(|part| part.authorship == expected_author),
+                            "{origin}: {:?}",
+                            answer.provenance
+                        );
+                    } else {
+                        assert_eq!(
+                            answer.provenance.authorship,
+                            if expected_author == ContentPartAuthorship::Human {
+                                MessageAuthorship::Human
+                            } else {
+                                MessageAuthorship::Unknown
+                            }
+                        );
+                    }
+                    answer.provenance.validate(&answer.content).unwrap();
+                    let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+                    db.upsert_session(&parsed, 0, 0).unwrap();
+                    db.upsert_session(&parsed, 0, 0).unwrap();
+                    let config = crate::config::Config::default();
+                    let service =
+                        crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+                    for scope in [MessageInputScope::Any, MessageInputScope::UserInput] {
+                        let response = service
+                            .search(
+                                MessageSearchRequest::builder(
+                                    MessageQuery::literal("answer marker").unwrap(),
+                                    MessageTarget::content(),
+                                )
+                                .session_id(parsed.session.id.clone())
+                                .unwrap()
+                                .input_scope(scope)
+                                .build()
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        assert_eq!(response.hits().len(), 1);
+                        assert_eq!(response.hits()[0].message.content, expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
