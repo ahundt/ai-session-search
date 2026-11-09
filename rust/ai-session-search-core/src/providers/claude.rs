@@ -24,10 +24,9 @@ use crate::providers::{
     walk_roots, ProviderDiscovery, ProviderPathWarning,
 };
 use crate::util::{
-    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, observe_session_start, parse_datetime,
-    preview_from_text, substantive_text, truncate_for_display, RawMessage,
-    UserRoleAuthorshipEvidence,
+    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
+    observe_session_end, observe_session_start, parse_datetime, preview_from_text,
+    substantive_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 /// The workflow engine's own log, written beside the agent transcripts it spawned. It records
@@ -307,11 +306,8 @@ impl ClaudeAdapter {
                             observe_session_end(&mut updated_at, timestamp);
                             let mut raw_message =
                                 RawMessage::message("user", content.clone(), timestamp, None)
-                                    .with_authorship(if subagent {
-                                        MessageAuthorship::Agent
-                                    } else {
-                                        MessageAuthorship::Human
-                                    })
+                                    // Legacy queue rows carry no sender or per-item origin.
+                                    .with_authorship(MessageAuthorship::Unknown)
                                     .with_input_delivery_state(InputDeliveryState::Submitted)
                                     .with_input_origin(MessageInputOrigin::Queued);
                             if let Some(event_id) = event_id {
@@ -684,9 +680,9 @@ impl ClaudeAdapter {
                 .or(agent_id),
         };
 
-        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
-        apply_user_role_authorship(
-            &mut messages,
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
             if subagent {
                 UserRoleAuthorshipEvidence::AgentDelegationEvent
             } else {
@@ -1566,8 +1562,8 @@ mod tests {
         assert_eq!(parsed.messages[1].content, "subagent queued turn");
         assert_eq!(
             parsed.messages[1].provenance.authorship,
-            crate::models::MessageAuthorship::Agent,
-            "queued input in a subagent transcript is not human evidence"
+            crate::models::MessageAuthorship::Unknown,
+            "the queue record carries no author receipt, even in a subagent transcript"
         );
         assert_eq!(
             parsed.messages[1].provenance.input_origin,
@@ -1794,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_answers_and_queued_enqueues_are_human_without_echo_duplicates() {
+    fn ask_user_answers_are_human_and_legacy_queue_authors_remain_unknown() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("input-session.jsonl");
         std::fs::write(
@@ -1856,9 +1852,10 @@ mod tests {
             2,
             "repeated submits survive; popAll is an echo"
         );
-        assert!(queued.iter().all(
-            |message| message.provenance.authorship == crate::models::MessageAuthorship::Human
-        ));
+        assert!(queued
+            .iter()
+            .all(|message| message.provenance.authorship
+                == crate::models::MessageAuthorship::Unknown));
         assert!(queued.iter().all(|message| {
             message.provenance.input_delivery_state
                 == Some(crate::models::InputDeliveryState::Submitted)
@@ -1904,6 +1901,62 @@ mod tests {
         let warning = parsed.session.parse_warning.as_deref().unwrap();
         assert!(warning.contains("skipped 1 malformed JSONL record"));
         assert!(warning.contains("queue delivery, cancellation"));
+    }
+
+    #[test]
+    fn queue_upgrade_repairs_archived_authorship_without_losing_submissions() {
+        use crate::models::{ContentAuthorshipSelection, MessageAuthorship, MessageFilters};
+
+        for (relative, old_version, provider) in [
+            ("project/input.jsonl", "claude-v5", Provider::Claude),
+            (
+                "local-agent-mode-sessions/install/account/local_input/audit.jsonl",
+                "claude-desktop-local-agent-v5",
+                Provider::ClaudeDesktop,
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let archived = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"input","timestamp":"2026-06-16T20:58:02Z","content":"/queue input"}"#;
+            let retained = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"input","timestamp":"2026-06-16T20:58:03Z","content":"retained queue input"}"#;
+            std::fs::write(&path, format!("{archived}\n{retained}\n")).unwrap();
+            let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+            let source = adapter.discover().remove(0);
+            let mut old = adapter.parse(&source);
+            assert_eq!(old.session.provider, provider);
+            old.session.parse_version = old_version.into();
+            for message in &mut old.messages {
+                message.provenance.authorship = MessageAuthorship::Human;
+            }
+            let db_path = temp.path().join("index.db");
+            let db = crate::db::Db::open(&db_path).unwrap();
+            db.upsert_session(&old, 1, 1).unwrap();
+            let human = MessageFilters {
+                content_authorship: ContentAuthorshipSelection::Human,
+                ..Default::default()
+            };
+            assert_eq!(db.search_messages("queue input", &human).unwrap().len(), 2);
+            std::fs::write(&path, format!("{retained}\n")).unwrap();
+            let repaired = adapter.parse(&source);
+            for generation in [2, 3] {
+                db.upsert_session(&repaired, generation, generation)
+                    .unwrap();
+                assert_eq!(
+                    db.search_messages("queue input", &Default::default())
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                assert!(db
+                    .search_messages("queue input", &human)
+                    .unwrap()
+                    .is_empty());
+            }
+            let stored = rusqlite::Connection::open(db_path).unwrap();
+            let unknown: i64 = stored.query_row("select count(*) from messages where authorship='unknown' and input_origin='queued' and input_delivery_state='submitted'", [], |row| row.get(0)).unwrap();
+            assert_eq!(unknown, 2);
+        }
     }
 
     #[test]
@@ -1968,22 +2021,22 @@ mod tests {
         for generation in [2, 3] {
             db.upsert_session(&shortened, generation, generation)
                 .unwrap();
-            let hits = db
+            assert!(db
                 .search_messages("repeated queued input", &filters)
-                .unwrap();
-            assert_eq!(hits.len(), 2);
-            let provenance: Vec<_> = hits
-                .iter()
-                .map(|hit| hit.provenance.as_deref().unwrap())
-                .collect();
-            assert_ne!(
-                provenance[0].correlation_identity,
-                provenance[1].correlation_identity
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.search_messages("repeated queued input", &Default::default())
+                    .unwrap()
+                    .len(),
+                2
             );
-            assert!(provenance
-                .iter()
-                .all(|p| p.input_delivery_state
-                    == Some(crate::models::InputDeliveryState::Submitted)));
+            let stored = rusqlite::Connection::open(temp.path().join("index.db")).unwrap();
+            let (identities, submitted, unknown): (i64, i64, i64) = stored.query_row(
+                "select count(distinct correlation_id), sum(input_delivery_state='submitted'), sum(authorship='unknown') from messages",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!((identities, submitted, unknown), (2, 2, 2));
         }
     }
 
@@ -2785,7 +2838,7 @@ mod tests {
         );
         assert_eq!(
             parsed.session.parse_version,
-            "claude-desktop-local-agent-v5"
+            "claude-desktop-local-agent-v6"
         );
         assert_eq!(parsed.session.message_count, Some(4));
         let metadata: serde_json::Value =

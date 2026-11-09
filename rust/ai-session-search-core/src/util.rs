@@ -1263,6 +1263,7 @@ pub struct RawMessage {
     kind: Option<MessageKind>,
     tool_call_id: Option<String>,
     provenance: MessageProvenance,
+    authorship_override: Option<MessageAuthorship>,
     native_event_identity: Option<(MessageCorrelationAuthority, String)>,
 }
 
@@ -1288,6 +1289,7 @@ impl RawMessage {
             kind: None,
             tool_call_id: None,
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1306,6 +1308,7 @@ impl RawMessage {
             kind: Some(MessageKind::HarnessNotice),
             tool_call_id: None,
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1324,6 +1327,7 @@ impl RawMessage {
             kind: Some(MessageKind::ToolCall),
             tool_call_id: tool_call_id.map(str::to_string),
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1351,13 +1355,14 @@ impl RawMessage {
             kind: Some(MessageKind::ToolResult),
             tool_call_id: tool_call_id.map(str::to_string),
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
 
-    /// Attach provider-verified semantic authorship before role normalization.
+    /// Attach provider-verified semantic authorship, including an explicit `Unknown` override.
     pub fn with_authorship(mut self, authorship: MessageAuthorship) -> Self {
-        self.provenance.authorship = authorship;
+        self.authorship_override = Some(authorship);
         self
     }
 
@@ -1405,7 +1410,7 @@ impl RawMessage {
     /// [`MessageProvenance::validate`] enforces ordered, gap-free Unicode-scalar ranges before
     /// persistence. The builder sets the required aggregate `Mixed` authorship automatically.
     pub fn with_content_parts(mut self, parts: Vec<MessageContentPart>) -> Self {
-        self.provenance.authorship = MessageAuthorship::Mixed;
+        self.authorship_override = Some(MessageAuthorship::Mixed);
         self.provenance.content_parts = parts;
         self
     }
@@ -1429,6 +1434,7 @@ impl From<LegacyRawMessage> for RawMessage {
             kind: None,
             tool_call_id: None,
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1476,17 +1482,26 @@ pub enum UserRoleAuthorshipEvidence {
     Unverified,
 }
 
+impl UserRoleAuthorshipEvidence {
+    fn authorship(self) -> MessageAuthorship {
+        match self {
+            Self::HumanInputEvent => MessageAuthorship::Human,
+            Self::AgentDelegationEvent => MessageAuthorship::Agent,
+            Self::Unverified => MessageAuthorship::Unknown,
+        }
+    }
+}
+
 /// Resolve user-role authorship from provider-supplied structured event evidence.
 ///
 /// This is linear in message count and changes only still-unknown conversation/slash rows. It
-/// therefore preserves explicit provider evidence while preventing a spawned agent's delegation
-/// prompt (stored by harnesses as `role = user`) from becoming human-authored evidence.
+/// cannot distinguish an explicit `Unknown` from unresolved evidence after normalization.
+/// Built-in adapters resolve evidence while normalizing [`RawMessage`] instead.
 pub fn apply_user_role_authorship(messages: &mut [Message], evidence: UserRoleAuthorshipEvidence) {
-    let user_authorship = match evidence {
-        UserRoleAuthorshipEvidence::HumanInputEvent => MessageAuthorship::Human,
-        UserRoleAuthorshipEvidence::AgentDelegationEvent => MessageAuthorship::Agent,
-        UserRoleAuthorshipEvidence::Unverified => return,
-    };
+    let user_authorship = evidence.authorship();
+    if user_authorship == MessageAuthorship::Unknown {
+        return;
+    }
     for message in messages {
         if message.provenance.authorship == MessageAuthorship::Unknown
             && matches!(message.role, Role::User | Role::Slash)
@@ -1520,7 +1535,7 @@ pub fn to_messages_with_tools<T>(raw: Vec<T>) -> Vec<Message>
 where
     T: Into<RawMessage>,
 {
-    normalize_raw_messages(raw, None)
+    normalize_raw_messages_with_evidence(raw, None, UserRoleAuthorshipEvidence::Unverified)
 }
 
 /// Normalize provider records while binding deferred native event IDs to one canonical session.
@@ -1532,10 +1547,14 @@ pub fn to_messages_with_tools_in_scope<T>(raw: Vec<T>, scope: &str) -> Vec<Messa
 where
     T: Into<RawMessage>,
 {
-    normalize_raw_messages(raw, Some(scope))
+    normalize_raw_messages_with_evidence(raw, Some(scope), UserRoleAuthorshipEvidence::Unverified)
 }
 
-fn normalize_raw_messages<T>(raw: Vec<T>, correlation_scope: Option<&str>) -> Vec<Message>
+pub(crate) fn normalize_raw_messages_with_evidence<T>(
+    raw: Vec<T>,
+    correlation_scope: Option<&str>,
+    evidence: UserRoleAuthorshipEvidence,
+) -> Vec<Message>
 where
     T: Into<RawMessage>,
 {
@@ -1548,9 +1567,17 @@ where
                 .kind
                 .unwrap_or_else(|| infer_message_kind(normalized, &raw.content));
             let mut provenance = raw.provenance;
-            if provenance.authorship == MessageAuthorship::Unknown {
-                provenance.authorship = infer_message_authorship(normalized, kind);
-            }
+            provenance.authorship = raw.authorship_override.unwrap_or_else(|| {
+                let inferred = infer_message_authorship(normalized, kind);
+                if inferred == MessageAuthorship::Unknown
+                    && matches!(normalized, Role::User | Role::Slash)
+                    && matches!(kind, MessageKind::Conversation | MessageKind::Unknown)
+                {
+                    evidence.authorship()
+                } else {
+                    inferred
+                }
+            });
             if let Some((authority, id)) = raw.native_event_identity {
                 let scope = correlation_scope.expect(
                     "provider-native event identity requires to_messages_with_tools_in_scope",
@@ -1582,6 +1609,151 @@ mod role_classification_tests {
     use crate::models::{
         MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind, MessageRecordRelation,
     };
+
+    #[test]
+    fn explicit_authorship_survives_session_evidence() {
+        for evidence in [
+            UserRoleAuthorshipEvidence::HumanInputEvent,
+            UserRoleAuthorshipEvidence::AgentDelegationEvent,
+            UserRoleAuthorshipEvidence::Unverified,
+        ] {
+            for authorship in [
+                MessageAuthorship::Unknown,
+                MessageAuthorship::Human,
+                MessageAuthorship::Agent,
+            ] {
+                let messages = normalize_raw_messages_with_evidence(
+                    vec![
+                        RawMessage::message("user", "prompt".into(), None, None)
+                            .with_authorship(authorship),
+                        RawMessage::tool_result("question", "reply".into(), Some("call"), None)
+                            .with_authorship(authorship),
+                    ],
+                    None,
+                    evidence,
+                );
+                assert_eq!(messages[0].provenance.authorship, authorship);
+                assert_eq!(messages[1].provenance.authorship, authorship);
+            }
+        }
+    }
+
+    #[test]
+    fn session_evidence_only_resolves_unclassified_input() {
+        for (evidence, expected) in [
+            (
+                UserRoleAuthorshipEvidence::HumanInputEvent,
+                MessageAuthorship::Human,
+            ),
+            (
+                UserRoleAuthorshipEvidence::AgentDelegationEvent,
+                MessageAuthorship::Agent,
+            ),
+            (
+                UserRoleAuthorshipEvidence::Unverified,
+                MessageAuthorship::Unknown,
+            ),
+        ] {
+            let messages = normalize_raw_messages_with_evidence(
+                vec![
+                    RawMessage::message("user", "prompt".into(), None, None),
+                    RawMessage::message("user", "/compact request".into(), None, None),
+                    RawMessage::harness_notice("notice".into(), None),
+                    RawMessage::tool_result("read", "output".into(), Some("call"), None),
+                    RawMessage::tool_call("read", json!({}), Some("call"), None),
+                    RawMessage::message("assistant", "response".into(), None, None),
+                    RawMessage::message("compaction", "summary".into(), None, None),
+                ],
+                None,
+                evidence,
+            );
+            let authorships: Vec<_> = messages
+                .iter()
+                .map(|message| message.provenance.authorship)
+                .collect();
+            assert_eq!(
+                authorships,
+                vec![
+                    expected,
+                    expected,
+                    MessageAuthorship::Harness,
+                    MessageAuthorship::Generated,
+                    MessageAuthorship::Agent,
+                    MessageAuthorship::Agent,
+                    MessageAuthorship::Generated,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_parts_origin_and_identity() {
+        use crate::models::{ContentPartAuthorship, ContentPartOrigin};
+
+        let parts = vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 2,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 2,
+                end_char: 3,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::ToolPayload,
+            },
+        ];
+        let raw = RawMessage::tool_result("question", "🦀\nx".into(), Some("call"), None)
+            .with_authorship(MessageAuthorship::Unknown)
+            .with_content_parts(parts.clone())
+            .with_input_origin(MessageInputOrigin::InteractiveAnswer)
+            .with_input_delivery_state(InputDeliveryState::Submitted)
+            .with_native_event_identity(MessageCorrelationAuthority::Anthropic, "event");
+        let invalid = raw.clone().with_authorship(MessageAuthorship::Human);
+        let messages = normalize_raw_messages_with_evidence(
+            vec![raw, invalid],
+            Some("claude:session"),
+            UserRoleAuthorshipEvidence::AgentDelegationEvent,
+        );
+        let provenance = &messages[0].provenance;
+        assert_eq!(provenance.authorship, MessageAuthorship::Mixed);
+        assert_eq!(provenance.content_parts, parts);
+        assert_eq!(
+            provenance.input_origin,
+            Some(MessageInputOrigin::InteractiveAnswer)
+        );
+        assert_eq!(
+            provenance.input_delivery_state,
+            Some(InputDeliveryState::Submitted)
+        );
+        assert_eq!(
+            provenance.correlation_identity.as_ref().unwrap().scope,
+            "claude:session"
+        );
+        assert!(provenance.validate(&messages[0].content).is_ok());
+        assert_eq!(messages[1].provenance.content_parts, parts);
+        assert!(messages[1]
+            .provenance
+            .validate(&messages[1].content)
+            .is_err());
+
+        let unknown = normalize_raw_messages_with_evidence(
+            vec![RawMessage::message("user", "x".into(), None, None)
+                .with_authorship(MessageAuthorship::Human)
+                .with_authorship(MessageAuthorship::Unknown)
+                .with_input_origin(MessageInputOrigin::Unknown)],
+            None,
+            UserRoleAuthorshipEvidence::HumanInputEvent,
+        );
+        assert_eq!(unknown[0].provenance.authorship, MessageAuthorship::Unknown);
+        assert_eq!(
+            unknown[0].provenance.input_origin,
+            Some(MessageInputOrigin::Unknown)
+        );
+    }
 
     #[test]
     fn typed_tool_events_preserve_kind_and_native_call_id() {
@@ -1747,8 +1919,8 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v5",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v5",
+        Provider::Claude => "claude-v6",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v6",
         Provider::Codex => "codex-v5",
         Provider::Cursor => "cursor-v4",
         Provider::Antigravity => "antigravity-v3",

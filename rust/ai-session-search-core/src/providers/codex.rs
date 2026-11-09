@@ -17,10 +17,9 @@ use crate::models::{
 };
 use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
-    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, parse_datetime, parse_unix_millis,
-    parse_unix_seconds, preview_from_text, truncate_for_display, RawMessage,
-    UserRoleAuthorshipEvidence,
+    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
+    observe_session_end, parse_datetime, parse_unix_millis, parse_unix_seconds, preview_from_text,
+    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -475,9 +474,9 @@ impl CodexAdapter {
             agent_label,
         };
 
-        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
-        apply_user_role_authorship(
-            &mut messages,
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
             if agent_started {
                 UserRoleAuthorshipEvidence::AgentDelegationEvent
             } else {

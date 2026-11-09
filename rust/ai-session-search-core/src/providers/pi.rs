@@ -17,10 +17,9 @@ use crate::models::{
 };
 use crate::providers::{spawn::SpawnOrigin, walk_roots, ProviderDiscovery};
 use crate::util::{
-    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, observe_session_start, parse_datetime,
-    preview_from_text, substantive_text, truncate_for_display, RawMessage,
-    UserRoleAuthorshipEvidence,
+    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
+    observe_session_end, observe_session_start, parse_datetime, preview_from_text,
+    substantive_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,9 +406,9 @@ impl PiAdapter {
                 .and_then(|origin| origin.run_suffix.split('/').next().map(ToOwned::to_owned)),
         };
 
-        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
-        apply_user_role_authorship(
-            &mut messages,
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
             if spawned.is_some() {
                 UserRoleAuthorshipEvidence::AgentDelegationEvent
             } else {

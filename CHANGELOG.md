@@ -96,7 +96,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
    `aise doctor`, and reads the file again on the next refresh.
 9. Claude queued submissions and structurally attributable `AskUserQuestion` answers are
-   searchable. Queued input remains marked submitted because the source does not prove delivery.
+   searchable. Legacy queue records have unknown authorship and require the default complete-content
+   search; human-only search excludes them. They remain submitted because the source does not prove delivery.
    Independent same-text submissions survive source rewrites, and parser upgrades preserve
    file-edit replay order.
 

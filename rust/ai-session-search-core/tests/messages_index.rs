@@ -75,17 +75,33 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     let db = Db::open(&config.db_path()).unwrap();
     indexer::reindex(&config, &db, true, None).unwrap();
     let service = MessageService::new(&config, &db, SearchSurface::Rust);
-    let request = || {
+    let request = |selection| {
         MessageSearchRequest::builder(
             MessageQuery::literal("correction").unwrap(),
             MessageTarget::content(),
         )
-        .content_authorship(ContentAuthorshipSelection::Human)
+        .content_authorship(selection)
         .build()
         .unwrap()
     };
-    let response = service.search(request()).unwrap();
-    assert_eq!(response.hits().len(), 3);
+    let response = service
+        .search(request(ContentAuthorshipSelection::Human))
+        .unwrap();
+    assert_eq!(response.hits().len(), 1);
+    let complete = service
+        .search(request(ContentAuthorshipSelection::Any))
+        .unwrap();
+    assert_eq!(complete.hits().len(), 4);
+    for queued in ["liquid correction", "vision correction"] {
+        assert_eq!(
+            complete
+                .hits()
+                .iter()
+                .filter(|hit| hit.message.content == queued)
+                .count(),
+            1
+        );
+    }
     assert_eq!(
         response
             .hits()
@@ -111,9 +127,21 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     }
     indexer::reindex(&config, &db, true, None).unwrap();
     assert_eq!(
-        service.search(request()).unwrap().hits().len(),
-        3,
+        service
+            .search(request(ContentAuthorshipSelection::Any))
+            .unwrap()
+            .hits()
+            .len(),
+        4,
         "refresh must not multiply queue evidence"
+    );
+    assert_eq!(
+        service
+            .search(request(ContentAuthorshipSelection::Human))
+            .unwrap()
+            .hits()
+            .len(),
+        1
     );
 }
 

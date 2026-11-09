@@ -268,7 +268,11 @@ impl AntigravityAdapter {
             agent_label: None,
         };
 
-        let messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
+            crate::util::UserRoleAuthorshipEvidence::Unverified,
+        );
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),

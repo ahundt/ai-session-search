@@ -1996,9 +1996,31 @@ impl Db {
         // them; the parse speaks for everything else.
         // Dates are compared as instants: stored RFC 3339 text orders correctly only within one
         // UTC offset.
+        let legacy_queue_version = match session.provider {
+            Provider::Claude => Some("claude-v5"),
+            Provider::ClaudeDesktop => Some("claude-desktop-local-agent-v5"),
+            _ => None,
+        }
+        .filter(|_| session.parse_version == crate::util::provider_parse_version(session.provider));
         let mut prior_dates: Vec<SessionDates> = Vec::new();
         for id in std::iter::once(&session.id).chain(&retired_ids) {
             prior_dates.extend(stored_session_dates(&tx, id)?);
+            if let Some(version) = legacy_queue_version {
+                // v5 inferred queue authors from session origin; repair archives before
+                // their version/identity changes, without touching newer alias evidence.
+                tx.execute(
+                    "update messages set authorship = 'unknown'
+                         where session_id = ?1
+                           and exists (select 1 from sessions where id = ?1
+                               and provider = ?2 and parse_version = ?3)
+                           and role in ('user', 'slash') and kind = 'conversation'
+                           and input_origin = 'queued' and input_delivery_state = 'submitted'
+                           and authorship in ('human', 'agent')
+                           and not exists (select 1 from message_content_parts
+                               where message_id = messages.id)",
+                    params![id, session.provider.as_str(), version],
+                )?;
+            }
         }
         let mut prior_transcripts: Vec<String> = Vec::new();
         for id in &retired_ids {
@@ -13479,7 +13501,7 @@ mod tests {
         db.conn
             .execute_batch(
                 "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, parse_warning, discovery_source) values
-                 ('claude:current','claude','current','','/a','claude-v5',null,'jsonl'),
+                 ('claude:current','claude','current','','/a','claude-v6',null,'jsonl'),
                  ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl');",
             )
             .unwrap();
@@ -13502,7 +13524,7 @@ mod tests {
             .iter()
             .find(|item| item.provider == Provider::Claude)
             .unwrap();
-        assert_eq!(claude.expected_parse_version, "claude-v5");
+        assert_eq!(claude.expected_parse_version, "claude-v6");
         assert_eq!((claude.current_sessions, claude.stale_sessions), (1, 1));
         assert_eq!(
             db.stale_session_sources().unwrap(),
@@ -16706,6 +16728,97 @@ mod tests {
             messages,
             file_edits: Vec::new(),
         }
+    }
+
+    #[test]
+    fn legacy_queue_repair_respects_alias_versions_and_rolls_back() {
+        use crate::models::{
+            InputDeliveryState, MessageAuthorship, MessageInputOrigin, MessageKind,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut legacy = parsed_with_messages(
+            "claude:legacy",
+            &["legacy queue", "direct input", "interactive input"],
+        );
+        legacy.session.source_path = "/old".into();
+        legacy.session.parse_version = "claude-v5".into();
+        for message in &mut legacy.messages {
+            message.provenance.authorship = MessageAuthorship::Human;
+        }
+        legacy.messages[0].provenance.authorship = MessageAuthorship::Agent;
+        legacy.messages[0].provenance.input_origin = Some(MessageInputOrigin::Queued);
+        legacy.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Submitted);
+        legacy.messages[2].role = Role::Tool;
+        legacy.messages[2].kind = MessageKind::ToolResult;
+        legacy.messages[2].provenance.input_origin = Some(MessageInputOrigin::InteractiveAnswer);
+        db.upsert_session(&legacy, 1, 1).unwrap();
+
+        let mut current = parsed_with_messages("claude:current", &["verified queue"]);
+        current.session.source_path = "/new".into();
+        current.session.parse_version =
+            crate::util::provider_parse_version(Provider::Claude).into();
+        current.messages[0].provenance = legacy.messages[0].provenance.clone();
+        current.messages[0].provenance.authorship = MessageAuthorship::Human;
+        db.upsert_session(&current, 1, 1).unwrap();
+        // Stored session versions remain authoritative when source stamps are unavailable.
+        db.conn.execute("delete from files_seen", []).unwrap();
+        db.conn
+            .execute_batch(
+                "create trigger fail_queue_upgrade before update on sessions
+            when new.id='claude:current' begin select raise(abort, 'late fixture failure'); end;",
+            )
+            .unwrap();
+        let aliases = [legacy.session.source_path.clone()];
+        assert!(db
+            .upsert_session_reconciling_sources(&current, 2, 2, &aliases, false)
+            .is_err());
+        let prior_author: String = db
+            .conn
+            .query_row(
+                "select authorship from messages where content='legacy queue'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prior_author, "agent");
+        assert!(db.resolve_session_record("claude:legacy").is_ok());
+        db.conn
+            .execute_batch("drop trigger fail_queue_upgrade")
+            .unwrap();
+
+        db.upsert_session_reconciling_sources(&current, 2, 2, &aliases, false)
+            .unwrap();
+        let rows: Vec<(String, String)> = db
+            .conn
+            .prepare("select content, authorship from messages order by content")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("direct input".into(), "human".into()),
+                ("interactive input".into(), "human".into()),
+                ("legacy queue".into(), "unknown".into()),
+                ("verified queue".into(), "human".into()),
+            ]
+        );
+        db.conn.execute_batch("create table queue_repairs(n integer); insert into queue_repairs values(0);
+            create trigger count_queue_repairs after update on messages begin update queue_repairs set n=n+1; end;").unwrap();
+        db.upsert_session_reconciling_sources(&current, 3, 3, &aliases, false)
+            .unwrap();
+        let updates: i64 = db
+            .conn
+            .query_row("select n from queue_repairs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            updates, 0,
+            "a repeated repair must not rewrite retained message rows"
+        );
     }
 
     #[test]

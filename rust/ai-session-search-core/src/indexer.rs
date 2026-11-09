@@ -1528,7 +1528,6 @@ mod tests {
             .search_messages(
                 "queued tail correction",
                 &crate::models::MessageFilters {
-                    content_authorship: crate::models::ContentAuthorshipSelection::Human,
                     session_id: Some("claude:queue-tail".to_string()),
                     ..Default::default()
                 },
@@ -1538,10 +1537,30 @@ mod tests {
             .iter()
             .find(|message| message.content == "queued tail correction")
             .expect("full parse preserved queue input");
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let metadata: (String, String, String) = stored
+            .query_row(
+                "select authorship, input_origin, input_delivery_state from messages
+             where session_id=?1 and content=?2",
+                rusqlite::params![queued.session_id, queued.content],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(
-            queued.provenance.as_ref().unwrap().input_delivery_state,
-            Some(crate::models::InputDeliveryState::Submitted)
+            metadata,
+            ("unknown".into(), "queued".into(), "submitted".into())
         );
+        assert!(db
+            .search_messages(
+                "queued tail correction",
+                &crate::models::MessageFilters {
+                    content_authorship: crate::models::ContentAuthorshipSelection::Human,
+                    session_id: Some("claude:queue-tail".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .is_empty());
         let warning = db
             .resolve_session("claude:queue-tail")
             .unwrap()

@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::providers::{spawn, walk_roots, ProviderDiscovery};
 use crate::util::{
-    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, preview_from_text, substantive_text, truncate_for_display,
-    RawMessage, UserRoleAuthorshipEvidence,
+    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
+    preview_from_text, substantive_text, truncate_for_display, RawMessage,
+    UserRoleAuthorshipEvidence,
 };
 
 pub struct CursorAdapter {
@@ -231,9 +231,9 @@ impl CursorAdapter {
             agent_label: spawned.as_ref().map(|origin| origin.run_suffix.clone()),
         };
 
-        let mut messages = crate::util::to_messages_with_tools(messages);
-        apply_user_role_authorship(
-            &mut messages,
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            None,
             if spawned.is_some() {
                 UserRoleAuthorshipEvidence::AgentDelegationEvent
             } else {
