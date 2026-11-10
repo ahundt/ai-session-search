@@ -3411,6 +3411,105 @@ mod message_search_service_tests {
     }
 
     #[test]
+    fn existing_only_reads_released_schema_five_without_user_input_columns() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        insert_session(
+            &db,
+            Provider::Claude,
+            "released-schema",
+            "/workspace",
+            "/missing/session.jsonl",
+            &["unrestricted legacy needle"],
+        );
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "drop index idx_messages_session_authorship_relation_seq;
+             drop index idx_messages_authorship_relation_ts;
+             alter table messages drop column input_delivery_state;
+             alter table messages drop column input_origin;
+             create index idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq);
+             create index idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq);
+             pragma user_version = 5;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let app = SessionSearch::open(config).unwrap();
+        let unrestricted = app
+            .messages()
+            .search_legacy("legacy needle", &MessageFilters::default())
+            .unwrap();
+        assert_eq!(unrestricted.len(), 1);
+        let all_sessions = |limit| SearchFilters {
+            limit,
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            app.catalog().list_sessions(&all_sessions(0)).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            app.analysis()
+                .role_statistics(&MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            app.analysis()
+                .documents(&all_sessions(1), None)
+                .unwrap()
+                .documents
+                .len(),
+            1
+        );
+        let policies = crate::corrections::ResolvedCorrectionPolicySet::from_policies(vec![
+            crate::corrections::embedded_policy().unwrap(),
+        ]);
+        app.analysis()
+            .corrections_with_resolved_policies(&MessageFilters::default(), &policies)
+            .unwrap();
+        let policy = crate::analysis_pipeline::AnalysisPolicySpec::default()
+            .compile()
+            .unwrap();
+        let request = crate::models::AnalysisRequest::new(
+            SearchFilters::default(),
+            crate::models::AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap();
+        assert_eq!(
+            app.analysis()
+                .run(&request, &policy)
+                .unwrap()
+                .result
+                .sessions
+                .len(),
+            1
+        );
+        let error = app
+            .messages()
+            .search_legacy(
+                "legacy needle",
+                &MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("user-input provenance"), "{error}");
+        assert!(error.contains("omit the role filter"), "{error}");
+    }
+
+    #[test]
     fn omitted_limits_keep_rust_cli_and_python_unbounded_while_mcp_stays_bounded() {
         let (_directory, db) = disposable_db();
         let config = Config::default();

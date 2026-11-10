@@ -397,7 +397,15 @@ fn parse_provenance_enum<T: serde::de::DeserializeOwned>(value: &str) -> Result<
     T::deserialize(serde::de::value::StringDeserializer::<
         serde::de::value::Error,
     >::new(value.to_ascii_lowercase().replace('-', "_")))
-    .map_err(|error| error.to_string())
+    .map_err(|error| {
+        format!(
+            "invalid {} {value:?}: {error}",
+            std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("provenance")
+        )
+    })
 }
 
 impl std::str::FromStr for MessageAuthorship {
@@ -648,6 +656,8 @@ pub enum MessageInputOrigin {
     DirectConversation,
     Queued,
     InteractiveAnswer,
+    /// Migration marker for rows indexed before origins were recorded.
+    /// Use `None` on MessageProvenance when current source evidence is absent.
     Unknown,
 }
 
@@ -1177,7 +1187,7 @@ impl MessageInputScope {
 /// Bounded source evidence for ordinary hits; partitions remain internal to matching.
 /// Full part arrays previously made even a compact, single-hit MCP response exceed its cap:
 /// text windows do not bound metadata. Keep full partitions/identity in the index, not this header.
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HitProvenance {
     pub authorship: MessageAuthorship,
     pub record_relation: MessageRecordRelation,
@@ -2243,6 +2253,10 @@ mod tests {
                 expected
             );
         }
+        let error = "UnrecognizedOrigin"
+            .parse::<MessageInputOrigin>()
+            .unwrap_err();
+        assert!(error.contains("MessageInputOrigin") && error.contains("UnrecognizedOrigin"));
         for value in ["delivered", "cancelled", "canceled"] {
             assert!(value.parse::<InputDeliveryState>().is_err());
         }

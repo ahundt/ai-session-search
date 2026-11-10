@@ -245,8 +245,6 @@ pub(crate) fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Resu
         "correlation_authority",
         "correlation_scope",
         "correlation_id",
-        "input_delivery_state",
-        "input_origin",
     ]
     .into_iter()
     .filter(|column| !columns.contains(*column))
@@ -258,6 +256,36 @@ pub(crate) fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Resu
         )));
     }
     Ok(None)
+}
+
+/// Validate recorded-input storage, including the base search layout and additive columns.
+///
+/// These columns were added after schema generation 5 was released. They are deliberately not
+/// part of [`current_schema_layout_problem`]: an older schema-5 index still owns the released FTS
+/// and base-message layout, so unrestricted reads can continue from a read-only connection. The
+/// user-input scope calls this check and reports the exact writable upgrade action instead.
+pub(crate) fn message_input_provenance_layout_problem(
+    conn: &rusqlite::Connection,
+) -> Result<Option<String>> {
+    if let Some(problem) = current_schema_layout_problem(conn)? {
+        return Ok(Some(problem));
+    }
+    let columns = conn
+        .prepare("pragma table_info(messages)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    let missing_columns = ["input_delivery_state", "input_origin"]
+        .into_iter()
+        .filter(|column| !columns.contains(*column))
+        .collect::<Vec<_>>();
+    if missing_columns.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "messages is missing user-input provenance column(s): {}",
+            missing_columns.join(", ")
+        )))
+    }
 }
 
 /// Validate the schema-4 derived message-search objects independently of newer parser-derived
@@ -1779,6 +1807,31 @@ mod tests {
     }
 
     #[test]
+    fn hard_link_sources_remain_one_input_and_unchanged_on_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first = first_root.join("a.jsonl");
+        let second = second_root.join("b.jsonl");
+        std::fs::write(&first, "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"sessionId\":\"hard-link\",\"content\":\"one linked submission\"}\n").unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let mut config = config_with_single_claude_fixture(&db_path, dir.path());
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(db.message_count().unwrap(), 1);
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+        // Selecting another live name for the same file is a verified alias, not a copy.
+        config.providers.claude.paths = vec![normalize_path(&second_root)];
+        reindex(&config, &db, false, None).unwrap();
+        assert!(first.exists());
+        assert_eq!(db.message_count().unwrap(), 1);
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+    }
+
+    #[test]
     fn renamed_claude_queue_source_reconciles_path_scoped_identity() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
@@ -2661,6 +2714,34 @@ mod tests {
                 (other, _) => panic!("{case}: unexpected schema state {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn released_schema_five_without_input_columns_stays_readable_for_unrestricted_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        drop(Db::open(&db_path).unwrap());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // This is the released v1.0.0 shape for the fields added after its schema-5 stamp. Keep
+        // the derived FTS layout intact: an old index is readable content, not a broken search
+        // index, and only the user-input scope needs the additive columns.
+        conn.execute_batch(
+            "drop index idx_messages_session_authorship_relation_seq;
+             drop index idx_messages_authorship_relation_ts;
+             alter table messages drop column input_delivery_state;
+             alter table messages drop column input_origin;
+             pragma user_version = 5;",
+        )
+        .unwrap();
+        let config = config_with_no_providers(&db_path);
+        assert_eq!(
+            IndexCoordinator::new(&config).inspect_schema().unwrap(),
+            SchemaState::Current
+        );
+        assert!(message_input_provenance_layout_problem(&conn)
+            .unwrap()
+            .is_some());
+        assert!(current_schema_layout_problem(&conn).unwrap().is_none());
     }
 
     #[test]

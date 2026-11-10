@@ -21,7 +21,10 @@
     {"seq": 62, "role": "assistant", "content": "\u0000nul needle é"},
     {"seq": 63, "role": "user", "content": ""},
     {"seq": 64, "role": "tool", "kind": "tool_result", "content": "", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": "interactive_answer", "input_delivery_state": null, "content_parts": []}},
-    {"seq": 65, "role": "assistant", "content": ""}
+    {"seq": 65, "role": "assistant", "content": ""},
+    {"seq": 70, "role": "user", "content": "legacy marker", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": "unknown", "input_delivery_state": null, "content_parts": []}},
+    {"seq": 71, "role": "user", "content": "legacy marker", "provenance": {"authorship": "unknown", "record_relation": "unknown", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}},
+    {"seq": 72, "role": "user", "content": "legacy marker", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}}
   ],
   "bulk": {
     "first_seq": 100,
@@ -30,6 +33,12 @@
     "content_prefix": "bulk row"
   },
   "cases": [
+    {"name": "literal legacy markers select recorded input", "mode": "literal", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"]], "role": "user"},
+    {"name": "literal legacy markers retain complete history", "mode": "literal", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"], [72, "user"]]},
+    {"name": "regex legacy markers select recorded input", "mode": "regex", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"]], "role": "user"},
+    {"name": "regex legacy markers retain complete history", "mode": "regex", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"], [72, "user"]]},
+    {"name": "fuzzy legacy markers select recorded input", "mode": "fuzzy", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"]], "role": "user"},
+    {"name": "fuzzy legacy markers retain complete history", "mode": "fuzzy", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"], [72, "user"]]},
     {"name": "empty user inputs retain zero-width regex membership across roles", "mode": "regex", "query": "^$", "role": "user", "all_results": true, "expected": [[63, "user"], [64, "tool"]]},
     {"name": "default zero-width regex keeps empty assistant rows", "mode": "regex", "query": "^$", "all_results": true, "expected": [[63, "user"], [64, "tool"], [65, "assistant"]]},
     {"name": "user content after NUL is searchable across roles", "mode": "literal", "query": "nul needle", "role": "user", "all_results": true, "expected": [[60, "user"], [61, "tool"]]},

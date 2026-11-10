@@ -241,15 +241,15 @@ impl CodexAdapter {
             match value.get("type").and_then(Value::as_str) {
                 Some("session_meta") => {
                     if let Some(payload) = value.get("payload") {
-                        let (parent, label) = codex_spawn_origin(payload);
-                        session_is_agent |= parent.is_some() || label.is_some();
                         // First session_meta wins, matching cwd/created_at below. A fork's
                         // second session_meta carries the PARENT's id; taking it would bind
                         // this file's content to the parent's session, and the
                         // `on conflict(id) do update` upsert in db.rs would then overwrite
                         // the parent's row wholesale instead of storing this one.
                         if !session_id_bound {
-                            header_spawn_origin = (parent.clone(), label.clone());
+                            let (parent, label) = codex_spawn_origin(payload);
+                            session_is_agent |= parent.is_some() || label.is_some();
+                            header_spawn_origin = (parent, label);
                             if let Some(id) = payload.get("id").and_then(Value::as_str) {
                                 provider_session_id = id.to_string();
                             }
@@ -1858,6 +1858,30 @@ mod tests {
             "nested out"
         );
         assert_eq!(codex_output_text(None), "");
+    }
+
+    #[test]
+    fn forked_session_does_not_inherit_parent_spawn_attribution() {
+        let source = json!({"subagent":{"thread_spawn":{"parent_thread_id":"grandparent","agent_nickname":"parent-agent"}}});
+        let records = [
+            json!({"type":"session_meta","payload":{"id":"own-fork","source":"cli"}}),
+            json!({"type":"session_meta","payload":{"id":"parent","source":source}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user",
+                "content":[{"type":"input_text","text":"own fork prompt"}],
+                "internal_chat_message_metadata_passthrough":{"content_item_metadata":[{"provenance":{"type":"user"}}]}}}),
+        ].into_iter().map(|value| value.to_string()+"\n").collect::<String>();
+        let parsed = CodexAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(records),
+                Path::new("/tmp/own-fork.jsonl"),
+            )
+            .unwrap();
+        assert!(parsed.session.parent_session_id.is_none());
+        assert!(parsed.session.agent_label.is_none());
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            MessageAuthorship::Human
+        );
     }
 
     /// A forked session's rollout carries TWO session_meta lines: its own first, then the

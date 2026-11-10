@@ -17,7 +17,9 @@ use fuzzy_matcher::FuzzyMatcher;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
 use rayon::prelude::*;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{
+    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+};
 
 use crate::hashing::FramedSha256;
 use crate::message_search::selected_message_field_parts;
@@ -30,8 +32,8 @@ use crate::models::{
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
-    fold_caseless, parse_stored_timestamp, snippet_from_match, snippet_from_match_while,
-    stored_timestamp, UnicodeLowerNeedle, SIGMAS,
+    canonical_source_path, fold_caseless, parse_stored_timestamp, snippet_from_match,
+    snippet_from_match_while, stored_timestamp, UnicodeLowerNeedle, SIGMAS,
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -40,12 +42,11 @@ struct FileIdentityReceipt {
     canonical_path: String,
 }
 
-pub(crate) fn file_identity_for_path(path: &Path) -> Option<String> {
+fn file_identity_for_path(path: &Path) -> Option<String> {
     let id = file_id::get_file_id(path).ok()?;
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     serde_json::to_string(&FileIdentityReceipt {
         id,
-        canonical_path: crate::util::normalize_path(&canonical),
+        canonical_path: canonical_source_path(path),
     })
     .ok()
 }
@@ -388,11 +389,12 @@ const AUTO_REINDEX_FRESHNESS_SQL: &str =
      join index_metadata word3 on word3.key = ?5
      where completed.key = ?1";
 const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
-const CORRECTION_CANDIDATES_SQL: &str =
+const CORRECTION_CANDIDATES_PREFIX: &str =
     "select m.id, m.session_id, m.seq, m.provider, m.ts, m.content, m.authorship
      from messages m
      where m.record_relation = 'original'
-       and coalesce(m.input_origin, 'unknown') != 'queued'
+       and ";
+const CORRECTION_CANDIDATES_SUFFIX: &str = "
        and (
            m.authorship = 'human'
            or (
@@ -411,12 +413,13 @@ const CORRECTION_CANDIDATES_SQL: &str =
 /// ascending under a session filter). A total order makes offset pages reproducible and
 /// non-overlapping across the CLI, Rust, Python, and MCP adapters.
 const CORRECTION_ORDER_SQL: &str = " order by m.ts desc, m.session_id asc, m.seq asc, m.id asc";
-const CORRECTION_HUMAN_PARTS_SQL: &str = "select m.id, p.start_char, p.end_char
+const CORRECTION_HUMAN_PARTS_PREFIX: &str = "select m.id, p.start_char, p.end_char
      from messages m
      join message_content_parts p on p.message_id = m.id
      where m.authorship = 'mixed'
        and m.record_relation = 'original'
-       and coalesce(m.input_origin, 'unknown') != 'queued'
+       and ";
+const CORRECTION_HUMAN_PARTS_SUFFIX: &str = "
        and p.authorship = 'human'";
 
 struct TrigramRebuild {
@@ -450,6 +453,64 @@ pub struct Db {
     /// the CLI sets an `eprintln` sink, the MCP server leaves it unset (silent, so nothing can
     /// pollute its stdio JSON-RPC channel). Mirrors the indexer's `progress` callback.
     progress: Option<ProgressReporter>,
+}
+
+/// Add the post-release columns used to distinguish recorded user input from other `role=user`
+/// rows. This is shared by normal writable opens and offline migration staging so the latter does
+/// not rebuild otherwise-healthy FTS indexes merely because additive storage was missing.
+pub(crate) fn ensure_message_input_provenance_storage(conn: &Connection) -> Result<()> {
+    let definitions = [
+        (
+            "input_delivery_state",
+            "input_delivery_state text default 'unknown'",
+        ),
+        ("input_origin", "input_origin text default 'unknown'"),
+    ];
+    let mut missing = Vec::new();
+    for (name, definition) in definitions {
+        let present: bool = conn.query_row(
+            "select exists(select 1 from pragma_table_info('messages') where name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        if !present {
+            missing.push((name, definition));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // Keep the additive columns and their covering indexes one atomic schema transition. A
+    // failed index DDL must not leave a half-upgraded database that later forces a query to use a
+    // missing or stale column. The initial read is intentionally outside the transaction so the
+    // common current-schema path performs no write transaction at all.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let mut added = false;
+    for (name, definition) in missing {
+        let present: bool = tx.query_row(
+            "select exists(select 1 from pragma_table_info('messages') where name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!("alter table messages add column {definition}"))?;
+            added = true;
+        }
+    }
+    // A peer may have completed the migration before this transaction acquired the writer lock.
+    if added {
+        tx.execute_batch(
+            "drop index if exists idx_messages_session_authorship_relation_seq;
+             drop index if exists idx_messages_authorship_relation_ts;
+             create index if not exists idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq, input_origin);
+             create index if not exists idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq, input_origin);",
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1176,8 +1237,8 @@ impl Db {
                 correlation_authority text,
                 correlation_scope text,
                 correlation_id text,
-                input_delivery_state text,
-                input_origin text,
+                input_delivery_state text default 'unknown',
+                input_origin text default 'unknown',
                 record_relation text not null default 'unknown'
                     check (record_relation in ('original', 'mirror', 'unknown')),
                 check (
@@ -1238,14 +1299,6 @@ impl Db {
             ("correlation_authority", "correlation_authority text"),
             ("correlation_scope", "correlation_scope text"),
             ("correlation_id", "correlation_id text"),
-            // These fields were added after schema 5 was already in the wild. A legacy row is
-            // explicitly unknown, not NULL, so an existing schema-5 file remains safely readable
-            // without pretending that delivery or input origin was observed.
-            (
-                "input_delivery_state",
-                "input_delivery_state text default 'unknown'",
-            ),
-            ("input_origin", "input_origin text default 'unknown'"),
             (
                 "record_relation",
                 "record_relation text not null default 'unknown'",
@@ -1259,14 +1312,12 @@ impl Db {
             if !exists {
                 self.conn
                     .execute_batch(&format!("alter table messages add column {definition}"))?;
-                if name == "input_origin" {
-                    self.conn.execute_batch(
-                        "drop index if exists idx_messages_session_authorship_relation_seq;
-                         drop index if exists idx_messages_authorship_relation_ts;",
-                    )?;
-                }
             }
         }
+        // These columns were added after schema 5 was already in the wild. Keep their additive
+        // DDL shared with offline database migration so a copied v1.0.0 index gains the exact
+        // storage needed for `role=user` without paying an unrelated FTS rebuild.
+        ensure_message_input_provenance_storage(&self.conn)?;
         self.conn.execute_batch(
             "drop index if exists idx_messages_authorship_role_provider_ts;
              create index if not exists idx_messages_tool_calls
@@ -3827,11 +3878,33 @@ impl Db {
 
     fn validate_input_scope_layout(&self, filters: &MessageFilters) -> Result<()> {
         if filters.input_scope() == crate::models::MessageInputScope::UserInput {
-            if let Some(problem) = crate::indexer::current_schema_layout_problem(&self.conn)? {
+            if let Some(problem) =
+                crate::indexer::message_input_provenance_layout_problem(&self.conn)?
+            {
                 bail!("user-input search requires current provenance storage: {problem}; run `aise reindex` to upgrade the index, or omit the role filter to search readable stored content");
             }
         }
         Ok(())
+    }
+
+    /// Return the one queued-delivery exclusion used by source-authoritative analytics.
+    ///
+    /// Schema-5 indexes released before input provenance was added have no `input_origin` column.
+    /// Their providers did not produce queued-delivery rows, so every stored original human row is
+    /// equivalent to the current non-queued predicate. Keeping that compatibility decision here
+    /// lets corrections, repeats, and analysis documents remain readable without mutating a
+    /// read-only index or duplicating schema probes in each SQL owner.
+    fn nonqueued_input_predicate(&self) -> Result<&'static str> {
+        // Delivery metadata can be missing while origin still proves that a row was queued.
+        let has_origin: bool = self.conn.query_row(
+            "select exists(select 1 from pragma_table_info('messages') where name = 'input_origin')",
+            [], |row| row.get(0),
+        )?;
+        Ok(if has_origin {
+            "coalesce(m.input_origin, 'unknown') != 'queued'"
+        } else {
+            "1 = 1"
+        })
     }
 
     /// Count the messages matching the structural filters (role / provider / session / path / time /
@@ -4429,7 +4502,8 @@ impl Db {
             regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
         }
 
-        let mut inner = String::from(
+        let nonqueued = self.nonqueued_input_predicate()?;
+        let mut inner = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind,
                     m.tool_call_id,
                     case
@@ -4448,7 +4522,7 @@ impl Db {
                     m.id as message_id
              from messages m
              where m.record_relation = 'original'
-       and coalesce(m.input_origin, 'unknown') != 'queued'
+       and {nonqueued}
                and (
                  m.authorship = 'human'
                  or (
@@ -4606,7 +4680,10 @@ impl Db {
             // Select only source-authoritative human content. Unknown schema-5 authorship stays
             // excluded rather than being guessed; unavailable source transcripts retain their
             // index rows but cannot become evidence about what a person said.
-            let mut sql = String::from(CORRECTION_CANDIDATES_SQL);
+            let nonqueued = self.nonqueued_input_predicate()?;
+            let mut sql = format!(
+                "{CORRECTION_CANDIDATES_PREFIX}{nonqueued}{CORRECTION_CANDIDATES_SUFFIX}"
+            );
             let mut args: Vec<Value> = Vec::new();
             append_stored_role_filters(&mut sql, &mut args, &filters, &self.access_scope);
             sql.push_str(CORRECTION_ORDER_SQL);
@@ -4641,7 +4718,9 @@ impl Db {
             // mixed message, avoiding both repeated SQLite `substr` prefix scans and copied
             // fragment text. This is two set-oriented queries total, never one query per message.
             if rows.iter().any(|row| row.human_parts.is_some()) {
-                let mut parts_sql = String::from(CORRECTION_HUMAN_PARTS_SQL);
+                let mut parts_sql = format!(
+                    "{CORRECTION_HUMAN_PARTS_PREFIX}{nonqueued}{CORRECTION_HUMAN_PARTS_SUFFIX}"
+                );
                 let mut parts_args: Vec<Value> = Vec::new();
                 append_stored_role_filters(
                     &mut parts_sql,
@@ -5121,6 +5200,7 @@ impl Db {
         }
         // Keep session metadata and all per-session message reads on one SQLite snapshot.
         // The read-only transaction rolls back via RAII on every return/error path.
+        let nonqueued = self.nonqueued_input_predicate()?;
         let transaction = self.conn.unchecked_transaction()?;
         analysis_document_page(
             &transaction,
@@ -5128,6 +5208,7 @@ impl Db {
             cursor,
             filters.limit,
             &self.access_scope,
+            nonqueued,
         )
     }
 
@@ -5150,10 +5231,11 @@ impl Db {
         ) -> Result<()>,
     ) -> Result<AnalysisTraversalReceipt> {
         self.validate_access_scope()?;
+        let nonqueued = self.nonqueued_input_predicate()?;
         let transaction = self.conn.unchecked_transaction()?;
-        let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
+        let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(nonqueued))?;
         let mut human_message_stmt =
-            transaction.prepare(ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL)?;
+            transaction.prepare(&analysis_attributable_human_messages_sql(nonqueued))?;
         let mut cursor = None;
         let mut selected_sessions = 0_u64;
         let mut messages_in_selected_sessions = 0_u64;
@@ -5642,11 +5724,12 @@ impl Db {
     }
 }
 
-const ANALYSIS_MESSAGE_COUNTS_SQL: &str = "select count(*),
+const ANALYSIS_MESSAGE_COUNTS_SQL_PREFIX: &str = "select count(*),
             coalesce(sum(
                 case
                     when m.record_relation = 'original'
-                     and coalesce(m.input_origin, 'unknown') != 'queued'
+                     and ";
+const ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX: &str = "
                      and (
                         m.authorship = 'human'
                         or (
@@ -5665,6 +5748,10 @@ const ANALYSIS_MESSAGE_COUNTS_SQL: &str = "select count(*),
      from messages m indexed by idx_messages_session_authorship_relation_seq
      where m.session_id = ?1";
 
+fn analysis_message_counts_sql(nonqueued: &str) -> String {
+    format!("{ANALYSIS_MESSAGE_COUNTS_SQL_PREFIX}{nonqueued}{ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX}")
+}
+
 /// One ordered text row per original message with attributable human-authored content.
 ///
 /// SQLite `substr` counts Unicode code points, matching the persisted Unicode-scalar part
@@ -5674,14 +5761,16 @@ const ANALYSIS_MESSAGE_COUNTS_SQL: &str = "select count(*),
 ///
 /// Let `M` be candidate messages and `P_h` selected human parts. Time is `O(log M + M + P_h)` plus
 /// emitted text bytes, and retained SQLite state is bounded by one session's selected part rows.
-const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL: &str = "select seq, group_concat(fragment, '')
+const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_PREFIX: &str =
+    "select seq, group_concat(fragment, '')
      from (
          select m.id as message_id, m.seq as seq, -1 as ordinal, m.content as fragment
          from messages m indexed by idx_messages_session_authorship_relation_seq
          where m.session_id = ?1
            and m.authorship = 'human'
            and m.record_relation = 'original'
-       and coalesce(m.input_origin, 'unknown') != 'queued'
+       and ";
+const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_MIDDLE: &str = "
          union all
          select m.id as message_id, m.seq as seq, p.ordinal as ordinal,
                 substr(m.content, p.start_char + 1, p.end_char - p.start_char) as fragment
@@ -5690,12 +5779,19 @@ const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL: &str = "select seq, group_concat
          where m.session_id = ?1
            and m.authorship = 'mixed'
            and m.record_relation = 'original'
-       and coalesce(m.input_origin, 'unknown') != 'queued'
+       and ";
+const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX: &str = "
            and p.authorship = 'human'
          order by seq, message_id, ordinal
      )
      group by message_id, seq
      order by seq, message_id";
+
+fn analysis_attributable_human_messages_sql(nonqueued: &str) -> String {
+    format!(
+        "{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_PREFIX}{nonqueued}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_MIDDLE}{nonqueued}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX}"
+    )
+}
 
 /// One keyset page of matching session records, ordered by canonical session ID.
 fn analysis_session_page(
@@ -5750,13 +5846,15 @@ fn analysis_document_page(
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
     access: &crate::search_scope::EffectiveAccessScope,
+    nonqueued: &str,
 ) -> Result<crate::models::AnalysisDocumentPage> {
     use crate::models::{AnalysisDocument, AnalysisDocumentPage};
 
     let (sessions, next_cursor) =
         analysis_session_page(transaction, filters, cursor, page_limit, access)?;
-    let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
-    let mut human_message_stmt = transaction.prepare(ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL)?;
+    let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(nonqueued))?;
+    let mut human_message_stmt =
+        transaction.prepare(&analysis_attributable_human_messages_sql(nonqueued))?;
     let mut documents = Vec::with_capacity(sessions.len());
     for session in sessions {
         let (message_count, human_message_count) = count_stmt.query_row([&session.id], |row| {
@@ -7072,12 +7170,8 @@ fn remap_verified_queue_scopes(
     if aliases.is_empty() {
         return Ok(());
     }
-    let new_scope_path = std::fs::canonicalize(&session.source_path)
-        .unwrap_or_else(|_| Path::new(&session.source_path).to_path_buf());
-    let new_scope = format!(
-        "claude_queue:{}",
-        crate::util::normalize_path(&new_scope_path)
-    );
+    use crate::providers::claude::claude_queue_scope;
+    let new_scope = claude_queue_scope(&canonical_source_path(Path::new(&session.source_path)));
     for alias in aliases {
         let Some(receipt) = tx
             .query_row(
@@ -7092,7 +7186,7 @@ fn remap_verified_queue_scopes(
         else {
             continue;
         };
-        let old_scope = format!("claude_queue:{}", receipt.canonical_path);
+        let old_scope = claude_queue_scope(&receipt.canonical_path);
         tx.execute(
             "update messages
              set correlation_scope = ?1
@@ -12368,21 +12462,26 @@ mod tests {
     }
 
     #[test]
-    fn migrated_archive_only_user_rows_remain_searchable() {
+    fn migrated_archive_only_user_rows_remain_searchable_from_legacy_message_layout() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         {
             let legacy = Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "create table messages (
+                "create table messages (
                 id integer primary key, session_id text not null, provider text not null,
                 seq integer not null, role text not null, ts text, tool_name text,
+                kind text not null default 'unknown', tool_call_id text,
                 is_compaction integer not null default 0, content text not null,
                 authorship text not null default 'unknown',
-                record_relation text not null default 'original');
-                insert into messages(session_id,provider,seq,role,content)
-                values ('antigravity:archive','antigravity',0,'user','archived correction');
+                correlation_authority text, correlation_scope text, correlation_id text,
+                record_relation text not null default 'unknown'
+                    check (record_relation in ('original', 'mirror', 'unknown')),
+                check ((correlation_authority is null and correlation_scope is null and correlation_id is null)
+                    or (correlation_authority is not null and correlation_scope is not null and correlation_id is not null)));
+                insert into messages(session_id,provider,seq,role,content,record_relation)
+                values ('antigravity:archive','antigravity',0,'user','archived correction','original');
                 insert into messages(session_id,provider,seq,role,content,authorship,record_relation)
                 values ('antigravity:archive','antigravity',2,'user','delegated correction','agent','original'),
                        ('antigravity:archive','antigravity',3,'user','mirrored correction','unknown','mirror');
@@ -12514,6 +12613,151 @@ mod tests {
             .unwrap();
         assert!(parts_table_exists);
         assert!(db.needs_backfill().unwrap());
+    }
+
+    #[test]
+    fn input_layout_guard_preserves_base_storage_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:missing-parts", &["stored needle"]),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .execute_batch("drop table message_content_parts")
+            .unwrap();
+        let error = db
+            .search_messages(
+                "needle",
+                &MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("user-input search requires current provenance storage"),
+            "{error}"
+        );
+        assert_eq!(
+            db.search_messages("needle", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn partial_input_storage_keeps_known_queues_out_of_read_only_analytics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:partial", &["direct needle", "queued needle"]),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "update messages set authorship='human', record_relation='original';
+            update messages set input_origin='queued' where seq=1;
+            alter table messages drop column input_delivery_state;",
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open_existing_read_only_with_threads(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let hits = db
+            .search_attributable_human_messages("needle", &MessageFilters::default())
+            .unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            db.search_messages("needle", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fresh_messages_default_omitted_input_provenance_to_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions
+                 (id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+                 values ('claude:fresh', 'claude', 'fresh', '', '/missing', 'test', 'test')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "insert into messages (session_id, provider, seq, role, content)
+                 values ('claude:fresh', 'claude', 0, 'user', 'old-writer row')",
+                [],
+            )
+            .unwrap();
+        let values: (String, String) = db
+            .conn
+            .query_row(
+                "select input_delivery_state, input_origin from messages where session_id = 'claude:fresh'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(values, ("unknown".into(), "unknown".into()));
+    }
+
+    #[test]
+    fn input_provenance_upgrade_rolls_back_columns_when_index_ddl_fails() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "create table messages (
+                    id integer primary key,
+                    session_id text not null,
+                    record_relation text not null,
+                    content text not null
+                );",
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "create virtual table messages_fts using fts5(content);
+                 insert into messages(id, session_id, record_relation, content)
+                 values (1, 'session', 'original', 'preserved row');
+                 insert into messages_fts(rowid, content) values (1, 'preserved row');",
+            )
+            .unwrap();
+        assert!(ensure_message_input_provenance_storage(&connection).is_err());
+        let columns = connection
+            .prepare("pragma table_info(messages)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|name| name == "input_delivery_state"));
+        assert!(!columns.iter().any(|name| name == "input_origin"));
+        let message: String = connection
+            .query_row("select content from messages where id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(message, "preserved row");
+        let fts_rows: i64 = connection
+            .query_row("select count(*) from messages_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 1);
     }
 
     #[test]
@@ -12777,9 +13021,10 @@ mod tests {
             assert!(!plan.contains("SCAN messages"), "{plan}");
         }
 
+        let nonqueued = db.nonqueued_input_predicate().unwrap();
         for sql in [
-            ANALYSIS_MESSAGE_COUNTS_SQL,
-            ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL,
+            analysis_message_counts_sql(nonqueued),
+            analysis_attributable_human_messages_sql(nonqueued),
         ] {
             let plan = db
                 .conn
@@ -12805,8 +13050,10 @@ mod tests {
     fn correction_candidate_and_part_queries_use_provenance_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        let candidates =
-            format!("explain query plan {CORRECTION_CANDIDATES_SQL}{CORRECTION_ORDER_SQL}");
+        let nonqueued = db.nonqueued_input_predicate().unwrap();
+        let candidates = format!(
+            "explain query plan {CORRECTION_CANDIDATES_PREFIX}{nonqueued}{CORRECTION_CANDIDATES_SUFFIX}{CORRECTION_ORDER_SQL}"
+        );
         let candidate_plan = db
             .conn
             .prepare(&candidates)
@@ -12823,7 +13070,7 @@ mod tests {
         assert!(!candidate_plan.contains("SCAN m"), "{candidate_plan}");
 
         let parts = format!(
-            "explain query plan {CORRECTION_HUMAN_PARTS_SQL}
+            "explain query plan {CORRECTION_HUMAN_PARTS_PREFIX}{nonqueued}{CORRECTION_HUMAN_PARTS_SUFFIX}
              order by m.id, p.ordinal"
         );
         let parts_plan = db

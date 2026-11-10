@@ -104,6 +104,10 @@ pub fn expand_tilde_required(path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
+pub(crate) fn canonical_source_path(path: &Path) -> String {
+    normalize_path(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
 pub fn normalize_path(path: &Path) -> String {
     let rendered = path.to_string_lossy();
     #[cfg(windows)]
@@ -2002,7 +2006,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude-v9",
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v9",
-        Provider::Codex => "codex-v7",
+        Provider::Codex => "codex-v8",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v4",
         Provider::Pi => "pi-v5",

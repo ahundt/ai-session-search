@@ -24,8 +24,8 @@ use crate::providers::{
     walk_roots, ProviderDiscovery, ProviderPathWarning,
 };
 use crate::util::{
-    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    observe_session_end, observe_session_start, parse_datetime, preview_from_text,
+    canonical_source_path, extract_text, find_repo_root, format_transcript_line, minimal_record,
+    normalize_path, observe_session_end, observe_session_start, parse_datetime, preview_from_text,
     substantive_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
@@ -35,6 +35,11 @@ const WORKFLOW_JOURNAL_FILE: &str = "journal.jsonl";
 
 /// Filename prefix claude gives every subagent transcript, in both layouts it writes them in.
 const SUBAGENT_FILE_PREFIX: &str = "agent-";
+
+// Receipts can outlive their source; never resolve their already canonical path again.
+pub(crate) fn claude_queue_scope(canonical_path: &str) -> String {
+    format!("claude_queue:{canonical_path}")
+}
 
 pub struct ClaudeAdapter {
     roots: Vec<PathBuf>,
@@ -338,12 +343,7 @@ impl ClaudeAdapter {
                                         // Verified aliases must name the same physical source.
                                         scope: queue_scope
                                             .get_or_init(|| {
-                                                let physical = std::fs::canonicalize(path)
-                                                    .unwrap_or_else(|_| path.to_path_buf());
-                                                format!(
-                                                    "claude_queue:{}",
-                                                    normalize_path(&physical)
-                                                )
+                                                claude_queue_scope(&canonical_source_path(path))
                                             })
                                             .clone(),
                                         id: format!("{identity_key}#{occurrence_id}"),

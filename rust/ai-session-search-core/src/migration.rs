@@ -678,6 +678,12 @@ fn ensure_migrated_index_is_current(conn: &Connection, path: &Path) -> Result<()
     if !matches!(version, 4 | crate::db::SCHEMA_VERSION) {
         return Ok(());
     }
+    // Schema 5 was released before these two additive provenance columns. Install them in the
+    // copied staging database before checking the derived layout; a healthy old index then avoids
+    // an unnecessary FTS rebuild while still gaining the storage required by `role=user` search.
+    if version == crate::db::SCHEMA_VERSION && crate::indexer::base_data_intact(conn)? {
+        crate::db::ensure_message_input_provenance_storage(conn)?;
+    }
     // A current stamp with a consistent layout is already publishable.
     let layout_problem = if version == 4 {
         crate::indexer::message_search_layout_problem(conn)?
@@ -889,6 +895,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, (4, true, true, 1));
+    }
+
+    #[test]
+    fn migrating_released_schema_five_adds_provenance_without_rebuilding_fts_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy/index.db");
+        let destination = dir.path().join("new/index.db");
+        let receipt = dir.path().join("new/migration.json");
+
+        drop(crate::db::Db::open(&source).unwrap());
+        let seed = Connection::open(&source).unwrap();
+        seed.execute(
+            "insert into sessions
+             (id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+             values ('claude:mig', 'claude', 'mig', 'migration', '/missing', 'test', 'fixture')",
+            [],
+        )
+        .unwrap();
+        seed.execute(
+            "insert into messages (session_id, provider, seq, role, kind, content)
+             values ('claude:mig', 'claude', 0, 'user', 'conversation', 'migration provenance needle')",
+            [],
+        )
+        .unwrap();
+        // Reproduce the released v1.0.0 schema-5 shape: the FTS objects and all original message
+        // columns remain, while the two later additive provenance columns do not.
+        seed.execute_batch(
+            "drop index idx_messages_session_authorship_relation_seq;
+             drop index idx_messages_authorship_relation_ts;
+             alter table messages drop column input_delivery_state;
+             alter table messages drop column input_origin;
+             pragma user_version = 5;",
+        )
+        .unwrap();
+        drop(seed);
+
+        let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt);
+        migrate_database(&options).unwrap();
+
+        let migrated =
+            Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(crate::indexer::current_schema_layout_problem(&migrated)
+            .unwrap()
+            .is_none());
+        assert!(
+            crate::indexer::message_input_provenance_layout_problem(&migrated)
+                .unwrap()
+                .is_none()
+        );
+        let values: (String, String, i64) = migrated
+            .query_row(
+                "select input_delivery_state, input_origin,
+                        (select count(*) from messages_fts where messages_fts match 'provenance')
+                 from messages where id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, ("unknown".into(), "unknown".into(), 1));
     }
 
     #[test]
