@@ -2106,37 +2106,23 @@ mod tests {
             crate::message_search::SearchSurface::Rust,
         );
         for (query, scope, expected) in [
-            (
-                "fake-produced-only",
-                crate::models::MessageInputScope::UserInput,
-                0,
-            ),
-            (
-                "fake-produced-only",
-                crate::models::MessageInputScope::Any,
-                1,
-            ),
-            (
-                "shell-only-command🙂",
-                crate::models::MessageInputScope::UserInput,
-                1,
-            ),
-            (
-                "shell-only-output🙂",
-                crate::models::MessageInputScope::UserInput,
-                0,
-            ),
-            (
-                "shell-only-output🙂",
-                crate::models::MessageInputScope::Any,
-                1,
-            ),
+            ("fake-produced-only", Some(crate::models::Role::User), 0),
+            ("fake-produced-only", None, 1),
+            ("shell-only-command🙂", Some(crate::models::Role::User), 1),
+            ("shell-only-output🙂", Some(crate::models::Role::User), 0),
+            ("shell-only-output🙂", None, 1),
         ] {
-            let request = crate::message_search::MessageSearchRequest::builder(
-                crate::message_search::MessageQuery::literal(query).unwrap(),
-                crate::message_search::MessageTarget::content(),
-            )
-            .input_scope(scope)
+            let request = {
+                let builder = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal(query).unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                );
+                if let Some(role) = scope {
+                    builder.role(role)
+                } else {
+                    builder
+                }
+            }
             .build()
             .unwrap();
             assert_eq!(
@@ -2203,15 +2189,18 @@ mod tests {
                 ("mixed-stdout🙂", 0),
                 ("mixed-context-é", 0),
             ] {
-                for (scope, count) in [
-                    (crate::models::MessageInputScope::UserInput, expected),
-                    (crate::models::MessageInputScope::Any, 2),
-                ] {
-                    let request = crate::message_search::MessageSearchRequest::builder(
-                        crate::message_search::MessageQuery::literal(query).unwrap(),
-                        crate::message_search::MessageTarget::content(),
-                    )
-                    .input_scope(scope)
+                for (scope, count) in [(Some(crate::models::Role::User), expected), (None, 2)] {
+                    let request = {
+                        let builder = crate::message_search::MessageSearchRequest::builder(
+                            crate::message_search::MessageQuery::literal(query).unwrap(),
+                            crate::message_search::MessageTarget::content(),
+                        );
+                        if let Some(role) = scope {
+                            builder.role(role)
+                        } else {
+                            builder
+                        }
+                    }
                     .build()
                     .unwrap();
                     assert_eq!(
@@ -2340,7 +2329,7 @@ mod tests {
             crate::message_search::MessageQuery::literal("delegated-command").unwrap(),
             crate::message_search::MessageTarget::content(),
         )
-        .input_scope(crate::models::MessageInputScope::UserInput)
+        .role(crate::models::Role::User)
         .build()
         .unwrap();
         assert!(service.search(request).unwrap().hits().is_empty());
@@ -2465,7 +2454,7 @@ mod tests {
                 crate::message_search::MessageQuery::literal(query).unwrap(),
                 crate::message_search::MessageTarget::content(),
             )
-            .input_scope(crate::models::MessageInputScope::UserInput)
+            .role(crate::models::Role::User)
             .build()
             .unwrap();
             assert_eq!(
@@ -2549,25 +2538,24 @@ mod tests {
             crate::message_search::SearchSurface::Rust,
         );
         let request = |scope| {
-            crate::message_search::MessageSearchRequest::builder(
-                crate::message_search::MessageQuery::literal("same answer phrase").unwrap(),
-                crate::message_search::MessageTarget::content(),
-            )
-            .input_scope(scope)
+            {
+                let builder = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal("same answer phrase").unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                );
+                if let Some(role) = scope {
+                    builder.role(role)
+                } else {
+                    builder
+                }
+            }
             .build()
             .unwrap()
         };
+        assert_eq!(service.search(request(None)).unwrap().hits().len(), 2);
         assert_eq!(
             service
-                .search(request(crate::models::MessageInputScope::Any))
-                .unwrap()
-                .hits()
-                .len(),
-            2
-        );
-        assert_eq!(
-            service
-                .search(request(crate::models::MessageInputScope::UserInput))
+                .search(request(Some(crate::models::Role::User)))
                 .unwrap()
                 .hits()
                 .len(),

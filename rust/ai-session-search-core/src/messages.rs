@@ -605,7 +605,6 @@ const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-descri
 #[command(group(
     ArgGroup::new("search_request")
         .args([
-            "input_scope",
             "positional_query",
             "query_arg",
             "role",
@@ -662,13 +661,8 @@ pub struct MessageSearchArgs {
         allow_hyphen_values = true
     )]
     pub query_arg: Option<String>,
-    /// Content to match: any (default) searches complete content; user_input searches recorded
-    /// prompts, queued submissions and answers. Requires --field content; omit --role to include
-    /// tool answers. Sender/delivery can be unknown; views/context may include generated text.
-    #[arg(help_heading = FILTER_HEADING, long, value_enum)]
-    pub input_scope: Option<crate::models::MessageInputScope>,
-    /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
-    /// slash (human-entered commands), or compaction. Omit for every role.
+    /// user selects recorded prompts, commands, queued inputs and answers across source roles;
+    /// other values select stored assistant, tool, slash or compaction records. Omit for all content.
     #[arg(help_heading = FILTER_HEADING, long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict by semantic message kind; tool calls and results are distinct. One-value alias
@@ -851,7 +845,8 @@ pub struct MessageGetArgs {
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
-    /// Filter by role. Omit for every role.
+    /// user selects recorded input across source roles; other values select stored roles.
+    /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     #[command(flatten)]
@@ -896,7 +891,8 @@ pub struct MessageGetArgs {
 pub struct TimelineArgs {
     /// Session id or prefix.
     pub id: String,
-    /// Filter by role. Omit for every role.
+    /// user selects recorded input across source roles; other values select stored roles.
+    /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     /// Keep only messages containing this literal substring. Omit to keep every message the other
@@ -1158,9 +1154,6 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         } else {
             RequestedExtent::page(args.limit, args.offset)?
         });
-    if let Some(selection) = args.input_scope {
-        builder = builder.input_scope(selection);
-    }
     if let Some(role) = args.role {
         builder = builder.role(role);
     }

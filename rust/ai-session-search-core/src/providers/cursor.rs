@@ -709,7 +709,7 @@ mod tests {
                 crate::message_search::MessageQuery::literal(query).unwrap(),
                 crate::message_search::MessageTarget::content(),
             )
-            .input_scope(crate::models::MessageInputScope::UserInput)
+            .role(crate::models::Role::User)
             .build()
             .unwrap();
             assert_eq!(service.search(request).unwrap().hits().len(), expected);
@@ -761,7 +761,7 @@ mod tests {
                 crate::message_search::MessageQuery::literal(query).unwrap(),
                 crate::message_search::MessageTarget::content(),
             )
-            .input_scope(crate::models::MessageInputScope::UserInput)
+            .role(crate::models::Role::User)
             .build()
             .unwrap()
         };

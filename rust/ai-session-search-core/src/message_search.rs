@@ -668,7 +668,6 @@ impl RequestedTimeRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct MessagePredicates {
-    input_scope: Option<MessageInputScope>,
     role: Option<Role>,
     kinds: Option<Vec<MessageKind>>,
     providers: Option<Vec<Provider>>,
@@ -687,7 +686,6 @@ pub struct MessagePredicates {
 impl Default for MessagePredicates {
     fn default() -> Self {
         Self {
-            input_scope: None,
             role: None,
             kinds: None,
             providers: None,
@@ -706,12 +704,6 @@ impl Default for MessagePredicates {
 }
 
 impl MessagePredicates {
-    pub fn input_scope(&self) -> MessageInputScope {
-        self.input_scope.unwrap_or_default()
-    }
-    pub const fn input_scope_is_explicit(&self) -> bool {
-        self.input_scope.is_some()
-    }
     pub const fn role(&self) -> Option<Role> {
         self.role
     }
@@ -857,7 +849,6 @@ impl SearchSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageSearchParameter {
-    InputScope,
     Query,
     QueryMode,
     Field,
@@ -891,7 +882,6 @@ pub enum MessageSearchParameter {
 impl MessageSearchParameter {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::InputScope => "input_scope",
             Self::Query => "query",
             Self::QueryMode => "query_mode",
             Self::Field => "field",
@@ -1039,7 +1029,6 @@ pub enum ValueOriginKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageSearchRule {
-    InputScopeRequiresContentField,
     DetailOwnsPresentationBudgets,
     SequenceRequiresSession,
     KindsMustRemainSatisfiable,
@@ -1053,7 +1042,6 @@ pub enum MessageSearchRule {
 
 impl MessageSearchRule {
     pub const ALL: &'static [Self] = &[
-        Self::InputScopeRequiresContentField,
         Self::DetailOwnsPresentationBudgets,
         Self::SequenceRequiresSession,
         Self::KindsMustRemainSatisfiable,
@@ -1067,7 +1055,6 @@ impl MessageSearchRule {
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::InputScopeRequiresContentField => "input_scope_requires_content_field",
             Self::DetailOwnsPresentationBudgets => "detail_owns_presentation_budgets",
             Self::SequenceRequiresSession => "sequence_requires_session",
             Self::KindsMustRemainSatisfiable => "kinds_must_remain_satisfiable",
@@ -1084,7 +1071,6 @@ impl MessageSearchRule {
 
     pub const fn message(self) -> &'static str {
         match self {
-            Self::InputScopeRequiresContentField => "input_scope=user_input requires field=content; use input_scope=any for tool fields",
             Self::DetailOwnsPresentationBudgets => {
                 "detail conflicts with lines_per_message, field_view, and match_view; omit detail to compose custom presentation budgets"
             }
@@ -1219,9 +1205,6 @@ impl MessageSearchParameterRegistry {
             surfaces: SearchSurface::ALL,
         };
         let parameters = vec![
-            parameter(MessageSearchParameter::InputScope,
-                "Content: any (default) searches all text; user_input searches recorded prompts, queues and interactive answers.",
-                enum_domain(serialized_variants::<MessageInputScope>()), MessageSearchOmission::TypedDefault),
             parameter(
                 MessageSearchParameter::Query,
                 "Text to match.",
@@ -1248,7 +1231,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::Role,
-                "Storage role.",
+                "user selects recorded input across roles; others select stored roles.",
                 enum_domain(serialized_variants::<Role>()),
                 MessageSearchOmission::AllEligible,
             ),
@@ -1488,7 +1471,6 @@ pub enum ValueOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageSearchOrigins {
-    pub(crate) input_scope: ValueOrigin,
     pub(crate) result_extent: ValueOrigin,
     pub(crate) context_messages_before: ValueOrigin,
     pub(crate) context_messages_after: ValueOrigin,
@@ -1502,9 +1484,6 @@ pub struct MessageSearchOrigins {
 }
 
 impl MessageSearchOrigins {
-    pub fn input_scope(&self) -> &ValueOrigin {
-        &self.input_scope
-    }
     pub fn result_extent(&self) -> &ValueOrigin {
         &self.result_extent
     }
@@ -1561,7 +1540,6 @@ pub enum ResolvedExtent {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMessagePredicates {
-    pub(crate) input_scope: MessageInputScope,
     pub(crate) role: Option<Role>,
     pub(crate) kinds: Option<Vec<MessageKind>>,
     pub(crate) providers: Option<Vec<Provider>>,
@@ -1733,13 +1711,12 @@ impl ResolvedRequestPresentation {
     }
 }
 
-/// Effective semantic choices returned with every response.
+/// Effective query, target, provider, paging, and presentation choices for the response.
 ///
 /// Parameter origins and planner evidence are optional receipt data; this compact record is always
-/// present so a caller can interpret result and presentation extent without conversational state.
+/// present to interpret result and presentation extent; it does not repeat every structural filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedMessageSearchRequest {
-    input_scope: MessageInputScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     query: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1756,13 +1733,8 @@ pub struct ResolvedMessageSearchRequest {
 }
 
 impl ResolvedMessageSearchRequest {
-    pub const fn input_scope(&self) -> MessageInputScope {
-        self.input_scope
-    }
-
     pub(crate) fn from_plan(plan: &MessageSearchPlan) -> Result<Self, MessageSearchError> {
         Ok(Self {
-            input_scope: plan.retrieval.predicates.input_scope,
             query: plan.retrieval.query.text().map(str::to_owned),
             query_mode: plan.retrieval.query.mode().map(ResolvedQueryMode::from),
             target: plan.retrieval.target.clone(),
@@ -2803,9 +2775,9 @@ struct SemanticMessageRef<'a> {
 }
 
 #[derive(Serialize)]
-struct SemanticMessageMetadata<'a> {
+struct SemanticMessageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
-    provenance: Option<&'a crate::models::MessageProvenance>,
+    provenance: Option<crate::models::HitProvenance>,
     provider: Provider,
     role: Role,
     kind: MessageKind,
@@ -2930,7 +2902,11 @@ impl Serialize for SemanticResult<'_> {
         map.serialize_entry(
             "message_metadata",
             &SemanticMessageMetadata {
-                provenance: hit.message.provenance.as_deref(),
+                provenance: hit
+                    .message
+                    .provenance
+                    .as_deref()
+                    .map(crate::models::HitProvenance::from),
                 provider: hit.message.provider,
                 role: hit.message.role,
                 kind: hit.message.kind,
@@ -3188,11 +3164,6 @@ impl MessageSearchRequest {
     }
 
     fn validate(&self) -> Result<(), MessageSearchError> {
-        if self.predicates.input_scope() == MessageInputScope::UserInput
-            && self.target.field != SearchField::Content
-        {
-            return Err(MessageSearchRule::InputScopeRequiresContentField.error());
-        }
         if self.presentation.detail.is_some()
             && (self.presentation.message_lines.is_some()
                 || self.presentation.field_view.is_some()
@@ -3258,10 +3229,6 @@ pub struct MessageSearchRequestBuilder {
 }
 
 impl MessageSearchRequestBuilder {
-    pub fn input_scope(mut self, selection: MessageInputScope) -> Self {
-        self.request.predicates.input_scope = Some(selection);
-        self
-    }
     pub fn role(mut self, role: Role) -> Self {
         self.request.predicates.role = Some(role);
         self
@@ -3491,7 +3458,7 @@ pub(crate) fn matching_content_regions(
     if provenance.record_relation == crate::models::MessageRecordRelation::Mirror {
         return Vec::new();
     }
-    if provenance.is_whole_user_input() {
+    if provenance.is_whole_user_input() || provenance.is_legacy_user_input(hit.role) {
         return vec![(0, &hit.content)];
     }
     crate::util::content_part_regions(
@@ -3545,7 +3512,9 @@ pub(crate) fn attach_match_evidence_cancellable(
                         message.seq
                     )
                 })?;
-                let evidence = if input_scope == MessageInputScope::UserInput {
+                let evidence = if input_scope == MessageInputScope::UserInput
+                    && target.field() == SearchField::Content
+                {
                     let mut selected_evidence = None;
                     let mut best_score = None;
                     let field_total_chars = selected.chars().count();

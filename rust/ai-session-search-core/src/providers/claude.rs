@@ -2194,7 +2194,7 @@ mod tests {
                 crate::message_search::MessageQuery::literal(query).unwrap(),
                 crate::message_search::MessageTarget::content(),
             )
-            .input_scope(crate::models::MessageInputScope::UserInput)
+            .role(crate::models::Role::User)
             .build()
             .unwrap()
         };
@@ -2419,7 +2419,7 @@ mod tests {
         use crate::message_search::{
             MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
         };
-        use crate::models::{ContentPartAuthorship, MessageAuthorship, MessageInputScope};
+        use crate::models::{ContentPartAuthorship, MessageAuthorship};
         use serde_json::json;
 
         let temp = tempfile::tempdir().unwrap();
@@ -2515,16 +2515,22 @@ mod tests {
                     let config = crate::config::Config::default();
                     let service =
                         crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
-                    for scope in [MessageInputScope::Any, MessageInputScope::UserInput] {
+                    for scope in [None, Some(crate::models::Role::User)] {
                         let response = service
                             .search(
-                                MessageSearchRequest::builder(
-                                    MessageQuery::literal("answer marker").unwrap(),
-                                    MessageTarget::content(),
-                                )
-                                .session_id(parsed.session.id.clone())
-                                .unwrap()
-                                .input_scope(scope)
+                                {
+                                    let builder = MessageSearchRequest::builder(
+                                        MessageQuery::literal("answer marker").unwrap(),
+                                        MessageTarget::content(),
+                                    )
+                                    .session_id(parsed.session.id.clone())
+                                    .unwrap();
+                                    if let Some(role) = scope {
+                                        builder.role(role)
+                                    } else {
+                                        builder
+                                    }
+                                }
                                 .build()
                                 .unwrap(),
                             )
@@ -2673,17 +2679,23 @@ mod tests {
             crate::message_search::SearchSurface::Rust,
         );
         let request = |scope| {
-            crate::message_search::MessageSearchRequest::builder(
-                crate::message_search::MessageQuery::literal(phrase).unwrap(),
-                crate::message_search::MessageTarget::content(),
-            )
-            .input_scope(scope)
+            {
+                let builder = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal(phrase).unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                );
+                if let Some(role) = scope {
+                    builder.role(role)
+                } else {
+                    builder
+                }
+            }
             .build()
             .unwrap()
         };
         assert_eq!(
             service
-                .search(request(crate::models::MessageInputScope::UserInput))
+                .search(request(Some(crate::models::Role::User)))
                 .unwrap()
                 .hits()
                 .len(),
@@ -2691,11 +2703,7 @@ mod tests {
             "human, channel, scheduled, and legacy rows are intended input"
         );
         assert_eq!(
-            service
-                .search(request(crate::models::MessageInputScope::Any))
-                .unwrap()
-                .hits()
-                .len(),
+            service.search(request(None)).unwrap().hits().len(),
             records.len(),
             "native exclusions affect UserInput only; Any keeps every exact row"
         );
@@ -2758,7 +2766,7 @@ mod tests {
                 crate::message_search::MessageQuery::literal(query).unwrap(),
                 crate::message_search::MessageTarget::content(),
             )
-            .input_scope(crate::models::MessageInputScope::UserInput)
+            .role(crate::models::Role::User)
             .build()
             .unwrap()
         };
@@ -2839,7 +2847,7 @@ mod tests {
 
     #[test]
     fn queue_upgrade_repairs_archived_authorship_without_losing_submissions() {
-        use crate::models::{MessageAuthorship, MessageFilters, MessageInputScope};
+        use crate::models::{MessageAuthorship, MessageFilters};
 
         for (relative, old_version, provider) in [
             ("project/input.jsonl", "claude-v5", Provider::Claude),
@@ -2867,7 +2875,7 @@ mod tests {
             let db = crate::db::Db::open(&db_path).unwrap();
             db.upsert_session(&old, 1, 1).unwrap();
             let human = MessageFilters {
-                input_scope: MessageInputScope::UserInput,
+                role: Some(crate::models::Role::User),
                 ..Default::default()
             };
             assert_eq!(db.search_messages("queue input", &human).unwrap().len(), 2);
@@ -2946,7 +2954,7 @@ mod tests {
         // With no provider identity these identical events cannot be distinguished after a
         // rewrite. The archive keeps both submissions without inventing a delivery outcome.
         let filters = crate::models::MessageFilters {
-            input_scope: crate::models::MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             ..Default::default()
         };
         for generation in [2, 3] {

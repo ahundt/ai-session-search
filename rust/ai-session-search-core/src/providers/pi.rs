@@ -815,7 +815,6 @@ mod tests {
         use crate::message_search::{
             MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
         };
-        use crate::models::MessageInputScope;
         let records = concat!(
             "{\"type\":\"session\",\"id\":\"input-purpose\"}\n",
             "{\"type\":\"message\",\"id\":\"cmd\",\"message\":{\"role\":\"bashExecution\",\"command\":\"command 🦀\",\"output\":\"generated stdout\",\"cancelled\":false}}\n",
@@ -850,11 +849,17 @@ mod tests {
                 ("native extension context", false, true),
             ] {
                 let request = |scope| {
-                    let builder = MessageSearchRequest::builder(
-                        MessageQuery::literal(query).unwrap(),
-                        MessageTarget::content(),
-                    )
-                    .input_scope(scope);
+                    let builder = {
+                        let builder = MessageSearchRequest::builder(
+                            MessageQuery::literal(query).unwrap(),
+                            MessageTarget::content(),
+                        );
+                        if let Some(role) = scope {
+                            builder.role(role)
+                        } else {
+                            builder
+                        }
+                    };
                     if notice {
                         builder.kind(crate::models::MessageKind::HarnessNotice)
                     } else {
@@ -865,7 +870,7 @@ mod tests {
                 };
                 assert_eq!(
                     service
-                        .search(request(MessageInputScope::UserInput))
+                        .search(request(Some(crate::models::Role::User)))
                         .unwrap()
                         .hits()
                         .len(),
@@ -874,11 +879,7 @@ mod tests {
                     adapter.provider.as_str()
                 );
                 assert_eq!(
-                    service
-                        .search(request(MessageInputScope::Any))
-                        .unwrap()
-                        .hits()
-                        .len(),
+                    service.search(request(None)).unwrap().hits().len(),
                     1,
                     "all-source search preserves {}: {query}",
                     adapter.provider.as_str()

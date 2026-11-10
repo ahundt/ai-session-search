@@ -836,10 +836,10 @@ class MessageScope:
 class MessageSearchRequest:
     """Canonical message predicates, match window, presentation, extent, purpose, and receipt.
 
-    ``input_scope="user_input"`` searches recorded prompts, queued submissions and answer
-    regions across roles. Omission or ``"any"`` searches complete content. User input requires
-    ``field="content"``; omit role to include tool answers. Sender/delivery uncertainty remains
-    in provenance. Views/context may include generated text; coordinates refer to indexed message content.
+    ``role="user"`` searches recorded user input across source roles, including queued
+    submissions and linked answers. Omit ``role`` to search complete content. Sender/delivery
+    uncertainty remains in provenance; views/context may include generated text and coordinates
+    refer to indexed message content.
 
     The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
     arguments use an RFC 6901 ``argument_path``. ``tool_name_contains`` is an additional
@@ -850,7 +850,6 @@ class MessageSearchRequest:
     request explicitly and conflicts with ``limit``. MCP separately uses a bounded default.
     """
 
-    input_scope: Literal["any", "user_input"] | None
     scope: MessageScope
     role: _MessageRole | None
     kind: _MessageKind | None
@@ -885,7 +884,6 @@ class MessageSearchRequest:
         kind: _MessageKind | None = None,
         kinds: list[_MessageKind] | None = None,
         field: _SearchField = "content",
-        input_scope: Literal["any", "user_input"] | None = None,
         argument_path: str | None = None,
         seq_from: int | None = None,
         seq_to: int | None = None,
@@ -1010,7 +1008,7 @@ class FileQuery:
 class MessageHit:
     """One indexed message with canonical session, role, kind, tool, and content fields."""
 
-    provenance: dict[str, object] | None
+    provenance: dict[str, str | None] | None
     session_id: str
     provider: str
     seq: int
@@ -1034,7 +1032,6 @@ class _MessageSearchEffectiveRequest(TypedDict):
     query: NotRequired[str]
     query_mode: NotRequired[_MessageQueryMode]
     target: _MessageSearchTarget
-    input_scope: Literal["any", "user_input"]
     provider_scope: dict[str, object]
     extent: dict[str, object]
     match_window: NotRequired[_MatchWindow]
@@ -1048,7 +1045,7 @@ class _MessageSearchMessageRef(TypedDict):
     message_seq: int
 
 class _MessageSearchMessageMetadata(TypedDict):
-    provenance: NotRequired[dict[str, object]]
+    provenance: NotRequired[dict[str, str | None]]
     provider: _ProviderId
     role: str
     kind: _MessageKind

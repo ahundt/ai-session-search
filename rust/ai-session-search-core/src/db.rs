@@ -2570,7 +2570,7 @@ impl Db {
 
         let mut sql = String::from("select m.role, count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_stored_role_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(" group by m.role order by m.role");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2715,7 +2715,6 @@ impl Db {
             ResolvedExtent::AllResults { offset } => (0, offset),
         };
         let filters = MessageFilters {
-            input_scope: plan.predicates.input_scope,
             role: plan.predicates.role,
             kinds: plan.predicates.kinds.clone(),
             field: Some(plan.target.field()),
@@ -3152,7 +3151,7 @@ impl Db {
                         &pattern,
                         &query_lower,
                         std::mem::take(&mut batch),
-                        filters.input_scope,
+                        filters.input_scope(),
                     )
                 })?;
                 matched += scored.len() as i64;
@@ -3164,7 +3163,7 @@ impl Db {
         }
         if !batch.is_empty() {
             let scored = self.runtime.install(|| {
-                score_fuzzy_message_hits(&pattern, &query_lower, batch, filters.input_scope)
+                score_fuzzy_message_hits(&pattern, &query_lower, batch, filters.input_scope())
             })?;
             matched += scored.len() as i64;
             top.extend(scored);
@@ -3480,8 +3479,9 @@ impl Db {
             // snapshot `search_messages_with_explain_order` opens keeps them on the same data.
             return self.search_tool_name_fuzzy_indexed(query, filters, include_explain);
         }
-        let mut sql = String::from(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
+        let provenance = input_provenance_projection(filters);
+        let mut sql = format!(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{provenance} \
              from messages m where 1 = 1",
         );
         let mut args = Vec::new();
@@ -3587,9 +3587,10 @@ impl Db {
         query: &str,
         filters: &MessageFilters,
     ) -> Result<Vec<MessageHit>> {
-        let mut sql = String::from(
+        let provenance = input_provenance_projection(filters);
+        let mut sql = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                    m.kind, m.tool_call_id, m.content
+                    m.kind, m.tool_call_id, m.content{provenance}
                from messages m
               where m.tool_name is not null",
         );
@@ -3714,9 +3715,10 @@ impl Db {
             let selected_names =
                 serde_json::to_string(&tier.iter().map(|(name, _)| name).collect::<Vec<_>>())?;
             let remaining = ranked_limit - top.len();
-            let mut sql = String::from(
+            let provenance = input_provenance_projection(filters);
+            let mut sql = format!(
                 "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                        m.kind, m.tool_call_id, m.content
+                        m.kind, m.tool_call_id, m.content{provenance}
                    from json_each(?) selected
                    join messages m on m.tool_name = selected.value
                   where m.tool_name is not null",
@@ -3784,9 +3786,9 @@ impl Db {
     }
 
     fn validate_input_scope_layout(&self, filters: &MessageFilters) -> Result<()> {
-        if filters.input_scope == crate::models::MessageInputScope::UserInput {
+        if filters.input_scope() == crate::models::MessageInputScope::UserInput {
             if let Some(problem) = crate::indexer::current_schema_layout_problem(&self.conn)? {
-                bail!("user-input search requires current provenance storage: {problem}; run `aise reindex` to upgrade the index, or pass input_scope=any to search the readable stored content");
+                bail!("user-input search requires current provenance storage: {problem}; run `aise reindex` to upgrade the index, or omit the role filter to search readable stored content");
             }
         }
         Ok(())
@@ -3797,7 +3799,7 @@ impl Db {
     /// denominator every receipt reports. Only receipts and the fuzzy tool-name planner call
     /// this; the search hot path probes [`Db::filtered_corpus_reaches`] instead.
     ///
-    /// For input_scope=user_input, eligibility also reads indexed provenance and parts;
+    /// For role=user, eligibility also reads indexed provenance and parts;
     /// its worst case is O(F + P) row/part reads, where P is the content parts examined.
     /// Whole-input eligibility does not read message content, including for empty inputs.
     /// Cost for the default any selection: index-only. The class predicate defaults to `kind != 'harness_notice'`, and no
@@ -3909,6 +3911,7 @@ impl Db {
                 filters,
                 &self.access_scope,
                 class,
+                true,
             );
             if filters.tool.is_some() {
                 // `unicode_lower_contains(m.tool_name, ?)` is already false on NULL, so this adds
@@ -4418,7 +4421,7 @@ impl Db {
                )",
         );
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut inner, &mut args, filters, &self.access_scope);
+        append_stored_role_filters(&mut inner, &mut args, filters, &self.access_scope);
         let mut sql = format!("select * from ({inner}) attributable where 1 = 1");
         if !query.is_empty() {
             match filters.match_mode {
@@ -4565,7 +4568,7 @@ impl Db {
             // index rows but cannot become evidence about what a person said.
             let mut sql = String::from(CORRECTION_CANDIDATES_SQL);
             let mut args: Vec<Value> = Vec::new();
-            append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
+            append_stored_role_filters(&mut sql, &mut args, &filters, &self.access_scope);
             sql.push_str(CORRECTION_ORDER_SQL);
 
             let mut stmt = self.conn.prepare(&sql)?;
@@ -4600,7 +4603,7 @@ impl Db {
             if rows.iter().any(|row| row.human_parts.is_some()) {
                 let mut parts_sql = String::from(CORRECTION_HUMAN_PARTS_SQL);
                 let mut parts_args: Vec<Value> = Vec::new();
-                append_message_filters(
+                append_stored_role_filters(
                     &mut parts_sql,
                     &mut parts_args,
                     &filters,
@@ -6017,7 +6020,7 @@ fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Opti
 }
 
 /// Project eligible ranges without changing the source content or row identity.
-const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')))";
+const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')) or (m.authorship='unknown' and m.record_relation='unknown' and coalesce(m.input_origin,'unknown')='unknown' and m.role in ('user','slash')))";
 const USER_INPUT_PART_SQL: &str = "((p.authorship in ('human','unknown') and p.origin='direct_input') or (p.authorship='human' and p.origin in ('quoted_content','unknown')))";
 
 const MESSAGE_CONTENT_PARTS_JSON: &str = "(select json_group_array(json_object(
@@ -6027,9 +6030,14 @@ const MESSAGE_CONTENT_PARTS_JSON: &str = "(select json_group_array(json_object(
         from message_content_parts where message_id=m.id order by ordinal))";
 
 fn input_provenance_projection(filters: &MessageFilters) -> String {
-    if filters.input_scope != crate::models::MessageInputScope::UserInput {
+    if filters.input_scope() != crate::models::MessageInputScope::UserInput {
         return String::new();
     }
+    let parts = if filters.field.unwrap_or(SearchField::Content) == SearchField::Content {
+        MESSAGE_CONTENT_PARTS_JSON
+    } else {
+        "'[]'"
+    };
     format!(", json_object(
         'authorship', m.authorship,
         'record_relation', m.record_relation,
@@ -6037,7 +6045,7 @@ fn input_provenance_projection(filters: &MessageFilters) -> String {
             json_object('authority',m.correlation_authority,'scope',m.correlation_scope,'id',m.correlation_id) end,
         'input_delivery_state', m.input_delivery_state,
         'input_origin', m.input_origin,
-        'content_parts', json({MESSAGE_CONTENT_PARTS_JSON})
+        'content_parts', json({parts})
     ) as source_provenance")
 }
 
@@ -6047,7 +6055,7 @@ fn append_content_match(sql: &mut String, filters: &MessageFilters, regex: bool)
     } else {
         " and unicode_lower_contains(m.content, ?"
     });
-    if filters.input_scope == crate::models::MessageInputScope::UserInput {
+    if filters.input_scope() == crate::models::MessageInputScope::UserInput {
         sql.push_str(", case when m.authorship='mixed' then ");
         sql.push_str(MESSAGE_CONTENT_PARTS_JSON);
         sql.push_str(" else null end");
@@ -6061,7 +6069,30 @@ fn append_message_filters(
     filters: &MessageFilters,
     access: &crate::search_scope::EffectiveAccessScope,
 ) {
-    append_message_filters_with_class(sql, args, filters, access, ClassSelection::FromFilters);
+    append_message_filters_with_class(
+        sql,
+        args,
+        filters,
+        access,
+        ClassSelection::FromFilters,
+        true,
+    );
+}
+
+fn append_stored_role_filters(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    filters: &MessageFilters,
+    access: &crate::search_scope::EffectiveAccessScope,
+) {
+    append_message_filters_with_class(
+        sql,
+        args,
+        filters,
+        access,
+        ClassSelection::FromFilters,
+        false,
+    );
 }
 
 fn append_message_filters_with_class(
@@ -6070,16 +6101,16 @@ fn append_message_filters_with_class(
     filters: &MessageFilters,
     access: &crate::search_scope::EffectiveAccessScope,
     class: ClassSelection<'_>,
+    recorded_user: bool,
 ) {
     use rusqlite::types::Value;
-    if filters.input_scope == crate::models::MessageInputScope::UserInput {
+    if recorded_user && filters.role == Some(Role::User) {
         sql.push_str(" and m.record_relation != 'mirror' and ((");
         sql.push_str(WHOLE_USER_INPUT_SQL);
         sql.push_str(") or (m.authorship='mixed' and exists (select 1 from message_content_parts p where p.message_id=m.id and ");
         sql.push_str(USER_INPUT_PART_SQL);
         sql.push_str(" and p.end_char > p.start_char)))");
-    }
-    if let Some(role) = filters.role {
+    } else if let Some(role) = filters.role {
         sql.push_str(" and m.role = ?");
         args.push(Value::Text(role.as_str().to_string()));
     }
@@ -8938,11 +8969,158 @@ mod tests {
     }
 
     #[test]
+    fn user_role_selects_recorded_inputs_without_rewriting_source_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+            values ('claude:user-role','claude','user-role','','/user-role','test','test');
+            insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin) values
+            (901,'claude:user-role','claude',0,'tool','tool_result','wrapper answer','mixed','original','interactive_answer'),
+            (902,'claude:user-role','claude',1,'user','conversation','wrapper answer','mixed','original','direct_conversation'),
+            (903,'claude:user-role','claude',2,'user','conversation','legacy answer','unknown','unknown',null),
+            (904,'claude:user-role','claude',3,'slash','conversation','/answer','human','original',null),
+            (905,'claude:user-role','claude',4,'user','conversation','agent answer','agent','original',null),
+            (906,'claude:user-role','claude',5,'assistant','conversation','model answer','agent','original',null);
+            insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values
+            (901,0,0,8,'generated','harness_context'),(901,1,8,14,'human','direct_input'),
+            (902,0,0,8,'generated','harness_context'),(902,1,8,14,'human','direct_input');").unwrap();
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            session_id: Some("claude:user-role".into()),
+            ..Default::default()
+        };
+        let hits = db.search_messages("answer", &filters).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.seq, hit.role))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Role::Tool),
+                (1, Role::User),
+                (2, Role::User),
+                (3, Role::Slash)
+            ]
+        );
+        assert!(db.search_messages("wrapper", &filters).unwrap().is_empty());
+        assert_eq!(db.search_messages("", &filters).unwrap().len(), 4);
+        assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 4);
+        assert_eq!(
+            db.read_session_messages(&filters, MessageOrder::OldestFirst)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            db.search_messages("wrapper", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
+        let tools = db
+            .search_messages(
+                "wrapper",
+                &MessageFilters {
+                    role: Some(Role::Tool),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].role, Role::Tool);
+        assert_eq!(
+            db.search_attributable_human_messages("answer", &filters)
+                .unwrap()
+                .len(),
+            1,
+            "specialized analytics retain their stored-role restriction"
+        );
+        // Statistics still describe stored roles, including an agent-origin user row.
+        assert_eq!(
+            db.message_role_counts(&filters).unwrap(),
+            vec![("user".into(), 3)]
+        );
+        db.conn
+            .execute(
+                "update messages set tool_name='AskUserQuestion' where id=901",
+                [],
+            )
+            .unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        for query in [
+            crate::message_search::MessageQuery::literal("Ask").unwrap(),
+            crate::message_search::MessageQuery::regex("^Ask").unwrap(),
+            crate::message_search::MessageQuery::fuzzy("Ask").unwrap(),
+        ] {
+            let result = service
+                .search(
+                    crate::message_search::MessageSearchRequest::builder(
+                        query,
+                        crate::message_search::MessageTarget::tool_name(),
+                    )
+                    .role(Role::User)
+                    .extent(crate::message_search::RequestedExtent::page(Some(10), 0).unwrap())
+                    .build()
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(result.hits().len(), 1);
+            let hit = result.hits()[0].message();
+            assert_eq!(hit.role, Role::Tool);
+            assert!(
+                hit.provenance
+                    .as_ref()
+                    .is_some_and(|source| source.content_parts.is_empty()),
+                "all modes retain source evidence without loading content partitions"
+            );
+            assert_eq!(
+                result.hits()[0].match_evidence().unwrap().field_start_char,
+                0
+            );
+        }
+        db.conn.execute("insert into messages(session_id,provider,seq,role,kind,tool_name,content,authorship,record_relation,input_origin)
+            values ('claude:user-role','claude',6,'user','tool_call','UserCommand',?1,'human','original','direct_conversation')",
+            [r#"{"args":{"command":"answer"}}"#]).unwrap();
+        for query in [
+            crate::message_search::MessageQuery::literal("answer").unwrap(),
+            crate::message_search::MessageQuery::regex("^answer$").unwrap(),
+            crate::message_search::MessageQuery::fuzzy("ans").unwrap(),
+        ] {
+            let result = service
+                .search(
+                    crate::message_search::MessageSearchRequest::builder(
+                        query,
+                        crate::message_search::MessageTarget::tool_argument("/command").unwrap(),
+                    )
+                    .role(Role::User)
+                    .extent(crate::message_search::RequestedExtent::page(Some(10), 0).unwrap())
+                    .build()
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(result.hits().len(), 1);
+            let source = result.hits()[0].message().provenance.as_ref().unwrap();
+            assert_eq!(
+                source.input_origin,
+                Some(crate::models::MessageInputOrigin::DirectConversation)
+            );
+            assert!(source.content_parts.is_empty());
+            assert_eq!(
+                result.hits()[0].match_evidence().unwrap().field_start_char,
+                0
+            );
+        }
+    }
+
+    #[test]
     fn user_content_sql_and_rust_agree_on_source_and_region_eligibility() {
         use crate::models::{
             ContentPartAuthorship as A, ContentPartOrigin as O, MessageContentPart,
-            MessageInputOrigin as I, MessageInputScope, MessageProvenance,
-            MessageRecordRelation as R,
+            MessageInputOrigin as I, MessageProvenance, MessageRecordRelation as R,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -9057,7 +9235,7 @@ mod tests {
             ("", MessageSearchMode::Literal),
         ] {
             let filters = MessageFilters {
-                input_scope: MessageInputScope::UserInput,
+                role: Some(crate::models::Role::User),
                 match_mode,
                 limit: 1000,
                 ..Default::default()
@@ -9079,7 +9257,6 @@ mod tests {
         use crate::message_search::{
             MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
         };
-        use crate::models::MessageInputScope;
         use crate::service::MessageService;
 
         let dir = tempfile::tempdir().unwrap();
@@ -9104,7 +9281,7 @@ mod tests {
             let response = service
                 .search(
                     MessageSearchRequest::builder(query, MessageTarget::content())
-                        .input_scope(MessageInputScope::UserInput)
+                        .role(crate::models::Role::User)
                         .build()
                         .unwrap(),
                 )
@@ -9130,7 +9307,7 @@ mod tests {
             }
         }
         let filters = MessageFilters {
-            input_scope: MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             ..Default::default()
         };
         assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 3);
@@ -9150,7 +9327,6 @@ mod tests {
 
     #[test]
     fn human_content_selection_preserves_source_spans_and_filters_before_paging() {
-        use crate::models::MessageInputScope;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn.execute_batch(
@@ -9167,7 +9343,7 @@ mod tests {
                     (902, 3, 27, 31, 'human', 'direct_input');"
         ).unwrap();
         let filters = MessageFilters {
-            input_scope: MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             limit: 1,
             ..Default::default()
         };
@@ -9182,7 +9358,7 @@ mod tests {
             .search_messages(
                 "needle",
                 &MessageFilters {
-                    role: Some(Role::User),
+                    role: Some(Role::Assistant),
                     ..filters.clone()
                 }
             )
@@ -9220,9 +9396,15 @@ mod tests {
         };
         assert_eq!(db.search_messages("needle", &all_human).unwrap().len(), 2);
         assert_eq!(
-            db.search_attributable_human_messages("needle", &all_human)
-                .unwrap()
-                .len(),
+            db.search_attributable_human_messages(
+                "needle",
+                &MessageFilters {
+                    role: None,
+                    ..all_human.clone()
+                }
+            )
+            .unwrap()
+            .len(),
             1,
             "unlinked queue copies are evidence but must not inflate recurrence counts"
         );
@@ -9890,7 +10072,7 @@ mod tests {
             ),
             vec![0, 1, 2, 3]
         );
-        // Role filter composes with the newest-N window.
+        // User-input selection includes the user-entered slash command in the newest window.
         assert_eq!(
             seqs(
                 db.read_session_messages(
@@ -9902,7 +10084,7 @@ mod tests {
                 )
                 .unwrap()
             ),
-            vec![2]
+            vec![3]
         );
         // Inclusive seq range is the non-overlapping chunked-read primitive.
         assert_eq!(
@@ -14225,7 +14407,7 @@ mod tests {
             db.search_messages(
                 "answer α",
                 &MessageFilters {
-                    input_scope: crate::models::MessageInputScope::UserInput,
+                    role: Some(crate::models::Role::User),
                     ..Default::default()
                 }
             )
@@ -20100,7 +20282,12 @@ mod tests {
         // partial `idx_messages_tool_calls` answers because its predicate is the literal text.
         let mut cases = corpus_count_filter_cases()
             .into_iter()
-            .map(|(name, filters)| (name, "1 = 1", filters))
+            .map(|(name, mut filters)| {
+                if filters.role == Some(Role::User) {
+                    filters.role = Some(Role::Assistant);
+                }
+                (name, "1 = 1", filters)
+            })
             .collect::<Vec<_>>();
         cases.push((
             "tool_argument",

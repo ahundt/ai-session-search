@@ -122,7 +122,6 @@ mod tests {
         use crate::message_search::{
             MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
         };
-        use crate::models::MessageInputScope;
         let parsed = AiStudioAdapter::new(vec![]).parse_raw(
             Path::new("/tmp/native-input.json"),
             r#"{"chunkedPrompt":{"chunks":[{"role":"user","text":"find α input"},{"role":"model","text":"find α input"},{"role":"user","text":"find α input"}]}}"#.into(),
@@ -134,17 +133,23 @@ mod tests {
         let config = crate::config::Config::default();
         let service = crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
         let request = |scope| {
-            MessageSearchRequest::builder(
-                MessageQuery::literal("find α input").unwrap(),
-                MessageTarget::content(),
-            )
-            .input_scope(scope)
+            {
+                let builder = MessageSearchRequest::builder(
+                    MessageQuery::literal("find α input").unwrap(),
+                    MessageTarget::content(),
+                );
+                if let Some(role) = scope {
+                    builder.role(role)
+                } else {
+                    builder
+                }
+            }
             .build()
             .unwrap()
         };
         for _ in 0..2 {
             let input = service
-                .search(request(MessageInputScope::UserInput))
+                .search(request(Some(crate::models::Role::User)))
                 .unwrap();
             assert_eq!(
                 input
@@ -154,14 +159,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![0, 2]
             );
-            assert_eq!(
-                service
-                    .search(request(MessageInputScope::Any))
-                    .unwrap()
-                    .hits()
-                    .len(),
-                3
-            );
+            assert_eq!(service.search(request(None)).unwrap().hits().len(), 3);
             db.upsert_session(&parsed, 0, 0).unwrap();
         }
     }

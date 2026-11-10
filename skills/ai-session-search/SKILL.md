@@ -17,13 +17,13 @@ App/IDE/CLI share `antigravity`. Cloud-only account history is outside this loca
 
 ## 1. Start
 
-For “my earlier messages/corrections”, use `input_scope="user_input"` on `search_messages`
-or CLI `--input-scope user_input`, without `role=user`: answers can have tool role. It finds
+For “my earlier messages/corrections”, use `role="user"` on `search_messages`
+or CLI `--role user`: answers can have tool role. It finds
 recorded prompts, queued submissions and linked answers without searching generated output.
-The default `any` searches complete content. User-input selection requires `field=content`;
+Omitting `role` searches complete content; matching remains on the selected field.
 views/context can include generated text. Provenance distinguishes source and sender/delivery
 uncertainty; a queued submission need not have reached the model. If exact searches are empty,
-check effective role/date/path/input-scope filters, try a bounded all-content search, locate the
+check effective role/date/path filters, try a bounded all-content search, locate the
 session from the note's references, and inspect surrounding events. Preserve source distinctions.
 
 ```sh
@@ -180,7 +180,7 @@ aise list --parent-session claude:7e745098-c299-4cf5-bdbe-5cdb1fb5a62d
 aise messages search "foreign key" --workspace-path ~/source/project --limit 20 --context 2
 aise messages search 'timeout|lock|busy' --query-mode regex --limit 20 --lines-per-message 4
 aise messages search "approximate remembered wording" --query-mode fuzzy --limit 20
-aise messages search misunderstood --input-scope user_input --when 14d --limit 20 --context 2
+aise messages search misunderstood --role user --when 14d --limit 20 --context 2
 aise messages search "CANNOT STOP" --kinds harness-notice --when 2d --limit 20
 aise messages search exec --field tool-name --query-mode fuzzy --limit 20
 aise messages search "cargo test" --field tool-argument --argument-path /cmd --limit 20

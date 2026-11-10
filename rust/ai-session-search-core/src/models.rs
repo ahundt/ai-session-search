@@ -758,6 +758,13 @@ impl MessageProvenance {
                 ))
     }
 
+    pub(crate) fn is_legacy_user_input(&self, role: Role) -> bool {
+        self.authorship == MessageAuthorship::Unknown
+            && self.record_relation == MessageRecordRelation::Unknown
+            && matches!(self.input_origin, None | Some(MessageInputOrigin::Unknown))
+            && matches!(role, Role::User | Role::Slash)
+    }
+
     /// Validate in one pass: `O(S)` time and `O(1)` additional memory for `S` content parts.
     pub fn validate(&self, content: &str) -> Result<(), String> {
         if let Some(identity) = &self.correlation_identity {
@@ -1205,36 +1212,49 @@ pub struct SearchHit {
     pub match_snippet: String,
 }
 
-/// Source regions allowed to satisfy a message-search query.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageInputScope {
+/// Internal matching policy derived from the existing role filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MessageInputScope {
     #[default]
     Any,
-    #[value(name = "user_input")]
     UserInput,
 }
 impl MessageInputScope {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Any => "any",
-            Self::UserInput => "user_input",
+    pub(crate) fn for_role(role: Option<Role>) -> Self {
+        if role == Some(Role::User) {
+            Self::UserInput
+        } else {
+            Self::Any
         }
     }
 }
-impl std::str::FromStr for MessageInputScope {
-    type Err = String;
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "any" => Ok(Self::Any),
-            "user_input" => Ok(Self::UserInput),
-            _ => Err(format!(
-                "input_scope must be any or user_input, got {value:?}; pass user_input to match recorded user input or any to search complete content"
-            )),
+
+/// Bounded source evidence for ordinary hits; partitions remain internal to matching.
+#[derive(Serialize)]
+pub(crate) struct HitProvenance {
+    pub authorship: MessageAuthorship,
+    pub record_relation: MessageRecordRelation,
+    pub input_origin: Option<MessageInputOrigin>,
+    pub input_delivery_state: Option<InputDeliveryState>,
+}
+impl From<&MessageProvenance> for HitProvenance {
+    fn from(source: &MessageProvenance) -> Self {
+        Self {
+            authorship: source.authorship,
+            record_relation: source.record_relation,
+            input_origin: source.input_origin,
+            input_delivery_state: source.input_delivery_state,
         }
     }
+}
+fn serialize_hit_provenance<S: serde::Serializer>(
+    value: &Option<Box<MessageProvenance>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    value
+        .as_deref()
+        .map(HitProvenance::from)
+        .serialize(serializer)
 }
 
 /// Filters for message-level search (`messages search`, analytics). Exact/regex `limit == 0`
@@ -1242,7 +1262,8 @@ impl std::str::FromStr for MessageInputScope {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MessageFilters {
-    pub input_scope: MessageInputScope,
+    /// User selects recorded input across source roles in search and range reads.
+    /// Other roles select stored roles; analytics retain their operation-specific policies.
     pub role: Option<Role>,
     /// Which semantic message classes to return. `None` selects the default set
     /// ([`MessageKind::default_search_set`]): every class except `HarnessNotice`, which is
@@ -1326,16 +1347,14 @@ pub struct MessageFilters {
 }
 
 impl MessageFilters {
+    pub(crate) fn input_scope(&self) -> MessageInputScope {
+        MessageInputScope::for_role(self.role)
+    }
+
     /// Validate invariants shared by CLI, MCP, Rust, and language bindings.
     ///
     /// `query` is interpreted according to [`MessageFilters::match_mode`].
     pub fn validate(&self, query: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.input_scope != MessageInputScope::UserInput
-                || self.field.unwrap_or(SearchField::Content) == SearchField::Content,
-            "{}",
-            crate::message_search::MessageSearchRule::InputScopeRequiresContentField.message()
-        );
         use anyhow::{bail, ensure};
 
         if self.match_mode == MessageSearchMode::Fuzzy {
@@ -1464,8 +1483,11 @@ impl MessageFilters {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageHit {
-    /// Source attribution supplied for input-scoped searches, including unknown senders.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Source evidence loaded for user-selected matching, including unknown senders.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_hit_provenance"
+    )]
     pub provenance: Option<Box<MessageProvenance>>,
     pub session_id: String,
     pub provider: Provider,

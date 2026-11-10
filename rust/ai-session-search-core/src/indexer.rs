@@ -1940,7 +1940,7 @@ mod tests {
                 .search_messages(
                     "human answer",
                     &crate::models::MessageFilters {
-                        input_scope: crate::models::MessageInputScope::UserInput,
+                        role: Some(crate::models::Role::User),
                         session_id: Some("claude:ask-tail".to_string()),
                         ..Default::default()
                     },
@@ -2077,7 +2077,7 @@ mod tests {
         assert!(matches!(outcome, TailOutcome::FullParse));
         reindex(&config, &db, false, None).unwrap();
         let filters = crate::models::MessageFilters {
-            input_scope: crate::models::MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             session_id: Some(session_id),
             ..Default::default()
         };
@@ -2163,7 +2163,7 @@ mod tests {
             db.search_messages(
                 "queued tail correction",
                 &crate::models::MessageFilters {
-                    input_scope: crate::models::MessageInputScope::UserInput,
+                    role: Some(crate::models::Role::User),
                     session_id: Some("claude:queue-tail".into()),
                     ..Default::default()
                 }
@@ -2461,7 +2461,7 @@ mod tests {
 
     #[test]
     fn gemini_json_jsonl_family_keeps_predecessor_history_and_two_receipts() {
-        use crate::models::{MessageFilters, MessageInputScope};
+        use crate::models::MessageFilters;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
@@ -2527,7 +2527,7 @@ mod tests {
             "migration preserves previously published session/message references"
         );
         let user_filters = MessageFilters {
-            input_scope: MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             session_id: Some(session_id.clone()),
             ..Default::default()
         };
@@ -2626,7 +2626,7 @@ mod tests {
         .unwrap();
         reindex(&config, &db, false, None).unwrap();
         let appended_filters = MessageFilters {
-            input_scope: MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             session_id: Some(session_id.clone()),
             ..Default::default()
         };
@@ -2709,7 +2709,7 @@ mod tests {
         config.providers.gemini_cli.paths = vec![normalize_path(&root)];
         let db = Db::open(&db_path).unwrap();
         let input = crate::models::MessageFilters {
-            input_scope: crate::models::MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             ..Default::default()
         };
         for pass in [0, 1] {
@@ -2762,7 +2762,7 @@ mod tests {
             db.search_messages(
                 "legacy-only later input",
                 &crate::models::MessageFilters {
-                    input_scope: crate::models::MessageInputScope::UserInput,
+                    role: Some(crate::models::Role::User),
                     ..Default::default()
                 },
             )
@@ -2774,7 +2774,7 @@ mod tests {
             db.search_messages(
                 "family revised α",
                 &crate::models::MessageFilters {
-                    input_scope: crate::models::MessageInputScope::UserInput,
+                    role: Some(crate::models::Role::User),
                     ..Default::default()
                 },
             )

@@ -15,10 +15,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
    and deletes nothing. See Fixed item 6.
-2. `messages search --input-scope user_input` and the matching Rust, Python and MCP option
-   search recorded prompts, queued submissions and interactive answers across storage roles.
-   The default `any` searches complete content. Omit the role filter to include tool answers;
-   returned views and context can still contain generated text.
 
 ### Changed
 
@@ -46,6 +42,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    (`2 weeks`) forms; `3 days ago` still selects that whole day. EDTF open intervals
    (`2026-01/..`, `../2026-03`) select everything after or before a date, and a space may
    separate date and time (`2026-01-15 14:30`), as RFC 3339 allows.
+
+5. `messages search --role user` and matching Rust, Python and MCP role selectors now find
+   recorded prompts, commands, queued submissions and interactive answers across stored roles.
+   They previously selected only user-role rows. Returned records keep their original roles;
+   omitting the role filter still searches complete content.
 
 ### Deprecated
 

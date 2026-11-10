@@ -50,7 +50,7 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
 fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     use ai_session_search::message_search::SearchSurface;
     use ai_session_search::service::MessageService;
-    use ai_session_search::{MessageInputScope, MessageQuery, MessageSearchRequest, MessageTarget};
+    use ai_session_search::{MessageQuery, MessageSearchRequest, MessageTarget};
     use serde_json::json;
 
     let dir = tempfile::tempdir().unwrap();
@@ -74,17 +74,21 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     indexer::reindex(&config, &db, true, None).unwrap();
     let service = MessageService::new(&config, &db, SearchSurface::Rust);
     let request = |selection| {
-        MessageSearchRequest::builder(
-            MessageQuery::literal("correction").unwrap(),
-            MessageTarget::content(),
-        )
-        .input_scope(selection)
+        {
+            let builder = MessageSearchRequest::builder(
+                MessageQuery::literal("correction").unwrap(),
+                MessageTarget::content(),
+            );
+            if let Some(role) = selection {
+                builder.role(role)
+            } else {
+                builder
+            }
+        }
         .build()
         .unwrap()
     };
-    let response = service
-        .search(request(MessageInputScope::UserInput))
-        .unwrap();
+    let response = service.search(request(Some(Role::User))).unwrap();
     assert_eq!(
         response.hits().len(),
         3,
@@ -101,7 +105,7 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
             ai_session_search::models::MessageAuthorship::Unknown
         );
     }
-    let complete = service.search(request(MessageInputScope::Any)).unwrap();
+    let complete = service.search(request(None)).unwrap();
     assert_eq!(complete.hits().len(), 4);
     for queued in ["liquid correction", "vision correction"] {
         assert_eq!(
@@ -138,17 +142,13 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
     }
     indexer::reindex(&config, &db, true, None).unwrap();
     assert_eq!(
-        service
-            .search(request(MessageInputScope::Any))
-            .unwrap()
-            .hits()
-            .len(),
+        service.search(request(None)).unwrap().hits().len(),
         4,
         "refresh must not multiply queue evidence"
     );
     assert_eq!(
         service
-            .search(request(MessageInputScope::UserInput))
+            .search(request(Some(Role::User)))
             .unwrap()
             .hits()
             .len(),
@@ -160,7 +160,7 @@ fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
 fn user_input_search_preserves_nul_and_unicode_in_prompts_and_answers() {
     use ai_session_search::message_search::SearchSurface;
     use ai_session_search::service::MessageService;
-    use ai_session_search::{MessageInputScope, MessageQuery, MessageSearchRequest, MessageTarget};
+    use ai_session_search::{MessageQuery, MessageSearchRequest, MessageTarget};
     use serde_json::json;
 
     let dir = tempfile::tempdir().unwrap();
@@ -189,7 +189,7 @@ fn user_input_search_preserves_nul_and_unicode_in_prompts_and_answers() {
         MessageQuery::regex("\\x00évidence").unwrap(),
     ] {
         let request = MessageSearchRequest::builder(query, MessageTarget::content())
-            .input_scope(MessageInputScope::UserInput)
+            .role(Role::User)
             .build()
             .unwrap();
         let response = service.search(request).unwrap();
@@ -213,7 +213,7 @@ fn user_input_search_preserves_nul_and_unicode_in_prompts_and_answers() {
         ("évd", MessageSearchMode::Fuzzy),
     ] {
         let filters = MessageFilters {
-            input_scope: MessageInputScope::UserInput,
+            role: Some(Role::User),
             match_mode,
             limit: 10,
             ..Default::default()
@@ -460,7 +460,7 @@ fn search_messages_filters_by_role_substring_and_regex() {
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
 
-    // Role filter: exactly the 2 plain user turns (the slash turn is Role::Slash).
+    // User input includes the two prompts and the user-entered slash command.
     let users = db
         .search_messages(
             "",
@@ -470,8 +470,9 @@ fn search_messages_filters_by_role_substring_and_regex() {
             },
         )
         .unwrap();
-    assert_eq!(users.len(), 2);
-    assert!(users.iter().all(|m| m.role == Role::User));
+    assert_eq!(users.len(), 3);
+    assert_eq!(users.iter().filter(|m| m.role == Role::User).count(), 2);
+    assert_eq!(users.iter().filter(|m| m.role == Role::Slash).count(), 1);
 
     // Role::Slash matches the single slash-command turn.
     let slash = db

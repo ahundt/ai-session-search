@@ -947,7 +947,18 @@ impl ToolRecovery {
         // the same schema rather than assumed, for the same reason `limit` is: no two tools carry
         // the same set, and naming one a tool lacks hands the caller an argument its own schema
         // rejects while the one that would have worked goes unmentioned.
-        let reducers = ReducingArguments::of(accepts);
+        let reducers = ReducingArguments::of(|argument| {
+            accepts(argument)
+                && match argument {
+                    "detail" => args[argument] != "compact",
+                    "context" => args[argument] != 0,
+                    "include" => args[argument]
+                        .as_array()
+                        .is_none_or(|items| !items.is_empty()),
+                    "receipt_level" => args[argument] != "none",
+                    _ => true,
+                }
+        });
         if !accepts("limit") {
             return Self {
                 paging: ToolPaging::Unpaged,
@@ -2589,13 +2600,12 @@ fn search_origins_output_schema() -> Value {
             "field_view": origin.clone(),
             "match_view": origin.clone(),
             "receipt_level": origin.clone(),
-            "input_scope": origin.clone(),
             "result_order": origin
         },
         "required": [
             "result_extent", "context_messages_before", "context_messages_after", "includes",
             "detail", "lines_per_message", "field_view", "match_view", "receipt_level",
-            "result_order", "input_scope"
+            "result_order"
         ],
         "additionalProperties": false
     })
@@ -2933,14 +2943,12 @@ fn search_messages_output_schema() -> Value {
                 "kind": { "type": "string", "enum": message_kind_values() },
                 "provenance": {
                     "type":"object", "additionalProperties":false,
-                    "required":["authorship","record_relation","correlation_identity","content_parts","input_delivery_state","input_origin"],
+                    "required":["authorship","record_relation","input_delivery_state","input_origin"],
                     "properties": {
                         "authorship":{"type":"string","enum":["human","agent","harness","generated","mixed","unknown"]},
                         "record_relation":{"type":"string","enum":["original","mirror","unknown"]},
                         "input_origin":{"type":["string","null"],"enum":["direct_conversation","queued","interactive_answer","unknown",null]},
-                        "input_delivery_state":{"type":["string","null"],"enum":["submitted","delivered","cancelled","unknown",null]},
-                        "correlation_identity":{"type":["object","null"],"additionalProperties":false,"required":["authority","scope","id"],"properties":{"authority":{"type":"string"},"scope":{"type":"string"},"id":{"type":"string"}}},
-                        "content_parts":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["ordinal","start_char","end_char","authorship","origin"],"properties":{"ordinal":{"type":"integer","minimum":0},"start_char":{"type":"integer","minimum":0},"end_char":{"type":"integer","minimum":0},"authorship":{"type":"string"},"origin":{"type":"string"}}}}
+                        "input_delivery_state":{"type":["string","null"],"enum":["submitted","delivered","cancelled","unknown",null]}
                     }
                 }
             },
@@ -3063,7 +3071,6 @@ fn search_messages_output_schema() -> Value {
                         "required": ["field"],
                         "additionalProperties": false
                     },
-                    "input_scope": { "type": "string", "enum": <crate::models::MessageInputScope as clap::ValueEnum>::value_variants() },
                     "provider_scope": {
                         "type": "object",
                         "properties": {
@@ -3132,7 +3139,7 @@ fn search_messages_output_schema() -> Value {
                     "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] }
                 },
                 "required": [
-                    "target", "input_scope", "provider_scope", "extent", "context", "presentation", "include",
+                    "target", "provider_scope", "extent", "context", "presentation", "include",
                     "receipt_level"
                 ],
                 "additionalProperties": false
@@ -3358,7 +3365,6 @@ fn message_search_mcp_fields(parameter: MessageSearchParameter) -> &'static [&'s
     match parameter {
         MessageSearchParameter::Query => &["query"],
         MessageSearchParameter::QueryMode => &["query_mode"],
-        MessageSearchParameter::InputScope => &["input_scope"],
         MessageSearchParameter::Field => &["field"],
         MessageSearchParameter::ArgumentPath => &["argument_path"],
         MessageSearchParameter::Role => &["role"],
@@ -3464,11 +3470,6 @@ enum McpFieldRole {
 /// `advertised_and_projected_field_sets_agree` asserts the two tables describe the same set, so
 /// neither can gain a field the other does not know about.
 const MESSAGE_SEARCH_MCP_FIELDS: &[(&str, MessageSearchParameter, McpFieldRole)] = &[
-    (
-        "input_scope",
-        MessageSearchParameter::InputScope,
-        McpFieldRole::Canonical,
-    ),
     (
         "query",
         MessageSearchParameter::Query,
@@ -3835,7 +3836,7 @@ fn message_search_tool_description(config: &Config, input_schema: &Value) -> Str
          field_view/match_view; views use Unicode scalars and preserve \
          matches, order, count, context and includes.\n",
     );
-    text.push_str("input_scope=user_input matches recorded inputs across roles, including queues and tool answers. Views/context may contain generated text. Provenance states sender/delivery uncertainty.\n");
+    text.push_str("role=user selects recorded user input across storage roles, including queues and interactive answers; returned metadata keeps the native stored role and sender/delivery uncertainty. Views/context may contain generated text.\n");
     text.push_str(&omitted_values_sentence(input_schema));
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {
@@ -3997,11 +3998,6 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         context_schema.remove("default");
     }
 
-    set_schema_default(
-        properties,
-        "input_scope",
-        json!(crate::models::MessageInputScope::default()),
-    );
     match configured.extent() {
         ResolvedRequestExtent::Page { limit, offset } => {
             set_schema_default(properties, "limit", json!(limit));
@@ -4316,7 +4312,6 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
                         "kind": { "type": "string", "enum": message_kind_values() },
                         "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
-                        "input_scope": { "type": "string", "enum": <crate::models::MessageInputScope as clap::ValueEnum>::value_variants(), "default": "any" },
                         "argument_path": { "type": "string" },
                         "providers": provider_set_schema(&provider_values),
                         "tool_name_contains": { "type": "string" },
@@ -6219,11 +6214,6 @@ fn tool_search_messages_cancellable(
     let mut builder = MessageSearchRequest::builder(query, target)
         .time(RequestedTimeRange::new(since, until).map_err(|error| error.to_string())?)
         .include_compaction(mcp_bool_arg(args, "include_compaction", true));
-    if let Some(selection) =
-        parse_opt_enum::<crate::models::MessageInputScope>(args, "input_scope")?
-    {
-        builder = builder.input_scope(selection);
-    }
     // `kinds` is the single class-selection mechanism; `kind` is its one-value alias. Do not
     // reintroduce per-class booleans here: one was tried and reverted because it duplicated
     // this parameter and self-cancelled against it. See models.rs MessageFilters::kinds.
@@ -7533,7 +7523,7 @@ mod tests {
                     (9001,2,18,25,'generated','tool_payload');"
         ).unwrap();
         let out = search_messages_value(
-            &json!({"query":"humanneedle","input_scope":"user_input","receipt_level":"full"}),
+            &json!({"query":"humanneedle","role":"user","receipt_level":"full"}),
             &config,
             &db,
         );
@@ -7550,12 +7540,84 @@ mod tests {
         let mut violations = Vec::new();
         output_schema_violations(&out, &schema, "structuredContent", &mut violations);
         assert!(violations.is_empty(), "{violations:?}");
-        let excluded = search_messages_value(
-            &json!({"query":"prefix","input_scope":"user_input"}),
+        let excluded =
+            search_messages_value(&json!({"query":"prefix","role":"user"}), &config, &db);
+        assert_eq!(excluded["page"]["returned"], 0);
+    }
+
+    #[test]
+    fn ceiling_recovery_does_not_repeat_already_applied_reductions() {
+        let config = Config::default();
+        let advertised = advertised_tools(&config);
+        let recovery = ToolRecovery::for_call(
+            "search_messages",
+            &json!({
+                "detail":"compact", "context":0, "include":[], "receipt_level":"none"
+            }),
+            &advertised,
+            &config,
+        );
+        let advice = recovery.reducers.sentence().unwrap();
+        for ineffective in [
+            "detail=compact",
+            "lower context",
+            "include=[]",
+            "receipt_level=none",
+        ] {
+            assert!(!advice.contains(ineffective), "{advice}");
+        }
+        assert!(advice.contains("field_view"));
+    }
+
+    #[test]
+    fn compact_input_search_keeps_many_partitioned_parts_within_mcp_ceiling() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let generated = "x".repeat(1_000);
+        let content = format!("{generated}needle");
+        let mut sql = String::new();
+        sql.push_str(
+            "insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin) values (9002,'claude:test1','claude',91,'tool','tool_result','",
+        );
+        sql.push_str(&content.replace('\'', "''"));
+        sql.push_str("','mixed','original','interactive_answer');");
+        for ordinal in 0..1_000 {
+            sql.push_str(&format!(
+                "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values (9002,{ordinal},{ordinal},{},'generated','tool_payload');",
+                ordinal + 1
+            ));
+        }
+        sql.push_str(
+            "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values (9002,1000,1000,1006,'unknown','direct_input');",
+        );
+        db.execute_batch_for_test(&sql).unwrap();
+
+        let response = tool_search_messages(
+            &json!({
+                "query": "needle",
+                "role": "user",
+                "limit": 1,
+                "detail": "compact",
+                "include": [],
+                "receipt_level": "none"
+            }),
             &config,
             &db,
+        )
+        .unwrap();
+        let structured = response
+            .structured_content
+            .expect("input search should return structured content");
+        assert_eq!(structured["page"]["returned"], 1);
+        assert_eq!(structured["results"][0]["message_metadata"]["role"], "tool");
+        assert_eq!(
+            structured["results"][0]["match"]["literal_occurrence"]["field_start_char"],
+            1_000
         );
-        assert_eq!(excluded["page"]["returned"], 0);
+        assert!(
+            serde_json::to_string(&structured).unwrap().chars().count() < 48_000,
+            "compact response must not serialize every internal partition"
+        );
     }
 
     #[test]
@@ -8710,7 +8772,6 @@ mod tests {
             ("providers", check::<crate::models::Provider>),
             ("role", check::<crate::models::Role>),
             ("field", check::<crate::models::SearchField>),
-            ("input_scope", check::<crate::models::MessageInputScope>),
             ("index_refresh", check::<crate::config::IndexRefresh>),
         ];
         // Advertised vocabularies with no Rust enum behind them: each is matched inline by the
@@ -14383,7 +14444,7 @@ mod tests {
         );
         assert_eq!(
             registry.rules().len(),
-            10,
+            9,
             "the conflict-rule count changed; tool.description renders them verbatim and its \
              2,048-character ceiling is budgeted against this count"
         );
@@ -14425,7 +14486,7 @@ mod tests {
             advertised.difference(&accepted).collect::<Vec<_>>(),
             accepted.difference(&advertised).collect::<Vec<_>>()
         );
-        assert_eq!(advertised.len(), 38, "{advertised:?}");
+        assert_eq!(advertised.len(), 37, "{advertised:?}");
 
         // `offset` is the field an earlier design proposed hiding. It cannot be hidden: the
         // response tells callers to send it back, so concealing it would publish an instruction

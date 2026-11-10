@@ -12,24 +12,23 @@ the [configuration guide](configuration.md).
 
 ## Python
 
-For historical user input across storage roles, pass
-`MessageSearchRequest(input_scope="user_input")` without a role filter. This selects recorded
-prompts, queued submissions and linked answer regions; omitted or `"any"` searches complete
-content. User-input selection requires `field="content"`. Other filters intersect normally.
+For historical user input across storage roles, pass `role="user"` to
+`MessageSearchRequest`. This selects recorded prompts, queued submissions and linked answer
+regions; omit the role to search complete content. Other filters intersect normally.
 Match coordinates count Unicode scalars in indexed message content and cannot bridge generated
-regions. Views and context may still include generated text. Results include source provenance. In Rust, use
-`MessageSearchRequest::builder(...).input_scope(MessageInputScope::UserInput)`;
-the enum lives in `ai_session_search::models`.
+regions. Views and context may still include generated text. Results include concise source
+provenance. The index retains full partition and correlation details for existing read-only SQL
+inspection; ordinary search hits do not emit those internal arrays.
 
 Legacy Claude queue operations lack per-item sender receipts and links proving delivery. They
 remain `authorship=unknown`, `input_origin=queued`, and `input_delivery_state=submitted`, while
-`input_scope="user_input"` still finds the recorded submission. Matching a later message by text
+`role="user"` still finds the recorded submission. Matching a later message by text
 alone does not prove identity. Recurrence/correction analytics keep their stricter attribution
 rules and exclude unverified queue copies; their existing behavior is unchanged.
 
 Recurrence analytics retain their existing projection that joins human fragments within a
 message. Their query coordinates and phrase grouping describe that projection. Message search
-with `input_scope="user_input"` instead matches contiguous original regions and reports
+with `role="user"` instead matches contiguous original regions and reports
 coordinates within the indexed message; it never joins across generated gaps.
 
 `SessionSearch` owns the configuration, the database handle, and the worker

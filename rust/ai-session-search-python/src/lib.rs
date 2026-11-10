@@ -2751,7 +2751,6 @@ impl MessageScope {
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageSearchRequest {
-    input_scope: Option<ai_session_search::models::MessageInputScope>,
     scope: MessageScope,
     role: Option<Role>,
     kind: Option<MessageKind>,
@@ -2791,23 +2790,17 @@ struct MessageSearchRequest {
 
 #[pymethods]
 impl MessageSearchRequest {
-    #[getter]
-    fn input_scope(&self) -> Option<&'static str> {
-        self.input_scope
-            .map(ai_session_search::models::MessageInputScope::as_str)
-    }
     #[new]
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", input_scope=None, argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None))]
     fn new(
         scope: Option<MessageScope>,
         role: Option<&str>,
         kind: Option<&str>,
         kinds: Option<Vec<String>>,
         field: &str,
-        input_scope: Option<&str>,
         argument_path: Option<String>,
         seq_from: Option<i64>,
         seq_to: Option<i64>,
@@ -2884,10 +2877,6 @@ impl MessageSearchRequest {
             })
             .transpose()?;
         Ok(Self {
-            input_scope: input_scope
-                .map(str::parse)
-                .transpose()
-                .map_err(PyValueError::new_err)?,
             scope: scope.unwrap_or_default(),
             role: role
                 .map(str::parse)
@@ -3080,7 +3069,6 @@ impl MessageSearchRequest {
 impl Default for MessageSearchRequest {
     fn default() -> Self {
         Self {
-            input_scope: None,
             scope: MessageScope::default(),
             role: None,
             kind: None,
@@ -3129,9 +3117,6 @@ impl MessageSearchRequest {
             } else {
                 CoreRequestedExtent::page(self.limit, self.offset).map_err(value_error)?
             });
-        if let Some(selection) = self.input_scope {
-            builder = builder.input_scope(selection);
-        }
         if let Some(value) = self.role {
             builder = builder.role(value);
         }
@@ -3600,7 +3585,17 @@ struct NativeMessageHit {
 impl NativeMessageHit {
     #[getter]
     fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        json_compatible(py, &self.provenance)
+        json_compatible(
+            py,
+            &self.provenance.as_ref().map(|provenance| {
+                serde_json::json!({
+                    "authorship": provenance.authorship,
+                    "record_relation": provenance.record_relation,
+                    "input_delivery_state": provenance.input_delivery_state,
+                    "input_origin": provenance.input_origin,
+                })
+            }),
+        )
     }
     #[getter]
     fn refs(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeMessageRef>>> {

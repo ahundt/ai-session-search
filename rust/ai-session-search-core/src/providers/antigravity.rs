@@ -664,7 +664,7 @@ mod tests {
                 crate::message_search::MessageQuery::literal(needle).unwrap(),
                 crate::message_search::MessageTarget::content(),
             )
-            .input_scope(crate::models::MessageInputScope::UserInput)
+            .role(crate::models::Role::User)
             .build()
             .unwrap()
         };
@@ -681,7 +681,6 @@ mod tests {
                         .unwrap(),
                     crate::message_search::MessageTarget::content(),
                 )
-                .input_scope(crate::models::MessageInputScope::Any)
                 .build()
                 .unwrap(),
             )
@@ -739,7 +738,7 @@ mod tests {
                     crate::message_search::MessageQuery::literal("same phrase").unwrap(),
                     crate::message_search::MessageTarget::content(),
                 )
-                .input_scope(crate::models::MessageInputScope::UserInput)
+                .role(crate::models::Role::User)
                 .build()
                 .unwrap(),
             )
@@ -823,7 +822,7 @@ mod tests {
                         crate::message_search::MessageQuery::literal(needle).unwrap(),
                         crate::message_search::MessageTarget::content(),
                     )
-                    .input_scope(crate::models::MessageInputScope::UserInput)
+                    .role(crate::models::Role::User)
                     .build()
                     .unwrap(),
                 )

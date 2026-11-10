@@ -491,11 +491,11 @@ canonical records rather than adapter-specific response models.
 Do not add a second parser for an opaque or duplicative database without evidence that it contains
 unique supported data.
 
-Input retrieval follows recorded source and purpose. `MessageInputScope::UserInput` selects
+Input retrieval follows recorded source and purpose. `role=user` selects
 prompts, queued submissions and linked interactive-answer regions across storage roles. Explicit
 native provenance takes precedence over session fallback; generated tool output, harness context,
-delegation and known mirrors do not satisfy that selection. Default `Any` and other filters keep
-their existing behavior. A queued submission can have an unknown sender and delivery outcome
+delegation and known mirrors do not satisfy that selection. Omitting role searches complete
+content; other filters retain their existing behavior. A queued submission can have an unknown sender and delivery outcome
 while its input purpose is known; retain that uncertainty instead of hiding the submission.
 
 Authorship retains the existing structural conventions: Antigravity's `USER_EXPLICIT` marks Human;

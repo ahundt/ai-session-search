@@ -89,12 +89,11 @@ aise files history src/app.py
 aise files extract src/app.py --restore
 ```
 
-To find user input across storage roles, use
-`aise messages search "correction" --input-scope user_input` and omit `--role`.
+To find your recorded input across storage roles, use
+`aise messages search "correction" --role user`.
 This includes recorded prompts, queued submissions and linked interactive answers. Matching
 stays within input regions; views/context can include surrounding generated text. Provenance
-preserves source and sender/delivery uncertainty. The default `--input-scope any` searches
-complete content as before.
+preserves source and sender/delivery uncertainty. Omit `--role` to search complete content.
 
 `aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
 [EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,

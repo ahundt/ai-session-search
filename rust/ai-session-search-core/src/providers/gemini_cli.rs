@@ -1718,7 +1718,6 @@ mod tests {
         use crate::message_search::{
             MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
         };
-        use crate::models::MessageInputScope;
         use crate::service::MessageService;
 
         for preindexed in [false, true] {
@@ -1759,7 +1758,7 @@ mod tests {
                         MessageQuery::literal(query).unwrap(),
                         MessageTarget::content(),
                     )
-                    .input_scope(MessageInputScope::UserInput)
+                    .role(crate::models::Role::User)
                     .build()
                     .unwrap();
                     assert_eq!(service.search(request).unwrap().hits().len(), expected);
@@ -1796,7 +1795,7 @@ mod tests {
         let adapter = GeminiCliAdapter::new(vec![]);
         let path = Path::new("/tmp/session-retained-input.jsonl");
         let filters = crate::models::MessageFilters {
-            input_scope: crate::models::MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             ..Default::default()
         };
         for stamp in [1, 2, 3] {
@@ -1877,7 +1876,7 @@ mod tests {
                 crate::message_search::MessageQuery::literal(query).unwrap(),
                 crate::message_search::MessageTarget::content(),
             )
-            .input_scope(crate::models::MessageInputScope::UserInput)
+            .role(crate::models::Role::User)
             .build()
             .unwrap();
             assert_eq!(
@@ -1941,7 +1940,7 @@ mod tests {
             crate::message_search::SearchSurface::Rust,
         );
         let filters = crate::models::MessageFilters {
-            input_scope: crate::models::MessageInputScope::UserInput,
+            role: Some(crate::models::Role::User),
             ..Default::default()
         };
         let mut first_identity = None;

@@ -35,27 +35,24 @@ def test_human_content_selection_changes_membership_and_preserves_coordinates(tm
             values (2, 0, 0, 15, 'generated', 'tool_payload'),
                    (2, 1, 15, 22, 'human', 'direct_input');
         """)
-    response = search.search_messages("needle", native.MessageSearchRequest(input_scope="user_input", limit=1, receipt_level="full"))
+    response = search.search_messages("needle", native.MessageSearchRequest(role="user", limit=1, receipt_level="full"))
     assert len(response.results) == 1
     result = response.results[0]
     assert result["message_ref"]["message_seq"] == 1
+    assert result["message_metadata"]["role"] == "tool"
     assert result["match"]["literal_occurrence"]["field_start_char"] == 16
     assert result["message_metadata"]["provenance"]["authorship"] == "mixed"
-    assert response.effective_request["input_scope"] == "user_input"
-    assert response.receipt["parameter_origins"]["input_scope"] == {"source": "explicit"}
+    assert "input_scope" not in response.effective_request
+    assert "input_scope" not in response.receipt["parameter_origins"]
     assert len(search.search_messages("needle").results) == 2
-    assert search.search_messages("needle", native.MessageSearchRequest(input_scope="user_input", role="user")).results == []
-    with pytest.raises(ValueError, match="input_scope"):
-        search.search_messages("needle", native.MessageSearchRequest(input_scope="user_input", field="tool_name"))
-    with pytest.raises(ValueError, match="any or user_input"):
-        native.MessageSearchRequest(input_scope="person")
+    assert len(search.search_messages("needle", native.MessageSearchRequest(role="user")).results) == 1
 
 
 def test_message_search_request_exposes_only_final_presentation_and_include_controls() -> None:
     parameters = inspect.signature(native.MessageSearchRequest).parameters
     for name in ("detail", "field_view", "match_view", "include"):
         assert name in parameters
-    for removed in ("include_refs", "match_evidence_max_chars"):
+    for removed in ("include_refs", "match_evidence_max_chars", "input_scope"):
         assert removed not in parameters
 
 
@@ -145,7 +142,6 @@ def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp
         ],
     }
     assert [descriptor["rule"] for descriptor in registry["rules"]] == [
-        "input_scope_requires_content_field",
         "detail_owns_presentation_budgets",
         "sequence_requires_session",
         "kinds_must_remain_satisfiable",
@@ -1972,7 +1968,7 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
     assert seqs(search.read_session_messages("reads", order="newest", limit=2)) == [2, 3]
     assert seqs(search.read_session_messages("reads", order="oldest", limit=2)) == [0, 1]
     # role composes with the newest-N window.
-    assert seqs(search.read_session_messages("reads", order="newest", role="user", limit=1)) == [2]
+    assert seqs(search.read_session_messages("reads", order="newest", role="user", limit=1)) == [3]
     # inclusive seq range is the non-overlapping chunked-read primitive.
     assert seqs(search.read_session_messages("reads", seq_from=1, seq_to=2)) == [1, 2]
     # offset paginates the oldest-first window.
@@ -2420,7 +2416,7 @@ def _binding_search(database: Path, spec: dict, case: dict, offset: int = 0, lim
         all_results=case.get("all_results", False),
         match_window=case.get("match_window"),
         field=case.get("field", "content"),
-        input_scope=case.get("input_scope"),
+        role=case.get("role"),
     )
     return native.SessionSearch(database).search_messages(case["query"], request, query_mode=case["mode"])
 
@@ -2447,8 +2443,8 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
         str(offset),
     ]
     limit = limit if limit is not None else case.get("limit")
-    if case.get("input_scope"):
-        command += ["--input-scope", case["input_scope"]]
+    if case.get("role"):
+        command += ["--role", case["role"]]
     if case.get("field"):
         command += ["--field", case["field"].replace("_", "-")]
     if case.get("all_results"):
