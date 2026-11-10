@@ -393,9 +393,7 @@ fn with_read_only_authorizer<T>(
     f: impl FnOnce(&mut Connection) -> Result<T>,
 ) -> Result<T> {
     conn.execute_batch("pragma query_only = on")?;
-    // Fail closed. rusqlite 0.40 reports whether the authorizer installed, and running the
-    // caller's SQL after a failed install would drop the read-only restriction this function
-    // exists to impose.
+    // Fail closed if the authorizer cannot install; the caller's SQL must not bypass it.
     conn.authorizer(Some(read_only_authorizer))
         .context("could not install the read-only SQL authorizer")?;
     let result = f(conn);
@@ -1642,7 +1640,7 @@ mod tests {
             "sessions(id, provider, provider_session_id, title, summary, cwd, repo_root, created_at, updated_at, last_message_at, preview_text, source_path, message_count, parse_version, raw_metadata_json, parse_warning, discovery_source, parent_session_id, agent_label)"
         ));
         assert!(summary.contains(
-            "messages(id, session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content, authorship, correlation_authority, correlation_scope, correlation_id, record_relation)"
+            "messages(id, session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content, authorship, correlation_authority, correlation_scope, correlation_id, input_delivery_state, input_origin, record_relation)"
         ));
         assert!(summary.contains(
             "file_edits(id, session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)"

@@ -17,6 +17,16 @@ App/IDE/CLI share `antigravity`. Cloud-only account history is outside this loca
 
 ## 1. Start
 
+For “my earlier messages/corrections”, use `role="user"` on `search_messages`
+or CLI `--role user`: answers can have tool role. It finds
+recorded prompts, queued submissions and linked answers. For content queries, matching stays in
+recorded input regions; known parent-agent prompts sent to spawned sessions are excluded from this
+selector. Omitting `role` searches complete content; matching remains on the selected field.
+Views and context can include generated text. Provenance distinguishes source and sender/delivery
+uncertainty; a queued submission need not have reached the model. If exact searches are empty,
+check effective role/date/path filters, try a bounded all-content search, locate the
+session from the note's references, and inspect surrounding events. Preserve source distinctions.
+
 ```sh
 aise --version
 aise doctor

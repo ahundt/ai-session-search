@@ -89,6 +89,12 @@ aise files history src/app.py
 aise files extract src/app.py --restore
 ```
 
+Find recorded prompts, queued submissions and linked answers with
+`aise messages search "correction" --role user`.
+Matches identify recorded input regions; displayed context can include generated text. Known
+parent-agent prompts sent to spawned sessions are excluded from this selector, while sender and
+delivery can be unknown. Omit `--role` to search complete message content.
+
 `aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
 [EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,
 read in your local time zone unless the value names an offset or a trailing

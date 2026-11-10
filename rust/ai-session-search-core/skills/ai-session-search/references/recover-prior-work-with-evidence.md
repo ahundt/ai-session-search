@@ -56,8 +56,10 @@ the named scope. Budgets control research effort and report size, not which matc
 1. Confirm the CLI or MCP schema instead of guessing options.
 2. Apply authorized roots, providers, and time scope before increasing result volume.
 3. For `exact-evidence`, start with `search_messages`.
-   Use literal matching first, regex for alternatives or boundaries, and fuzzy only for uncertain
-   wording.
+   For earlier user input, set `role="user"` (CLI `--role user`) so answers stored as tool
+   results remain eligible. Sender uncertainty
+   stays in provenance. Use literal matching first, regex for alternatives or boundaries, and
+   fuzzy only for uncertain wording.
 4. For `topic-overview`, start with `search_sessions`, then inspect the relevant start, end, or
    matched turn with `get_session`.
 5. For `topic-then-verify`, use session discovery only to derive candidate sessions or terms, then

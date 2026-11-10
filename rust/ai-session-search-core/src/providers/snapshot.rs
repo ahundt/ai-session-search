@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
-    format_transcript_line, normalize_path, provider_parse_version,
-    to_messages_with_tools_in_scope, RawMessage,
+    format_transcript_line, normalize_path, normalize_raw_messages_with_evidence,
+    provider_parse_version, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 pub(super) type Turn = (String, String, Option<DateTime<Utc>>);
@@ -61,16 +61,25 @@ pub(super) fn parsed_session_from_raw(
     metadata: SnapshotMetadata<'_>,
     raw_messages: Vec<RawMessage>,
 ) -> ParsedSession {
+    parsed_session_from_raw_with_evidence(
+        provider,
+        path,
+        metadata,
+        raw_messages,
+        UserRoleAuthorshipEvidence::HumanInputEvent,
+    )
+}
+
+pub(super) fn parsed_session_from_raw_with_evidence(
+    provider: Provider,
+    path: &Path,
+    metadata: SnapshotMetadata<'_>,
+    raw_messages: Vec<RawMessage>,
+    evidence: UserRoleAuthorshipEvidence,
+) -> ParsedSession {
     let correlation_scope = format!("{}:{}", provider.as_str(), metadata.provider_session_id);
-    let mut messages = to_messages_with_tools_in_scope(raw_messages, &correlation_scope);
-    // One file is one person-started session for these providers (no spawn marker exists in
-    // either format), so a user turn is the person's prompt: the same session-level evidence the
-    // Codex, Cursor, and Pi adapters use for a session nothing spawned. Tool echoes and notices
-    // arrive already classified, so only conversation rows are resolved here.
-    crate::util::apply_user_role_authorship(
-        &mut messages,
-        crate::util::UserRoleAuthorshipEvidence::HumanInputEvent,
-    );
+    let messages =
+        normalize_raw_messages_with_evidence(raw_messages, Some(&correlation_scope), evidence);
     // The transcript is what session search ranks; it carries the conversation, as it does for
     // every other provider, and leaves tool traffic to message search.
     let transcript_text = messages
