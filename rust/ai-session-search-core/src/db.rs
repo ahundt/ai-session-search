@@ -526,6 +526,8 @@ const MESSAGE_INPUT_INDEXES_SQL: &str =
 /// Add the post-release columns used to distinguish recorded user input from other `role=user`
 /// rows. This is shared by normal writable opens and offline migration staging so the latter does
 /// not rebuild otherwise-healthy FTS indexes merely because additive storage was missing.
+/// The origin default is a SQL-only legacy marker; current parsers bind NULL for absent evidence.
+/// Retaining it preserves old indexes and covering query plans without a row rewrite.
 pub(crate) fn ensure_message_input_provenance_storage(conn: &Connection) -> Result<()> {
     let definitions = [
         (
@@ -6582,7 +6584,7 @@ fn insert_messages<'a>(
                 .provenance
                 .input_delivery_state
                 .map(|value| value.as_str()),
-            message.provenance.input_origin.map(|value| value.as_str()),
+            message.provenance.stored_input_origin(),
             message.provenance.record_relation.as_str(),
         ])?;
         let message_id = tx.last_insert_rowid();
@@ -6635,7 +6637,7 @@ fn update_message_row(
                 .provenance
                 .input_delivery_state
                 .map(|value| value.as_str()),
-            message.provenance.input_origin.map(|value| value.as_str()),
+            message.provenance.stored_input_origin(),
             message.provenance.record_relation.as_str(),
             message_id,
         ],
@@ -7099,6 +7101,7 @@ fn merge_family_input_row(
     // A partial rendering's missing origin does not erase a previously recorded input channel.
     merged.provenance.input_origin = incoming.provenance.input_origin.or(old_input_origin
         .as_deref()
+        .filter(|value| *value != "unknown")
         .map(str::parse)
         .transpose()
         .map_err(anyhow::Error::msg)?);
@@ -7482,7 +7485,7 @@ fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
             .provenance
             .input_delivery_state
             .map(|value| value.as_str()),
-        input_origin: message.provenance.input_origin.map(|value| value.as_str()),
+        input_origin: message.provenance.stored_input_origin(),
         record_relation: Some(message.provenance.record_relation.as_str()),
         content: &message.content,
     }
@@ -9520,7 +9523,6 @@ mod tests {
         ] {
             for (input_origin, positive) in [
                 (None, false),
-                (Some(I::Unknown), false),
                 (Some(I::DirectConversation), true),
                 (Some(I::Queued), true),
                 (Some(I::InteractiveAnswer), true),
@@ -12693,6 +12695,10 @@ mod tests {
                 vec![0],
                 "{match_mode:?}"
             );
+            let provenance = hits[0].provenance.as_ref().unwrap();
+            assert_eq!(provenance.input_origin, None);
+            assert_eq!(provenance.input_delivery_state, None);
+            assert!(provenance.is_legacy_user_input(Role::User));
         }
         assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 1);
         assert_eq!(
@@ -19774,7 +19780,7 @@ mod tests {
         );
         initial.messages[0].provenance.authorship = MessageAuthorship::Human;
         initial.messages[0].provenance.correlation_identity = Some(identity());
-        initial.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Unknown);
+        initial.messages[0].provenance.input_delivery_state = None;
         db.upsert_session(&initial, 1, 1).unwrap();
         let original_id: i64 = db
             .conn

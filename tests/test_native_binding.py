@@ -21,6 +21,27 @@ from scripts.verify_harness_discovery import environment as isolated_environment
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
+def test_legacy_input_sentinels_return_none_without_selecting_current_unknown_input(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    search = native.SessionSearch(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+            values ('claude:legacy', 'claude', 'legacy', '', '/legacy', 'test', 'test');
+            insert into messages(session_id, provider, seq, role, kind, content, authorship, record_relation, input_origin, input_delivery_state)
+            values ('claude:legacy', 'claude', 0, 'user', 'conversation', 'needle', 'unknown', 'original', 'unknown', 'unknown'),
+                   ('claude:legacy', 'claude', 1, 'user', 'conversation', 'needle', 'unknown', 'original', null, 'unknown');
+        """)
+    results = search.search_messages("needle", native.MessageSearchRequest(role="user")).results
+    assert [hit["message_ref"]["message_seq"] for hit in results] == [0]
+    assert results[0]["message_metadata"]["provenance"] == {
+        "authorship": "unknown",
+        "record_relation": "original",
+        "input_origin": None,
+        "input_delivery_state": None,
+    }
+
+
 def test_human_content_selection_changes_membership_and_preserves_coordinates(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     search = native.SessionSearch(db_path)

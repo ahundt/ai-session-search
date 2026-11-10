@@ -1856,16 +1856,12 @@ mod role_classification_tests {
         let unknown = normalize_raw_messages_with_evidence(
             vec![RawMessage::message("user", "x".into(), None, None)
                 .with_authorship(MessageAuthorship::Human)
-                .with_authorship(MessageAuthorship::Unknown)
-                .with_input_origin(MessageInputOrigin::Unknown)],
+                .with_authorship(MessageAuthorship::Unknown)],
             None,
             UserRoleAuthorshipEvidence::HumanInputEvent,
         );
         assert_eq!(unknown[0].provenance.authorship, MessageAuthorship::Unknown);
-        assert_eq!(
-            unknown[0].provenance.input_origin,
-            Some(MessageInputOrigin::Unknown)
-        );
+        assert_eq!(unknown[0].provenance.input_origin, None);
     }
 
     #[test]

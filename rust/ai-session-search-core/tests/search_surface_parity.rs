@@ -93,14 +93,15 @@ fn fixture() -> Fixture {
         tool_call_id: None,
         content,
         is_compaction: false,
-        provenance: ai_session_search::models::MessageProvenance {
-            authorship: if role == Role::User {
+        provenance: {
+            let mut provenance = ai_session_search::models::MessageProvenance::default();
+            provenance.authorship = if role == Role::User {
                 ai_session_search::models::MessageAuthorship::Human
             } else {
                 ai_session_search::models::MessageAuthorship::Agent
-            },
-            record_relation: ai_session_search::models::MessageRecordRelation::Original,
-            ..Default::default()
+            };
+            provenance.record_relation = ai_session_search::models::MessageRecordRelation::Original;
+            provenance
         },
     };
     let mut messages: Vec<Message> = spec["messages"]

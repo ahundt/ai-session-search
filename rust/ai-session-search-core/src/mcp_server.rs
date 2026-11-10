@@ -7559,6 +7559,13 @@ mod tests {
             7
         );
         let schema = search_messages_output_schema();
+        for field in ["input_origin", "input_delivery_state"] {
+            let values = &schema["$defs"]["MessageMetadata"]["properties"]["provenance"]
+                ["properties"][field]["enum"];
+            let values = values.as_array().expect("provenance evidence enum");
+            assert!(values.contains(&Value::Null));
+            assert!(!values.contains(&json!("unknown")));
+        }
         let mut violations = Vec::new();
         output_schema_violations(&out, &schema, "structuredContent", &mut violations);
         assert!(violations.is_empty(), "{violations:?}");

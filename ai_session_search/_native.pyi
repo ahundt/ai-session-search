@@ -1007,7 +1007,10 @@ class FileQuery:
 
 @final
 class MessageHit:
-    """One indexed message with canonical session, role, kind, tool, and content fields."""
+    """One indexed message with canonical session, role, kind, tool, and content fields.
+
+    Provenance origin and delivery are None when source evidence is absent.
+    """
 
     provenance: dict[str, str | None] | None
     session_id: str

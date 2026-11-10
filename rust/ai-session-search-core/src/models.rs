@@ -619,16 +619,15 @@ impl std::str::FromStr for MessageRecordRelation {
 /// it does not confirm that the model received the input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InputDeliveryState {
     Submitted,
-    Unknown,
 }
 
 impl InputDeliveryState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Submitted => "submitted",
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -652,13 +651,11 @@ impl InputDeliveryState {
 /// result. Neither origin proves that the model received the input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageInputOrigin {
     DirectConversation,
     Queued,
     InteractiveAnswer,
-    /// Migration marker for rows indexed before origins were recorded.
-    /// Use `None` on MessageProvenance when current source evidence is absent.
-    Unknown,
 }
 
 impl MessageInputOrigin {
@@ -667,7 +664,6 @@ impl MessageInputOrigin {
             Self::DirectConversation => "direct_conversation",
             Self::Queued => "queued",
             Self::InteractiveAnswer => "interactive_answer",
-            Self::Unknown => "unknown",
         }
     }
 
@@ -685,18 +681,65 @@ impl std::str::FromStr for MessageInputOrigin {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredMessageProvenance")]
 pub struct MessageProvenance {
     pub authorship: MessageAuthorship,
     pub record_relation: MessageRecordRelation,
     pub correlation_identity: Option<MessageCorrelationIdentity>,
-    #[serde(default)]
+    /// `None` when the source provides no delivery evidence.
     pub input_delivery_state: Option<InputDeliveryState>,
-    #[serde(default)]
+    /// `None` when the source provides no origin evidence.
     pub input_origin: Option<MessageInputOrigin>,
     pub content_parts: Vec<MessageContentPart>,
+    /// SQL-only `input_origin='unknown'` marks rows written before origin recording.
+    #[serde(skip)]
+    pub(crate) legacy_input_origin: bool,
+}
+
+// Keep legacy storage spellings at the read boundary, outside the public evidence enums.
+#[derive(Deserialize)]
+struct StoredMessageProvenance {
+    authorship: MessageAuthorship,
+    record_relation: MessageRecordRelation,
+    correlation_identity: Option<MessageCorrelationIdentity>,
+    input_delivery_state: Option<String>,
+    input_origin: Option<String>,
+    content_parts: Vec<MessageContentPart>,
+}
+
+impl TryFrom<StoredMessageProvenance> for MessageProvenance {
+    type Error = String;
+
+    fn try_from(source: StoredMessageProvenance) -> Result<Self, Self::Error> {
+        Ok(Self {
+            legacy_input_origin: source.input_origin.as_deref() == Some("unknown"),
+            authorship: source.authorship,
+            record_relation: source.record_relation,
+            correlation_identity: source.correlation_identity,
+            input_delivery_state: source
+                .input_delivery_state
+                .filter(|value| value != "unknown")
+                .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            input_origin: source
+                .input_origin
+                .filter(|value| value != "unknown")
+                .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            content_parts: source.content_parts,
+        })
+    }
 }
 
 impl MessageProvenance {
+    pub(crate) fn stored_input_origin(&self) -> Option<&'static str> {
+        self.input_origin
+            .map(MessageInputOrigin::as_str)
+            .or(self.legacy_input_origin.then_some("unknown"))
+    }
+
     pub(crate) fn is_whole_user_input(&self) -> bool {
         self.authorship == MessageAuthorship::Human
             || (self.authorship == MessageAuthorship::Unknown
@@ -712,11 +755,10 @@ impl MessageProvenance {
 
     pub(crate) fn is_legacy_user_input(&self, role: Role) -> bool {
         self.authorship == MessageAuthorship::Unknown
-            // ALTER marks pre-origin rows as Unknown; current parsers use None for absent evidence.
             && (self.record_relation == MessageRecordRelation::Unknown
                 || (self.record_relation == MessageRecordRelation::Original
-                    && self.input_origin == Some(MessageInputOrigin::Unknown)))
-            && matches!(self.input_origin, None | Some(MessageInputOrigin::Unknown))
+                    && self.legacy_input_origin))
+            && self.input_origin.is_none()
             && matches!(role, Role::User | Role::Slash)
     }
 
@@ -1855,6 +1897,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_input_sentinels_decode_to_absent_evidence() {
+        let provenance: MessageProvenance = serde_json::from_value(serde_json::json!({
+            "authorship": "unknown", "record_relation": "original",
+            "correlation_identity": null, "content_parts": [],
+            "input_origin": "unknown", "input_delivery_state": "unknown"
+        }))
+        .unwrap();
+        assert_eq!(provenance.input_origin, None);
+        assert_eq!(provenance.input_delivery_state, None);
+        assert!(provenance.is_legacy_user_input(Role::User));
+        assert!(!provenance.is_legacy_user_input(Role::Tool));
+        let output = serde_json::to_value(&provenance).unwrap();
+        assert!(output["input_origin"].is_null());
+        assert!(output["input_delivery_state"].is_null());
+        assert_eq!(output.as_object().unwrap().len(), 6);
+        assert!(!MessageProvenance {
+            record_relation: MessageRecordRelation::Original,
+            ..Default::default()
+        }
+        .is_legacy_user_input(Role::User));
+    }
+
+    #[test]
+    fn legacy_input_marker_depends_only_on_origin_and_preserves_eligibility() {
+        for origin in [None, Some("unknown"), Some("queued")] {
+            for delivery in [None, Some("unknown"), Some("submitted")] {
+                for relation in ["original", "unknown", "mirror"] {
+                    let provenance: MessageProvenance = serde_json::from_value(serde_json::json!({
+                        "authorship": "unknown", "record_relation": relation,
+                        "correlation_identity": null, "content_parts": [],
+                        "input_origin": origin, "input_delivery_state": delivery
+                    }))
+                    .unwrap();
+                    assert_eq!(provenance.legacy_input_origin, origin == Some("unknown"));
+                    assert_eq!(provenance.stored_input_origin(), origin);
+                    assert_eq!(
+                        provenance.is_legacy_user_input(Role::User),
+                        origin != Some("queued")
+                            && (relation == "unknown"
+                                || (relation == "original" && origin == Some("unknown")))
+                    );
+                    assert_eq!(
+                        provenance.input_delivery_state,
+                        (delivery == Some("submitted")).then_some(InputDeliveryState::Submitted)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn message_provenance_accepts_complete_unicode_scalar_parts_and_scoped_correlation() {
         let provenance = MessageProvenance {
             authorship: MessageAuthorship::Mixed,
@@ -2258,10 +2351,10 @@ mod tests {
             .parse::<MessageInputOrigin>()
             .unwrap_err();
         assert!(error.contains("MessageInputOrigin") && error.contains("UnrecognizedOrigin"));
-        for value in ["delivered", "cancelled", "canceled"] {
+        for value in ["unknown", "delivered", "cancelled", "canceled"] {
             assert!(value.parse::<InputDeliveryState>().is_err());
         }
-        for value in ["direct", "queued_input", "interactive"] {
+        for value in ["unknown", "direct", "queued_input", "interactive"] {
             assert!(value.parse::<MessageInputOrigin>().is_err());
         }
     }
@@ -2329,11 +2422,11 @@ mod tests {
                 MessageCorrelationAuthority::SourceLocal,
             ],
             InputDeliveryState => [
-                InputDeliveryState::Submitted, InputDeliveryState::Unknown,
+                InputDeliveryState::Submitted,
             ],
             MessageInputOrigin => [
                 MessageInputOrigin::DirectConversation, MessageInputOrigin::Queued,
-                MessageInputOrigin::InteractiveAnswer, MessageInputOrigin::Unknown,
+                MessageInputOrigin::InteractiveAnswer,
             ],
             MessageRecordRelation => [
                 MessageRecordRelation::Original, MessageRecordRelation::Mirror,

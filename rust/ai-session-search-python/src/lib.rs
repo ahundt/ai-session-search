@@ -3555,6 +3555,7 @@ impl FileQuery {
 }
 
 /// One indexed message with canonical session, role, kind, tool, and content fields.
+/// Provenance origin and delivery are None when source evidence is absent.
 #[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
     provenance: Option<ai_session_search::models::HitProvenance>,
