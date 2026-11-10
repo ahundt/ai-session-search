@@ -867,7 +867,9 @@ def test_release_uses_trusted_publishing_for_both_package_registries() -> None:
     from pathlib import Path
 
     workflow = Path(".github/workflows/publish.yml").read_text(encoding="utf-8")
-    assert "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18" in workflow
+    # Pinned to a full commit SHA, whichever release it is: Dependabot bumps the pin, and
+    # repeating one SHA here failed every such bump without protecting anything more.
+    assert re.search(r"rust-lang/crates-io-auth-action@[0-9a-f]{40}\b", workflow)
     assert "CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}" in workflow
     assert "cargo publish --locked -p ai-session-search" in workflow
     assert "pypa/gh-action-pypi-publish@" in workflow
