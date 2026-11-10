@@ -837,9 +837,10 @@ class MessageSearchRequest:
     """Canonical message predicates, match window, presentation, extent, purpose, and receipt.
 
     ``role="user"`` searches recorded user input across source roles, including queued
-    submissions and linked answers. Omit ``role`` to search complete content. Sender/delivery
-    uncertainty remains in provenance; views/context may include generated text and coordinates
-    refer to indexed message content.
+    submissions and linked answers. Known parent-agent prompts sent to spawned sessions are excluded
+    from this selector. Omit ``role`` to search complete content. Sender/delivery uncertainty
+    remains in provenance; views/context may include generated text. Coordinates refer to the
+    selected field.
 
     The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
     arguments use an RFC 6901 ``argument_path``. ``tool_name_contains`` is an additional

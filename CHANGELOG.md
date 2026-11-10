@@ -45,8 +45,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 5. `messages search --role user` and matching Rust, Python and MCP role selectors now find
    recorded prompts, commands, queued submissions and interactive answers across stored roles.
-   They previously selected only user-role rows. Returned records keep their original roles;
-   omitting the role filter still searches complete content.
+   Known parent-agent prompts sent to spawned sessions are excluded from this selector. Returned
+   records keep their original roles; omitting the role filter still searches complete content.
 
 ### Deprecated
 
@@ -140,8 +140,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    1.26.1. `jiff` stays at 0.2.39, which `main` already uses. `pyo3` 0.30 and `rusqlite` 0.41
    fell outside that refresh's version requirements; the SQLite security upgrade above is a
    separate change.
-   A later security update selects `rmcp` 3.9.0 to resolve RUSTSEC-2026-0462 while retaining
-   Rust 1.88 support.
+   A later security update selects `rmcp` 3.9.0 to resolve RUSTSEC-2026-0462.
 2. The workspace uses Cargo's resolver 3, so `cargo update` selects only versions that build
    with the declared `rust-version`.
 3. `dirs` 6.0.0 to 7.0.0. Its only source change moves Windows `preference_dir()` from Local to

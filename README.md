@@ -89,11 +89,11 @@ aise files history src/app.py
 aise files extract src/app.py --restore
 ```
 
-To find your recorded input across storage roles, use
+Find recorded prompts, queued submissions and linked answers with
 `aise messages search "correction" --role user`.
-This includes recorded prompts, queued submissions and linked interactive answers. Matching
-stays within input regions; views/context can include surrounding generated text. Provenance
-preserves source and sender/delivery uncertainty. Omit `--role` to search complete content.
+Matches identify recorded input regions; displayed context can include generated text. Known
+parent-agent prompts sent to spawned sessions are excluded from this selector, while sender and
+delivery can be unknown. Omit `--role` to search complete message content.
 
 `aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
 [EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,
