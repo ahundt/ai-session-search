@@ -238,6 +238,10 @@ Rust, Python, CLI, and MCP must route message search and deterministic capabilit
 typed service requests and responses. Adapters translate surface syntax and serialization; they
 must not independently redefine matching, ordering, filtering, paging, or completeness.
 
+Keep familiar tasks on existing selectors. A distinction in provider storage is not sufficient
+reason for another public parameter, response field, enum or workflow step. Reuse canonical
+requests and existing evidence/read surfaces; require a concrete user benefit for added exposure.
+
 ### REQ003-preserve-surface-semantics
 
 Intentional defaults are part of the API:
@@ -262,6 +266,14 @@ content without removing a result.
 Line windows, field-view limits, match-view budgets, response formats, and whitespace
 presentation must never change matching, ranking, hit membership, context membership, result count,
 offsets, next-page identity, classification categories, or policy digests.
+
+Text windows do not bound metadata. Emitting full content-part arrays with each ordinary search
+hit made even compact, one-hit MCP calls exceed the result ceiling. Ordinary hits therefore carry
+a bounded source header while the index retains full partitions and correlation identity. Apply
+the same constraint to capability matches and receipts: measure total serialized output, preserve
+required evidence and classification results, and do not hide excess payload by dropping matches
+or raising client limits. Capability-definition input limits protect parsing; they do not bound
+the output. Recheck both emitted schemas and actual result size after any public-surface change.
 
 `lines_per_message` uses one sign convention:
 

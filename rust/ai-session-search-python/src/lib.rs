@@ -3585,6 +3585,7 @@ struct NativeMessageHit {
 impl NativeMessageHit {
     #[getter]
     fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        // Match the core's bounded HitProvenance header, not its internal partition/identity data.
         json_compatible(
             py,
             &self.provenance.as_ref().map(|provenance| {

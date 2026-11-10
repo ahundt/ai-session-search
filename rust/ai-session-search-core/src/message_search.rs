@@ -2776,6 +2776,7 @@ struct SemanticMessageRef<'a> {
 
 #[derive(Serialize)]
 struct SemanticMessageMetadata {
+    // Use the bounded header on every surface; adding internal fields here bypasses text budgets.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<crate::models::HitProvenance>,
     provider: Provider,

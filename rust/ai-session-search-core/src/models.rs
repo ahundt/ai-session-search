@@ -1212,7 +1212,7 @@ pub struct SearchHit {
     pub match_snippet: String,
 }
 
-/// Internal matching policy derived from the existing role filter.
+/// Internal matching policy derived from role; storage differences do not need a public selector.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum MessageInputScope {
     #[default]
@@ -1230,6 +1230,8 @@ impl MessageInputScope {
 }
 
 /// Bounded source evidence for ordinary hits; partitions remain internal to matching.
+/// Full part arrays previously made even a compact, single-hit MCP response exceed its cap:
+/// text windows do not bound metadata. Keep full partitions/identity in the index, not this header.
 #[derive(Serialize)]
 pub(crate) struct HitProvenance {
     pub authorship: MessageAuthorship,

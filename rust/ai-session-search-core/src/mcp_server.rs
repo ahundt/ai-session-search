@@ -2694,6 +2694,8 @@ fn message_field_view_output_schema() -> Value {
 }
 
 fn run_skill_capability_output_schema() -> Value {
+    // Capability matches share the result ceiling: extra per-match metadata must fit independently
+    // of text windows, without dropping matches, changing classifications, or raising the cap.
     let selector = skill_selector_input_schema();
     let selected_location = json!({
         "oneOf": [
@@ -2905,6 +2907,7 @@ fn run_skill_capability_output_schema() -> Value {
 }
 
 fn search_messages_output_schema() -> Value {
+    // Keep ordinary metadata aligned with HitProvenance; full partition arrays broke compact calls.
     // The canonical response uses custom conditional `Serialize` projections. Deriving a schema
     // through `schemars` would require a parallel DTO and recreate the semantic drift this adapter
     // removed. Keep this protocol declaration separate from runtime construction, then validate
