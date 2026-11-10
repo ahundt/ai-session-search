@@ -96,6 +96,10 @@ def environment(home: pathlib.Path, *, config: pathlib.Path | None = None) -> di
     result = {key: value for key, value in os.environ.items() if key.upper() in {
         "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR",
     }}
+    # The Rust toolchain is not aise state. Pin it to the caller's before HOME moves, or a
+    # source build (uvx from git) finds no rustup default under the temporary home.
+    for key, default in (("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")):
+        result[key] = os.environ.get(key) or str(pathlib.Path.home() / default)
     result.update({
         "HOME": str(home), "USERPROFILE": str(home),
         "APPDATA": str(home / "AppData/Roaming"),

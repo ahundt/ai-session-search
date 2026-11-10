@@ -216,3 +216,19 @@ def test_main_prints_harness_output_the_console_encoding_cannot_represent(
     assert verifier.main(["--executable", str(tmp_path / "aise")]) == 0
     stream.flush()
     assert b"ok" in stream.buffer.getvalue()
+
+
+def test_isolated_environment_keeps_the_callers_rust_toolchain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A source build under the isolated HOME must still find rustup's toolchain; without the
+    # caller's CARGO_HOME and RUSTUP_HOME, rustup looks under the temporary home and fails.
+    real_home = tmp_path / "real-home"
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("USERPROFILE", str(real_home))
+    monkeypatch.delenv("CARGO_HOME", raising=False)
+    monkeypatch.setenv("RUSTUP_HOME", str(tmp_path / "toolchains"))
+    built = verifier.environment(tmp_path / "isolated")
+    assert built["HOME"] == str((tmp_path / "isolated").resolve())
+    assert built["CARGO_HOME"] == str(real_home / ".cargo")
+    assert built["RUSTUP_HOME"] == str(tmp_path / "toolchains")
