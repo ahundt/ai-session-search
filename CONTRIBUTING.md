@@ -32,7 +32,7 @@ surfaces pick it up at once.
 
 ## Development setup
 
-Requires Rust 1.88 or newer, CPython 3.12 through 3.14 with the standard GIL,
+Requires Rust 1.89 or newer, CPython 3.12 through 3.14 with the standard GIL,
 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
@@ -97,7 +97,7 @@ against Linux without waiting for CI:
 
 ```bash
 ./scripts/linux_container_gate.sh                     # ./run_ci_local.sh on Linux
-./scripts/linux_container_gate.sh --rust 1.88.0 msrv  # the commands the msrv job runs
+./scripts/linux_container_gate.sh --rust 1.89.0 msrv  # the commands the msrv job runs
 ```
 
 It needs Docker or Podman with at least 8 GiB of memory, and adds no checks of
