@@ -39,7 +39,11 @@ fn command(
     std::fs::create_dir_all(root).unwrap();
     let mut staged = tempfile::NamedTempFile::new_in(root).unwrap();
     staged.write_all(text.as_bytes()).unwrap();
-    staged.persist(&config).unwrap();
+    // Every command for a root writes the same text, and concurrent readers share one root. Keep
+    // the first copy: replacing it fails on Windows while another child has the file open.
+    if let Err(error) = staged.persist_noclobber(&config) {
+        assert!(config.is_file(), "{}", error.error);
+    }
     let mut command = Command::new(program);
     command.env_clear().envs(inherited.filter(|(key, _)| {
         matches!(
