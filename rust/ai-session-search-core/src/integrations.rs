@@ -6532,7 +6532,11 @@ mod tests {
         target.registration = Some(state);
         publish_planned_mutations(&plan_upsert_target(&target, Path::new("/bin/aise")).unwrap())
             .unwrap();
-        let plugin = marketplace.join("plugins/ai-session-search/.mcp.json");
+        // Component joins: the error names the native path, which uses `\` on Windows.
+        let plugin = marketplace
+            .join("plugins")
+            .join("ai-session-search")
+            .join(".mcp.json");
         let mut value: Value = serde_json::from_str(&fs::read_to_string(&plugin).unwrap()).unwrap();
         value["mcpServers"][SERVER_NAME]["env"] = json!({"TEAM":"keep"});
         value["mcpServers"][SERVER_NAME]["extension"] = json!(42);

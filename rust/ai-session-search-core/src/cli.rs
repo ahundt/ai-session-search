@@ -1657,18 +1657,18 @@ fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
 /// show which values they chose. Only the database and cache paths are written live, recording
 /// where the index is.
 fn initial_config_text(config: &Config) -> Result<String> {
-    let db_path = toml::Value::String(
-        std::path::absolute(config.db_path())?
-            .to_string_lossy()
-            .into_owned(),
-    )
-    .to_string();
-    let cache_dir = toml::Value::String(
-        std::path::absolute(config.cache_dir())?
-            .to_string_lossy()
-            .into_owned(),
-    )
-    .to_string();
+    // Anchor only relative selections. `std::path::absolute` also rewrites `/` to `\` on Windows,
+    // which would make an already absolute default differ from the value it came from.
+    fn written(path: std::path::PathBuf) -> Result<String> {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::path::absolute(path)?
+        };
+        Ok(toml::Value::String(path.to_string_lossy().into_owned()).to_string())
+    }
+    let db_path = written(config.db_path())?;
+    let cache_dir = written(config.cache_dir())?;
     let mut text = String::with_capacity(crate::config::CONFIG_EXAMPLE_TOML.len() + 256);
     for line in crate::config::CONFIG_EXAMPLE_TOML.lines() {
         if line == "# db_path = \"/absolute/path/to/index.db\"" {
