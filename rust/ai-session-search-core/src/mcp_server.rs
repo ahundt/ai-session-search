@@ -752,7 +752,7 @@ fn execute_official_tool_call(
         }
         Err(error) => return (rmcp_tool_error(error), false),
     };
-    let app = match SessionSearch::open_prepared_reader(config, inputs, Arc::clone(runtime)) {
+    let mut app = match SessionSearch::open_prepared_reader(config, inputs, Arc::clone(runtime)) {
         Ok(app) => app,
         Err(error) => {
             return (
@@ -763,7 +763,7 @@ fn execute_official_tool_call(
     };
     // Reported rather than ignored: this call would otherwise run uncancellable while the
     // client believes its cancellation notification still applies.
-    if let Err(error) = app.database().install_query_cancellation(&cancellation) {
+    if let Err(error) = app.install_query_cancellation(&cancellation) {
         return (
             rmcp_tool_error(format!("failed to arm query cancellation: {error:#}")),
             false,

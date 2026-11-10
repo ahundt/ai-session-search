@@ -423,7 +423,7 @@ pub(crate) struct AnalysisTraversalReceipt {
 
 const QUERY_PROGRESS_HANDLER_OPCODES: i32 = 10_000;
 
-struct ProgressHandlerReset<'connection>(&'connection Connection);
+struct ProgressHandlerReset<'connection>(&'connection mut Connection);
 
 impl Drop for ProgressHandlerReset<'_> {
     fn drop(&mut self) {
@@ -586,27 +586,27 @@ impl QueryCancellation {
 
 #[cfg(test)]
 pub(crate) fn with_sqlite_query_timeout<T>(
-    connection: &Connection,
+    connection: &mut Connection,
     timeout_ms: Option<NonZeroU64>,
     operation: &str,
     recovery: &str,
-    run: impl FnOnce() -> Result<T>,
+    run: impl FnOnce(&mut Connection) -> Result<T>,
 ) -> Result<T> {
     with_sqlite_query_control(connection, timeout_ms, None, operation, recovery, run)
 }
 
 pub(crate) fn with_sqlite_query_control<T>(
-    connection: &Connection,
+    connection: &mut Connection,
     timeout_ms: Option<NonZeroU64>,
     cancellation: Option<Arc<AtomicBool>>,
     operation: &str,
     recovery: &str,
-    run: impl FnOnce() -> Result<T>,
+    run: impl FnOnce(&mut Connection) -> Result<T>,
 ) -> Result<T> {
     // One progress callback composes the two independent stop conditions. Installing competing
     // handlers would make the last caller silently disable the earlier deadline or cancellation.
     if timeout_ms.is_none() && cancellation.is_none() {
-        return run();
+        return run(connection);
     }
     let deadline = timeout_ms
         .map(|timeout_ms| {
@@ -631,7 +631,7 @@ pub(crate) fn with_sqlite_query_control<T>(
         )
         .with_context(|| format!("{operation} could not arm its query stop conditions"))?;
     let reset = ProgressHandlerReset(connection);
-    let result = run();
+    let result = run(reset.0);
     drop(reset);
     result.map_err(|error| {
         if error.chain().any(|cause| {
@@ -792,7 +792,7 @@ impl Db {
     ///
     /// Returns the failure instead of swallowing it: a caller that believes cancellation is
     /// armed, on a connection where it is not, waits for a query it can no longer stop.
-    pub(crate) fn interrupt_while(&self, cancellation: Arc<AtomicBool>) -> Result<()> {
+    pub(crate) fn interrupt_while(&mut self, cancellation: Arc<AtomicBool>) -> Result<()> {
         self.conn
             .progress_handler(
                 QUERY_PROGRESS_HANDLER_OPCODES,
@@ -802,7 +802,7 @@ impl Db {
     }
 
     pub(crate) fn install_query_cancellation(
-        &self,
+        &mut self,
         cancellation: &QueryCancellation,
     ) -> Result<()> {
         self.interrupt_while(cancellation.flag_arc())?;
@@ -12746,15 +12746,15 @@ mod tests {
     #[test]
     fn query_timeout_interrupts_expensive_work_and_resets_the_handler() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
 
         let error = with_sqlite_query_timeout(
-            &db.conn,
+            &mut db.conn,
             std::num::NonZeroU64::new(1),
             "read-only SQL query",
             "increase timeout_ms or pass 0 for no timeout",
-            || {
-                db.conn
+            |conn| {
+                conn
                     .query_row(
                         "with recursive n(x) as (values(0) union all select x + 1 from n where x < 100000000) select sum(x) from n",
                         [],
@@ -12779,7 +12779,7 @@ mod tests {
     #[test]
     fn persistent_interrupt_cancels_a_statement_started_after_the_flag_is_set() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
         db.interrupt_while(Arc::clone(&cancellation))
             .expect("arming cancellation is a precondition of this test");
@@ -12810,7 +12810,7 @@ mod tests {
     #[test]
     fn query_cancellation_registered_after_cancel_still_interrupts_the_next_statement() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
         let cancellation = QueryCancellation::new();
 
         cancellation.cancel();
@@ -12864,16 +12864,15 @@ mod tests {
     #[test]
     fn query_timeout_never_panics_when_deadline_exceeds_platform_instant_range() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
 
         let result = with_sqlite_query_timeout(
-            &db.conn,
+            &mut db.conn,
             std::num::NonZeroU64::new(u64::MAX),
             "read-only SQL query",
             "increase timeout_ms or pass 0 for no timeout",
-            || {
-                db.conn
-                    .query_row("select 1", [], |row| row.get::<_, i64>(0))
+            |conn| {
+                conn.query_row("select 1", [], |row| row.get::<_, i64>(0))
                     .map_err(Into::into)
             },
         );

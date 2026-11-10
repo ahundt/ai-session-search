@@ -181,7 +181,7 @@ upgrade can replace older aise-owned wording while refusing to overwrite user-ow
 Published wheels support GIL-enabled CPython 3.12 through 3.14 on
 manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do
 not require a local Rust compiler. Git, sdist, and Cargo installations build
-native code from source and require Git, Rust 1.88 or newer, and a C compiler
+native code from source and require Git, Rust 1.89 or newer, and a C compiler
 for the target platform, because SQLite is built from bundled C.
 
 ## Update and uninstall

@@ -106,6 +106,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    timestamp changed but whose content did not now takes 27 ms on a 20,000-message session,
    down from 1.65 s.
 
+### Security
+
+1. Upgrade bundled SQLite from 3.53.2 to 3.54.1 to resolve RUSTSEC-2026-0459, which can expose
+   uninitialized memory when opening a crafted database and WAL. Source builds now require
+   Rust 1.89 or newer, up from 1.88; prebuilt CLI and MCP users do not need a Rust compiler.
+
 ### For contributors
 
 1. `Cargo.lock` takes the newest release of each dependency that is semver-compatible, builds
@@ -113,7 +119,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    the cooldown `.github/dependabot.yml` applies. Among them: `rmcp` 3.4.0 to 3.8.0, `tokio`
    1.53.3 to 1.54.1, `pyo3` 0.29.2 to 0.29.3, `ureq` 3.4.2 to 3.5.0, and `uuid` 1.24.0 to
    1.26.1. `jiff` stays at 0.2.39, which `main` already uses. `pyo3` 0.30 and `rusqlite` 0.41
-   fall outside the current version requirements; each needs its own change.
+   fell outside that refresh's version requirements; the SQLite security upgrade above is a
+   separate change.
    A later security update selects `rmcp` 3.9.0 to resolve RUSTSEC-2026-0462.
 2. The workspace uses Cargo's resolver 3, so `cargo update` selects only versions that build
    with the declared `rust-version`.

@@ -395,7 +395,7 @@ installing, `uv add ai-session-search` adds a project dependency, and
 `python -m pip install ai-session-search` also works.
 
 Wheels cover CPython 3.12 through 3.14 on manylinux2014 x86_64 and aarch64, macOS x86_64 and
-arm64, and Windows x86_64. Building from source needs Rust 1.88 or newer and a C compiler,
+arm64, and Windows x86_64. Building from source needs Rust 1.89 or newer and a C compiler,
 because SQLite is built from bundled C.
 
 Installing the package never touches your configuration: no aliases, no MCP client edits, no
