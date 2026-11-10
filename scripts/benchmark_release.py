@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any, ClassVar, TypedDict
 
 if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    # Appended so an installed ai_session_search keeps precedence over the checkout.
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from scripts.verify_harness_discovery import environment as isolated_environment
 
