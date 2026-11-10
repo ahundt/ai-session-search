@@ -274,7 +274,6 @@ impl ClaudeAdapter {
             // Only enqueue records a submission; other queue operations establish neither a
             // new input nor a link proving delivery. Keep repeated submissions independently.
             if value.get("type").and_then(Value::as_str) == Some("queue-operation") {
-                requires_full_parse_for_tail = true;
                 let operation = value
                     .get("operation")
                     .and_then(Value::as_str)
@@ -283,6 +282,7 @@ impl ClaudeAdapter {
                     .entry(operation.to_string())
                     .or_default() += 1;
                 if operation == "enqueue" {
+                    requires_full_parse_for_tail = true;
                     if let Some(content) = value.get("content").and_then(Value::as_str) {
                         let content = strip_command_markup(content).trim().to_string();
                         if substantive_text(&content) {
@@ -608,19 +608,7 @@ impl ClaudeAdapter {
         }
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
-        let parse_warning = match (
-            super::malformed_jsonl_warning(malformed_line_count),
-            !has_queue_operations,
-        ) {
-            (Some(existing), false) => Some(format!(
-                "{existing}; Claude queue delivery, cancellation, and correlation with direct user copies remain structurally unresolved"
-            )),
-            (None, false) => Some(
-                "Claude queue delivery, cancellation, and correlation with direct user copies remain structurally unresolved"
-                    .to_string(),
-            ),
-            (existing, true) => existing,
-        };
+        let parse_warning = super::malformed_jsonl_warning(malformed_line_count);
 
         // A subagent's identity is its parent's id plus what distinguishes the run under that
         // parent. Neither half alone works: the records name only the parent, and the agent id
@@ -2301,6 +2289,31 @@ mod tests {
     }
 
     #[test]
+    fn only_queue_enqueues_require_occurrence_history_for_tail_parsing() {
+        let adapter = ClaudeAdapter::new(vec![]);
+        for (operation, full_parse) in [("enqueue", true), ("popAll", false)] {
+            let record = json!({"type":"queue-operation", "sessionId":"queue-tail-state",
+                "operation":operation, "content":"queued prompt"})
+            .to_string();
+            let parsed = adapter
+                .parse_reader(
+                    std::io::Cursor::new(record),
+                    std::path::Path::new("/tmp/queue-tail-state.jsonl"),
+                )
+                .unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                metadata["requires_full_parse_for_tail"]
+                    .as_bool()
+                    .unwrap_or(false),
+                full_parse
+            );
+            assert!(parsed.session.parse_warning.is_none());
+        }
+    }
+
+    #[test]
     fn ask_user_answers_are_human_and_legacy_queue_authors_remain_unknown() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("input-session.jsonl");
@@ -2411,7 +2424,7 @@ mod tests {
         assert!(metadata.contains("\"popAll\":1"));
         let warning = parsed.session.parse_warning.as_deref().unwrap();
         assert!(warning.contains("skipped 1 malformed JSONL record"));
-        assert!(warning.contains("queue delivery, cancellation"));
+        assert!(!warning.contains("queue delivery, cancellation"));
     }
 
     #[test]
@@ -2945,12 +2958,7 @@ mod tests {
         db.upsert_session(&initial, 1, 1).unwrap();
         std::fs::write(&path, format!("{record}\n")).unwrap();
         let shortened = adapter.parse(&adapter.discover()[0]);
-        assert!(shortened
-            .session
-            .parse_warning
-            .as_deref()
-            .unwrap()
-            .contains("structurally unresolved"));
+        assert!(shortened.session.parse_warning.is_none());
         // With no provider identity these identical events cannot be distinguished after a
         // rewrite. The archive keeps both submissions without inventing a delivery outcome.
         let filters = crate::models::MessageFilters {

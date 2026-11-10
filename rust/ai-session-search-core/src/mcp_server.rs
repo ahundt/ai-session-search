@@ -2948,10 +2948,10 @@ fn search_messages_output_schema() -> Value {
                     "type":"object", "additionalProperties":false,
                     "required":["authorship","record_relation","input_delivery_state","input_origin"],
                     "properties": {
-                        "authorship":{"type":"string","enum":["human","agent","harness","generated","mixed","unknown"]},
-                        "record_relation":{"type":"string","enum":["original","mirror","unknown"]},
-                        "input_origin":{"type":["string","null"],"enum":["direct_conversation","queued","interactive_answer","unknown",null]},
-                        "input_delivery_state":{"type":["string","null"],"enum":["submitted","delivered","cancelled","unknown",null]}
+                        "authorship":{"type":"string","enum":provenance_enum_values::<crate::models::MessageAuthorship>(false)},
+                        "record_relation":{"type":"string","enum":provenance_enum_values::<crate::models::MessageRecordRelation>(false)},
+                        "input_origin":{"type":["string","null"],"enum":provenance_enum_values::<crate::models::MessageInputOrigin>(true)},
+                        "input_delivery_state":{"type":["string","null"],"enum":provenance_enum_values::<crate::models::InputDeliveryState>(true)}
                     }
                 }
             },
@@ -5692,6 +5692,16 @@ fn apply_raw_metadata_include(value: &mut Value, include: &[String]) {
         }
         _ => {}
     }
+}
+
+fn provenance_enum_values<T: clap::ValueEnum + Copy + serde::Serialize + 'static>(
+    nullable: bool,
+) -> Vec<Value> {
+    T::value_variants()
+        .iter()
+        .map(|value| serde_json::to_value(value).expect("provenance enum serializes"))
+        .chain(nullable.then_some(Value::Null))
+        .collect()
 }
 
 /// Every `MessageKind` spelling, derived from the enum rather than written out, so a new

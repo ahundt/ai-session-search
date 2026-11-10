@@ -581,7 +581,7 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    // Reuse public controls before adding fields or trimming help; raising a pin cannot repair UX.
+    // Reuse public controls before adding fields or trimming help; a higher recorded ceiling does not raise a client's limit.
     // Reusing role for recorded input measures 4,732 bytes after Codex normalization.
     ("search_messages", 4_732, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`

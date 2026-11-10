@@ -1219,9 +1219,12 @@ fn answer_from_output(output: &Value, name: &str) -> Option<(String, Vec<String>
     let output = output.as_str()?;
     let object: Value = serde_json::from_str(output).ok()?;
     let answers = object.get("answers")?.as_object()?;
+    let mut answers = answers.iter().collect::<Vec<_>>();
+    // JSON object keys sort lexically; numeric question indexes must keep their source order.
+    answers.sort_by_key(|(key, _)| (key.parse::<u64>().ok(), key.as_str()));
     let values = answers
-        .values()
-        .filter_map(Value::as_str)
+        .into_iter()
+        .filter_map(|(_, value)| value.as_str())
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
@@ -1483,6 +1486,19 @@ fn read_json(path: PathBuf) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_output_preserves_numeric_question_order() {
+        let answers: serde_json::Map<String, Value> = (0..12)
+            .map(|i| (i.to_string(), Value::String(format!("answer {i}"))))
+            .collect();
+        let output = Value::String(json!({"answers":answers}).to_string());
+        let (_, actual) = answer_from_output(&output, "ask_user").unwrap();
+        assert_eq!(
+            actual,
+            (0..12).map(|i| format!("answer {i}")).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn discovers_messages_resolves_project_and_strips_file_blocks() {

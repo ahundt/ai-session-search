@@ -393,9 +393,7 @@ fn with_read_only_authorizer<T>(
     f: impl FnOnce(&mut Connection) -> Result<T>,
 ) -> Result<T> {
     conn.execute_batch("pragma query_only = on")?;
-    // Fail closed. rusqlite 0.40 reports whether the authorizer installed, and running the
-    // caller's SQL after a failed install would drop the read-only restriction this function
-    // exists to impose.
+    // Fail closed if the authorizer cannot install; the caller's SQL must not bypass it.
     conn.authorizer(Some(read_only_authorizer))
         .context("could not install the read-only SQL authorizer")?;
     let result = f(conn);

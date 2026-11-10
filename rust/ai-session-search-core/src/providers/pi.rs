@@ -217,6 +217,8 @@ impl PiAdapter {
         let mut created_at: Option<DateTime<Utc>> = None;
         let mut updated_at: Option<DateTime<Utc>> = None;
         let mut messages = Vec::new();
+        let mut first_user_index = None;
+        let mut last_user_index = None;
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut pending_file_mutations = PendingFileMutations::default();
@@ -319,6 +321,10 @@ impl PiAdapter {
                                     event_id,
                                 );
                             }
+                            if role == Some("user") && substantive_text(text) {
+                                first_user_index.get_or_insert(messages.len());
+                                last_user_index = Some(messages.len());
+                            }
                             messages.push(raw_message);
                             transcript_lines.push(format_transcript_line(
                                 role.unwrap_or("message"),
@@ -375,15 +381,9 @@ impl PiAdapter {
             }
         }
 
-        let first_user = messages
-            .iter()
-            .find(|message| message.role() == "user" && substantive_text(message.content()))
-            .map(|message| message.content().to_string());
-        let last_user = messages
-            .iter()
-            .rev()
-            .find(|message| message.role() == "user" && substantive_text(message.content()))
-            .map(|message| message.content().to_string());
+        let user_text =
+            |index: Option<usize>| index.map(|index| messages[index].content().to_owned());
+        let (first_user, last_user) = (user_text(first_user_index), user_text(last_user_index));
         let title = first_user
             .clone()
             .or_else(|| last_user.clone())
@@ -831,6 +831,13 @@ mod tests {
                     std::path::Path::new("/tmp/input-purpose.jsonl"),
                 )
                 .unwrap();
+            assert!(!parsed.session.preview_text.contains("generated stdout"));
+            assert!(!parsed
+                .session
+                .title
+                .as_deref()
+                .unwrap_or_default()
+                .contains("generated stdout"));
             let directory = tempdir().unwrap();
             let db = crate::db::Db::open(&directory.path().join("index.db")).unwrap();
             db.mark_schema_current().unwrap();

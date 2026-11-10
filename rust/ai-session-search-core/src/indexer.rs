@@ -760,7 +760,7 @@ pub(crate) fn reindex_until(
     let indexed_source_paths = db
         .indexed_source_identities()?
         .into_iter()
-        .map(|(provider, source_path, _, _)| (provider, source_path))
+        .map(|source| (source.provider, source.source_path))
         .collect::<HashSet<_>>();
     if should_cancel() {
         return Ok(ReindexRun::Cancelled {
@@ -1266,12 +1266,12 @@ fn gemini_migration_families(
     }
     let indexed = db.indexed_source_identities()?;
     let mut indexed_by_path = HashMap::<String, Vec<(String, usize)>>::new();
-    for (provider, path, count, session_id) in indexed {
-        if provider == Provider::GeminiCli {
+    for source in indexed {
+        if source.provider == Provider::GeminiCli {
             indexed_by_path
-                .entry(path)
+                .entry(source.source_path)
                 .or_default()
-                .push((session_id, count));
+                .push((source.session_id, source.sessions));
         }
     }
     let parser_version = crate::util::provider_parse_version(Provider::GeminiCli);
@@ -1512,59 +1512,74 @@ fn source_reconciliation(
     db: &Db,
     sources: &[SourceFile],
 ) -> Result<HashMap<(Provider, String), SourceReconciliation>> {
-    let mut indexed_by_identity =
-        HashMap::<(Provider, String), Vec<(String, usize, String)>>::new();
-    // Stored paths by name, for a source whose earlier form no longer exists on disk: a Codex
-    // rollout compressed to `.jsonl.zst` (or decompressed on resume) is the same source.
-    let mut indexed_by_path = HashMap::<(Provider, String), (String, usize, String)>::new();
-    for (provider, stored_path, sessions, session_id) in db.indexed_source_identities()? {
-        indexed_by_path.insert(
-            (provider, stored_path.clone()),
-            (stored_path.clone(), sessions, session_id.clone()),
-        );
-        let Ok(canonical) = std::fs::canonicalize(&stored_path) else {
-            continue;
-        };
-        indexed_by_identity
-            .entry((provider, normalize_path(&canonical)))
-            .or_default()
-            .push((stored_path, sessions, session_id));
+    let stored = db.indexed_source_identities()?;
+    let mut by_canonical = HashMap::<_, Vec<_>>::new();
+    let mut by_file = HashMap::<_, Vec<_>>::new();
+    let mut by_path = HashMap::new();
+    for entry in &stored {
+        by_path.insert((entry.provider, entry.source_path.clone()), entry);
+        if let Ok(path) = std::fs::canonicalize(&entry.source_path) {
+            by_canonical
+                .entry((entry.provider, normalize_path(&path)))
+                .or_default()
+                .push(entry);
+        }
+        if let (Some(id), Some(mtime), Some(size)) = (
+            entry
+                .file_identity
+                .as_deref()
+                .and_then(crate::db::file_identity_key),
+            entry.mtime_ns,
+            entry.size_bytes,
+        ) {
+            by_file
+                .entry((entry.provider, id, mtime, size))
+                .or_default()
+                .push(entry);
+        }
     }
     Ok(sources
         .iter()
         .filter_map(|source| {
             let path = normalize_path(&source.path);
-            let sibling = (source.provider == Provider::Codex)
-                .then(|| crate::providers::codex::rollout_sibling(&source.path))
-                .flatten()
-                .map(|sibling| normalize_path(&sibling))
-                .and_then(|sibling| indexed_by_path.get(&(source.provider, sibling)).cloned());
-            let mut indexed = indexed_by_identity
+            let mut matches = by_canonical
                 .get(&(source.provider, path.clone()))
                 .cloned()
                 .unwrap_or_default();
-            if let Some(entry) = sibling {
-                if !indexed.iter().any(|(stored, _, _)| stored == &entry.0) {
-                    indexed.push(entry);
-                }
+            // Missing receipts and changed stamps cannot prove a historical move; preserve the archive.
+            if let Ok(id) = file_id::get_file_id(&source.path) {
+                matches.extend(
+                    by_file
+                        .get(&(source.provider, id, source.mtime_ns, source.size_bytes))
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
             }
-            if indexed.is_empty() {
+            // Compressed and resumed Codex siblings represent the same source even after removal.
+            if source.provider == Provider::Codex {
+                matches.extend(
+                    crate::providers::codex::rollout_sibling(&source.path)
+                        .and_then(|sibling| {
+                            by_path.get(&(source.provider, normalize_path(&sibling)))
+                        })
+                        .copied(),
+                );
+            }
+            matches.sort_unstable_by_key(|entry| &entry.source_path);
+            matches.dedup_by_key(|entry| &entry.source_path);
+            if matches.is_empty() {
                 return None;
             }
-            let indexed = &indexed;
-            let aliases = indexed
+            let aliases = matches
                 .iter()
-                .filter(|(stored, _, _)| stored != &path)
-                .map(|(stored, _, _)| stored.clone())
+                .filter(|entry| entry.source_path != path)
+                .map(|entry| entry.source_path.clone())
                 .collect::<Vec<_>>();
             let requires_reparse = !aliases.is_empty()
-                || indexed
-                    .iter()
-                    .map(|(_, sessions, _)| sessions)
-                    .sum::<usize>()
-                    > 1;
-            let session_id =
-                (indexed.len() == 1 && indexed[0].1 == 1).then(|| indexed[0].2.clone());
+                || matches.iter().map(|entry| entry.sessions).sum::<usize>() > 1;
+            let session_id = (matches.len() == 1 && matches[0].sessions == 1)
+                .then(|| matches[0].session_id.clone());
             Some((
                 (source.provider, path),
                 SourceReconciliation {
@@ -1691,6 +1706,23 @@ where
             if expected_session_id != Some(tail.session.id.as_str()) {
                 return Ok(TailOutcome::FullParse);
             }
+            // Spawn metadata normally lives in the session header, which can be outside the
+            // bounded tail overlap. If the stored session is already known to be a subagent but
+            // this slice is not, a tail append would misclassify new Codex user records as root
+            // input. Re-read the source so attribution stays identical to a full parse.
+            if source.provider == Provider::Codex {
+                let stored_spawned = db
+                    .session_metadata(std::slice::from_ref(&tail.session.id))?
+                    .get(&tail.session.id)
+                    .is_some_and(|session| {
+                        session.parent_session_id.is_some() || session.agent_label.is_some()
+                    });
+                let tail_spawned =
+                    tail.session.parent_session_id.is_some() || tail.session.agent_label.is_some();
+                if stored_spawned && !tail_spawned {
+                    return Ok(TailOutcome::FullParse);
+                }
+            }
             if tail_requires_full_parse(&tail.session) {
                 return Ok(TailOutcome::FullParse);
             }
@@ -1744,6 +1776,128 @@ mod tests {
                 assert_eq!(tail_requires_full_parse(&session), expected);
             }
         }
+    }
+
+    #[test]
+    fn renamed_claude_queue_source_reconciles_path_scoped_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("session.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-move","timestamp":"2026-06-17T00:00:00Z","content":"moved queued input"}"#;
+        std::fs::write(&old_path, format!("{record}\n{record}\n")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let old_scope: String = stored
+            .query_row(
+                "select correlation_scope from messages where content = 'moved queued input'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(stored);
+        assert!(old_scope.contains("session.jsonl"), "{old_scope}");
+        let new_path = root.join("renamed.jsonl");
+        std::fs::rename(&old_path, &new_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let (count, new_scope): (i64, String) = stored
+            .query_row(
+                "select count(*), min(correlation_scope) from messages
+                 where content = 'moved queued input'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "a physical rename must preserve both independent submissions without duplicating them"
+        );
+        assert!(new_scope.contains("renamed.jsonl"), "{new_scope}");
+        assert_ne!(old_scope, new_scope);
+    }
+
+    #[test]
+    fn source_reconciliation_does_not_infer_missing_or_copied_file_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("session.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-copy","timestamp":"2026-06-17T00:00:00Z","content":"copied queued input"}"#;
+        std::fs::write(&old_path, format!("{record}\n")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let copy_path = root.join("copy.jsonl");
+        std::fs::copy(&old_path, &copy_path).unwrap();
+        let adapter = ProviderSet::new(&config);
+        let copied = adapter.discover_enabled(&config).sources;
+        let reconciliation = source_reconciliation(&db, &copied).unwrap();
+        assert!(
+            reconciliation
+                .get(&(Provider::Claude, normalize_path(&copy_path)))
+                .is_none_or(|value| value.aliases.is_empty()),
+            "a distinct physical copy is not an alias"
+        );
+        std::fs::remove_file(&copy_path).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        stored
+            .execute(
+                "update files_seen set file_identity = null where provider = 'claude'",
+                [],
+            )
+            .unwrap();
+        drop(stored);
+        let missing_path = root.join("missing-renamed.jsonl");
+        std::fs::rename(&old_path, &missing_path).unwrap();
+        let adapter = ProviderSet::new(&config);
+        let moved = adapter.discover_enabled(&config).sources;
+        let reconciliation = source_reconciliation(&db, &moved).unwrap();
+        assert!(reconciliation
+            .get(&(Provider::Claude, normalize_path(&missing_path)))
+            .is_none_or(|value| value.aliases.is_empty()));
+
+        std::fs::copy(&missing_path, &old_path).unwrap();
+        let copied = adapter.discover_enabled(&config).sources;
+        let reconciliation = source_reconciliation(&db, &copied).unwrap();
+        assert!(reconciliation
+            .get(&(Provider::Claude, normalize_path(&old_path)))
+            .is_none_or(|value| value.aliases.is_empty()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_claude_queue_source_through_symlink_root_remaps_canonical_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let real_root = dir.path().join("real");
+        let alias_root = dir.path().join("alias");
+        std::fs::create_dir_all(&real_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+        let old_path = real_root.join("session.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-symlink-move","timestamp":"2026-06-17T00:00:00Z","content":"symlink moved queued input"}"#;
+        std::fs::write(&old_path, format!("{record}\n")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &alias_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let new_path = real_root.join("renamed.jsonl");
+        std::fs::rename(&old_path, &new_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let (count, scope): (i64, String) = stored
+            .query_row(
+                "select count(*), min(correlation_scope) from messages
+                 where content = 'symlink moved queued input'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(scope.ends_with("real/renamed.jsonl"), "{scope}");
     }
 
     #[test]
@@ -2093,7 +2247,104 @@ mod tests {
     }
 
     #[test]
-    fn queue_state_beyond_overlap_forces_full_parse_and_preserves_warning() {
+    fn codex_spawn_metadata_beyond_overlap_forces_full_parse() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "019efd97-d602-7922-89dd-467272106505";
+        let path = root.join(format!("rollout-2026-06-25T03-04-06-{id}.jsonl"));
+        let spawn_source = serde_json::json!({
+            "subagent": {
+                "thread_spawn": {
+                    "parent_thread_id": "root-session",
+                    "agent_nickname": "worker"
+                }
+            }
+        });
+        let mut initial = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": id, "source": spawn_source}
+        })
+        .to_string()
+            + "\n";
+        let padding = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "x".repeat(1024)}]
+            }
+        })
+        .to_string()
+            + "\n";
+        while initial.len()
+            <= crate::tail::OVERLAP_BYTES as usize + 2 * crate::tail::FINGERPRINT_LEN
+        {
+            initial.push_str(&padding);
+        }
+        std::fs::write(&path, initial).unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&root)];
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let session_id = format!("codex:{id}");
+        let adapters = ProviderSet::new(&config);
+        let stored = db
+            .session_metadata(std::slice::from_ref(&session_id))
+            .unwrap();
+        assert_eq!(
+            stored[&session_id].parent_session_id.as_deref(),
+            Some("codex:root-session")
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                br#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"spawned tail prompt"}],"internal_chat_message_metadata_passthrough":{"content_item_metadata":[{"provenance":{"type":"user"}}]}}}
+"#,
+            )
+            .unwrap();
+        let source = adapters.discover_enabled(&config).sources.remove(0);
+        let outcome = try_tail(
+            &source,
+            &normalize_path(&source.path),
+            Some(&session_id),
+            &db,
+            &|| false,
+            |reader, path| adapters.codex.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, TailOutcome::FullParse),
+            "tail parsing must not lose the stored spawned-session attribution"
+        );
+        reindex(&config, &db, false, None).unwrap();
+        let filters = crate::models::MessageFilters {
+            role: Some(crate::models::Role::User),
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        assert!(db
+            .search_messages("spawned tail prompt", &filters)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_messages("spawned tail prompt", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn queue_state_beyond_overlap_forces_full_parse_and_preserves_metadata() {
         use std::io::Write as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2172,13 +2423,12 @@ mod tests {
             .len(),
             1
         );
-        let warning = db
+        assert!(db
             .resolve_session("claude:queue-tail")
             .unwrap()
             .session
             .parse_warning
-            .unwrap();
-        assert!(warning.contains("queue delivery, cancellation"));
+            .is_none());
     }
 
     #[test]
@@ -2513,8 +2763,11 @@ mod tests {
         assert_eq!(files_seen, 2);
         let identities = db.indexed_source_identities().unwrap();
         assert_eq!(identities.len(), 1, "family has one logical session");
-        assert!(identities[0].1.ends_with(".jsonl"), "{identities:?}");
-        let session_id = identities[0].3.clone();
+        assert!(
+            identities[0].source_path.ends_with(".jsonl"),
+            "{identities:?}"
+        );
+        let session_id = identities[0].session_id.clone();
         let migrated_reference = db
             .search_messages("legacy-only answer", &MessageFilters::default())
             .unwrap();
@@ -2672,12 +2925,15 @@ mod tests {
         reindex(&config, &db, false, None).unwrap();
         let after_deletion = db.indexed_source_identities().unwrap();
         assert_eq!(after_deletion.len(), 1);
-        assert_eq!(after_deletion[0].3, session_id, "logical ID remains stable");
+        assert_eq!(
+            after_deletion[0].session_id, session_id,
+            "logical ID remains stable"
+        );
         assert_eq!(
             db.search_messages(
                 "successor-only answer",
                 &MessageFilters {
-                    session_id: Some(after_deletion[0].3.clone()),
+                    session_id: Some(after_deletion[0].session_id.clone()),
                     ..Default::default()
                 }
             )
@@ -2983,7 +3239,7 @@ mod tests {
         assert!(reindex(&config, &db, false, None).is_err());
         let identity = db.indexed_source_identities().unwrap();
         assert_eq!(identity.len(), 1);
-        assert!(identity[0].1.ends_with(".json"), "{identity:?}");
+        assert!(identity[0].source_path.ends_with(".json"), "{identity:?}");
         let receipt_count: i64 = fixture
             .query_row(
                 "select count(*) from files_seen where provider = 'gemini-cli'",

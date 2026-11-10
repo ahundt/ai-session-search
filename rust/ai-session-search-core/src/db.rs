@@ -34,6 +34,28 @@ use crate::util::{
     stored_timestamp, UnicodeLowerNeedle, SIGMAS,
 };
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FileIdentityReceipt {
+    id: file_id::FileId,
+    canonical_path: String,
+}
+
+pub(crate) fn file_identity_for_path(path: &Path) -> Option<String> {
+    let id = file_id::get_file_id(path).ok()?;
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    serde_json::to_string(&FileIdentityReceipt {
+        id,
+        canonical_path: crate::util::normalize_path(&canonical),
+    })
+    .ok()
+}
+
+pub(crate) fn file_identity_key(receipt: &str) -> Option<file_id::FileId> {
+    serde_json::from_str::<FileIdentityReceipt>(receipt)
+        .ok()
+        .map(|receipt| receipt.id)
+}
+
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
 /// the upstream session-only release never set SQLite's `pragma user_version`, so any pre-existing
 /// index reads as `0`. [`Db::needs_backfill`] compares this constant against `user_version` to
@@ -430,6 +452,17 @@ pub struct Db {
     progress: Option<ProgressReporter>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedSourceIdentity {
+    pub(crate) provider: Provider,
+    pub(crate) source_path: String,
+    pub(crate) sessions: usize,
+    pub(crate) session_id: String,
+    pub(crate) file_identity: Option<String>,
+    pub(crate) mtime_ns: Option<i64>,
+    pub(crate) size_bytes: Option<i64>,
+}
+
 /// Same-snapshot population facts accumulated by [`Db::visit_analysis_sessions`].
 pub(crate) struct AnalysisTraversalReceipt {
     pub(crate) selected_sessions: u64,
@@ -447,9 +480,8 @@ struct ProgressHandlerReset<'connection>(&'connection mut Connection);
 
 impl Drop for ProgressHandlerReset<'_> {
     fn drop(&mut self) {
-        // rusqlite 0.40 reports whether clearing the handler succeeded. Drop cannot propagate,
-        // and leaving this query's expired deadline installed would stop the next query on the
-        // same connection, so surface it where a caller can act: debug and test builds.
+        // Drop cannot return a failed reset; an expired handler would interrupt the next query.
+        // Report the failure in debug and test builds.
         let cleared = self.0.progress_handler(0, None::<fn() -> bool>);
         debug_assert!(
             cleared.is_ok(),
@@ -1108,6 +1140,7 @@ impl Db {
             create table if not exists files_seen (
                 provider text not null,
                 source_path text not null,
+                file_identity text,
                 mtime_ns integer not null,
                 size_bytes integer not null,
                 last_indexed_at text not null,
@@ -1419,6 +1452,7 @@ impl Db {
             "prefix_fingerprint",
             "prefix_fingerprint text",
         )?;
+        self.ensure_column("files_seen", "file_identity", "file_identity text")?;
         let parse_version_added = self.ensure_column(
             "files_seen",
             "parse_version",
@@ -1859,26 +1893,38 @@ impl Db {
             .map_err(Into::into)
     }
 
-    pub(crate) fn indexed_source_identities(
-        &self,
-    ) -> Result<Vec<(Provider, String, usize, String)>> {
-        let mut stmt = self.conn.prepare(
-            "select provider, source_path, count(*), min(id) from sessions
-             group by provider, source_path",
+    pub(crate) fn indexed_source_identities(&self) -> Result<Vec<IndexedSourceIdentity>> {
+        let has_file_identity: bool = self.conn.query_row(
+            "select exists(select 1 from pragma_table_info('files_seen') where name = 'file_identity')",
+            [],
+            |row| row.get(0),
         )?;
+        let (receipt, join) = if has_file_identity {
+            ("f.file_identity, f.mtime_ns, f.size_bytes",
+             "left join files_seen f on f.provider = s.provider and f.source_path = s.source_path")
+        } else {
+            ("null, null, null", "")
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "select s.provider, s.source_path, count(*), min(s.id), {receipt}
+             from sessions s {join} group by s.provider, s.source_path"
+        ))?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((
-                    decode_db_enum(
+                Ok(IndexedSourceIdentity {
+                    provider: decode_db_enum(
                         row.get::<_, String>(0)?,
                         0,
                         "sessions.provider",
                         Provider::from_db_str,
                     )?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? as usize,
-                    row.get::<_, String>(3)?,
-                ))
+                    source_path: row.get(1)?,
+                    sessions: row.get::<_, i64>(2)? as usize,
+                    session_id: row.get(3)?,
+                    file_identity: row.get(4)?,
+                    mtime_ns: row.get(5)?,
+                    size_bytes: row.get(6)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -2132,7 +2178,8 @@ impl Db {
             prior_dates.extend(stored_session_dates(&tx, id)?);
             if let Some(version) = legacy_queue_version {
                 // v5 inferred queue authors from session origin; repair archives before
-                // their version/identity changes, without touching newer alias evidence.
+                // their version/identity changes, without touching newer alias evidence. Keep
+                // this shim because archive-only rows have no source left to reparse.
                 tx.execute(
                     "update messages set authorship = 'unknown'
                          where session_id = ?1
@@ -2146,6 +2193,9 @@ impl Db {
                     params![id, session.provider.as_str(), version],
                 )?;
             }
+        }
+        if matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop) {
+            remap_verified_queue_scopes(&tx, session, source_aliases)?;
         }
         let mut prior_transcripts: Vec<String> = Vec::new();
         for id in &retired_ids {
@@ -2217,65 +2267,54 @@ impl Db {
                 session.agent_label,
             ],
         )?;
-        // Family receipts are deliberately separate from source_aliases. The predecessor has no
-        // tail checkpoint: only the canonical JSONL member may use the append-only fast path.
-        for member in family_members {
-            if member.source_path == session.source_path {
-                continue;
-            }
-            tx.execute(
-                "
-                insert into files_seen (
-                    provider, source_path, mtime_ns, size_bytes, last_indexed_at,
-                    content_hash, parse_version, tail_byte_offset, prefix_fingerprint
-                )
-                values (?1, ?2, ?3, ?4, ?5, null, ?6, null, null)
-                on conflict(provider, source_path) do update set
-                    mtime_ns = excluded.mtime_ns,
-                    size_bytes = excluded.size_bytes,
-                    last_indexed_at = excluded.last_indexed_at,
-                    parse_version = excluded.parse_version,
-                    tail_byte_offset = null,
-                    prefix_fingerprint = null
-                ",
-                params![
-                    session.provider.as_str(),
-                    member.source_path,
-                    member.mtime_ns,
-                    member.size_bytes,
-                    stored_timestamp(Utc::now()),
-                    session.parse_version,
-                ],
-            )?;
-        }
         // Move each retired identity's stored rows to the replacement session, then retire the
         // identity; rows the replacement already holds go with it through the cascade.
         for retired in &retired_ids {
             move_retired_rows(&tx, &session.id, retired)?;
             tx.execute("delete from sessions where id = ?1", params![retired])?;
         }
-        tx.execute(
-            "
-            insert into files_seen (
-                provider, source_path, mtime_ns, size_bytes, last_indexed_at,
-                content_hash, parse_version
-            )
-            values (?1, ?2, ?3, ?4, ?5, null, ?6)
-            on conflict(provider, source_path) do update set
-                mtime_ns = excluded.mtime_ns,
-                size_bytes = excluded.size_bytes,
-                last_indexed_at = excluded.last_indexed_at,
-                parse_version = excluded.parse_version
-            ",
-            params![
-                session.provider.as_str(),
-                session.source_path,
+        // Family receipts reset their tail checkpoint; the canonical source retains its own.
+        for (source_path, mtime_ns, size_bytes) in family_members
+            .iter()
+            .filter(|member| member.source_path != session.source_path)
+            .map(|member| {
+                (
+                    member.source_path.as_str(),
+                    member.mtime_ns,
+                    member.size_bytes,
+                )
+            })
+            .chain(std::iter::once((
+                session.source_path.as_str(),
                 mtime_ns,
                 size_bytes,
-                stored_timestamp(Utc::now()),
-                session.parse_version,
-            ],
-        )?;
+            )))
+        {
+            tx.execute(
+                "insert into files_seen (
+                    provider, source_path, file_identity, mtime_ns, size_bytes, last_indexed_at,
+                    content_hash, parse_version, tail_byte_offset, prefix_fingerprint
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6, null, ?7, null, null)
+                 on conflict(provider, source_path) do update set
+                    file_identity = excluded.file_identity,
+                    mtime_ns = excluded.mtime_ns,
+                    size_bytes = excluded.size_bytes,
+                    last_indexed_at = excluded.last_indexed_at,
+                    parse_version = excluded.parse_version,
+                    tail_byte_offset = case when ?8 then null else files_seen.tail_byte_offset end,
+                    prefix_fingerprint = case when ?8 then null else files_seen.prefix_fingerprint end",
+                params![
+                    session.provider.as_str(),
+                    source_path,
+                    file_identity_for_path(Path::new(source_path)),
+                    mtime_ns,
+                    size_bytes,
+                    stored_timestamp(Utc::now()),
+                    session.parse_version,
+                    source_path != session.source_path,
+                ],
+            )?;
+        }
         let kept_messages_missing_from_parse = store_parsed_messages(
             &tx,
             parsed,
@@ -2515,12 +2554,13 @@ impl Db {
         // Persist the checkpoint + refresh files_seen mtime/size in the same transaction.
         tx.execute(
             "update files_seen set
-                mtime_ns = ?3, size_bytes = ?4, last_indexed_at = ?5,
-                tail_byte_offset = ?6, prefix_fingerprint = ?7, parse_version = ?8
+                file_identity = ?3, mtime_ns = ?4, size_bytes = ?5, last_indexed_at = ?6,
+                tail_byte_offset = ?7, prefix_fingerprint = ?8, parse_version = ?9
              where provider = ?1 and source_path = ?2",
             params![
                 session.provider.as_str(),
                 session.source_path,
+                file_identity_for_path(Path::new(&session.source_path)),
                 mtime_ns,
                 size_bytes,
                 stored_timestamp(Utc::now()),
@@ -6020,7 +6060,7 @@ fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Opti
 }
 
 /// Project eligible ranges without changing the source content or row identity.
-const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')) or (m.authorship='unknown' and m.record_relation='unknown' and coalesce(m.input_origin,'unknown')='unknown' and m.role in ('user','slash')))";
+const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')) or (m.authorship='unknown' and (m.record_relation='unknown' or (m.record_relation='original' and m.input_origin='unknown')) and coalesce(m.input_origin,'unknown')='unknown' and m.role in ('user','slash')))";
 const USER_INPUT_PART_SQL: &str = "((p.authorship in ('human','unknown') and p.origin='direct_input') or (p.authorship='human' and p.origin in ('quoted_content','unknown')))";
 
 const MESSAGE_CONTENT_PARTS_JSON: &str = "(select json_group_array(json_object(
@@ -7017,6 +7057,51 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
             update.execute(params![target, next_seq + moved, id])?;
             moved += 1;
         }
+    }
+    Ok(())
+}
+
+/// Repair path-scoped Claude queue identities after a verified physical-file rename. The event
+/// id remains the provider-independent key; scope is changed only for rows from the verified old
+/// path, so unrelated same-session files and repeated submissions stay distinct.
+fn remap_verified_queue_scopes(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionRecord,
+    aliases: &[String],
+) -> Result<()> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    let new_scope_path = std::fs::canonicalize(&session.source_path)
+        .unwrap_or_else(|_| Path::new(&session.source_path).to_path_buf());
+    let new_scope = format!(
+        "claude_queue:{}",
+        crate::util::normalize_path(&new_scope_path)
+    );
+    for alias in aliases {
+        let Some(receipt) = tx
+            .query_row(
+                "select file_identity from files_seen
+                 where provider = ?1 and source_path = ?2",
+                params![session.provider.as_str(), alias],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|value| serde_json::from_str::<FileIdentityReceipt>(&value).ok())
+        else {
+            continue;
+        };
+        let old_scope = format!("claude_queue:{}", receipt.canonical_path);
+        tx.execute(
+            "update messages
+             set correlation_scope = ?1
+             where session_id = ?2
+               and correlation_authority = 'source_local'
+               and correlation_id is not null
+               and correlation_scope = ?3",
+            params![new_scope, session.id, old_scope],
+        )?;
     }
     Ok(())
 }
@@ -11326,8 +11411,7 @@ mod tests {
             )
             .unwrap();
         let corpus = 4_usize;
-        // `seq` is a SQLite integer column: bind the width SQLite stores, which rusqlite 0.40
-        // no longer infers from usize.
+        // Bind SQLite's signed integer width rather than a platform-sized usize.
         for seq in 0..corpus as i64 {
             db.conn
                 .execute(
@@ -12281,6 +12365,75 @@ mod tests {
             let error = db.resolve_session_record(literal).unwrap_err().to_string();
             assert!(error.contains("no session matches"), "{error}");
         }
+    }
+
+    #[test]
+    fn migrated_archive_only_user_rows_remain_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "create table messages (
+                id integer primary key, session_id text not null, provider text not null,
+                seq integer not null, role text not null, ts text, tool_name text,
+                is_compaction integer not null default 0, content text not null,
+                authorship text not null default 'unknown',
+                record_relation text not null default 'original');
+                insert into messages(session_id,provider,seq,role,content)
+                values ('antigravity:archive','antigravity',0,'user','archived correction');
+                insert into messages(session_id,provider,seq,role,content,authorship,record_relation)
+                values ('antigravity:archive','antigravity',2,'user','delegated correction','agent','original'),
+                       ('antigravity:archive','antigravity',3,'user','mirrored correction','unknown','mirror');
+                pragma user_version=5;",
+                )
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.conn.execute_batch("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+            values ('antigravity:archive','antigravity','archive','','/missing/archive','antigravity-v3','test');
+            insert into messages(session_id,provider,seq,role,content,authorship,record_relation,input_origin)
+            values ('antigravity:archive','antigravity',1,'user','ambiguous native correction','unknown','original',null);").unwrap();
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            session_id: Some("antigravity:archive".into()),
+            ..Default::default()
+        };
+        for match_mode in [
+            MessageSearchMode::Literal,
+            MessageSearchMode::Regex,
+            MessageSearchMode::Fuzzy,
+        ] {
+            let hits = db
+                .search_messages(
+                    "correction",
+                    &MessageFilters {
+                        match_mode,
+                        limit: 10,
+                        ..filters.clone()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+                vec![0],
+                "{match_mode:?}"
+            );
+        }
+        assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 1);
+        assert_eq!(
+            db.read_session_messages(&filters, MessageOrder::OldestFirst)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages("correction", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            4
+        );
     }
 
     #[test]
@@ -14613,7 +14766,7 @@ mod tests {
         assert!(db.resolve_session_record("claude:old-alias").is_err());
         assert_eq!(db.indexed_source_identities().unwrap().len(), 1);
         assert_eq!(
-            db.indexed_source_identities().unwrap()[0].1,
+            db.indexed_source_identities().unwrap()[0].source_path,
             canonical.to_string_lossy()
         );
     }
@@ -18959,7 +19112,7 @@ mod tests {
         );
         initial.messages[0].provenance.authorship = MessageAuthorship::Human;
         initial.messages[0].provenance.correlation_identity = Some(identity());
-        initial.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Submitted);
+        initial.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Unknown);
         db.upsert_session(&initial, 1, 1).unwrap();
         let original_id: i64 = db
             .conn
@@ -18980,7 +19133,7 @@ mod tests {
         );
         refreshed.messages[0].provenance.authorship = MessageAuthorship::Human;
         refreshed.messages[0].provenance.correlation_identity = Some(identity());
-        refreshed.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Delivered);
+        refreshed.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Submitted);
         db.upsert_session(&refreshed, 2, 2).unwrap();
 
         let stored_state: (i64, String, i64) = db
@@ -18992,7 +19145,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(stored_state, (original_id, "delivered".into(), 2));
+        assert_eq!(stored_state, (original_id, "submitted".into(), 2));
         assert_eq!(
             session_rows(&db, "codex:archive")[1],
             row(1, "user", "archived source text")
@@ -19893,6 +20046,39 @@ mod tests {
             schema_before,
             "SQLite read-only mode must leave the incompatible derived schema unchanged"
         );
+    }
+
+    #[test]
+    fn source_identity_listing_reads_older_read_only_cache_without_file_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "create table sessions (
+                    id text primary key, provider text not null,
+                    provider_session_id text not null, source_path text not null);
+                 create table files_seen (
+                    provider text not null, source_path text not null,
+                    mtime_ns integer not null, size_bytes integer not null,
+                    last_indexed_at text not null, parse_version text not null default '',
+                    primary key(provider, source_path));
+                 insert into sessions(id, provider, provider_session_id, source_path)
+                    values ('claude:legacy', 'claude', 'legacy', '/old/session.jsonl');
+                 pragma user_version = 2;",
+            )
+            .unwrap();
+        drop(legacy);
+        let db = Db::open_existing_read_only_with_threads(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let identities = db.indexed_source_identities().unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].source_path, "/old/session.jsonl");
+        assert!(identities[0].file_identity.is_none());
     }
 
     #[test]

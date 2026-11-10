@@ -200,6 +200,7 @@ impl CodexAdapter {
         // A forked or resumed session emits a SECOND session_meta carrying the parent's id.
         // Only the first one identifies this file, so bind the id once. See the guard below.
         let mut session_id_bound = false;
+        let mut header_spawn_origin = (None, None);
         let mut cwd = None;
         let mut created_at = None;
         let mut updated_at = None;
@@ -248,6 +249,7 @@ impl CodexAdapter {
                         // `on conflict(id) do update` upsert in db.rs would then overwrite
                         // the parent's row wholesale instead of storing this one.
                         if !session_id_bound {
+                            header_spawn_origin = (parent.clone(), label.clone());
                             if let Some(id) = payload.get("id").and_then(Value::as_str) {
                                 provider_session_id = id.to_string();
                             }
@@ -615,8 +617,13 @@ impl CodexAdapter {
         }
         // Codex records a spawn as `source: {"subagent":{"thread_spawn":{...}}}`, carrying the
         // parent thread and an agent nickname. Lifting it into the typed fields is what makes
-        // it queryable; inside the JSON blob it was present but unusable.
+        // it queryable; the same value may arrive encoded as a string from state_5.sqlite.
         let (parent_session_id, agent_label) = codex_spawn_origin(&raw_metadata);
+        // The rollout header carries spawn provenance even when state_5.sqlite is absent. Keep
+        // it as typed session metadata so bounded tail parses can compare against the persisted
+        // full-parse result; sidecar values remain authoritative when present.
+        let parent_session_id = parent_session_id.or(header_spawn_origin.0);
+        let agent_label = agent_label.or(header_spawn_origin.1);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
         let agent_started = parent_session_id.is_some() || agent_label.is_some();
 
@@ -1405,22 +1412,18 @@ fn codex_apply_patch_succeeded(output: Option<&Value>) -> bool {
         && text.contains("\nOutput:\nSuccess. Updated the following files:")
 }
 
-/// True when a role:user codex message is injected context rather than real user
-/// input: the approval-mode agent-history transcript codex asks the model to assess,
-/// or an injected `AGENTS.md`. Excluded from user/correction analytics.
-/// Read codex's spawn record out of session metadata as (parent session id, agent label).
-///
-/// Codex stores `source` as a JSON *string* holding
-/// `{"subagent":{"thread_spawn":{"parent_thread_id":...,"agent_nickname":...}}}`, or
-/// `{"subagent":{"other":"guardian"}}` for a spawn with no parent recorded. Both shapes are
-/// handled: the second yields a label with no parent, which is still worth keeping because it
-/// marks the session as agent-spawned rather than user-started.
+/// Read Codex's spawn record out of session metadata as (parent session id, agent label).
+/// `source` is an object in native rollout records and an encoded JSON string in state_5.sqlite;
+/// both carry `{"subagent":{"thread_spawn":...}}` (or a label-only `other` record).
 fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) {
-    let Some(source) = raw_metadata.get("source").and_then(Value::as_str) else {
+    let Some(source) = raw_metadata.get("source") else {
         return (None, None);
     };
-    let Ok(source) = serde_json::from_str::<Value>(source) else {
-        return (None, None);
+    let decoded = source.as_str().map(serde_json::from_str::<Value>);
+    let source = match decoded {
+        Some(Ok(ref source)) => source,
+        Some(Err(_)) => return (None, None),
+        None => source,
     };
     let Some(subagent) = source.get("subagent") else {
         return (None, None);
@@ -1436,6 +1439,7 @@ fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) 
         .and_then(|spawn| spawn.get("agent_nickname"))
         .and_then(Value::as_str)
         .or_else(|| subagent.get("other").and_then(Value::as_str))
+        .or_else(|| subagent.as_str())
         .map(ToOwned::to_owned);
     (parent, label)
 }
@@ -2791,9 +2795,7 @@ mod tests {
         assert_ne!(prose.kind, crate::models::MessageKind::HarnessNotice);
     }
 
-    /// Codex records a spawn as a JSON *string* under `source`, and has done all along; the
-    /// parent thread and agent nickname were present but unreachable inside that blob. Lifting
-    /// them into the typed fields is what makes "every subagent of this session" a query.
+    /// Native source objects and encoded SQLite values preserve the same spawn identity.
     #[test]
     fn codex_spawn_origin_is_read_from_the_source_payload() {
         let spawn = json!({
@@ -2809,6 +2811,33 @@ mod tests {
                 Some("McClintock".to_string())
             )
         );
+        let native_object = json!({
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "019f6287-88d4-71a0-a523-6f66568e4a3b",
+                        "agent_nickname": "McClintock"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            codex_spawn_origin(&native_object),
+            codex_spawn_origin(&spawn)
+        );
+
+        for label in ["review", "compact", "memory_consolidation"] {
+            let source = json!({"subagent":label});
+            for value in [
+                source.clone(),
+                serde_json::Value::String(source.to_string()),
+            ] {
+                assert_eq!(
+                    codex_spawn_origin(&json!({"source":value})),
+                    (None, Some(label.into()))
+                );
+            }
+        }
 
         // A spawn with no parent recorded still marks the session as agent-started.
         let other = json!({ "source": r#"{"subagent":{"other":"guardian"}}"# });

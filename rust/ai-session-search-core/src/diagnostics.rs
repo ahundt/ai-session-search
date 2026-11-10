@@ -157,7 +157,7 @@ pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>>
     let holders: HashMap<(Provider, String), String> = db
         .indexed_source_identities()?
         .into_iter()
-        .map(|(provider, source_path, _, id)| ((provider, id), source_path))
+        .map(|source| ((source.provider, source.session_id), source.source_path))
         .collect();
 
     let providers = crate::source::ProviderSet::new(config);
@@ -194,7 +194,7 @@ fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
     Ok(db
         .indexed_source_identities()?
         .into_iter()
-        .map(|(provider, source_path, _, _)| (provider, source_path))
+        .map(|source| (source.provider, source.source_path))
         .collect())
 }
 
