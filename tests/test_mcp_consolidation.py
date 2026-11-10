@@ -350,7 +350,7 @@ def test_mcp_reads_an_index_requiring_a_newer_writer(tmp_path: Path) -> None:
 
     environment = controlled_environment(tmp_path)
     config = Path(environment["AI_SESSION_SEARCH_CONFIG"])
-    config.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text("\n".join(f"[providers.{provider}]\nenabled = false" for provider in
         ("claude", "claude-desktop", "codex", "cursor", "antigravity", "pi",
          "prime-agent", "aistudio", "gemini-cli")), encoding="utf-8")
