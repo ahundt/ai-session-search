@@ -939,10 +939,12 @@ def test_runtime_environment_rejects_poisoned_state(tmp_path, monkeypatch) -> No
     from scripts.verify_upgrade_path import _environment as upgrade_environment
     _demo_environment = runpy.run_path(str(ROOT / "tests/test_demo.py"))["_demo_environment"]
     mcp_environment = runpy.run_path(str(ROOT / "tests/test_mcp_consolidation.py"))["_environment"]
-    for builder in (environment, hermetic_environment, mcp_environment,
-                    lambda root: upgrade_environment(root, None),
-                    lambda root: _demo_environment(ROOT / "tests/aise-demo", root)):
-        child_env = builder(tmp_path / builder.__name__)
+    builders = (environment, hermetic_environment, mcp_environment,
+                lambda root: upgrade_environment(root, None),
+                lambda root: _demo_environment(ROOT / "tests/aise-demo", root))
+    # Indexed roots: a lambda's __name__ is "<lambda>", which Windows rejects in a path.
+    for index, builder in enumerate(builders):
+        child_env = builder(tmp_path / f"builder-{index}")
         assert str(production) not in child_env.values()
     child_env = environment(tmp_path / "sandbox")
     assert str(production) not in child_env.values()
