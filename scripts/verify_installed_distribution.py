@@ -20,7 +20,9 @@ import time
 from typing import Any
 
 if not __package__:
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    # Appended, not prepended: the installed package must win over the source checkout, or the
+    # import checks below would verify the checkout instead of the artifact.
+    sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 from scripts.verify_harness_discovery import environment as isolated_environment
 
