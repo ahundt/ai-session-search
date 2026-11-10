@@ -1031,7 +1031,7 @@ fn codex_native_message_attribution(payload: &Value) -> Option<CodexMessageAttri
         .all(|(_, _, authorship, _)| *authorship == first_authorship)
     {
         return Some(CodexMessageAttribution::Whole {
-            authorship: codex_message_authorship(first_authorship),
+            authorship: first_authorship.into(),
             input_origin: (first_authorship == ContentPartAuthorship::Human
                 && observed
                     .iter()
@@ -1055,16 +1055,6 @@ fn codex_native_message_attribution(payload: &Value) -> Option<CodexMessageAttri
             )
             .collect(),
     ))
-}
-
-fn codex_message_authorship(authorship: ContentPartAuthorship) -> MessageAuthorship {
-    match authorship {
-        ContentPartAuthorship::Human => MessageAuthorship::Human,
-        ContentPartAuthorship::Agent => MessageAuthorship::Agent,
-        ContentPartAuthorship::Harness => MessageAuthorship::Harness,
-        ContentPartAuthorship::Generated => MessageAuthorship::Generated,
-        ContentPartAuthorship::Unknown => MessageAuthorship::Unknown,
-    }
 }
 
 fn codex_content_item_provenance(

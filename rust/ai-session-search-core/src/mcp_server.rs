@@ -2907,7 +2907,7 @@ fn run_skill_capability_output_schema() -> Value {
 }
 
 fn search_messages_output_schema() -> Value {
-    // Keep ordinary metadata aligned with HitProvenance; full partition arrays broke compact calls.
+    // Keep metadata aligned with MessageProvenance::hit_header; full partitions broke compact calls.
     // The canonical response uses custom conditional `Serialize` projections. Deriving a schema
     // through `schemars` would require a parallel DTO and recreate the semantic drift this adapter
     // removed. Keep this protocol declaration separate from runtime construction, then validate

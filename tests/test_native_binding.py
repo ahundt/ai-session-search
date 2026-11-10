@@ -40,6 +40,10 @@ def test_legacy_input_sentinels_return_none_without_selecting_current_unknown_in
         "input_origin": None,
         "input_delivery_state": None,
     }
+    ranged = search.read_session_messages("claude:legacy", role="user")
+    assert [hit.seq for hit in ranged] == [0]
+    assert ranged[0].provenance == results[0]["message_metadata"]["provenance"]
+    assert all(hit.provenance is None for hit in search.read_session_messages("claude:legacy"))
 
 
 def test_human_content_selection_changes_membership_and_preserves_coordinates(tmp_path: Path) -> None:
@@ -63,6 +67,12 @@ def test_human_content_selection_changes_membership_and_preserves_coordinates(tm
     assert result["message_metadata"]["role"] == "tool"
     assert result["match"]["literal_occurrence"]["field_start_char"] == 16
     assert result["message_metadata"]["provenance"]["authorship"] == "mixed"
+    ranged = search.read_session_messages("claude:human", role="user")
+    assert [hit.seq for hit in ranged] == [1]
+    assert ranged[0].provenance == result["message_metadata"]["provenance"]
+    assert set(ranged[0].provenance) == {
+        "authorship", "record_relation", "input_origin", "input_delivery_state",
+    }
     assert "input_scope" not in response.effective_request
     assert "input_scope" not in response.receipt["parameter_origins"]
     assert len(search.search_messages("needle").results) == 2

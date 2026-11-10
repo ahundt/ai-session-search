@@ -11,6 +11,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Rust API
+
+1. `MessageProvenance`, `MessageHit`, `MessageContentPart`, `MessageCorrelationIdentity`,
+   `RawMessage`, and the provenance enums (`MessageAuthorship`, `ContentPartAuthorship`,
+   `ContentPartOrigin`, `MessageCorrelationAuthority`, `MessageRecordRelation`,
+   `MessageInputOrigin`, `InputDeliveryState`) are non-exhaustive. Construct through provided
+   constructors or defaults; add wildcard match arms. `MessageProvenance::hit_header()` replaces
+   `HitProvenance`. Use `RawMessage::with_authorship` before normalization in place of
+   `apply_user_role_authorship`; `UserRoleAuthorshipEvidence` is now crate-private.
+
 ### Added
 
 1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices

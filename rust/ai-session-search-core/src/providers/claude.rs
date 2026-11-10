@@ -319,7 +319,8 @@ impl ClaudeAdapter {
                             // the queue origin and its submitted lifecycle evidence.
                             match claude_native_message_semantics(&value) {
                                 Some(semantics) => {
-                                    raw_message = raw_message.with_authorship(semantics.authorship);
+                                    raw_message = raw_message
+                                        .with_authorship(semantics.content_authorship.into());
                                     if semantics.input_origin.is_some() {
                                         raw_message = raw_message
                                             .with_input_origin(MessageInputOrigin::Queued);
@@ -516,7 +517,8 @@ impl ClaudeAdapter {
                     );
                     if is_user_role {
                         if let Some(semantics) = native_semantics {
-                            raw_message = raw_message.with_authorship(semantics.authorship);
+                            raw_message =
+                                raw_message.with_authorship(semantics.content_authorship.into());
                             if let Some(origin) = semantics.input_origin {
                                 raw_message = raw_message.with_input_origin(origin);
                             }
@@ -733,7 +735,6 @@ impl ClaudeMixedUserContent {
 /// public model already has the authorship/origin vocabulary needed by search and persistence.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClaudeNativeMessageSemantics {
-    authorship: MessageAuthorship,
     content_authorship: ContentPartAuthorship,
     content_origin: ContentPartOrigin,
     input_origin: Option<MessageInputOrigin>,
@@ -745,7 +746,6 @@ fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageS
         match is_synthetic.as_bool() {
             Some(true) => {
                 return Some(ClaudeNativeMessageSemantics {
-                    authorship: MessageAuthorship::Generated,
                     content_authorship: ContentPartAuthorship::Generated,
                     content_origin: ContentPartOrigin::GeneratedSummary,
                     input_origin: None,
@@ -755,7 +755,6 @@ fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageS
             Some(false) => {}
             None => {
                 return Some(ClaudeNativeMessageSemantics {
-                    authorship: MessageAuthorship::Unknown,
                     content_authorship: ContentPartAuthorship::Unknown,
                     content_origin: ContentPartOrigin::Unknown,
                     input_origin: None,
@@ -777,7 +776,6 @@ fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageS
         })
     {
         return Some(ClaudeNativeMessageSemantics {
-            authorship: MessageAuthorship::Agent,
             content_authorship: ContentPartAuthorship::Agent,
             content_origin: ContentPartOrigin::DirectInput,
             input_origin: None,
@@ -787,7 +785,6 @@ fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageS
     let origin = value.get("origin")?;
     let Some(origin) = origin.as_object() else {
         return Some(ClaudeNativeMessageSemantics {
-            authorship: MessageAuthorship::Unknown,
             content_authorship: ContentPartAuthorship::Unknown,
             content_origin: ContentPartOrigin::Unknown,
             input_origin: None,
@@ -802,28 +799,21 @@ fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageS
         }
         _ => false,
     };
-    let (authorship, content_authorship) = match kind {
-        Some("human") => (MessageAuthorship::Human, ContentPartAuthorship::Human),
+    let content_authorship = match kind {
+        Some("human") => ContentPartAuthorship::Human,
         Some("channel") | Some("task-notification") if direct_input => {
-            (MessageAuthorship::Unknown, ContentPartAuthorship::Unknown)
+            ContentPartAuthorship::Unknown
         }
-        Some("peer") | Some("coordinator") => {
-            (MessageAuthorship::Agent, ContentPartAuthorship::Agent)
-        }
+        Some("peer") | Some("coordinator") => ContentPartAuthorship::Agent,
         Some("task-notification")
             if origin.get("subkind").and_then(Value::as_str) == Some("peer-send-message") =>
         {
-            (MessageAuthorship::Agent, ContentPartAuthorship::Agent)
+            ContentPartAuthorship::Agent
         }
-        Some("task-notification") => (
-            MessageAuthorship::Generated,
-            ContentPartAuthorship::Generated,
-        ),
-        Some("auto-continuation") | Some("unclassified") => (
-            MessageAuthorship::Generated,
-            ContentPartAuthorship::Generated,
-        ),
-        _ => (MessageAuthorship::Unknown, ContentPartAuthorship::Unknown),
+        Some("task-notification") | Some("auto-continuation") | Some("unclassified") => {
+            ContentPartAuthorship::Generated
+        }
+        _ => ContentPartAuthorship::Unknown,
     };
     let content_origin = match kind {
         Some("human") | Some("channel") | Some("task-notification") if direct_input => {
@@ -836,7 +826,6 @@ fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageS
         _ => ContentPartOrigin::Unknown,
     };
     Some(ClaudeNativeMessageSemantics {
-        authorship,
         content_authorship,
         content_origin,
         input_origin: direct_input.then_some(MessageInputOrigin::DirectConversation),
@@ -1038,7 +1027,7 @@ pub(crate) fn claude_mixed_user_content(
         transcript_text: transcript_parts.join("\n"),
         has_interactive_answer,
         has_direct_text,
-        native_authorship: native_semantics.map(|semantics| semantics.authorship),
+        native_authorship: native_semantics.map(|semantics| semantics.content_authorship.into()),
         native_input_origin: native_semantics.and_then(|semantics| semantics.input_origin),
         tool_name,
         tool_call_id,

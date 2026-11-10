@@ -2775,10 +2775,13 @@ struct SemanticMessageRef<'a> {
 }
 
 #[derive(Serialize)]
-struct SemanticMessageMetadata {
+struct SemanticMessageMetadata<'a> {
     // Use the bounded header on every surface; adding internal fields here bypasses text budgets.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provenance: Option<crate::models::HitProvenance>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::models::serialize_hit_provenance"
+    )]
+    provenance: Option<&'a crate::models::MessageProvenance>,
     provider: Provider,
     role: Role,
     kind: MessageKind,
@@ -2903,11 +2906,7 @@ impl Serialize for SemanticResult<'_> {
         map.serialize_entry(
             "message_metadata",
             &SemanticMessageMetadata {
-                provenance: hit
-                    .message
-                    .provenance
-                    .as_deref()
-                    .map(crate::models::HitProvenance::from),
+                provenance: hit.message.provenance.as_deref(),
                 provider: hit.message.provider,
                 role: hit.message.role,
                 kind: hit.message.kind,

@@ -1321,6 +1321,7 @@ pub type LegacyRawMessage = (String, String, Option<DateTime<Utc>>, Option<Strin
 
 /// Provider evidence before role normalization and sequence assignment.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawMessage {
     role: String,
     content: String,
@@ -1548,7 +1549,7 @@ fn infer_message_authorship(role: Role, kind: MessageKind) -> MessageAuthorship 
 
 /// Provider evidence that can resolve an otherwise-unknown user-role conversation row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserRoleAuthorshipEvidence {
+pub(crate) enum UserRoleAuthorshipEvidence {
     HumanInputEvent,
     AgentDelegationEvent,
     Unverified,
@@ -1560,29 +1561,6 @@ impl UserRoleAuthorshipEvidence {
             Self::HumanInputEvent => MessageAuthorship::Human,
             Self::AgentDelegationEvent => MessageAuthorship::Agent,
             Self::Unverified => MessageAuthorship::Unknown,
-        }
-    }
-}
-
-/// Resolve user-role authorship from provider-supplied structured event evidence.
-///
-/// This is linear in message count and changes only still-unknown conversation/slash rows. It
-/// cannot distinguish an explicit `Unknown` from unresolved evidence after normalization.
-/// Built-in adapters resolve evidence while normalizing [`RawMessage`] instead.
-pub fn apply_user_role_authorship(messages: &mut [Message], evidence: UserRoleAuthorshipEvidence) {
-    let user_authorship = evidence.authorship();
-    if user_authorship == MessageAuthorship::Unknown {
-        return;
-    }
-    for message in messages {
-        if message.provenance.authorship == MessageAuthorship::Unknown
-            && matches!(message.role, Role::User | Role::Slash)
-            && matches!(
-                message.kind,
-                MessageKind::Conversation | MessageKind::Unknown
-            )
-        {
-            message.provenance.authorship = user_authorship;
         }
     }
 }

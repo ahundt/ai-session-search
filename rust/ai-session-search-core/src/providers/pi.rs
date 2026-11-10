@@ -574,11 +574,7 @@ fn pi_native_input_record(
     }
     raw = raw.with_input_origin(MessageInputOrigin::DirectConversation);
     if generated.is_empty() {
-        return Some(raw.with_authorship(if subagent {
-            MessageAuthorship::Agent
-        } else {
-            MessageAuthorship::Human
-        }));
+        return Some(raw.with_authorship(input_author.into()));
     }
     let end_input = input.chars().count();
     let end_content = end_input + 1 + generated.chars().count();

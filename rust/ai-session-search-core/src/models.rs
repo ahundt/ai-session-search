@@ -366,6 +366,7 @@ impl std::str::FromStr for MessageKind {
 )]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MessageAuthorship {
     Human,
     Agent,
@@ -422,12 +423,25 @@ impl std::str::FromStr for MessageAuthorship {
 /// validation and match attribution linear in the number of parts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ContentPartAuthorship {
     Human,
     Agent,
     Harness,
     Generated,
     Unknown,
+}
+
+impl From<ContentPartAuthorship> for MessageAuthorship {
+    fn from(part: ContentPartAuthorship) -> Self {
+        match part {
+            ContentPartAuthorship::Human => Self::Human,
+            ContentPartAuthorship::Agent => Self::Agent,
+            ContentPartAuthorship::Harness => Self::Harness,
+            ContentPartAuthorship::Generated => Self::Generated,
+            ContentPartAuthorship::Unknown => Self::Unknown,
+        }
+    }
 }
 
 impl ContentPartAuthorship {
@@ -458,6 +472,7 @@ impl std::str::FromStr for ContentPartAuthorship {
 /// provider string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ContentPartOrigin {
     DirectInput,
     QuotedContent,
@@ -497,6 +512,7 @@ impl std::str::FromStr for ContentPartOrigin {
 /// Offsets are half-open Unicode-scalar positions, matching the public message-search character
 /// coordinates rather than UTF-8 byte indexes. Parts are stored without another copy of the text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageContentPart {
     pub ordinal: u32,
     pub start_char: usize,
@@ -506,6 +522,24 @@ pub struct MessageContentPart {
 }
 
 impl MessageContentPart {
+    /// Construct a region with half-open Unicode-scalar offsets. Full-message validation occurs
+    /// through [`MessageProvenance::validate`] before persistence.
+    pub fn new(
+        ordinal: u32,
+        start_char: usize,
+        end_char: usize,
+        authorship: ContentPartAuthorship,
+        origin: ContentPartOrigin,
+    ) -> Self {
+        Self {
+            ordinal,
+            start_char,
+            end_char,
+            authorship,
+            origin,
+        }
+    }
+
     pub(crate) fn is_user_input(&self) -> bool {
         match self.origin {
             ContentPartOrigin::DirectInput => matches!(
@@ -530,6 +564,7 @@ impl MessageContentPart {
 /// authority from colliding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageCorrelationAuthority {
     Anthropic,
     #[serde(alias = "openai")]
@@ -577,15 +612,33 @@ impl std::str::FromStr for MessageCorrelationAuthority {
 /// Hash/equality deliberately cover only identity. Whether a stored row is the original or a copy
 /// is separate metadata and must never split one correlation group.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageCorrelationIdentity {
     pub authority: MessageCorrelationAuthority,
     pub scope: String,
     pub id: String,
 }
 
+impl MessageCorrelationIdentity {
+    /// Construct a source identity. [`MessageProvenance::validate`] checks nonempty scope and ID
+    /// before persistence.
+    pub fn new(
+        authority: MessageCorrelationAuthority,
+        scope: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Self {
+        Self {
+            authority,
+            scope: scope.into(),
+            id: id.into(),
+        }
+    }
+}
+
 /// How this stored row relates to its correlation group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageRecordRelation {
     Original,
     Mirror,
@@ -682,6 +735,7 @@ impl std::str::FromStr for MessageInputOrigin {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "StoredMessageProvenance")]
+#[non_exhaustive]
 pub struct MessageProvenance {
     pub authorship: MessageAuthorship,
     pub record_relation: MessageRecordRelation,
@@ -696,7 +750,10 @@ pub struct MessageProvenance {
     pub(crate) legacy_input_origin: bool,
 }
 
-// Keep legacy storage spellings at the read boundary, outside the public evidence enums.
+/// Read-only storage adapter: legacy origin "unknown" must set the private legacy marker as
+/// well as public None. A field deserializer cannot set a sibling field; a manual parent visitor
+/// would repeat these fields plus serde's missing/duplicate-field handling. Keep this private so
+/// storage compatibility does not introduce a second public provenance model.
 #[derive(Deserialize)]
 struct StoredMessageProvenance {
     authorship: MessageAuthorship,
@@ -734,12 +791,32 @@ impl TryFrom<StoredMessageProvenance> for MessageProvenance {
 }
 
 impl MessageProvenance {
+    /// Borrow the four-field hit header without copying or serializing partitions or identity.
+    /// Full evidence can exceed an MCP response cap even for one hit with bounded text.
+    /// Serialization takes constant time and space, independent of evidence size.
+    pub fn hit_header(&self) -> impl Serialize + '_ {
+        struct Header<'a>(&'a MessageProvenance);
+        impl Serialize for Header<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct;
+                let mut header = serializer.serialize_struct("MessageProvenance", 4)?;
+                header.serialize_field("authorship", &self.0.authorship)?;
+                header.serialize_field("record_relation", &self.0.record_relation)?;
+                header.serialize_field("input_origin", &self.0.input_origin)?;
+                header.serialize_field("input_delivery_state", &self.0.input_delivery_state)?;
+                header.end()
+            }
+        }
+        Header(self)
+    }
+
     pub(crate) fn stored_input_origin(&self) -> Option<&'static str> {
         self.input_origin
             .map(MessageInputOrigin::as_str)
             .or(self.legacy_input_origin.then_some("unknown"))
     }
 
+    /// Explicit source evidence, also used for source-family reconciliation without role inference.
     pub(crate) fn is_whole_user_input(&self) -> bool {
         self.authorship == MessageAuthorship::Human
             || (self.authorship == MessageAuthorship::Unknown
@@ -753,6 +830,7 @@ impl MessageProvenance {
                 ))
     }
 
+    /// Retrieval fallback for older rows; this must not establish native source-family identity.
     pub(crate) fn is_legacy_user_input(&self, role: Role) -> bool {
         self.authorship == MessageAuthorship::Unknown
             && (self.record_relation == MessageRecordRelation::Unknown
@@ -1226,33 +1304,16 @@ impl MessageInputScope {
     }
 }
 
-/// Bounded source evidence for ordinary hits; partitions remain internal to matching.
-/// Full part arrays previously made even a compact, single-hit MCP response exceed its cap:
-/// text windows do not bound metadata. Keep full partitions/identity in the index, not this header.
-#[derive(Debug, Clone, Serialize)]
-pub struct HitProvenance {
-    pub authorship: MessageAuthorship,
-    pub record_relation: MessageRecordRelation,
-    pub input_origin: Option<MessageInputOrigin>,
-    pub input_delivery_state: Option<InputDeliveryState>,
-}
-impl From<&MessageProvenance> for HitProvenance {
-    fn from(source: &MessageProvenance) -> Self {
-        Self {
-            authorship: source.authorship,
-            record_relation: source.record_relation,
-            input_origin: source.input_origin,
-            input_delivery_state: source.input_delivery_state,
-        }
-    }
-}
-fn serialize_hit_provenance<S: serde::Serializer>(
-    value: &Option<Box<MessageProvenance>>,
+pub(crate) fn serialize_hit_provenance<
+    S: serde::Serializer,
+    T: std::borrow::Borrow<MessageProvenance>,
+>(
+    value: &Option<T>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     value
-        .as_deref()
-        .map(HitProvenance::from)
+        .as_ref()
+        .map(|source| source.borrow().hit_header())
         .serialize(serializer)
 }
 
@@ -1481,6 +1542,7 @@ impl MessageFilters {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct MessageHit {
     /// Source evidence loaded for user-selected matching, including unknown senders.
     #[serde(
@@ -1501,6 +1563,32 @@ pub struct MessageHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_score: Option<u32>,
     pub content: String,
+}
+
+impl MessageHit {
+    /// Construct a hit with no timestamp, tool, score or provenance metadata.
+    pub fn new(
+        session_id: impl Into<String>,
+        provider: Provider,
+        seq: i64,
+        role: Role,
+        kind: MessageKind,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            provider,
+            seq,
+            role,
+            kind,
+            content: content.into(),
+            provenance: None,
+            ts: None,
+            tool_name: None,
+            tool_call_id: None,
+            fuzzy_score: None,
+        }
+    }
 }
 
 /// Lightweight per-session metadata used to enrich message hits with human-readable
@@ -1895,6 +1983,69 @@ pub struct DiagnosticStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_part_authorship_converts_without_changing_meaning() {
+        for (part, message) in [
+            (ContentPartAuthorship::Human, MessageAuthorship::Human),
+            (ContentPartAuthorship::Agent, MessageAuthorship::Agent),
+            (ContentPartAuthorship::Harness, MessageAuthorship::Harness),
+            (
+                ContentPartAuthorship::Generated,
+                MessageAuthorship::Generated,
+            ),
+            (ContentPartAuthorship::Unknown, MessageAuthorship::Unknown),
+        ] {
+            assert_eq!(MessageAuthorship::from(part), message);
+        }
+    }
+
+    #[test]
+    fn hit_header_borrows_provenance_without_serializing_unbounded_evidence() {
+        let mut provenance = MessageProvenance {
+            authorship: MessageAuthorship::Mixed,
+            record_relation: MessageRecordRelation::Original,
+            input_origin: Some(MessageInputOrigin::InteractiveAnswer),
+            input_delivery_state: Some(InputDeliveryState::Submitted),
+            correlation_identity: Some(MessageCorrelationIdentity {
+                authority: MessageCorrelationAuthority::SourceLocal,
+                scope: "s".repeat(100_000),
+                id: "i".repeat(100_000),
+            }),
+            content_parts: (0..1_001)
+                .map(|ordinal| MessageContentPart {
+                    ordinal,
+                    start_char: ordinal as usize,
+                    end_char: ordinal as usize + 1,
+                    authorship: ContentPartAuthorship::Unknown,
+                    origin: ContentPartOrigin::DirectInput,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let expected = serde_json::json!({
+            "authorship": "mixed", "record_relation": "original",
+            "input_origin": "interactive_answer", "input_delivery_state": "submitted"
+        });
+        assert_eq!(
+            serde_json::to_value(provenance.hit_header()).unwrap(),
+            expected
+        );
+        assert_eq!(provenance.content_parts.len(), 1_001);
+        assert_eq!(
+            serde_json::to_value(&provenance).unwrap()["content_parts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1_001
+        );
+        provenance.input_origin = None;
+        provenance.input_delivery_state = None;
+        let header = serde_json::to_value(provenance.hit_header()).unwrap();
+        assert!(header["input_origin"].is_null());
+        assert!(header["input_delivery_state"].is_null());
+        assert_eq!(header.as_object().unwrap().len(), 4);
+    }
 
     #[test]
     fn legacy_input_sentinels_decode_to_absent_evidence() {

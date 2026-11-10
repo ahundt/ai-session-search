@@ -2,6 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Compile-only coverage for the supported public Rust API.
+//!
+//! Hit fields can grow; construct hits through their constructor.
+//! ```compile_fail
+//! use ai_session_search::models::{MessageHit, MessageKind, Provider, Role};
+//! let hit = MessageHit {
+//!     provenance: None, session_id: "claude:example".into(), provider: Provider::Claude,
+//!     seq: 0, role: Role::User, kind: MessageKind::Conversation, ts: None,
+//!     tool_name: None, tool_call_id: None, fuzzy_score: None, content: "prompt".into(),
+//! };
+//! ```
+//!
+//! Correlation authorities can grow; downstream matches need a wildcard arm.
+//! ```compile_fail
+//! use ai_session_search::models::MessageCorrelationAuthority;
+//! fn is_local(authority: MessageCorrelationAuthority) -> bool {
+//!     match authority {
+//!         MessageCorrelationAuthority::Anthropic | MessageCorrelationAuthority::OpenAi
+//!         | MessageCorrelationAuthority::Cursor | MessageCorrelationAuthority::Google
+//!         | MessageCorrelationAuthority::Pi | MessageCorrelationAuthority::PrimeAgent => false,
+//!         MessageCorrelationAuthority::SourceLocal => true,
+//!     }
+//! }
+//! ```
 
 use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
@@ -15,6 +38,53 @@ use ai_session_search::{
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
+
+/// Construct provenance and hits without depending on exhaustive public field lists.
+pub fn provenance_hit() -> ai_session_search::models::MessageHit {
+    use ai_session_search::models::{
+        ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageContentPart,
+        MessageCorrelationAuthority, MessageCorrelationIdentity, MessageHit, MessageKind,
+        MessageProvenance, Provider, Role,
+    };
+    let mut provenance = MessageProvenance::default();
+    provenance.authorship = MessageAuthorship::Mixed;
+    provenance.content_parts = vec![
+        MessageContentPart::new(
+            0,
+            0,
+            1,
+            ContentPartAuthorship::Human,
+            ContentPartOrigin::DirectInput,
+        ),
+        MessageContentPart::new(
+            1,
+            1,
+            2,
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        ),
+    ];
+    provenance.correlation_identity = Some(MessageCorrelationIdentity::new(
+        MessageCorrelationAuthority::SourceLocal,
+        "claude:example",
+        "event",
+    ));
+    provenance.validate("ab").unwrap();
+    let mut hit = MessageHit::new(
+        "claude:example",
+        Provider::Claude,
+        0,
+        Role::Tool,
+        MessageKind::ToolResult,
+        "ab",
+    );
+    hit.provenance = Some(Box::new(provenance));
+    let _ = match MessageCorrelationAuthority::SourceLocal {
+        MessageCorrelationAuthority::SourceLocal => "source_local",
+        _ => "other",
+    };
+    hit
+}
 
 /// Compile the supported construction pattern for public configuration structs.
 ///

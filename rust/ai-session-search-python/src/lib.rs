@@ -3558,7 +3558,8 @@ impl FileQuery {
 /// Provenance origin and delivery are None when source evidence is absent.
 #[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
-    provenance: Option<ai_session_search::models::HitProvenance>,
+    // Retain only the serialized header, so Python hits do not keep matching partitions alive.
+    provenance: String,
     #[pyo3(get)]
     session_id: String,
     #[pyo3(get)]
@@ -3586,7 +3587,8 @@ struct NativeMessageHit {
 impl NativeMessageHit {
     #[getter]
     fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        json_compatible(py, &self.provenance)
+        py.import("json")?
+            .call_method1("loads", (&self.provenance,))
     }
     #[getter]
     fn refs(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeMessageRef>>> {
@@ -3606,7 +3608,10 @@ impl NativeMessageHit {
 impl From<MessageHit> for NativeMessageHit {
     fn from(hit: MessageHit) -> Self {
         Self {
-            provenance: hit.provenance.as_deref().map(Into::into),
+            provenance: serde_json::to_string(
+                &hit.provenance.as_deref().map(|source| source.hit_header()),
+            )
+            .expect("provenance header contains only string enums and nulls"),
             session_id: hit.session_id,
             provider: hit.provider.as_str().to_string(),
             seq: hit.seq,

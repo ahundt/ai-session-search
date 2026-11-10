@@ -6331,7 +6331,9 @@ fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Opti
     }
 }
 
-/// Project eligible ranges without changing the source content or row identity.
+/// SQL keeps filtering before paging; models.rs owns the corresponding typed predicates.
+/// The whole_user_input_sql_matches_rust_including_legacy_storage and
+/// user_input_part_sql_matches_rust_case_table tests enforce parity over shared case tables.
 const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')) or (m.authorship='unknown' and (m.record_relation='unknown' or (m.record_relation='original' and m.input_origin='unknown')) and coalesce(m.input_origin,'unknown')='unknown' and m.role in ('user','slash')))";
 const USER_INPUT_PART_SQL: &str = "((p.authorship in ('human','unknown') and p.origin='direct_input') or (p.authorship='human' and p.origin in ('quoted_content','unknown')))";
 
@@ -9469,6 +9471,91 @@ mod tests {
                 result.hits()[0].match_evidence().unwrap().field_start_char,
                 0
             );
+        }
+    }
+
+    #[test]
+    fn whole_user_input_sql_matches_rust_including_legacy_storage() {
+        use crate::models::MessageProvenance;
+        let conn = Connection::open_in_memory().unwrap();
+        let mut statement = conn
+            .prepare(&format!(
+                "select coalesce({WHOLE_USER_INPUT_SQL}, 0) from
+             (select ?1 authorship, ?2 record_relation, ?3 input_origin, ?4 role) m"
+            ))
+            .unwrap();
+        for authorship in ["human", "unknown", "agent", "harness", "generated", "mixed"] {
+            for relation in ["original", "unknown", "mirror"] {
+                for origin in [
+                    None,
+                    Some("unknown"),
+                    Some("direct_conversation"),
+                    Some("queued"),
+                    Some("interactive_answer"),
+                ] {
+                    for role in [
+                        Role::User,
+                        Role::Slash,
+                        Role::Assistant,
+                        Role::Tool,
+                        Role::Compaction,
+                    ] {
+                        let provenance: MessageProvenance =
+                            serde_json::from_value(serde_json::json!({
+                                "authorship": authorship, "record_relation": relation,
+                                "input_origin": origin, "content_parts": []
+                            }))
+                            .unwrap();
+                        let actual: bool = statement
+                            .query_row(
+                                params![authorship, relation, origin, role.as_str()],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            actual,
+                            provenance.is_whole_user_input()
+                                || provenance.is_legacy_user_input(role),
+                            "{authorship} {relation} {origin:?} {role:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn user_input_part_sql_matches_rust_case_table() {
+        use crate::models::{ContentPartAuthorship as A, ContentPartOrigin as O};
+        let conn = Connection::open_in_memory().unwrap();
+        let mut statement = conn
+            .prepare(&format!(
+                "select {USER_INPUT_PART_SQL} from (select ?1 authorship, ?2 origin) p"
+            ))
+            .unwrap();
+        for authorship in [A::Human, A::Unknown, A::Agent, A::Harness, A::Generated] {
+            for origin in [
+                O::DirectInput,
+                O::QuotedContent,
+                O::Unknown,
+                O::HarnessContext,
+                O::GeneratedSummary,
+                O::ToolPayload,
+            ] {
+                let part = MessageContentPart {
+                    ordinal: 0,
+                    start_char: 0,
+                    end_char: 1,
+                    authorship,
+                    origin,
+                };
+                let actual: bool = statement
+                    .query_row(params![authorship.as_str(), origin.as_str()], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(actual, part.is_user_input(), "{part:?}");
+            }
         }
     }
 
