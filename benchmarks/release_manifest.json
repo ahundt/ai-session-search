@@ -3,7 +3,7 @@
   "seed": 20260716,
   "tiers": {"smoke": 3, "subsystem": 5, "release": 9},
   "fixture": {
-    "required_schema_version": 5,
+    "required_schema_version": 6,
     "description": "An immutable disposable AI Session Search SQLite fixture; never the configured live index."
   },
   "cases": [
