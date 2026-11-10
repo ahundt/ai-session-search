@@ -91,16 +91,19 @@ def _run(argv: Sequence[str], environment: dict[str, str]) -> subprocess.Complet
 def _stop_process_group(process: subprocess.Popen[str]) -> None:
     group = process.pid
     for termination in (signal.SIGTERM, signal.SIGKILL):
+        # macOS answers EPERM, not ESRCH, for a group whose only members are zombies waiting
+        # for launchd to reap them. This verifier created the session, so EPERM cannot mean a
+        # live member it lacks permission for: the group has exited.
         try:
             os.killpg(group, termination)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             process.poll()
             try:
                 os.killpg(group, 0)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 return
             time.sleep(0.01)
     raise BackgroundChildrenAlive(f"background process group {group} did not exit after SIGKILL")
