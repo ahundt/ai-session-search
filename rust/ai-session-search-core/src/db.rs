@@ -455,6 +455,12 @@ pub struct Db {
     progress: Option<ProgressReporter>,
 }
 
+const MESSAGE_INPUT_INDEXES_SQL: &str =
+    "create index if not exists idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq, input_origin);
+             create index if not exists idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq, input_origin);";
+
 /// Add the post-release columns used to distinguish recorded user input from other `role=user`
 /// rows. This is shared by normal writable opens and offline migration staging so the latter does
 /// not rebuild otherwise-healthy FTS indexes merely because additive storage was missing.
@@ -502,12 +508,9 @@ pub(crate) fn ensure_message_input_provenance_storage(conn: &Connection) -> Resu
     if added {
         tx.execute_batch(
             "drop index if exists idx_messages_session_authorship_relation_seq;
-             drop index if exists idx_messages_authorship_relation_ts;
-             create index if not exists idx_messages_session_authorship_relation_seq
-                 on messages(session_id, authorship, record_relation, seq, input_origin);
-             create index if not exists idx_messages_authorship_relation_ts
-                 on messages(authorship, record_relation, ts desc, session_id, seq, input_origin);",
+             drop index if exists idx_messages_authorship_relation_ts;",
         )?;
+        tx.execute_batch(MESSAGE_INPUT_INDEXES_SQL)?;
     }
     tx.commit()?;
     Ok(())
@@ -1324,10 +1327,6 @@ impl Db {
                  on messages(session_id, seq) where kind = 'tool_call';
              create index if not exists idx_messages_provider_session_seq
                  on messages(provider, session_id, seq);
-             create index if not exists idx_messages_session_authorship_relation_seq
-                 on messages(session_id, authorship, record_relation, seq, input_origin);
-             create index if not exists idx_messages_authorship_relation_ts
-                 on messages(authorship, record_relation, ts desc, session_id, seq, input_origin);
              create index if not exists idx_messages_correlation
                  on messages(correlation_authority, correlation_scope, correlation_id)
                  where correlation_id is not null;
@@ -1357,6 +1356,7 @@ impl Db {
                  select raise(abort, 'message correlation authority, scope, and id must be all null or all non-null');
              end;",
         )?;
+        self.conn.execute_batch(MESSAGE_INPUT_INDEXES_SQL)?;
         // `sessions_fts` (an FTS5 copy of every title, summary, preview, and transcript) stopped
         // being read on 2026-07-22, when session search moved to scoring the complete corpus, and
         // stayed maintained: on one real index it held 464 MB (a second copy of every transcript
@@ -3881,7 +3881,7 @@ impl Db {
             if let Some(problem) =
                 crate::indexer::message_input_provenance_layout_problem(&self.conn)?
             {
-                bail!("user-input search requires current provenance storage: {problem}; run `aise reindex` to upgrade the index, or omit the role filter to search readable stored content");
+                bail!("user-input search requires current provenance storage: {problem}; run a writable aise command (without --index-refresh existing-only) to upgrade the index, or omit the role filter to search readable stored content");
             }
         }
         Ok(())
@@ -9597,7 +9597,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("aise reindex") && error.contains("provenance storage"),
+            error.contains("writable aise command") && error.contains("provenance storage"),
             "{error}"
         );
         assert!(
@@ -12715,6 +12715,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(values, ("unknown".into(), "unknown".into()));
+    }
+
+    #[test]
+    fn input_provenance_upgrade_retries_after_a_competing_writer_releases_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Db::open(&path).unwrap());
+        let owner = Connection::open(&path).unwrap();
+        owner
+            .execute_batch(
+                "drop index idx_messages_session_authorship_relation_seq;
+            drop index idx_messages_authorship_relation_ts;
+            alter table messages drop column input_origin;
+            alter table messages drop column input_delivery_state;",
+            )
+            .unwrap();
+        let contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let lock = owner.unchecked_transaction().unwrap();
+        lock.execute_batch("update sessions set title=title")
+            .unwrap();
+        let error = ensure_message_input_provenance_storage(&contender).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code),
+            Some(ErrorCode::DatabaseBusy)
+        );
+        assert!(!contender.query_row("select exists(select 1 from pragma_table_info('messages') where name='input_origin')", [], |row| row.get::<_, bool>(0)).unwrap());
+        drop(lock);
+        ensure_message_input_provenance_storage(&contender).unwrap();
+        assert!(
+            crate::indexer::message_input_provenance_layout_problem(&contender)
+                .unwrap()
+                .is_none()
+        );
+        ensure_message_input_provenance_storage(&owner).unwrap();
     }
 
     #[test]

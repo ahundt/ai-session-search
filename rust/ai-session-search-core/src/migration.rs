@@ -843,17 +843,18 @@ mod tests {
         // pre-publish consistency gate the migration would republish it as "healthy" and the index
         // would dead-lock at open. Assert the published index is instead self-consistent (opens
         // Current, FTS5 trigram rebuilt, obsolete custom index dropped, message preserved).
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("legacy/index.db");
-        let destination = dir.path().join("new/index.db");
-        let receipt = dir.path().join("new/migration.json");
-        create_parent(&source).unwrap();
+        for version in [4, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("legacy/index.db");
+            let destination = dir.path().join("new/index.db");
+            let receipt = dir.path().join("new/migration.json");
+            create_parent(&source).unwrap();
 
-        // Full v4 schema via Db::open, then corrupt into the stamped-current hybrid via a plain
-        // connection (the migration test module cannot reach Db's private connection).
-        drop(crate::db::Db::open(&source).unwrap());
-        let seed = Connection::open(&source).unwrap();
-        seed.execute_batch(
+            // Create the current schema, then remove derived storage via a plain
+            // connection (the migration test module cannot reach Db's private connection).
+            drop(crate::db::Db::open(&source).unwrap());
+            let seed = Connection::open(&source).unwrap();
+            seed.execute_batch(
             "insert into sessions (id, provider, provider_session_id, preview_text, source_path,
                  parse_version, discovery_source)
                  values ('claude:mig', 'claude', 'mig', '', '/mig.jsonl', 'test', 'fixture');
@@ -870,31 +871,53 @@ mod tests {
              pragma user_version=4;",
         )
         .unwrap();
-        drop(seed);
+            if version == 5 {
+                seed.execute_batch(
+                    "drop index idx_messages_session_authorship_relation_seq;
+                drop index idx_messages_authorship_relation_ts;
+                alter table messages drop column input_origin;
+                alter table messages drop column input_delivery_state;
+                create index idx_messages_session_authorship_relation_seq
+                    on messages(session_id, authorship, record_relation, seq);
+                create index idx_messages_authorship_relation_ts
+                    on messages(authorship, record_relation, ts desc, session_id, seq);",
+                )
+                .unwrap();
+            }
+            seed.pragma_update(None, "user_version", version).unwrap();
+            drop(seed);
 
-        let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt);
-        let published = migrate_database(&options).unwrap();
-        assert_eq!(published.phase, DatabaseMigrationPhase::Published);
+            let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt);
+            let published = migrate_database(&options).unwrap();
+            assert_eq!(published.phase, DatabaseMigrationPhase::Published);
 
-        let dest =
-            Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        assert!(
-            crate::indexer::message_search_layout_problem(&dest)
-                .unwrap()
-                .is_none(),
-            "migrated v4 index must own its claimed FTS layout with no runtime self-heal needed"
-        );
-        let state: (i64, bool, bool, i64) = dest
-            .query_row(
-                "select (select user_version from pragma_user_version),
+            let dest = Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+            assert!(
+                crate::indexer::message_search_layout_problem(&dest)
+                    .unwrap()
+                    .is_none(),
+                "migrated index must own its claimed FTS layout with no runtime self-heal needed"
+            );
+            let state: (i64, bool, bool, i64) = dest
+                .query_row(
+                    "select (select user_version from pragma_user_version),
                         exists(select 1 from sqlite_schema where name='messages_trigram'),
                         not exists(select 1 from sqlite_schema where name='trigram_postings'),
                         (select count(*) from messages)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(state, (4, true, true, 1));
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, (version, true, true, 1));
+            if version == 5 {
+                assert!(
+                    crate::indexer::message_input_provenance_layout_problem(&dest)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]
@@ -926,7 +949,12 @@ mod tests {
              drop index idx_messages_authorship_relation_ts;
              alter table messages drop column input_delivery_state;
              alter table messages drop column input_origin;
-             pragma user_version = 5;",
+             create index idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq);
+             create index idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq);
+             pragma user_version = 5;
+             insert into messages_fts(rowid, content) values (1, 'rebuildsentinel');",
         )
         .unwrap();
         drop(seed);
@@ -954,6 +982,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(values, ("unknown".into(), "unknown".into(), 1));
+        // An FTS rebuild regenerates terms from message content and erases this index-only term.
+        let sentinel: i64 = migrated
+            .query_row(
+                "select count(*) from messages_fts where messages_fts match 'rebuildsentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sentinel, 1,
+            "additive migration must not rebuild healthy FTS"
+        );
+        for name in [
+            "idx_messages_session_authorship_relation_seq",
+            "idx_messages_authorship_relation_ts",
+        ] {
+            let columns = migrated
+                .prepare(&format!("pragma index_info({name})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                columns.last().map(String::as_str),
+                Some("input_origin"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

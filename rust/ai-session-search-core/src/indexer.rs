@@ -1827,6 +1827,12 @@ mod tests {
         config.providers.claude.paths = vec![normalize_path(&second_root)];
         reindex(&config, &db, false, None).unwrap();
         assert!(first.exists());
+        assert_eq!(
+            db.resolve_session_record("claude:hard-link")
+                .unwrap()
+                .source_path,
+            crate::util::canonical_source_path(&second)
+        );
         assert_eq!(db.message_count().unwrap(), 1);
         assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
     }
@@ -2730,6 +2736,10 @@ mod tests {
              drop index idx_messages_authorship_relation_ts;
              alter table messages drop column input_delivery_state;
              alter table messages drop column input_origin;
+             create index idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq);
+             create index idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq);
              pragma user_version = 5;",
         )
         .unwrap();
