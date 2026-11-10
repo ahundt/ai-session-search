@@ -3557,6 +3557,7 @@ impl FileQuery {
 /// One indexed message with canonical session, role, kind, tool, and content fields.
 #[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
+    provenance: Option<ai_session_search::models::HitProvenance>,
     #[pyo3(get)]
     session_id: String,
     #[pyo3(get)]
@@ -3583,6 +3584,10 @@ struct NativeMessageHit {
 #[pymethods]
 impl NativeMessageHit {
     #[getter]
+    fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        json_compatible(py, &self.provenance)
+    }
+    #[getter]
     fn refs(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeMessageRef>>> {
         self.refs
             .iter()
@@ -3600,6 +3605,7 @@ impl NativeMessageHit {
 impl From<MessageHit> for NativeMessageHit {
     fn from(hit: MessageHit) -> Self {
         Self {
+            provenance: hit.provenance.as_deref().map(Into::into),
             session_id: hit.session_id,
             provider: hit.provider.as_str().to_string(),
             seq: hit.seq,

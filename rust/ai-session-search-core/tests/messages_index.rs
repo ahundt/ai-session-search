@@ -47,6 +47,435 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
 }
 
 #[test]
+fn recorded_needles_survive_generated_copies_large_wrappers_and_refresh() {
+    use ai_session_search::db::MessageOrder;
+    use ai_session_search::message_search::{MatchWindow, SearchSurface};
+    use ai_session_search::service::MessageService;
+    use ai_session_search::{MessageQuery, MessageSearchRequest, MessageTarget, RequestedExtent};
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let mut generated = 0;
+    let mut records = String::new();
+    for seq in 0..3003 {
+        let genuine = [0, 1500, 3002].contains(&seq);
+        let assistant = !genuine && generated < 2000;
+        generated += usize::from(assistant);
+        let role = if assistant { "assistant" } else { "user" };
+        let content = if genuine || assistant {
+            "ordinal needle λ".to_string()
+        } else {
+            format!("haystack filler {seq}")
+        };
+        records.push_str(
+            &json!({"sessionId":"haystack", "uuid":format!("event-{seq}"),
+            "type":role, "cwd":"/fixture/haystack",
+            "timestamp":if assistant { "2026-06-02T12:00:00Z" } else { "2026-06-01T12:00:00Z" },
+            "message":{"role":role,"content":content}})
+            .to_string(),
+        );
+        records.push('\n');
+    }
+    let wrapper = "x".repeat(1_048_600) + "\0generated ordinal needle λ";
+    let expected_start = wrapper.chars().count() + 1;
+    records.push_str(
+        &json!({"sessionId":"haystack", "uuid":"mixed-tail", "type":"user",
+        "timestamp":"2026-06-01T12:00:00Z", "message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"generated-read","content":wrapper},
+            {"type":"text","text":"ordinal needle λ"}]}})
+        .to_string(),
+    );
+    records.push('\n');
+    std::fs::write(projects.join("haystack.jsonl"), records).unwrap();
+    let config = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&config.db_path()).unwrap();
+    indexer::reindex(&config, &db, false, None).unwrap();
+    drop(db);
+    // Old indexed evidence can coexist with current rows until source refresh repairs it.
+    let stored = rusqlite::Connection::open(config.db_path()).unwrap();
+    stored
+        .execute(
+            "update messages set authorship='unknown', input_origin='unknown'
+        where session_id='claude:haystack' and seq in (0,1500,3002)",
+            [],
+        )
+        .unwrap();
+    drop(stored);
+
+    for phase in 0..2 {
+        let db = Db::open(&config.db_path()).unwrap();
+        let stored = rusqlite::Connection::open(config.db_path()).unwrap();
+        let marker_count: i64 = stored
+            .query_row(
+                "select count(*) from messages
+            where session_id='claude:haystack' and seq in (0,1500,3002)
+              and authorship='unknown' and input_origin='unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, if phase == 0 { 3 } else { 0 });
+        drop(stored);
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            session_id: Some("claude:haystack".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        for (query, mode, accelerated) in [
+            ("ordinal needle", MessageSearchMode::Literal, true),
+            ("ordinal\\s+needle", MessageSearchMode::Regex, true),
+            ("λ", MessageSearchMode::Literal, false),
+            ("ordinal needle", MessageSearchMode::Fuzzy, false),
+        ] {
+            let (hits, explain) = db
+                .search_messages_with_explain(
+                    query,
+                    &MessageFilters {
+                        match_mode: mode,
+                        ..filters.clone()
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+                [0, 1500, 3002, 3003],
+                "{mode:?}/{query}"
+            );
+            let explain = explain.unwrap();
+            assert_eq!(explain.corpus, 1004);
+            if accelerated {
+                assert!(explain.prefilter_skipped.is_none());
+                assert_eq!(explain.candidates, Some(4));
+            }
+            assert_eq!(
+                explain.prefilter.is_some(),
+                accelerated,
+                "verify query path for {mode:?}/{query}"
+            );
+        }
+        for offset in 0..5 {
+            let hits = db
+                .search_messages(
+                    "ordinal needle",
+                    &MessageFilters {
+                        match_mode: MessageSearchMode::Fuzzy,
+                        limit: 1,
+                        offset,
+                        ..filters.clone()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+                [0, 1500, 3002, 3003]
+                    .get(offset)
+                    .copied()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+        }
+        let range = MessageFilters {
+            seq_from: Some(1400),
+            seq_to: Some(1600),
+            ..filters.clone()
+        };
+        assert_eq!(
+            db.read_session_messages(&range, MessageOrder::OldestFirst)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.seq)
+                .collect::<Vec<_>>(),
+            [1500]
+        );
+        let since = ai_session_search::util::parse_datetime("2026-06-02T00:00:00Z").unwrap();
+        assert!(db
+            .search_messages(
+                "ordinal needle",
+                &MessageFilters {
+                    since: Some(since),
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_messages(
+                "ordinal needle",
+                &MessageFilters {
+                    limit: 0,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            2004
+        );
+        assert!(db
+            .search_messages(
+                "ordinal needle",
+                &MessageFilters {
+                    path_prefix: Some("/wrong-workspace".into()),
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            db.search_messages(
+                "ordinal needle",
+                &MessageFilters {
+                    path_prefix: Some("/fixture/haystack".into()),
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .iter()
+            .map(|hit| hit.seq)
+            .collect::<Vec<_>>(),
+            [0, 1500, 3002, 3003]
+        );
+
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+        let response = service
+            .search(
+                MessageSearchRequest::builder(
+                    MessageQuery::literal("ordinal needle").unwrap(),
+                    MessageTarget::content(),
+                )
+                .role(Role::User)
+                .session_id("claude:haystack")
+                .unwrap()
+                .extent(RequestedExtent::page(Some(2), 0).unwrap())
+                .match_window(MatchWindow::Latest)
+                .build()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            response
+                .hits()
+                .iter()
+                .map(|hit| hit.message.seq)
+                .collect::<Vec<_>>(),
+            [3002, 3003]
+        );
+        assert_eq!(
+            response.hits()[1].literal_match().unwrap().field_start_char,
+            expected_start
+        );
+        indexer::reindex(&config, &db, true, None).unwrap();
+        assert_eq!(db.message_count().unwrap(), 3004);
+        let stored = rusqlite::Connection::open(config.db_path()).unwrap();
+        let restored: i64 = stored
+            .query_row(
+                "select count(*) from messages
+            where session_id='claude:haystack' and seq in (0,1500,3002)
+              and authorship='human' and input_origin='direct_conversation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restored, 3,
+            "source refresh must repair evidence, not merely retain membership"
+        );
+    }
+}
+
+#[test]
+fn historical_corrections_are_recovered_from_queue_and_interactive_input() {
+    use ai_session_search::message_search::SearchSurface;
+    use ai_session_search::service::MessageService;
+    use ai_session_search::{MessageQuery, MessageSearchRequest, MessageTarget};
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let events = [
+        json!({"type":"assistant","sessionId":"historical-input","timestamp":"2026-06-16T20:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"question-1","name":"AskUserQuestion","input":{"questions":[]}}]}}),
+        json!({"type":"user","sessionId":"historical-input","uuid":"answer-1","timestamp":"2026-06-16T20:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"question-1","content":"User has answered your questions: \"Quality?\"=\"reticule correction\". You can now continue."}]},"toolUseResult":{"answers":{"Quality?":"reticule correction"}}}),
+        json!({"type":"queue-operation","operation":"enqueue","sessionId":"historical-input","timestamp":"2026-06-16T20:02:00Z","content":"liquid correction"}),
+        json!({"type":"queue-operation","operation":"enqueue","sessionId":"historical-input","timestamp":"2026-06-16T20:03:00Z","content":"vision correction"}),
+        json!({"type":"queue-operation","operation":"popAll","sessionId":"historical-input","timestamp":"2026-06-16T20:04:00Z","content":"vision correction"}),
+        json!({"type":"assistant","sessionId":"historical-input","timestamp":"2026-06-16T20:05:00Z","message":{"role":"assistant","content":"quoted correction"}}),
+    ];
+    let text = events
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(projects.join("historical-input.jsonl"), text).unwrap();
+    let config = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&config.db_path()).unwrap();
+    indexer::reindex(&config, &db, true, None).unwrap();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    let request = |selection| {
+        {
+            let builder = MessageSearchRequest::builder(
+                MessageQuery::literal("correction").unwrap(),
+                MessageTarget::content(),
+            );
+            if let Some(role) = selection {
+                builder.role(role)
+            } else {
+                builder
+            }
+        }
+        .build()
+        .unwrap()
+    };
+    let response = service.search(request(Some(Role::User))).unwrap();
+    assert_eq!(
+        response.hits().len(),
+        3,
+        "input-focused retrieval must retain submitted inputs with unknown senders"
+    );
+    for queued in ["liquid correction", "vision correction"] {
+        let hit = response
+            .hits()
+            .iter()
+            .find(|hit| hit.message.content == queued)
+            .expect("recorded queue input remains findable");
+        assert_eq!(
+            hit.message.provenance.as_ref().unwrap().authorship,
+            ai_session_search::models::MessageAuthorship::Unknown
+        );
+    }
+    let complete = service.search(request(None)).unwrap();
+    assert_eq!(complete.hits().len(), 4);
+    for queued in ["liquid correction", "vision correction"] {
+        assert_eq!(
+            complete
+                .hits()
+                .iter()
+                .filter(|hit| hit.message.content == queued)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        response
+            .hits()
+            .iter()
+            .filter(|hit| hit.message.role == Role::Tool)
+            .count(),
+        1
+    );
+    for hit in response.hits() {
+        assert!(hit.message.ts.is_some());
+        let provenance = hit.message.provenance.as_ref().unwrap();
+        assert!(provenance.correlation_identity.is_some());
+        let occurrence = hit.literal_match().unwrap();
+        assert_eq!(
+            hit.message
+                .content
+                .chars()
+                .skip(occurrence.field_start_char)
+                .take(occurrence.field_end_char_exclusive - occurrence.field_start_char)
+                .collect::<String>(),
+            "correction"
+        );
+    }
+    indexer::reindex(&config, &db, true, None).unwrap();
+    assert_eq!(
+        service.search(request(None)).unwrap().hits().len(),
+        4,
+        "refresh must not multiply queue evidence"
+    );
+    assert_eq!(
+        service
+            .search(request(Some(Role::User)))
+            .unwrap()
+            .hits()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn user_input_search_preserves_nul_and_unicode_in_prompts_and_answers() {
+    use ai_session_search::message_search::SearchSurface;
+    use ai_session_search::service::MessageService;
+    use ai_session_search::{MessageQuery, MessageSearchRequest, MessageTarget};
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let answer = "\0évidence 🦀";
+    let events = [
+        json!({"type":"user","sessionId":"nul-input","uuid":"direct","message":{"role":"user","content":answer}}),
+        json!({"type":"assistant","sessionId":"nul-input","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-nul","name":"AskUserQuestion","input":{}}]}}),
+        json!({"type":"user","sessionId":"nul-input","uuid":"answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-nul","content":format!("generated wrapper: {answer}")}]},"toolUseResult":{"response":answer}}),
+        json!({"type":"assistant","sessionId":"nul-input","message":{"role":"assistant","content":answer}}),
+    ];
+    let text = events
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(projects.join("nul-input.jsonl"), text).unwrap();
+    let config = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&config.db_path()).unwrap();
+    indexer::reindex(&config, &db, true, None).unwrap();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    for query in [
+        MessageQuery::literal("évidence").unwrap(),
+        MessageQuery::literal("\0évidence").unwrap(),
+        MessageQuery::regex("évidence 🦀$").unwrap(),
+        MessageQuery::regex("\\x00évidence").unwrap(),
+    ] {
+        let request = MessageSearchRequest::builder(query, MessageTarget::content())
+            .role(Role::User)
+            .build()
+            .unwrap();
+        let response = service.search(request).unwrap();
+        assert_eq!(
+            response.hits().len(),
+            2,
+            "direct and mixed user content after NUL must remain findable"
+        );
+        assert!(response
+            .hits()
+            .iter()
+            .any(|hit| hit.message.role == Role::Tool));
+        assert!(response
+            .hits()
+            .iter()
+            .all(|hit| hit.message.role != Role::Assistant));
+    }
+    for (query, match_mode) in [
+        ("", MessageSearchMode::Literal),
+        ("évidence", MessageSearchMode::Literal),
+        ("évd", MessageSearchMode::Fuzzy),
+    ] {
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            match_mode,
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(db.search_messages(query, &filters).unwrap().len(), 2);
+    }
+    assert_eq!(
+        db.search_messages("évidence", &MessageFilters::default())
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        db.search_messages("\0évidence", &MessageFilters::default())
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
 fn messages_role_counts_match_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
@@ -272,7 +701,7 @@ fn search_messages_filters_by_role_substring_and_regex() {
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
 
-    // Role filter: exactly the 2 plain user turns (the slash turn is Role::Slash).
+    // User input includes the two prompts and the user-entered slash command.
     let users = db
         .search_messages(
             "",
@@ -282,8 +711,9 @@ fn search_messages_filters_by_role_substring_and_regex() {
             },
         )
         .unwrap();
-    assert_eq!(users.len(), 2);
-    assert!(users.iter().all(|m| m.role == Role::User));
+    assert_eq!(users.len(), 3);
+    assert_eq!(users.iter().filter(|m| m.role == Role::User).count(), 2);
+    assert_eq!(users.iter().filter(|m| m.role == Role::Slash).count(), 1);
 
     // Role::Slash matches the single slash-command turn.
     let slash = db

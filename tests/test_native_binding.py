@@ -21,11 +21,38 @@ import ai_session_search
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
+def test_human_content_selection_changes_membership_and_preserves_coordinates(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    search = native.SessionSearch(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+            values ('claude:human', 'claude', 'human', '', '/human', 'test', 'test');
+            insert into messages(id, session_id, provider, seq, role, kind, content, authorship, record_relation)
+            values (1, 'claude:human', 'claude', 0, 'tool', 'tool_result', 'needle generated', 'generated', 'original'),
+                   (2, 'claude:human', 'claude', 1, 'tool', 'tool_result', 'needle wrapper éneedle', 'mixed', 'original');
+            insert into message_content_parts(message_id, ordinal, start_char, end_char, authorship, origin)
+            values (2, 0, 0, 15, 'generated', 'tool_payload'),
+                   (2, 1, 15, 22, 'human', 'direct_input');
+        """)
+    response = search.search_messages("needle", native.MessageSearchRequest(role="user", limit=1, receipt_level="full"))
+    assert len(response.results) == 1
+    result = response.results[0]
+    assert result["message_ref"]["message_seq"] == 1
+    assert result["message_metadata"]["role"] == "tool"
+    assert result["match"]["literal_occurrence"]["field_start_char"] == 16
+    assert result["message_metadata"]["provenance"]["authorship"] == "mixed"
+    assert "input_scope" not in response.effective_request
+    assert "input_scope" not in response.receipt["parameter_origins"]
+    assert len(search.search_messages("needle").results) == 2
+    assert len(search.search_messages("needle", native.MessageSearchRequest(role="user")).results) == 1
+
+
 def test_message_search_request_exposes_only_final_presentation_and_include_controls() -> None:
     parameters = inspect.signature(native.MessageSearchRequest).parameters
     for name in ("detail", "field_view", "match_view", "include"):
         assert name in parameters
-    for removed in ("include_refs", "match_evidence_max_chars"):
+    for removed in ("include_refs", "match_evidence_max_chars", "input_scope"):
         assert removed not in parameters
 
 
@@ -1941,7 +1968,7 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
     assert seqs(search.read_session_messages("reads", order="newest", limit=2)) == [2, 3]
     assert seqs(search.read_session_messages("reads", order="oldest", limit=2)) == [0, 1]
     # role composes with the newest-N window.
-    assert seqs(search.read_session_messages("reads", order="newest", role="user", limit=1)) == [2]
+    assert seqs(search.read_session_messages("reads", order="newest", role="user", limit=1)) == [3]
     # inclusive seq range is the non-overlapping chunked-read primitive.
     assert seqs(search.read_session_messages("reads", seq_from=1, seq_to=2)) == [1, 2]
     # offset paginates the oldest-first window.
@@ -2319,7 +2346,7 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
     database = tmp_path / "index.db"
     native.SessionSearch(database)
     session = spec["session_id"]
-    rows = [(m["seq"], m["role"], m["content"], None, "conversation") for m in spec["messages"]]
+    rows = [(m["seq"], m["role"], m["content"], None, m.get("kind", "conversation")) for m in spec["messages"]]
     bulk = spec["bulk"]
     rows += [(bulk["first_seq"] + i, bulk["role"], f"{bulk['content_prefix']} {i}", None, "conversation") for i in range(bulk["count"])]
     twins = spec["twins"]
@@ -2342,9 +2369,27 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
             "insert into messages (session_id, provider, seq, role, kind, content, tool_name) values (?, 'claude', ?, ?, ?, ?, ?)",
             [(session, seq, role, kind, content, tool_name) for seq, role, content, tool_name, kind in rows],
         )
+        connection.execute("update messages set authorship=case when role='user' then 'human' else 'agent' end, record_relation='original'")
+        for message in spec["messages"]:
+            if "provenance" not in message:
+                continue
+            provenance = message["provenance"]
+            connection.execute(
+                "update messages set authorship=?,record_relation=?,input_origin=?,input_delivery_state=? where session_id=? and seq=? and role=?",
+                (provenance["authorship"], provenance["record_relation"], provenance["input_origin"], provenance["input_delivery_state"], session, message["seq"], message["role"]),
+            )
+            message_id = connection.execute("select id from messages where session_id=? and seq=? and role=?", (session, message["seq"], message["role"])).fetchone()[0]
+            connection.executemany(
+                "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values(?,?,?,?,?,?)",
+                [(message_id, part["ordinal"], part["start_char"], part["end_char"], part["authorship"], part["origin"]) for part in provenance["content_parts"]],
+            )
         connection.commit()
+        # Fixture inserts use Python's SQLite, whose older trigram tokenizer stops at NUL.
+        # Rebuild the derived index with the product's bundled SQLite before testing parity.
+        connection.execute("drop table messages_trigram")
     finally:
         connection.close()
+    native.SessionSearch(database)
     return database, spec
 
 
@@ -2371,6 +2416,7 @@ def _binding_search(database: Path, spec: dict, case: dict, offset: int = 0, lim
         all_results=case.get("all_results", False),
         match_window=case.get("match_window"),
         field=case.get("field", "content"),
+        role=case.get("role"),
     )
     return native.SessionSearch(database).search_messages(case["query"], request, query_mode=case["mode"])
 
@@ -2397,6 +2443,8 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
         str(offset),
     ]
     limit = limit if limit is not None else case.get("limit")
+    if case.get("role"):
+        command += ["--role", case["role"]]
     if case.get("field"):
         command += ["--field", case["field"].replace("_", "-")]
     if case.get("all_results"):

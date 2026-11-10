@@ -661,8 +661,8 @@ pub struct MessageSearchArgs {
         allow_hyphen_values = true
     )]
     pub query_arg: Option<String>,
-    /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
-    /// slash (human-entered commands), or compaction. Omit for every role.
+    /// user selects recorded prompts, commands, queued inputs and answers across source roles;
+    /// other values select stored assistant, tool, slash or compaction records. Omit for all content.
     #[arg(help_heading = FILTER_HEADING, long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict by semantic message kind; tool calls and results are distinct. One-value alias
@@ -845,7 +845,8 @@ pub struct MessageGetArgs {
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
-    /// Filter by role. Omit for every role.
+    /// user selects recorded input across source roles; other values select stored roles.
+    /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     #[command(flatten)]
@@ -890,7 +891,8 @@ pub struct MessageGetArgs {
 pub struct TimelineArgs {
     /// Session id or prefix.
     pub id: String,
-    /// Filter by role. Omit for every role.
+    /// user selects recorded input across source roles; other values select stored roles.
+    /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     /// Keep only messages containing this literal substring. Omit to keep every message the other
@@ -1926,6 +1928,7 @@ mod tests {
 
     fn sample_hit(seq: i64, content: &str) -> MessageHit {
         MessageHit {
+            provenance: None,
             session_id: "claude:s1".to_string(),
             provider: Provider::Claude,
             seq,
@@ -2521,6 +2524,7 @@ mod tests {
     #[test]
     fn structured_context_rows_reuse_complete_message_hit_metadata() {
         let hit = MessageHit {
+            provenance: None,
             session_id: "codex:context-contract".to_string(),
             provider: Provider::Codex,
             seq: 7,

@@ -678,6 +678,12 @@ fn ensure_migrated_index_is_current(conn: &Connection, path: &Path) -> Result<()
     if !matches!(version, 4 | crate::db::SCHEMA_VERSION) {
         return Ok(());
     }
+    // Schema 5 was released before these two additive provenance columns. Install them in the
+    // copied staging database before checking the derived layout; a healthy old index then avoids
+    // an unnecessary FTS rebuild while still gaining the storage required by `role=user` search.
+    if version == crate::db::SCHEMA_VERSION && crate::indexer::base_data_intact(conn)? {
+        crate::db::ensure_message_input_provenance_storage(conn)?;
+    }
     // A current stamp with a consistent layout is already publishable.
     let layout_problem = if version == 4 {
         crate::indexer::message_search_layout_problem(conn)?
@@ -837,17 +843,18 @@ mod tests {
         // pre-publish consistency gate the migration would republish it as "healthy" and the index
         // would dead-lock at open. Assert the published index is instead self-consistent (opens
         // Current, FTS5 trigram rebuilt, obsolete custom index dropped, message preserved).
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("legacy/index.db");
-        let destination = dir.path().join("new/index.db");
-        let receipt = dir.path().join("new/migration.json");
-        create_parent(&source).unwrap();
+        for version in [4, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("legacy/index.db");
+            let destination = dir.path().join("new/index.db");
+            let receipt = dir.path().join("new/migration.json");
+            create_parent(&source).unwrap();
 
-        // Full v4 schema via Db::open, then corrupt into the stamped-current hybrid via a plain
-        // connection (the migration test module cannot reach Db's private connection).
-        drop(crate::db::Db::open(&source).unwrap());
-        let seed = Connection::open(&source).unwrap();
-        seed.execute_batch(
+            // Create the current schema, then remove derived storage via a plain
+            // connection (the migration test module cannot reach Db's private connection).
+            drop(crate::db::Db::open(&source).unwrap());
+            let seed = Connection::open(&source).unwrap();
+            seed.execute_batch(
             "insert into sessions (id, provider, provider_session_id, preview_text, source_path,
                  parse_version, discovery_source)
                  values ('claude:mig', 'claude', 'mig', '', '/mig.jsonl', 'test', 'fixture');
@@ -864,31 +871,146 @@ mod tests {
              pragma user_version=4;",
         )
         .unwrap();
-        drop(seed);
+            if version == 5 {
+                seed.execute_batch(
+                    "drop index idx_messages_session_authorship_relation_seq;
+                drop index idx_messages_authorship_relation_ts;
+                alter table messages drop column input_origin;
+                alter table messages drop column input_delivery_state;
+                create index idx_messages_session_authorship_relation_seq
+                    on messages(session_id, authorship, record_relation, seq);
+                create index idx_messages_authorship_relation_ts
+                    on messages(authorship, record_relation, ts desc, session_id, seq);",
+                )
+                .unwrap();
+            }
+            seed.pragma_update(None, "user_version", version).unwrap();
+            drop(seed);
 
-        let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt);
-        let published = migrate_database(&options).unwrap();
-        assert_eq!(published.phase, DatabaseMigrationPhase::Published);
+            let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt);
+            let published = migrate_database(&options).unwrap();
+            assert_eq!(published.phase, DatabaseMigrationPhase::Published);
 
-        let dest =
-            Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        assert!(
-            crate::indexer::message_search_layout_problem(&dest)
-                .unwrap()
-                .is_none(),
-            "migrated v4 index must own its claimed FTS layout with no runtime self-heal needed"
-        );
-        let state: (i64, bool, bool, i64) = dest
-            .query_row(
-                "select (select user_version from pragma_user_version),
+            let dest = Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+            assert!(
+                crate::indexer::message_search_layout_problem(&dest)
+                    .unwrap()
+                    .is_none(),
+                "migrated index must own its claimed FTS layout with no runtime self-heal needed"
+            );
+            let state: (i64, bool, bool, i64) = dest
+                .query_row(
+                    "select (select user_version from pragma_user_version),
                         exists(select 1 from sqlite_schema where name='messages_trigram'),
                         not exists(select 1 from sqlite_schema where name='trigram_postings'),
                         (select count(*) from messages)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, (version, true, true, 1));
+            if version == 5 {
+                assert!(
+                    crate::indexer::message_input_provenance_layout_problem(&dest)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migrating_released_schema_five_adds_provenance_without_rebuilding_fts_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy/index.db");
+        let destination = dir.path().join("new/index.db");
+        let receipt = dir.path().join("new/migration.json");
+
+        drop(crate::db::Db::open(&source).unwrap());
+        let seed = Connection::open(&source).unwrap();
+        seed.execute(
+            "insert into sessions
+             (id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+             values ('claude:mig', 'claude', 'mig', 'migration', '/missing', 'test', 'fixture')",
+            [],
+        )
+        .unwrap();
+        seed.execute(
+            "insert into messages (session_id, provider, seq, role, kind, content)
+             values ('claude:mig', 'claude', 0, 'user', 'conversation', 'migration provenance needle')",
+            [],
+        )
+        .unwrap();
+        // Reproduce the released v1.0.0 schema-5 shape: the FTS objects and all original message
+        // columns remain, while the two later additive provenance columns do not.
+        seed.execute_batch(
+            "drop index idx_messages_session_authorship_relation_seq;
+             drop index idx_messages_authorship_relation_ts;
+             alter table messages drop column input_delivery_state;
+             alter table messages drop column input_origin;
+             create index idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq);
+             create index idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq);
+             pragma user_version = 5;
+             insert into messages_fts(rowid, content) values (1, 'rebuildsentinel');",
+        )
+        .unwrap();
+        drop(seed);
+
+        let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt);
+        migrate_database(&options).unwrap();
+
+        let migrated =
+            Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(crate::indexer::current_schema_layout_problem(&migrated)
+            .unwrap()
+            .is_none());
+        assert!(
+            crate::indexer::message_input_provenance_layout_problem(&migrated)
+                .unwrap()
+                .is_none()
+        );
+        let values: (String, String, i64) = migrated
+            .query_row(
+                "select input_delivery_state, input_origin,
+                        (select count(*) from messages_fts where messages_fts match 'provenance')
+                 from messages where id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(state, (4, true, true, 1));
+        assert_eq!(values, ("unknown".into(), "unknown".into(), 1));
+        // An FTS rebuild regenerates terms from message content and erases this index-only term.
+        let sentinel: i64 = migrated
+            .query_row(
+                "select count(*) from messages_fts where messages_fts match 'rebuildsentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sentinel, 1,
+            "additive migration must not rebuild healthy FTS"
+        );
+        for name in [
+            "idx_messages_session_authorship_relation_seq",
+            "idx_messages_authorship_relation_ts",
+        ] {
+            let columns = migrated
+                .prepare(&format!("pragma index_info({name})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                columns.last().map(String::as_str),
+                Some("input_origin"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

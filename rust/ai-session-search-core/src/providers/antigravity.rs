@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 
 use crate::models::{
     ContentPartAuthorship, ContentPartOrigin, FileEdit, MessageAuthorship, MessageContentPart,
-    MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
+    MessageCorrelationAuthority, MessageInputOrigin, ParsedSession, Provider, SessionRecord,
+    SourceFile,
 };
 use crate::providers::{walk_roots, ProviderDiscovery};
 use crate::util::{
@@ -188,11 +189,25 @@ impl AntigravityAdapter {
                     } else {
                         RawMessage::message(role, text.clone(), timestamp, None)
                     };
-                    if role == "user" && source == "USER_EXPLICIT" {
-                        raw_message = match antigravity_user_request_parts(&text) {
-                            Some(parts) => raw_message.with_content_parts(parts),
-                            None => raw_message.with_authorship(MessageAuthorship::Human),
+                    let is_native_input = role == "user"
+                        && (record_type == "USER_INPUT"
+                            || source == "USER_EXPLICIT"
+                            || (record_type.is_empty() && source == "USER"));
+                    if is_native_input {
+                        // Native input purpose is known even when its sender is unknown.
+                        raw_message =
+                            raw_message.with_input_origin(MessageInputOrigin::DirectConversation);
+                        let input_authorship = if source == "USER_EXPLICIT" {
+                            ContentPartAuthorship::Human
+                        } else {
+                            ContentPartAuthorship::Unknown
                         };
+                        if let Some(parts) = antigravity_user_request_parts(&text, input_authorship)
+                        {
+                            raw_message = raw_message.with_content_parts(parts);
+                        } else if source == "USER_EXPLICIT" {
+                            raw_message = raw_message.with_authorship(MessageAuthorship::Human);
+                        }
                     }
                     if let Some(step_index) = value.get("step_index").and_then(Value::as_i64) {
                         raw_message = raw_message.with_native_event_identity(
@@ -268,7 +283,11 @@ impl AntigravityAdapter {
             agent_label: None,
         };
 
-        let messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
+            crate::util::UserRoleAuthorshipEvidence::Unverified,
+        );
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
@@ -278,15 +297,29 @@ impl AntigravityAdapter {
     }
 }
 
-fn antigravity_user_request_parts(content: &str) -> Option<Vec<MessageContentPart>> {
+fn antigravity_user_request_parts(
+    content: &str,
+    direct_authorship: ContentPartAuthorship,
+) -> Option<Vec<MessageContentPart>> {
     const OPEN: &str = "<USER_REQUEST>\n";
     const CLOSE: &str = "\n</USER_REQUEST>";
-    let direct_input = content.strip_prefix(OPEN)?.strip_suffix(CLOSE)?;
+    let after_open = content.strip_prefix(OPEN)?;
+    let body_start_byte = OPEN.len();
+    // The outer close is the last close. This preserves literal/repeated close tags in the
+    // input body, while an unrecognized suffix falls back to the whole native input below.
+    let close_start_byte = after_open
+        .rfind(CLOSE)
+        .map(|offset| body_start_byte + offset)?;
+    let direct_input = &content[body_start_byte..close_start_byte];
     if direct_input.is_empty() {
         return None;
     }
-    let open_end = OPEN.chars().count();
-    let input_end = open_end + direct_input.chars().count();
+    let suffix = &content[close_start_byte + CLOSE.len()..];
+    if !suffix.is_empty() && !is_antigravity_metadata_suffix(suffix) {
+        return None;
+    }
+    let open_end = content[..body_start_byte].chars().count();
+    let input_end = content[..close_start_byte].chars().count();
     let content_end = content.chars().count();
     Some(vec![
         MessageContentPart {
@@ -300,7 +333,7 @@ fn antigravity_user_request_parts(content: &str) -> Option<Vec<MessageContentPar
             ordinal: 1,
             start_char: open_end,
             end_char: input_end,
-            authorship: ContentPartAuthorship::Human,
+            authorship: direct_authorship,
             origin: ContentPartOrigin::DirectInput,
         },
         MessageContentPart {
@@ -311,6 +344,30 @@ fn antigravity_user_request_parts(content: &str) -> Option<Vec<MessageContentPar
             origin: ContentPartOrigin::HarnessContext,
         },
     ])
+}
+
+fn is_antigravity_metadata_suffix(mut suffix: &str) -> bool {
+    const SECTIONS: [(&str, &str); 2] = [
+        ("<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>"),
+        ("<USER_SETTINGS_CHANGE>", "</USER_SETTINGS_CHANGE>"),
+    ];
+    let mut section_count = 0;
+    while !suffix.is_empty() {
+        suffix = suffix.trim_start_matches(['\n', '\r']);
+        if suffix.is_empty() {
+            break;
+        }
+        let Some((open, close)) = SECTIONS.iter().find(|(open, _)| suffix.starts_with(open)) else {
+            return false;
+        };
+        let body = &suffix[open.len()..];
+        let Some(close_start) = body.find(close) else {
+            return false;
+        };
+        suffix = &body[close_start + close.len()..];
+        section_count += 1;
+    }
+    section_count > 0
 }
 
 fn antigravity_transcript_priority(path: &Path) -> u8 {
@@ -478,6 +535,10 @@ mod tests {
             crate::models::MessageAuthorship::Human
         );
         assert_eq!(
+            parsed.messages[0].provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::DirectConversation)
+        );
+        assert_eq!(
             parsed.messages[0]
                 .provenance
                 .correlation_identity
@@ -550,6 +611,224 @@ mod tests {
             })
             .expect("VIEW_FILE result step indexed as a tool message");
         assert!(result.content.contains("File Path:"));
+    }
+
+    #[test]
+    fn native_user_input_keeps_unknown_sender_but_selects_only_request_body() {
+        let content = concat!(
+            "<USER_REQUEST>\n",
+            "needle direct 🦀\n",
+            "</USER_REQUEST>\n",
+            "<ADDITIONAL_METADATA>\n",
+            "needle generated metadata\n",
+            "</ADDITIONAL_METADATA>",
+        );
+        let parsed = AntigravityAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(
+                    serde_json::json!({"type": "USER_INPUT", "content": content}).to_string(),
+                ),
+                Path::new("/tmp/antigravity/session/.system_generated/logs/transcript.jsonl"),
+            )
+            .expect("native input record parses");
+        let parsed_message = &parsed.messages[0];
+        assert_eq!(
+            parsed_message.provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(
+            parsed_message.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::DirectConversation)
+        );
+        assert_eq!(
+            parsed_message.provenance.content_parts[1].authorship,
+            crate::models::ContentPartAuthorship::Unknown
+        );
+        parsed_message
+            .provenance
+            .validate(content)
+            .expect("Unicode-scalar wrapper ranges cover the complete source text");
+
+        let directory = tempdir().unwrap();
+        let db = crate::db::Db::open(&directory.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let user_input = |needle| {
+            crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(needle).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .role(crate::models::Role::User)
+            .build()
+            .unwrap()
+        };
+        let direct = service.search(user_input("needle direct 🦀")).unwrap();
+        assert_eq!(direct.hits().len(), 1);
+        let metadata = service
+            .search(user_input("needle generated metadata"))
+            .unwrap();
+        assert!(metadata.hits().is_empty());
+        let any = service
+            .search(
+                crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal("needle generated metadata")
+                        .unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                )
+                .build()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(any.hits().len(), 1);
+        assert_eq!(any.hits()[0].message.content, content);
+    }
+
+    #[test]
+    fn source_user_without_type_is_direct_input_without_sender_claim() {
+        let records = concat!(
+            r#"{"source":"USER","content":"same phrase"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"same phrase"}"#,
+            "\n",
+            r#"{"type":"RUN_COMMAND","source":"USER","content":"same phrase"}"#,
+        );
+        let parsed = AntigravityAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(records),
+                Path::new("/tmp/antigravity/session/.system_generated/logs/transcript.jsonl"),
+            )
+            .expect("source-only native records parse");
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        assert_eq!(
+            parsed.messages[0].provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::DirectConversation)
+        );
+        assert_eq!(
+            parsed.messages[1].provenance.input_origin, None,
+            "generated output with the same phrase is not an input record"
+        );
+        assert_eq!(
+            parsed.messages[2].provenance.input_origin, None,
+            "a weak source marker does not override a typed tool record"
+        );
+
+        let directory = tempdir().unwrap();
+        let db = crate::db::Db::open(&directory.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let response = service
+            .search(
+                crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal("same phrase").unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                )
+                .role(crate::models::Role::User)
+                .build()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(response.hits().len(), 1);
+        assert_eq!(response.hits()[0].message.role, crate::models::Role::User);
+    }
+
+    #[test]
+    fn user_request_partition_is_bounded_for_empty_malformed_and_repeated_wrappers() {
+        assert!(antigravity_user_request_parts(
+            "<USER_REQUEST>\n\n</USER_REQUEST>",
+            ContentPartAuthorship::Unknown
+        )
+        .is_none());
+        assert!(antigravity_user_request_parts(
+            "<USER_REQUEST>\nmissing close",
+            ContentPartAuthorship::Unknown
+        )
+        .is_none());
+        let repeated =
+            "<USER_REQUEST>\nfirst\n</USER_REQUEST>\n<USER_REQUEST>\nsecond\n</USER_REQUEST>";
+        let parts = antigravity_user_request_parts(repeated, ContentPartAuthorship::Unknown)
+            .expect("the outer wrapper keeps both input fragments");
+        assert_eq!(
+            parts
+                .iter()
+                .find(|part| part.origin == ContentPartOrigin::DirectInput)
+                .map(|part| repeated
+                    .chars()
+                    .skip(part.start_char)
+                    .take(part.end_char - part.start_char)
+                    .collect::<String>()),
+            Some("first\n</USER_REQUEST>\n<USER_REQUEST>\nsecond".to_string())
+        );
+        assert_eq!(
+            parts[2].start_char,
+            repeated.chars().count() - "\n</USER_REQUEST>".chars().count()
+        );
+
+        let literal = "<USER_REQUEST>\nuser literal </USER_REQUEST> marker\n</USER_REQUEST>";
+        let literal_parts = antigravity_user_request_parts(literal, ContentPartAuthorship::Unknown)
+            .expect("literal close remains in the outer body");
+        assert_eq!(
+            literal_parts[1].end_char,
+            literal.chars().count() - "\n</USER_REQUEST>".chars().count()
+        );
+        assert!(is_antigravity_metadata_suffix(
+            "\n<ADDITIONAL_METADATA>\ncreated by harness\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nchanged\n</USER_SETTINGS_CHANGE>"
+        ));
+        assert!(!is_antigravity_metadata_suffix("\nuser tail"));
+        assert!(is_antigravity_metadata_suffix(
+            "\n<ADDITIONAL_METADATA>generated</ADDITIONAL_METADATA>\r\n"
+        ));
+
+        let records = concat!(
+            r#"{"type":"USER_INPUT","content":"<USER_REQUEST>\nfirst\n</USER_REQUEST>\n<USER_REQUEST>\nsecond\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"type":"USER_INPUT","content":"<USER_REQUEST>\nuser literal </USER_REQUEST> marker\n</USER_REQUEST>"}"#,
+        );
+        let parsed = AntigravityAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(records),
+                Path::new("/tmp/antigravity/session/.system_generated/logs/transcript.jsonl"),
+            )
+            .unwrap();
+        let directory = tempdir().unwrap();
+        let db = crate::db::Db::open(&directory.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        for needle in ["second", "marker"] {
+            let response = service
+                .search(
+                    crate::message_search::MessageSearchRequest::builder(
+                        crate::message_search::MessageQuery::literal(needle).unwrap(),
+                        crate::message_search::MessageTarget::content(),
+                    )
+                    .role(crate::models::Role::User)
+                    .build()
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(response.hits().len(), 1, "{needle} remains findable");
+        }
     }
 
     #[test]

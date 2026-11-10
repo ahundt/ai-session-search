@@ -91,18 +91,33 @@ fn fixture() -> Fixture {
         tool_call_id: None,
         content,
         is_compaction: false,
-        provenance: Default::default(),
+        provenance: ai_session_search::models::MessageProvenance {
+            authorship: if role == Role::User {
+                ai_session_search::models::MessageAuthorship::Human
+            } else {
+                ai_session_search::models::MessageAuthorship::Agent
+            },
+            record_relation: ai_session_search::models::MessageRecordRelation::Original,
+            ..Default::default()
+        },
     };
     let mut messages: Vec<Message> = spec["messages"]
         .as_array()
         .unwrap()
         .iter()
         .map(|m| {
-            message(
+            let mut message = message(
                 m["seq"].as_i64().unwrap(),
                 role(m["role"].as_str().unwrap()),
                 m["content"].as_str().unwrap().to_string(),
-            )
+            );
+            if let Some(provenance) = m.get("provenance") {
+                message.provenance = serde_json::from_value(provenance.clone()).unwrap();
+            }
+            if let Some(kind) = m.get("kind") {
+                message.kind = serde_json::from_value(kind.clone()).unwrap();
+            }
+            message
         })
         .collect();
     let bulk = &spec["bulk"];
@@ -222,6 +237,7 @@ fn expected(spec: &Value, value: &Value) -> Ids {
 /// deliberately surface-specific omitted limit.
 #[derive(Clone, Debug)]
 struct Search {
+    role: Option<String>,
     mode: String,
     /// `None` searches content; otherwise the snake_case field name MCP and Python use.
     field: Option<String>,
@@ -235,6 +251,7 @@ struct Search {
 impl Search {
     fn from_case(case: &Value) -> Self {
         Self {
+            role: case["role"].as_str().map(str::to_owned),
             mode: case["mode"].as_str().unwrap().into(),
             field: case["field"].as_str().map(str::to_string),
             query: case["query"].as_str().unwrap().into(),
@@ -251,6 +268,7 @@ fn service_search(f: &Fixture, surface: SearchSurface, search: &Search) -> anyho
     let config = Config::default();
     let service = MessageService::new(&config, &db, surface);
     let query = match search.mode.as_str() {
+        _ if search.query.is_empty() => MessageQuery::All,
         "literal" => MessageQuery::literal(&search.query)?,
         "regex" => MessageQuery::regex(&search.query)?,
         "fuzzy" => MessageQuery::fuzzy(&search.query)?,
@@ -267,6 +285,9 @@ fn service_search(f: &Fixture, surface: SearchSurface, search: &Search) -> anyho
         Some(other) => panic!("field {other}"),
     };
     let mut builder = MessageSearchRequest::builder(query, target).extent(extent);
+    if let Some(value) = &search.role {
+        builder = builder.role(value.parse::<Role>().unwrap());
+    }
     if search.latest_in_session {
         builder = builder
             .session_id(f.spec["session_id"].as_str().unwrap())?
@@ -336,6 +357,9 @@ fn cli_search(f: &Fixture, search: &Search) -> Result<Value, String> {
         "--offset",
         &search.offset.to_string(),
     ]);
+    if let Some(value) = &search.role {
+        command.args(["--role", value]);
+    }
     if let Some(field) = &search.field {
         command.args(["--field", &field.replace('_', "-")]);
     }
@@ -373,6 +397,9 @@ fn mcp_searches(f: &Fixture, searches: &[Search]) -> Vec<Result<Value, String>> 
                 "offset": search.offset,
                 "index_refresh": "existing-only",
             });
+            if let Some(value) = &search.role {
+                arguments["role"] = json!(value);
+            }
             if let Some(field) = &search.field {
                 arguments["field"] = json!(field);
             }
@@ -501,6 +528,7 @@ fn paging_one_row_at_a_time_reproduces_the_whole_order_on_every_interface() {
         let pages: Vec<Search> = (0..want.len() + page)
             .step_by(page)
             .map(|offset| Search {
+                role: walk["role"].as_str().map(str::to_owned),
                 mode: walk["mode"].as_str().unwrap().into(),
                 field: walk["field"].as_str().map(str::to_string),
                 query: walk["query"].as_str().unwrap().into(),
@@ -548,6 +576,7 @@ fn an_omitted_limit_keeps_its_documented_per_surface_meaning() {
     let all = spec["all_surfaces_but_mcp"].as_u64().unwrap() as usize;
     let mcp_page = spec["mcp_default_page"].as_u64().unwrap() as usize;
     let search = Search {
+        role: None,
         mode: "literal".into(),
         field: None,
         query: spec["query"].as_str().unwrap().into(),
@@ -586,6 +615,7 @@ fn an_omitted_limit_keeps_its_documented_per_surface_meaning() {
 fn fuzzy_all_results_is_refused_on_every_interface() {
     let f = fixture();
     let search = Search {
+        role: None,
         mode: "fuzzy".into(),
         field: None,
         query: f.spec["deliberate_differences"]["fuzzy_rejects_all_results"]["query"]

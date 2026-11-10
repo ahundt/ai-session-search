@@ -13,11 +13,12 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, IndexRefresh};
-use crate::db::{Db, SchemaState, SourceFileRefreshState, SCHEMA_VERSION};
+use crate::db::{Db, SchemaState, SourceFamilyStamp, SourceFileRefreshState, SCHEMA_VERSION};
 use crate::durable_fs::open_file_lock;
 use crate::models::{Provider, SourceFile};
 use crate::source::ProviderSet;
 use crate::util::normalize_path;
+use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReindexMode {
@@ -255,6 +256,36 @@ pub(crate) fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Resu
         )));
     }
     Ok(None)
+}
+
+/// Validate recorded-input storage, including the base search layout and additive columns.
+///
+/// These columns were added after schema generation 5 was released. They are deliberately not
+/// part of [`current_schema_layout_problem`]: an older schema-5 index still owns the released FTS
+/// and base-message layout, so unrestricted reads can continue from a read-only connection. The
+/// user-input scope calls this check and reports the exact writable upgrade action instead.
+pub(crate) fn message_input_provenance_layout_problem(
+    conn: &rusqlite::Connection,
+) -> Result<Option<String>> {
+    if let Some(problem) = current_schema_layout_problem(conn)? {
+        return Ok(Some(problem));
+    }
+    let columns = conn
+        .prepare("pragma table_info(messages)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    let missing_columns = ["input_delivery_state", "input_origin"]
+        .into_iter()
+        .filter(|column| !columns.contains(*column))
+        .collect::<Vec<_>>();
+    if missing_columns.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "messages is missing user-input provenance column(s): {}",
+            missing_columns.join(", ")
+        )))
+    }
 }
 
 /// Validate the schema-4 derived message-search objects independently of newer parser-derived
@@ -748,7 +779,7 @@ pub(crate) fn reindex_until(
     db.ensure_message_kind_index()?;
     let adapters = ProviderSet::new(config);
     let discovery = adapters.discover_enabled(config);
-    let sources = deduplicate_sources(discovery.sources);
+    let mut sources = deduplicate_sources(discovery.sources);
     let mut discovery_warnings = discovery.warnings;
     let discovered_source_paths = sources
         .iter()
@@ -757,7 +788,7 @@ pub(crate) fn reindex_until(
     let indexed_source_paths = db
         .indexed_source_identities()?
         .into_iter()
-        .map(|(provider, source_path, _, _)| (provider, source_path))
+        .map(|source| (source.provider, source.source_path))
         .collect::<HashSet<_>>();
     if should_cancel() {
         return Ok(ReindexRun::Cancelled {
@@ -774,10 +805,29 @@ pub(crate) fn reindex_until(
             discovery_warnings,
         });
     }
+    let gemini_families =
+        gemini_migration_families(db, &sources, full, &mut discovery_warnings, should_cancel)?;
+    order_gemini_family_successors_first(&mut sources, &gemini_families);
+    if should_cancel() {
+        return Ok(ReindexRun::Cancelled {
+            files_seen: 0,
+            sessions_updated: 0,
+            discovery_warnings,
+        });
+    }
 
     let total = sources.len();
     let mut updated = 0usize;
     let mut progress = progress;
+    let mut joined_gemini_families = HashSet::new();
+    let persisted_gemini_families = if sources
+        .iter()
+        .any(|source| source.provider == Provider::GeminiCli)
+    {
+        db.gemini_family_sessions_by_path()?
+    } else {
+        HashMap::new()
+    };
     if full {
         db.clear_trigram_base()?;
     }
@@ -790,6 +840,18 @@ pub(crate) fn reindex_until(
             });
         }
         let source_path = normalize_path(&source.path);
+        let family = gemini_families.get(&source_path).cloned();
+        if family
+            .as_ref()
+            .is_some_and(|family| family.predecessor_path == source_path)
+            && family
+                .as_ref()
+                .is_some_and(|family| joined_gemini_families.contains(&family.successor_path))
+        {
+            // The successor was already parsed and persisted with both physical receipts. Do not
+            // index the predecessor a second time after a successful family join.
+            continue;
+        }
         let reconciliation = source_reconciliation.get(&(source.provider, source_path.clone()));
         let requires_reconciliation = reconciliation.is_some_and(|item| item.requires_reparse);
         let expected_session_id = reconciliation.and_then(|item| item.session_id.as_deref());
@@ -801,14 +863,34 @@ pub(crate) fn reindex_until(
             source.size_bytes,
             parser_version,
         )?;
+        let persisted_gemini_family = (source.provider == Provider::GeminiCli)
+            .then(|| persisted_gemini_families.get(&source_path).cloned())
+            .flatten();
+        if family.is_none()
+            && persisted_gemini_family.is_some()
+            && refresh_state == SourceFileRefreshState::Current
+        {
+            // A removed family member is an archive receipt, not an instruction to replace the
+            // canonical mixed session with the weaker surviving rendering.
+            continue;
+        }
         // A prior ID collision can leave a current files_seen row whose session still points at a
         // source that has since vanished. Parse that one candidate instead of prescribing an
         // incremental reindex that skips it forever.
-        let current_without_session =
-            !full && refresh_state == SourceFileRefreshState::Current && reconciliation.is_none();
+        let family_current = family
+            .as_ref()
+            .is_some_and(|family| !family.requires_reparse);
+        let current_without_session = !full
+            && refresh_state == SourceFileRefreshState::Current
+            && reconciliation.is_none()
+            && !family_current;
+        let family_requires_reparse = family
+            .as_ref()
+            .is_some_and(|family| family.requires_reparse);
         if !full
             && !requires_reconciliation
             && !current_without_session
+            && !family_requires_reparse
             && refresh_state == SourceFileRefreshState::Current
         {
             continue;
@@ -818,7 +900,7 @@ pub(crate) fn reindex_until(
         // rewritten/rotated), parse + append ONLY the appended bytes instead of re-reading the
         // whole (possibly multi-hundred-MB) file. Each provider reuses its own `parse_reader`
         // over the appended slice; on any doubt it returns `FullParse` and we re-read below.
-        if !full && !requires_reconciliation && !current_without_session {
+        if !full && !requires_reconciliation && !current_without_session && family.is_none() {
             let outcome = match source.provider {
                 Provider::Claude | Provider::ClaudeDesktop => try_tail(
                     source,
@@ -891,33 +973,95 @@ pub(crate) fn reindex_until(
         }
         // Shared with diagnostics::explain_unindexed so a diagnosis parses a file exactly as
         // indexing does; two copies of this dispatch could disagree.
-        let mut parsed = match adapters.parse_until(source, should_cancel) {
-            Ok(Some(parsed)) => parsed,
-            Ok(None) => {
-                return Ok(ReindexRun::Cancelled {
-                    files_seen: i,
-                    sessions_updated: updated,
-                    discovery_warnings,
-                })
+        let (joined_family, parsed_from_family) = if let Some(family) = family
+            .as_ref()
+            .filter(|family| family.successor_path == source_path)
+            .filter(|family| family.requires_reparse)
+        {
+            match parse_gemini_migration_family(&adapters, family, should_cancel) {
+                Ok(GeminiFamilyParse::Joined(parsed)) => (true, Some(*parsed)),
+                Ok(GeminiFamilyParse::NotJoined(reason)) => {
+                    discovery_warnings.push(gemini_family_warning(
+                        &source.path,
+                        format!("Gemini JSON/JSONL family join skipped after parsing: {reason}"),
+                    ));
+                    (false, None)
+                }
+                Ok(GeminiFamilyParse::Cancelled) => {
+                    return Ok(ReindexRun::Cancelled {
+                        files_seen: i,
+                        sessions_updated: updated,
+                        discovery_warnings,
+                    })
+                }
+                Err(error) => {
+                    discovery_warnings.push(gemini_family_warning(
+                        &source.path,
+                        format!("Gemini JSON/JSONL family parse failed: {error:#}"),
+                    ));
+                    (false, None)
+                }
             }
-            Err(error)
-                if indexed_source_paths.contains(&(source.provider, source_path.clone()))
-                    || reconciliation.is_some() =>
-            {
-                // A failed refresh is not a new archive state. Keep the last successful rows and
-                // their old files_seen metadata so the next refresh retries this source, and
-                // report the failure. A source reconciliation also proves an existing row through
-                // a canonical-path alias.
-                discovery_warnings.push(crate::source::ProviderDiscoveryWarning::refresh_failed(
-                    source.provider,
+        } else {
+            (false, None)
+        };
+        let mut parsed = match parsed_from_family {
+            Some(parsed) => parsed,
+            None => match adapters.parse_until(source, should_cancel) {
+                Ok(Some(parsed)) => parsed,
+                Ok(None) => {
+                    return Ok(ReindexRun::Cancelled {
+                        files_seen: i,
+                        sessions_updated: updated,
+                        discovery_warnings,
+                    })
+                }
+                Err(error)
+                    if indexed_source_paths.contains(&(source.provider, source_path.clone()))
+                        || reconciliation.is_some() =>
+                {
+                    // A failed refresh is not a new archive state. Keep the last successful rows and
+                    // their old files_seen metadata so the next refresh retries this source, and
+                    // report the failure. A source reconciliation also proves an existing row through
+                    // a canonical-path alias.
+                    discovery_warnings.push(
+                        crate::source::ProviderDiscoveryWarning::refresh_failed(
+                            source.provider,
+                            &source.path,
+                            &error,
+                        ),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    crate::util::minimal_record(source.provider, &source.path, format!("{error:#}"))
+                }
+            },
+        };
+        let persisted_gemini_family = match persisted_gemini_family {
+            Some(identity) if parsed.session.provider_session_id == identity.native_session_id => {
+                parsed.session.id = identity.canonical_session_id.clone();
+                Some(identity.canonical_session_id)
+            }
+            Some(identity) => {
+                discovery_warnings.push(gemini_family_warning(
                     &source.path,
-                    &error,
+                    "Gemini native session ID changed; the previous family binding is not reused"
+                        .to_string(),
                 ));
-                continue;
+                // A path-based parser ID or source retirement would overwrite the old reference.
+                // Preserve that archive and leave the conflicting readable source unstamped.
+                if parsed.session.id == identity.canonical_session_id
+                    || db
+                        .exact_session_source_path(&identity.canonical_session_id)?
+                        .as_deref()
+                        == Some(&source_path)
+                {
+                    continue;
+                }
+                None
             }
-            Err(error) => {
-                crate::util::minimal_record(source.provider, &source.path, format!("{error:#}"))
-            }
+            None => None,
         };
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
@@ -946,16 +1090,60 @@ pub(crate) fn reindex_until(
         {
             continue;
         }
+        if should_cancel() {
+            return Ok(ReindexRun::Cancelled {
+                files_seen: i,
+                sessions_updated: updated,
+                discovery_warnings,
+            });
+        }
         let aliases = reconciliation.map_or(&[][..], |item| item.aliases.as_slice());
         // Constraint failures are not actionable without the session and source file being
         // applied; retain both in the error chain.
-        db.upsert_session_reconciling_sources(
-            &parsed,
-            source.mtime_ns,
-            source.size_bytes,
-            aliases,
-            false,
-        )
+        if joined_family {
+            let family = family
+                .as_ref()
+                .expect("joined Gemini family has a family descriptor");
+            let family_members = [
+                SourceFamilyStamp {
+                    source_path: family.predecessor_path.clone(),
+                    mtime_ns: family.predecessor.mtime_ns,
+                    size_bytes: family.predecessor.size_bytes,
+                },
+                SourceFamilyStamp {
+                    source_path: family.successor_path.clone(),
+                    mtime_ns: family.successor.mtime_ns,
+                    size_bytes: family.successor.size_bytes,
+                },
+            ];
+            db.upsert_session_reconciling_family(
+                &parsed,
+                source.mtime_ns,
+                source.size_bytes,
+                &family_members,
+                false,
+            )
+        } else if persisted_gemini_family.is_some() {
+            db.upsert_session_reconciling_family(
+                &parsed,
+                source.mtime_ns,
+                source.size_bytes,
+                &[SourceFamilyStamp {
+                    source_path: source_path.clone(),
+                    mtime_ns: source.mtime_ns,
+                    size_bytes: source.size_bytes,
+                }],
+                false,
+            )
+        } else {
+            db.upsert_session_reconciling_sources(
+                &parsed,
+                source.mtime_ns,
+                source.size_bytes,
+                aliases,
+                false,
+            )
+        }
         .with_context(|| {
             format!(
                 "failed to index session '{}' from {}",
@@ -963,6 +1151,14 @@ pub(crate) fn reindex_until(
                 source.path.display()
             )
         })?;
+        if joined_family {
+            if let Some(family) = family.as_ref() {
+                // The DB transaction committed both receipts. Mark the predecessor consumed only
+                // after that atomic publication; a later checkpoint failure merely causes a safe
+                // retry, never an unrecorded half-family.
+                joined_gemini_families.insert(family.successor_path.clone());
+            }
+        }
         // Record/refresh the tail checkpoint so the next reindex of this grown file can append
         // incrementally from the end of what we just parsed (instead of re-reading it all).
         let (offset, fingerprint) = full_parse_checkpoint(source)?;
@@ -1055,63 +1251,363 @@ struct SourceReconciliation {
     session_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct GeminiMigrationFamily {
+    predecessor: SourceFile,
+    successor: SourceFile,
+    predecessor_path: String,
+    successor_path: String,
+    native_session_id: String,
+    logical_session_id: String,
+    requires_reparse: bool,
+}
+
+#[derive(Debug)]
+enum GeminiFamilyParse {
+    Joined(Box<crate::models::ParsedSession>),
+    NotJoined(String),
+    Cancelled,
+}
+
+/// Prove only the exact Google migration pair: one sibling `foo.json` and one `foo.jsonl`, with
+/// the same non-empty native session ID in both files. Failed proof leaves both sources on the
+/// ordinary indexing path; the warning is diagnostic, never a reason to hide readable history.
+/// For a changed/new pair the proof scans each member once and leaves parsing to the canonical
+/// successor's turn in the normal indexing loop. This keeps discovery retention at `O(F_pair)`
+/// descriptors; at most one pair's parsed messages and `O(B_pair)` payload bytes exist during its
+/// transaction. An unchanged pair consults the two `files_seen` receipts and does no transcript
+/// read.
+fn gemini_migration_families(
+    db: &Db,
+    sources: &[SourceFile],
+    full: bool,
+    discovery_warnings: &mut Vec<crate::source::ProviderDiscoveryWarning>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<HashMap<String, GeminiMigrationFamily>> {
+    let source_by_path = sources
+        .iter()
+        .filter(|source| source.provider == Provider::GeminiCli)
+        .map(|source| (normalize_path(&source.path), source.clone()))
+        .collect::<HashMap<_, _>>();
+    if source_by_path.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let indexed = db.indexed_source_identities()?;
+    let mut indexed_by_path = HashMap::<String, Vec<(String, usize)>>::new();
+    for source in indexed {
+        if source.provider == Provider::GeminiCli {
+            indexed_by_path
+                .entry(source.source_path)
+                .or_default()
+                .push((source.session_id, source.sessions));
+        }
+    }
+    let parser_version = crate::util::provider_parse_version(Provider::GeminiCli);
+    let mut plans = HashMap::new();
+    for predecessor in sources.iter().filter(|source| {
+        source.provider == Provider::GeminiCli
+            && source.path.extension().and_then(|value| value.to_str()) == Some("json")
+    }) {
+        if should_cancel() {
+            break;
+        }
+        let successor_path = normalize_path(&predecessor.path.with_extension("jsonl"));
+        let Some(successor) = source_by_path.get(&successor_path) else {
+            continue;
+        };
+        let predecessor_path = normalize_path(&predecessor.path);
+        let predecessor_refresh = db.source_file_refresh_state(
+            Provider::GeminiCli,
+            &predecessor_path,
+            predecessor.mtime_ns,
+            predecessor.size_bytes,
+            parser_version,
+        )?;
+        let successor_refresh = db.source_file_refresh_state(
+            Provider::GeminiCli,
+            &successor_path,
+            successor.mtime_ns,
+            successor.size_bytes,
+            parser_version,
+        )?;
+        // A previously joined family has two current files_seen receipts. Do not scan either
+        // transcript again just to rediscover a relationship that is already represented by the
+        // canonical session and receipts; a change or a new member re-enters proof below.
+        if !full
+            && predecessor_refresh == SourceFileRefreshState::Current
+            && successor_refresh == SourceFileRefreshState::Current
+        {
+            let mut existing_ids = HashSet::new();
+            for path in [&predecessor_path, &successor_path] {
+                existing_ids.extend(
+                    indexed_by_path
+                        .get(path)
+                        .into_iter()
+                        .flatten()
+                        .map(|(session_id, _)| session_id.clone()),
+                );
+            }
+            if existing_ids.len() > 1 {
+                discovery_warnings.push(gemini_family_warning(
+                    &predecessor.path,
+                    "Gemini JSON/JSONL family left independent because both session identities are already indexed".to_string(),
+                ));
+            } else if let Some(logical_session_id) = existing_ids.into_iter().next() {
+                // Both receipts and exactly one logical session are the persisted narrow family
+                // evidence. Reuse it without rereading either unchanged transcript; if a member
+                // changes on a later refresh, the branch above is bypassed and native proof runs.
+                let family = GeminiMigrationFamily {
+                    predecessor: predecessor.clone(),
+                    successor: successor.clone(),
+                    predecessor_path: predecessor_path.clone(),
+                    successor_path: successor_path.clone(),
+                    native_session_id: String::new(),
+                    logical_session_id,
+                    requires_reparse: false,
+                };
+                plans.insert(predecessor_path, family.clone());
+                plans.insert(successor_path, family);
+            }
+            continue;
+        }
+        let predecessor_native_id =
+            crate::providers::gemini_cli::native_session_id_until(&predecessor.path, should_cancel);
+        if should_cancel() {
+            break;
+        }
+        let successor_native_id =
+            crate::providers::gemini_cli::native_session_id_until(&successor.path, should_cancel);
+        let native_id = match (predecessor_native_id, successor_native_id) {
+            (Ok(Some(left)), Ok(Some(right))) if left == right => left,
+            (Ok(left), Ok(right)) => {
+                discovery_warnings.push(gemini_family_warning(
+                    &predecessor.path,
+                    format!(
+                        "Gemini JSON/JSONL family proof rejected: native session IDs were {left:?} and {right:?}"
+                    ),
+                ));
+                continue;
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                discovery_warnings.push(gemini_family_warning(
+                    &predecessor.path,
+                    format!("Gemini JSON/JSONL family proof rejected: {error:#}"),
+                ));
+                continue;
+            }
+        };
+        let mut existing_ids = HashSet::new();
+        let mut existing_conflict = false;
+        for path in [&predecessor_path, &successor_path] {
+            for (session_id, count) in indexed_by_path.get(path).into_iter().flatten() {
+                if *count != 1 {
+                    existing_conflict = true;
+                }
+                existing_ids.insert(session_id.clone());
+            }
+        }
+        if existing_conflict || existing_ids.len() > 1 {
+            discovery_warnings.push(gemini_family_warning(
+                &predecessor.path,
+                format!(
+                    "Gemini JSON/JSONL family proof rejected: {} independently indexed session identities already exist",
+                    existing_ids.len()
+                ),
+            ));
+            continue;
+        }
+        let logical_session_id = existing_ids
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| format!("gemini-cli:{predecessor_path}"));
+        let requires_reparse = full
+            || predecessor_refresh != SourceFileRefreshState::Current
+            || successor_refresh != SourceFileRefreshState::Current;
+        let family = GeminiMigrationFamily {
+            predecessor: predecessor.clone(),
+            successor: successor.clone(),
+            predecessor_path: predecessor_path.clone(),
+            successor_path: successor_path.clone(),
+            native_session_id: native_id,
+            logical_session_id,
+            requires_reparse,
+        };
+        plans.insert(predecessor_path, family.clone());
+        plans.insert(successor_path, family);
+    }
+    Ok(plans)
+}
+
+/// The family merge must run at the successor's normal indexing turn so the predecessor is not
+/// indexed first and then forced through a second replacement. Exact sibling families are disjoint,
+/// so a stable pair swap is enough and keeps the ordinary discovery pipeline single-pass.
+fn order_gemini_family_successors_first(
+    sources: &mut [SourceFile],
+    families: &HashMap<String, GeminiMigrationFamily>,
+) {
+    // Normalize each discovered path once. Families are already proven disjoint, so a local
+    // position map preserves the existing pair-swap behavior while avoiding a full source scan
+    // (and repeated path allocation) for every family.
+    let mut positions = HashMap::with_capacity(sources.len());
+    for (position, source) in sources.iter().enumerate() {
+        positions
+            .entry(normalize_path(&source.path))
+            .or_insert(position);
+    }
+    let mut swaps = Vec::new();
+    let mut seen_predecessors = HashSet::new();
+    for family in families.values() {
+        if !seen_predecessors.insert(family.predecessor_path.clone()) {
+            continue;
+        }
+        let Some(&predecessor) = positions.get(&family.predecessor_path) else {
+            continue;
+        };
+        let Some(&successor) = positions.get(&family.successor_path) else {
+            continue;
+        };
+        if predecessor < successor {
+            swaps.push((predecessor, successor));
+        }
+    }
+    for (predecessor, successor) in swaps {
+        sources.swap(predecessor, successor);
+    }
+}
+
+fn gemini_family_warning(path: &Path, message: String) -> crate::source::ProviderDiscoveryWarning {
+    crate::source::ProviderDiscoveryWarning {
+        provider: Provider::GeminiCli,
+        path: normalize_path(path),
+        operation: "migration_family_proof".to_string(),
+        message,
+        readable_sources_preserved: true,
+        verification_command: "aise doctor --format json".to_string(),
+        guidance: "The source files remain readable; run `aise doctor --format json` to inspect the source pair and any conflicting archived reference.".to_string(),
+    }
+}
+
+fn parse_gemini_migration_family(
+    adapters: &ProviderSet,
+    family: &GeminiMigrationFamily,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<GeminiFamilyParse> {
+    let Some(predecessor) = adapters.parse_until(&family.predecessor, should_cancel)? else {
+        return Ok(GeminiFamilyParse::Cancelled);
+    };
+    if should_cancel() {
+        return Ok(GeminiFamilyParse::Cancelled);
+    }
+    let Some(successor) = adapters.parse_until(&family.successor, should_cancel)? else {
+        return Ok(GeminiFamilyParse::Cancelled);
+    };
+    if predecessor.session.provider_session_id != family.native_session_id
+        || successor.session.provider_session_id != family.native_session_id
+    {
+        return Ok(GeminiFamilyParse::NotJoined(
+            "native session ID changed between family proof and parse".to_string(),
+        ));
+    }
+    match crate::providers::gemini_cli::merge_migration_family(successor, predecessor) {
+        Ok(mut parsed) => {
+            parsed.session.id = family.logical_session_id.clone();
+            let metadata = parsed
+                .session
+                .raw_metadata_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            let mut metadata = metadata;
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "gemini_migration_family".to_string(),
+                    json!({
+                        "predecessor_json": family.predecessor_path,
+                        "successor_jsonl": family.successor_path,
+                        "native_session_id": family.native_session_id,
+                    }),
+                );
+            }
+            parsed.session.raw_metadata_json = Some(metadata.to_string());
+            Ok(GeminiFamilyParse::Joined(Box::new(parsed)))
+        }
+        Err(error) => Ok(GeminiFamilyParse::NotJoined(format!("{error:#}"))),
+    }
+}
+
 fn source_reconciliation(
     db: &Db,
     sources: &[SourceFile],
 ) -> Result<HashMap<(Provider, String), SourceReconciliation>> {
-    let mut indexed_by_identity =
-        HashMap::<(Provider, String), Vec<(String, usize, String)>>::new();
-    // Stored paths by name, for a source whose earlier form no longer exists on disk: a Codex
-    // rollout compressed to `.jsonl.zst` (or decompressed on resume) is the same source.
-    let mut indexed_by_path = HashMap::<(Provider, String), (String, usize, String)>::new();
-    for (provider, stored_path, sessions, session_id) in db.indexed_source_identities()? {
-        indexed_by_path.insert(
-            (provider, stored_path.clone()),
-            (stored_path.clone(), sessions, session_id.clone()),
-        );
-        let Ok(canonical) = std::fs::canonicalize(&stored_path) else {
-            continue;
-        };
-        indexed_by_identity
-            .entry((provider, normalize_path(&canonical)))
-            .or_default()
-            .push((stored_path, sessions, session_id));
+    let stored = db.indexed_source_identities()?;
+    let mut by_canonical = HashMap::<_, Vec<_>>::new();
+    let mut by_file = HashMap::<_, Vec<_>>::new();
+    let mut by_path = HashMap::new();
+    for entry in &stored {
+        by_path.insert((entry.provider, entry.source_path.clone()), entry);
+        if let Ok(path) = std::fs::canonicalize(&entry.source_path) {
+            by_canonical
+                .entry((entry.provider, normalize_path(&path)))
+                .or_default()
+                .push(entry);
+        }
+        if let (Some(id), Some(mtime), Some(size)) = (
+            entry
+                .file_identity
+                .as_deref()
+                .and_then(crate::db::file_identity_key),
+            entry.mtime_ns,
+            entry.size_bytes,
+        ) {
+            by_file
+                .entry((entry.provider, id, mtime, size))
+                .or_default()
+                .push(entry);
+        }
     }
     Ok(sources
         .iter()
         .filter_map(|source| {
             let path = normalize_path(&source.path);
-            let sibling = (source.provider == Provider::Codex)
-                .then(|| crate::providers::codex::rollout_sibling(&source.path))
-                .flatten()
-                .map(|sibling| normalize_path(&sibling))
-                .and_then(|sibling| indexed_by_path.get(&(source.provider, sibling)).cloned());
-            let mut indexed = indexed_by_identity
+            let mut matches = by_canonical
                 .get(&(source.provider, path.clone()))
                 .cloned()
                 .unwrap_or_default();
-            if let Some(entry) = sibling {
-                if !indexed.iter().any(|(stored, _, _)| stored == &entry.0) {
-                    indexed.push(entry);
-                }
+            // Missing receipts and changed stamps cannot prove a historical move; preserve the archive.
+            if let Ok(id) = file_id::get_file_id(&source.path) {
+                matches.extend(
+                    by_file
+                        .get(&(source.provider, id, source.mtime_ns, source.size_bytes))
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
             }
-            if indexed.is_empty() {
+            // Compressed and resumed Codex siblings represent the same source even after removal.
+            if source.provider == Provider::Codex {
+                matches.extend(
+                    crate::providers::codex::rollout_sibling(&source.path)
+                        .and_then(|sibling| {
+                            by_path.get(&(source.provider, normalize_path(&sibling)))
+                        })
+                        .copied(),
+                );
+            }
+            matches.sort_unstable_by_key(|entry| &entry.source_path);
+            matches.dedup_by_key(|entry| &entry.source_path);
+            if matches.is_empty() {
                 return None;
             }
-            let indexed = &indexed;
-            let aliases = indexed
+            let aliases = matches
                 .iter()
-                .filter(|(stored, _, _)| stored != &path)
-                .map(|(stored, _, _)| stored.clone())
+                .filter(|entry| entry.source_path != path)
+                .map(|entry| entry.source_path.clone())
                 .collect::<Vec<_>>();
             let requires_reparse = !aliases.is_empty()
-                || indexed
-                    .iter()
-                    .map(|(_, sessions, _)| sessions)
-                    .sum::<usize>()
-                    > 1;
-            let session_id =
-                (indexed.len() == 1 && indexed[0].1 == 1).then(|| indexed[0].2.clone());
+                || matches.iter().map(|entry| entry.sessions).sum::<usize>() > 1;
+            let session_id = (matches.len() == 1 && matches[0].sessions == 1)
+                .then(|| matches[0].session_id.clone());
             Some((
                 (source.provider, path),
                 SourceReconciliation {
@@ -1182,6 +1678,17 @@ enum TailOutcome {
     Cancelled,
 }
 
+/// Read a parser's conservative marker when records depend on an earlier prefix.
+fn tail_requires_full_parse(session: &crate::models::SessionRecord) -> bool {
+    session
+        .raw_metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|metadata| metadata.get("requires_full_parse_for_tail").cloned())
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 /// Try to incrementally append only the bytes appended to a session file since its last
 /// checkpoint, reusing that provider's real parser (`parse_slice`) over the appended slice
 /// ([`crate::tail`]). The preconditions (a stored checkpoint, no truncation, an unchanged file
@@ -1211,9 +1718,6 @@ where
     else {
         return Ok(TailOutcome::FullParse);
     };
-    if source.provider == Provider::ClaudeDesktop {
-        return Ok(TailOutcome::FullParse);
-    }
     // Truncation / copytruncate: the file is now shorter than where we parsed to → re-read whole.
     if offset <= 0 || source.size_bytes <= offset {
         return Ok(TailOutcome::FullParse);
@@ -1228,6 +1732,26 @@ where
             // the bounded tail overlap. Never insert child rows under a fallback ID: re-read the
             // complete source so parent replacement and child publication stay one transaction.
             if expected_session_id != Some(tail.session.id.as_str()) {
+                return Ok(TailOutcome::FullParse);
+            }
+            // Spawn metadata normally lives in the session header, which can be outside the
+            // bounded tail overlap. If the stored session is already known to be a subagent but
+            // this slice is not, a tail append would misclassify new Codex user records as root
+            // input. Re-read the source so attribution stays identical to a full parse.
+            if source.provider == Provider::Codex {
+                let stored_spawned = db
+                    .session_metadata(std::slice::from_ref(&tail.session.id))?
+                    .get(&tail.session.id)
+                    .is_some_and(|session| {
+                        session.parent_session_id.is_some() || session.agent_label.is_some()
+                    });
+                let tail_spawned =
+                    tail.session.parent_session_id.is_some() || tail.session.agent_label.is_some();
+                if stored_spawned && !tail_spawned {
+                    return Ok(TailOutcome::FullParse);
+                }
+            }
+            if tail_requires_full_parse(&tail.session) {
                 return Ok(TailOutcome::FullParse);
             }
             // Fills the tail's volatile end for `append_tail`; the tail's `created_at` is never
@@ -1261,6 +1785,181 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefix_dependent_tail_marker_is_provider_neutral_and_typed() {
+        for provider in [Provider::Claude, Provider::ClaudeDesktop, Provider::Codex] {
+            let mut session = crate::util::minimal_record(
+                provider,
+                Path::new("/tmp/tail-marker.jsonl"),
+                "fixture".into(),
+            )
+            .session;
+            for (metadata, expected) in [
+                (None, false),
+                (Some("not json"), false),
+                (Some(r#"{"requires_full_parse_for_tail":"true"}"#), false),
+                (Some(r#"{"requires_full_parse_for_tail":false}"#), false),
+                (Some(r#"{"requires_full_parse_for_tail":true}"#), true),
+            ] {
+                session.raw_metadata_json = metadata.map(str::to_owned);
+                assert_eq!(tail_requires_full_parse(&session), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn hard_link_sources_remain_one_input_and_unchanged_on_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first = first_root.join("a.jsonl");
+        let second = second_root.join("b.jsonl");
+        std::fs::write(&first, "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"sessionId\":\"hard-link\",\"content\":\"one linked submission\"}\n").unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let mut config = config_with_single_claude_fixture(&db_path, dir.path());
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(db.message_count().unwrap(), 1);
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+        // Selecting another live name for the same file is a verified alias, not a copy.
+        config.providers.claude.paths = vec![normalize_path(&second_root)];
+        reindex(&config, &db, false, None).unwrap();
+        assert!(first.exists());
+        assert_eq!(
+            db.resolve_session_record("claude:hard-link")
+                .unwrap()
+                .source_path,
+            crate::util::canonical_source_path(&second)
+        );
+        assert_eq!(db.message_count().unwrap(), 1);
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+    }
+
+    #[test]
+    fn renamed_claude_queue_source_reconciles_path_scoped_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("session.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-move","timestamp":"2026-06-17T00:00:00Z","content":"moved queued input"}"#;
+        std::fs::write(&old_path, format!("{record}\n{record}\n")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let old_scope: String = stored
+            .query_row(
+                "select correlation_scope from messages where content = 'moved queued input'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(stored);
+        assert!(old_scope.contains("session.jsonl"), "{old_scope}");
+        let new_path = root.join("renamed.jsonl");
+        std::fs::rename(&old_path, &new_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let (count, new_scope): (i64, String) = stored
+            .query_row(
+                "select count(*), min(correlation_scope) from messages
+                 where content = 'moved queued input'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "a physical rename must preserve both independent submissions without duplicating them"
+        );
+        assert!(new_scope.contains("renamed.jsonl"), "{new_scope}");
+        assert_ne!(old_scope, new_scope);
+    }
+
+    #[test]
+    fn source_reconciliation_does_not_infer_missing_or_copied_file_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("session.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-copy","timestamp":"2026-06-17T00:00:00Z","content":"copied queued input"}"#;
+        std::fs::write(&old_path, format!("{record}\n")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let copy_path = root.join("copy.jsonl");
+        std::fs::copy(&old_path, &copy_path).unwrap();
+        let adapter = ProviderSet::new(&config);
+        let copied = adapter.discover_enabled(&config).sources;
+        let reconciliation = source_reconciliation(&db, &copied).unwrap();
+        assert!(
+            reconciliation
+                .get(&(Provider::Claude, normalize_path(&copy_path)))
+                .is_none_or(|value| value.aliases.is_empty()),
+            "a distinct physical copy is not an alias"
+        );
+        std::fs::remove_file(&copy_path).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        stored
+            .execute(
+                "update files_seen set file_identity = null where provider = 'claude'",
+                [],
+            )
+            .unwrap();
+        drop(stored);
+        let missing_path = root.join("missing-renamed.jsonl");
+        std::fs::rename(&old_path, &missing_path).unwrap();
+        let adapter = ProviderSet::new(&config);
+        let moved = adapter.discover_enabled(&config).sources;
+        let reconciliation = source_reconciliation(&db, &moved).unwrap();
+        assert!(reconciliation
+            .get(&(Provider::Claude, normalize_path(&missing_path)))
+            .is_none_or(|value| value.aliases.is_empty()));
+
+        std::fs::copy(&missing_path, &old_path).unwrap();
+        let copied = adapter.discover_enabled(&config).sources;
+        let reconciliation = source_reconciliation(&db, &copied).unwrap();
+        assert!(reconciliation
+            .get(&(Provider::Claude, normalize_path(&old_path)))
+            .is_none_or(|value| value.aliases.is_empty()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_claude_queue_source_through_symlink_root_remaps_canonical_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let real_root = dir.path().join("real");
+        let alias_root = dir.path().join("alias");
+        std::fs::create_dir_all(&real_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+        let old_path = real_root.join("session.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-symlink-move","timestamp":"2026-06-17T00:00:00Z","content":"symlink moved queued input"}"#;
+        std::fs::write(&old_path, format!("{record}\n")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &alias_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let new_path = real_root.join("renamed.jsonl");
+        std::fs::rename(&old_path, &new_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let (count, scope): (i64, String) = stored
+            .query_row(
+                "select count(*), min(correlation_scope) from messages
+                 where content = 'symlink moved queued input'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(scope.ends_with("real/renamed.jsonl"), "{scope}");
+    }
+
+    #[test]
     fn full_parse_checkpoint_never_advances_past_the_discovered_snapshot() {
         use std::io::Write as _;
 
@@ -1286,6 +1985,7 @@ mod tests {
             "a later reopen must not checkpoint concurrently appended bytes the parser may not have read"
         );
     }
+
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1310,6 +2010,484 @@ mod tests {
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
         config
+    }
+
+    fn claude_overlap_padding(session_id: &str) -> String {
+        let mut initial = format!(
+            r#"{{"sessionId":"{session_id}","type":"user","message":{{"role":"user","content":"first prompt"}}}}
+"#
+        );
+        let progress = format!(
+            r#"{{"sessionId":"{session_id}","type":"assistant","message":{{"role":"assistant","content":"{}"}}}}
+"#,
+            "x".repeat(1024)
+        );
+        while initial.len() <= crate::tail::OVERLAP_BYTES as usize + crate::tail::FINGERPRINT_LEN {
+            initial.push_str(&progress);
+        }
+        initial
+    }
+
+    #[test]
+    fn ordinary_claude_append_keeps_incremental_tail_fast_path() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let source = claude_root.join("session.jsonl");
+        std::fs::write(
+            &source,
+            format!("{{\"sessionId\":\"ordinary-tail\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"first prompt\"}}}}\n{}", claude_overlap_padding("ordinary-tail")),
+        )
+        .unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let initial_count = db.message_count().unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                br#"{"sessionId":"ordinary-tail","type":"assistant","message":{"role":"assistant","content":"ordinary reply"}}
+"#,
+            )
+            .unwrap();
+
+        let adapters = ProviderSet::new(&config);
+        let source_file = adapters
+            .discover_enabled(&config)
+            .sources
+            .into_iter()
+            .next()
+            .unwrap();
+        let (offset, fingerprint) = db
+            .file_checkpoint(
+                Provider::Claude,
+                &normalize_path(&source_file.path),
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap()
+            .expect("initial indexing writes a tail checkpoint");
+        assert!(
+            crate::tail::fingerprint_matches(&source, &fingerprint).unwrap(),
+            "append preserves the source head"
+        );
+        let parsed_tail = crate::tail::tail_parse(&source, offset, |reader, path| {
+            adapters.claude.parse_reader(reader, path)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed_tail.session.id, "claude:ordinary-tail");
+        let outcome = try_tail(
+            &source_file,
+            &normalize_path(&source_file.path),
+            Some("claude:ordinary-tail"),
+            &db,
+            &|| false,
+            |reader, path| adapters.claude.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(matches!(outcome, TailOutcome::Appended));
+        assert_eq!(db.message_count().unwrap(), initial_count + 1);
+    }
+
+    #[test]
+    fn ask_user_answer_beyond_overlap_forces_full_parse_and_preserves_attribution() {
+        use std::io::Write as _;
+
+        for (answer_index, answer_record) in [
+            concat!(
+                r#"{"sessionId":"ask-tail","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-tail-1","content":"Your questions have been answered: \"choice\"=\"human answer\"."}]},"toolUseResult":{"answers":{"choice":"human answer"}}}"#,
+                "\n"
+            ),
+            concat!(
+                r#"{"sessionId":"ask-tail","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-tail-1","content":"The user responded: human answer"}]},"toolUseResult":{"response":"human answer"}}"#,
+                "\n"
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.db");
+            let claude_root = dir.path().join("claude");
+            std::fs::create_dir_all(&claude_root).unwrap();
+            let source = claude_root.join("session.jsonl");
+            let initial = concat!(
+            r#"{"sessionId":"ask-tail","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-tail-1","name":"AskUserQuestion","input":{}}]}}"#,
+            "\n"
+        ).to_owned() + &claude_overlap_padding("ask-tail");
+            std::fs::write(&source, initial).unwrap();
+            let config = config_with_single_claude_fixture(&db_path, &claude_root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(answer_record.as_bytes())
+                .unwrap();
+
+            let adapters = ProviderSet::new(&config);
+            let source_file = adapters
+                .discover_enabled(&config)
+                .sources
+                .into_iter()
+                .next()
+                .unwrap();
+            let outcome = try_tail(
+                &source_file,
+                &normalize_path(&source_file.path),
+                Some("claude:ask-tail"),
+                &db,
+                &|| false,
+                |reader, path| adapters.claude.parse_reader(reader, path),
+            )
+            .unwrap();
+            assert!(matches!(outcome, TailOutcome::FullParse));
+            reindex(&config, &db, false, None).unwrap();
+            let messages = db
+                .search_messages(
+                    "human answer",
+                    &crate::models::MessageFilters {
+                        role: Some(crate::models::Role::User),
+                        session_id: Some("claude:ask-tail".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let answer = messages
+                .iter()
+                .find(|message| message.content.contains("human answer"))
+                .expect("full parse preserved the structured answer");
+            assert_eq!(
+                answer.provenance.as_ref().unwrap().authorship,
+                crate::models::MessageAuthorship::Mixed
+            );
+            assert_eq!(
+                answer.provenance.as_ref().unwrap().input_origin,
+                Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+            );
+
+            if answer_index == 0 {
+                // First move the dependent answer beyond the bounded overlap. The filler append
+                // still overlaps the answer, so this reindex must take the conservative full
+                // parse and advance the checkpoint past the filler.
+                let filler_line = format!(
+                    r#"{{"sessionId":"ask-tail","type":"assistant","message":{{"role":"assistant","content":"{}"}}}}
+"#,
+                    "x".repeat(1024)
+                );
+                let mut unrelated_append = String::new();
+                while unrelated_append.len()
+                    <= crate::tail::OVERLAP_BYTES as usize + crate::tail::FINGERPRINT_LEN
+                {
+                    unrelated_append.push_str(&filler_line);
+                }
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .unwrap()
+                    .write_all(unrelated_append.as_bytes())
+                    .unwrap();
+                reindex(&config, &db, false, None).unwrap();
+
+                // With the answer now outside the overlap, a short unrelated append should use
+                // the incremental path rather than permanently inheriting the old full parse.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .unwrap()
+                    .write_all(
+                        br#"{"sessionId":"ask-tail","type":"assistant","message":{"role":"assistant","content":"post-overlap tail"}}
+"#,
+                    )
+                    .unwrap();
+                let source_after_append = adapters
+                    .discover_enabled(&config)
+                    .sources
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                let resumed = try_tail(
+                    &source_after_append,
+                    &normalize_path(&source_after_append.path),
+                    Some("claude:ask-tail"),
+                    &db,
+                    &|| false,
+                    |reader, path| adapters.claude.parse_reader(reader, path),
+                )
+                .unwrap();
+                assert!(
+                    matches!(resumed, TailOutcome::Appended),
+                    "dependent answer should stop forcing full parses after leaving overlap"
+                );
+
+                let tail_count = db.message_count().unwrap();
+                let tail_hit = db
+                    .search_messages("post-overlap tail", &Default::default())
+                    .unwrap();
+                assert_eq!(tail_hit.len(), 1);
+                reindex(&config, &db, true, None).unwrap();
+                assert_eq!(db.message_count().unwrap(), tail_count);
+                let full_hit = db
+                    .search_messages("post-overlap tail", &Default::default())
+                    .unwrap();
+                assert_eq!(full_hit.len(), 1);
+                assert_eq!(full_hit[0].session_id, tail_hit[0].session_id);
+                assert_eq!(full_hit[0].seq, tail_hit[0].seq);
+                assert_eq!(full_hit[0].content, tail_hit[0].content);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_answer_beyond_overlap_reparses_the_call_prefix_once() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "019efd97-d602-7922-89dd-467272106505";
+        let path = root.join(format!("rollout-2026-06-25T03-04-06-{id}.jsonl"));
+        let mut initial =
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n");
+        initial.push_str(concat!(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"outside-overlap","arguments":"{\"questions\":[{\"id\":\"q1\",\"question\":\"Choice?\"}]}"}}"#,
+            "\n",
+        ));
+        let padding = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(1024)}]}}).to_string() + "\n";
+        while initial.len()
+            <= crate::tail::OVERLAP_BYTES as usize + 2 * crate::tail::FINGERPRINT_LEN
+        {
+            initial.push_str(&padding);
+        }
+        std::fs::write(&path, initial).unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&root)];
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(concat!(
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"outside-overlap","output":{"answers":{"q1":{"answers":["tail answer α"]}}}}}"#,
+            "\n",
+        ).as_bytes()).unwrap();
+        let adapters = ProviderSet::new(&config);
+        let source = adapters.discover_enabled(&config).sources.remove(0);
+        let session_id = format!("codex:{id}");
+        let outcome = try_tail(
+            &source,
+            &normalize_path(&source.path),
+            Some(&session_id),
+            &db,
+            &|| false,
+            |reader, path| adapters.codex.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(matches!(outcome, TailOutcome::FullParse));
+        reindex(&config, &db, false, None).unwrap();
+        let filters = crate::models::MessageFilters {
+            role: Some(crate::models::Role::User),
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_messages("tail answer α", &filters).unwrap().len(),
+            1
+        );
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+        assert_eq!(
+            db.search_messages("tail answer α", &filters).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_spawn_metadata_beyond_overlap_forces_full_parse() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "019efd97-d602-7922-89dd-467272106505";
+        let path = root.join(format!("rollout-2026-06-25T03-04-06-{id}.jsonl"));
+        let spawn_source = serde_json::json!({
+            "subagent": {
+                "thread_spawn": {
+                    "parent_thread_id": "root-session",
+                    "agent_nickname": "worker"
+                }
+            }
+        });
+        let mut initial = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": id, "source": spawn_source}
+        })
+        .to_string()
+            + "\n";
+        let padding = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "x".repeat(1024)}]
+            }
+        })
+        .to_string()
+            + "\n";
+        while initial.len()
+            <= crate::tail::OVERLAP_BYTES as usize + 2 * crate::tail::FINGERPRINT_LEN
+        {
+            initial.push_str(&padding);
+        }
+        std::fs::write(&path, initial).unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&root)];
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let session_id = format!("codex:{id}");
+        let adapters = ProviderSet::new(&config);
+        let stored = db
+            .session_metadata(std::slice::from_ref(&session_id))
+            .unwrap();
+        assert_eq!(
+            stored[&session_id].parent_session_id.as_deref(),
+            Some("codex:root-session")
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                br#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"spawned tail prompt"}],"internal_chat_message_metadata_passthrough":{"content_item_metadata":[{"provenance":{"type":"user"}}]}}}
+"#,
+            )
+            .unwrap();
+        let source = adapters.discover_enabled(&config).sources.remove(0);
+        let outcome = try_tail(
+            &source,
+            &normalize_path(&source.path),
+            Some(&session_id),
+            &db,
+            &|| false,
+            |reader, path| adapters.codex.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, TailOutcome::FullParse),
+            "tail parsing must not lose the stored spawned-session attribution"
+        );
+        reindex(&config, &db, false, None).unwrap();
+        let filters = crate::models::MessageFilters {
+            role: Some(crate::models::Role::User),
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        assert!(db
+            .search_messages("spawned tail prompt", &filters)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_messages("spawned tail prompt", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn queue_state_beyond_overlap_forces_full_parse_and_preserves_metadata() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let source = claude_root.join("session.jsonl");
+        std::fs::write(&source, claude_overlap_padding("queue-tail")).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                br#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-tail","timestamp":"2026-06-17T00:00:00Z","content":"queued tail correction"}
+"#,
+            )
+            .unwrap();
+
+        let adapters = ProviderSet::new(&config);
+        let source_file = adapters
+            .discover_enabled(&config)
+            .sources
+            .into_iter()
+            .next()
+            .unwrap();
+        let outcome = try_tail(
+            &source_file,
+            &normalize_path(&source_file.path),
+            Some("claude:queue-tail"),
+            &db,
+            &|| false,
+            |reader, path| adapters.claude.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(matches!(outcome, TailOutcome::FullParse));
+        reindex(&config, &db, false, None).unwrap();
+        let messages = db
+            .search_messages(
+                "queued tail correction",
+                &crate::models::MessageFilters {
+                    session_id: Some("claude:queue-tail".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let queued = messages
+            .iter()
+            .find(|message| message.content == "queued tail correction")
+            .expect("full parse preserved queue input");
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let metadata: (String, String, String) = stored
+            .query_row(
+                "select authorship, input_origin, input_delivery_state from messages
+             where session_id=?1 and content=?2",
+                rusqlite::params![queued.session_id, queued.content],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            metadata,
+            ("unknown".into(), "queued".into(), "submitted".into())
+        );
+        assert_eq!(
+            db.search_messages(
+                "queued tail correction",
+                &crate::models::MessageFilters {
+                    role: Some(crate::models::Role::User),
+                    session_id: Some("claude:queue-tail".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(db
+            .resolve_session("claude:queue-tail")
+            .unwrap()
+            .session
+            .parse_warning
+            .is_none());
     }
 
     #[test]
@@ -1545,6 +2723,38 @@ mod tests {
     }
 
     #[test]
+    fn released_schema_five_without_input_columns_stays_readable_for_unrestricted_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        drop(Db::open(&db_path).unwrap());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // This is the released v1.0.0 shape for the fields added after its schema-5 stamp. Keep
+        // the derived FTS layout intact: an old index is readable content, not a broken search
+        // index, and only the user-input scope needs the additive columns.
+        conn.execute_batch(
+            "drop index idx_messages_session_authorship_relation_seq;
+             drop index idx_messages_authorship_relation_ts;
+             alter table messages drop column input_delivery_state;
+             alter table messages drop column input_origin;
+             create index idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq);
+             create index idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq);
+             pragma user_version = 5;",
+        )
+        .unwrap();
+        let config = config_with_no_providers(&db_path);
+        assert_eq!(
+            IndexCoordinator::new(&config).inspect_schema().unwrap(),
+            SchemaState::Current
+        );
+        assert!(message_input_provenance_layout_problem(&conn)
+            .unwrap()
+            .is_some());
+        assert!(current_schema_layout_problem(&conn).unwrap().is_none());
+    }
+
+    #[test]
     fn reindex_discovers_and_searches_snapshot_providers() {
         use crate::models::MessageFilters;
 
@@ -1588,6 +2798,667 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn gemini_json_jsonl_family_keeps_predecessor_history_and_two_receipts() {
+        use crate::models::MessageFilters;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("gemini");
+        let chats = root.join("project-hash").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let legacy = chats.join("session-2026-07-12T10-30-family.json");
+        let successor = chats.join("session-2026-07-12T10-30-family.jsonl");
+        std::fs::write(
+            &legacy,
+            r#"{"sessionId":"g-family","kind":"main","messages":[
+                {"id":"u1","type":"user","content":"original user input","timestamp":"2026-07-12T10:30:01Z"},
+                {"id":"old-answer","type":"gemini","content":"legacy-only answer","timestamp":"2026-07-12T10:30:02Z"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.gemini_cli.enabled = true;
+        config.providers.gemini_cli.paths = vec![root.to_string_lossy().to_string()];
+        let db = Db::open(&db_path).unwrap();
+
+        let (files_seen, _) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            files_seen, 1,
+            "legacy-only partial migration is indexed first"
+        );
+        assert_eq!(db.indexed_source_identities().unwrap().len(), 1);
+
+        let old_reference = db
+            .search_messages("legacy-only answer", &MessageFilters::default())
+            .unwrap();
+        let old_reference = (old_reference[0].session_id.clone(), old_reference[0].seq);
+
+        std::fs::write(
+            &successor,
+            concat!(
+                r#"{"sessionId":"g-family","kind":"main","startTime":"2026-07-12T10:30:00Z"}"#,
+                "\n",
+                r#"{"id":"u1","type":"user","content":"original user input","timestamp":"2026-07-12T10:30:01Z"}"#,
+                "\n",
+                r#"{"id":"echo","type":"user","content":[{"functionResponse":{"id":"q","name":"ask_user","response":{"output":"echoed"}}}]}"#,
+                "\n",
+                r#"{"id":"new-answer","type":"gemini","content":"successor-only answer","timestamp":"2026-07-12T10:30:03Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let (files_seen, _) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(files_seen, 2);
+        let identities = db.indexed_source_identities().unwrap();
+        assert_eq!(identities.len(), 1, "family has one logical session");
+        assert!(
+            identities[0].source_path.ends_with(".jsonl"),
+            "{identities:?}"
+        );
+        let session_id = identities[0].session_id.clone();
+        let migrated_reference = db
+            .search_messages("legacy-only answer", &MessageFilters::default())
+            .unwrap();
+        assert_eq!(
+            (
+                migrated_reference[0].session_id.clone(),
+                migrated_reference[0].seq
+            ),
+            old_reference,
+            "migration preserves previously published session/message references"
+        );
+        let user_filters = MessageFilters {
+            role: Some(crate::models::Role::User),
+            session_id: Some(session_id.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_messages("original user input", &user_filters)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages(
+                "legacy-only answer",
+                &MessageFilters {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages(
+                "successor-only answer",
+                &MessageFilters {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(db
+            .search_messages(
+                "functionResponse",
+                &MessageFilters {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .is_empty());
+
+        let receipts = rusqlite::Connection::open(&db_path).unwrap();
+        let receipt_count: i64 = receipts
+            .query_row(
+                "select count(*) from files_seen where provider='gemini-cli'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt_count, 2,
+            "both physical family members are freshened"
+        );
+        let predecessor_checkpoint: Option<i64> = receipts
+            .query_row(
+                "select tail_byte_offset from files_seen where provider='gemini-cli' and source_path like '%.json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            predecessor_checkpoint, None,
+            "predecessor never gets a tail checkpoint"
+        );
+        drop(receipts);
+
+        let trigger_conn = rusqlite::Connection::open(&db_path).unwrap();
+        trigger_conn
+            .execute_batch(
+                "create temp table family_message_updates(n integer);
+                 insert into family_message_updates values (0);
+                 create temp trigger count_family_message_updates after update on messages begin
+                     update family_message_updates set n = n + 1; end;",
+            )
+            .unwrap();
+        assert_eq!(reindex(&config, &db, false, None).unwrap(), (2, 0));
+        let unchanged_updates: i64 = trigger_conn
+            .query_row("select n from family_message_updates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            unchanged_updates, 0,
+            "unchanged family refresh is write-free"
+        );
+
+        std::fs::write(
+            &legacy,
+            r#"{"sessionId":"g-family","kind":"main","messages":[
+                {"id":"u1","type":"user","content":"original user input","timestamp":"2026-07-12T10:30:01Z"},
+                {"id":"old-answer","type":"gemini","content":"legacy-only answer","timestamp":"2026-07-12T10:30:02Z"},
+                {"id":"old-new","type":"user","content":"predecessor appended input","timestamp":"2026-07-12T10:30:04Z"}
+            ]}"#,
+        )
+        .unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let appended_filters = MessageFilters {
+            role: Some(crate::models::Role::User),
+            session_id: Some(session_id.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_messages("predecessor appended input", &appended_filters)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages("original user input", &appended_filters)
+                .unwrap()
+                .len(),
+            1,
+            "refresh does not duplicate the shared native input"
+        );
+
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&successor)
+            .unwrap()
+            .write_all(
+                br#"{"id":"new-successor","type":"gemini","content":"successor appended answer","timestamp":"2026-07-12T10:30:05Z"}
+"#,
+            )
+            .unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            db.search_messages(
+                "successor appended answer",
+                &MessageFilters {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        std::fs::remove_file(&successor).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let after_deletion = db.indexed_source_identities().unwrap();
+        assert_eq!(after_deletion.len(), 1);
+        assert_eq!(
+            after_deletion[0].session_id, session_id,
+            "logical ID remains stable"
+        );
+        assert_eq!(
+            db.search_messages(
+                "successor-only answer",
+                &MessageFilters {
+                    session_id: Some(after_deletion[0].session_id.clone()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1,
+            "archived successor rows survive member deletion"
+        );
+    }
+
+    #[test]
+    fn gemini_family_accepts_retained_input_and_keeps_it_after_successor_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("gemini");
+        let chats = root.join("project").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let legacy = chats.join("session-family.json");
+        let successor = chats.join("session-family.jsonl");
+        std::fs::write(&legacy, r#"{"sessionId":"retained-family","kind":"main","messages":[{"id":"u1","type":"user","content":"family original α","timestamp":"2026-07-12T10:30:01Z"}]}"#).unwrap();
+        std::fs::write(&successor, concat!(
+            "{\"sessionId\":\"retained-family\",\"kind\":\"main\"}\n",
+            "{\"id\":\"u1\",\"type\":\"user\",\"content\":\"family original α\",\"timestamp\":\"2026-07-12T10:30:01Z\"}\n",
+            "{\"$patch\":{\"id\":\"u1\",\"content\":\"generated context β\"}}\n",
+        )).unwrap();
+        let original_successor = std::fs::read_to_string(&successor).unwrap();
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.gemini_cli.enabled = true;
+        config.providers.gemini_cli.paths = vec![normalize_path(&root)];
+        let db = Db::open(&db_path).unwrap();
+        let input = crate::models::MessageFilters {
+            role: Some(crate::models::Role::User),
+            ..Default::default()
+        };
+        for pass in [0, 1] {
+            reindex(&config, &db, false, None).unwrap();
+            assert_eq!(
+                db.indexed_source_identities().unwrap().len(),
+                1,
+                "one native family at pass {pass}"
+            );
+            assert_eq!(
+                db.search_messages("family original α", &input)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(db
+                .search_messages("generated context β", &input)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.search_messages("generated context β", &Default::default())
+                    .unwrap()
+                    .len(),
+                1,
+                "previously indexed context survives member removal"
+            );
+            if pass == 0 {
+                std::fs::remove_file(&successor).unwrap();
+            }
+        }
+        // A surviving legacy member may change after the successor disappeared. Its weaker
+        // rendering must add new native events without downgrading the already indexed mixed row.
+        std::fs::write(
+            &legacy,
+            r#"{"sessionId":"retained-family","kind":"main","messages":[
+                {"id":"u1","type":"user","content":"family revised α","timestamp":"2026-07-12T10:30:01Z"},
+                {"id":"u2","type":"user","content":"legacy-only later input","timestamp":"2026-07-12T10:30:02Z"}
+            ]}"#,
+        )
+        .unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            db.search_messages("generated context β", &Default::default())
+                .unwrap()
+                .len(),
+            1,
+            "a changed surviving member cannot downgrade the joined mixed row"
+        );
+        assert_eq!(
+            db.search_messages(
+                "legacy-only later input",
+                &crate::models::MessageFilters {
+                    role: Some(crate::models::Role::User),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages(
+                "family revised α",
+                &crate::models::MessageFilters {
+                    role: Some(crate::models::Role::User),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        for pass in 0..2 {
+            let mut current = std::fs::read_to_string(&legacy).unwrap();
+            current.push(' ');
+            std::fs::write(&legacy, current).unwrap();
+            reindex(&config, &db, true, None).unwrap();
+            assert_eq!(
+                db.search_messages("family revised α", &input)
+                    .unwrap()
+                    .len(),
+                1,
+                "repeated full refresh must not multiply revised native input at pass {pass}"
+            );
+        }
+        std::fs::write(&successor, &original_successor).unwrap();
+        for pass in 0..2 {
+            reindex(&config, &db, true, None).unwrap();
+            for query in [
+                "family original α",
+                "family revised α",
+                "legacy-only later input",
+            ] {
+                assert_eq!(
+                    db.search_messages(query, &input).unwrap().len(),
+                    1,
+                    "successor reappearance preserves each input once: {query}, pass {pass}"
+                );
+            }
+            assert_eq!(
+                db.search_messages("generated context β", &Default::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        std::fs::write(&successor, format!("{original_successor}{{\"$patch\":{{\"id\":\"u1\",\"content\":\"generated context γ\"}}}}\n")).unwrap();
+        reindex(&config, &db, true, None).unwrap();
+        for query in [
+            "family original α",
+            "family revised α",
+            "legacy-only later input",
+        ] {
+            assert_eq!(db.search_messages(query, &input).unwrap().len(), 1);
+        }
+        for query in ["generated context β", "generated context γ"] {
+            assert_eq!(
+                db.search_messages(query, &Default::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(db.search_messages(query, &input).unwrap().is_empty());
+        }
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        let duplicates: i64 = connection.query_row(
+            "select count(*) from (select correlation_authority, correlation_scope, correlation_id
+                from messages where correlation_id is not null
+                group by correlation_authority, correlation_scope, correlation_id having count(*) > 1)",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(duplicates, 0, "each native event has one canonical row");
+        connection.execute_batch("create trigger reject_unchanged_family_update before update on messages begin select raise(abort, 'unchanged family event rewritten'); end;").unwrap();
+        reindex(&config, &db, true, None).unwrap();
+    }
+
+    #[test]
+    fn gemini_family_receipt_cannot_rebind_a_changed_native_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("gemini");
+        let chats = root.join("project/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let legacy = chats.join("session-family.json");
+        let successor = chats.join("session-family.jsonl");
+        std::fs::write(&legacy, r#"{"sessionId":"old-native","messages":[{"id":"u1","type":"user","content":"original family input"}]}"#).unwrap();
+        std::fs::write(&successor, "{\"sessionId\":\"old-native\"}\n{\"id\":\"u1\",\"type\":\"user\",\"content\":\"original family input\"}\n").unwrap();
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.gemini_cli.enabled = true;
+        config.providers.gemini_cli.paths = vec![normalize_path(&root)];
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let old_id = db
+            .search_messages("original family input", &Default::default())
+            .unwrap()[0]
+            .session_id
+            .clone();
+        std::fs::write(&successor, "{\"sessionId\":\"different-native\"}\n{\"id\":\"u1\",\"type\":\"user\",\"content\":\"replacement independent input\"}\n").unwrap();
+        let ReindexRun::Completed {
+            discovery_warnings, ..
+        } = reindex_until(&config, &db, false, None, &|| false).unwrap()
+        else {
+            panic!("unexpected cancellation")
+        };
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        let native_id: String = connection
+            .query_row(
+                "select provider_session_id from sessions where id = ?1",
+                [&old_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            native_id, "old-native",
+            "a stale family receipt cannot rename the old native session"
+        );
+        let replacement = db
+            .search_messages("replacement independent input", &Default::default())
+            .unwrap();
+        assert!(replacement.iter().all(|hit| hit.session_id != old_id));
+        assert!(
+            replacement.len() == 1
+                || discovery_warnings
+                    .iter()
+                    .any(|warning| warning.message.contains("native session ID changed")),
+            "a blocked path collision must be observable"
+        );
+    }
+
+    #[test]
+    fn gemini_family_orders_successor_before_forced_reverse_discovery() {
+        let predecessor_path = PathBuf::from("/fixture/session.json");
+        let successor_path = PathBuf::from("/fixture/session.jsonl");
+        let unrelated_path = PathBuf::from("/fixture/other-session.jsonl");
+        let source = |path: &Path| SourceFile {
+            provider: Provider::GeminiCli,
+            path: path.to_path_buf(),
+            mtime_ns: 1,
+            size_bytes: 1,
+        };
+        let predecessor = source(&predecessor_path);
+        let successor = source(&successor_path);
+        let family = GeminiMigrationFamily {
+            predecessor: predecessor.clone(),
+            successor: successor.clone(),
+            predecessor_path: normalize_path(&predecessor_path),
+            successor_path: normalize_path(&successor_path),
+            native_session_id: "native".into(),
+            logical_session_id: "gemini-cli:fixture".into(),
+            requires_reparse: true,
+        };
+        let mut families = HashMap::new();
+        families.insert(family.predecessor_path.clone(), family.clone());
+        families.insert(family.successor_path.clone(), family);
+        let unrelated = source(&unrelated_path);
+        for mut sources in [
+            vec![predecessor.clone(), unrelated.clone(), successor.clone()],
+            vec![successor.clone(), unrelated.clone(), predecessor.clone()],
+        ] {
+            order_gemini_family_successors_first(&mut sources, &families);
+            assert_eq!(
+                sources
+                    .iter()
+                    .map(|source| source.path.clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    successor_path.clone(),
+                    unrelated_path.clone(),
+                    predecessor_path.clone()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_family_receipts_roll_back_together_on_sql_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("gemini");
+        let chats = root.join("project").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let legacy = chats.join("session-rollback.json");
+        let successor = chats.join("session-rollback.jsonl");
+        std::fs::write(
+            &legacy,
+            r#"{"sessionId":"rollback-family","kind":"main","messages":[{"id":"u1","type":"user","content":"legacy"}]}"#,
+        )
+        .unwrap();
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.gemini_cli.enabled = true;
+        config.providers.gemini_cli.paths = vec![root.to_string_lossy().to_string()];
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        std::fs::write(
+            &successor,
+            concat!(
+                r#"{"sessionId":"rollback-family","kind":"main"}"#,
+                "\n",
+                r#"{"id":"u1","type":"user","content":"legacy"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let fixture = rusqlite::Connection::open(&db_path).unwrap();
+        fixture
+            .execute_batch(
+                "create trigger fail_gemini_family_receipt before insert on files_seen
+                 when new.source_path like '%.jsonl'
+                 begin select raise(abort, 'fixture family receipt failure'); end;",
+            )
+            .unwrap();
+        assert!(reindex(&config, &db, false, None).is_err());
+        let identity = db.indexed_source_identities().unwrap();
+        assert_eq!(identity.len(), 1);
+        assert!(identity[0].source_path.ends_with(".json"), "{identity:?}");
+        let receipt_count: i64 = fixture
+            .query_row(
+                "select count(*) from files_seen where provider = 'gemini-cli'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt_count, 1,
+            "failed family publish leaves no half receipt"
+        );
+        fixture
+            .execute_batch("drop trigger fail_gemini_family_receipt")
+            .unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(db.indexed_source_identities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn gemini_family_cancellation_between_members_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let predecessor_path = dir.path().join("session-cancel.json");
+        let successor_path = dir.path().join("session-cancel.jsonl");
+        std::fs::write(
+            &predecessor_path,
+            r#"{"sessionId":"cancel-family","kind":"main","messages":[{"id":"u1","type":"user","content":"legacy"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &successor_path,
+            concat!(
+                r#"{"sessionId":"cancel-family","kind":"main"}"#,
+                "\n",
+                r#"{"id":"u1","type":"user","content":"legacy"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let source = |path: &Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            SourceFile {
+                provider: Provider::GeminiCli,
+                path: path.to_path_buf(),
+                mtime_ns: 1,
+                size_bytes: metadata.len() as i64,
+            }
+        };
+        let family = GeminiMigrationFamily {
+            predecessor: source(&predecessor_path),
+            successor: source(&successor_path),
+            predecessor_path: normalize_path(&predecessor_path),
+            successor_path: normalize_path(&successor_path),
+            native_session_id: "cancel-family".into(),
+            logical_session_id: "gemini-cli:cancel-family".into(),
+            requires_reparse: true,
+        };
+        let config = config_with_no_providers(&db_path);
+        let adapters = ProviderSet::new(&config);
+        let checks = std::cell::Cell::new(0usize);
+        let cancelled = parse_gemini_migration_family(&adapters, &family, &|| {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 4
+        })
+        .unwrap();
+        assert!(matches!(cancelled, GeminiFamilyParse::Cancelled));
+        assert!(checks.get() >= 4);
+    }
+
+    #[test]
+    fn gemini_family_proof_failures_keep_files_independently_indexable() {
+        for (label, legacy_json, successor_jsonl) in [
+            (
+                "conflicting",
+                r#"{"sessionId":"g-one","messages":[{"id":"u1","type":"user","content":"legacy"}]}"#,
+                "{\"sessionId\":\"g-two\"}\n{\"id\":\"u2\",\"type\":\"user\",\"content\":\"successor\"}\n",
+            ),
+            (
+                "missing",
+                r#"{"messages":[{"id":"u1","type":"user","content":"legacy"}]}"#,
+                "{\"id\":\"u2\",\"type\":\"user\",\"content\":\"successor\"}\n",
+            ),
+            (
+                "malformed",
+                r#"{"sessionId":"g-one","messages":[{"id":"u1","type":"user","content":"legacy"}]}"#,
+                "not json\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.db");
+            let root = dir.path().join("gemini");
+            let chats = root.join("project-hash").join("chats");
+            std::fs::create_dir_all(&chats).unwrap();
+            std::fs::write(
+                chats.join(format!("session-{label}.json")),
+                legacy_json,
+            )
+            .unwrap();
+            std::fs::write(
+                chats.join(format!("session-{label}.jsonl")),
+                successor_jsonl,
+            )
+            .unwrap();
+            let mut config = config_with_no_providers(&db_path);
+            config.providers.gemini_cli.enabled = true;
+            config.providers.gemini_cli.paths = vec![root.to_string_lossy().to_string()];
+            let db = Db::open(&db_path).unwrap();
+            let run = reindex_until(&config, &db, false, None, &|| false).unwrap();
+            assert_eq!(
+                db.indexed_source_identities().unwrap().len(),
+                2,
+                "{label} proof failure must not merge independent sources"
+            );
+            let discovery_warnings = match run {
+                ReindexRun::Completed {
+                    discovery_warnings, ..
+                } => discovery_warnings,
+                ReindexRun::Cancelled { .. } => panic!("test refresh unexpectedly cancelled"),
+            };
+            assert!(
+                discovery_warnings
+                    .iter()
+                    .any(|warning| warning.operation == "migration_family_proof"),
+                "{label} warning missing: {:?}",
+                discovery_warnings
+            );
+        }
     }
 
     /// `reindex(full = true)` must not delete a session whose source file is gone.
@@ -2447,13 +4318,13 @@ mod tests {
         let claude_root = dir.path().join("claude");
         std::fs::create_dir_all(&claude_root).unwrap();
         let session_file = claude_root.join("session.jsonl");
-        let line = |role: &str, content: &str| {
+        let line = |id: &str, role: &str, content: &str| {
             format!(
-                "{{\"sessionId\":\"s1\",\"type\":\"{role}\",\
+                "{{\"uuid\":\"{id}\",\"sessionId\":\"s1\",\"type\":\"{role}\",\
                  \"message\":{{\"role\":\"{role}\",\"content\":\"{content}\"}}}}\n"
             )
         };
-        std::fs::write(&session_file, line("user", "first prompt")).unwrap();
+        std::fs::write(&session_file, line("event-1", "user", "first prompt")).unwrap();
 
         let config = config_with_single_claude_fixture(&db_path, &claude_root);
         let db = Db::open(&db_path).unwrap();
@@ -2496,7 +4367,7 @@ mod tests {
             .append(true)
             .open(&session_file)
             .unwrap()
-            .write_all(line("assistant", "second reply").as_bytes())
+            .write_all(line("event-2", "assistant", "second reply").as_bytes())
             .unwrap();
         let adapters = ProviderSet::new(&config);
         let source_file = adapters

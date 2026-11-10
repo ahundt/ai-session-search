@@ -13,19 +13,20 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use crate::files::{FileMutationPayload, PendingFileMutations};
+use crate::hashing::sha256;
 use crate::models::{
-    ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, MessageContentPart,
-    MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
+    ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, InputDeliveryState,
+    MessageAuthorship, MessageContentPart, MessageCorrelationAuthority, MessageCorrelationIdentity,
+    MessageInputOrigin, ParsedSession, Provider, SessionRecord, SourceFile,
 };
 use crate::providers::{
     spawn::{self, SpawnOrigin},
     walk_roots, ProviderDiscovery, ProviderPathWarning,
 };
 use crate::util::{
-    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, observe_session_start, parse_datetime,
-    preview_from_text, substantive_text, truncate_for_display, RawMessage,
-    UserRoleAuthorshipEvidence,
+    canonical_source_path, extract_text, find_repo_root, format_transcript_line, minimal_record,
+    normalize_path, observe_session_end, observe_session_start, parse_datetime, preview_from_text,
+    substantive_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 /// The workflow engine's own log, written beside the agent transcripts it spawned. It records
@@ -34,6 +35,11 @@ const WORKFLOW_JOURNAL_FILE: &str = "journal.jsonl";
 
 /// Filename prefix claude gives every subagent transcript, in both layouts it writes them in.
 const SUBAGENT_FILE_PREFIX: &str = "agent-";
+
+// Receipts can outlive their source; never resolve their already canonical path again.
+pub(crate) fn claude_queue_scope(canonical_path: &str) -> String {
+    format!("claude_queue:{canonical_path}")
+}
 
 pub struct ClaudeAdapter {
     roots: Vec<PathBuf>,
@@ -150,6 +156,7 @@ impl ClaudeAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let source_kind = ClaudeSourceKind::from_path(path);
+        let source_path = normalize_path(path);
         let desktop = match source_kind {
             ClaudeSourceKind::CodeJsonl => ClaudeDesktopMetadata::default(),
             ClaudeSourceKind::DesktopLocalAgent => claude_desktop_metadata(path),
@@ -200,6 +207,10 @@ impl ClaudeAdapter {
         // tool_use_id -> tool name, so a later tool_result (which references the call by
         // id, not name) can be tagged with the tool it came from.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
+        let mut queue_operation_counts: HashMap<String, usize> = HashMap::new();
+        let mut queue_occurrences: HashMap<String, usize> = HashMap::new();
+        let queue_scope = std::cell::OnceCell::new();
+        let mut requires_full_parse_for_tail = false;
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -265,6 +276,101 @@ impl ClaudeAdapter {
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty());
 
+            // Only enqueue records a submission; other queue operations establish neither a
+            // new input nor a link proving delivery. Keep repeated submissions independently.
+            if value.get("type").and_then(Value::as_str) == Some("queue-operation") {
+                let operation = value
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                *queue_operation_counts
+                    .entry(operation.to_string())
+                    .or_default() += 1;
+                if operation == "enqueue" {
+                    requires_full_parse_for_tail = true;
+                    if let Some(content) = value.get("content").and_then(Value::as_str) {
+                        let content = strip_command_markup(content).trim().to_string();
+                        if substantive_text(&content) {
+                            let timestamp_key = value
+                                .get("timestamp")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .or_else(|| timestamp.map(crate::util::stored_timestamp))
+                                .unwrap_or_else(|| "unknown-time".to_string());
+                            // Timestamp alone is not stable when an earlier, different enqueue
+                            // sharing that timestamp disappears from a shortened source. Include
+                            // the content digest in the source-local bucket; identical repeated
+                            // submissions still receive distinct occurrence suffixes.
+                            let identity_key =
+                                format!("{timestamp_key}:{}", sha256(content.as_bytes()));
+                            let occurrence =
+                                queue_occurrences.entry(identity_key.clone()).or_default();
+                            let occurrence_id = *occurrence;
+                            *occurrence += 1;
+                            observe_session_start(&mut created_at, timestamp);
+                            observe_session_end(&mut updated_at, timestamp);
+                            let mut raw_message =
+                                RawMessage::message("user", content.clone(), timestamp, None)
+                                    .with_input_delivery_state(InputDeliveryState::Submitted);
+                            // Legacy queue rows carry no sender or per-item origin. If a future
+                            // producer includes the SDK's native origin, preserve it: a known
+                            // generated/unclassified row must not become UserInput merely because
+                            // queue delivery is known, while direct/channel/scheduled input keeps
+                            // the queue origin and its submitted lifecycle evidence.
+                            match claude_native_message_semantics(&value) {
+                                Some(semantics) => {
+                                    raw_message = raw_message.with_authorship(semantics.authorship);
+                                    if semantics.input_origin.is_some() {
+                                        raw_message = raw_message
+                                            .with_input_origin(MessageInputOrigin::Queued);
+                                    }
+                                }
+                                None => {
+                                    raw_message = raw_message
+                                        .with_authorship(MessageAuthorship::Unknown)
+                                        .with_input_origin(MessageInputOrigin::Queued);
+                                }
+                            }
+                            if let Some(event_id) = event_id {
+                                raw_message = raw_message.with_native_event_identity(
+                                    MessageCorrelationAuthority::Anthropic,
+                                    event_id,
+                                );
+                            } else {
+                                raw_message = raw_message.with_correlation_identity(
+                                    MessageCorrelationIdentity {
+                                        authority: MessageCorrelationAuthority::SourceLocal,
+                                        // Verified aliases must name the same physical source.
+                                        scope: queue_scope
+                                            .get_or_init(|| {
+                                                claude_queue_scope(&canonical_source_path(path))
+                                            })
+                                            .clone(),
+                                        id: format!("{identity_key}#{occurrence_id}"),
+                                    },
+                                );
+                            }
+                            messages.push(raw_message);
+                            transcript_lines
+                                .push(format_transcript_line("user", timestamp, &content));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if claude_tool_use_result(&value).is_some_and(|result| {
+                result.get("answers").is_some_and(Value::is_object)
+                    || result.get("response").is_some_and(Value::is_string)
+            }) {
+                requires_full_parse_for_tail = true;
+            }
+
+            // Claude Code and Claude Desktop SDK user records carry this optional, structural
+            // origin metadata on the outer record. Absence is intentionally left unresolved so
+            // the legacy session-level evidence below remains unchanged.
+            let native_semantics = claude_native_message_semantics(&value);
+
             let mut role = value
                 .get("type")
                 .and_then(Value::as_str)
@@ -283,7 +389,14 @@ impl ClaudeAdapter {
                     .or(role);
                 text = extract_text(message);
                 if role.as_deref() == Some("user") {
-                    mixed_user_content = claude_mixed_user_content(message, subagent);
+                    mixed_user_content = claude_mixed_user_content(
+                        message,
+                        &value,
+                        subagent,
+                        &tool_use_names,
+                        true,
+                        native_semantics,
+                    );
                 }
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
@@ -339,11 +452,7 @@ impl ClaudeAdapter {
                     if let Some(mixed) = mixed_user_content {
                         observe_session_start(&mut created_at, timestamp);
                         observe_session_end(&mut updated_at, timestamp);
-                        let mut raw_message =
-                            RawMessage::message("user", mixed.content, timestamp, None);
-                        if let Some(parts) = mixed.parts {
-                            raw_message = raw_message.with_content_parts(parts);
-                        }
+                        let (mut raw_message, transcript_text) = mixed.into_raw_message(timestamp);
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::Anthropic,
@@ -351,11 +460,11 @@ impl ClaudeAdapter {
                             );
                         }
                         messages.push(raw_message);
-                        if !mixed.transcript_text.is_empty() {
+                        if !transcript_text.is_empty() {
                             transcript_lines.push(format_transcript_line(
                                 "user",
                                 timestamp,
-                                &mixed.transcript_text,
+                                &transcript_text,
                             ));
                         }
                         continue;
@@ -398,12 +507,21 @@ impl ClaudeAdapter {
                     }
                     observe_session_start(&mut created_at, timestamp);
                     observe_session_end(&mut updated_at, timestamp);
+                    let is_user_role = role.as_deref() == Some("user");
                     let mut raw_message = RawMessage::message(
                         role.unwrap_or_default(),
                         text.clone(),
                         timestamp,
                         None,
                     );
+                    if is_user_role {
+                        if let Some(semantics) = native_semantics {
+                            raw_message = raw_message.with_authorship(semantics.authorship);
+                            if let Some(origin) = semantics.input_origin {
+                                raw_message = raw_message.with_input_origin(origin);
+                            }
+                        }
+                    }
                     if let Some(event_id) = event_id {
                         raw_message = raw_message.with_native_event_identity(
                             MessageCorrelationAuthority::Anthropic,
@@ -463,7 +581,7 @@ impl ClaudeAdapter {
         let mut raw_metadata = json!({
             "line_count": line_count,
             "valid_record_count": valid_record_count,
-            "session_path": normalize_path(path),
+            "session_path": source_path,
         });
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
@@ -480,6 +598,13 @@ impl ClaudeAdapter {
             // enumerating them here would silently drop whichever key claude adds next.
             raw_metadata["subagent"] = sidecar.value.clone();
             raw_metadata["metadata_path"] = json!(normalize_path(&sidecar.path));
+        }
+        let has_queue_operations = !queue_operation_counts.is_empty();
+        if has_queue_operations {
+            raw_metadata["queue_operations"] = json!(queue_operation_counts);
+        }
+        if requires_full_parse_for_tail {
+            raw_metadata["requires_full_parse_for_tail"] = json!(true);
         }
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
@@ -520,7 +645,7 @@ impl ClaudeAdapter {
             updated_at,
             last_message_at: updated_at,
             preview_text: preview,
-            source_path: normalize_path(path),
+            source_path,
             message_count: Some(messages.len() as i64),
             parse_version: source_kind.parse_version().to_string(),
             raw_metadata_json,
@@ -537,9 +662,9 @@ impl ClaudeAdapter {
                 .or(agent_id),
         };
 
-        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
-        apply_user_role_authorship(
-            &mut messages,
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
             if subagent {
                 UserRoleAuthorshipEvidence::AgentDelegationEvent
             } else {
@@ -555,13 +680,186 @@ impl ClaudeAdapter {
     }
 }
 
-struct ClaudeMixedUserContent {
+pub(crate) struct ClaudeMixedUserContent {
     content: String,
     parts: Option<Vec<MessageContentPart>>,
     transcript_text: String,
+    has_interactive_answer: bool,
+    has_direct_text: bool,
+    native_authorship: Option<MessageAuthorship>,
+    native_input_origin: Option<MessageInputOrigin>,
+    tool_name: Option<String>,
+    tool_call_id: Option<String>,
 }
 
-fn claude_mixed_user_content(message: &Value, subagent: bool) -> Option<ClaudeMixedUserContent> {
+impl ClaudeMixedUserContent {
+    pub(crate) fn into_raw_message(self, timestamp: Option<DateTime<Utc>>) -> (RawMessage, String) {
+        let has_parts = self.parts.is_some();
+        let mut raw = if self.has_direct_text {
+            RawMessage::message("user", self.content, timestamp, self.tool_name)
+                .with_tool_call_id(self.tool_call_id)
+        } else {
+            RawMessage::tool_result_with_name(
+                self.tool_name,
+                self.content,
+                self.tool_call_id.as_deref(),
+                timestamp,
+            )
+        };
+        if let Some(parts) = self.parts {
+            raw = raw.with_content_parts(parts);
+        }
+        if self.has_interactive_answer {
+            raw = raw.with_input_origin(MessageInputOrigin::InteractiveAnswer);
+            if !has_parts {
+                raw =
+                    raw.with_authorship(self.native_authorship.unwrap_or(MessageAuthorship::Human));
+            }
+        } else if self.has_direct_text {
+            if let Some(origin) = self.native_input_origin {
+                raw = raw.with_input_origin(origin);
+            }
+            if !has_parts {
+                if let Some(authorship) = self.native_authorship {
+                    raw = raw.with_authorship(authorship);
+                }
+            }
+        }
+        (raw, self.transcript_text)
+    }
+}
+
+/// Exact source-native fields from Claude's SDK user-message envelope. This stays private: the
+/// public model already has the authorship/origin vocabulary needed by search and persistence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClaudeNativeMessageSemantics {
+    authorship: MessageAuthorship,
+    content_authorship: ContentPartAuthorship,
+    content_origin: ContentPartOrigin,
+    input_origin: Option<MessageInputOrigin>,
+    allow_interactive_answers: bool,
+}
+
+fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageSemantics> {
+    if let Some(is_synthetic) = value.get("isSynthetic") {
+        match is_synthetic.as_bool() {
+            Some(true) => {
+                return Some(ClaudeNativeMessageSemantics {
+                    authorship: MessageAuthorship::Generated,
+                    content_authorship: ContentPartAuthorship::Generated,
+                    content_origin: ContentPartOrigin::GeneratedSummary,
+                    input_origin: None,
+                    allow_interactive_answers: false,
+                });
+            }
+            Some(false) => {}
+            None => {
+                return Some(ClaudeNativeMessageSemantics {
+                    authorship: MessageAuthorship::Unknown,
+                    content_authorship: ContentPartAuthorship::Unknown,
+                    content_origin: ContentPartOrigin::Unknown,
+                    input_origin: None,
+                    allow_interactive_answers: false,
+                });
+            }
+        }
+    }
+
+    // SDK streams can interleave child messages in a main-session log. These fields identify
+    // that child context; a missing origin must not inherit the main session's input fallback.
+    if value.get("origin").is_none()
+        && value.get("type").and_then(Value::as_str) == Some("user")
+        && ["agent_id", "parent_tool_use_id"].iter().any(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        })
+    {
+        return Some(ClaudeNativeMessageSemantics {
+            authorship: MessageAuthorship::Agent,
+            content_authorship: ContentPartAuthorship::Agent,
+            content_origin: ContentPartOrigin::DirectInput,
+            input_origin: None,
+            allow_interactive_answers: false,
+        });
+    }
+    let origin = value.get("origin")?;
+    let Some(origin) = origin.as_object() else {
+        return Some(ClaudeNativeMessageSemantics {
+            authorship: MessageAuthorship::Unknown,
+            content_authorship: ContentPartAuthorship::Unknown,
+            content_origin: ContentPartOrigin::Unknown,
+            input_origin: None,
+            allow_interactive_answers: false,
+        });
+    };
+    let kind = origin.get("kind").and_then(Value::as_str);
+    let direct_input = match kind {
+        Some("human") | Some("channel") => true,
+        Some("task-notification") => {
+            origin.get("subkind").and_then(Value::as_str) == Some("scheduled-trigger")
+        }
+        _ => false,
+    };
+    let (authorship, content_authorship) = match kind {
+        Some("human") => (MessageAuthorship::Human, ContentPartAuthorship::Human),
+        Some("channel") | Some("task-notification") if direct_input => {
+            (MessageAuthorship::Unknown, ContentPartAuthorship::Unknown)
+        }
+        Some("peer") | Some("coordinator") => {
+            (MessageAuthorship::Agent, ContentPartAuthorship::Agent)
+        }
+        Some("task-notification")
+            if origin.get("subkind").and_then(Value::as_str) == Some("peer-send-message") =>
+        {
+            (MessageAuthorship::Agent, ContentPartAuthorship::Agent)
+        }
+        Some("task-notification") => (
+            MessageAuthorship::Generated,
+            ContentPartAuthorship::Generated,
+        ),
+        Some("auto-continuation") | Some("unclassified") => (
+            MessageAuthorship::Generated,
+            ContentPartAuthorship::Generated,
+        ),
+        _ => (MessageAuthorship::Unknown, ContentPartAuthorship::Unknown),
+    };
+    let content_origin = match kind {
+        Some("human") | Some("channel") | Some("task-notification") if direct_input => {
+            ContentPartOrigin::DirectInput
+        }
+        Some("auto-continuation") | Some("unclassified") | Some("task-notification") => {
+            ContentPartOrigin::GeneratedSummary
+        }
+        Some("peer") | Some("coordinator") => ContentPartOrigin::DirectInput,
+        _ => ContentPartOrigin::Unknown,
+    };
+    Some(ClaudeNativeMessageSemantics {
+        authorship,
+        content_authorship,
+        content_origin,
+        input_origin: direct_input.then_some(MessageInputOrigin::DirectConversation),
+        allow_interactive_answers: direct_input,
+    })
+}
+
+/// Claude Code uses camelCase while the SDK's documented user/replay envelope uses snake_case.
+/// Keep this translation in one accessor so tail markers, attribution, and rendering agree.
+fn claude_tool_use_result(value: &Value) -> Option<&Value> {
+    value
+        .get("toolUseResult")
+        .or_else(|| value.get("tool_use_result"))
+}
+
+pub(crate) fn claude_mixed_user_content(
+    message: &Value,
+    value: &Value,
+    subagent: bool,
+    tool_use_names: &HashMap<String, String>,
+    decode_native_answers: bool,
+    native_semantics: Option<ClaudeNativeMessageSemantics>,
+) -> Option<ClaudeMixedUserContent> {
     let blocks = message.get("content")?.as_array()?;
     let has_tool_result = blocks
         .iter()
@@ -570,50 +868,161 @@ fn claude_mixed_user_content(message: &Value, subagent: bool) -> Option<ClaudeMi
         block.get("type").and_then(Value::as_str) != Some("tool_result")
             && !extract_text(block).trim().is_empty()
     });
-    if !(has_tool_result && has_direct_text) {
+    if !has_tool_result {
         return None;
     }
 
-    let direct_authorship = if subagent {
-        ContentPartAuthorship::Agent
-    } else {
-        ContentPartAuthorship::Human
-    };
+    let direct_authorship = native_semantics
+        .map(|semantics| semantics.content_authorship)
+        .unwrap_or_else(|| {
+            if subagent {
+                ContentPartAuthorship::Agent
+            } else {
+                ContentPartAuthorship::Human
+            }
+        });
+    let direct_origin = native_semantics
+        .map(|semantics| semantics.content_origin)
+        .unwrap_or(ContentPartOrigin::DirectInput);
     let mut content = String::new();
+    let mut content_chars = 0;
     let mut parts: Vec<MessageContentPart> = Vec::new();
     let mut transcript_parts = Vec::new();
+    let mut has_interactive_answer = false;
+    let mut tool_result_count = 0;
+    let mut tool_name = None;
+    let mut tool_call_id = None;
+    let allow_interactive_answers = decode_native_answers
+        && native_semantics
+            .map(|semantics| semantics.allow_interactive_answers)
+            .unwrap_or(!subagent);
+    let interactive_results = blocks
+        .iter()
+        .filter(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| tool_use_names.get(id))
+                    .is_some_and(|name| is_ask_user_tool_name(name))
+        })
+        .count();
     for block in blocks {
-        let text = extract_text(block);
-        let text = text.trim();
+        let is_tool_result = block.get("type").and_then(Value::as_str) == Some("tool_result");
+        if is_tool_result {
+            tool_result_count += 1;
+            if tool_result_count == 1 {
+                tool_call_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                tool_name = tool_call_id
+                    .as_deref()
+                    .and_then(|id| tool_use_names.get(id))
+                    .cloned();
+            } else {
+                // One aggregate record may contain several independent results. A first
+                // call's id/name would misdescribe the other blocks, so keep the row's
+                // content but clear the ambiguous tool metadata.
+                tool_call_id = None;
+                tool_name = None;
+            }
+        }
+        let text = extract_text(block).trim().to_owned();
+        let linked_answer = is_tool_result
+            && allow_interactive_answers
+            && interactive_results == 1
+            && block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .and_then(|id| tool_use_names.get(id))
+                .is_some_and(|name| is_ask_user_tool_name(name));
+        let (text, attributed_answer) = if linked_answer {
+            interactive_answer_content(
+                value,
+                text,
+                native_semantics
+                    .map(|semantics| semantics.content_authorship)
+                    .unwrap_or(ContentPartAuthorship::Human),
+            )
+        } else {
+            (text, None)
+        };
         if text.is_empty() {
             continue;
         }
-        let is_tool_result = block.get("type").and_then(Value::as_str) == Some("tool_result");
         if !content.is_empty() {
             content.push('\n');
-            if let Some(previous) = parts.last_mut() {
+            let separator_start = content_chars;
+            content_chars += 1;
+            if let Some(previous) = parts.last_mut().filter(|part| {
+                part.authorship == ContentPartAuthorship::Generated
+                    && part.origin == ContentPartOrigin::ToolPayload
+            }) {
                 previous.end_char += 1;
+            } else {
+                parts.push(content_part(
+                    parts.len() as u32,
+                    separator_start,
+                    content_chars,
+                    ContentPartAuthorship::Generated,
+                    ContentPartOrigin::ToolPayload,
+                ));
             }
         }
-        let start_char = content.chars().count();
-        content.push_str(text);
-        let end_char = content.chars().count();
-        let (authorship, origin) = if is_tool_result {
-            (
-                ContentPartAuthorship::Generated,
-                ContentPartOrigin::ToolPayload,
-            )
+        let start_char = content_chars;
+        content.push_str(&text);
+        content_chars += text.chars().count();
+        let end_char = content_chars;
+        if attributed_answer.is_some() {
+            has_interactive_answer = true;
+        }
+        if let Some(attribution) = attributed_answer {
+            match attribution {
+                InteractiveAnswerAttribution::Whole => parts.push(MessageContentPart {
+                    ordinal: parts.len() as u32,
+                    start_char,
+                    end_char,
+                    authorship: direct_authorship,
+                    origin: ContentPartOrigin::DirectInput,
+                }),
+                InteractiveAnswerAttribution::Mixed(local_parts) => {
+                    for mut part in local_parts {
+                        part.ordinal = parts.len() as u32;
+                        part.start_char += start_char;
+                        part.end_char += start_char;
+                        parts.push(part);
+                    }
+                }
+            }
+        } else if is_tool_result {
+            if let Some(previous) = parts.last_mut().filter(|part| {
+                part.authorship == ContentPartAuthorship::Generated
+                    && part.origin == ContentPartOrigin::ToolPayload
+            }) {
+                previous.end_char = end_char;
+            } else {
+                parts.push(content_part(
+                    parts.len() as u32,
+                    start_char,
+                    end_char,
+                    ContentPartAuthorship::Generated,
+                    ContentPartOrigin::ToolPayload,
+                ));
+            }
         } else {
             transcript_parts.push(text.to_string());
-            (direct_authorship, ContentPartOrigin::DirectInput)
-        };
-        parts.push(MessageContentPart {
-            ordinal: parts.len() as u32,
-            start_char,
-            end_char,
-            authorship,
-            origin,
-        });
+            parts.push(MessageContentPart {
+                ordinal: parts.len() as u32,
+                start_char,
+                end_char,
+                authorship: direct_authorship,
+                origin: direct_origin,
+            });
+        }
+    }
+    if content.is_empty() {
+        return None;
     }
     // One linear pass over the retained partitions avoids fabricating `Mixed` when a structural
     // block (such as a tool reference) has no searchable text. No text or part is copied here.
@@ -627,6 +1036,12 @@ fn claude_mixed_user_content(message: &Value, subagent: bool) -> Option<ClaudeMi
         content,
         parts: has_distinct_authorship.then_some(parts),
         transcript_text: transcript_parts.join("\n"),
+        has_interactive_answer,
+        has_direct_text,
+        native_authorship: native_semantics.map(|semantics| semantics.authorship),
+        native_input_origin: native_semantics.and_then(|semantics| semantics.input_origin),
+        tool_name,
+        tool_call_id,
     })
 }
 
@@ -971,6 +1386,278 @@ pub(crate) fn collect_tool_use_names(message: &Value, out: &mut HashMap<String, 
     }
 }
 
+fn is_ask_user_tool_name(name: &str) -> bool {
+    name.chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .eq("askuserquestion".chars())
+}
+
+enum InteractiveAnswerAttribution {
+    Whole,
+    Mixed(Vec<MessageContentPart>),
+}
+
+/// Keep native answers findable even when the display omits them. Existing wrapper bytes stay
+/// generated; only unrepresented decoded values are appended, with generated separators.
+/// With A answers, B display bytes and N native payload bytes: expected O(N + A*B + A log A)
+/// time, O(N + B + A) peak state and O(B + T + A) retained output for T answer bytes.
+fn interactive_answer_content(
+    value: &Value,
+    mut content: String,
+    answer_authorship: ContentPartAuthorship,
+) -> (String, Option<InteractiveAnswerAttribution>) {
+    let attribution = interactive_answer_attribution(value, &content, answer_authorship);
+    let mut parts = match attribution {
+        Some(InteractiveAnswerAttribution::Whole) => vec![content_part(
+            0,
+            0,
+            content.chars().count(),
+            answer_authorship,
+            ContentPartOrigin::DirectInput,
+        )],
+        Some(InteractiveAnswerAttribution::Mixed(parts)) => parts,
+        None if !content.is_empty() => vec![content_part(
+            0,
+            0,
+            content.chars().count(),
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        )],
+        None => Vec::new(),
+    };
+    let mut represented = HashMap::<String, usize>::new();
+    for part in parts
+        .iter()
+        .filter(|part| part.authorship == answer_authorship)
+    {
+        let text = content
+            .chars()
+            .skip(part.start_char)
+            .take(part.end_char - part.start_char)
+            .collect();
+        *represented.entry(text).or_default() += 1;
+    }
+    let result = claude_tool_use_result(value);
+    let values: Vec<&str> = if let Some(response) = result
+        .and_then(|result| result.get("response"))
+        .and_then(Value::as_str)
+    {
+        vec![response]
+    } else {
+        let order: HashMap<&str, usize> = result
+            .and_then(|result| result.get("questions"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, question)| {
+                question
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .map(|question| (question, index))
+            })
+            .collect();
+        let mut answers: Vec<_> = result
+            .and_then(|result| result.get("answers"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|answers| answers.iter())
+            .filter_map(|(question, answer)| {
+                answer.as_str().map(|answer| (question.as_str(), answer))
+            })
+            .collect();
+        answers
+            .sort_by_cached_key(|(question, _)| order.get(question).copied().unwrap_or(usize::MAX));
+        answers.into_iter().map(|(_, answer)| answer).collect()
+    };
+    let mut cursor = content.chars().count();
+    for answer in values.into_iter().filter(|answer| !answer.is_empty()) {
+        if let Some(count) = represented.get_mut(answer) {
+            if *count > 0 {
+                *count -= 1;
+                continue;
+            }
+        }
+        if !content.is_empty() {
+            content.push('\n');
+            parts.push(content_part(
+                parts.len() as u32,
+                cursor,
+                cursor + 1,
+                ContentPartAuthorship::Generated,
+                ContentPartOrigin::ToolPayload,
+            ));
+            cursor += 1;
+        }
+        content.push_str(answer);
+        let end = cursor + answer.chars().count();
+        parts.push(content_part(
+            parts.len() as u32,
+            cursor,
+            end,
+            answer_authorship,
+            ContentPartOrigin::DirectInput,
+        ));
+        cursor = end;
+    }
+    let has_input = parts
+        .iter()
+        .any(|part| part.authorship == answer_authorship);
+    let has_generated = parts
+        .iter()
+        .any(|part| part.authorship == ContentPartAuthorship::Generated);
+    let attribution = if !has_input {
+        None
+    } else if has_generated {
+        Some(InteractiveAnswerAttribution::Mixed(parts))
+    } else {
+        Some(InteractiveAnswerAttribution::Whole)
+    };
+    (content, attribution)
+}
+
+/// Attribute a tool-result wrapper using only the structured answer values belonging to an
+/// earlier AskUserQuestion call. Unknown wrapper text remains generated; absent or unmappable
+/// answers return `None` so the normal tool-result classification remains unchanged.
+/// For A answers, B wrapper bytes and P parts, matching costs O(A*B + P log P); scalar
+/// conversion costs O(B + P), with O(P + longest pair) temporary memory and no wrapper copy.
+/// shortcut: scan per answer; use multi-pattern matching if large answer maps measure costly.
+fn interactive_answer_attribution(
+    value: &Value,
+    content: &str,
+    answer_authorship: ContentPartAuthorship,
+) -> Option<InteractiveAnswerAttribution> {
+    let result = claude_tool_use_result(value)?;
+    if let Some(response) = result.get("response").and_then(Value::as_str) {
+        if response.is_empty() {
+            return None;
+        }
+        if content == response {
+            return Some(InteractiveAnswerAttribution::Whole);
+        }
+        const PREFIX: &str = "The user responded: ";
+        if content.strip_prefix(PREFIX) != Some(response) {
+            return None;
+        }
+        let start = PREFIX.chars().count();
+        return Some(InteractiveAnswerAttribution::Mixed(vec![
+            content_part(
+                0,
+                0,
+                start,
+                ContentPartAuthorship::Generated,
+                ContentPartOrigin::ToolPayload,
+            ),
+            content_part(
+                1,
+                start,
+                content.chars().count(),
+                answer_authorship,
+                ContentPartOrigin::DirectInput,
+            ),
+        ]));
+    }
+    let answers = result.get("answers").and_then(Value::as_object)?;
+    if answers.len() == 1 {
+        if let Some(answer) = answers.values().next().and_then(Value::as_str) {
+            if !answer.is_empty() && content == answer {
+                return Some(InteractiveAnswerAttribution::Whole);
+            }
+        }
+    }
+    // Claude's wrapper is structurally `"question"="answer"`; do not search for an answer
+    // value in arbitrary wrapper prose, because the same word can occur in the question or in
+    // generated text. Repeated pairs are ambiguous and remain generated.
+    let mut matches = answers
+        .iter()
+        .filter_map(|(question, answer)| {
+            let answer = answer.as_str().filter(|answer| !answer.is_empty())?;
+            let pair = format!(r#""{question}"="{answer}""#);
+            let mut occurrences = content.match_indices(&pair);
+            let (pair_start, _) = occurrences.next()?;
+            if occurrences.next().is_some() {
+                return None;
+            }
+            let answer_start = pair_start + question.len() + 4;
+            Some((answer_start, answer_start + answer.len()))
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_unstable_by_key(|(start, _)| *start);
+    if matches.windows(2).any(|window| window[1].0 < window[0].1) {
+        return None;
+    }
+    // Walk disjoint slices once; a byte-to-character table would allocate a machine word for
+    // every input byte even though only the part boundaries need scalar coordinates.
+    let mut cursor = 0usize;
+    let mut cursor_char = 0usize;
+    let mut parts = Vec::new();
+    for (start, end) in matches {
+        let start_char = cursor_char + content[cursor..start].chars().count();
+        let end_char = start_char + content[start..end].chars().count();
+        if start > cursor {
+            parts.push(content_part(
+                parts.len() as u32,
+                cursor_char,
+                start_char,
+                ContentPartAuthorship::Generated,
+                ContentPartOrigin::ToolPayload,
+            ));
+        }
+        parts.push(content_part(
+            parts.len() as u32,
+            start_char,
+            end_char,
+            answer_authorship,
+            ContentPartOrigin::DirectInput,
+        ));
+        cursor = end;
+        cursor_char = end_char;
+    }
+    if cursor < content.len() {
+        parts.push(content_part(
+            parts.len() as u32,
+            cursor_char,
+            cursor_char + content[cursor..].chars().count(),
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        ));
+    }
+    let has_input = parts
+        .iter()
+        .any(|part| part.authorship == answer_authorship);
+    let has_generated = parts
+        .iter()
+        .any(|part| part.authorship == ContentPartAuthorship::Generated);
+    if !has_input {
+        return None;
+    }
+    if has_generated {
+        Some(InteractiveAnswerAttribution::Mixed(parts))
+    } else {
+        Some(InteractiveAnswerAttribution::Whole)
+    }
+}
+
+fn content_part(
+    ordinal: u32,
+    start_char: usize,
+    end_char: usize,
+    authorship: ContentPartAuthorship,
+    origin: ContentPartOrigin,
+) -> MessageContentPart {
+    MessageContentPart {
+        ordinal,
+        start_char,
+        end_char,
+        authorship,
+        origin,
+    }
+}
+
 /// Index assistant `tool_use` inputs as searchable tool messages. Tool results remain separate
 /// rows, so users can search both what the agent called and what came back.
 pub(crate) fn append_tool_use_messages(
@@ -1206,6 +1893,7 @@ mod tests {
             project.join("agent-0ccb8736.jsonl"),
             format!(
                 r#"{{"type":"user","isSidechain":true,"agentId":"0ccb8736","sessionId":"{parent}","userType":"external","cwd":"/tmp/proj","message":{{"role":"user","content":"subagent turn"}}}}
+{{"type":"queue-operation","operation":"enqueue","sessionId":"{parent}","timestamp":"2026-06-17T00:00:00Z","content":"subagent queued turn"}}
 "#
             ),
         )
@@ -1243,6 +1931,16 @@ mod tests {
             crate::models::MessageAuthorship::Agent,
             "a user-role turn in a structurally identified subagent transcript is agent delegation"
         );
+        assert_eq!(parsed.messages[1].content, "subagent queued turn");
+        assert_eq!(
+            parsed.messages[1].provenance.authorship,
+            crate::models::MessageAuthorship::Unknown,
+            "the queue record carries no author receipt, even in a subagent transcript"
+        );
+        assert_eq!(
+            parsed.messages[1].provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::Queued)
+        );
 
         // The parent still parses to itself, unaffected.
         let parent_source = sources
@@ -1255,6 +1953,29 @@ mod tests {
             parsed_parent.messages[0].provenance.authorship,
             crate::models::MessageAuthorship::Human
         );
+    }
+
+    #[test]
+    fn subagent_interactive_answers_do_not_infer_human_authorship_from_the_tool_name() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parent/subagents/agent-answer.jsonl");
+        let records = concat!(
+            r#"{"type":"assistant","sessionId":"parent","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"parent","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"yes"}]},"toolUseResult":{"answers":{"Proceed?":"yes"}}}"#,
+            "\n"
+        );
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(std::io::Cursor::new(records), &path)
+            .unwrap();
+        assert!(parsed.messages.iter().all(
+            |message| message.provenance.authorship != crate::models::MessageAuthorship::Human
+        ));
+        assert!(parsed
+            .messages
+            .iter()
+            .flat_map(|message| &message.provenance.content_parts)
+            .all(|part| part.authorship != crate::models::ContentPartAuthorship::Human));
     }
 
     #[test]
@@ -1280,6 +2001,11 @@ mod tests {
         );
         assert_eq!(message.content, "before α\noutput β\nafter γ");
         assert_eq!(
+            message.provenance.content_parts[0].end_char,
+            "before α".chars().count(),
+            "inserted separators are generated, not part of the submitted text"
+        );
+        assert_eq!(
             message
                 .provenance
                 .content_parts
@@ -1296,13 +2022,1047 @@ mod tests {
             .provenance
             .validate(&message.content)
             .expect("mixed parts exactly cover the Unicode-scalar content");
-        assert!(
-            message.tool_call_id.is_none(),
-            "one mixed record cannot use one tool-call id as the identity of all parts"
+        assert_eq!(
+            message.tool_call_id.as_deref(),
+            Some("tool-1"),
+            "a single tool relation is retained independently of the source event identity"
         );
         assert!(parsed.transcript_text.contains("before α"));
         assert!(parsed.transcript_text.contains("after γ"));
         assert!(!parsed.transcript_text.contains("output β"));
+    }
+
+    #[test]
+    fn mixed_direct_interactive_and_ordinary_tool_results_preserve_each_origin() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("mixed-interactive-session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"mixed-interactive","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-mixed","name":"AskUserQuestion","input":{}},{"type":"tool_use","id":"ordinary","name":"Read","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"mixed-interactive","message":{"role":"user","content":[{"type":"text","text":"direct request"},{"type":"tool_result","tool_use_id":"ordinary","content":"ordinary output"},{"type":"tool_result","tool_use_id":"ask-mixed","content":"Your questions have been answered: \"Did you say yes?\"=\"yes\"."}]},"toolUseResult":{"answers":{"Did you say yes?":"yes"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let message = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("direct request"))
+            .expect("mixed user record");
+        assert_eq!(
+            message.provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(
+            message.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+        let human_parts: Vec<_> = message
+            .provenance
+            .content_parts
+            .iter()
+            .filter(|part| part.authorship == crate::models::ContentPartAuthorship::Human)
+            .collect();
+        assert_eq!(human_parts.len(), 2, "direct text plus answer value");
+        assert!(human_parts.iter().any(|part| {
+            let text: String = message
+                .content
+                .chars()
+                .skip(part.start_char)
+                .take(part.end_char - part.start_char)
+                .collect();
+            text == "yes"
+        }));
+        assert!(message.provenance.content_parts.iter().any(|part| {
+            part.authorship == crate::models::ContentPartAuthorship::Generated
+                && part.origin == crate::models::ContentPartOrigin::ToolPayload
+        }));
+        message.provenance.validate(&message.content).unwrap();
+    }
+
+    #[test]
+    fn later_ask_user_tool_result_is_attributed_without_direct_text() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("later-interactive-session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"later-interactive","message":{"role":"assistant","content":[{"type":"tool_use","id":"ordinary","name":"Read","input":{}},{"type":"tool_use","id":"ask-later","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"later-interactive","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ordinary","content":"ordinary output"},{"type":"tool_result","tool_use_id":"ask-later","content":"User has answered: \"Quality?\"=\"yes\"."}]},"toolUseResult":{"answers":{"Quality?":"yes"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.kind == crate::models::MessageKind::ToolResult)
+            .expect("the aggregate tool-result row remains searchable");
+        assert_eq!(
+            answer.provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert!(answer.provenance.content_parts.iter().any(|part| {
+            part.authorship == crate::models::ContentPartAuthorship::Human
+                && part.origin == crate::models::ContentPartOrigin::DirectInput
+        }));
+        answer.provenance.validate(&answer.content).unwrap();
+    }
+
+    #[test]
+    fn aggregate_tool_results_attribute_answers_to_the_matching_block_only() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("aggregate-answer-session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"aggregate-answer","message":{"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{}},{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"Your questions have been answered: \"Quality?\"=\"yes\"."},{"type":"tool_result","tool_use_id":"ask-1","content":"yes"}]},"toolUseResult":{"answers":{"Quality?":"yes"}}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"The user responded: freeform α\ncontinue"}]},"toolUseResult":{"response":"freeform α\ncontinue"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"native only α"},{"type":"tool_result","tool_use_id":"ask-1","content":"answer recorded"}]},"toolUseResult":{"response":"native only α"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"aggregate-answer","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"stored elsewhere"}]},"toolUseResult":{"questions":[{"question":"z"},{"question":"a"}],"answers":{"a":"α answer","z":"z answer"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.kind == crate::models::MessageKind::ToolResult)
+            .expect("aggregate tool-result row remains one source record");
+        let human_parts: Vec<_> = answer
+            .provenance
+            .content_parts
+            .iter()
+            .filter(|part| part.authorship == crate::models::ContentPartAuthorship::Human)
+            .collect();
+        assert_eq!(human_parts.len(), 1);
+        assert!(
+            human_parts[0].start_char
+                > "Your questions have been answered: \"Quality?\"=\"yes\"."
+                    .chars()
+                    .count()
+        );
+        let text: String = answer
+            .content
+            .chars()
+            .skip(human_parts[0].start_char)
+            .take(human_parts[0].end_char - human_parts[0].start_char)
+            .collect();
+        assert_eq!(text, "yes");
+        answer.provenance.validate(&answer.content).unwrap();
+
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let user_input = |query| {
+            crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(query).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .role(crate::models::Role::User)
+            .build()
+            .unwrap()
+        };
+        assert_eq!(service.search(user_input("yes")).unwrap().hits().len(), 1);
+        assert_eq!(
+            service
+                .search(user_input("freeform α\ncontinue"))
+                .unwrap()
+                .hits()
+                .len(),
+            1
+        );
+        assert!(service
+            .search(user_input("The user responded:"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert_eq!(
+            service
+                .search(user_input("native only α"))
+                .unwrap()
+                .hits()
+                .len(),
+            1
+        );
+        assert!(service
+            .search(user_input("answer recorded"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| message.content == "stored elsewhere\nz answer\nα answer"));
+        for query in ["z answer", "α answer"] {
+            assert_eq!(service.search(user_input(query)).unwrap().hits().len(), 1);
+        }
+        assert!(service
+            .search(user_input("z answer\nα answer"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert!(service
+            .search(user_input("Quality?"))
+            .unwrap()
+            .hits()
+            .is_empty());
+    }
+
+    #[test]
+    fn interactive_answers_keep_native_values_when_display_is_ambiguous() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("answer-safety-session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"answer-safety","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"answer-safety","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"Your questions have been answered: \"Did you say yes?\"=\"yes\"."}]},"toolUseResult":{"answers":{"Did you say yes?":"yes"}}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"answer-safety","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"\"q\"=\"yes\" and \"q\"=\"yes\""}]},"toolUseResult":{"answers":{"q":"yes"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let answers: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|message| message.kind == crate::models::MessageKind::ToolResult)
+            .collect();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(
+            answers[0].provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        let human_answer = answers[0]
+            .provenance
+            .content_parts
+            .iter()
+            .find(|part| part.authorship == crate::models::ContentPartAuthorship::Human)
+            .unwrap();
+        let answer_text: String = answers[0]
+            .content
+            .chars()
+            .skip(human_answer.start_char)
+            .take(human_answer.end_char - human_answer.start_char)
+            .collect();
+        assert_eq!(answer_text, "yes");
+        assert_eq!(
+            answers[1].provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(answers[1].content, "\"q\"=\"yes\" and \"q\"=\"yes\"\nyes");
+        let native_answer = answers[1].provenance.content_parts.last().unwrap();
+        assert_eq!(
+            native_answer.authorship,
+            crate::models::ContentPartAuthorship::Human
+        );
+        assert_eq!(native_answer.end_char - native_answer.start_char, 3);
+        assert!(native_answer.start_char > "\"q\"=\"yes\" and \"q\"=\"yes\"".chars().count());
+    }
+
+    #[test]
+    fn only_queue_enqueues_require_occurrence_history_for_tail_parsing() {
+        let adapter = ClaudeAdapter::new(vec![]);
+        for (operation, full_parse) in [("enqueue", true), ("popAll", false)] {
+            let record = json!({"type":"queue-operation", "sessionId":"queue-tail-state",
+                "operation":operation, "content":"queued prompt"})
+            .to_string();
+            let parsed = adapter
+                .parse_reader(
+                    std::io::Cursor::new(record),
+                    std::path::Path::new("/tmp/queue-tail-state.jsonl"),
+                )
+                .unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                metadata["requires_full_parse_for_tail"]
+                    .as_bool()
+                    .unwrap_or(false),
+                full_parse
+            );
+            assert!(parsed.session.parse_warning.is_none());
+        }
+    }
+
+    #[test]
+    fn ask_user_answers_are_human_and_legacy_queue_authors_remain_unknown() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("input-session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"input-session","timestamp":"2026-06-16T20:58:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{"questions":[]}}]}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"input-session","timestamp":"2026-06-16T20:58:01Z","uuid":"answer-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"Your questions have been answered: \"quality\"=\"human answer α\"."}]},"toolUseResult":{"answers":{"quality":"human answer α"}}}"#,
+                "\n",
+                r#"{"type":"queue-operation","operation":"enqueue","sessionId":"input-session","timestamp":"2026-06-16T20:58:02Z","content":"queued correction"}"#,
+                "\n",
+                "{malformed\n",
+                r#"{"type":"queue-operation","operation":"popAll","sessionId":"input-session","timestamp":"2026-06-16T20:58:03Z","content":"queued correction"}"#,
+                "\n",
+                r#"{"type":"queue-operation","operation":"enqueue","sessionId":"input-session","timestamp":"2026-06-16T20:58:04Z","content":"queued correction"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        assert_eq!(
+            parsed.messages.len(),
+            4,
+            "tool call, answer, and two submits"
+        );
+
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("human answer α"))
+            .expect("structured answer remains searchable");
+        assert_eq!(answer.role, crate::models::Role::Tool);
+        assert_eq!(
+            answer.provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(
+            answer.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+        assert!(answer.provenance.content_parts.iter().any(|part| {
+            part.authorship == crate::models::ContentPartAuthorship::Human
+                && part.origin == crate::models::ContentPartOrigin::DirectInput
+        }));
+        answer
+            .provenance
+            .validate(&answer.content)
+            .expect("interactive answer parts cover the wrapper exactly");
+
+        let queued: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|message| message.content == "queued correction")
+            .collect();
+        assert_eq!(
+            queued.len(),
+            2,
+            "repeated submits survive; popAll is an echo"
+        );
+        assert!(queued
+            .iter()
+            .all(|message| message.provenance.authorship
+                == crate::models::MessageAuthorship::Unknown));
+        assert!(queued.iter().all(|message| {
+            message.provenance.input_delivery_state
+                == Some(crate::models::InputDeliveryState::Submitted)
+        }));
+        assert!(queued.iter().all(|message| {
+            message.provenance.input_origin == Some(crate::models::MessageInputOrigin::Queued)
+        }));
+        let queued_ids: Vec<_> = queued
+            .iter()
+            .map(|message| {
+                message
+                    .provenance
+                    .correlation_identity
+                    .as_ref()
+                    .expect("queue records receive a source-local identity")
+                    .id
+                    .clone()
+            })
+            .collect();
+        assert_ne!(queued_ids[0], queued_ids[1], "same text is not an identity");
+        let reparsed = adapter.parse(&adapter.discover()[0]);
+        let reparsed_ids: Vec<_> = reparsed
+            .messages
+            .iter()
+            .filter(|message| message.content == "queued correction")
+            .map(|message| {
+                message
+                    .provenance
+                    .correlation_identity
+                    .as_ref()
+                    .unwrap()
+                    .id
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            queued_ids, reparsed_ids,
+            "source-local IDs survive full reparses"
+        );
+        let metadata = parsed.session.raw_metadata_json.as_deref().unwrap();
+        assert!(metadata.contains("\"queue_operations\""));
+        assert!(metadata.contains("\"popAll\":1"));
+        let warning = parsed.session.parse_warning.as_deref().unwrap();
+        assert!(warning.contains("skipped 1 malformed JSONL record"));
+        assert!(!warning.contains("queue delivery, cancellation"));
+    }
+
+    #[test]
+    fn interactive_answers_preserve_channel_and_scheduled_sender_uncertainty() {
+        use crate::message_search::{
+            MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+        };
+        use crate::models::{ContentPartAuthorship, MessageAuthorship};
+        use serde_json::json;
+
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        for path in [
+            temp.path().join("origin-answer.jsonl"),
+            temp.path()
+                .join("local-agent-mode-sessions/install/account/local_origin/audit.jsonl"),
+        ] {
+            for (origin, expected_author) in [
+                (json!({"kind":"human"}), ContentPartAuthorship::Human),
+                (
+                    json!({"kind":"channel","server":"slack"}),
+                    ContentPartAuthorship::Unknown,
+                ),
+                (
+                    json!({"kind":"task-notification","subkind":"scheduled-trigger"}),
+                    ContentPartAuthorship::Unknown,
+                ),
+            ] {
+                for (display, prefix) in [
+                    (
+                        "Your questions have been answered: \"Q\"=\"answer marker\".",
+                        "",
+                    ),
+                    ("answer marker", ""),
+                    ("answer marker", "direct preamble"),
+                ] {
+                    let mut blocks = Vec::new();
+                    if !prefix.is_empty() {
+                        blocks.push(json!({"type":"text","text":prefix}));
+                    }
+                    blocks
+                        .push(json!({"type":"tool_result","tool_use_id":"ask","content":display}));
+                    let input = [
+                    json!({"type":"assistant","sessionId":"origin-answer","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask","name":"AskUserQuestion","input":{}}]}}),
+                    json!({"type":"user","sessionId":"origin-answer","uuid":"answer","origin":origin,"message":{"role":"user","content":blocks},"toolUseResult":{"answers":{"Q":"answer marker"}}}),
+                ].into_iter().map(|value| value.to_string()).collect::<Vec<_>>().join("\n");
+                    let parsed = adapter
+                        .parse_reader(std::io::Cursor::new(input), &path)
+                        .unwrap();
+                    let answer = parsed
+                        .messages
+                        .iter()
+                        .find(|message| {
+                            message
+                                .provenance
+                                .correlation_identity
+                                .as_ref()
+                                .is_some_and(|identity| identity.id == "answer")
+                        })
+                        .unwrap();
+                    let expected = if prefix.is_empty() {
+                        display.to_string()
+                    } else {
+                        format!("{prefix}\n{display}")
+                    };
+                    assert_eq!(
+                        answer.content, expected,
+                        "native answer must appear exactly once: {origin}"
+                    );
+                    if answer.provenance.authorship == MessageAuthorship::Mixed {
+                        let input_parts: Vec<_> = answer
+                            .provenance
+                            .content_parts
+                            .iter()
+                            .filter(|part| {
+                                part.origin == crate::models::ContentPartOrigin::DirectInput
+                            })
+                            .collect();
+                        assert!(!input_parts.is_empty());
+                        assert!(
+                            input_parts
+                                .iter()
+                                .all(|part| part.authorship == expected_author),
+                            "{origin}: {:?}",
+                            answer.provenance
+                        );
+                    } else {
+                        assert_eq!(
+                            answer.provenance.authorship,
+                            if expected_author == ContentPartAuthorship::Human {
+                                MessageAuthorship::Human
+                            } else {
+                                MessageAuthorship::Unknown
+                            }
+                        );
+                    }
+                    answer.provenance.validate(&answer.content).unwrap();
+                    let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+                    db.upsert_session(&parsed, 0, 0).unwrap();
+                    db.upsert_session(&parsed, 0, 0).unwrap();
+                    let config = crate::config::Config::default();
+                    let service =
+                        crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+                    for scope in [None, Some(crate::models::Role::User)] {
+                        let response = service
+                            .search(
+                                {
+                                    let builder = MessageSearchRequest::builder(
+                                        MessageQuery::literal("answer marker").unwrap(),
+                                        MessageTarget::content(),
+                                    )
+                                    .session_id(parsed.session.id.clone())
+                                    .unwrap();
+                                    if let Some(role) = scope {
+                                        builder.role(role)
+                                    } else {
+                                        builder
+                                    }
+                                }
+                                .build()
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        assert_eq!(response.hits().len(), 1);
+                        assert_eq!(response.hits()[0].message.content, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_origins_override_session_fallback_without_hiding_any_content() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("native-origins.jsonl");
+        let phrase = "same native-origin phrase";
+        let records = [
+            format!(
+                r#"{{"type":"user","uuid":"human","sessionId":"native","agent_id":"child-with-explicit-human","origin":{{"kind":"human"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"channel","sessionId":"native","origin":{{"kind":"channel","server":"slack"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"scheduled","sessionId":"native","origin":{{"kind":"task-notification","subkind":"scheduled-trigger"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"peer","sessionId":"native","origin":{{"kind":"peer","agent_id":"worker"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"synthetic","sessionId":"native","isSynthetic":true,"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"task-peer","sessionId":"native","origin":{{"kind":"task-notification","subkind":"peer-send-message"}},"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"peer-mixed","sessionId":"native","origin":{{"kind":"peer","agent_id":"worker"}},"message":{{"role":"user","content":[{{"type":"text","text":"{phrase}"}},{{"type":"tool_result","tool_use_id":"unknown","content":"generated peer output"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"malformed","sessionId":"native","origin":[],"message":{{"role":"user","content":[{{"type":"text","text":"{phrase}"}},{{"type":"tool_result","content":"generated ambiguous output"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"legacy","sessionId":"native","agent_id":"","parent_tool_use_id":null,"message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"sdk-child","session_id":"native","agent_id":"child-task","parent_tool_use_id":"spawn-call","message":{{"role":"user","content":"{phrase}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","uuid":"sdk-child-parent-only","session_id":"native","parent_tool_use_id":"spawn-call","message":{{"role":"user","content":[{{"type":"text","text":"{phrase}"}},{{"type":"tool_result","tool_use_id":"unknown","content":"generated child output"}}]}}}}"#
+            ),
+        ];
+        std::fs::write(&path, records.join("\n") + "\n").unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let message = |id: &str| {
+            parsed
+                .messages
+                .iter()
+                .find(|message| {
+                    message
+                        .provenance
+                        .correlation_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.id == id)
+                })
+                .unwrap_or_else(|| panic!("missing native event {id}"))
+        };
+        assert_eq!(
+            message("human").provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        assert_eq!(
+            message("channel").provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        assert_eq!(
+            message("scheduled").provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        for id in ["human", "channel", "scheduled"] {
+            assert_eq!(
+                message(id).provenance.input_origin,
+                Some(crate::models::MessageInputOrigin::DirectConversation),
+                "{id} is structurally an intended inbound input"
+            );
+        }
+        assert_eq!(
+            message("peer").provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        assert_eq!(
+            message("synthetic").provenance.authorship,
+            crate::models::MessageAuthorship::Generated
+        );
+        assert_eq!(
+            message("task-peer").provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        assert_eq!(
+            message("peer-mixed").provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(message("peer-mixed").provenance.input_origin, None);
+        assert_eq!(
+            message("malformed").provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(message("malformed").provenance.input_origin, None);
+        assert!(message("malformed")
+            .provenance
+            .content_parts
+            .iter()
+            .all(|part| {
+                part.authorship != crate::models::ContentPartAuthorship::Unknown
+                    || part.origin == crate::models::ContentPartOrigin::Unknown
+            }));
+        assert_eq!(
+            message("sdk-child").provenance.authorship,
+            crate::models::MessageAuthorship::Agent,
+            "SDK interleaved child input cannot inherit root fallback"
+        );
+        assert_eq!(
+            message("sdk-child-parent-only").provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert!(message("sdk-child-parent-only")
+            .provenance
+            .content_parts
+            .iter()
+            .all(|part| part.authorship != crate::models::ContentPartAuthorship::Human));
+        assert_eq!(
+            message("legacy").provenance.authorship,
+            crate::models::MessageAuthorship::Human,
+            "missing native fields retain the existing session-level fallback"
+        );
+
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let request = |scope| {
+            {
+                let builder = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal(phrase).unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                );
+                if let Some(role) = scope {
+                    builder.role(role)
+                } else {
+                    builder
+                }
+            }
+            .build()
+            .unwrap()
+        };
+        assert_eq!(
+            service
+                .search(request(Some(crate::models::Role::User)))
+                .unwrap()
+                .hits()
+                .len(),
+            4,
+            "human, channel, scheduled, and legacy rows are intended input"
+        );
+        assert_eq!(
+            service.search(request(None)).unwrap().hits().len(),
+            records.len(),
+            "native exclusions affect UserInput only; Any keeps every exact row"
+        );
+    }
+
+    #[test]
+    fn explicit_non_user_queue_origin_does_not_override_legacy_queue_semantics() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("queue-native-origin.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"queue-operation","operation":"enqueue","uuid":"generated-queue","sessionId":"queue-native","origin":{"kind":"unclassified"},"timestamp":"2026-06-17T00:00:00Z","content":"generated queue text"}"#,
+                "\n",
+                r#"{"type":"queue-operation","operation":"enqueue","uuid":"legacy-queue","sessionId":"queue-native","timestamp":"2026-06-17T00:00:01Z","content":"legacy queue text"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let generated = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "generated queue text")
+            .unwrap();
+        assert_eq!(
+            generated.provenance.authorship,
+            crate::models::MessageAuthorship::Generated
+        );
+        assert_eq!(generated.provenance.input_origin, None);
+        assert_eq!(
+            generated.provenance.input_delivery_state,
+            Some(crate::models::InputDeliveryState::Submitted)
+        );
+        let legacy = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "legacy queue text")
+            .unwrap();
+        assert_eq!(
+            legacy.provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        assert_eq!(
+            legacy.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::Queued)
+        );
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let request = |query| {
+            crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(query).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .role(crate::models::Role::User)
+            .build()
+            .unwrap()
+        };
+        assert!(service
+            .search(request("generated queue text"))
+            .unwrap()
+            .hits()
+            .is_empty());
+        assert_eq!(
+            service
+                .search(request("legacy queue text"))
+                .unwrap()
+                .hits()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn desktop_sdk_snake_case_answers_and_native_origin_are_retained() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("local-agent-mode-sessions");
+        let session_dir = root.join("install/account/local_desktop-native");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("audit.jsonl"),
+            concat!(
+                r#"{"type":"assistant","session_id":"desktop-native","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-desktop","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"desktop-freeform","session_id":"desktop-native","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-desktop","content":"The user responded: freeform desktop"}]},"tool_use_result":{"response":"freeform desktop"}}"#,
+                "\n",
+                r#"{"type":"assistant","session_id":"desktop-native","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-desktop-structured","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"desktop-structured","session_id":"desktop-native","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-desktop-structured","content":"Your questions have been answered: \"Deploy?\"=\"yes\"."}]},"tool_use_result":{"questions":[{"question":"Deploy?"}],"answers":{"Deploy?":"yes"}}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"desktop-peer","session_id":"desktop-native","origin":{"kind":"peer","agent_id":"worker"},"message":{"role":"user","content":"desktop peer context"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("freeform desktop"))
+            .expect("snake_case SDK answer remains indexed");
+        assert_eq!(
+            answer.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+        assert!(answer.provenance.content_parts.iter().any(|part| {
+            part.authorship == crate::models::ContentPartAuthorship::Human
+                && part.origin == crate::models::ContentPartOrigin::DirectInput
+        }));
+        let structured = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("yes"))
+            .expect("snake_case structured answer remains indexed");
+        assert_eq!(
+            structured.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+        let peer = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "desktop peer context")
+            .expect("Desktop peer record remains searchable in Any");
+        assert_eq!(
+            peer.provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        assert_eq!(peer.provenance.input_origin, None);
+    }
+
+    #[test]
+    fn queue_upgrade_repairs_archived_authorship_without_losing_submissions() {
+        use crate::models::{MessageAuthorship, MessageFilters};
+
+        for (relative, old_version, provider) in [
+            ("project/input.jsonl", "claude-v5", Provider::Claude),
+            (
+                "local-agent-mode-sessions/install/account/local_input/audit.jsonl",
+                "claude-desktop-local-agent-v5",
+                Provider::ClaudeDesktop,
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let archived = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"input","timestamp":"2026-06-16T20:58:02Z","content":"/queue input"}"#;
+            let retained = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"input","timestamp":"2026-06-16T20:58:03Z","content":"retained queue input"}"#;
+            std::fs::write(&path, format!("{archived}\n{retained}\n")).unwrap();
+            let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+            let source = adapter.discover().remove(0);
+            let mut old = adapter.parse(&source);
+            assert_eq!(old.session.provider, provider);
+            old.session.parse_version = old_version.into();
+            for message in &mut old.messages {
+                message.provenance.authorship = MessageAuthorship::Human;
+            }
+            let db_path = temp.path().join("index.db");
+            let db = crate::db::Db::open(&db_path).unwrap();
+            db.upsert_session(&old, 1, 1).unwrap();
+            let human = MessageFilters {
+                role: Some(crate::models::Role::User),
+                ..Default::default()
+            };
+            assert_eq!(db.search_messages("queue input", &human).unwrap().len(), 2);
+            std::fs::write(&path, format!("{retained}\n")).unwrap();
+            let repaired = adapter.parse(&source);
+            for generation in [2, 3] {
+                db.upsert_session(&repaired, generation, generation)
+                    .unwrap();
+                assert_eq!(
+                    db.search_messages("queue input", &Default::default())
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                assert_eq!(db.search_messages("queue input", &human).unwrap().len(), 2);
+            }
+            let stored = rusqlite::Connection::open(db_path).unwrap();
+            let unknown: i64 = stored.query_row("select count(*) from messages where authorship='unknown' and input_origin='queued' and input_delivery_state='submitted'", [], |row| row.get(0)).unwrap();
+            assert_eq!(unknown, 2);
+        }
+    }
+
+    #[test]
+    fn queued_source_local_identity_survives_shortening_same_timestamp_prefix() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("queue-identity-session.jsonl");
+        let first = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-identity","timestamp":"2026-06-16T20:58:02Z","content":"first queued input"}"#;
+        let surviving = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-identity","timestamp":"2026-06-16T20:58:02Z","content":"surviving queued input"}"#;
+        std::fs::write(&path, format!("{first}\n{surviving}\n")).unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let initial = adapter.parse(&adapter.discover()[0]);
+        let initial_survivor_id = initial
+            .messages
+            .iter()
+            .find(|message| message.content == "surviving queued input")
+            .and_then(|message| message.provenance.correlation_identity.as_ref())
+            .expect("surviving enqueue has source-local identity")
+            .id
+            .clone();
+
+        // Removing an earlier, different enqueue must not shift the surviving message into a
+        // different identity bucket. The digest is part of the bucket; the occurrence suffix is
+        // reserved for genuinely repeated identical submissions.
+        std::fs::write(&path, format!("{surviving}\n")).unwrap();
+        let shortened = adapter.parse(&adapter.discover()[0]);
+        let shortened_survivor_id = shortened
+            .messages
+            .iter()
+            .find(|message| message.content == "surviving queued input")
+            .and_then(|message| message.provenance.correlation_identity.as_ref())
+            .expect("surviving enqueue remains source-locally identified")
+            .id
+            .clone();
+        assert_eq!(initial_survivor_id, shortened_survivor_id);
+    }
+
+    #[test]
+    fn shortening_identical_queued_inputs_keeps_both_archived_submissions() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("queue-repeats.jsonl");
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-repeats","timestamp":"2026-06-16T20:58:02Z","content":"repeated queued input"}"#;
+        std::fs::write(&path, format!("{record}\n{record}\n")).unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        let initial = adapter.parse(&adapter.discover()[0]);
+        db.upsert_session(&initial, 1, 1).unwrap();
+        std::fs::write(&path, format!("{record}\n")).unwrap();
+        let shortened = adapter.parse(&adapter.discover()[0]);
+        assert!(shortened.session.parse_warning.is_none());
+        // With no provider identity these identical events cannot be distinguished after a
+        // rewrite. The archive keeps both submissions without inventing a delivery outcome.
+        let filters = crate::models::MessageFilters {
+            role: Some(crate::models::Role::User),
+            ..Default::default()
+        };
+        for generation in [2, 3] {
+            db.upsert_session(&shortened, generation, generation)
+                .unwrap();
+            assert_eq!(
+                db.search_messages("repeated queued input", &filters)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                db.search_messages("repeated queued input", &Default::default())
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let stored = rusqlite::Connection::open(temp.path().join("index.db")).unwrap();
+            let (identities, submitted, unknown): (i64, i64, i64) = stored.query_row(
+                "select count(distinct correlation_id), sum(input_delivery_state='submitted'), sum(authorship='unknown') from messages",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!((identities, submitted, unknown), (2, 2, 2));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verified_source_aliases_do_not_duplicate_identical_queue_submissions() {
+        let temp = tempdir().unwrap();
+        let real_root = temp.path().join("real");
+        std::fs::create_dir(&real_root).unwrap();
+        let alias_root = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-alias","timestamp":"2026-06-16T20:58:02Z","content":"same queued submission"}"#;
+        std::fs::write(
+            real_root.join("session.jsonl"),
+            format!("{record}\n{record}\n"),
+        )
+        .unwrap();
+        let old_adapter = ClaudeAdapter::new(vec![alias_root]);
+        let old_source = old_adapter.discover().remove(0);
+        let initial = old_adapter.parse(&old_source);
+        let new_adapter = ClaudeAdapter::new(vec![real_root]);
+        let new_source = new_adapter.discover().remove(0);
+        assert_eq!(
+            std::fs::canonicalize(&old_source.path).unwrap(),
+            std::fs::canonicalize(&new_source.path).unwrap()
+        );
+        let reparsed = new_adapter.parse(&new_source);
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.upsert_session(&initial, 1, 1).unwrap();
+        for generation in [2, 3] {
+            db.upsert_session_reconciling_sources(
+                &reparsed,
+                generation,
+                generation,
+                std::slice::from_ref(&initial.session.source_path),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                db.message_count().unwrap(),
+                2,
+                "aliases are one source; its two identical submissions remain independent"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_user_answer_without_wrapper_is_whole_human() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("answer-session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"answer-session","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"answer-session","uuid":"answer-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask-1","content":"human answer"}]},"toolUseResult":{"answers":{"question":"human answer"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "human answer")
+            .expect("answer row");
+        assert_eq!(
+            answer.provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        assert_eq!(
+            answer.provenance.input_origin,
+            Some(crate::models::MessageInputOrigin::InteractiveAnswer)
+        );
+        assert!(answer.provenance.content_parts.is_empty());
     }
 
     #[test]
@@ -1637,7 +3397,9 @@ mod tests {
         for cmd in &[
             "/exit", "/resume", "/clear", "/compact", "/mcp", "/config", "/help",
         ] {
-            let text = format!("<command-name>{cmd}</command-name><command-message>{cmd}</command-message><command-args></command-args>");
+            let text = format!(
+                "<command-name>{cmd}</command-name><command-message>{cmd}</command-message><command-args></command-args>"
+            );
             let value = json!({ "isMeta": false });
             assert!(
                 should_skip_message(&value, &text),
@@ -1961,8 +3723,8 @@ mod tests {
         use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
-        let root = temp.path().join("Claude/local-agent-mode-sessions");
-        let parent = root.join("install-id/account-id");
+        let root = temp.path().join("Claude").join("local-agent-mode-sessions");
+        let parent = root.join("install-id").join("account-id");
         let session_dir = parent.join("local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
@@ -2025,9 +3787,21 @@ mod tests {
         );
         assert_eq!(
             parsed.session.parse_version,
-            "claude-desktop-local-agent-v4"
+            crate::util::provider_parse_version(Provider::ClaudeDesktop)
         );
         assert_eq!(parsed.session.message_count, Some(4));
+        let metadata: serde_json::Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            metadata["session_path"],
+            crate::util::normalize_path(&session_dir.join("audit.jsonl"))
+        );
+        assert_eq!(
+            metadata["metadata_path"],
+            crate::util::normalize_path(
+                &parent.join("local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json")
+            )
+        );
         let event_ids: Vec<Option<&str>> = parsed
             .messages
             .iter()

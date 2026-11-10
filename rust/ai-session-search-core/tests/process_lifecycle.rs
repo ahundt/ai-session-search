@@ -180,6 +180,14 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
             .len(),
         28
     );
+    assert!(specification["configured_default"]
+        .get("input_scope")
+        .is_none());
+    assert!(specification["registry"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|descriptor| descriptor["parameter"] == "role"));
     assert!(specification["registry"]["rules"]
         .as_array()
         .unwrap()

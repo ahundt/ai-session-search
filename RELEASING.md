@@ -58,7 +58,7 @@ the eight locations above.
 
 ## Toolchain and compatibility
 
-Releases require Rust at or above the workspace `rust-version` (1.88 at the time of writing;
+Releases require Rust at or above the workspace `rust-version` (1.89 at the time of writing;
 `Cargo.toml` is authoritative) and CPython 3.12 through 3.14 with the standard GIL enabled. Wheels use `cp312-abi3`.
 Free-threaded CPython is not supported. The distribution exposes one executable, `aise`, and
 MCP clients run `aise mcp serve`.

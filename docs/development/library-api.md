@@ -12,6 +12,27 @@ the [configuration guide](configuration.md).
 
 ## Python
 
+For historical user input across storage roles, pass `role="user"` to
+`MessageSearchRequest`. This selects recorded prompts, queued submissions and linked answer
+regions; omit the role to search complete content. Known parent-agent prompts sent to spawned
+sessions are excluded from this selector. Other filters intersect normally.
+Content queries match contiguous input regions in the indexed message and report Unicode-scalar
+coordinates in that message. Tool-name and tool-argument queries use their own field coordinates.
+Views and context may include generated text. Results include concise source
+provenance. The index retains full partition and correlation details for existing read-only SQL
+inspection; ordinary search hits do not emit those internal arrays.
+
+Legacy Claude queue operations lack per-item sender receipts and links proving delivery. They
+remain `authorship=unknown`, `input_origin=queued`, and `input_delivery_state=submitted`, while
+`role="user"` still finds the recorded submission. Matching a later message by text
+alone does not prove identity. Recurrence/correction analytics keep their stricter attribution
+rules and exclude unverified queue copies; their existing behavior is unchanged.
+
+Recurrence analytics join attributable fragments within a message before matching; their
+coordinates and phrase grouping describe that projection. Content search with `role="user"`
+matches contiguous original regions and reports message coordinates without joining across
+generated gaps.
+
 `SessionSearch` owns the configuration, the database handle, and the worker
 pool. Query objects are immutable mirrors of the Rust request types, so one you
 build is safe to reuse.

@@ -289,8 +289,8 @@ pub(crate) fn schema_path(
     busy_timeout_ms: u64,
     args: &DbSchemaArgs,
 ) -> Result<QueryResult> {
-    let conn = open_read_only(path, busy_timeout_ms)?;
-    schema_connection(&conn, args)
+    let mut conn = open_read_only(path, busy_timeout_ms)?;
+    schema_connection(&mut conn, args)
 }
 
 pub(crate) fn schema_path_cancellable(
@@ -299,15 +299,15 @@ pub(crate) fn schema_path_cancellable(
     args: &DbSchemaArgs,
     cancellation: &crate::db::QueryCancellation,
 ) -> Result<QueryResult> {
-    let conn = open_read_only(path, busy_timeout_ms)?;
+    let mut conn = open_read_only(path, busy_timeout_ms)?;
     cancellation.register(&conn);
     crate::db::with_sqlite_query_control(
-        &conn,
+        &mut conn,
         None,
         Some(cancellation.flag_arc()),
         "schema inspection",
         "retry the request after indexing or database contention subsides",
-        || schema_connection(&conn, args),
+        |conn| schema_connection(conn, args),
     )
 }
 
@@ -317,8 +317,8 @@ pub fn schema_summary_path(
     max_tables: usize,
     max_columns: usize,
 ) -> Result<String> {
-    let conn = open_read_only(path, busy_timeout_ms)?;
-    schema_summary_connection(&conn, max_tables, max_columns)
+    let mut conn = open_read_only(path, busy_timeout_ms)?;
+    schema_summary_connection(&mut conn, max_tables, max_columns)
 }
 
 pub fn query_path(
@@ -327,8 +327,8 @@ pub fn query_path(
     args: &ResolvedDbQueryArgs,
 ) -> Result<QueryResult> {
     validate_sql(&args.sql)?;
-    let conn = open_read_only(path, busy_timeout_ms)?;
-    query_connection(&conn, args)
+    let mut conn = open_read_only(path, busy_timeout_ms)?;
+    query_connection(&mut conn, args)
 }
 
 pub(crate) fn query_path_cancellable(
@@ -338,9 +338,9 @@ pub(crate) fn query_path_cancellable(
     cancellation: &crate::db::QueryCancellation,
 ) -> Result<QueryResult> {
     validate_sql(&args.sql)?;
-    let conn = open_read_only(path, busy_timeout_ms)?;
+    let mut conn = open_read_only(path, busy_timeout_ms)?;
     cancellation.register(&conn);
-    query_connection_control(&conn, args, Some(cancellation.flag_arc()))
+    query_connection_control(&mut conn, args, Some(cancellation.flag_arc()))
 }
 
 fn open_read_only(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
@@ -351,8 +351,8 @@ fn open_read_only(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
     Ok(conn)
 }
 
-fn schema_connection(conn: &Connection, args: &DbSchemaArgs) -> Result<QueryResult> {
-    with_read_only_authorizer(conn, || {
+fn schema_connection(conn: &mut Connection, args: &DbSchemaArgs) -> Result<QueryResult> {
+    with_read_only_authorizer(conn, |conn| {
         if let Some(table) = args.table.as_deref() {
             table_columns(conn, table)
         } else {
@@ -362,11 +362,11 @@ fn schema_connection(conn: &Connection, args: &DbSchemaArgs) -> Result<QueryResu
 }
 
 fn schema_summary_connection(
-    conn: &Connection,
+    conn: &mut Connection,
     max_tables: usize,
     max_columns: usize,
 ) -> Result<String> {
-    with_read_only_authorizer(conn, || {
+    with_read_only_authorizer(conn, |conn| {
         let schema = load_schema_objects(conn, false)?;
         let mut parts = Vec::new();
         for name in prioritized_schema_table_names(&schema)
@@ -388,14 +388,15 @@ fn schema_summary_connection(
     })
 }
 
-fn with_read_only_authorizer<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+fn with_read_only_authorizer<T>(
+    conn: &mut Connection,
+    f: impl FnOnce(&mut Connection) -> Result<T>,
+) -> Result<T> {
     conn.execute_batch("pragma query_only = on")?;
-    // Fail closed. rusqlite 0.40 reports whether the authorizer installed, and running the
-    // caller's SQL after a failed install would drop the read-only restriction this function
-    // exists to impose.
+    // Fail closed if the authorizer cannot install; the caller's SQL must not bypass it.
     conn.authorizer(Some(read_only_authorizer))
         .context("could not install the read-only SQL authorizer")?;
-    let result = f();
+    let result = f(conn);
     let cleared = conn
         .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>)
         .context("could not clear the read-only SQL authorizer");
@@ -423,23 +424,23 @@ fn table_column_names(conn: &Connection, table: &str, max_columns: usize) -> Res
     Ok(ColumnNames { names, truncated })
 }
 
-fn query_connection(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<QueryResult> {
+fn query_connection(conn: &mut Connection, args: &ResolvedDbQueryArgs) -> Result<QueryResult> {
     query_connection_control(conn, args, None)
 }
 
 fn query_connection_control(
-    conn: &Connection,
+    conn: &mut Connection,
     args: &ResolvedDbQueryArgs,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<QueryResult> {
-    with_read_only_authorizer(conn, || {
+    with_read_only_authorizer(conn, |conn| {
         crate::db::with_sqlite_query_control(
             conn,
             NonZeroU64::new(args.timeout_ms),
             cancellation,
             "query",
             QUERY_TIMEOUT_RECOVERY,
-            || collect_query_rows(conn, args),
+            |conn| collect_query_rows(conn, args),
         )
     })
 }
@@ -1015,7 +1016,7 @@ fn skip_bracket_quoted(bytes: &[u8], pos: &mut usize) {
     }
 }
 
-fn unique_column_names(names: Vec<&str>) -> Vec<String> {
+fn unique_column_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut seen = HashMap::<String, usize>::new();
     names
         .into_iter()
@@ -1639,7 +1640,7 @@ mod tests {
             "sessions(id, provider, provider_session_id, title, summary, cwd, repo_root, created_at, updated_at, last_message_at, preview_text, source_path, message_count, parse_version, raw_metadata_json, parse_warning, discovery_source, parent_session_id, agent_label)"
         ));
         assert!(summary.contains(
-            "messages(id, session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content, authorship, correlation_authority, correlation_scope, correlation_id, record_relation)"
+            "messages(id, session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content, authorship, correlation_authority, correlation_scope, correlation_id, input_delivery_state, input_origin, record_relation)"
         ));
         assert!(summary.contains(
             "file_edits(id, session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)"

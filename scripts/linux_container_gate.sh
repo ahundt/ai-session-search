@@ -40,7 +40,7 @@ Modes:
   run         run the command after `--` in the prepared container
 
 Options:
-  --rust <toolchain>   rustup toolchain for the image (default: stable; use 1.88.0 for msrv)
+  --rust <toolchain>   rustup toolchain for the image (default: stable; use 1.89.0 for msrv)
   --python <version>   interpreter uv installs in the image (default: .python-version)
   --platform <target>  container platform (default: the host architecture). On Apple Silicon
                        that is linux/arm64, which the CI matrix covers with one runner; pass

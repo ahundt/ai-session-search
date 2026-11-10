@@ -17,21 +17,45 @@ use fuzzy_matcher::FuzzyMatcher;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
 use rayon::prelude::*;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{
+    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+};
 
 use crate::hashing::FramedSha256;
 use crate::message_search::selected_message_field_parts;
 use crate::models::{
-    AnalysisRequest, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery,
-    MessageClassificationMatch, MessageFilters, MessageHit, MessageSearchMode, ParsedSession,
-    ParserHealth, PlanningCount, Provider, ProviderParserHealth, Role, SearchExplain, SearchField,
-    SearchFilters, SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
+    AnalysisRequest, ContentPartAuthorship, ContentPartOrigin, EditOp, FileCrossRef, FileEdit,
+    FileEditSummary, FileQuery, Message, MessageAuthorship, MessageClassificationMatch,
+    MessageContentPart, MessageFilters, MessageHit, MessageSearchMode, ParsedSession, ParserHealth,
+    PlanningCount, Provider, ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters,
+    SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
-    fold_caseless, parse_stored_timestamp, snippet_from_match, snippet_from_match_while,
-    stored_timestamp, UnicodeLowerNeedle, SIGMAS,
+    canonical_source_path, fold_caseless, parse_stored_timestamp, snippet_from_match,
+    snippet_from_match_while, stored_timestamp, UnicodeLowerNeedle, SIGMAS,
 };
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FileIdentityReceipt {
+    id: file_id::FileId,
+    canonical_path: String,
+}
+
+fn file_identity_for_path(path: &Path) -> Option<String> {
+    let id = file_id::get_file_id(path).ok()?;
+    serde_json::to_string(&FileIdentityReceipt {
+        id,
+        canonical_path: canonical_source_path(path),
+    })
+    .ok()
+}
+
+pub(crate) fn file_identity_key(receipt: &str) -> Option<file_id::FileId> {
+    serde_json::from_str::<FileIdentityReceipt>(receipt)
+        .ok()
+        .map(|receipt| receipt.id)
+}
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
 /// the upstream session-only release never set SQLite's `pragma user_version`, so any pre-existing
@@ -208,6 +232,23 @@ pub(crate) enum SourceFileRefreshState {
     New,
 }
 
+/// One physical receipt belonging to a proven provider migration family. The canonical session
+/// still owns one logical row, while every member keeps its own freshness stamp. A family member
+/// is never treated as a session alias: doing so deletes the receipt and causes reindex
+/// oscillation when the two on-disk forms are both present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceFamilyStamp {
+    pub(crate) source_path: String,
+    pub(crate) mtime_ns: i64,
+    pub(crate) size_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeminiFamilyIdentity {
+    pub(crate) canonical_session_id: String,
+    pub(crate) native_session_id: String,
+}
+
 struct PreparedMessageQuery {
     sql: String,
     args: Vec<rusqlite::types::Value>,
@@ -348,10 +389,12 @@ const AUTO_REINDEX_FRESHNESS_SQL: &str =
      join index_metadata word3 on word3.key = ?5
      where completed.key = ?1";
 const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
-const CORRECTION_CANDIDATES_SQL: &str =
+const CORRECTION_CANDIDATES_PREFIX: &str =
     "select m.id, m.session_id, m.seq, m.provider, m.ts, m.content, m.authorship
      from messages m
      where m.record_relation = 'original'
+       and ";
+const CORRECTION_CANDIDATES_SUFFIX: &str = "
        and (
            m.authorship = 'human'
            or (
@@ -370,11 +413,13 @@ const CORRECTION_CANDIDATES_SQL: &str =
 /// ascending under a session filter). A total order makes offset pages reproducible and
 /// non-overlapping across the CLI, Rust, Python, and MCP adapters.
 const CORRECTION_ORDER_SQL: &str = " order by m.ts desc, m.session_id asc, m.seq asc, m.id asc";
-const CORRECTION_HUMAN_PARTS_SQL: &str = "select m.id, p.start_char, p.end_char
+const CORRECTION_HUMAN_PARTS_PREFIX: &str = "select m.id, p.start_char, p.end_char
      from messages m
      join message_content_parts p on p.message_id = m.id
      where m.authorship = 'mixed'
        and m.record_relation = 'original'
+       and ";
+const CORRECTION_HUMAN_PARTS_SUFFIX: &str = "
        and p.authorship = 'human'";
 
 struct TrigramRebuild {
@@ -410,6 +455,78 @@ pub struct Db {
     progress: Option<ProgressReporter>,
 }
 
+const MESSAGE_INPUT_INDEXES_SQL: &str =
+    "create index if not exists idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq, input_origin);
+             create index if not exists idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq, input_origin);";
+
+/// Add the post-release columns used to distinguish recorded user input from other `role=user`
+/// rows. This is shared by normal writable opens and offline migration staging so the latter does
+/// not rebuild otherwise-healthy FTS indexes merely because additive storage was missing.
+pub(crate) fn ensure_message_input_provenance_storage(conn: &Connection) -> Result<()> {
+    let definitions = [
+        (
+            "input_delivery_state",
+            "input_delivery_state text default 'unknown'",
+        ),
+        ("input_origin", "input_origin text default 'unknown'"),
+    ];
+    let mut missing = Vec::new();
+    for (name, definition) in definitions {
+        let present: bool = conn.query_row(
+            "select exists(select 1 from pragma_table_info('messages') where name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        if !present {
+            missing.push((name, definition));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // Keep the additive columns and their covering indexes one atomic schema transition. A
+    // failed index DDL must not leave a half-upgraded database that later forces a query to use a
+    // missing or stale column. The initial read is intentionally outside the transaction so the
+    // common current-schema path performs no write transaction at all.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let mut added = false;
+    for (name, definition) in missing {
+        let present: bool = tx.query_row(
+            "select exists(select 1 from pragma_table_info('messages') where name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!("alter table messages add column {definition}"))?;
+            added = true;
+        }
+    }
+    // A peer may have completed the migration before this transaction acquired the writer lock.
+    if added {
+        tx.execute_batch(
+            "drop index if exists idx_messages_session_authorship_relation_seq;
+             drop index if exists idx_messages_authorship_relation_ts;",
+        )?;
+        tx.execute_batch(MESSAGE_INPUT_INDEXES_SQL)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedSourceIdentity {
+    pub(crate) provider: Provider,
+    pub(crate) source_path: String,
+    pub(crate) sessions: usize,
+    pub(crate) session_id: String,
+    pub(crate) file_identity: Option<String>,
+    pub(crate) mtime_ns: Option<i64>,
+    pub(crate) size_bytes: Option<i64>,
+}
+
 /// Same-snapshot population facts accumulated by [`Db::visit_analysis_sessions`].
 pub(crate) struct AnalysisTraversalReceipt {
     pub(crate) selected_sessions: u64,
@@ -423,13 +540,12 @@ pub(crate) struct AnalysisTraversalReceipt {
 
 const QUERY_PROGRESS_HANDLER_OPCODES: i32 = 10_000;
 
-struct ProgressHandlerReset<'connection>(&'connection Connection);
+struct ProgressHandlerReset<'connection>(&'connection mut Connection);
 
 impl Drop for ProgressHandlerReset<'_> {
     fn drop(&mut self) {
-        // rusqlite 0.40 reports whether clearing the handler succeeded. Drop cannot propagate,
-        // and leaving this query's expired deadline installed would stop the next query on the
-        // same connection, so surface it where a caller can act: debug and test builds.
+        // Drop cannot return a failed reset; an expired handler would interrupt the next query.
+        // Report the failure in debug and test builds.
         let cleared = self.0.progress_handler(0, None::<fn() -> bool>);
         debug_assert!(
             cleared.is_ok(),
@@ -586,27 +702,27 @@ impl QueryCancellation {
 
 #[cfg(test)]
 pub(crate) fn with_sqlite_query_timeout<T>(
-    connection: &Connection,
+    connection: &mut Connection,
     timeout_ms: Option<NonZeroU64>,
     operation: &str,
     recovery: &str,
-    run: impl FnOnce() -> Result<T>,
+    run: impl FnOnce(&mut Connection) -> Result<T>,
 ) -> Result<T> {
     with_sqlite_query_control(connection, timeout_ms, None, operation, recovery, run)
 }
 
 pub(crate) fn with_sqlite_query_control<T>(
-    connection: &Connection,
+    connection: &mut Connection,
     timeout_ms: Option<NonZeroU64>,
     cancellation: Option<Arc<AtomicBool>>,
     operation: &str,
     recovery: &str,
-    run: impl FnOnce() -> Result<T>,
+    run: impl FnOnce(&mut Connection) -> Result<T>,
 ) -> Result<T> {
     // One progress callback composes the two independent stop conditions. Installing competing
     // handlers would make the last caller silently disable the earlier deadline or cancellation.
     if timeout_ms.is_none() && cancellation.is_none() {
-        return run();
+        return run(connection);
     }
     let deadline = timeout_ms
         .map(|timeout_ms| {
@@ -631,7 +747,7 @@ pub(crate) fn with_sqlite_query_control<T>(
         )
         .with_context(|| format!("{operation} could not arm its query stop conditions"))?;
     let reset = ProgressHandlerReset(connection);
-    let result = run();
+    let result = run(reset.0);
     drop(reset);
     result.map_err(|error| {
         if error.chain().any(|cause| {
@@ -792,7 +908,7 @@ impl Db {
     ///
     /// Returns the failure instead of swallowing it: a caller that believes cancellation is
     /// armed, on a connection where it is not, waits for a query it can no longer stop.
-    pub(crate) fn interrupt_while(&self, cancellation: Arc<AtomicBool>) -> Result<()> {
+    pub(crate) fn interrupt_while(&mut self, cancellation: Arc<AtomicBool>) -> Result<()> {
         self.conn
             .progress_handler(
                 QUERY_PROGRESS_HANDLER_OPCODES,
@@ -802,7 +918,7 @@ impl Db {
     }
 
     pub(crate) fn install_query_cancellation(
-        &self,
+        &mut self,
         cancellation: &QueryCancellation,
     ) -> Result<()> {
         self.interrupt_while(cancellation.flag_arc())?;
@@ -1088,6 +1204,7 @@ impl Db {
             create table if not exists files_seen (
                 provider text not null,
                 source_path text not null,
+                file_identity text,
                 mtime_ns integer not null,
                 size_bytes integer not null,
                 last_indexed_at text not null,
@@ -1123,6 +1240,8 @@ impl Db {
                 correlation_authority text,
                 correlation_scope text,
                 correlation_id text,
+                input_delivery_state text default 'unknown',
+                input_origin text default 'unknown',
                 record_relation text not null default 'unknown'
                     check (record_relation in ('original', 'mirror', 'unknown')),
                 check (
@@ -1198,16 +1317,16 @@ impl Db {
                     .execute_batch(&format!("alter table messages add column {definition}"))?;
             }
         }
+        // These columns were added after schema 5 was already in the wild. Keep their additive
+        // DDL shared with offline database migration so a copied v1.0.0 index gains the exact
+        // storage needed for `role=user` without paying an unrelated FTS rebuild.
+        ensure_message_input_provenance_storage(&self.conn)?;
         self.conn.execute_batch(
             "drop index if exists idx_messages_authorship_role_provider_ts;
              create index if not exists idx_messages_tool_calls
                  on messages(session_id, seq) where kind = 'tool_call';
              create index if not exists idx_messages_provider_session_seq
                  on messages(provider, session_id, seq);
-             create index if not exists idx_messages_session_authorship_relation_seq
-                 on messages(session_id, authorship, record_relation, seq);
-             create index if not exists idx_messages_authorship_relation_ts
-                 on messages(authorship, record_relation, ts desc, session_id, seq);
              create index if not exists idx_messages_correlation
                  on messages(correlation_authority, correlation_scope, correlation_id)
                  where correlation_id is not null;
@@ -1237,6 +1356,7 @@ impl Db {
                  select raise(abort, 'message correlation authority, scope, and id must be all null or all non-null');
              end;",
         )?;
+        self.conn.execute_batch(MESSAGE_INPUT_INDEXES_SQL)?;
         // `sessions_fts` (an FTS5 copy of every title, summary, preview, and transcript) stopped
         // being read on 2026-07-22, when session search moved to scoring the complete corpus, and
         // stayed maintained: on one real index it held 464 MB (a second copy of every transcript
@@ -1383,6 +1503,7 @@ impl Db {
             "prefix_fingerprint",
             "prefix_fingerprint text",
         )?;
+        self.ensure_column("files_seen", "file_identity", "file_identity text")?;
         let parse_version_added = self.ensure_column(
             "files_seen",
             "parse_version",
@@ -1823,29 +1944,94 @@ impl Db {
             .map_err(Into::into)
     }
 
-    pub(crate) fn indexed_source_identities(
-        &self,
-    ) -> Result<Vec<(Provider, String, usize, String)>> {
-        let mut stmt = self.conn.prepare(
-            "select provider, source_path, count(*), min(id) from sessions
-             group by provider, source_path",
+    pub(crate) fn indexed_source_identities(&self) -> Result<Vec<IndexedSourceIdentity>> {
+        let has_file_identity: bool = self.conn.query_row(
+            "select exists(select 1 from pragma_table_info('files_seen') where name = 'file_identity')",
+            [],
+            |row| row.get(0),
         )?;
+        let (receipt, join) = if has_file_identity {
+            ("f.file_identity, f.mtime_ns, f.size_bytes",
+             "left join files_seen f on f.provider = s.provider and f.source_path = s.source_path")
+        } else {
+            ("null, null, null", "")
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "select s.provider, s.source_path, count(*), min(s.id), {receipt}
+             from sessions s {join} group by s.provider, s.source_path"
+        ))?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((
-                    decode_db_enum(
+                Ok(IndexedSourceIdentity {
+                    provider: decode_db_enum(
                         row.get::<_, String>(0)?,
                         0,
                         "sessions.provider",
                         Provider::from_db_str,
                     )?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? as usize,
-                    row.get::<_, String>(3)?,
-                ))
+                    source_path: row.get(1)?,
+                    sessions: row.get::<_, i64>(2)? as usize,
+                    session_id: row.get(3)?,
+                    file_identity: row.get(4)?,
+                    mtime_ns: row.get(5)?,
+                    size_bytes: row.get(6)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Load canonical sessions for all recorded Gemini family members once per reindex.
+    /// Family receipts intentionally outlive a removed native member, so ordinary source-path
+    /// reconciliation cannot discover this relationship. Conflicting session IDs for one path
+    /// are omitted instead of guessing which archive is authoritative.
+    pub(crate) fn gemini_family_sessions_by_path(
+        &self,
+    ) -> Result<HashMap<String, GeminiFamilyIdentity>> {
+        let mut result = HashMap::<String, Option<GeminiFamilyIdentity>>::new();
+        let mut statement = self.conn.prepare(
+            "select id, raw_metadata_json from sessions where provider = ?1 and raw_metadata_json is not null",
+        )?;
+        let mut rows = statement.query(params![Provider::GeminiCli.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            let Some(family) = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|metadata| metadata.get("gemini_migration_family").cloned())
+            else {
+                continue;
+            };
+            let Some(native_session_id) = family
+                .get("native_session_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            else {
+                continue;
+            };
+            let identity = GeminiFamilyIdentity {
+                canonical_session_id: id,
+                native_session_id: native_session_id.to_string(),
+            };
+            for key in ["predecessor_json", "successor_jsonl"] {
+                let Some(path) = family.get(key).and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let canonical = result
+                    .entry(path.to_string())
+                    .or_insert_with(|| Some(identity.clone()));
+                if canonical
+                    .as_ref()
+                    .is_some_and(|existing| existing != &identity)
+                {
+                    *canonical = None;
+                }
+            }
+        }
+        Ok(result
+            .into_iter()
+            .filter_map(|(path, id)| id.map(|id| (path, id)))
+            .collect())
     }
 
     pub(crate) fn exact_session_source_path(&self, id: &str) -> Result<Option<String>> {
@@ -1872,14 +2058,14 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
-        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true, &[])
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true, &[], &[])
     }
 
     /// Persist a full parse of a session's source without the append shortcut, comparing every
     /// stored row against the parse:
     ///
     /// - rows equal to the parse are left untouched;
-    /// - a new parser version replaces the rows, so parser fixes repair them;
+    /// - a new parser version repairs identifiable source-present rows and keeps archive-only rows;
     /// - under the same parser, messages and file edits are decided separately: a parse that
     ///   still holds every stored row of that kind replaces them, and one that no longer holds a
     ///   stored row keeps it, because harnesses compact, rewrite and prune their own transcripts
@@ -1892,7 +2078,7 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
-        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, false, &[])
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, false, &[], &[])
     }
 
     pub(crate) fn upsert_session_reconciling_sources(
@@ -1909,6 +2095,28 @@ impl Db {
             size_bytes,
             allow_append_optimization,
             source_aliases,
+            &[],
+        )
+    }
+
+    /// Persist one canonical Gemini session while recording every physical JSON/JSONL family
+    /// member in the same transaction. The member paths are freshness receipts, not aliases, so
+    /// the predecessor remains available to prove the migration on the next refresh.
+    pub(crate) fn upsert_session_reconciling_family(
+        &self,
+        parsed: &ParsedSession,
+        mtime_ns: i64,
+        size_bytes: i64,
+        family_members: &[SourceFamilyStamp],
+        allow_append_optimization: bool,
+    ) -> Result<()> {
+        self.upsert_session_with_mode(
+            parsed,
+            mtime_ns,
+            size_bytes,
+            allow_append_optimization,
+            &[],
+            family_members,
         )
     }
 
@@ -1919,6 +2127,7 @@ impl Db {
         size_bytes: i64,
         allow_append_optimization: bool,
         source_aliases: &[String],
+        family_members: &[SourceFamilyStamp],
     ) -> Result<()> {
         // IMMEDIATE takes the write lock before the first read, so another writer committing
         // between this transaction's reads and its first write cannot fail the upgrade with
@@ -1941,7 +2150,11 @@ impl Db {
         // replaces it. Content identifies a message only while the parser that rendered it is
         // unchanged; see `store_parsed_messages`.
         let mut previous_parse_version: Option<String> = None;
-        for path in &source_paths {
+        for path in source_paths.iter().copied().chain(
+            family_members
+                .iter()
+                .map(|member| member.source_path.as_str()),
+        ) {
             previous_parse_version = tx
                 .query_row(
                     "select parse_version from files_seen where provider = ?1 and source_path = ?2",
@@ -1954,6 +2167,33 @@ impl Db {
             }
         }
         let same_parser = previous_parse_version.as_deref() == Some(session.parse_version.as_str());
+        let persisted_family_metadata = if family_members.is_empty() {
+            None
+        } else {
+            tx.query_row(
+                "select raw_metadata_json from sessions where id = ?1",
+                params![session.id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        };
+        let raw_metadata_json = match (
+            session.raw_metadata_json.as_deref(),
+            persisted_family_metadata.as_deref(),
+        ) {
+            (Some(current), Some(previous))
+                if !serde_json::from_str::<serde_json::Value>(current)
+                    .ok()
+                    .and_then(|metadata| metadata.get("gemini_migration_family").cloned())
+                    .is_some() =>
+            {
+                Some(previous.to_string())
+            }
+            (Some(current), _) => Some(current.to_string()),
+            (None, Some(previous)) => Some(previous.to_string()),
+            (None, None) => None,
+        };
         // A complete source parse represents one canonical session. Parser improvements or
         // mutable sidecar metadata can change the provider session ID, and a verified alias can
         // move the source path. Earlier identities for this provider and source are retired
@@ -1978,9 +2218,35 @@ impl Db {
         // them; the parse speaks for everything else.
         // Dates are compared as instants: stored RFC 3339 text orders correctly only within one
         // UTC offset.
+        let legacy_queue_version = match session.provider {
+            Provider::Claude => Some("claude-v5"),
+            Provider::ClaudeDesktop => Some("claude-desktop-local-agent-v5"),
+            _ => None,
+        }
+        .filter(|_| session.parse_version == crate::util::provider_parse_version(session.provider));
         let mut prior_dates: Vec<SessionDates> = Vec::new();
         for id in std::iter::once(&session.id).chain(&retired_ids) {
             prior_dates.extend(stored_session_dates(&tx, id)?);
+            if let Some(version) = legacy_queue_version {
+                // v5 inferred queue authors from session origin; repair archives before
+                // their version/identity changes, without touching newer alias evidence. Keep
+                // this shim because archive-only rows have no source left to reparse.
+                tx.execute(
+                    "update messages set authorship = 'unknown'
+                         where session_id = ?1
+                           and exists (select 1 from sessions where id = ?1
+                               and provider = ?2 and parse_version = ?3)
+                           and role in ('user', 'slash') and kind = 'conversation'
+                           and input_origin = 'queued' and input_delivery_state = 'submitted'
+                           and authorship in ('human', 'agent')
+                           and not exists (select 1 from message_content_parts
+                               where message_id = messages.id)",
+                    params![id, session.provider.as_str(), version],
+                )?;
+            }
+        }
+        if matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop) {
+            remap_verified_queue_scopes(&tx, session, source_aliases)?;
         }
         let mut prior_transcripts: Vec<String> = Vec::new();
         for id in &retired_ids {
@@ -2045,7 +2311,7 @@ impl Db {
                 session.source_path,
                 session.message_count,
                 session.parse_version,
-                session.raw_metadata_json,
+                raw_metadata_json,
                 session.parse_warning,
                 session.discovery_source,
                 session.parent_session_id,
@@ -2058,30 +2324,56 @@ impl Db {
             move_retired_rows(&tx, &session.id, retired)?;
             tx.execute("delete from sessions where id = ?1", params![retired])?;
         }
-        tx.execute(
-            "
-            insert into files_seen (
-                provider, source_path, mtime_ns, size_bytes, last_indexed_at,
-                content_hash, parse_version
-            )
-            values (?1, ?2, ?3, ?4, ?5, null, ?6)
-            on conflict(provider, source_path) do update set
-                mtime_ns = excluded.mtime_ns,
-                size_bytes = excluded.size_bytes,
-                last_indexed_at = excluded.last_indexed_at,
-                parse_version = excluded.parse_version
-            ",
-            params![
-                session.provider.as_str(),
-                session.source_path,
+        // Family receipts reset their tail checkpoint; the canonical source retains its own.
+        for (source_path, mtime_ns, size_bytes) in family_members
+            .iter()
+            .filter(|member| member.source_path != session.source_path)
+            .map(|member| {
+                (
+                    member.source_path.as_str(),
+                    member.mtime_ns,
+                    member.size_bytes,
+                )
+            })
+            .chain(std::iter::once((
+                session.source_path.as_str(),
                 mtime_ns,
                 size_bytes,
-                stored_timestamp(Utc::now()),
-                session.parse_version,
-            ],
+            )))
+        {
+            tx.execute(
+                "insert into files_seen (
+                    provider, source_path, file_identity, mtime_ns, size_bytes, last_indexed_at,
+                    content_hash, parse_version, tail_byte_offset, prefix_fingerprint
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6, null, ?7, null, null)
+                 on conflict(provider, source_path) do update set
+                    file_identity = excluded.file_identity,
+                    mtime_ns = excluded.mtime_ns,
+                    size_bytes = excluded.size_bytes,
+                    last_indexed_at = excluded.last_indexed_at,
+                    parse_version = excluded.parse_version,
+                    tail_byte_offset = case when ?8 then null else files_seen.tail_byte_offset end,
+                    prefix_fingerprint = case when ?8 then null else files_seen.prefix_fingerprint end",
+                params![
+                    session.provider.as_str(),
+                    source_path,
+                    file_identity_for_path(Path::new(source_path)),
+                    mtime_ns,
+                    size_bytes,
+                    stored_timestamp(Utc::now()),
+                    session.parse_version,
+                    source_path != session.source_path,
+                ],
+            )?;
+        }
+        let kept_messages_missing_from_parse = store_parsed_messages(
+            &tx,
+            parsed,
+            allow_append_optimization,
+            same_parser,
+            !family_members.is_empty(),
+            family_members.len() == 1,
         )?;
-        let kept_messages_missing_from_parse =
-            store_parsed_messages(&tx, parsed, allow_append_optimization, same_parser)?;
         store_parsed_file_edits(&tx, parsed, same_parser)?;
         if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
@@ -2166,7 +2458,7 @@ impl Db {
     /// The stored incremental tail-parse checkpoint for a file, only when its parser version
     /// exactly matches `required_parse_version`.
     ///
-    /// Returning `None` for an older parser generation forces a full replacement rather than
+    /// Returning `None` for an older parser generation forces a full parse and reconciliation rather than
     /// appending newly classified rows to a stale prefix. Lookup is `O(log F)` through the
     /// `files_seen` primary key and retains only the two checkpoint fields.
     pub fn file_checkpoint(
@@ -2313,12 +2605,13 @@ impl Db {
         // Persist the checkpoint + refresh files_seen mtime/size in the same transaction.
         tx.execute(
             "update files_seen set
-                mtime_ns = ?3, size_bytes = ?4, last_indexed_at = ?5,
-                tail_byte_offset = ?6, prefix_fingerprint = ?7, parse_version = ?8
+                file_identity = ?3, mtime_ns = ?4, size_bytes = ?5, last_indexed_at = ?6,
+                tail_byte_offset = ?7, prefix_fingerprint = ?8, parse_version = ?9
              where provider = ?1 and source_path = ?2",
             params![
                 session.provider.as_str(),
                 session.source_path,
+                file_identity_for_path(Path::new(&session.source_path)),
                 mtime_ns,
                 size_bytes,
                 stored_timestamp(Utc::now()),
@@ -2368,7 +2661,7 @@ impl Db {
 
         let mut sql = String::from("select m.role, count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        append_stored_role_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(" group by m.role order by m.role");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2646,8 +2939,9 @@ impl Db {
         };
         let page_index_hint =
             self.ordered_page_index_hint(filters, order, content_prefilter.as_deref())?;
+        let ranges = input_provenance_projection(filters);
         let mut sql = format!(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges} \
              from messages m{page_index_hint} where 1 = 1",
         );
         let mut args = Vec::new();
@@ -2657,12 +2951,12 @@ impl Db {
             let literal_query =
                 filters.match_mode == MessageSearchMode::Literal && !query.is_empty();
             if literal_query {
-                sql.push_str(" and unicode_lower_contains(m.content, ?)");
+                append_content_match(&mut sql, filters, false);
                 args.push(Value::Text(fold_caseless(query)));
             }
             if filters.match_mode == MessageSearchMode::Regex {
                 regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
-                sql.push_str(" and rust_regexp(?, m.content)");
+                append_content_match(&mut sql, filters, true);
                 args.push(Value::Text(query.to_string()));
             }
             let prefilter_pattern = content_prefilter_pattern(query, filters.match_mode);
@@ -2854,6 +3148,7 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         self.validate_access_scope()?;
         filters.validate(query)?;
+        self.validate_input_scope_layout(filters)?;
         let field = filters.field.unwrap_or(SearchField::Content);
         if filters.match_mode != MessageSearchMode::Fuzzy {
             let prepared =
@@ -2904,8 +3199,9 @@ impl Db {
             );
         }
 
-        let mut sql = String::from(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
+        let ranges = input_provenance_projection(filters);
+        let mut sql = format!(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges} \
              from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
@@ -2942,7 +3238,12 @@ impl Db {
             if fuzzy_batch_is_full(batch.len(), batch_bytes) {
                 batch_bytes = 0;
                 let scored = self.runtime.install(|| {
-                    score_fuzzy_message_hits(&pattern, &query_lower, std::mem::take(&mut batch))
+                    score_fuzzy_message_hits(
+                        &pattern,
+                        &query_lower,
+                        std::mem::take(&mut batch),
+                        filters.input_scope(),
+                    )
                 })?;
                 matched += scored.len() as i64;
                 top.extend(scored);
@@ -2952,9 +3253,9 @@ impl Db {
             }
         }
         if !batch.is_empty() {
-            let scored = self
-                .runtime
-                .install(|| score_fuzzy_message_hits(&pattern, &query_lower, batch))?;
+            let scored = self.runtime.install(|| {
+                score_fuzzy_message_hits(&pattern, &query_lower, batch, filters.input_scope())
+            })?;
             matched += scored.len() as i64;
             top.extend(scored);
         }
@@ -2981,6 +3282,7 @@ impl Db {
     ) -> Result<MessageBatchVisitOutcome> {
         self.validate_access_scope()?;
         filters.validate(query)?;
+        self.validate_input_scope_layout(filters)?;
         anyhow::ensure!(
             filters.match_mode != MessageSearchMode::Fuzzy,
             "batched exhaustive traversal supports literal, regex, and queryless searches; pass a finite limit to the bounded fuzzy search"
@@ -3268,8 +3570,9 @@ impl Db {
             // snapshot `search_messages_with_explain_order` opens keeps them on the same data.
             return self.search_tool_name_fuzzy_indexed(query, filters, include_explain);
         }
-        let mut sql = String::from(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
+        let provenance = input_provenance_projection(filters);
+        let mut sql = format!(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{provenance} \
              from messages m where 1 = 1",
         );
         let mut args = Vec::new();
@@ -3375,9 +3678,10 @@ impl Db {
         query: &str,
         filters: &MessageFilters,
     ) -> Result<Vec<MessageHit>> {
-        let mut sql = String::from(
+        let provenance = input_provenance_projection(filters);
+        let mut sql = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                    m.kind, m.tool_call_id, m.content
+                    m.kind, m.tool_call_id, m.content{provenance}
                from messages m
               where m.tool_name is not null",
         );
@@ -3502,9 +3806,10 @@ impl Db {
             let selected_names =
                 serde_json::to_string(&tier.iter().map(|(name, _)| name).collect::<Vec<_>>())?;
             let remaining = ranked_limit - top.len();
-            let mut sql = String::from(
+            let provenance = input_provenance_projection(filters);
+            let mut sql = format!(
                 "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                        m.kind, m.tool_call_id, m.content
+                        m.kind, m.tool_call_id, m.content{provenance}
                    from json_each(?) selected
                    join messages m on m.tool_name = selected.value
                   where m.tool_name is not null",
@@ -3571,12 +3876,46 @@ impl Db {
             .map_err(Into::into)
     }
 
+    fn validate_input_scope_layout(&self, filters: &MessageFilters) -> Result<()> {
+        if filters.input_scope() == crate::models::MessageInputScope::UserInput {
+            if let Some(problem) =
+                crate::indexer::message_input_provenance_layout_problem(&self.conn)?
+            {
+                bail!("user-input search requires current provenance storage: {problem}; run a writable aise command (without --index-refresh existing-only) to upgrade the index, or omit the role filter to search readable stored content");
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the one queued-delivery exclusion used by source-authoritative analytics.
+    ///
+    /// Schema-5 indexes released before input provenance was added have no `input_origin` column.
+    /// Their providers did not produce queued-delivery rows, so every stored original human row is
+    /// equivalent to the current non-queued predicate. Keeping that compatibility decision here
+    /// lets corrections, repeats, and analysis documents remain readable without mutating a
+    /// read-only index or duplicating schema probes in each SQL owner.
+    fn nonqueued_input_predicate(&self) -> Result<&'static str> {
+        // Delivery metadata can be missing while origin still proves that a row was queued.
+        let has_origin: bool = self.conn.query_row(
+            "select exists(select 1 from pragma_table_info('messages') where name = 'input_origin')",
+            [], |row| row.get(0),
+        )?;
+        Ok(if has_origin {
+            "coalesce(m.input_origin, 'unknown') != 'queued'"
+        } else {
+            "1 = 1"
+        })
+    }
+
     /// Count the messages matching the structural filters (role / provider / session / path / time /
     /// tool / class) — the corpus that literal or regex content matching then scans, and the
     /// denominator every receipt reports. Only receipts and the fuzzy tool-name planner call
     /// this; the search hot path probes [`Db::filtered_corpus_reaches`] instead.
     ///
-    /// Cost: index-only. The class predicate defaults to `kind != 'harness_notice'`, and no
+    /// For role=user, eligibility also reads indexed provenance and parts;
+    /// its worst case is O(F + P) row/part reads, where P is the content parts examined.
+    /// Whole-input eligibility does not read message content, including for empty inputs.
+    /// Cost for the default any selection: index-only. The class predicate defaults to `kind != 'harness_notice'`, and no
     /// index answers a `!=` without visiting rows, so this is computed as
     /// `count(every class) - count(only the excluded classes)`. The first term is served by the
     /// index that leads with the selected filter column (`role`, `provider`, `session_id`, `ts`,
@@ -3685,6 +4024,7 @@ impl Db {
                 filters,
                 &self.access_scope,
                 class,
+                true,
             );
             if filters.tool.is_some() {
                 // `unicode_lower_contains(m.tool_name, ?)` is already false on NULL, so this adds
@@ -4133,6 +4473,8 @@ impl Db {
     }
 
     /// Return only source-authoritative human text for prose analytics such as `repeats`.
+    /// Queued submissions are searchable evidence, but their unlinked direct-message delivery
+    /// copies cannot safely count as independent corrections or repetitions.
     ///
     /// Whole human messages retain their original identity and content. Mixed messages concatenate
     /// source-ordered human parts, so generated or harness regions cannot become repeat evidence.
@@ -4160,7 +4502,8 @@ impl Db {
             regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
         }
 
-        let mut inner = String::from(
+        let nonqueued = self.nonqueued_input_predicate()?;
+        let mut inner = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind,
                     m.tool_call_id,
                     case
@@ -4179,6 +4522,7 @@ impl Db {
                     m.id as message_id
              from messages m
              where m.record_relation = 'original'
+       and {nonqueued}
                and (
                  m.authorship = 'human'
                  or (
@@ -4191,7 +4535,7 @@ impl Db {
                )",
         );
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut inner, &mut args, filters, &self.access_scope);
+        append_stored_role_filters(&mut inner, &mut args, filters, &self.access_scope);
         let mut sql = format!("select * from ({inner}) attributable where 1 = 1");
         if !query.is_empty() {
             match filters.match_mode {
@@ -4336,9 +4680,12 @@ impl Db {
             // Select only source-authoritative human content. Unknown schema-5 authorship stays
             // excluded rather than being guessed; unavailable source transcripts retain their
             // index rows but cannot become evidence about what a person said.
-            let mut sql = String::from(CORRECTION_CANDIDATES_SQL);
+            let nonqueued = self.nonqueued_input_predicate()?;
+            let mut sql = format!(
+                "{CORRECTION_CANDIDATES_PREFIX}{nonqueued}{CORRECTION_CANDIDATES_SUFFIX}"
+            );
             let mut args: Vec<Value> = Vec::new();
-            append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
+            append_stored_role_filters(&mut sql, &mut args, &filters, &self.access_scope);
             sql.push_str(CORRECTION_ORDER_SQL);
 
             let mut stmt = self.conn.prepare(&sql)?;
@@ -4371,9 +4718,11 @@ impl Db {
             // mixed message, avoiding both repeated SQLite `substr` prefix scans and copied
             // fragment text. This is two set-oriented queries total, never one query per message.
             if rows.iter().any(|row| row.human_parts.is_some()) {
-                let mut parts_sql = String::from(CORRECTION_HUMAN_PARTS_SQL);
+                let mut parts_sql = format!(
+                    "{CORRECTION_HUMAN_PARTS_PREFIX}{nonqueued}{CORRECTION_HUMAN_PARTS_SUFFIX}"
+                );
                 let mut parts_args: Vec<Value> = Vec::new();
-                append_message_filters(
+                append_stored_role_filters(
                     &mut parts_sql,
                     &mut parts_args,
                     &filters,
@@ -4851,6 +5200,7 @@ impl Db {
         }
         // Keep session metadata and all per-session message reads on one SQLite snapshot.
         // The read-only transaction rolls back via RAII on every return/error path.
+        let nonqueued = self.nonqueued_input_predicate()?;
         let transaction = self.conn.unchecked_transaction()?;
         analysis_document_page(
             &transaction,
@@ -4858,6 +5208,7 @@ impl Db {
             cursor,
             filters.limit,
             &self.access_scope,
+            nonqueued,
         )
     }
 
@@ -4880,10 +5231,11 @@ impl Db {
         ) -> Result<()>,
     ) -> Result<AnalysisTraversalReceipt> {
         self.validate_access_scope()?;
+        let nonqueued = self.nonqueued_input_predicate()?;
         let transaction = self.conn.unchecked_transaction()?;
-        let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
+        let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(nonqueued))?;
         let mut human_message_stmt =
-            transaction.prepare(ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL)?;
+            transaction.prepare(&analysis_attributable_human_messages_sql(nonqueued))?;
         let mut cursor = None;
         let mut selected_sessions = 0_u64;
         let mut messages_in_selected_sessions = 0_u64;
@@ -5372,10 +5724,12 @@ impl Db {
     }
 }
 
-const ANALYSIS_MESSAGE_COUNTS_SQL: &str = "select count(*),
+const ANALYSIS_MESSAGE_COUNTS_SQL_PREFIX: &str = "select count(*),
             coalesce(sum(
                 case
                     when m.record_relation = 'original'
+                     and ";
+const ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX: &str = "
                      and (
                         m.authorship = 'human'
                         or (
@@ -5391,8 +5745,12 @@ const ANALYSIS_MESSAGE_COUNTS_SQL: &str = "select count(*),
                     else 0
                 end
             ), 0)
-     from messages m
+     from messages m indexed by idx_messages_session_authorship_relation_seq
      where m.session_id = ?1";
+
+fn analysis_message_counts_sql(nonqueued: &str) -> String {
+    format!("{ANALYSIS_MESSAGE_COUNTS_SQL_PREFIX}{nonqueued}{ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX}")
+}
 
 /// One ordered text row per original message with attributable human-authored content.
 ///
@@ -5403,26 +5761,37 @@ const ANALYSIS_MESSAGE_COUNTS_SQL: &str = "select count(*),
 ///
 /// Let `M` be candidate messages and `P_h` selected human parts. Time is `O(log M + M + P_h)` plus
 /// emitted text bytes, and retained SQLite state is bounded by one session's selected part rows.
-const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL: &str = "select seq, group_concat(fragment, '')
+const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_PREFIX: &str =
+    "select seq, group_concat(fragment, '')
      from (
          select m.id as message_id, m.seq as seq, -1 as ordinal, m.content as fragment
-         from messages m
+         from messages m indexed by idx_messages_session_authorship_relation_seq
          where m.session_id = ?1
            and m.authorship = 'human'
            and m.record_relation = 'original'
+       and ";
+const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_MIDDLE: &str = "
          union all
          select m.id as message_id, m.seq as seq, p.ordinal as ordinal,
                 substr(m.content, p.start_char + 1, p.end_char - p.start_char) as fragment
-         from messages m
+         from messages m indexed by idx_messages_session_authorship_relation_seq
          join message_content_parts p on p.message_id = m.id
          where m.session_id = ?1
            and m.authorship = 'mixed'
            and m.record_relation = 'original'
+       and ";
+const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX: &str = "
            and p.authorship = 'human'
          order by seq, message_id, ordinal
      )
      group by message_id, seq
      order by seq, message_id";
+
+fn analysis_attributable_human_messages_sql(nonqueued: &str) -> String {
+    format!(
+        "{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_PREFIX}{nonqueued}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_MIDDLE}{nonqueued}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX}"
+    )
+}
 
 /// One keyset page of matching session records, ordered by canonical session ID.
 fn analysis_session_page(
@@ -5477,13 +5846,15 @@ fn analysis_document_page(
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
     access: &crate::search_scope::EffectiveAccessScope,
+    nonqueued: &str,
 ) -> Result<crate::models::AnalysisDocumentPage> {
     use crate::models::{AnalysisDocument, AnalysisDocumentPage};
 
     let (sessions, next_cursor) =
         analysis_session_page(transaction, filters, cursor, page_limit, access)?;
-    let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
-    let mut human_message_stmt = transaction.prepare(ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL)?;
+    let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(nonqueued))?;
+    let mut human_message_stmt =
+        transaction.prepare(&analysis_attributable_human_messages_sql(nonqueued))?;
     let mut documents = Vec::with_capacity(sessions.len());
     for session in sessions {
         let (message_count, human_message_count) = count_stmt.query_row([&session.id], |row| {
@@ -5786,13 +6157,80 @@ fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Opti
     }
 }
 
+/// Project eligible ranges without changing the source content or row identity.
+const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')) or (m.authorship='unknown' and (m.record_relation='unknown' or (m.record_relation='original' and m.input_origin='unknown')) and coalesce(m.input_origin,'unknown')='unknown' and m.role in ('user','slash')))";
+const USER_INPUT_PART_SQL: &str = "((p.authorship in ('human','unknown') and p.origin='direct_input') or (p.authorship='human' and p.origin in ('quoted_content','unknown')))";
+
+const MESSAGE_CONTENT_PARTS_JSON: &str = "(select json_group_array(json_object(
+    'ordinal',ordinal,'start_char',start_char,'end_char',end_char,
+    'authorship',authorship,'origin',origin))
+    from (select ordinal,start_char,end_char,authorship,origin
+        from message_content_parts where message_id=m.id order by ordinal))";
+
+fn input_provenance_projection(filters: &MessageFilters) -> String {
+    if filters.input_scope() != crate::models::MessageInputScope::UserInput {
+        return String::new();
+    }
+    let parts = if filters.field.unwrap_or(SearchField::Content) == SearchField::Content {
+        MESSAGE_CONTENT_PARTS_JSON
+    } else {
+        "'[]'"
+    };
+    format!(", json_object(
+        'authorship', m.authorship,
+        'record_relation', m.record_relation,
+        'correlation_identity', case when m.correlation_id is null then null else
+            json_object('authority',m.correlation_authority,'scope',m.correlation_scope,'id',m.correlation_id) end,
+        'input_delivery_state', m.input_delivery_state,
+        'input_origin', m.input_origin,
+        'content_parts', json({parts})
+    ) as source_provenance")
+}
+
+fn append_content_match(sql: &mut String, filters: &MessageFilters, regex: bool) {
+    sql.push_str(if regex {
+        " and rust_regexp(?, m.content"
+    } else {
+        " and unicode_lower_contains(m.content, ?"
+    });
+    if filters.input_scope() == crate::models::MessageInputScope::UserInput {
+        sql.push_str(", case when m.authorship='mixed' then ");
+        sql.push_str(MESSAGE_CONTENT_PARTS_JSON);
+        sql.push_str(" else null end");
+    }
+    sql.push(')');
+}
+
 fn append_message_filters(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
     filters: &MessageFilters,
     access: &crate::search_scope::EffectiveAccessScope,
 ) {
-    append_message_filters_with_class(sql, args, filters, access, ClassSelection::FromFilters);
+    append_message_filters_with_class(
+        sql,
+        args,
+        filters,
+        access,
+        ClassSelection::FromFilters,
+        true,
+    );
+}
+
+fn append_stored_role_filters(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    filters: &MessageFilters,
+    access: &crate::search_scope::EffectiveAccessScope,
+) {
+    append_message_filters_with_class(
+        sql,
+        args,
+        filters,
+        access,
+        ClassSelection::FromFilters,
+        false,
+    );
 }
 
 fn append_message_filters_with_class(
@@ -5801,9 +6239,16 @@ fn append_message_filters_with_class(
     filters: &MessageFilters,
     access: &crate::search_scope::EffectiveAccessScope,
     class: ClassSelection<'_>,
+    recorded_user: bool,
 ) {
     use rusqlite::types::Value;
-    if let Some(role) = filters.role {
+    if recorded_user && filters.role == Some(Role::User) {
+        sql.push_str(" and m.record_relation != 'mirror' and ((");
+        sql.push_str(WHOLE_USER_INPUT_SQL);
+        sql.push_str(") or (m.authorship='mixed' and exists (select 1 from message_content_parts p where p.message_id=m.id and ");
+        sql.push_str(USER_INPUT_PART_SQL);
+        sql.push_str(" and p.end_char > p.start_char)))");
+    } else if let Some(role) = filters.role {
         sql.push_str(" and m.role = ?");
         args.push(Value::Text(role.as_str().to_string()));
     }
@@ -5934,14 +6379,10 @@ fn insert_messages<'a>(
         "insert into messages
             (session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction,
              content, authorship, correlation_authority, correlation_scope, correlation_id,
-             record_relation)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             input_delivery_state, input_origin, record_relation)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )?;
-    let mut part_stmt = tx.prepare(
-        "insert into message_content_parts
-            (message_id, ordinal, start_char, end_char, authorship, origin)
-         values (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
+    let mut part_stmt = tx.prepare(INSERT_MESSAGE_PARTS_SQL)?;
     for (seq, message) in rows {
         if let Err(detail) = message.provenance.validate(&message.content) {
             bail!(
@@ -5965,21 +6406,131 @@ fn insert_messages<'a>(
             correlation.map(|value| value.authority.as_str()),
             correlation.map(|value| value.scope.as_str()),
             correlation.map(|value| value.id.as_str()),
+            message
+                .provenance
+                .input_delivery_state
+                .map(|value| value.as_str()),
+            message.provenance.input_origin.map(|value| value.as_str()),
             message.provenance.record_relation.as_str(),
         ])?;
         let message_id = tx.last_insert_rowid();
-        for part in &message.provenance.content_parts {
-            part_stmt.execute(params![
-                message_id,
-                i64::from(part.ordinal),
-                i64::try_from(part.start_char).context("content-part start exceeds SQLite i64")?,
-                i64::try_from(part.end_char).context("content-part end exceeds SQLite i64")?,
-                part.authorship.as_str(),
-                part.origin.as_str(),
-            ])?;
-        }
+        insert_message_parts(
+            &mut part_stmt,
+            message_id,
+            &message.provenance.content_parts,
+        )?;
     }
     Ok(())
+}
+
+/// Update an identified source row in place while preserving its archive sequence and row id.
+/// Content-part rows are replaced under the same transaction so their source coordinates stay
+/// aligned with the repaired message content.
+fn update_message_row(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: i64,
+    session: &SessionRecord,
+    message: &crate::models::Message,
+) -> Result<()> {
+    if let Err(detail) = message.provenance.validate(&message.content) {
+        bail!(
+            "invalid provenance for message sequence {} in session '{}': {detail}",
+            message.seq,
+            session.id
+        );
+    }
+    let correlation = message.provenance.correlation_identity.as_ref();
+    tx.execute(
+        "update messages set provider = ?1, role = ?2, ts = ?3, tool_name = ?4,
+         kind = ?5, tool_call_id = ?6, is_compaction = ?7, content = ?8,
+         authorship = ?9, correlation_authority = ?10, correlation_scope = ?11,
+         correlation_id = ?12, input_delivery_state = ?13, input_origin = ?14,
+         record_relation = ?15 where id = ?16",
+        params![
+            session.provider.as_str(),
+            message.role.as_str(),
+            message.ts.map(stored_timestamp),
+            message.tool_name,
+            message.kind.as_str(),
+            message.tool_call_id,
+            message.is_compaction as i64,
+            message.content,
+            message.provenance.authorship.as_str(),
+            correlation.map(|value| value.authority.as_str()),
+            correlation.map(|value| value.scope.as_str()),
+            correlation.map(|value| value.id.as_str()),
+            message
+                .provenance
+                .input_delivery_state
+                .map(|value| value.as_str()),
+            message.provenance.input_origin.map(|value| value.as_str()),
+            message.provenance.record_relation.as_str(),
+            message_id,
+        ],
+    )?;
+    tx.execute(
+        "delete from message_content_parts where message_id = ?1",
+        params![message_id],
+    )?;
+    let mut part_stmt = tx.prepare(INSERT_MESSAGE_PARTS_SQL)?;
+    insert_message_parts(
+        &mut part_stmt,
+        message_id,
+        &message.provenance.content_parts,
+    )
+}
+
+const INSERT_MESSAGE_PARTS_SQL: &str = "insert into message_content_parts
+    (message_id, ordinal, start_char, end_char, authorship, origin)
+    values (?1, ?2, ?3, ?4, ?5, ?6)";
+
+fn insert_message_parts(
+    statement: &mut rusqlite::Statement<'_>,
+    message_id: i64,
+    parts: &[crate::models::MessageContentPart],
+) -> Result<()> {
+    for part in parts {
+        statement.execute(params![
+            message_id,
+            i64::from(part.ordinal),
+            i64::try_from(part.start_char).context("content-part start exceeds SQLite i64")?,
+            i64::try_from(part.end_char).context("content-part end exceeds SQLite i64")?,
+            part.authorship.as_str(),
+            part.origin.as_str(),
+        ])?;
+    }
+    Ok(())
+}
+
+// Parts depend on provider structure as well as text; unchanged columns do not prove unchanged
+// attribution. Empty parts need no lookup; mixed rows cost one indexed seek plus O(parts) reads.
+fn message_parts_match(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: i64,
+    message: &crate::models::Message,
+) -> Result<bool> {
+    if message.provenance.content_parts.is_empty() {
+        return Ok(true);
+    }
+    let mut statement = tx.prepare_cached(
+        "select ordinal, start_char, end_char, authorship, origin from message_content_parts
+         where message_id = ?1 order by ordinal",
+    )?;
+    let mut rows = statement.query([message_id])?;
+    for part in &message.provenance.content_parts {
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        if row.get::<_, i64>(0)? != i64::from(part.ordinal)
+            || row.get::<_, i64>(1)? != i64::try_from(part.start_char)?
+            || row.get::<_, i64>(2)? != i64::try_from(part.end_char)?
+            || row.get_ref(3)?.as_str()? != part.authorship.as_str()
+            || row.get_ref(4)?.as_str()? != part.origin.as_str()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(rows.next()?.is_none())
 }
 
 /// Write a session's transcript row.
@@ -6090,19 +6641,22 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 ///   that boundary row is compared, so a caller passing `allow_append_optimization` asserts its
 ///   sources are append-only.
 /// - Unchanged: under the same parser, a parse whose rows equal the stored rows writes nothing.
-/// - Replace: a parser change, or a parse that holds every stored message (same role and
-///   content), replaces the rows, so a parser upgrade can reclassify them.
-/// - Keep: otherwise the harness compacted, rewrote or pruned its transcript. The index is the
-///   archive, so stored rows stay, and parse messages no stored row of the same role and content
-///   accounts for are appended after the highest stored seq. Content cannot tell a re-rendered
-///   message from a removed one across parser versions, which is why only the same parser keeps.
+/// - Replace: under the same parser, a parse that holds every stored identity (role/content for
+///   legacy rows) replaces the rows, so an ordinary reclassification can use the source sequence.
+/// - Reconcile: a parser upgrade repairs each matched source row in place (native identity first,
+///   legacy role/content second), retains archive-only rows, and appends parse-only rows after the
+///   highest stored sequence. The same reconciliation path handles a same-parser shrink or rewrite
+///   without deleting archive history.
 ///
-/// O(stored + parsed rows and bytes) time off the append path; O(rows) memory for 32-byte keys.
+/// Key work is O(stored + parsed rows and bytes), with O(rows) memory for 32-byte keys.
+/// Mixed-row equality additionally performs the indexed checks in [`message_parts_match`].
 fn store_parsed_messages(
     tx: &rusqlite::Transaction<'_>,
     parsed: &ParsedSession,
     allow_append_optimization: bool,
     same_parser: bool,
+    preserve_family_sequences: bool,
+    preserve_family_history: bool,
 ) -> Result<bool> {
     let session = &parsed.session;
     let existing_count: i64 = tx.query_row(
@@ -6124,34 +6678,53 @@ fn store_parsed_messages(
         // "continue") at that position cannot pass for it after an archive keep.
         let boundary = &parsed.messages[(existing_count - 1) as usize];
         let stored_boundary = stored_message_keys(tx, &session.id, Some(boundary.seq))?;
-        if stored_boundary
-            .first()
-            .is_some_and(|(_, keys)| keys.all_columns == parsed_message_keys(boundary).all_columns)
-        {
-            insert_messages(
-                tx,
-                session,
-                parsed.messages[existing_count as usize..]
-                    .iter()
-                    .map(|m| (m.seq, m)),
-            )?;
-            return Ok(false);
+        if let Some((id, keys)) = stored_boundary.first() {
+            if *keys == parsed_message_keys(boundary) && message_parts_match(tx, *id, boundary)? {
+                insert_messages(
+                    tx,
+                    session,
+                    parsed.messages[existing_count as usize..]
+                        .iter()
+                        .map(|m| (m.seq, m)),
+                )?;
+                return Ok(false);
+            }
         }
     }
     let stored = stored_message_keys(tx, &session.id, None)?;
     let parsed_keys: Vec<MessageKeys> = parsed.messages.iter().map(parsed_message_keys).collect();
-    if same_parser
-        && stored
-            .iter()
-            .map(|(_, keys)| keys.all_columns)
-            .eq(parsed_keys.iter().map(|keys| keys.all_columns))
-    {
+    // A first parse has no archive rows to reconcile. Keep the parser's published sequence
+    // numbers verbatim: they may be sparse or tied, and replacing them with insertion offsets
+    // loses the provider's stable coordinates before any later search or recovery can use them.
+    if stored.is_empty() {
+        insert_messages(
+            tx,
+            session,
+            parsed.messages.iter().map(|message| (message.seq, message)),
+        )?;
         return Ok(false);
     }
-    if !same_parser
-        || covers_every_stored_key(
-            stored.iter().map(|(_, keys)| keys.role_and_content),
-            parsed_keys.iter().map(|keys| keys.role_and_content),
+    if same_parser && stored.iter().map(|(_, keys)| keys).eq(parsed_keys.iter()) {
+        let mut same_parts = true;
+        for ((id, _), message) in stored.iter().zip(&parsed.messages) {
+            if !message_parts_match(tx, *id, message)? {
+                same_parts = false;
+                break;
+            }
+        }
+        if same_parts {
+            return Ok(false);
+        }
+    }
+    if same_parser
+        && !preserve_family_sequences
+        && covers_every_stored_key(
+            stored
+                .iter()
+                .map(|(_, keys)| keys.correlation.unwrap_or(keys.role_and_content)),
+            parsed_keys
+                .iter()
+                .map(|keys| keys.correlation.unwrap_or(keys.role_and_content)),
         )
     {
         tx.execute(
@@ -6161,21 +6734,278 @@ fn store_parsed_messages(
         insert_messages(tx, session, parsed.messages.iter().map(|m| (m.seq, m)))?;
         return Ok(false);
     }
-    let mut stored_roles = key_counts(stored.iter().map(|(_, keys)| keys.role_and_content));
-    let unseen = parsed
-        .messages
-        .iter()
-        .zip(&parsed_keys)
-        .filter(|(_, keys)| !take_key(&mut stored_roles, &keys.role_and_content))
-        .map(|(message, _)| message);
+    // A parser upgrade must repair rows it can identify while retaining rows that only the
+    // previous source generation contained. Native correlation identity is authoritative when
+    // present; role/content is the conservative fallback for older rows without an identity.
+    // Text alone never merges two copies: every key is consumed once.
+    let mut stored_by_identity: HashMap<RowDigest, std::collections::VecDeque<usize>> =
+        HashMap::new();
+    let mut stored_by_role_and_content: HashMap<RowDigest, std::collections::VecDeque<usize>> =
+        HashMap::new();
+    for (position, (_, keys)) in stored.iter().enumerate() {
+        if let Some(identity) = keys.correlation {
+            stored_by_identity
+                .entry(identity)
+                .or_default()
+                .push_back(position);
+        } else {
+            // A text fallback may repair a legacy row that has no identity, but must never
+            // merge two rows whose provider identities disagree.
+            stored_by_role_and_content
+                .entry(keys.role_and_content)
+                .or_default()
+                .push_back(position);
+        }
+    }
+    let mut matched = vec![false; stored.len()];
+    // Upgrade-only relation matching repairs changed rendering without treating a call ID
+    // as event identity. Ambiguous relations on either side remain separate archive rows.
+    let mut legacy_tool_results = HashMap::<RowDigest, (usize, Option<usize>)>::new();
+    if !same_parser
+        && session.parse_version == crate::util::provider_parse_version(session.provider)
+    {
+        for (position, (_, keys)) in stored.iter().enumerate() {
+            if let Some(key) = keys.tool_result_relation {
+                let entry = legacy_tool_results.entry(key).or_default();
+                entry.0 += 1;
+                if keys.correlation.is_none() {
+                    entry.1 = Some(position);
+                }
+            }
+        }
+        let mut parsed_relations = HashMap::<RowDigest, usize>::new();
+        for keys in &parsed_keys {
+            if let Some(key) = keys.tool_result_relation {
+                *parsed_relations.entry(key).or_default() += 1;
+            }
+        }
+        legacy_tool_results.retain(|key, (count, position)| {
+            *count == 1 && position.is_some() && parsed_relations.get(key) == Some(&1)
+        });
+    }
+    let mut unseen = Vec::new();
+    for (message, keys) in parsed.messages.iter().zip(&parsed_keys) {
+        let position = keys
+            .correlation
+            .and_then(|identity| stored_by_identity.get_mut(&identity))
+            .and_then(|queue| {
+                while let Some(position) = queue.pop_front() {
+                    if !matched[position] {
+                        return Some(position);
+                    }
+                }
+                None
+            })
+            .or_else(|| {
+                keys.tool_result_relation
+                    .and_then(|key| legacy_tool_results.get(&key))
+                    .and_then(|(_, position)| *position)
+                    .filter(|position| !matched[*position])
+            })
+            .or_else(|| {
+                stored_by_role_and_content
+                    .get_mut(&keys.role_and_content)
+                    .and_then(|queue| {
+                        while let Some(position) = queue.pop_front() {
+                            if !matched[position] {
+                                return Some(position);
+                            }
+                        }
+                        None
+                    })
+            });
+        if let Some(position) = position {
+            matched[position] = true;
+            // A parser upgrade can change part attribution without changing message columns.
+            if preserve_family_history
+                && same_parser
+                && keys.correlation.is_some()
+                && stored[position].1.correlation == keys.correlation
+                && stored[position].1.columns_without_seq != keys.columns_without_seq
+            {
+                if let Some(merged) = merge_family_input_row(tx, stored[position].0, message)? {
+                    if stored[position].1.columns_without_seq
+                        != parsed_message_keys(&merged).columns_without_seq
+                        || !message_parts_match(tx, stored[position].0, &merged)?
+                    {
+                        update_message_row(tx, stored[position].0, session, &merged)?;
+                    }
+                    continue;
+                }
+            }
+            if !same_parser
+                || stored[position].1.columns_without_seq != keys.columns_without_seq
+                || !message_parts_match(tx, stored[position].0, message)?
+            {
+                update_message_row(tx, stored[position].0, session, message)?;
+            }
+        } else {
+            unseen.push(message);
+        }
+    }
     insert_messages(
         tx,
         session,
         unseen
+            .into_iter()
             .enumerate()
             .map(|(offset, message)| (next_seq + offset as i64, message)),
     )?;
-    Ok(true)
+    Ok(matched.iter().any(|matched| !matched))
+}
+
+/// Union structurally attributed fragments only within the same proven native family event.
+/// Existing multiplicities are consumed once; newly observed fragments retain their native order
+/// and classification. O(B + P) expected time and O(B + P) memory for B bytes and P parts, including
+/// the resulting canonical text. Reads one row and its parts; unchanged unions perform no writes.
+fn merge_family_input_row(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: i64,
+    incoming: &Message,
+) -> Result<Option<Message>> {
+    if incoming.provenance.content_parts.is_empty() && !incoming.provenance.is_whole_user_input() {
+        return Ok(None);
+    }
+    let (same_event_shape, old_input_origin): (bool, Option<String>) = tx.query_row(
+        "select role is ?2 and ts is ?3 and tool_name is ?4 and kind is ?5
+           and tool_call_id is ?6 and is_compaction = ?7 and record_relation is ?8, input_origin
+         from messages where id = ?1",
+        params![
+            message_id,
+            incoming.role.as_str(),
+            incoming.ts.map(stored_timestamp),
+            incoming.tool_name,
+            incoming.kind.as_str(),
+            incoming.tool_call_id,
+            incoming.is_compaction,
+            incoming.provenance.record_relation.as_str()
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if !same_event_shape {
+        return Ok(None);
+    }
+    let Some((old_content, old_parts)) = stored_message_content_parts(tx, message_id)? else {
+        return Ok(None);
+    };
+    if old_parts.is_empty() {
+        return Ok(None);
+    }
+    let mut held = HashMap::new();
+    for (part, text) in crate::util::content_part_regions(&old_content, &old_parts)? {
+        *held
+            .entry((part.authorship, part.origin, text))
+            .or_insert(0usize) += 1;
+    }
+    let whole = [MessageContentPart {
+        ordinal: 0,
+        start_char: 0,
+        end_char: incoming.content.chars().count(),
+        authorship: if incoming.provenance.authorship == MessageAuthorship::Human {
+            ContentPartAuthorship::Human
+        } else {
+            ContentPartAuthorship::Unknown
+        },
+        origin: ContentPartOrigin::DirectInput,
+    }];
+    let incoming_parts = if incoming.provenance.content_parts.is_empty() {
+        &whole[..]
+    } else {
+        &incoming.provenance.content_parts
+    };
+    let mut novel = Vec::new();
+    for (part, text) in crate::util::content_part_regions(&incoming.content, incoming_parts)? {
+        match held.get_mut(&(part.authorship, part.origin, text)) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => novel.push((part, text)),
+        }
+    }
+    let mut cursor = old_content.chars().count();
+    let mut merged = incoming.clone();
+    merged.content = old_content;
+    merged.provenance.authorship = MessageAuthorship::Mixed;
+    // A partial rendering's missing origin does not erase a previously recorded input channel.
+    merged.provenance.input_origin = incoming.provenance.input_origin.or(old_input_origin
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?);
+    merged.provenance.content_parts = old_parts;
+    for (part, text) in novel {
+        let parts = &mut merged.provenance.content_parts;
+        merged.content.push('\n');
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char: cursor,
+            end_char: cursor + 1,
+            authorship: ContentPartAuthorship::Generated,
+            origin: ContentPartOrigin::ToolPayload,
+        });
+        cursor += 1;
+        let end = cursor + text.chars().count();
+        merged.content.push_str(text);
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char: cursor,
+            end_char: end,
+            authorship: part.authorship,
+            origin: part.origin,
+        });
+        cursor = end;
+    }
+    Ok(Some(merged))
+}
+
+fn stored_message_content_parts(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: i64,
+) -> Result<Option<(String, Vec<MessageContentPart>)>> {
+    let Some(content) = tx
+        .query_row(
+            "select content from messages where id = ?1",
+            [message_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut statement = tx.prepare(
+        "select ordinal, start_char, end_char, authorship, origin
+         from message_content_parts where message_id = ?1 order by ordinal",
+    )?;
+    let parts = statement
+        .query_map([message_id], |row| {
+            let authorship: String = row.get(3)?;
+            let origin: String = row.get(4)?;
+            Ok(MessageContentPart {
+                ordinal: row.get::<_, i64>(0)?.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "ordinal".to_string(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?,
+                start_char: row.get::<_, i64>(1)?.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        1,
+                        "start_char".to_string(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?,
+                end_char: row.get::<_, i64>(2)?.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        2,
+                        "end_char".to_string(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?,
+                authorship: ContentPartAuthorship::from_db_str(&authorship),
+                origin: ContentPartOrigin::from_db_str(&origin),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some((content, parts)))
 }
 
 /// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
@@ -6205,12 +7035,10 @@ fn store_parsed_file_edits(
     {
         return Ok(());
     }
-    if !same_parser
-        || covers_every_stored_key(
-            stored.iter().map(|(_, _, keys)| keys.edit),
-            parsed_keys.iter().map(|keys| keys.edit),
-        )
-    {
+    if covers_every_stored_key(
+        stored.iter().map(|(_, _, keys)| keys.edit),
+        parsed_keys.iter().map(|keys| keys.edit),
+    ) {
         tx.execute(
             "delete from file_edits where session_id = ?1",
             params![session.id],
@@ -6230,6 +7058,26 @@ fn store_parsed_file_edits(
                 .and_then(|queue| queue.pop_front())
         })
         .collect();
+    if !same_parser {
+        let mut update = tx.prepare(
+            "update file_edits set ts = ?1, tool = ?2, file_path = ?3, file_name = ?4,
+             new_content = ?5, edits_json = ?6 where id = ?7",
+        )?;
+        for (edit, position) in parsed.file_edits.iter().zip(&matched) {
+            if let Some(position) = position {
+                let edits_json = serialize_edits_json(edit)?;
+                update.execute(params![
+                    edit.ts.map(stored_timestamp),
+                    edit.tool,
+                    edit.file_path,
+                    edit.file_name,
+                    edit.new_content,
+                    edits_json,
+                    stored[*position].0,
+                ])?;
+            }
+        }
+    }
     // (stored position to precede or follow, 0 = parse-only before 1 = stored, tiebreak index).
     let mut order: Vec<(usize, u8, usize)> = (0..stored.len()).map(|j| (j, 1, j)).collect();
     let mut next_retained = stored.len();
@@ -6257,10 +7105,11 @@ fn store_parsed_file_edits(
 }
 
 /// Move a retired identity's rows into `target` before the retired session row is deleted. A
-/// row the target already holds (same role and content for a message, same edit for a file
-/// edit) stays and leaves with the retired session; every other row moves after the target's
-/// highest seq in its stored order. A target with no messages takes the retired messages with
-/// their seqs in one statement. O(target + retired rows and bytes) time, O(rows) key memory.
+/// row the target already holds (the same native message correlation identity, or the same role
+/// and content only when both messages have no identity; the same edit for a file edit) stays and
+/// leaves with the retired session; every other row moves after the target's highest seq in its
+/// stored order. A target with no messages takes the retired messages with their seqs in one
+/// statement. O(target + retired rows and bytes) time, O(rows) key memory.
 fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str) -> Result<()> {
     let held = stored_message_keys(tx, target, None)?;
     if held.is_empty() {
@@ -6269,13 +7118,25 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
             params![target, retired],
         )?;
     } else {
-        let mut held = key_counts(held.iter().map(|(_, keys)| keys.role_and_content));
+        // A native identity proves whether two same-text rows are one source event. Only rows
+        // from the legacy identity-less corpus may use role/content as a conservative fallback;
+        // cross-matching an identified row would discard an independent queued input on alias
+        // reconciliation.
+        let mut held_by_identity = key_counts(held.iter().filter_map(|(_, keys)| keys.correlation));
+        let mut held_legacy =
+            key_counts(held.iter().filter_map(|(_, keys)| {
+                keys.correlation.is_none().then_some(keys.role_and_content)
+            }));
         let next_seq = next_message_seq(tx, target)?;
         let mut moved = 0;
         let mut update =
             tx.prepare("update messages set session_id = ?1, seq = ?2 where id = ?3")?;
         for (id, keys) in stored_message_keys(tx, retired, None)? {
-            if !take_key(&mut held, &keys.role_and_content) {
+            let already_held = match keys.correlation {
+                Some(identity) => take_key(&mut held_by_identity, &identity),
+                None => take_key(&mut held_legacy, &keys.role_and_content),
+            };
+            if !already_held {
                 update.execute(params![target, next_seq + moved, id])?;
                 moved += 1;
             }
@@ -6298,17 +7159,65 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
     Ok(())
 }
 
+/// Repair path-scoped Claude queue identities after a verified physical-file rename. The event
+/// id remains the provider-independent key; scope is changed only for rows from the verified old
+/// path, so unrelated same-session files and repeated submissions stay distinct.
+fn remap_verified_queue_scopes(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionRecord,
+    aliases: &[String],
+) -> Result<()> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    use crate::providers::claude::claude_queue_scope;
+    let new_scope = claude_queue_scope(&canonical_source_path(Path::new(&session.source_path)));
+    for alias in aliases {
+        let Some(receipt) = tx
+            .query_row(
+                "select file_identity from files_seen
+                 where provider = ?1 and source_path = ?2",
+                params![session.provider.as_str(), alias],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|value| serde_json::from_str::<FileIdentityReceipt>(&value).ok())
+        else {
+            continue;
+        };
+        let old_scope = claude_queue_scope(&receipt.canonical_path);
+        tx.execute(
+            "update messages
+             set correlation_scope = ?1
+             where session_id = ?2
+               and correlation_authority = 'source_local'
+               and correlation_id is not null
+               and correlation_scope = ?3",
+            params![new_scope, session.id, old_scope],
+        )?;
+    }
+    Ok(())
+}
+
 type RowDigest = [u8; 32];
 
 /// Identities of one message row for the archive rule (`store_parsed_messages`, `move_retired_rows`).
 ///
 /// - `role_and_content` decides whether a parse still holds a stored message, so text a new
 ///   message shares with a stored message of another role is not taken for it.
-/// - `all_columns` covers every stored column except the content parts, which the parser derives from
-///   the content; equal `all_columns` sequences mean the parse would write exactly what is stored.
+/// - `correlation` is the provider-native identity used first during parser-upgrade repair.
+/// - `seq` participates in complete-source equality but not in-place archive repair: retained
+///   rows keep their archive coordinates even when the source's sequence shifts after pruning.
+/// - `columns_without_seq` covers other message columns; mixed-message parts are compared
+///   separately because provider structure can change attribution without changing content.
+#[derive(PartialEq, Eq)]
 struct MessageKeys {
     role_and_content: RowDigest,
-    all_columns: RowDigest,
+    correlation: Option<RowDigest>,
+    tool_result_relation: Option<RowDigest>,
+    seq: i64,
+    columns_without_seq: RowDigest,
 }
 
 /// The stored message columns the archive keys read; `None` is SQL NULL.
@@ -6322,6 +7231,8 @@ struct MessageColumns<'a> {
     tool_call_id: Option<&'a str>,
     is_compaction: bool,
     correlation: [Option<&'a str>; 3],
+    input_delivery_state: Option<&'a str>,
+    input_origin: Option<&'a str>,
     record_relation: Option<&'a str>,
     content: &'a str,
 }
@@ -6334,8 +7245,7 @@ impl MessageColumns<'_> {
         let mut role_and_content = FramedSha256::new(b"aise-archive-message-role-v1");
         role_and_content.update_optional_str(self.role);
         role_and_content.update_bytes(&content);
-        let mut all_columns = FramedSha256::new(b"aise-archive-message-row-v1");
-        all_columns.update_i64(self.seq);
+        let mut columns_without_seq = FramedSha256::new(b"aise-archive-message-columns-v1");
         for value in [
             self.role,
             self.kind,
@@ -6346,15 +7256,32 @@ impl MessageColumns<'_> {
             self.correlation[0],
             self.correlation[1],
             self.correlation[2],
+            self.input_delivery_state,
+            self.input_origin,
             self.record_relation,
         ] {
-            all_columns.update_optional_str(value);
+            columns_without_seq.update_optional_str(value);
         }
-        all_columns.update_u8(u8::from(self.is_compaction));
-        all_columns.update_bytes(&content);
+        columns_without_seq.update_u8(u8::from(self.is_compaction));
+        columns_without_seq.update_bytes(&content);
+        let correlation = match self.correlation {
+            [Some(authority), Some(scope), Some(id)] => {
+                let mut digest = FramedSha256::new(b"aise-archive-message-correlation-v1");
+                digest.update_bytes(authority.as_bytes());
+                digest.update_bytes(scope.as_bytes());
+                digest.update_bytes(id.as_bytes());
+                Some(digest.finish_bytes())
+            }
+            _ => None,
+        };
         MessageKeys {
             role_and_content: role_and_content.finish_bytes(),
-            all_columns: all_columns.finish_bytes(),
+            correlation,
+            tool_result_relation: (self.kind == Some("tool_result"))
+                .then(|| tool_result_relation_key(self.tool_name, self.tool_call_id))
+                .flatten(),
+            seq: self.seq,
+            columns_without_seq: columns_without_seq.finish_bytes(),
         }
     }
 }
@@ -6363,7 +7290,7 @@ impl MessageColumns<'_> {
 fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
     let ts = message.ts.map(stored_timestamp);
     let correlation = message.provenance.correlation_identity.as_ref();
-    MessageColumns {
+    let mut keys = MessageColumns {
         seq: message.seq,
         role: Some(message.role.as_str()),
         kind: Some(message.kind.as_str()),
@@ -6377,10 +7304,41 @@ fn parsed_message_keys(message: &crate::models::Message) -> MessageKeys {
             correlation.map(|value| value.scope.as_str()),
             correlation.map(|value| value.id.as_str()),
         ],
+        input_delivery_state: message
+            .provenance
+            .input_delivery_state
+            .map(|value| value.as_str()),
+        input_origin: message.provenance.input_origin.map(|value| value.as_str()),
         record_relation: Some(message.provenance.record_relation.as_str()),
         content: &message.content,
     }
-    .keys()
+    .keys();
+    if message.kind == crate::models::MessageKind::Conversation
+        && message.role == crate::models::Role::User
+        && message.provenance.authorship == crate::models::MessageAuthorship::Mixed
+        && message
+            .provenance
+            .content_parts
+            .iter()
+            .any(|part| part.origin == crate::models::ContentPartOrigin::ToolPayload)
+    {
+        keys.tool_result_relation = tool_result_relation_key(
+            message.tool_name.as_deref(),
+            message.tool_call_id.as_deref(),
+        );
+    }
+    keys
+}
+
+fn tool_result_relation_key(name: Option<&str>, call_id: Option<&str>) -> Option<RowDigest> {
+    let (name, call_id) = (
+        name.filter(|value| !value.is_empty())?,
+        call_id.filter(|value| !value.is_empty())?,
+    );
+    let mut digest = FramedSha256::new(b"aise-archive-tool-result-relation-v1");
+    digest.update_bytes(name.as_bytes());
+    digest.update_bytes(call_id.as_bytes());
+    Some(digest.finish_bytes())
 }
 
 /// A session's stored message rows as (row id, keys) in (seq, id) order, or only the rows at
@@ -6392,8 +7350,8 @@ fn stored_message_keys(
     only_seq: Option<i64>,
 ) -> Result<Vec<(i64, MessageKeys)>> {
     const COLUMNS: &str = "select id, seq, role, kind, authorship, ts, tool_name, tool_call_id,
-        is_compaction, correlation_authority, correlation_scope, correlation_id, record_relation,
-        content from messages";
+        is_compaction, correlation_authority, correlation_scope, correlation_id,
+        input_delivery_state, input_origin, record_relation, content from messages";
     // Two fixed statements, so the single-seq read stays an index seek: an `?2 is null or`
     // predicate can keep SQLite off the (session_id, seq) key.
     let mut statement = tx.prepare(&match only_seq {
@@ -6413,8 +7371,10 @@ fn stored_message_keys(
         let (role, kind, authorship, ts, tool_name, tool_call_id) =
             (text(2)?, text(3)?, text(4)?, text(5)?, text(6)?, text(7)?);
         let correlation = [text(9)?, text(10)?, text(11)?];
-        let record_relation = text(12)?;
-        let content: String = row.get(13)?;
+        let input_delivery_state = text(12)?;
+        let input_origin = text(13)?;
+        let record_relation = text(14)?;
+        let content: String = row.get(15)?;
         let columns = MessageColumns {
             seq: row.get(1)?,
             role: role.as_deref(),
@@ -6425,6 +7385,8 @@ fn stored_message_keys(
             tool_call_id: tool_call_id.as_deref(),
             is_compaction: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
             correlation: correlation.each_ref().map(Option::as_deref),
+            input_delivery_state: input_delivery_state.as_deref(),
+            input_origin: input_origin.as_deref(),
             record_relation: record_relation.as_deref(),
             content: &content,
         };
@@ -6851,6 +7813,23 @@ fn decode_db_enum<T>(
 fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<MessageHit> {
     let ts: Option<String> = row.get(offset + 4)?;
     Ok(MessageHit {
+        provenance: row
+            .as_ref()
+            .column_index("source_provenance")
+            .ok()
+            .map(
+                |index| -> rusqlite::Result<Box<crate::models::MessageProvenance>> {
+                    let json: String = row.get(index)?;
+                    serde_json::from_str(&json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            index,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                },
+            )
+            .transpose()?,
         session_id: row.get(offset)?,
         provider: decode_db_enum(
             row.get::<_, String>(offset + 1)?,
@@ -6940,19 +7919,37 @@ fn score_fuzzy_message_hits(
     pattern: &Pattern,
     query_lower: &str,
     hits: Vec<(usize, MessageHit)>,
+    input_scope: crate::models::MessageInputScope,
 ) -> Vec<ScoredFuzzyHit> {
     let exact_phrase_needle = UnicodeLowerNeedle::from_lowered(query_lower);
     hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
             |(matcher, utf32_buf), (ordinal, mut hit)| {
-                let score = {
-                    let haystack = Utf32Str::new(&hit.content, utf32_buf);
-                    pattern.score(haystack, matcher)
+                let (score, exact_phrase) = if input_scope == crate::models::MessageInputScope::Any
+                {
+                    let score = pattern.score(Utf32Str::new(&hit.content, utf32_buf), matcher);
+                    let exact_phrase =
+                        score.is_some() && exact_phrase_needle.contains(&hit.content);
+                    (score, exact_phrase)
+                } else {
+                    let regions =
+                        crate::message_search::matching_content_regions(&hit, input_scope);
+                    let score = regions
+                        .iter()
+                        .filter_map(|(_, text)| {
+                            utf32_buf.clear();
+                            pattern.score(Utf32Str::new(text, utf32_buf), matcher)
+                        })
+                        .max();
+                    let exact_phrase = score.is_some()
+                        && regions
+                            .iter()
+                            .any(|(_, text)| exact_phrase_needle.contains(text));
+                    (score, exact_phrase)
                 };
                 score.map(|score| {
                     hit.fuzzy_score = Some(score);
-                    let exact_phrase = exact_phrase_needle.contains(&hit.content);
                     (hit, exact_phrase, ordinal)
                 })
             },
@@ -8151,6 +9148,467 @@ mod tests {
     }
 
     #[test]
+    fn user_role_selects_recorded_inputs_without_rewriting_source_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+            values ('claude:user-role','claude','user-role','','/user-role','test','test');
+            insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin) values
+            (901,'claude:user-role','claude',0,'tool','tool_result','wrapper answer','mixed','original','interactive_answer'),
+            (902,'claude:user-role','claude',1,'user','conversation','wrapper answer','mixed','original','direct_conversation'),
+            (903,'claude:user-role','claude',2,'user','conversation','legacy answer','unknown','unknown',null),
+            (904,'claude:user-role','claude',3,'slash','conversation','/answer','human','original',null),
+            (905,'claude:user-role','claude',4,'user','conversation','agent answer','agent','original',null),
+            (906,'claude:user-role','claude',5,'assistant','conversation','model answer','agent','original',null);
+            insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values
+            (901,0,0,8,'generated','harness_context'),(901,1,8,14,'human','direct_input'),
+            (902,0,0,8,'generated','harness_context'),(902,1,8,14,'human','direct_input');").unwrap();
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            session_id: Some("claude:user-role".into()),
+            ..Default::default()
+        };
+        let hits = db.search_messages("answer", &filters).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.seq, hit.role))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Role::Tool),
+                (1, Role::User),
+                (2, Role::User),
+                (3, Role::Slash)
+            ]
+        );
+        assert!(db.search_messages("wrapper", &filters).unwrap().is_empty());
+        assert_eq!(db.search_messages("", &filters).unwrap().len(), 4);
+        assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 4);
+        assert_eq!(
+            db.read_session_messages(&filters, MessageOrder::OldestFirst)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            db.search_messages("wrapper", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
+        let tools = db
+            .search_messages(
+                "wrapper",
+                &MessageFilters {
+                    role: Some(Role::Tool),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].role, Role::Tool);
+        assert_eq!(
+            db.search_attributable_human_messages("answer", &filters)
+                .unwrap()
+                .len(),
+            1,
+            "specialized analytics retain their stored-role restriction"
+        );
+        // Statistics still describe stored roles, including an agent-origin user row.
+        assert_eq!(
+            db.message_role_counts(&filters).unwrap(),
+            vec![("user".into(), 3)]
+        );
+        db.conn
+            .execute(
+                "update messages set tool_name='AskUserQuestion' where id=901",
+                [],
+            )
+            .unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        for query in [
+            crate::message_search::MessageQuery::literal("Ask").unwrap(),
+            crate::message_search::MessageQuery::regex("^Ask").unwrap(),
+            crate::message_search::MessageQuery::fuzzy("Ask").unwrap(),
+        ] {
+            let result = service
+                .search(
+                    crate::message_search::MessageSearchRequest::builder(
+                        query,
+                        crate::message_search::MessageTarget::tool_name(),
+                    )
+                    .role(Role::User)
+                    .extent(crate::message_search::RequestedExtent::page(Some(10), 0).unwrap())
+                    .build()
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(result.hits().len(), 1);
+            let hit = result.hits()[0].message();
+            assert_eq!(hit.role, Role::Tool);
+            assert!(
+                hit.provenance
+                    .as_ref()
+                    .is_some_and(|source| source.content_parts.is_empty()),
+                "all modes retain source evidence without loading content partitions"
+            );
+            assert_eq!(
+                result.hits()[0].match_evidence().unwrap().field_start_char,
+                0
+            );
+        }
+        db.conn.execute("insert into messages(session_id,provider,seq,role,kind,tool_name,content,authorship,record_relation,input_origin)
+            values ('claude:user-role','claude',6,'user','tool_call','UserCommand',?1,'human','original','direct_conversation')",
+            [r#"{"args":{"command":"answer"}}"#]).unwrap();
+        for query in [
+            crate::message_search::MessageQuery::literal("answer").unwrap(),
+            crate::message_search::MessageQuery::regex("^answer$").unwrap(),
+            crate::message_search::MessageQuery::fuzzy("ans").unwrap(),
+        ] {
+            let result = service
+                .search(
+                    crate::message_search::MessageSearchRequest::builder(
+                        query,
+                        crate::message_search::MessageTarget::tool_argument("/command").unwrap(),
+                    )
+                    .role(Role::User)
+                    .extent(crate::message_search::RequestedExtent::page(Some(10), 0).unwrap())
+                    .build()
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(result.hits().len(), 1);
+            let source = result.hits()[0].message().provenance.as_ref().unwrap();
+            assert_eq!(
+                source.input_origin,
+                Some(crate::models::MessageInputOrigin::DirectConversation)
+            );
+            assert!(source.content_parts.is_empty());
+            assert_eq!(
+                result.hits()[0].match_evidence().unwrap().field_start_char,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn user_content_sql_and_rust_agree_on_source_and_region_eligibility() {
+        use crate::models::{
+            ContentPartAuthorship as A, ContentPartOrigin as O, MessageContentPart,
+            MessageInputOrigin as I, MessageProvenance, MessageRecordRelation as R,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+            values ('claude:eligibility','claude','eligibility','','/eligibility','test','test')").unwrap();
+        let mut expected = Vec::new();
+        let mut seq = 0i64;
+        let mut insert = |provenance: MessageProvenance, eligible: bool| {
+            let content = if provenance.content_parts.is_empty() {
+                "needle"
+            } else {
+                "needle|generated"
+            };
+            provenance.validate(content).unwrap();
+            assert_eq!(
+                provenance.record_relation != R::Mirror
+                    && (provenance.is_whole_user_input()
+                        || provenance
+                            .content_parts
+                            .iter()
+                            .any(MessageContentPart::is_user_input)),
+                eligible
+            );
+            db.conn.execute("insert into messages(session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin)
+                values ('claude:eligibility','claude',?1,'tool','tool_result',?2,?3,?4,?5)",
+                params![seq, content, provenance.authorship.as_str(), provenance.record_relation.as_str(), provenance.input_origin.map(I::as_str)]).unwrap();
+            let id = db.conn.last_insert_rowid();
+            for part in &provenance.content_parts {
+                db.conn.execute("insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin)
+                    values (?1,?2,?3,?4,?5,?6)", params![id,part.ordinal,i64::try_from(part.start_char).unwrap(),i64::try_from(part.end_char).unwrap(),part.authorship.as_str(),part.origin.as_str()]).unwrap();
+            }
+            if eligible {
+                expected.push(seq);
+            }
+            seq += 1;
+        };
+        for (authorship, user, unknown) in [
+            (MessageAuthorship::Human, true, false),
+            (MessageAuthorship::Unknown, false, true),
+            (MessageAuthorship::Agent, false, false),
+            (MessageAuthorship::Harness, false, false),
+            (MessageAuthorship::Generated, false, false),
+        ] {
+            for (input_origin, positive) in [
+                (None, false),
+                (Some(I::Unknown), false),
+                (Some(I::DirectConversation), true),
+                (Some(I::Queued), true),
+                (Some(I::InteractiveAnswer), true),
+            ] {
+                for record_relation in [R::Original, R::Unknown, R::Mirror] {
+                    insert(
+                        MessageProvenance {
+                            authorship,
+                            input_origin,
+                            record_relation,
+                            ..Default::default()
+                        },
+                        record_relation != R::Mirror && (user || (unknown && positive)),
+                    );
+                }
+            }
+        }
+        for authorship in [A::Human, A::Unknown, A::Agent, A::Harness] {
+            for origin in [
+                O::DirectInput,
+                O::QuotedContent,
+                O::Unknown,
+                O::HarnessContext,
+                O::GeneratedSummary,
+                O::ToolPayload,
+            ] {
+                for record_relation in [R::Original, R::Unknown, R::Mirror] {
+                    let eligible = record_relation != R::Mirror
+                        && match origin {
+                            O::DirectInput => matches!(authorship, A::Human | A::Unknown),
+                            O::QuotedContent | O::Unknown => authorship == A::Human,
+                            _ => false,
+                        };
+                    insert(
+                        MessageProvenance {
+                            authorship: MessageAuthorship::Mixed,
+                            record_relation,
+                            content_parts: vec![
+                                MessageContentPart {
+                                    ordinal: 0,
+                                    start_char: 0,
+                                    end_char: 6,
+                                    authorship,
+                                    origin,
+                                },
+                                MessageContentPart {
+                                    ordinal: 1,
+                                    start_char: 6,
+                                    end_char: 16,
+                                    authorship: A::Generated,
+                                    origin: O::ToolPayload,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        eligible,
+                    );
+                }
+            }
+        }
+        for (query, match_mode) in [
+            ("needle", MessageSearchMode::Literal),
+            ("^needle$", MessageSearchMode::Regex),
+            ("ndl", MessageSearchMode::Fuzzy),
+            ("", MessageSearchMode::Literal),
+        ] {
+            let filters = MessageFilters {
+                role: Some(crate::models::Role::User),
+                match_mode,
+                limit: 1000,
+                ..Default::default()
+            };
+            let hits = db.search_messages(query, &filters).unwrap();
+            let mut actual = hits.iter().map(|hit| hit.seq).collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{match_mode:?} {query:?}");
+            assert_eq!(
+                db.filtered_corpus_count(&filters).unwrap() as usize,
+                expected.len()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_recorded_user_input_remains_queryless_and_zero_width_searchable() {
+        use crate::config::Config;
+        use crate::message_search::{
+            MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+        };
+        use crate::service::MessageService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch(
+            "insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+             values ('claude:empty-input','claude','empty-input','','/empty-input','test','test');
+             insert into messages(session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin)
+             values ('claude:empty-input','claude',0,'user','conversation','','human','original',null),
+                    ('claude:empty-input','claude',1,'tool','tool_result','','unknown','original','interactive_answer'),
+                    ('claude:empty-input','claude',2,'user','conversation','','agent','original','direct_conversation'),
+                    ('claude:empty-input','claude',3,'user','conversation','','human','mirror',null),
+                    ('claude:empty-input','claude',4,'user','conversation','present','human','original',null);"
+        ).unwrap();
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+        for (query, expected) in [
+            (MessageQuery::All, vec![0, 1, 4]),
+            (MessageQuery::regex("^$").unwrap(), vec![0, 1]),
+            (MessageQuery::regex("^").unwrap(), vec![0, 1, 4]),
+        ] {
+            let response = service
+                .search(
+                    MessageSearchRequest::builder(query, MessageTarget::content())
+                        .role(crate::models::Role::User)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                response
+                    .hits()
+                    .iter()
+                    .map(|hit| hit.message.seq)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for hit in response
+                .hits()
+                .iter()
+                .filter(|hit| hit.message.content.is_empty())
+            {
+                if let Some(evidence) = hit.match_evidence() {
+                    assert_eq!(evidence.field_total_chars, 0);
+                    assert_eq!(evidence.field_start_char, 0);
+                    assert!(evidence.view_text.is_empty());
+                }
+            }
+        }
+        let filters = MessageFilters {
+            role: Some(crate::models::Role::User),
+            ..Default::default()
+        };
+        assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 3);
+        assert_eq!(
+            db.search_messages(
+                "^$",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Regex,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn human_content_selection_preserves_source_spans_and_filters_before_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch(
+            "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+             values ('claude:human-spans', 'claude', 'human-spans', '', '/human-spans', 'test', 'test');
+             insert into messages(id, session_id, provider, seq, role, kind, content, authorship, record_relation)
+             values (901, 'claude:human-spans', 'claude', 0, 'tool', 'tool_result', 'needle generated', 'generated', 'original'),
+                    (902, 'claude:human-spans', 'claude', 1, 'tool', 'tool_result', 'needle wrapper éneedle gap tail', 'mixed', 'original'),
+                    (903, 'claude:human-spans', 'claude', 2, 'user', 'conversation', 'needle', 'human', 'mirror');
+             insert into message_content_parts(message_id, ordinal, start_char, end_char, authorship, origin)
+             values (902, 0, 0, 15, 'generated', 'tool_payload'),
+                    (902, 1, 15, 22, 'human', 'direct_input'),
+                    (902, 2, 22, 27, 'generated', 'tool_payload'),
+                    (902, 3, 27, 31, 'human', 'direct_input');"
+        ).unwrap();
+        let filters = MessageFilters {
+            role: Some(crate::models::Role::User),
+            limit: 1,
+            ..Default::default()
+        };
+        let hits = db.search_messages("needle", &filters).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seq, 1);
+        assert!(db
+            .search_messages("needle gap tail", &filters)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .search_messages(
+                "needle",
+                &MessageFilters {
+                    role: Some(Role::Assistant),
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_messages(
+                "^éneedle$",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Regex,
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages(
+                "ndl",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Fuzzy,
+                    ..filters.clone()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(db.search_messages("", &filters).unwrap().len(), 1);
+        db.conn.execute_batch("insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin,input_delivery_state) values (904,'claude:human-spans','claude',3,'user','conversation','needle','human','original','queued','submitted')").unwrap();
+        let all_human = MessageFilters {
+            limit: 0,
+            ..filters.clone()
+        };
+        assert_eq!(db.search_messages("needle", &all_human).unwrap().len(), 2);
+        assert_eq!(
+            db.search_attributable_human_messages(
+                "needle",
+                &MessageFilters {
+                    role: None,
+                    ..all_human.clone()
+                }
+            )
+            .unwrap()
+            .len(),
+            1,
+            "unlinked queue copies are evidence but must not inflate recurrence counts"
+        );
+        db.conn
+            .execute_batch(
+                "alter table messages rename column input_delivery_state to legacy_delivery_state",
+            )
+            .unwrap();
+        let error = db
+            .search_messages("needle", &all_human)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("writable aise command") && error.contains("provenance storage"),
+            "{error}"
+        );
+        assert!(
+            !db.search_messages("needle", &MessageFilters::default())
+                .unwrap()
+                .is_empty(),
+            "complete-content search remains available on a readable legacy layout"
+        );
+    }
+
+    #[test]
     fn search_messages_uses_exact_literal_substring_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -8793,7 +10251,7 @@ mod tests {
             ),
             vec![0, 1, 2, 3]
         );
-        // Role filter composes with the newest-N window.
+        // User-input selection includes the user-entered slash command in the newest window.
         assert_eq!(
             seqs(
                 db.read_session_messages(
@@ -8805,7 +10263,7 @@ mod tests {
                 )
                 .unwrap()
             ),
-            vec![2]
+            vec![3]
         );
         // Inclusive seq range is the non-overlapping chunked-read primitive.
         assert_eq!(
@@ -10047,8 +11505,7 @@ mod tests {
             )
             .unwrap();
         let corpus = 4_usize;
-        // `seq` is a SQLite integer column: bind the width SQLite stores, which rusqlite 0.40
-        // no longer infers from usize.
+        // Bind SQLite's signed integer width rather than a platform-sized usize.
         for seq in 0..corpus as i64 {
             db.conn
                 .execute(
@@ -11005,6 +12462,80 @@ mod tests {
     }
 
     #[test]
+    fn migrated_archive_only_user_rows_remain_searchable_from_legacy_message_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                "create table messages (
+                id integer primary key, session_id text not null, provider text not null,
+                seq integer not null, role text not null, ts text, tool_name text,
+                kind text not null default 'unknown', tool_call_id text,
+                is_compaction integer not null default 0, content text not null,
+                authorship text not null default 'unknown',
+                correlation_authority text, correlation_scope text, correlation_id text,
+                record_relation text not null default 'unknown'
+                    check (record_relation in ('original', 'mirror', 'unknown')),
+                check ((correlation_authority is null and correlation_scope is null and correlation_id is null)
+                    or (correlation_authority is not null and correlation_scope is not null and correlation_id is not null)));
+                insert into messages(session_id,provider,seq,role,content,record_relation)
+                values ('antigravity:archive','antigravity',0,'user','archived correction','original');
+                insert into messages(session_id,provider,seq,role,content,authorship,record_relation)
+                values ('antigravity:archive','antigravity',2,'user','delegated correction','agent','original'),
+                       ('antigravity:archive','antigravity',3,'user','mirrored correction','unknown','mirror');
+                pragma user_version=5;",
+                )
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.conn.execute_batch("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+            values ('antigravity:archive','antigravity','archive','','/missing/archive','antigravity-v3','test');
+            insert into messages(session_id,provider,seq,role,content,authorship,record_relation,input_origin)
+            values ('antigravity:archive','antigravity',1,'user','ambiguous native correction','unknown','original',null);").unwrap();
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            session_id: Some("antigravity:archive".into()),
+            ..Default::default()
+        };
+        for match_mode in [
+            MessageSearchMode::Literal,
+            MessageSearchMode::Regex,
+            MessageSearchMode::Fuzzy,
+        ] {
+            let hits = db
+                .search_messages(
+                    "correction",
+                    &MessageFilters {
+                        match_mode,
+                        limit: 10,
+                        ..filters.clone()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+                vec![0],
+                "{match_mode:?}"
+            );
+        }
+        assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 1);
+        assert_eq!(
+            db.read_session_messages(&filters, MessageOrder::OldestFirst)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages("correction", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
     fn open_adds_typed_message_columns_to_version_one_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
@@ -11048,7 +12579,20 @@ mod tests {
             .any(|column| column == "correlation_authority"));
         assert!(columns.iter().any(|column| column == "correlation_scope"));
         assert!(columns.iter().any(|column| column == "correlation_id"));
+        assert!(columns
+            .iter()
+            .any(|column| column == "input_delivery_state"));
+        assert!(columns.iter().any(|column| column == "input_origin"));
         assert!(columns.iter().any(|column| column == "record_relation"));
+        let legacy_input: (String, String) = db
+            .conn
+            .query_row(
+                "select input_delivery_state, input_origin from messages limit 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_input, ("unknown".to_string(), "unknown".to_string()));
         let legacy_authorship: String = db
             .conn
             .query_row("select authorship from messages limit 1", [], |row| {
@@ -11072,11 +12616,193 @@ mod tests {
     }
 
     #[test]
+    fn input_layout_guard_preserves_base_storage_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:missing-parts", &["stored needle"]),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .execute_batch("drop table message_content_parts")
+            .unwrap();
+        let error = db
+            .search_messages(
+                "needle",
+                &MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("user-input search requires current provenance storage"),
+            "{error}"
+        );
+        assert_eq!(
+            db.search_messages("needle", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn partial_input_storage_keeps_known_queues_out_of_read_only_analytics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:partial", &["direct needle", "queued needle"]),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "update messages set authorship='human', record_relation='original';
+            update messages set input_origin='queued' where seq=1;
+            alter table messages drop column input_delivery_state;",
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open_existing_read_only_with_threads(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let hits = db
+            .search_attributable_human_messages("needle", &MessageFilters::default())
+            .unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            db.search_messages("needle", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fresh_messages_default_omitted_input_provenance_to_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions
+                 (id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+                 values ('claude:fresh', 'claude', 'fresh', '', '/missing', 'test', 'test')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "insert into messages (session_id, provider, seq, role, content)
+                 values ('claude:fresh', 'claude', 0, 'user', 'old-writer row')",
+                [],
+            )
+            .unwrap();
+        let values: (String, String) = db
+            .conn
+            .query_row(
+                "select input_delivery_state, input_origin from messages where session_id = 'claude:fresh'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(values, ("unknown".into(), "unknown".into()));
+    }
+
+    #[test]
+    fn input_provenance_upgrade_retries_after_a_competing_writer_releases_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Db::open(&path).unwrap());
+        let owner = Connection::open(&path).unwrap();
+        owner
+            .execute_batch(
+                "drop index idx_messages_session_authorship_relation_seq;
+            drop index idx_messages_authorship_relation_ts;
+            alter table messages drop column input_origin;
+            alter table messages drop column input_delivery_state;",
+            )
+            .unwrap();
+        let contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let lock = owner.unchecked_transaction().unwrap();
+        lock.execute_batch("update sessions set title=title")
+            .unwrap();
+        let error = ensure_message_input_provenance_storage(&contender).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code),
+            Some(ErrorCode::DatabaseBusy)
+        );
+        assert!(!contender.query_row("select exists(select 1 from pragma_table_info('messages') where name='input_origin')", [], |row| row.get::<_, bool>(0)).unwrap());
+        drop(lock);
+        ensure_message_input_provenance_storage(&contender).unwrap();
+        assert!(
+            crate::indexer::message_input_provenance_layout_problem(&contender)
+                .unwrap()
+                .is_none()
+        );
+        ensure_message_input_provenance_storage(&owner).unwrap();
+    }
+
+    #[test]
+    fn input_provenance_upgrade_rolls_back_columns_when_index_ddl_fails() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "create table messages (
+                    id integer primary key,
+                    session_id text not null,
+                    record_relation text not null,
+                    content text not null
+                );",
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "create virtual table messages_fts using fts5(content);
+                 insert into messages(id, session_id, record_relation, content)
+                 values (1, 'session', 'original', 'preserved row');
+                 insert into messages_fts(rowid, content) values (1, 'preserved row');",
+            )
+            .unwrap();
+        assert!(ensure_message_input_provenance_storage(&connection).is_err());
+        let columns = connection
+            .prepare("pragma table_info(messages)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|name| name == "input_delivery_state"));
+        assert!(!columns.iter().any(|name| name == "input_origin"));
+        let message: String = connection
+            .query_row("select content from messages where id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(message, "preserved row");
+        let fts_rows: i64 = connection
+            .query_row("select count(*) from messages_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 1);
+    }
+
+    #[test]
     fn message_provenance_round_trips_without_copying_part_text() {
         use crate::models::{
             ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageContentPart,
-            MessageCorrelationAuthority, MessageCorrelationIdentity, MessageProvenance,
-            MessageRecordRelation,
+            MessageCorrelationAuthority, MessageCorrelationIdentity, MessageInputOrigin,
+            MessageProvenance, MessageRecordRelation,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -11105,6 +12831,7 @@ mod tests {
                     scope: "conversation_event".to_string(),
                     id: "event-7".to_string(),
                 }),
+                input_origin: Some(MessageInputOrigin::InteractiveAnswer),
                 content_parts: vec![
                     MessageContentPart {
                         ordinal: 0,
@@ -11121,15 +12848,16 @@ mod tests {
                         origin: ContentPartOrigin::QuotedContent,
                     },
                 ],
+                ..Default::default()
             },
         }];
 
         db.upsert_session(&parsed, 0, 0).unwrap();
-        let stored: (String, String, String, String, String) = db
+        let stored: (String, String, String, String, String, String) = db
             .conn
             .query_row(
                 "select authorship, correlation_authority, correlation_scope,
-                        correlation_id, record_relation
+                        correlation_id, input_origin, record_relation
                  from messages where session_id = ?1 and seq = 0",
                 [&parsed.session.id],
                 |row| {
@@ -11139,6 +12867,7 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -11150,6 +12879,7 @@ mod tests {
                 "google".to_string(),
                 "conversation_event".to_string(),
                 "event-7".to_string(),
+                "interactive_answer".to_string(),
                 "mirror".to_string(),
             )
         );
@@ -11328,9 +13058,10 @@ mod tests {
             assert!(!plan.contains("SCAN messages"), "{plan}");
         }
 
+        let nonqueued = db.nonqueued_input_predicate().unwrap();
         for sql in [
-            ANALYSIS_MESSAGE_COUNTS_SQL,
-            ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL,
+            analysis_message_counts_sql(nonqueued),
+            analysis_attributable_human_messages_sql(nonqueued),
         ] {
             let plan = db
                 .conn
@@ -11356,8 +13087,10 @@ mod tests {
     fn correction_candidate_and_part_queries_use_provenance_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        let candidates =
-            format!("explain query plan {CORRECTION_CANDIDATES_SQL}{CORRECTION_ORDER_SQL}");
+        let nonqueued = db.nonqueued_input_predicate().unwrap();
+        let candidates = format!(
+            "explain query plan {CORRECTION_CANDIDATES_PREFIX}{nonqueued}{CORRECTION_CANDIDATES_SUFFIX}{CORRECTION_ORDER_SQL}"
+        );
         let candidate_plan = db
             .conn
             .prepare(&candidates)
@@ -11374,7 +13107,7 @@ mod tests {
         assert!(!candidate_plan.contains("SCAN m"), "{candidate_plan}");
 
         let parts = format!(
-            "explain query plan {CORRECTION_HUMAN_PARTS_SQL}
+            "explain query plan {CORRECTION_HUMAN_PARTS_PREFIX}{nonqueued}{CORRECTION_HUMAN_PARTS_SUFFIX}
              order by m.id, p.ordinal"
         );
         let parts_plan = db
@@ -12746,15 +14479,15 @@ mod tests {
     #[test]
     fn query_timeout_interrupts_expensive_work_and_resets_the_handler() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
 
         let error = with_sqlite_query_timeout(
-            &db.conn,
+            &mut db.conn,
             std::num::NonZeroU64::new(1),
             "read-only SQL query",
             "increase timeout_ms or pass 0 for no timeout",
-            || {
-                db.conn
+            |conn| {
+                conn
                     .query_row(
                         "with recursive n(x) as (values(0) union all select x + 1 from n where x < 100000000) select sum(x) from n",
                         [],
@@ -12779,7 +14512,7 @@ mod tests {
     #[test]
     fn persistent_interrupt_cancels_a_statement_started_after_the_flag_is_set() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
         db.interrupt_while(Arc::clone(&cancellation))
             .expect("arming cancellation is a precondition of this test");
@@ -12810,7 +14543,7 @@ mod tests {
     #[test]
     fn query_cancellation_registered_after_cancel_still_interrupts_the_next_statement() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
         let cancellation = QueryCancellation::new();
 
         cancellation.cancel();
@@ -12864,16 +14597,15 @@ mod tests {
     #[test]
     fn query_timeout_never_panics_when_deadline_exceeds_platform_instant_range() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
 
         let result = with_sqlite_query_timeout(
-            &db.conn,
+            &mut db.conn,
             std::num::NonZeroU64::new(u64::MAX),
             "read-only SQL query",
             "increase timeout_ms or pass 0 for no timeout",
-            || {
-                db.conn
-                    .query_row("select 1", [], |row| row.get::<_, i64>(0))
+            |conn| {
+                conn.query_row("select 1", [], |row| row.get::<_, i64>(0))
                     .map_err(Into::into)
             },
         );
@@ -13006,10 +14738,11 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.mark_schema_current().unwrap();
         db.conn
-            .execute_batch(
+            .execute(
                 "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, parse_warning, discovery_source) values
-                 ('claude:current','claude','current','','/a','claude-v4',null,'jsonl'),
+                 ('claude:current','claude','current','','/a',?1,null,'jsonl'),
                  ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl');",
+                [crate::util::provider_parse_version(Provider::Claude)],
             )
             .unwrap();
         db.conn
@@ -13031,7 +14764,10 @@ mod tests {
             .iter()
             .find(|item| item.provider == Provider::Claude)
             .unwrap();
-        assert_eq!(claude.expected_parse_version, "claude-v4");
+        assert_eq!(
+            claude.expected_parse_version,
+            crate::util::provider_parse_version(Provider::Claude)
+        );
         assert_eq!((claude.current_sessions, claude.stale_sessions), (1, 1));
         assert_eq!(
             db.stale_session_sources().unwrap(),
@@ -13040,7 +14776,146 @@ mod tests {
     }
 
     #[test]
-    fn complete_parse_replaces_superseded_identity_for_the_same_source() {
+    fn unique_legacy_tool_result_upgrade_keeps_row_identity_and_rolls_back() {
+        use crate::models::{ContentPartAuthorship, ContentPartOrigin, MessageContentPart};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut old = crate::util::minimal_record(
+            Provider::Codex,
+            Path::new("/fixture/answer.jsonl"),
+            String::new(),
+        );
+        old.session.parse_version = "codex-v5".into();
+        old.messages = crate::util::to_messages_with_tools(vec![
+            crate::util::RawMessage::tool_result_with_name(
+                Some("request_user_input".into()),
+                "raw output".into(),
+                Some("call-1"),
+                None,
+            ),
+        ]);
+        db.upsert_session(&old, 1, 1).unwrap();
+        let row_id: i64 = db
+            .conn
+            .query_row("select id from messages", [], |row| row.get(0))
+            .unwrap();
+        let mut current = old.clone();
+        current.session.parse_version = crate::util::provider_parse_version(Provider::Codex).into();
+        current.messages[0].content = "raw output\nanswer α".into();
+        current.messages[0].provenance.authorship = crate::models::MessageAuthorship::Mixed;
+        current.messages[0].provenance.content_parts = vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 11,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::ToolPayload,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 11,
+                end_char: 19,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+        ];
+        db.conn.execute_batch("create trigger fail_answer_upgrade before update on messages begin select raise(abort, 'fixture upgrade failure'); end;").unwrap();
+        assert!(db.upsert_session(&current, 2, 2).is_err());
+        assert_eq!(db.message_count().unwrap(), 1);
+        let version: String = db
+            .conn
+            .query_row("select parse_version from sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, "codex-v5");
+        db.conn
+            .execute_batch("drop trigger fail_answer_upgrade;")
+            .unwrap();
+        for stamp in [2, 3] {
+            db.upsert_session(&current, stamp, stamp).unwrap();
+            assert_eq!(db.message_count().unwrap(), 1);
+            assert_eq!(
+                db.conn
+                    .query_row("select id from messages", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                row_id
+            );
+        }
+        assert_eq!(
+            db.search_messages(
+                "answer α",
+                &MessageFilters {
+                    role: Some(crate::models::Role::User),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_tool_result_upgrade_preserves_ambiguous_and_conflicting_events() {
+        for case in [
+            "stored duplicate",
+            "parsed duplicate",
+            "native conflict",
+            "missing relation",
+            "tool call",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
+            let mut old = crate::util::minimal_record(
+                Provider::Codex,
+                Path::new("/fixture/legacy-result.jsonl"),
+                String::new(),
+            );
+            old.session.parse_version = "codex-v5".into();
+            old.messages = crate::util::to_messages_with_tools(vec![
+                crate::util::RawMessage::tool_result_with_name(
+                    Some("request_user_input".into()),
+                    "old output".into(),
+                    Some("call-1"),
+                    None,
+                ),
+            ]);
+            let mut current = old.clone();
+            current.session.parse_version =
+                crate::util::provider_parse_version(Provider::Codex).into();
+            current.messages[0].content = "old output\nnew answer".into();
+            match case {
+                "stored duplicate" => old.messages.push(old.messages[0].clone()),
+                "parsed duplicate" => current.messages.push(current.messages[0].clone()),
+                "native conflict" => {
+                    old.messages[0].provenance.correlation_identity =
+                        Some(crate::models::MessageCorrelationIdentity {
+                            authority: crate::models::MessageCorrelationAuthority::OpenAi,
+                            scope: "codex:fixture".into(),
+                            id: "old-event".into(),
+                        });
+                    current.messages[0].provenance.correlation_identity =
+                        Some(crate::models::MessageCorrelationIdentity {
+                            authority: crate::models::MessageCorrelationAuthority::OpenAi,
+                            scope: "codex:fixture".into(),
+                            id: "new-event".into(),
+                        });
+                }
+                "missing relation" => current.messages[0].tool_call_id = None,
+                "tool call" => old.messages[0].kind = crate::models::MessageKind::ToolCall,
+                _ => unreachable!(),
+            }
+            db.upsert_session(&old, 1, 1).unwrap();
+            db.upsert_session(&current, 2, 2).unwrap();
+            assert_eq!(
+                db.message_count().unwrap(),
+                i64::try_from(old.messages.len() + current.messages.len()).unwrap(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_parse_moves_superseded_identity_and_retains_archive_rows() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         let source = std::path::Path::new("/fixture/changing-identity.jsonl");
@@ -13085,10 +14960,19 @@ mod tests {
                 .source_path,
             source.to_string_lossy()
         );
-        assert!(db
-            .search_messages("obsolete", &MessageFilters::default())
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            db.search_messages("obsolete", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1,
+            "superseded source rows remain in the archive"
+        );
+        assert_eq!(
+            db.search_messages("replacement", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(db
             .is_file_current(
                 Provider::ClaudeDesktop,
@@ -13166,7 +15050,7 @@ mod tests {
         assert!(db.resolve_session_record("claude:old-alias").is_err());
         assert_eq!(db.indexed_source_identities().unwrap().len(), 1);
         assert_eq!(
-            db.indexed_source_identities().unwrap()[0].1,
+            db.indexed_source_identities().unwrap()[0].source_path,
             canonical.to_string_lossy()
         );
     }
@@ -14351,7 +16235,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_freelist_compaction_preserves_rows_fts_and_search_results() {
+    fn parser_upgrade_preserves_archive_rows_fts_and_search_results() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         let large_suffix = " allocation-padding".repeat(32_768);
@@ -14373,17 +16257,15 @@ mod tests {
             let mut parsed = parsed_with_messages(&id, &[&content]);
             parsed.session.provider_session_id = format!("allocation-{index}");
             parsed.session.source_path = format!("/allocation/{index}.jsonl");
-            // A new parser version: replacing rows a re-parse by the same parser no longer holds
-            // would delete archived history, so only a parser upgrade replaces them.
+            // A parser upgrade repairs or appends source rows while retaining the prior source
+            // generation as archive history.
             parsed.session.parse_version = "allocation-parser-v2".into();
             db.replace_session(&parsed, 10 + index, 10 + index).unwrap();
         }
         db.optimize_fts().unwrap();
 
-        let before = db.storage_allocation().unwrap();
-        assert!(before.reclaimable_bytes > 0);
-        assert_eq!(db.message_count().unwrap(), 6);
-        assert_eq!(db.messages_fts_count().unwrap(), 6);
+        assert_eq!(db.message_count().unwrap(), 9);
+        assert_eq!(db.messages_fts_count().unwrap(), 9);
         for index in 0..3 {
             assert_eq!(
                 db.search_messages(
@@ -14394,20 +16276,9 @@ mod tests {
                 .len(),
                 1
             );
-        }
-
-        db.vacuum().unwrap();
-        db.checkpoint_truncate().unwrap();
-
-        let after = db.storage_allocation().unwrap();
-        assert_eq!(after.reclaimable_bytes, 0);
-        assert!(after.total_bytes < before.total_bytes);
-        assert_eq!(db.message_count().unwrap(), 6);
-        assert_eq!(db.messages_fts_count().unwrap(), 6);
-        for index in 0..3 {
             assert_eq!(
                 db.search_messages(
-                    &format!("replacement-token-{index}"),
+                    &format!("original-token-{index}"),
                     &MessageFilters::default(),
                 )
                 .unwrap()
@@ -16242,6 +18113,125 @@ mod tests {
     }
 
     #[test]
+    fn gemini_family_map_keeps_three_way_path_conflicts_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for index in 0..3 {
+            let mut parsed = parsed_with_messages(&format!("gemini-cli:family-{index}"), &[]);
+            parsed.session.provider = Provider::GeminiCli;
+            parsed.session.source_path = format!("/fixture/{index}.jsonl");
+            parsed.session.raw_metadata_json = Some(
+                serde_json::json!({
+                    "gemini_migration_family": {
+                        "native_session_id":format!("native-{index}"),
+                    "predecessor_json":"/fixture/shared.json",
+                        "successor_jsonl":parsed.session.source_path
+                    }
+                })
+                .to_string(),
+            );
+            db.upsert_session(&parsed, 0, 0).unwrap();
+        }
+        let families = db.gemini_family_sessions_by_path().unwrap();
+        assert!(
+            !families.contains_key("/fixture/shared.json"),
+            "a third claimant cannot restore an ambiguous mapping"
+        );
+        assert_eq!(families.len(), 3);
+    }
+
+    #[test]
+    fn legacy_queue_repair_respects_alias_versions_and_rolls_back() {
+        use crate::models::{
+            InputDeliveryState, MessageAuthorship, MessageInputOrigin, MessageKind,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut legacy = parsed_with_messages(
+            "claude:legacy",
+            &["legacy queue", "direct input", "interactive input"],
+        );
+        legacy.session.source_path = "/old".into();
+        legacy.session.parse_version = "claude-v5".into();
+        for message in &mut legacy.messages {
+            message.provenance.authorship = MessageAuthorship::Human;
+        }
+        legacy.messages[0].provenance.authorship = MessageAuthorship::Agent;
+        legacy.messages[0].provenance.input_origin = Some(MessageInputOrigin::Queued);
+        legacy.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Submitted);
+        legacy.messages[2].role = Role::Tool;
+        legacy.messages[2].kind = MessageKind::ToolResult;
+        legacy.messages[2].provenance.input_origin = Some(MessageInputOrigin::InteractiveAnswer);
+        db.upsert_session(&legacy, 1, 1).unwrap();
+
+        let mut current = parsed_with_messages("claude:current", &["verified queue"]);
+        current.session.source_path = "/new".into();
+        current.session.parse_version =
+            crate::util::provider_parse_version(Provider::Claude).into();
+        current.messages[0].provenance = legacy.messages[0].provenance.clone();
+        current.messages[0].provenance.authorship = MessageAuthorship::Human;
+        db.upsert_session(&current, 1, 1).unwrap();
+        // Stored session versions remain authoritative when source stamps are unavailable.
+        db.conn.execute("delete from files_seen", []).unwrap();
+        db.conn
+            .execute_batch(
+                "create trigger fail_queue_upgrade before update on sessions
+            when new.id='claude:current' begin select raise(abort, 'late fixture failure'); end;",
+            )
+            .unwrap();
+        let aliases = [legacy.session.source_path.clone()];
+        assert!(db
+            .upsert_session_reconciling_sources(&current, 2, 2, &aliases, false)
+            .is_err());
+        let prior_author: String = db
+            .conn
+            .query_row(
+                "select authorship from messages where content='legacy queue'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prior_author, "agent");
+        assert!(db.resolve_session_record("claude:legacy").is_ok());
+        db.conn
+            .execute_batch("drop trigger fail_queue_upgrade")
+            .unwrap();
+
+        db.upsert_session_reconciling_sources(&current, 2, 2, &aliases, false)
+            .unwrap();
+        let rows: Vec<(String, String)> = db
+            .conn
+            .prepare("select content, authorship from messages order by content")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("direct input".into(), "human".into()),
+                ("interactive input".into(), "human".into()),
+                ("legacy queue".into(), "unknown".into()),
+                ("verified queue".into(), "human".into()),
+            ]
+        );
+        db.conn.execute_batch("create table queue_repairs(n integer); insert into queue_repairs values(0);
+            create trigger count_queue_repairs after update on messages begin update queue_repairs set n=n+1; end;").unwrap();
+        db.upsert_session_reconciling_sources(&current, 3, 3, &aliases, false)
+            .unwrap();
+        let updates: i64 = db
+            .conn
+            .query_row("select n from queue_repairs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            updates, 0,
+            "a repeated repair must not rewrite retained message rows"
+        );
+    }
+
+    #[test]
     fn upsert_appends_only_new_messages_when_session_grows() {
         // Root-cause reindex perf: an append-only session that GREW must NOT delete + re-insert
         // (and re-trigram-index) its unchanged prefix — that re-indexed entire multi-hundred-MB
@@ -16349,16 +18339,164 @@ mod tests {
     }
 
     #[test]
-    fn a_new_parser_version_rewrites_matching_prefix_metadata() {
+    fn unchanged_archive_refresh_does_not_rewrite_shifted_source_sequences() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-
-        db.replace_session(
-            &parsed_with_messages("claude:s1", &["alpha", "bravo"]),
+        db.upsert_session(
+            &parsed_with_messages("claude:archive-noop", &["archived", "retained"]),
             1,
             100,
         )
         .unwrap();
+        let mut shortened = parsed_with_messages("claude:archive-noop", &["retained"]);
+        db.upsert_session(&shortened, 2, 90).unwrap();
+        db.conn
+            .execute_batch(
+                "create temp table message_updates(id integer);
+                 create temp trigger count_updates after update on messages begin
+                     insert into message_updates values (new.id); end;",
+            )
+            .unwrap();
+        let update_count = || {
+            db.conn
+                .query_row("select count(*) from temp.message_updates", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+
+        db.upsert_session(&shortened, 3, 90).unwrap();
+        assert_eq!(update_count(), 0, "the retained row's archive seq stays 1");
+
+        shortened.messages[0].provenance.authorship = crate::models::MessageAuthorship::Human;
+        db.upsert_session(&shortened, 4, 90).unwrap();
+        assert_eq!(update_count(), 1, "actual attribution changes still repair");
+        db.upsert_session(&shortened, 5, 90).unwrap();
+        assert_eq!(update_count(), 1, "the repaired row is unchanged afterward");
+        assert_eq!(
+            db.message_count().unwrap(),
+            2,
+            "archive-only input survives"
+        );
+    }
+
+    #[test]
+    fn complete_source_sequence_changes_are_not_an_unchanged_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = parsed_with_messages("claude:new-sequences", &["first", "second"]);
+        db.upsert_session(&parsed, 1, 100).unwrap();
+        parsed.messages[0].seq = 17;
+        parsed.messages[1].seq = 300;
+        db.upsert_session(&parsed, 2, 100).unwrap();
+        let rows: Vec<(i64, String)> = db
+            .conn
+            .prepare("select seq, content from messages order by seq")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, [(17, "first".into()), (300, "second".into())]);
+    }
+
+    #[test]
+    fn a_parser_upgrade_repairs_only_changed_content_parts_in_place() {
+        assert_content_part_repair(true, true);
+    }
+
+    #[test]
+    fn a_same_parser_refresh_repairs_only_changed_content_parts() {
+        assert_content_part_repair(false, false);
+    }
+
+    #[test]
+    fn a_same_parser_refresh_repairs_content_parts_beside_archived_rows() {
+        assert_content_part_repair(false, true);
+    }
+
+    fn assert_content_part_repair(parser_upgrade: bool, retain_archive: bool) {
+        use crate::models::{
+            ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageContentPart,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = parsed_with_messages("claude:parts-upgrade", &["ab"]);
+        parsed.messages[0].provenance.authorship = MessageAuthorship::Mixed;
+        parsed.messages[0].provenance.content_parts = vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 1,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 1,
+                end_char: 2,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::QuotedContent,
+            },
+        ];
+        let mut initial = parsed.clone();
+        if retain_archive {
+            initial.messages.push(archive_message(
+                1,
+                "archive-only",
+                crate::models::MessageKind::Conversation,
+            ));
+        }
+        db.upsert_session(&initial, 1, 1).unwrap();
+        let message_id: i64 = db
+            .conn
+            .query_row("select id from messages where seq = 0", [], |r| r.get(0))
+            .unwrap();
+
+        if parser_upgrade {
+            parsed.session.parse_version = "parts-v2".into();
+        }
+        parsed.messages[0].provenance.content_parts[0].authorship =
+            ContentPartAuthorship::Generated;
+        parsed.messages[0].provenance.content_parts[0].origin = ContentPartOrigin::QuotedContent;
+        parsed.messages[0].provenance.content_parts[1].authorship = ContentPartAuthorship::Human;
+        parsed.messages[0].provenance.content_parts[1].origin = ContentPartOrigin::DirectInput;
+        db.upsert_session(&parsed, 2, 2).unwrap();
+        db.upsert_session(&parsed, 3, 3).unwrap();
+        let parts: Vec<(i64, String)> = db
+            .conn
+            .prepare("select message_id, authorship from message_content_parts order by ordinal")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            parts,
+            [
+                (message_id, "generated".into()),
+                (message_id, "human".into())
+            ]
+        );
+        assert_eq!(
+            db.message_count().unwrap(),
+            if retain_archive { 2 } else { 1 }
+        );
+    }
+
+    #[test]
+    fn a_new_parser_version_rewrites_matching_prefix_metadata() {
+        use crate::models::{MessageCorrelationAuthority, MessageCorrelationIdentity};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+
+        let mut initial = parsed_with_messages("claude:s1", &["alpha", "bravo"]);
+        initial.messages[0].provenance.correlation_identity = Some(MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::OpenAi,
+            scope: "test".into(),
+            id: "message-0".into(),
+        });
+        db.replace_session(&initial, 1, 100).unwrap();
         db.conn
             .execute(
                 "update messages set role='tool', tool_name='STALE' where session_id='claude:s1' and seq=0",
@@ -16366,9 +18504,14 @@ mod tests {
             )
             .unwrap();
 
-        // Parser fixes bump the parse version, and a new version replaces the rows. Under the
-        // same version a differing role cannot be told from a replaced message, so it is kept.
+        // Parser fixes bump the parse version. The native identity repairs the matching row in
+        // place, while the new source-only row is appended after the archived sequence range.
         let mut fixed = parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]);
+        fixed.messages[0].provenance.correlation_identity = Some(MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::OpenAi,
+            scope: "test".into(),
+            id: "message-0".into(),
+        });
         fixed.session.parse_version = "v2".into();
         db.replace_session(&fixed, 2, 150).unwrap();
         let row: (String, Option<String>) = db
@@ -16620,6 +18763,35 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap()
+    }
+
+    #[test]
+    fn initial_parse_preserves_sparse_and_tied_source_message_sequences() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(17, "first", Conversation),
+                    archive_message(17, "tied", Conversation),
+                    archive_message(300, "tail", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(17, "user", "first"),
+                row(17, "user", "tied"),
+                row(300, "user", "tail"),
+            ]
+        );
     }
 
     #[test]
@@ -16898,6 +19070,115 @@ mod tests {
     }
 
     #[test]
+    fn a_same_parser_rewrite_keeps_independent_identified_messages_with_equal_text() {
+        use crate::models::{MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind};
+        let message = |seq, id: &str| {
+            let mut message =
+                archive_message(seq, "same submitted input", MessageKind::Conversation);
+            message.provenance.correlation_identity = Some(MessageCorrelationIdentity {
+                authority: MessageCorrelationAuthority::Anthropic,
+                scope: "rewrite-inputs".into(),
+                id: id.into(),
+            });
+            message
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(vec![message(0, "a"), message(1, "b")], Vec::new()),
+            1,
+            1,
+        )
+        .unwrap();
+        let rewritten = archive_session(vec![message(0, "b"), message(1, "c")], Vec::new());
+        for generation in [2, 3] {
+            db.upsert_session(&rewritten, generation, generation)
+                .unwrap();
+            let ids: Vec<String> = db
+                .conn
+                .prepare("select correlation_id from messages order by seq, id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                ids,
+                ["a", "b", "c"],
+                "text equality cannot replace source event identity"
+            );
+        }
+    }
+
+    #[test]
+    fn source_alias_reconciliation_preserves_same_text_messages_with_distinct_identities() {
+        use crate::models::{
+            MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind::Conversation,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let identity = |id: &str| MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::SourceLocal,
+            scope: "alias-reconciliation".into(),
+            id: id.into(),
+        };
+
+        let mut retired = archive_session(
+            vec![archive_message(0, "same input", Conversation)],
+            Vec::new(),
+        );
+        retired.session.id = "codex:archive-old".into();
+        retired.session.source_path = "/x/archive-old.jsonl".into();
+        retired.messages[0].provenance.correlation_identity = Some(identity("retired"));
+        db.upsert_session(&retired, 1, 1).unwrap();
+
+        let mut occupied = archive_session(
+            vec![archive_message(0, "same input", Conversation)],
+            Vec::new(),
+        );
+        occupied.session.id = "codex:archive-target".into();
+        occupied.session.source_path = "/x/archive-target.jsonl".into();
+        occupied.messages[0].provenance.correlation_identity = Some(identity("target"));
+        db.upsert_session(&occupied, 1, 1).unwrap();
+
+        let mut current = archive_session(
+            vec![archive_message(0, "summary", Conversation)],
+            Vec::new(),
+        );
+        current.session.id = "codex:archive-target".into();
+        current.session.source_path = "/x/archive-current.jsonl".into();
+        db.upsert_session_reconciling_sources(
+            &current,
+            2,
+            2,
+            &["/x/archive-old.jsonl".into()],
+            false,
+        )
+        .unwrap();
+
+        let rows: Vec<(i64, String, Option<String>)> = db
+            .conn
+            .prepare(
+                "select seq, content, correlation_id from messages
+                 where session_id = 'codex:archive-target' order by seq, id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, "same input".into(), Some("target".into())),
+                (1, "same input".into(), Some("retired".into())),
+                (2, "summary".into(), None),
+            ],
+            "same-text events with distinct source-local identities are independent archive rows"
+        );
+    }
+
+    #[test]
     fn renaming_with_several_retired_ids_keeps_every_retired_row() {
         use crate::models::MessageKind::Conversation;
         let dir = tempfile::tempdir().unwrap();
@@ -17006,7 +19287,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_parser_version_replaces_rows_even_when_the_append_boundary_matches() {
+    fn a_new_parser_version_keeps_archive_only_rows_and_appends_new_source_rows() {
         use crate::models::MessageKind::Conversation;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -17035,11 +19316,219 @@ mod tests {
         assert_eq!(
             session_rows(&db, "codex:archive"),
             [
-                row(0, "user", "x"),
+                row(0, "user", "a"),
                 row(1, "user", "b"),
-                row(2, "user", "c")
+                row(2, "user", "x"),
+                row(3, "user", "c")
             ]
         );
+    }
+
+    #[test]
+    fn a_new_parser_version_keeps_archive_only_messages_and_file_edits() {
+        use crate::models::MessageKind::Conversation;
+        let edit = |seq: i64, content: &str| FileEdit {
+            seq,
+            ts: None,
+            tool: "Write".into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: Some(content.into()),
+            edits: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "a", Conversation),
+                    archive_message(1, "b", Conversation),
+                ],
+                vec![edit(0, "v1"), edit(1, "v2")],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut upgraded = archive_session(
+            vec![archive_message(0, "summary", Conversation)],
+            vec![edit(0, "v3")],
+        );
+        upgraded.session.parse_version = "v2".into();
+        db.upsert_session(&upgraded, 2, 2).unwrap();
+
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "a"),
+                row(1, "user", "b"),
+                row(2, "user", "summary")
+            ]
+        );
+        let versions: Vec<String> = db
+            .file_edits_for("f.rs", None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, edit)| edit.new_content.unwrap())
+            .collect();
+        assert_eq!(versions, ["v1", "v2", "v3"]);
+    }
+
+    #[test]
+    fn a_same_parser_refresh_updates_delivery_metadata_and_keeps_archive_rows() {
+        use crate::models::{
+            InputDeliveryState, MessageAuthorship, MessageCorrelationAuthority,
+            MessageCorrelationIdentity, MessageKind,
+        };
+        let identity = || MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::Anthropic,
+            scope: "queue-test".into(),
+            id: "enqueue-1".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut initial = archive_session(
+            vec![
+                archive_message(0, "queued correction", MessageKind::Conversation),
+                archive_message(1, "archived source text", MessageKind::Conversation),
+            ],
+            Vec::new(),
+        );
+        initial.messages[0].provenance.authorship = MessageAuthorship::Human;
+        initial.messages[0].provenance.correlation_identity = Some(identity());
+        initial.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Unknown);
+        db.upsert_session(&initial, 1, 1).unwrap();
+        let original_id: i64 = db
+            .conn
+            .query_row(
+                "select id from messages where session_id = 'codex:archive' and seq = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let mut refreshed = archive_session(
+            vec![archive_message(
+                0,
+                "queued correction",
+                MessageKind::Conversation,
+            )],
+            Vec::new(),
+        );
+        refreshed.messages[0].provenance.authorship = MessageAuthorship::Human;
+        refreshed.messages[0].provenance.correlation_identity = Some(identity());
+        refreshed.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Submitted);
+        db.upsert_session(&refreshed, 2, 2).unwrap();
+
+        let stored_state: (i64, String, i64) = db
+            .conn
+            .query_row(
+                "select id, input_delivery_state, (select count(*) from messages where session_id = 'codex:archive')
+                 from messages where session_id = 'codex:archive' and seq = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_state, (original_id, "submitted".into(), 2));
+        assert_eq!(
+            session_rows(&db, "codex:archive")[1],
+            row(1, "user", "archived source text")
+        );
+
+        // Repeating the same parse must not append another queue event or rewrite the row again.
+        db.upsert_session(&refreshed, 3, 3).unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages where session_id = 'codex:archive'",
+                [],
+                |value| value.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn a_parser_upgrade_preserves_duplicate_legacy_messages_by_multiplicity() {
+        use crate::models::MessageKind::Conversation;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                vec![
+                    archive_message(0, "same instruction", Conversation),
+                    archive_message(1, "same instruction", Conversation),
+                ],
+                Vec::new(),
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut upgraded = archive_session(
+            vec![
+                archive_message(0, "same instruction", Conversation),
+                archive_message(1, "same instruction", Conversation),
+                archive_message(2, "new instruction", Conversation),
+            ],
+            Vec::new(),
+        );
+        upgraded.session.parse_version = "v2".into();
+        db.upsert_session(&upgraded, 2, 2).unwrap();
+        assert_eq!(
+            session_rows(&db, "codex:archive"),
+            [
+                row(0, "user", "same instruction"),
+                row(1, "user", "same instruction"),
+                row(2, "user", "new instruction")
+            ]
+        );
+        db.upsert_session(&upgraded, 3, 3).unwrap();
+        assert_eq!(session_rows(&db, "codex:archive").len(), 3);
+    }
+
+    #[test]
+    fn an_invalid_parser_upgrade_rolls_back_archive_and_metadata_updates() {
+        use crate::models::{
+            InputDeliveryState, MessageAuthorship, MessageCorrelationAuthority,
+            MessageCorrelationIdentity,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut initial = archive_session(
+            vec![archive_message(
+                0,
+                "queued correction",
+                crate::models::MessageKind::Conversation,
+            )],
+            Vec::new(),
+        );
+        initial.messages[0].provenance.authorship = MessageAuthorship::Human;
+        initial.messages[0].provenance.correlation_identity = Some(MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::Anthropic,
+            scope: "rollback-test".into(),
+            id: "enqueue-1".into(),
+        });
+        initial.messages[0].provenance.input_delivery_state = Some(InputDeliveryState::Submitted);
+        db.upsert_session(&initial, 1, 1).unwrap();
+
+        let mut broken = initial.clone();
+        broken.session.parse_version = "v2".into();
+        broken.messages[0].provenance.authorship = MessageAuthorship::Mixed;
+        broken.messages[0].provenance.content_parts.clear();
+        assert!(db.replace_session(&broken, 2, 2).is_err());
+        let state: (String, String, String, i64) = db
+            .conn
+            .query_row(
+                "select s.parse_version, m.authorship, m.input_delivery_state,
+                        (select count(*) from messages where session_id = s.id)
+                 from sessions s join messages m on m.session_id = s.id
+                 where s.id = 'codex:archive' and m.seq = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("v1".into(), "human".into(), "submitted".into(), 1));
     }
 
     #[test]
@@ -17078,6 +19567,15 @@ mod tests {
 
     #[test]
     fn a_new_edit_before_a_retained_edit_replays_in_source_order() {
+        assert_new_edit_replay_order(false);
+    }
+
+    #[test]
+    fn a_parser_upgrade_preserves_edit_replay_order_and_repairs_metadata() {
+        assert_new_edit_replay_order(true);
+    }
+
+    fn assert_new_edit_replay_order(parser_upgrade: bool) {
         // A rewrite drops the first Write and adds another Write before a retained Edit. Replay
         // must apply the new Write before the Edit, or the Write resets the file afterwards.
         use crate::models::MessageKind::Conversation;
@@ -17117,15 +19615,16 @@ mod tests {
             1,
         )
         .unwrap();
-        db.upsert_session(
-            &archive_session(
-                vec![archive_message(0, "summary", Conversation)],
-                vec![write("v0"), delta],
-            ),
-            2,
-            2,
-        )
-        .unwrap();
+        let mut rewritten = archive_session(
+            vec![archive_message(0, "summary", Conversation)],
+            vec![write("v0"), delta],
+        );
+        if parser_upgrade {
+            rewritten.session.parse_version = "v2".into();
+            rewritten.file_edits[1].ts = Some("2026-11-07T00:00:00Z".parse().unwrap());
+        }
+        db.upsert_session(&rewritten, 2, 2).unwrap();
+        db.upsert_session(&rewritten, 3, 3).unwrap();
         let replay: Vec<(i64, String)> = db
             .file_edits_for("f.rs", None)
             .unwrap()
@@ -17147,10 +19646,73 @@ mod tests {
             .into_iter()
             .map(|(_, _, edit)| edit)
             .collect();
+        assert_eq!(edits.last().unwrap().ts, rewritten.file_edits[1].ts);
         assert_eq!(
             crate::files::reconstruct(&edits, edits.len()).as_deref(),
             Some("w0")
         );
+    }
+
+    #[test]
+    fn a_parser_upgrade_interleaves_new_edits_with_retained_edits() {
+        let edit = |seq, old: &str, new: &str| FileEdit {
+            seq,
+            ts: None,
+            tool: if old.is_empty() { "Write" } else { "Edit" }.into(),
+            file_path: "/x/f.rs".into(),
+            file_name: "f.rs".into(),
+            new_content: old.is_empty().then(|| new.into()),
+            edits: if old.is_empty() {
+                Vec::new()
+            } else {
+                vec![EditOp {
+                    old: old.into(),
+                    new: new.into(),
+                    replace_all: false,
+                }]
+            },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &archive_session(
+                Vec::new(),
+                vec![edit(0, "", "v1"), edit(1, "v", "w"), edit(2, "w", "x")],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let mut upgraded = archive_session(
+            Vec::new(),
+            vec![
+                edit(0, "", "v0"),
+                edit(1, "v", "w"),
+                edit(2, "0", "9"),
+                edit(3, "w", "x"),
+                edit(4, "9", "2"),
+            ],
+        );
+        upgraded.session.parse_version = "v2".into();
+        for generation in [2, 3] {
+            db.upsert_session(&upgraded, generation, generation)
+                .unwrap();
+            let edits: Vec<_> = db
+                .file_edits_for("f.rs", None)
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, edit)| edit)
+                .collect();
+            assert_eq!(
+                edits.len(),
+                6,
+                "archive-only Write survives; refresh is idempotent"
+            );
+            assert_eq!(
+                crate::files::reconstruct(&edits, edits.len()).as_deref(),
+                Some("x2")
+            );
+        }
     }
 
     #[test]
@@ -17771,6 +20333,39 @@ mod tests {
     }
 
     #[test]
+    fn source_identity_listing_reads_older_read_only_cache_without_file_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "create table sessions (
+                    id text primary key, provider text not null,
+                    provider_session_id text not null, source_path text not null);
+                 create table files_seen (
+                    provider text not null, source_path text not null,
+                    mtime_ns integer not null, size_bytes integer not null,
+                    last_indexed_at text not null, parse_version text not null default '',
+                    primary key(provider, source_path));
+                 insert into sessions(id, provider, provider_session_id, source_path)
+                    values ('claude:legacy', 'claude', 'legacy', '/old/session.jsonl');
+                 pragma user_version = 2;",
+            )
+            .unwrap();
+        drop(legacy);
+        let db = Db::open_existing_read_only_with_threads(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let identities = db.indexed_source_identities().unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].source_path, "/old/session.jsonl");
+        assert!(identities[0].file_identity.is_none());
+    }
+
+    #[test]
     fn concurrent_read_only_connections_share_one_fixed_worker_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
@@ -18157,7 +20752,12 @@ mod tests {
         // partial `idx_messages_tool_calls` answers because its predicate is the literal text.
         let mut cases = corpus_count_filter_cases()
             .into_iter()
-            .map(|(name, filters)| (name, "1 = 1", filters))
+            .map(|(name, mut filters)| {
+                if filters.role == Some(Role::User) {
+                    filters.role = Some(Role::Assistant);
+                }
+                (name, "1 = 1", filters)
+            })
             .collect::<Vec<_>>();
         cases.push((
             "tool_argument",

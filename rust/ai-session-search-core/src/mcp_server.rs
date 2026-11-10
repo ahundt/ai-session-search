@@ -752,7 +752,7 @@ fn execute_official_tool_call(
         }
         Err(error) => return (rmcp_tool_error(error), false),
     };
-    let app = match SessionSearch::open_prepared_reader(config, inputs, Arc::clone(runtime)) {
+    let mut app = match SessionSearch::open_prepared_reader(config, inputs, Arc::clone(runtime)) {
         Ok(app) => app,
         Err(error) => {
             return (
@@ -763,7 +763,7 @@ fn execute_official_tool_call(
     };
     // Reported rather than ignored: this call would otherwise run uncancellable while the
     // client believes its cancellation notification still applies.
-    if let Err(error) = app.database().install_query_cancellation(&cancellation) {
+    if let Err(error) = app.install_query_cancellation(&cancellation) {
         return (
             rmcp_tool_error(format!("failed to arm query cancellation: {error:#}")),
             false,
@@ -947,7 +947,18 @@ impl ToolRecovery {
         // the same schema rather than assumed, for the same reason `limit` is: no two tools carry
         // the same set, and naming one a tool lacks hands the caller an argument its own schema
         // rejects while the one that would have worked goes unmentioned.
-        let reducers = ReducingArguments::of(accepts);
+        let reducers = ReducingArguments::of(|argument| {
+            accepts(argument)
+                && match argument {
+                    "detail" => args[argument] != "compact",
+                    "context" => args[argument] != 0,
+                    "include" => args[argument]
+                        .as_array()
+                        .is_none_or(|items| !items.is_empty()),
+                    "receipt_level" => args[argument] != "none",
+                    _ => true,
+                }
+        });
         if !accepts("limit") {
             return Self {
                 paging: ToolPaging::Unpaged,
@@ -2683,6 +2694,8 @@ fn message_field_view_output_schema() -> Value {
 }
 
 fn run_skill_capability_output_schema() -> Value {
+    // Capability matches share the result ceiling: extra per-match metadata must fit independently
+    // of text windows, without dropping matches, changing classifications, or raising the cap.
     let selector = skill_selector_input_schema();
     let selected_location = json!({
         "oneOf": [
@@ -2894,6 +2907,7 @@ fn run_skill_capability_output_schema() -> Value {
 }
 
 fn search_messages_output_schema() -> Value {
+    // Keep ordinary metadata aligned with HitProvenance; full partition arrays broke compact calls.
     // The canonical response uses custom conditional `Serialize` projections. Deriving a schema
     // through `schemars` would require a parallel DTO and recreate the semantic drift this adapter
     // removed. Keep this protocol declaration separate from runtime construction, then validate
@@ -2929,7 +2943,17 @@ fn search_messages_output_schema() -> Value {
             "properties": {
                 "provider": { "type": "string", "enum": crate::source::PROVIDERS },
                 "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
-                "kind": { "type": "string", "enum": message_kind_values() }
+                "kind": { "type": "string", "enum": message_kind_values() },
+                "provenance": {
+                    "type":"object", "additionalProperties":false,
+                    "required":["authorship","record_relation","input_delivery_state","input_origin"],
+                    "properties": {
+                        "authorship":{"type":"string","enum":provenance_enum_values::<crate::models::MessageAuthorship>(false)},
+                        "record_relation":{"type":"string","enum":provenance_enum_values::<crate::models::MessageRecordRelation>(false)},
+                        "input_origin":{"type":["string","null"],"enum":provenance_enum_values::<crate::models::MessageInputOrigin>(true)},
+                        "input_delivery_state":{"type":["string","null"],"enum":provenance_enum_values::<crate::models::InputDeliveryState>(true)}
+                    }
+                }
             },
             "required": ["provider", "role", "kind"],
             "additionalProperties": false
@@ -3666,14 +3690,12 @@ fn render_message_search_field_description(
         McpFieldRole::OneValueAlias { plural } => {
             format!("One value; conflicts with {plural}.")
         }
-        McpFieldRole::ContextBefore => format!(
-            "Preceding neighbours per hit; omit for {}.",
-            context.messages_before()
-        ),
-        McpFieldRole::ContextAfter => format!(
-            "Following neighbours per hit; omit for {}.",
-            context.messages_after()
-        ),
+        McpFieldRole::ContextBefore => {
+            format!("Neighbours before; omit for {}.", context.messages_before())
+        }
+        McpFieldRole::ContextAfter => {
+            format!("Neighbours after; omit for {}.", context.messages_after())
+        }
         // "fuzzy search does not support all_results" and "sequence bounds require one session"
         // are two of the nine validator rules, and `message_search_tool_description` renders all
         // nine verbatim. A reader holding the parameter list holds the tool description too, so
@@ -3687,7 +3709,7 @@ fn render_message_search_field_description(
         McpFieldRole::TimePeriod => {
             "One period, both bounds; conflicts with since and until.".to_owned()
         }
-        McpFieldRole::PurposeVersion => "Purpose bundle version; required with purpose.".to_owned(),
+        McpFieldRole::PurposeVersion => "Required purpose version.".to_owned(),
         McpFieldRole::Canonical => {
             // A handful of fields need a number the registry does not carry, because the value is
             // this surface's planner-resolved policy rather than the parameter's semantics. Read
@@ -3757,7 +3779,7 @@ fn render_message_search_field_description(
                 // A mode rather than a value, so it is worded without "omit for" and stays out
                 // of the tool description's omitted-values sentence, which lists values.
                 (_, MessageSearchOmission::QuerylessSearch) => {
-                    "without it every message the filters allow is eligible.".to_owned()
+                    "without it all eligible messages.".to_owned()
                 }
                 // A defaulted parameter must name its default value in the text, not just in the
                 // keyword. `default` is one of the six keywords both Codex and VS Code delete
@@ -3805,27 +3827,19 @@ fn message_search_tool_description(config: &Config, input_schema: &Value) -> Str
         .expect("validated MCP configuration resolves a queryless message-search request");
     let registry = specification.registry();
     let mut text = String::from(
-        "Find exact message evidence across local AI session history. structuredContent is \
-         authoritative: effective_request states the resolved request and budgets, results carry \
-         message_ref plus field and match views with exact literal coordinates, and \
-         page.next_offset is the next offset when more results exist. Expand one hit with \
-         get_session(session_id, message_seq).\n",
+        "Search local messages. structuredContent is authoritative; effective_request states choices; \
+         results carry message_ref, views and literal coordinates. \
+         page.next_offset is the next offset; expand with get_session(session_id, message_seq).\n",
     );
-    // Only what `enum` cannot say. The six message classes and nine provider slugs already
-    // travel as accepted values on their own parameters, and restating them here would be a
-    // second copy of a list the model already has, free to drift from it. Literal-mode semantics
-    // and the time examples are here because the CLI states them in its own help and a model
-    // may have no shell to run `aise dates`.
     text.push_str(
-        "Omitting a filter leaves it unapplied. harness_notice (the harness's own text, not a \
-         person's) is the one class omitted when kinds is omitted. query_mode literal is a \
-         case-insensitive substring (punctuation significant), regex is Rust regex, fuzzy is a \
-         bounded fuzzy match. since/until/when take an RFC 3339 instant or a relative form such \
-         as 7d, yesterday, or 2026-01. receipt_level summary explains how the search was \
-         planned; full adds each value's origin. lines_per_message (line window first) and \
-         field_view/match_view (character budgets in Unicode scalars) change presentation only, \
-         never matching, order, count, context, or includes.\n",
+        "Omitting a filter leaves it unapplied. harness_notice (harness output) is the one class omitted when kinds is omitted. \
+         literal: case-insensitive substring, punctuation significant; regex uses Rust regex; \
+         fuzzy is bounded. since/until/when accept RFC 3339 or relative dates (7d, yesterday, 2026-01). \
+         receipt_level summary explains how the search was planned; full adds each value's origin. lines_per_message runs before \
+         field_view/match_view; views use Unicode scalars and preserve \
+         matches, order, count, context and includes.\n",
     );
+    text.push_str("role=user selects recorded user input across storage roles, including queues and interactive answers; returned metadata keeps the native stored role and sender/delivery uncertainty. Views/context may contain generated text.\n");
     text.push_str(&omitted_values_sentence(input_schema));
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {
@@ -5680,6 +5694,16 @@ fn apply_raw_metadata_include(value: &mut Value, include: &[String]) {
     }
 }
 
+fn provenance_enum_values<T: clap::ValueEnum + Copy + serde::Serialize + 'static>(
+    nullable: bool,
+) -> Vec<Value> {
+    T::value_variants()
+        .iter()
+        .map(|value| serde_json::to_value(value).expect("provenance enum serializes"))
+        .chain(nullable.then_some(Value::Null))
+        .collect()
+}
+
 /// Every `MessageKind` spelling, derived from the enum rather than written out, so a new
 /// member reaches the MCP schema automatically. Two hand-maintained copies of this list had
 /// already been written, which is exactly how a schema drifts from the values it accepts.
@@ -7500,6 +7524,116 @@ mod tests {
     /// null, so a schema that renames a field or forgets that one is optional makes a correct
     /// response fail validation at the caller with no server-side symptom to debug from.
     #[test]
+    fn human_content_results_conform_to_the_closed_schema_with_provenance() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        db.execute_batch_for_test(
+            "insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin)
+             values (9001,'claude:test1','claude',90,'tool','tool_result','prefix humanneedle suffix','mixed','original','interactive_answer');
+             insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin)
+             values (9001,0,0,7,'generated','tool_payload'),
+                    (9001,1,7,18,'human','direct_input'),
+                    (9001,2,18,25,'generated','tool_payload');"
+        ).unwrap();
+        let out = search_messages_value(
+            &json!({"query":"humanneedle","role":"user","receipt_level":"full"}),
+            &config,
+            &db,
+        );
+        assert_eq!(out["page"]["returned"], 1);
+        assert_eq!(
+            out["results"][0]["message_metadata"]["provenance"]["input_origin"],
+            "interactive_answer"
+        );
+        assert_eq!(
+            out["results"][0]["match"]["literal_occurrence"]["field_start_char"],
+            7
+        );
+        let schema = search_messages_output_schema();
+        let mut violations = Vec::new();
+        output_schema_violations(&out, &schema, "structuredContent", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        let excluded =
+            search_messages_value(&json!({"query":"prefix","role":"user"}), &config, &db);
+        assert_eq!(excluded["page"]["returned"], 0);
+    }
+
+    #[test]
+    fn ceiling_recovery_does_not_repeat_already_applied_reductions() {
+        let config = Config::default();
+        let advertised = advertised_tools(&config);
+        let recovery = ToolRecovery::for_call(
+            "search_messages",
+            &json!({
+                "detail":"compact", "context":0, "include":[], "receipt_level":"none"
+            }),
+            &advertised,
+            &config,
+        );
+        let advice = recovery.reducers.sentence().unwrap();
+        for ineffective in [
+            "detail=compact",
+            "lower context",
+            "include=[]",
+            "receipt_level=none",
+        ] {
+            assert!(!advice.contains(ineffective), "{advice}");
+        }
+        assert!(advice.contains("field_view"));
+    }
+
+    #[test]
+    fn compact_input_search_keeps_many_partitioned_parts_within_mcp_ceiling() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let generated = "x".repeat(1_000);
+        let content = format!("{generated}needle");
+        let mut sql = String::new();
+        sql.push_str(
+            "insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin) values (9002,'claude:test1','claude',91,'tool','tool_result','",
+        );
+        sql.push_str(&content.replace('\'', "''"));
+        sql.push_str("','mixed','original','interactive_answer');");
+        for ordinal in 0..1_000 {
+            sql.push_str(&format!(
+                "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values (9002,{ordinal},{ordinal},{},'generated','tool_payload');",
+                ordinal + 1
+            ));
+        }
+        sql.push_str(
+            "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values (9002,1000,1000,1006,'unknown','direct_input');",
+        );
+        db.execute_batch_for_test(&sql).unwrap();
+
+        let response = tool_search_messages(
+            &json!({
+                "query": "needle",
+                "role": "user",
+                "limit": 1,
+                "detail": "compact",
+                "include": [],
+                "receipt_level": "none"
+            }),
+            &config,
+            &db,
+        )
+        .unwrap();
+        let structured = response
+            .structured_content
+            .expect("input search should return structured content");
+        assert_eq!(structured["page"]["returned"], 1);
+        assert_eq!(structured["results"][0]["message_metadata"]["role"], "tool");
+        assert_eq!(
+            structured["results"][0]["match"]["literal_occurrence"]["field_start_char"],
+            1_000
+        );
+        assert!(
+            serde_json::to_string(&structured).unwrap().chars().count() < 48_000,
+            "compact response must not serialize every internal partition"
+        );
+    }
+
+    #[test]
     fn search_messages_output_schema_matches_every_key_and_type_the_runtime_emits() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -7649,7 +7783,10 @@ mod tests {
             .unwrap()["inputSchema"]["properties"]["query"]["description"]
             .as_str()
             .unwrap();
-        assert!(query.contains("without it every message"), "{query}");
+        assert!(
+            query.contains("without it all eligible messages"),
+            "{query}"
+        );
     }
 
     /// A `oneOf` failure names every accepted shape, because a client that dropped `oneOf`
@@ -8615,7 +8752,7 @@ mod tests {
         }
         // What `enum` cannot say about them is said once, in the channel every client forwards.
         assert!(
-            tool_doc.contains("harness_notice (the harness's own text, not a person's)"),
+            tool_doc.contains("harness_notice (harness output)"),
             "the one class whose meaning a token cannot carry is glossed: {tool_doc}"
         );
     }
@@ -13689,8 +13826,8 @@ mod tests {
         // what keeps three copies from drifting apart.
         let tool_doc = search_messages["description"].as_str().unwrap();
         for required in [
-            "lines_per_message (line window first)",
-            "never matching, order, count, context, or includes",
+            "lines_per_message runs before field_view/match_view",
+            "preserve matches, order, count, context and includes",
             "detail conflicts with lines_per_message, field_view, and match_view",
         ] {
             assert!(
@@ -13717,7 +13854,7 @@ mod tests {
         );
         // Which regex dialect and how bounded the fuzzy match is are facts an enum token cannot
         // carry, so they are stated once in the channel every client forwards whole.
-        for required in ["regex is Rust regex", "bounded fuzzy match"] {
+        for required in ["regex uses Rust regex", "fuzzy is bounded"] {
             assert!(
                 tool_doc.contains(required),
                 "missing {required:?} from tool.description: {tool_doc}"

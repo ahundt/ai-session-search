@@ -238,6 +238,10 @@ Rust, Python, CLI, and MCP must route message search and deterministic capabilit
 typed service requests and responses. Adapters translate surface syntax and serialization; they
 must not independently redefine matching, ordering, filtering, paging, or completeness.
 
+Keep familiar tasks on existing selectors. A distinction in provider storage is not sufficient
+reason for another public parameter, response field, enum or workflow step. Reuse canonical
+requests and existing evidence/read surfaces; require a concrete user benefit for added exposure.
+
 ### REQ003-preserve-surface-semantics
 
 Intentional defaults are part of the API:
@@ -262,6 +266,14 @@ content without removing a result.
 Line windows, field-view limits, match-view budgets, response formats, and whitespace
 presentation must never change matching, ranking, hit membership, context membership, result count,
 offsets, next-page identity, classification categories, or policy digests.
+
+Text windows do not bound metadata. Emitting full content-part arrays with each ordinary search
+hit made even compact, one-hit MCP calls exceed the result ceiling. Ordinary hits therefore carry
+a bounded source header while the index retains full partitions and correlation identity. Apply
+the same constraint to capability matches and receipts: measure total serialized output, preserve
+required evidence and classification results, and do not hide excess payload by dropping matches
+or raising client limits. Capability-definition input limits protect parsing; they do not bound
+the output. Recheck both emitted schemas and actual result size after any public-surface change.
 
 `lines_per_message` uses one sign convention:
 
@@ -491,15 +503,27 @@ canonical records rather than adapter-specific response models.
 Do not add a second parser for an opaque or duplicative database without evidence that it contains
 unique supported data.
 
-Authorship for a user turn comes from structural evidence: a per-message origin marker where the
-format has one (Antigravity's `USER_EXPLICIT`), otherwise the session's own start (Claude, Codex,
-Cursor, Pi: a session nothing spawned is a person's, a spawned run's user turns are the caller's
-delegation). Google AI Studio and Gemini CLI store one person-started chat per file with no spawn
-concept, so their user turns resolve to human by that same session-level evidence; the Gemini CLI
-adapter first sets aside the `functionResponse` echoes the API writes as user turns and records
-`toolCalls` as tool-call and tool-result rows and `warning`/`info`/`error` turns as harness
-notices, so no generated text is left in a user row to be called human. Both parse versions moved
-(`aistudio-v3`, `gemini-cli-v4`) so an existing index reparses those files at its next refresh.
+Input retrieval follows recorded source and purpose. `role=user` selects
+prompts, queued submissions and linked interactive-answer regions across storage roles. Explicit
+native provenance takes precedence over session fallback; generated tool output, harness context,
+delegation and known mirrors do not satisfy that selection. Omitting role searches complete
+content; other filters retain their existing behavior. A queued submission can have an unknown sender and delivery outcome
+while its input purpose is known; retain that uncertainty instead of hiding the submission.
+
+Authorship retains the existing structural conventions: Antigravity's `USER_EXPLICIT` marks Human;
+ordinary root-session user turns resolve to Human and known spawned-run delegation to Agent.
+Native per-part metadata and explicit Unknown override those defaults. Interactive results keep
+their tool role and source event identity; content partitions distinguish input from generated
+wrappers. Canonical decoded answers retain the original searchable payload and generated
+separators cannot join separate answers into a matching phrase. Parser-version changes must
+repair identifiable old rows without deleting archive-only inputs or multiplying events.
+
+Gemini CLI supports legacy JSON and native JSONL history, including explicit subagent evidence,
+generated `functionResponse` echoes, tool calls/results and harness notices. Rewind, masking and
+removal cannot erase original input from the append log. Google AI Studio JSON chunks distinguish
+user from model content. Its legacy Markdown path preserves the existing whole-document role
+convention; the format cannot establish individual turn boundaries, so do not infer them from
+prose or headings.
 
 Adding a provider variant is an index-compatibility event even when the schema generation does not
 move: Prime Agent shipped at generation 5, so a `1.0.0rc1` executable opening an index that a later

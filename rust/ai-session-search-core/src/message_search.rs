@@ -15,6 +15,7 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::hashing::FramedSha256;
+use crate::models::MessageInputScope;
 use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField, SessionMeta};
 use crate::refs::MessageRef;
 
@@ -1230,7 +1231,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::Role,
-                "Author role.",
+                "user selects recorded input across roles; others select stored roles.",
                 enum_domain(serialized_variants::<Role>()),
                 MessageSearchOmission::AllEligible,
             ),
@@ -1710,10 +1711,10 @@ impl ResolvedRequestPresentation {
     }
 }
 
-/// Effective semantic choices returned with every response.
+/// Effective query, target, provider, paging, and presentation choices for the response.
 ///
 /// Parameter origins and planner evidence are optional receipt data; this compact record is always
-/// present so a caller can interpret result and presentation extent without conversational state.
+/// present to interpret result and presentation extent; it does not repeat every structural filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedMessageSearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2775,6 +2776,9 @@ struct SemanticMessageRef<'a> {
 
 #[derive(Serialize)]
 struct SemanticMessageMetadata {
+    // Use the bounded header on every surface; adding internal fields here bypasses text budgets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<crate::models::HitProvenance>,
     provider: Provider,
     role: Role,
     kind: MessageKind,
@@ -2899,6 +2903,11 @@ impl Serialize for SemanticResult<'_> {
         map.serialize_entry(
             "message_metadata",
             &SemanticMessageMetadata {
+                provenance: hit
+                    .message
+                    .provenance
+                    .as_deref()
+                    .map(crate::models::HitProvenance::from),
                 provider: hit.message.provider,
                 role: hit.message.role,
                 kind: hit.message.kind,
@@ -3014,6 +3023,7 @@ impl Serialize for SemanticContextMessage<'_> {
         map.serialize_entry(
             "message_metadata",
             &SemanticMessageMetadata {
+                provenance: None,
                 provider: message.provider,
                 role: message.role,
                 kind: message.kind,
@@ -3435,20 +3445,52 @@ pub(crate) fn selected_message_field_parts<'a>(
     }
 }
 
+/// Borrow eligible source regions in one scalar pass: O(B + P) time, O(P) range memory.
+pub(crate) fn matching_content_regions(
+    hit: &crate::models::MessageHit,
+    scope: MessageInputScope,
+) -> Vec<(usize, &str)> {
+    if scope == MessageInputScope::Any {
+        return vec![(0, &hit.content)];
+    }
+    let Some(provenance) = &hit.provenance else {
+        return Vec::new();
+    };
+    if provenance.record_relation == crate::models::MessageRecordRelation::Mirror {
+        return Vec::new();
+    }
+    if provenance.is_whole_user_input() || provenance.is_legacy_user_input(hit.role) {
+        return vec![(0, &hit.content)];
+    }
+    crate::util::content_part_regions(
+        &hit.content,
+        provenance
+            .content_parts
+            .iter()
+            .filter(|part| part.is_user_input()),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(part, text)| (part.start_char, text))
+    .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn attach_match_evidence(
+    input_scope: MessageInputScope,
     query: &MessageQuery,
     target: &MessageTarget,
     match_view: MatchViewBudget,
     hits: Vec<crate::models::MessageHit>,
 ) -> anyhow::Result<Vec<MessageSearchHit>> {
-    attach_match_evidence_cancellable(query, target, match_view, hits, || Ok(()))
+    attach_match_evidence_cancellable(query, target, match_view, input_scope, hits, || Ok(()))
 }
 
 pub(crate) fn attach_match_evidence_cancellable(
     query: &MessageQuery,
     target: &MessageTarget,
     match_view: MatchViewBudget,
+    input_scope: MessageInputScope,
     hits: Vec<crate::models::MessageHit>,
     mut check_active: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<MessageSearchHit>> {
@@ -3471,7 +3513,33 @@ pub(crate) fn attach_match_evidence_cancellable(
                         message.seq
                     )
                 })?;
-                let evidence = prepared.build(&selected, match_view).ok_or_else(|| {
+                let evidence = if input_scope == MessageInputScope::UserInput
+                    && target.field() == SearchField::Content
+                {
+                    let mut selected_evidence = None;
+                    let mut best_score = None;
+                    let field_total_chars = selected.chars().count();
+                    for (offset, region) in matching_content_regions(&message, input_scope) {
+                        check_active()?;
+                        if let Some((score, mut evidence)) = prepared.build(region, match_view) {
+                            if best_score.is_none_or(|best| score > best) {
+                                evidence.field_start_char += offset;
+                                evidence.field_total_chars = field_total_chars;
+                                selected_evidence = Some(evidence);
+                                best_score = Some(score);
+                            }
+                            if !matches!(query, MessageQuery::Fuzzy(_)) {
+                                break;
+                            }
+                        }
+                    }
+                    selected_evidence
+                } else {
+                    prepared
+                        .build(&selected, match_view)
+                        .map(|(_, evidence)| evidence)
+                };
+                let evidence = evidence.ok_or_else(|| {
                     anyhow::anyhow!(
                         "message-search match evidence disagrees with {:?} membership for {} sequence {}",
                         target.field(),
@@ -3831,7 +3899,7 @@ impl PreparedMatchEvidence {
         &mut self,
         selected: &str,
         match_view: MatchViewBudget,
-    ) -> Option<MessageMatchEvidence> {
+    ) -> Option<(u32, MessageMatchEvidence)> {
         let field_total_chars = selected.chars().count();
         match self {
             Self::All => None,
@@ -3842,12 +3910,9 @@ impl PreparedMatchEvidence {
                     field_total_chars,
                     std::slice::from_ref(&range),
                 );
-                Some(character_evidence(
-                    selected,
-                    field_total_chars,
-                    maximum,
-                    vec![range],
-                    false,
+                Some((
+                    0,
+                    character_evidence(selected, field_total_chars, maximum, vec![range], false),
                 ))
             }
             Self::Regex(regex) => {
@@ -3861,11 +3926,9 @@ impl PreparedMatchEvidence {
                             max_chars.get().min(field_total_chars.max(1))
                         }
                     };
-                    Some(boundary_evidence(
-                        selected,
-                        field_total_chars,
-                        maximum,
-                        start,
+                    Some((
+                        0,
+                        boundary_evidence(selected, field_total_chars, maximum, start),
                     ))
                 } else {
                     let range = FieldCharRange {
@@ -3877,12 +3940,15 @@ impl PreparedMatchEvidence {
                         field_total_chars,
                         std::slice::from_ref(&range),
                     );
-                    Some(character_evidence(
-                        selected,
-                        field_total_chars,
-                        maximum,
-                        vec![range],
-                        false,
+                    Some((
+                        0,
+                        character_evidence(
+                            selected,
+                            field_total_chars,
+                            maximum,
+                            vec![range],
+                            false,
+                        ),
                     ))
                 }
             }
@@ -3895,7 +3961,7 @@ impl PreparedMatchEvidence {
                 utf32_buf.clear();
                 indices.clear();
                 let matcher_input = Utf32Str::new(selected, utf32_buf);
-                pattern.indices(matcher_input, matcher, indices)?;
+                let score = pattern.indices(matcher_input, matcher, indices)?;
                 let matcher_unit_ranges = scalar_ranges_by_matcher_unit(selected, matcher_input);
                 let ranges = indices
                     .iter()
@@ -3903,12 +3969,9 @@ impl PreparedMatchEvidence {
                     .collect::<Option<Vec<_>>>()?;
                 let ranges = coalesce_character_ranges(ranges);
                 let maximum = match_view_max_chars(match_view, field_total_chars, &ranges);
-                Some(character_evidence(
-                    selected,
-                    field_total_chars,
-                    maximum,
-                    ranges,
-                    true,
+                Some((
+                    score,
+                    character_evidence(selected, field_total_chars, maximum, ranges, true),
                 ))
             }
         }
@@ -4258,6 +4321,7 @@ mod tests {
 
     fn hit(content: impl Into<String>) -> crate::models::MessageHit {
         crate::models::MessageHit {
+            provenance: None,
             session_id: "claude:evidence".into(),
             provider: Provider::Claude,
             seq: 7,
@@ -4269,6 +4333,132 @@ mod tests {
             fuzzy_score: None,
             content: content.into(),
         }
+    }
+
+    #[test]
+    fn human_evidence_uses_original_coordinates_for_each_match_mode() {
+        let mut message = hit("needle wrapper éneedle gap tail");
+        message.provenance = Some(Box::new(crate::models::MessageProvenance {
+            authorship: crate::models::MessageAuthorship::Mixed,
+            content_parts: [
+                (0, 15, false),
+                (15, 22, true),
+                (22, 27, false),
+                (27, 31, true),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(ordinal, (start_char, end_char, human))| crate::models::MessageContentPart {
+                    ordinal: ordinal as u32,
+                    start_char,
+                    end_char,
+                    authorship: if human {
+                        crate::models::ContentPartAuthorship::Human
+                    } else {
+                        crate::models::ContentPartAuthorship::Generated
+                    },
+                    origin: crate::models::ContentPartOrigin::Unknown,
+                },
+            )
+            .collect(),
+            ..Default::default()
+        }));
+        for query in [
+            MessageQuery::literal("needle").unwrap(),
+            MessageQuery::regex("^éneedle$").unwrap(),
+            MessageQuery::fuzzy("ndl").unwrap(),
+        ] {
+            let hits = attach_match_evidence(
+                MessageInputScope::UserInput,
+                &query,
+                &MessageTarget::content(),
+                MatchViewBudget::MinimalSpan,
+                vec![message.clone()],
+            )
+            .unwrap();
+            let evidence = hits[0].match_evidence().unwrap();
+            assert!(evidence.field_start_char >= 15);
+            assert_eq!(evidence.field_total_chars, 31);
+            assert!(!evidence.view_text.contains("wrapper"));
+            if let Some(occurrence) = hits[0].literal_match() {
+                assert_eq!(occurrence.field_start_char, 16);
+                assert_eq!(occurrence.field_end_char_exclusive, 22);
+                assert_eq!(occurrence.text, "needle");
+            }
+        }
+        let zero_width = attach_match_evidence(
+            MessageInputScope::UserInput,
+            &MessageQuery::regex("^é").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message.clone()],
+        )
+        .unwrap();
+        assert_eq!(zero_width[0].match_evidence().unwrap().field_start_char, 15);
+        let complete = attach_match_evidence(
+            MessageInputScope::Any,
+            &MessageQuery::literal("needle").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            complete[0].literal_match().unwrap().field_start_char,
+            0,
+            "provenance must not narrow the default all-content mode"
+        );
+        assert!(attach_match_evidence(
+            MessageInputScope::UserInput,
+            &MessageQuery::literal("needle gap tail").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn human_fuzzy_evidence_selects_the_best_original_region() {
+        use crate::models::{
+            ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageContentPart,
+            MessageProvenance,
+        };
+        let mut message = hit("n-----d-----l|ndl");
+        message.provenance = Some(Box::new(MessageProvenance {
+            authorship: MessageAuthorship::Mixed,
+            content_parts: [(0, 13, true), (13, 14, false), (14, 17, true)]
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(ordinal, (start_char, end_char, human))| MessageContentPart {
+                        ordinal: ordinal as u32,
+                        start_char,
+                        end_char,
+                        authorship: if human {
+                            ContentPartAuthorship::Human
+                        } else {
+                            ContentPartAuthorship::Generated
+                        },
+                        origin: ContentPartOrigin::Unknown,
+                    },
+                )
+                .collect(),
+            ..Default::default()
+        }));
+        let hits = attach_match_evidence(
+            MessageInputScope::UserInput,
+            &MessageQuery::fuzzy("ndl").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![message],
+        )
+        .unwrap();
+        let evidence = hits[0].match_evidence().unwrap();
+        assert_eq!(evidence.field_start_char, 14);
+        assert_eq!(evidence.view_text, "ndl");
+        assert_eq!(evidence.field_total_chars, 17);
     }
 
     #[test]
@@ -4345,6 +4535,7 @@ mod tests {
         let command = format!("{}Trash{}", "x".repeat(855), "y".repeat(400));
         let content = serde_json::json!({"args": {"command": command}}).to_string();
         let evidence = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::literal("trash").unwrap(),
             &MessageTarget::tool_argument("/command").unwrap(),
             MatchViewBudget::MaxChars {
@@ -4371,6 +4562,7 @@ mod tests {
             &query,
             &target,
             MatchViewBudget::MinimalSpan,
+            MessageInputScope::Any,
             source_hits.clone(),
             || {
                 evidence_checks += 1;
@@ -4384,9 +4576,14 @@ mod tests {
             .to_string()
             .contains("injected evidence cancellation"));
 
-        let mut hits =
-            attach_match_evidence(&query, &target, MatchViewBudget::MinimalSpan, source_hits)
-                .unwrap();
+        let mut hits = attach_match_evidence(
+            MessageInputScope::Any,
+            &query,
+            &target,
+            MatchViewBudget::MinimalSpan,
+            source_hits,
+        )
+        .unwrap();
         let presentation = ResolvedMessagePresentation {
             include_refs: false,
             message_lines: LineWindow::Full,
@@ -4417,6 +4614,7 @@ mod tests {
         let literal = "Needle".repeat(80);
         let content = format!("prefix {literal} suffix");
         let hits = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::literal(literal.to_lowercase()).unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MaxChars {
@@ -4446,6 +4644,7 @@ mod tests {
             MessageQuery::regex(r"(?:Needle){80}").unwrap(),
         ] {
             let hits = attach_match_evidence(
+                MessageInputScope::Any,
                 &query,
                 &MessageTarget::content(),
                 MatchViewBudget::MinimalSpan,
@@ -4456,6 +4655,7 @@ mod tests {
         }
 
         let fuzzy = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::fuzzy("tst").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MinimalSpan,
@@ -4465,6 +4665,7 @@ mod tests {
         assert_eq!(fuzzy[0].match_evidence().unwrap().view_text, "test");
 
         let boundary = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::regex(r"(?m)^").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MinimalSpan,
@@ -4655,6 +4856,7 @@ mod tests {
     #[test]
     fn regex_zero_width_and_fuzzy_matches_have_typed_markers() {
         let regex = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::regex(r"(?m)^").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MaxChars {
@@ -4669,6 +4871,7 @@ mod tests {
         ));
 
         let fuzzy = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::fuzzy("tst").unwrap(),
             &MessageTarget::content(),
             MatchViewBudget::MaxChars {
@@ -4732,6 +4935,7 @@ mod tests {
             ),
         ] {
             let fuzzy = attach_match_evidence(
+                MessageInputScope::Any,
                 &MessageQuery::fuzzy("tst").unwrap(),
                 &MessageTarget::content(),
                 MatchViewBudget::MaxChars {
@@ -4752,6 +4956,7 @@ mod tests {
     #[test]
     fn queryless_hits_omit_evidence_without_projecting_selected_fields() {
         let hits = attach_match_evidence(
+            MessageInputScope::Any,
             &MessageQuery::All,
             &MessageTarget::tool_argument("/missing").unwrap(),
             MatchViewBudget::MaxChars {

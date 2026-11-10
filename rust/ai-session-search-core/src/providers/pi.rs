@@ -12,15 +12,15 @@ use serde_json::{json, Value};
 
 use crate::files::{FileMutationPayload, PendingFileMutations};
 use crate::models::{
-    EditOp, FileEdit, MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord,
-    SourceFile,
+    ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, MessageAuthorship,
+    MessageContentPart, MessageCorrelationAuthority, MessageInputOrigin, ParsedSession, Provider,
+    SessionRecord, SourceFile,
 };
 use crate::providers::{spawn::SpawnOrigin, walk_roots, ProviderDiscovery};
 use crate::util::{
-    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, observe_session_start, parse_datetime,
-    preview_from_text, substantive_text, truncate_for_display, RawMessage,
-    UserRoleAuthorshipEvidence,
+    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
+    observe_session_end, observe_session_start, parse_datetime, preview_from_text,
+    substantive_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +217,8 @@ impl PiAdapter {
         let mut created_at: Option<DateTime<Utc>> = None;
         let mut updated_at: Option<DateTime<Utc>> = None;
         let mut messages = Vec::new();
+        let mut first_user_index = None;
+        let mut last_user_index = None;
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut pending_file_mutations = PendingFileMutations::default();
@@ -266,6 +268,20 @@ impl PiAdapter {
                         continue;
                     };
                     let role = message.get("role").and_then(Value::as_str);
+                    if let Some(mut raw) =
+                        pi_native_input_record(message, timestamp, spawned.is_some())
+                    {
+                        if let Some(id) = value
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.trim().is_empty())
+                        {
+                            raw = raw.with_native_event_identity(self.correlation_authority(), id);
+                        }
+                        messages.push(raw);
+                        observe_session_end(&mut updated_at, timestamp);
+                        continue;
+                    }
                     // Capture file-mutating `toolCall` blocks before the empty-text skip,
                     // so a tool-only assistant turn (no text) still records its edits.
                     if role == Some("assistant") {
@@ -305,6 +321,10 @@ impl PiAdapter {
                                     event_id,
                                 );
                             }
+                            if role == Some("user") && substantive_text(text) {
+                                first_user_index.get_or_insert(messages.len());
+                                last_user_index = Some(messages.len());
+                            }
                             messages.push(raw_message);
                             transcript_lines.push(format_transcript_line(
                                 role.unwrap_or("message"),
@@ -342,19 +362,28 @@ impl PiAdapter {
                         _ => continue,
                     }
                 }
+                Some("compaction" | "custom_message") => {
+                    if let Some(mut raw) =
+                        pi_native_input_record(&value, timestamp, spawned.is_some())
+                    {
+                        if let Some(id) = value
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.trim().is_empty())
+                        {
+                            raw = raw.with_native_event_identity(self.correlation_authority(), id);
+                        }
+                        messages.push(raw);
+                        observe_session_end(&mut updated_at, timestamp);
+                    }
+                }
                 _ => {}
             }
         }
 
-        let first_user = messages
-            .iter()
-            .find(|message| message.role() == "user" && substantive_text(message.content()))
-            .map(|message| message.content().to_string());
-        let last_user = messages
-            .iter()
-            .rev()
-            .find(|message| message.role() == "user" && substantive_text(message.content()))
-            .map(|message| message.content().to_string());
+        let user_text =
+            |index: Option<usize>| index.map(|index| messages[index].content().to_owned());
+        let (first_user, last_user) = (user_text(first_user_index), user_text(last_user_index));
         let title = first_user
             .clone()
             .or_else(|| last_user.clone())
@@ -407,9 +436,9 @@ impl PiAdapter {
                 .and_then(|origin| origin.run_suffix.split('/').next().map(ToOwned::to_owned)),
         };
 
-        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
-        apply_user_role_authorship(
-            &mut messages,
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
             if spawned.is_some() {
                 UserRoleAuthorshipEvidence::AgentDelegationEvent
             } else {
@@ -494,6 +523,85 @@ impl PiAdapter {
     fn spawn_origin_of(&self, path: &Path) -> Option<SpawnOrigin> {
         self.spawn_origin(self.root_for(path)?, path)
     }
+}
+
+/// Native command/instruction fields are input; their adjacent output/summary is generated.
+/// For B field bytes, one render/scalar pass costs O(B) time/output and O(1) extra state.
+fn pi_native_input_record(
+    value: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    subagent: bool,
+) -> Option<RawMessage> {
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("type").and_then(Value::as_str))?;
+    let (input_key, generated_key, stored_role) = match role {
+        "bashExecution" => ("command", "output", "user"),
+        "compactionSummary" | "compaction" => ("customInstructions", "summary", "compaction"),
+        "custom" | "custom_message" => {
+            let text = extract_text(value);
+            return (!text.trim().is_empty()).then(|| RawMessage::harness_notice(text, timestamp));
+        }
+        _ => return None,
+    };
+    let input = value
+        .get(input_key)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let generated = value
+        .get(generated_key)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if input.is_empty() && generated.is_empty() {
+        return None;
+    }
+    let input_author = if value.get("fromHook").and_then(Value::as_bool) == Some(true) {
+        ContentPartAuthorship::Generated
+    } else if subagent {
+        ContentPartAuthorship::Agent
+    } else {
+        ContentPartAuthorship::Human
+    };
+    let mut content = input.to_owned();
+    if !input.is_empty() && !generated.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(generated);
+    let mut raw = RawMessage::message(stored_role, content, timestamp, None);
+    if input.is_empty() || input_author == ContentPartAuthorship::Generated {
+        return Some(raw.with_authorship(MessageAuthorship::Generated));
+    }
+    raw = raw.with_input_origin(MessageInputOrigin::DirectConversation);
+    if generated.is_empty() {
+        return Some(raw.with_authorship(if subagent {
+            MessageAuthorship::Agent
+        } else {
+            MessageAuthorship::Human
+        }));
+    }
+    let end_input = input.chars().count();
+    let end_content = end_input + 1 + generated.chars().count();
+    Some(raw.with_content_parts(vec![
+        MessageContentPart {
+            ordinal: 0,
+            start_char: 0,
+            end_char: end_input,
+            authorship: input_author,
+            origin: ContentPartOrigin::DirectInput,
+        },
+        MessageContentPart {
+            ordinal: 1,
+            start_char: end_input,
+            end_char: end_content,
+            authorship: ContentPartAuthorship::Generated,
+            origin: if stored_role == "compaction" {
+                ContentPartOrigin::GeneratedSummary
+            } else {
+                ContentPartOrigin::ToolPayload
+            },
+        },
+    ]))
 }
 
 /// The directory a configured root actually keeps transcripts in.
@@ -702,6 +810,94 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[test]
+    fn native_commands_and_compaction_instructions_are_input_not_generated_output() {
+        use crate::message_search::{
+            MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+        };
+        let records = concat!(
+            "{\"type\":\"session\",\"id\":\"input-purpose\"}\n",
+            "{\"type\":\"message\",\"id\":\"cmd\",\"message\":{\"role\":\"bashExecution\",\"command\":\"command 🦀\",\"output\":\"generated stdout\",\"cancelled\":false}}\n",
+            "{\"type\":\"compaction\",\"id\":\"compact\",\"customInstructions\":\"retain α inputs\",\"summary\":\"generated digest\"}\n",
+            "{\"type\":\"message\",\"id\":\"compact-message\",\"message\":{\"role\":\"compactionSummary\",\"customInstructions\":\"retain β inputs\",\"summary\":\"generated summary\"}}\n",
+            "{\"type\":\"compaction\",\"id\":\"hook\",\"fromHook\":true,\"customInstructions\":\"hook injected instructions\",\"summary\":\"hook digest\"}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"custom\",\"content\":\"extension generated context\"}}\n",
+            "{\"type\":\"custom_message\",\"id\":\"extension\",\"customType\":\"agent_message\",\"content\":\"native extension context\"}\n",
+        );
+        for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
+            let parsed = adapter
+                .parse_reader(
+                    std::io::Cursor::new(records),
+                    std::path::Path::new("/tmp/input-purpose.jsonl"),
+                )
+                .unwrap();
+            assert!(!parsed.session.preview_text.contains("generated stdout"));
+            assert!(!parsed
+                .session
+                .title
+                .as_deref()
+                .unwrap_or_default()
+                .contains("generated stdout"));
+            let directory = tempdir().unwrap();
+            let db = crate::db::Db::open(&directory.path().join("index.db")).unwrap();
+            db.mark_schema_current().unwrap();
+            db.upsert_session(&parsed, 0, 0).unwrap();
+            let config = crate::config::Config::default();
+            let service = crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+            for (query, expected_input, notice) in [
+                ("command 🦀", true, false),
+                ("retain α inputs", true, false),
+                ("retain β inputs", true, false),
+                ("generated stdout", false, false),
+                ("generated digest", false, false),
+                ("generated summary", false, false),
+                ("hook injected instructions", false, false),
+                ("extension generated context", false, true),
+                ("native extension context", false, true),
+            ] {
+                let request = |scope| {
+                    let builder = {
+                        let builder = MessageSearchRequest::builder(
+                            MessageQuery::literal(query).unwrap(),
+                            MessageTarget::content(),
+                        );
+                        if let Some(role) = scope {
+                            builder.role(role)
+                        } else {
+                            builder
+                        }
+                    };
+                    if notice {
+                        builder.kind(crate::models::MessageKind::HarnessNotice)
+                    } else {
+                        builder
+                    }
+                    .build()
+                    .unwrap()
+                };
+                assert_eq!(
+                    service
+                        .search(request(Some(crate::models::Role::User)))
+                        .unwrap()
+                        .hits()
+                        .len(),
+                    usize::from(expected_input),
+                    "{}: {query}",
+                    adapter.provider.as_str()
+                );
+                assert_eq!(
+                    service.search(request(None)).unwrap().hits().len(),
+                    1,
+                    "all-source search preserves {}: {query}",
+                    adapter.provider.as_str()
+                );
+            }
+            for message in &parsed.messages {
+                message.provenance.validate(&message.content).unwrap();
+            }
+        }
+    }
+
     /// A transcript whose records are not in time order still reports the span it covers.
     ///
     /// Records normally arrive in order, so the last one is the latest. A repaired file, a
@@ -900,6 +1096,7 @@ mod tests {
             format!(
                 r#"{{"type":"session","version":3,"id":"{run_id}","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}}
 {{"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{{"role":"user","content":[{{"type":"text","text":"trace the caller"}}]}}}}
+{{"type":"message","id":"command","message":{{"role":"bashExecution","command":"delegated command","output":"generated output","cancelled":true}}}}
 "#
             ),
         )
@@ -928,6 +1125,16 @@ mod tests {
             parsed.messages[0].provenance.authorship,
             crate::models::MessageAuthorship::Agent
         );
+        let command = &parsed.messages[1];
+        assert_eq!(
+            command.provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(
+            command.provenance.content_parts[0].authorship,
+            crate::models::ContentPartAuthorship::Agent
+        );
+        command.provenance.validate(&command.content).unwrap();
     }
 
     /// A run whose transcript names no id falls back to a parent-qualified name rather than a

@@ -103,10 +103,10 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master; no semver tags, and upstream requires a master-history SHA
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: msrv-1.88.0
+          shared-key: msrv-1.89.0
       - run: cargo test -p ai-session-search --lib --locked --no-run
       - run: cargo check -p ai-session-search-api-consumer --lib --locked
 

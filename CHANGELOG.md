@@ -43,6 +43,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    (`2026-01/..`, `../2026-03`) select everything after or before a date, and a space may
    separate date and time (`2026-01-15 14:30`), as RFC 3339 allows.
 
+5. `messages search --role user` and matching Rust, Python and MCP role selectors now find
+   recorded prompts, commands, queued submissions and interactive answers across stored roles.
+   Known parent-agent prompts sent to spawned sessions are excluded from this selector. Returned
+   records keep their original roles; omitting the role filter still searches complete content.
+
 ### Deprecated
 
 1. `Db::purge_injected_messages`: it now relabels through `Db::classify_injected_messages`
@@ -80,9 +85,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    - a source that gets a new session id moves its rows to that id, skipping rows the id
      already holds. They used to be deleted with the old id.
 
-   A new parser version still replaces the session, because it may render the same message
-   differently. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
-   avoids took 1.65 s.
+   Parser upgrades also retain archive-only messages and file edits while repairing identifiable
+   source rows. A prior same-parser measurement on a 20,000-message session took 43 ms for the
+   kept reindex; the full replacement it avoided took 1.65 s.
 
 8. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout
    as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so it missed
@@ -91,6 +96,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    that cannot be decompressed is a warned parse failure for a session not yet indexed. For an
    indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
    `aise doctor`, and reads the file again on the next refresh.
+9. Claude queued submissions and structurally attributable `AskUserQuestion` answers are
+   searchable. Input-focused search includes legacy queue submissions while keeping their sender unknown.
+   They remain submitted because the source does not prove delivery.
+   Independent same-text submissions survive source rewrites, and parser upgrades preserve
+   file-edit replay order.
+10. User-input message searches preserve NUL-containing prompts and answers, Unicode match
+    coordinates, and boundaries between user content and generated text. Literal and regex
+    queries containing NUL use the safe portions of the trigram prefilter.
+11. Gemini CLI native JSONL history retains original user prompts when context patches replace
+    their current content. Legacy JSON/JSONL migrations retain archived inputs and message
+    references without counting the same native event again on refresh.
+12. Native input regions in Codex, Cursor, Antigravity and Pi/Prime records retain their source
+    distinctions from generated context and command output. Correlated Codex answers in known
+    spawned sessions follow the existing agent-attribution convention.
 
 ### Performance
 
@@ -106,14 +125,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    timestamp changed but whose content did not now takes 27 ms on a 20,000-message session,
    down from 1.65 s.
 
+### Security
+
+1. Upgrade bundled SQLite from 3.53.2 to 3.54.1 to resolve RUSTSEC-2026-0459, which can expose
+   uninitialized memory when opening a crafted database and WAL. Source builds now require
+   Rust 1.89 or newer, up from 1.88; prebuilt CLI and MCP users do not need a Rust compiler.
+
 ### For contributors
 
-1. `Cargo.lock` takes the newest release of each dependency that is semver-compatible, builds
-   with the minimum supported Rust (1.88), and is at least 7 days old as of November 7, 2026,
-   the cooldown `.github/dependabot.yml` applies. Among them: `rmcp` 3.4.0 to 3.8.0, `tokio`
+1. The November 7, 2026 dependency refresh selected semver-compatible releases that build
+   with Rust 1.88 and were at least 7 days old, matching the cooldown in
+   `.github/dependabot.yml`. Among them: `rmcp` 3.4.0 to 3.8.0, `tokio`
    1.53.3 to 1.54.1, `pyo3` 0.29.2 to 0.29.3, `ureq` 3.4.2 to 3.5.0, and `uuid` 1.24.0 to
    1.26.1. `jiff` stays at 0.2.39, which `main` already uses. `pyo3` 0.30 and `rusqlite` 0.41
-   fall outside the current version requirements; each needs its own change.
+   fell outside that refresh's version requirements; the SQLite security upgrade above is a
+   separate change.
+   A later security update selects `rmcp` 3.9.0 to resolve RUSTSEC-2026-0462.
 2. The workspace uses Cargo's resolver 3, so `cargo update` selects only versions that build
    with the declared `rust-version`.
 3. `dirs` 6.0.0 to 7.0.0. Its only source change moves Windows `preference_dir()` from Local to
