@@ -21,6 +21,9 @@ os.environ.update(_EXECUTION_ENV)
 
 
 @pytest.fixture(autouse=True)
-def _isolated_aise_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for key, value in environment(tmp_path / "runtime").items():
+def _isolated_aise_config(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A root of its own, not under tmp_path: tests that assert what tmp_path holds must not see it.
+    for key, value in environment(tmp_path_factory.mktemp("runtime")).items():
         monkeypatch.setenv(key, value)
