@@ -250,3 +250,12 @@ pub fn caller_built_inputs(
     ai_session_search::files::reconstruct(&[write, edit], 2)
 }
 
+// Compile the Rust examples in the repository README and the library guide. They live outside the
+// published crate, so this unpublished crate owns the check.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct RepositoryReadmeExamples;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/development/library-api.md")]
+struct LibraryGuideExamples;

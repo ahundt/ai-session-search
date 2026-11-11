@@ -267,3 +267,10 @@ mod storage_pressure_tests {
         }
     }
 }
+
+// Compile the Rust examples in the crate README, which ships in the package, so an API change that
+// breaks one fails `cargo test --doc`. The repository README and library guide are compiled by the
+// unpublished `tests/rust-api-consumer` crate, because their paths do not exist in the package.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct CrateReadmeExamples;

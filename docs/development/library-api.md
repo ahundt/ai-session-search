@@ -128,12 +128,12 @@ use ai_session_search::service::SessionSearch;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = SessionSearch::load()?;
-    // Every field but the limit keeps its default, including session_kinds, which returns both
-    // user-started sessions and the subagent runs they spawned.
-    let sessions = app.catalog().list_sessions(&SearchFilters {
-        limit: 20,
-        ..SearchFilters::default()
-    })?;
+    // Public types are #[non_exhaustive]: start from the default and set fields. Every field but
+    // the limit keeps its default, including session_kinds, which returns both user-started
+    // sessions and the subagent runs they spawned.
+    let mut filters = SearchFilters::default();
+    filters.limit = 20;
+    let sessions = app.catalog().list_sessions(&filters)?;
     let status = app.index().status()?;
     println!("{} sessions; {} repairs", sessions.len(), status.repair_commands.len());
     Ok(())

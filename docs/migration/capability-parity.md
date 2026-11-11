@@ -131,12 +131,11 @@ use ai_session_search::service::SessionSearch;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = SessionSearch::load()?;
-    let sessions = app.catalog().list_sessions(&SearchFilters {
-        limit: 50,
-        // Every other field defaults to no filtering, including `session_kinds`, which
-        // returns both user-started sessions and the subagent runs they spawned.
-        ..SearchFilters::default()
-    })?;
+    // Every other field defaults to no filtering, including `session_kinds`, which
+    // returns both user-started sessions and the subagent runs they spawned.
+    let mut filters = SearchFilters::default();
+    filters.limit = 50;
+    let sessions = app.catalog().list_sessions(&filters)?;
     let messages = app.messages().search_legacy("timeout", &MessageFilters::default())?;
     let status = app.index().status()?;
     println!("{} {} {}", sessions.len(), messages.len(), status.repair_commands.len());
@@ -152,12 +151,12 @@ name-derived relationship hints, taxonomy planning, and artifact publication now
 through the shared Rust service and immutable publication plan:
 
 ```rust,ignore
-let policy = AnalysisPolicySpec {
-    classification_rules,
-    relationship_rules,
-    phrase_vocabulary,
-    max_classification_chars,
-}.compile()?;
+let mut spec = AnalysisPolicySpec::default();
+spec.classification_rules = classification_rules;
+spec.relationship_rules = relationship_rules;
+spec.phrase_vocabulary = phrase_vocabulary;
+spec.max_classification_chars = max_classification_chars;
+let policy = spec.compile()?;
 let result = app.analysis().run(&filters, &policy)?;
 let plan = AnalysisPublicationPlan::new(output_dir, formats)?;
 plan.preflight()?;
