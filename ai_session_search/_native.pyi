@@ -618,7 +618,7 @@ class SelectedSkillLocation:
 class CapabilityExecutionSource:
     """Where the deterministic capability bytes executed by a skill came from."""
 
-    kind: Literal["embedded", "path"]
+    kind: Literal["embedded", "path", "inline"]
     canonical_capability_toml: Path | None
 
 @final
