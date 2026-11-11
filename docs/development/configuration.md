@@ -101,7 +101,7 @@ Future access restrictions must live in these strict namespaces so older binarie
 
 ## Config compatibility when upgrading
 
-From 1.0.1 onward, newer ordinary config keys do not prevent an older binary from loading the file.
+From 1.1.0 onward, newer ordinary config keys do not prevent an older binary from loading the file.
 Unknown access restrictions still require a binary that understands them. The released 1.0.0 binary
 remains strict, including ordinary tables. Automatic startup and upgrade refresh never add active
 keys to an existing config. `aise config init` keeps new defaults commented and refuses to replace

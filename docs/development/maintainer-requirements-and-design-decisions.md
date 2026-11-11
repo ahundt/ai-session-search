@@ -501,7 +501,7 @@ Native install receipts may ignore additive metadata but still require the suppo
 package identity, target/version evidence, and executable hash; unknown metadata grants no authority.
 
 The immutable 1.0.0 skill-manifest reader rejects unknown top-level keys and silently drops unknown
-nested keys on rewrite. A 1.0.1 reader cannot restore fields an older writer already discarded.
+nested keys on rewrite. A 1.1.0 reader cannot restore fields an older writer already discarded.
 Background status is weaker evidence: unknown optional failure details become unclassified, while
 an unknown refresh state remains unknown and must never be reported as successful.
 
@@ -657,7 +657,7 @@ install each published release's integrations and printed config from `UPGRADE_F
 `scripts/verify_upgrade_path.py` on, run the new executable, and fail when anything would need a
 manual step.
 
-Starting with 1.0.1, ordinary config tables tolerate unknown keys from newer releases. Serde's
+Starting with 1.1.0, ordinary config tables tolerate unknown keys from newer releases. Serde's
 ignored-field tracking collects dotted paths on `Config::unknown_config_keys`; loading prints
 nothing. Suggestions use serialized typed fields and existing registries, without a parallel list
 of valid keys. Doctor's human/JSON status and MCP `get_index_status` report these diagnostics;

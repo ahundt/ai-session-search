@@ -11,15 +11,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Upgrading from 1.0.0
+
+Index generation 6 keeps 1.0.0 from deleting archived messages and file edits: a newly
+started 1.0.0 refuses to open it. A healthy generation-5 index is upgraded by changing metadata
+only, without rereading transcripts or rebuilding FTS indexes. Stop running aise processes
+(restart harnesses) before upgrading an index 1.0.0 uses; a 1.0.0 process that already has it
+open can still delete archived history. To downgrade, move the index aside and run
+`aise reindex --full` with 1.0.0, which rebuilds from the transcripts; the moved index keeps the
+archived history for a later upgrade.
+
 ### Rust API
 
-1. `MessageProvenance`, `MessageHit`, `MessageContentPart`, `MessageCorrelationIdentity`,
-   `RawMessage`, and the provenance enums (`MessageAuthorship`, `ContentPartAuthorship`,
-   `ContentPartOrigin`, `MessageCorrelationAuthority`, `MessageRecordRelation`,
-   `MessageInputOrigin`, `InputDeliveryState`) are non-exhaustive. Construct through provided
-   constructors or defaults; add wildcard match arms. `MessageProvenance::hit_header()` replaces
-   `HitProvenance`. Use `RawMessage::with_authorship` before normalization in place of
-   `apply_user_role_authorship`; `UserRoleAuthorshipEvidence` is now crate-private.
+The Python, CLI, and MCP interfaces are unchanged.
+
+1. Every exported struct and enum is `#[non_exhaustive]`, so later releases can add fields and
+   variants without breaking Rust callers; 1.0.0 exported most of them exhaustive. Struct literals
+   and exhaustive matches on these types no longer compile outside the crate: start from
+   `T::default()` or the type's constructor, and add a wildcard match arm. Clippy's
+   `exhaustive_structs` and `exhaustive_enums` lints keep new types non-exhaustive.
+
+   ```rust
+   // 1.0.0
+   let filters = SearchFilters { path_prefix: Some(dir), ..SearchFilters::default() };
+   // 1.1.0
+   let mut filters = SearchFilters::default();
+   filters.path_prefix = Some(dir);
+   ```
+2. `MessageProvenance::hit_header()` replaces `HitProvenance`. Call `RawMessage::with_authorship`
+   before normalization instead of `apply_user_role_authorship`; `UserRoleAuthorshipEvidence` is
+   crate-private.
 
 ### Added
 
@@ -47,7 +68,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    Unsupported formats refuse before recovery changes any artifact, and supported rewrites preserve
    additive fields.
 8. Skill manifests preserve additive fields at every level. A 1.0.0 reader still rejects unknown
-   top-level fields and drops unknown nested fields on rewrite; 1.0.1 cannot recover discarded fields.
+   top-level fields and drops unknown nested fields on rewrite; 1.1.0 cannot recover discarded fields.
 9. Background refresh reports stay readable when an optional failure kind is unfamiliar; an unknown
    refresh state stays explicitly unrecognized.
 10. Native-archive ownership checks tolerate additive receipt metadata while continuing to require
@@ -79,12 +100,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    (`2 weeks`) forms; `3 days ago` still selects that whole day. EDTF open intervals
    (`2026-01/..`, `../2026-03`) select everything after or before a date, and a space may
    separate date and time (`2026-01-15 14:30`), as RFC 3339 allows.
-5. Index generation 6 protects archived messages and file edits from older writers. Healthy
-   generation-5 indexes receive a metadata-only promotion; it does not reread transcripts or rebuild
-   FTS indexes. Stop running aise processes (restart harnesses) before upgrading an index used by
-   1.0.0: an already-open old writer can still erase retained history. New 1.0.0 data opens refuse
-   generation 6; keep the archive and upgrade the executable again to read it.
-
 5. `messages search --role user` and matching Rust, Python and MCP role selectors now find
    recorded prompts, commands, queued submissions and interactive answers across stored roles.
    Known parent-agent prompts sent to spawned sessions are excluded from this selector. Returned
@@ -114,11 +129,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    40,180-message Codex session, three sequence numbers each named two messages written a day
    apart. New messages now continue after the highest stored sequence number, and a reindex of
    a session with gaps in its numbering replaces it from the parse.
-6. A full reindex deleted stored user-role rows starting with `<environment_context>`,
+5. A full reindex deleted stored user-role rows starting with `<environment_context>`,
    `<turn_aborted>` or `<local-command-*>`, records the parsers now keep on purpose. These rows
    are now labelled harness notices, which default search, corrections and repeat mining leave
    out, and nothing is deleted.
-7. A reindex no longer deletes stored messages when a harness shrinks or rewrites its
+6. A reindex no longer deletes stored messages when a harness shrinks or rewrites its
    transcript. One Codex session went from 4,720 indexed messages to 16 after Codex rewrote
    its file. With the same parser version, aise keeps the stored messages and file edits and
    adds the new ones:
@@ -131,84 +146,84 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    parse, keeps the rows it cannot match, and adds the new ones after them. On a
    20,000-message session the kept reindex takes 43 ms; the full replace it avoids took 1.65 s.
 
-8. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout
+7. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout
    as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so it missed
    everything Codex wrote after its last read of such a session. The compressed file is now the
    same source as its plain form, and the session keeps its id and stored messages. A `.zst`
    that cannot be decompressed is a warned parse failure for a session not yet indexed. For an
    indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
    `aise doctor`, and reads the file again on the next refresh.
-9. OpenCode loads the aise MCP server. aise wrote it directly under `mcp`, which OpenCode 2
+8. OpenCode loads the aise MCP server. aise wrote it directly under `mcp`, which OpenCode 2
    ignores, so `opencode mcp list` reported no servers. It is now written to
    `mcp.servers.ai-session-search` with `type: "local"`, and `aise integrations install` moves
    an entry left in the old place.
-10. Zed on macOS loads the aise MCP server. aise wrote it to
+9. Zed on macOS loads the aise MCP server. aise wrote it to
     `~/Library/Application Support/Zed/settings.json`, but Zed reads `~/.config/zed/settings.json`
     there. Install now writes the file Zed reads and removes aise's entry from the old one,
     keeping any other servers in it. Linux and Windows paths were already correct.
-11. `aise integrations install` edits client JSON files that contain comments or trailing
+10. `aise integrations install` edits client JSON files that contain comments or trailing
     commas, as Zed's settings and VS Code's `mcp.json` allow. One such file made the whole
     install fail for every client. aise now changes only its own entry and leaves the comments,
     commas and other settings as they were.
-12. The Kilo Code CLI and JetBrains plugin load the aise MCP server. aise wrote only the VS Code
+11. The Kilo Code CLI and JetBrains plugin load the aise MCP server. aise wrote only the VS Code
     extension's `mcp_settings.json`, which Kilo 7 reads only inside VS Code. Install now also
     writes `mcp.ai-session-search` into `~/.config/kilo/kilo.jsonc`, which every Kilo 7 surface
     reads.
-13. OpenClaw loads the aise MCP server. aise wrote a top-level `mcpServers` in
+12. OpenClaw loads the aise MCP server. aise wrote a top-level `mcpServers` in
     `~/.openclaw/openclaw.json`, but OpenClaw reads servers from `mcp.servers`, and its file is
     JSON5, which aise could not parse. Install now writes `mcp.servers.ai-session-search`, removes
     the old entry, and keeps the file's comments and JSON5 syntax.
-14. Upgrading moves these MCP entries without a manual step. The first command after an upgrade
+13. Upgrading moves these MCP entries without a manual step. The first command after an upgrade
     already refreshed installed skills and instruction blocks; it now also moves an aise MCP
     entry an earlier release left where its client no longer reads it, keeping the executable
     that entry named. Clients without an existing aise integration are left alone.
 
-15. Pi 0.99.0 and newer receive the aise MCP server in `~/.pi/agent/mcp.json` and MCP-first
+14. Pi 0.99.0 and newer receive the aise MCP server in `~/.pi/agent/mcp.json` and MCP-first
     instructions. Earlier installs provided only CLI guidance. Untouched CLI-only integrations
     gain the MCP registration during the post-upgrade refresh.
 
-16. Prime Agent receives a local aise MCP registration under `mcpServers` in
+15. Prime Agent receives a local aise MCP registration under `mcpServers` in
     `~/.prime/agent/settings.json` with its required `type: "stdio"`. It previously received only
     CLI guidance; untouched CLI-only integrations also gain the registration during refresh.
 
-17. Cursor receives the required `type: "stdio"` in `~/.cursor/mcp.json`. aise omitted the
+16. Cursor receives the required `type: "stdio"` in `~/.cursor/mcp.json`. aise omitted the
     field; install and the post-upgrade refresh now add it to earlier untyped registrations.
 
-18. Claude Code no longer receives an aise entry in `~/.claude/.mcp.json`, which is not its
+17. Claude Code no longer receives an aise entry in `~/.claude/.mcp.json`, which is not its
     user MCP configuration. Install writes `~/.claude.json` and removes aise entries from the old
     file; the post-upgrade refresh also moves an entry left there, preserving other content.
 
-19. Gemini CLI uses `<gemini home>/.agents/skills/ai-session-search`, where Gemini home is
+18. Gemini CLI uses `<gemini home>/.agents/skills/ai-session-search`, where Gemini home is
     `GEMINI_CLI_HOME` or the real home; Codex keeps `~/.agents/skills/ai-session-search`.
     Matching paths share one link, avoiding a duplicate skill warning; different paths get separate
     links, and uninstalling either harness preserves the other's link. Install and upgrade refresh
     remove untouched aise-owned entries from `<gemini home>/.gemini/skills/ai-session-search`;
     modified or foreign entries are preserved and reported.
 
-20. MCP registrations retain explicitly selected config, database, cache, and harness paths
+19. MCP registrations retain explicitly selected config, database, cache, and harness paths
     when a client starts the server without the installer's environment. Reinstall preserves
     the entry's environment and unknown fields, and refuses conflicting state selections before
     writing. Config-file database and cache settings remain editable without reinstalling.
-21. `aise config init` records CLI- or environment-selected database and cache paths instead
+20. `aise config init` records CLI- or environment-selected database and cache paths instead
     of platform defaults. `aise package update` passes state selections to the replacement
     executable's skill refresh.
-22. Configs with newer ordinary keys load on 1.0.1 and later. Interactive CLI commands name ignored
+21. Configs with newer ordinary keys load on 1.1.0 and later. Interactive CLI commands name ignored
     keys on stderr; MCP serving emits no unknown-key warnings. Provider source restrictions, search
     scope, hard search budgets, and purpose/policy tables still reject unknown keys with recovery
     guidance. The released 1.0.0 binary remains strict: automatic upgrades never add active keys to
     an existing config, and `config init` keeps new defaults commented.
-23. Claude queued submissions and structurally attributable `AskUserQuestion` answers are
+22. Claude queued submissions and structurally attributable `AskUserQuestion` answers are
    searchable. Input-focused search includes legacy queue submissions while keeping their sender unknown.
    They remain submitted because the source does not prove delivery.
    Independent same-text submissions survive source rewrites, and parser upgrades preserve
    file-edit replay order.
-24. User-input message searches preserve NUL-containing prompts and answers, Unicode match
+23. User-input message searches preserve NUL-containing prompts and answers, Unicode match
     coordinates, and boundaries between user content and generated text. Literal and regex
     queries containing NUL use the safe portions of the trigram prefilter.
-25. Gemini CLI native JSONL history retains original user prompts when context patches replace
+24. Gemini CLI native JSONL history retains original user prompts when context patches replace
     their current content. Legacy JSON/JSONL migrations retain archived inputs and message
     references without counting the same native event again on refresh.
-26. Native input regions in Codex, Cursor, Antigravity and Pi/Prime records retain their source
+25. Native input regions in Codex, Cursor, Antigravity and Pi/Prime records retain their source
     distinctions from generated context and command output. Correlated Codex answers in known
     spawned sessions follow the existing agent-attribution convention.
 

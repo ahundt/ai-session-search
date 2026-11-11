@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "ai-session-search"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "ai-session-search-python"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "ai-session-search",
  "anyhow",
