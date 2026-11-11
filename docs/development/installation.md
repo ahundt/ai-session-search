@@ -223,10 +223,26 @@ for the target platform, because SQLite is built from bundled C.
 
 ## Update and uninstall
 
-Before upgrading an index used by 1.0.0, **stop running aise processes (restart harnesses)**.
-The 1.0.1 generation-6 promotion blocks fresh 1.0.0 data opens, but cannot revoke a writer that
-already opened the index. Keep the promoted archive if downgrading; 1.0.0 needs a separate
-generation-5 snapshot, which omits any history archived after that snapshot.
+Before upgrading an index 1.0.0 uses, **stop running aise processes (restart harnesses)**. 1.1.0
+moves the index to generation 6 on first open. A newly started 1.0.0 refuses it, but a 1.0.0
+process that already has it open can delete the history 1.1.0 keeps from shrunk, rewritten, or
+deleted transcripts.
+
+To downgrade, stop every aise process, then:
+
+```bash
+# The index 1.1.0 uses, before anything moves.
+DB="$(aise config show | sed -n 's/^db_path = "\(.*\)"$/\1/p')"
+# Move the index and its WAL files aside together.
+for f in "$DB" "$DB-wal" "$DB-shm"; do [ -e "$f" ] && mv "$f" "$f.from-1.1.0"; done
+uv tool install --force 'ai-session-search==1.0.0'   # or your package manager's command below
+aise --database "$DB" reindex --full                 # rebuild at the same path from the transcripts
+```
+
+Name the path for the rebuild: with the file moved, 1.0.0 could otherwise resolve its default to a
+different directory. 1.0.0 loads the config and integration state 1.1.0 leaves. History that only
+1.1.0 kept stays in the `.from-1.1.0` files; after upgrading again, move them back over the rebuilt
+index.
 
 Use the same owner for installation, update, and removal. Before removing a
 global command, remove its MCP registrations while the command is still

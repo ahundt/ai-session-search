@@ -13,7 +13,13 @@ For each earlier release, in an empty home directory:
 3. run one ordinary command with the candidate executable, which is all an upgrade through uv,
    pip, Cargo, or a native archive does;
 4. require `aise integrations status --format json` to report every integration the earlier
-   release installed as `current`.
+   release installed as `current`;
+5. require the earlier release to still read that config and integration state, as it must
+   after a downgrade.
+
+From 1.0.0 it also proves the documented index downgrade: 1.0.0 refuses the candidate's index,
+rebuilds from the transcripts once that index is moved aside, and the moved index keeps every
+archived row for the next upgrade.
 
 A failure names the release and what would have needed a manual step. CI runs this on every
 push against the Linux build, so a change that breaks upgrades fails before it merges, and the
@@ -184,6 +190,11 @@ def archive_evidence(database: sqlite3.Connection) -> dict[str, bool]:
 
 
 def _archive_writer_evidence(command: Sequence[str], home: pathlib.Path) -> dict[str, bool]:
+    return _archive_home(command, home)[0]
+
+
+def _archive_home(command: Sequence[str], home: pathlib.Path) -> tuple[dict[str, bool], dict[str, str]]:
+    """Index a transcript, shrink and rewrite it, and return the archive markers and environment."""
     home.mkdir()
     environment = isolated_environment(home)
     config = pathlib.Path(environment["AI_SESSION_SEARCH_CONFIG"])
@@ -232,7 +243,109 @@ def _archive_writer_evidence(command: Sequence[str], home: pathlib.Path) -> dict
     write_source(["gamma"])
     reindex()
     with sqlite3.connect(environment["AI_SESSION_SEARCH_DATABASE"]) as database:
-        return archive_evidence(database)
+        return archive_evidence(database), environment
+
+
+DOWNGRADE_GUIDE = pathlib.Path(__file__).resolve().parents[1] / "docs/development/installation.md"
+DOCUMENTED_REBUILD = 'aise --database "$DB" reindex --full'
+
+
+def _index_files(database: pathlib.Path) -> list[pathlib.Path]:
+    return [database.with_name(database.name + suffix) for suffix in ("", "-wal", "-shm")]
+
+
+def check_downgrade(old: Sequence[str], executable: pathlib.Path) -> list[str]:
+    """Prove the documented downgrade: move the index aside and let the earlier release rebuild.
+
+    The candidate's index refuses the earlier release, the earlier release rebuilds from the
+    transcripts still on disk, and the index moved aside keeps every archived row for an upgrade
+    back.
+    """
+    if os.name == "nt":
+        raise UpgradeCheckUnavailable("historical archive writers require a disposable Unix home")
+    with tempfile.TemporaryDirectory(prefix="aise-downgrade-") as directory:
+        evidence, environment = _archive_home([str(executable)], pathlib.Path(directory).resolve() / "home")
+        if not all(evidence.values()):
+            return [f"candidate did not retain every archive marker before the downgrade: {evidence}"]
+        database = pathlib.Path(environment["AI_SESSION_SEARCH_DATABASE"])
+        refused = _run([*old, "reindex"], environment)
+        if refused.returncode == 0 or "newer than this aise build" not in refused.stderr:
+            return [f"the earlier release did not refuse the candidate's index: exit "
+                    f"{refused.returncode}, {refused.stderr.strip()}"]
+        moved = _move_index_as_documented(executable, environment, database)
+        if isinstance(moved, str):
+            return [moved]
+        problems = _rebuild_with_earlier_release(old, environment, database, moved)
+        for path in _index_files(database):
+            path.unlink(missing_ok=True)
+        _rename_existing({kept: path for path, kept in moved.items()})
+        restored = _run([str(executable), "reindex"], environment)
+        if restored.returncode != 0:
+            problems.append(f"the candidate could not reopen the restored index: {restored.stderr.strip()}")
+        with sqlite3.connect(database) as connection:
+            after = archive_evidence(connection)
+        problems.extend(f"restored index lost {name}" for name, kept in after.items() if not kept)
+        return problems
+
+
+def _rename_existing(moves: dict[pathlib.Path, pathlib.Path]) -> None:
+    for source, target in moves.items():
+        if source.exists():
+            source.rename(target)
+
+
+def _documented_downgrade_lines() -> list[str]:
+    """The shell lines of the downgrade block in installation.md, comments and blanks removed."""
+    text = DOWNGRADE_GUIDE.read_text(encoding="utf-8")
+    block = re.search(r"To downgrade, stop every aise process.*?```bash\n(.*?)```", text, re.S)
+    if block is None:
+        raise UpgradeCheckUnavailable(f"{DOWNGRADE_GUIDE} has no downgrade command block")
+    lines = [line.split("  #")[0].strip() for line in block.group(1).splitlines()]
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def _move_index_as_documented(
+    executable: pathlib.Path, environment: dict[str, str], database: pathlib.Path
+) -> dict[pathlib.Path, pathlib.Path] | str:
+    """Run the guide's own path lookup and move loop with the candidate first on PATH.
+
+    Returns each moved index file mapped to where the guide put it, or the problem that stopped
+    it, so a wrong command in the guide fails here rather than on a user's index.
+    """
+    lines = _documented_downgrade_lines()
+    if DOCUMENTED_REBUILD not in lines:
+        return f"the downgrade guide no longer rebuilds with `{DOCUMENTED_REBUILD}`"
+    steps = [line for line in lines if not line.startswith(("uv tool install", DOCUMENTED_REBUILD))]
+    shell = {**environment, "PATH": f"{executable.parent}{os.pathsep}{environment['PATH']}"}
+    result = _run(["bash", "-euc", "\n".join([*steps, 'printf "%s" "$DB"'])], shell)
+    if result.returncode != 0 or result.stdout != str(database):
+        return (f"the guide's commands did not move {database}: exit {result.returncode}, "
+                f"printed {result.stdout!r}, {result.stderr.strip()}")
+    moved = {path: path.with_name(path.name + ".from-1.1.0") for path in _index_files(database)}
+    left = [str(path) for path in _index_files(database) if path.exists()]
+    if left or not moved[database].exists():
+        return f"the guide's commands left {left or [str(database)]} in place"
+    return {path: kept for path, kept in moved.items() if kept.exists()}
+
+
+def _rebuild_with_earlier_release(
+    old: Sequence[str],
+    environment: dict[str, str],
+    database: pathlib.Path,
+    moved: dict[pathlib.Path, pathlib.Path],
+) -> list[str]:
+    """Rebuild at the same path with the earlier release; the moved files must stay byte-identical."""
+    moved_bytes = {kept: kept.read_bytes() for kept in moved.values()}
+    rebuilt = _run([*old, "--database", str(database), "reindex", "--full"], environment)
+    if rebuilt.returncode != 0:
+        return [f"the earlier release could not rebuild after the index was moved aside: "
+                f"{rebuilt.stderr.strip()}"]
+    with sqlite3.connect(database) as connection:
+        current = {row[0] for row in connection.execute("select content from messages")}
+    problems = [] if "gamma" in current else ["the rebuilt index lacks the transcript's current message"]
+    problems += [f"{kept.name} changed while the earlier release ran"
+                 for kept, before in moved_bytes.items() if kept.read_bytes() != before]
+    return problems
 
 
 def check_archive_write_paths(old: Sequence[str], executable: pathlib.Path) -> list[str]:
@@ -249,12 +362,26 @@ def check_archive_write_paths(old: Sequence[str], executable: pathlib.Path) -> l
     return problems
 
 
+def _earlier_release_still_reads(
+    previous: str, old: Sequence[str], environment: dict[str, str], clients: Sequence[str], home: pathlib.Path
+) -> list[str]:
+    """Downgrading replaces the executable again; the earlier release must still read the config
+    and integration state the candidate left behind."""
+    problems = []
+    for command in (["config", "show"], ["integrations", "status", *_client_arguments(clients)]):
+        downgraded = _run([*old, *command], environment)
+        if downgraded.returncode != 0:
+            problems.append(f"{previous} `aise {' '.join(command[:2])}` failed after the candidate "
+                            f"ran: {downgraded.stderr.strip().replace(str(home), '~')}")
+    return problems
+
+
 def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
     """Return the problems an upgrade from ``previous`` to ``executable`` leaves behind."""
     if previous == "1.0.0":
-        archive_problems = check_archive_write_paths(
-            ["uvx", "--quiet", "--from", "ai-session-search==1.0.0", "aise"], executable,
-        )
+        released = ["uvx", "--quiet", "--from", "ai-session-search==1.0.0", "aise"]
+        archive_problems = check_archive_write_paths(released, executable)
+        archive_problems += check_downgrade(released, executable)
         if archive_problems:
             return archive_problems
     home = pathlib.Path(tempfile.mkdtemp(prefix="aise-upgrade-")).resolve()
@@ -301,9 +428,8 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
         )
         if status.returncode != 0:
             return [f"integrations status failed after upgrading from {previous}: {status.stderr}"]
-        return [
-            line.replace(str(home), "~") for line in problems_in_status(status.stdout)
-        ]
+        problems = [line.replace(str(home), "~") for line in problems_in_status(status.stdout)]
+        return problems + _earlier_release_still_reads(previous, old, old_environment, clients, home)
 
     except BackgroundChildrenAlive as error:
         cleanup = False
@@ -357,7 +483,8 @@ def _check_all(versions: list[str], executable: pathlib.Path) -> int:
             for problem in problems:
                 print(f"  {problem}", file=sys.stderr)
         else:
-            print(f"upgrading from {previous}: its config loads and every integration is current")
+            print(f"upgrading from {previous}: its config loads, every integration is current, "
+                  f"and {previous} still loads both after a downgrade")
     if failed:
         return 1
     return 2 if unavailable else 0
