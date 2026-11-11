@@ -144,12 +144,14 @@ impl<'de> Deserialize<'de> for SkillName {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillNameSelector {
     pub name: SkillName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillPathSelector {
     pub path: PathBuf,
 }
@@ -157,6 +159,7 @@ pub struct SkillPathSelector {
 /// Canonical wire selector: exactly one name or path object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum SkillSelector {
     Name(SkillNameSelector),
     Path(SkillPathSelector),

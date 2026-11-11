@@ -211,6 +211,7 @@ impl Row for PlanningCount {
 
 /// One role's message count, for `stats`.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct RoleStat {
     pub role: String,
     pub count: i64,

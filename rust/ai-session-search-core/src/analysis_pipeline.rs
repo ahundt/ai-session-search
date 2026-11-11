@@ -21,6 +21,7 @@ use crate::models::{AnalysisDocument, SessionRecord};
 /// Document field inspected by one classification rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ClassificationTarget {
     Title,
     Summary,
@@ -33,6 +34,7 @@ pub enum ClassificationTarget {
 /// Serializable input for one classification rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ClassificationRuleSpec {
     pub dimension: String,
     pub label: String,
@@ -41,9 +43,28 @@ pub struct ClassificationRuleSpec {
     pub weight: i64,
 }
 
+impl ClassificationRuleSpec {
+    pub fn new(
+        dimension: impl Into<String>,
+        label: impl Into<String>,
+        target: ClassificationTarget,
+        pattern: impl Into<String>,
+        weight: i64,
+    ) -> Self {
+        Self {
+            dimension: dimension.into(),
+            label: label.into(),
+            target,
+            pattern: pattern.into(),
+            weight,
+        }
+    }
+}
+
 /// Semantic meaning of an explicit, name-derived relationship hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RelationshipKind {
     Branch,
     Copy,
@@ -53,10 +74,21 @@ pub enum RelationshipKind {
 /// Serializable relationship rule. `pattern` must contain a named `parent` capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RelationshipRuleSpec {
     pub id: String,
     pub kind: RelationshipKind,
     pub pattern: String,
+}
+
+impl RelationshipRuleSpec {
+    pub fn new(id: impl Into<String>, kind: RelationshipKind, pattern: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            pattern: pattern.into(),
+        }
+    }
 }
 
 /// Validated, serialized policy for optional recurring-phrase aggregation.
@@ -73,6 +105,7 @@ pub struct PhraseVocabularySpec {
 /// Selects which normalized user content contributes to recurring phrases.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PhraseTextMode {
     /// Analyze all normalized user text, including code and configuration snippets.
     #[default]
@@ -88,6 +121,7 @@ pub enum PhraseTextMode {
 /// boundary, then reuse the compiled policy for every document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PhraseVocabularyPolicySpec {
     pub widths: Vec<usize>,
     pub max_unique_phrases: usize,
@@ -102,6 +136,18 @@ pub struct PhraseVocabularyPolicySpec {
 }
 
 impl PhraseVocabularyPolicySpec {
+    /// A policy with the given widths and phrase cap; every other field takes its serde default.
+    pub fn new(widths: Vec<usize>, max_unique_phrases: usize) -> Self {
+        Self {
+            widths,
+            max_unique_phrases,
+            min_document_tokens: 0,
+            excluded_tokens: Vec::new(),
+            exclude_numeric_tokens: default_true(),
+            text_mode: PhraseTextMode::default(),
+        }
+    }
+
     /// Validate and compile this transport representation.
     pub fn compile(&self) -> Result<PhraseVocabularySpec> {
         let widths = self
@@ -222,6 +268,7 @@ pub struct AnalysisPolicy {
 /// Serializable, provider-neutral input for one compiled analysis run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AnalysisPolicySpec {
     pub classification_rules: Vec<ClassificationRuleSpec>,
     pub relationship_rules: Vec<RelationshipRuleSpec>,
@@ -1199,6 +1246,7 @@ fn char_prefix(value: &str, max_chars: Option<NonZeroUsize>) -> &str {
 
 /// One matched codebook rule. No source text is retained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClassificationMatch {
     pub dimension: String,
     pub label: String,
@@ -1209,6 +1257,7 @@ pub struct ClassificationMatch {
 /// Deterministic resolution of one explicit relationship hint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RelationshipResolution {
     Unresolved,
     Resolved { session_id: String },
@@ -1217,6 +1266,7 @@ pub enum RelationshipResolution {
 
 /// Name-derived evidence and its canonical-ID resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RelationshipHint {
     pub rule_id: String,
     pub kind: RelationshipKind,
@@ -1226,6 +1276,7 @@ pub struct RelationshipHint {
 
 /// Analysis metadata for one canonical session. Aggregate user text is intentionally absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AnalyzedSession {
     pub session: SessionRecord,
     pub has_user_text: bool,
@@ -1238,6 +1289,7 @@ pub struct AnalyzedSession {
 
 /// One recurring normalized phrase aggregated without retaining source messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PhraseFrequency {
     pub phrase: String,
     pub words: usize,
@@ -1247,6 +1299,7 @@ pub struct PhraseFrequency {
 
 /// Pure analysis result keyed by canonical session ID, never by mutable/display titles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AnalysisResult {
     pub sessions: BTreeMap<String, AnalyzedSession>,
     pub vocabulary: Vec<PhraseFrequency>,
@@ -1254,6 +1307,7 @@ pub struct AnalysisResult {
 
 /// Canonical session metadata retained by the provider-neutral graph projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionGraphNode {
     pub session_id: String,
     pub provider: String,
@@ -1268,6 +1322,7 @@ pub struct SessionGraphNode {
 
 /// A resolved, directed provenance relationship between two canonical sessions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionGraphEdge {
     pub source_session_id: String,
     pub target_session_id: String,
@@ -1277,6 +1332,7 @@ pub struct SessionGraphEdge {
 
 /// Set-valued membership that must not be interpreted as parent-child lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionGraphGroup {
     pub dimension: String,
     pub key: String,
@@ -1285,6 +1341,7 @@ pub struct SessionGraphGroup {
 
 /// Deterministic graph projection with canonical identity and no inferred all-pairs edges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionGraph {
     pub nodes: BTreeMap<String, SessionGraphNode>,
     pub edges: Vec<SessionGraphEdge>,

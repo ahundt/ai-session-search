@@ -54,6 +54,7 @@ use std::sync::OnceLock;
 
 /// Inclusive lower (`Start`) or upper (`End`) instant a fuzzy period collapses to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Bound {
     Start,
     End,

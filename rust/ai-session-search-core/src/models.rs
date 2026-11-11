@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Provider {
     Claude,
     #[serde(rename = "claude-desktop")]
@@ -117,6 +118,7 @@ impl std::str::FromStr for Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Role {
     User,
     Assistant,
@@ -179,6 +181,7 @@ impl std::str::FromStr for Role {
 /// not equivalent over rows whose stored `kind` is outside the current enum: `AllExcept`
 /// keeps them, `Only` does not. See [`MessageFilters::kind_predicate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KindPredicate {
     /// Caller named no set: return everything except these classes.
     AllExcept(Vec<MessageKind>),
@@ -195,6 +198,7 @@ pub enum KindPredicate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MessageKind {
     Conversation,
     Compaction,
@@ -213,6 +217,7 @@ pub enum MessageKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum MessageSearchMode {
     #[default]
     Literal,
@@ -248,6 +253,7 @@ impl std::str::FromStr for MessageSearchMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SearchField {
     Content,
     ToolName,
@@ -915,6 +921,7 @@ impl MessageProvenance {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Message {
     pub seq: i64,
     pub role: Role,
@@ -928,7 +935,25 @@ pub struct Message {
     pub provenance: MessageProvenance,
 }
 
+impl Message {
+    /// A conversation message with no timestamp, tool, or recorded provenance.
+    pub fn new(seq: i64, role: Role, content: impl Into<String>) -> Self {
+        Self {
+            seq,
+            role,
+            ts: None,
+            tool_name: None,
+            kind: MessageKind::Conversation,
+            tool_call_id: None,
+            is_compaction: false,
+            content: content.into(),
+            provenance: MessageProvenance::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionRecord {
     pub id: String,
     pub provider: Provider,
@@ -974,6 +999,40 @@ pub struct SessionRecord {
     pub agent_label: Option<String>,
 }
 
+impl SessionRecord {
+    /// A session with its identity and parse provenance; every descriptive field is empty.
+    pub fn new(
+        id: impl Into<String>,
+        provider: Provider,
+        provider_session_id: impl Into<String>,
+        source_path: impl Into<String>,
+        parse_version: impl Into<String>,
+        discovery_source: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            provider,
+            provider_session_id: provider_session_id.into(),
+            title: None,
+            summary: None,
+            cwd: None,
+            repo_root: None,
+            created_at: None,
+            updated_at: None,
+            last_message_at: None,
+            preview_text: String::new(),
+            source_path: source_path.into(),
+            message_count: None,
+            parse_version: parse_version.into(),
+            raw_metadata_json: None,
+            parse_warning: None,
+            discovery_source: discovery_source.into(),
+            parent_session_id: None,
+            agent_label: None,
+        }
+    }
+}
+
 /// Opaque keyset cursor for a bounded session-analysis document scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -995,6 +1054,7 @@ impl AnalysisCursor {
 /// whose transcript role is `user`: agent delegation, harness, generated, mirrored, and unknown
 /// content is excluded, while only human-authored parts of mixed messages are retained.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct AnalysisDocument {
     pub session: SessionRecord,
     pub user_text: String,
@@ -1005,6 +1065,7 @@ pub struct AnalysisDocument {
 
 /// One bounded keyset page of provider-normalized analysis documents.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct AnalysisDocumentPage {
     pub documents: Vec<AnalysisDocument>,
     pub next_cursor: Option<AnalysisCursor>,
@@ -1015,6 +1076,7 @@ pub struct AnalysisDocumentPage {
 /// [`Message`], persisted to the `file_edits` table, and replayed to reconstruct
 /// historical file content (`files extract`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FileEdit {
     /// Monotonic order within the session (independent of message seq).
     pub seq: i64,
@@ -1030,11 +1092,30 @@ pub struct FileEdit {
     pub edits: Vec<EditOp>,
 }
 
+impl FileEdit {
+    /// An edit with no timestamp, no full content and no replacements; `file_name` is the
+    /// basename of `file_path`, as the parsers store it. Set `new_content` for a `Write` or push
+    /// [`EditOp`]s for an `Edit`.
+    pub fn new(seq: i64, tool: impl Into<String>, file_path: impl Into<String>) -> Self {
+        let file_path = file_path.into();
+        Self {
+            seq,
+            ts: None,
+            tool: tool.into(),
+            file_name: crate::util::file_basename(&file_path),
+            file_path,
+            new_content: None,
+            edits: Vec::new(),
+        }
+    }
+}
+
 /// One `old_string`→`new_string` replacement from an `Edit`/`MultiEdit` tool call.
 /// `replace_all` mirrors Claude's `Edit` flag: when true the replacement is applied to
 /// every occurrence, otherwise only the first (which is also the only one, since a
 /// non-`replace_all` `Edit` requires `old_string` to be unique).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EditOp {
     pub old: String,
     pub new: String,
@@ -1055,6 +1136,7 @@ impl EditOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ParsedSession {
     pub session: SessionRecord,
     pub transcript_text: String,
@@ -1064,12 +1146,42 @@ pub struct ParsedSession {
     pub file_edits: Vec<FileEdit>,
 }
 
+impl ParsedSession {
+    /// A parse result with no transcript text and no file edits.
+    pub fn new(session: SessionRecord, messages: Vec<Message>) -> Self {
+        Self {
+            session,
+            transcript_text: String::new(),
+            messages,
+            file_edits: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SourceFile {
     pub provider: Provider,
     pub path: std::path::PathBuf,
     pub mtime_ns: i64,
     pub size_bytes: i64,
+}
+
+impl SourceFile {
+    /// A transcript file to hand to a provider adapter's `parse`, as its `discover` reports one.
+    pub fn new(
+        provider: Provider,
+        path: impl Into<std::path::PathBuf>,
+        mtime_ns: i64,
+        size_bytes: i64,
+    ) -> Self {
+        Self {
+            provider,
+            path: path.into(),
+            mtime_ns,
+            size_bytes,
+        }
+    }
 }
 
 /// Who started a session — the session-level counterpart of [`MessageKind`], selected the same
@@ -1096,6 +1208,7 @@ pub struct SourceFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SessionKind {
     /// A session a person started. Codex's `thread_source: "user"`; claude's
     /// `isSidechain: false`, which held on 143,220 of 143,224 records in top-level transcripts.
@@ -1165,6 +1278,7 @@ impl std::str::FromStr for SessionKind {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SearchFilters {
     pub provider: Option<Provider>,
     /// Which classes of session to return. `None` selects the default set
@@ -1220,6 +1334,7 @@ impl SearchFilters {
 /// recency sample, message limit, or claim of representativeness.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AnalysisSessionSelection {
     /// Analyze every session accepted by the request scope.
     #[default]
@@ -1272,6 +1387,7 @@ impl AnalysisRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SessionWithTranscript {
     #[serde(flatten)]
     pub session: SessionRecord,
@@ -1279,6 +1395,7 @@ pub struct SessionWithTranscript {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SearchHit {
     #[serde(flatten)]
     pub session: SessionRecord,
@@ -1321,6 +1438,7 @@ pub(crate) fn serialize_hit_provenance<
 /// means unlimited; fuzzy validation requires a positive finite page.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageFilters {
     /// User selects recorded input across source roles in search and range reads.
     /// Other roles select stored roles; analytics retain their operation-specific policies.
@@ -1597,6 +1715,7 @@ impl MessageHit {
 /// Kept off [`MessageHit`] so the CLI table rendering is unchanged; the MCP layer joins
 /// it on via [`crate::db::Db::session_metadata`].
 #[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct SessionMeta {
     pub provider_session_id: Option<String>,
     pub cwd: Option<String>,
@@ -1617,6 +1736,7 @@ pub struct SessionMeta {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ProviderParserHealth {
     pub provider: Provider,
     pub expected_parse_version: String,
@@ -1626,6 +1746,7 @@ pub struct ProviderParserHealth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ParserHealth {
     pub schema_version: i64,
     pub expected_schema_version: i64,
@@ -1639,6 +1760,7 @@ pub struct ParserHealth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IndexSnapshotAvailability {
     Unavailable,
     Usable,
@@ -1654,6 +1776,7 @@ impl IndexSnapshotAvailability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct IndexSnapshotStatus {
     pub availability: IndexSnapshotAvailability,
     pub last_successful_refresh_at: Option<DateTime<Utc>>,
@@ -1661,6 +1784,7 @@ pub struct IndexSnapshotStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IndexRefreshState {
     NotStarted,
     Indexing,
@@ -1683,6 +1807,7 @@ impl IndexRefreshState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IndexRefreshTrigger {
     IntegrationInstall,
     CommandLine,
@@ -1700,6 +1825,7 @@ impl IndexRefreshTrigger {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct IndexRefreshStatus {
     pub state: IndexRefreshState,
     pub started_by: Option<IndexRefreshTrigger>,
@@ -1714,6 +1840,7 @@ pub struct IndexRefreshStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct IndexReadinessStatus {
     pub snapshot: IndexSnapshotStatus,
     pub refresh: IndexRefreshStatus,
@@ -1743,6 +1870,7 @@ impl IndexReadinessStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct IndexStatus {
     pub parser_health: ParserHealth,
     /// Stale sessions whose source files are currently enabled and discoverable.
@@ -1761,6 +1889,7 @@ pub struct IndexStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SessionTimeProfile {
     pub messages: i64,
     pub timestamped_messages: i64,
@@ -1778,6 +1907,7 @@ pub struct SessionTimeProfile {
 /// prefilter output that requires verification. For fuzzy search, it is every row that matched
 /// during complete-corpus scoring, independent of the requested result page.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SearchExplain {
     /// Trigram query derived from literal text or regex literals. `None` means the query has no
     /// >=3-char literal anchor, so it must scan the structurally-filtered corpus.
@@ -1859,6 +1989,7 @@ impl SearchExplain {
 
 /// A message classified by one of the selected capability's rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageClassificationMatch {
     pub session_id: String,
     /// Session-local message sequence used with `session_id` for exact focused recovery.
@@ -1882,6 +2013,7 @@ pub struct MessageClassificationMatch {
 
 /// Aggregate slash-command usage frequency.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct PlanningCount {
     pub command: String,
     pub count: i64,
@@ -1894,6 +2026,7 @@ pub struct PlanningCount {
 /// contains a `/`. `limit == 0` means unlimited; `offset` skips rows in the surface's
 /// deterministic order.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FileQuery {
     pub pattern: Option<String>,
     /// Restrict to one indexed session source.
@@ -1920,6 +2053,7 @@ pub struct FileQuery {
 
 /// One aggregate row per file across the filtered edit set (`files search`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FileEditSummary {
     pub file_path: String,
     pub file_name: String,
@@ -1930,6 +2064,7 @@ pub struct FileEditSummary {
 
 /// One reconstructed version (edit) of a file within a session (`files history`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FileVersion {
     pub session_id: String,
     pub provider: Provider,
@@ -1942,6 +2077,7 @@ pub struct FileVersion {
 
 /// A file ↔ session linkage with that pair's edit count (`files cross-ref`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FileCrossRef {
     pub file_path: String,
     pub session_id: String,
@@ -1950,6 +2086,7 @@ pub struct FileCrossRef {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ProviderHealth {
     pub provider: Provider,
     pub enabled: bool,
@@ -1971,6 +2108,7 @@ pub struct ProviderHealth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct DiagnosticStatus {
     pub db_path: String,
     pub unknown_config_keys: Vec<crate::config::UnknownConfigKey>,

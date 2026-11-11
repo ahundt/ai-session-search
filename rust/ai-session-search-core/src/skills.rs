@@ -32,6 +32,7 @@ use crate::util::truncate_for_display;
 const TABLE_REGEX_CHARS: usize = 72;
 
 #[derive(Debug, Subcommand)]
+#[non_exhaustive]
 pub enum SkillsCmd {
     /// List every discovered skill — aise-managed and user-authored alike — and whether its
     /// adjacent deterministic capability loads.
@@ -328,6 +329,7 @@ pub struct SkillsCreateArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[non_exhaustive]
 pub enum ScaffoldCapability {
     MessageClassification,
 }
@@ -335,6 +337,7 @@ pub enum ScaffoldCapability {
 /// Who owns a skill directory, which decides whether `aise` may ever write to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SkillOwnership {
     /// `SKILL.md` carries the managed marker: `aise` wrote it and may update it.
     Aise,
@@ -359,6 +362,7 @@ impl SkillOwnership {
 /// Whether a discovered skill can currently supply a deterministic capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SkillCapabilityStatus {
     /// `aise-capability.toml` is present and compiles.
     Ok,
@@ -380,6 +384,7 @@ impl SkillCapabilityStatus {
 
 /// One skill as `aise skills list` reports it.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillSummary {
     pub name: String,
     pub ownership: SkillOwnership,
@@ -426,6 +431,7 @@ impl Row for SkillSummary {
 
 /// One category, at the position it is evaluated.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillCategoryRow {
     /// 1-based evaluation position. First match wins, so this is behavior, not presentation: a
     /// message matching two categories is reported as the lower-numbered one.
@@ -451,6 +457,7 @@ impl Row for SkillCategoryRow {
 
 /// One skill as `aise skills show` explains it.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillDetail {
     pub name: String,
     pub path: String,
@@ -466,6 +473,7 @@ pub struct SkillDetail {
 
 /// One problem found by `aise skills validate`, with the fix.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillDiagnostic {
     /// Which file the problem is in, relative to the skill root.
     pub file: String,
@@ -494,6 +502,7 @@ impl Row for SkillDiagnostic {
 
 /// The full result of validating one directory.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillValidation {
     pub path: String,
     pub name: Option<String>,
@@ -1027,6 +1036,7 @@ where
 
 /// One file a scaffold will create, relative to the new skill root.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ScaffoldedFile {
     pub relative_path: String,
     pub bytes: usize,
@@ -1043,6 +1053,7 @@ impl Row for ScaffoldedFile {
 
 /// What `aise skills create` did, or would do under `--dry-run`.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillScaffoldReceipt {
     pub name: String,
     pub root: String,

@@ -57,10 +57,11 @@ fn count_matching(db: &Db, filters: &MessageFilters, needle: &str) -> usize {
 #[test]
 fn hook_feedback_is_indexed_rather_than_discarded() {
     let (_dir, db) = indexed_fixture();
-    let notices = MessageFilters {
-        kinds: Some(vec![MessageKind::HarnessNotice]),
-        limit: 0,
-        ..Default::default()
+    let notices = {
+        let mut value = MessageFilters::default();
+        value.kinds = Some(vec![MessageKind::HarnessNotice]);
+        value.limit = 0;
+        value
     };
     let hits = db.search_messages("CANNOT STOP", &notices).unwrap();
     assert_eq!(
@@ -79,9 +80,10 @@ fn hook_feedback_is_indexed_rather_than_discarded() {
 #[test]
 fn ordinary_search_excludes_harness_notices_but_keeps_prose() {
     let (_dir, db) = indexed_fixture();
-    let default = MessageFilters {
-        limit: 0,
-        ..Default::default()
+    let default = {
+        let mut value = MessageFilters::default();
+        value.limit = 0;
+        value
     };
     assert_eq!(
         count_matching(&db, &default, "CANNOT STOP"),
@@ -100,16 +102,18 @@ fn a_task_notification_without_the_meta_flag_is_still_a_harness_notice() {
     // These arrive as role:user with userType "external" and no isMeta, so they are matched on
     // their leading tag. Missing this case is how they previously reached user analytics.
     let (_dir, db) = indexed_fixture();
-    let notices = MessageFilters {
-        kinds: Some(vec![MessageKind::HarnessNotice]),
-        limit: 0,
-        ..Default::default()
+    let notices = {
+        let mut value = MessageFilters::default();
+        value.kinds = Some(vec![MessageKind::HarnessNotice]);
+        value.limit = 0;
+        value
     };
     assert_eq!(count_matching(&db, &notices, "agent done"), 1);
 
-    let default = MessageFilters {
-        limit: 0,
-        ..Default::default()
+    let default = {
+        let mut value = MessageFilters::default();
+        value.limit = 0;
+        value
     };
     assert_eq!(count_matching(&db, &default, "agent done"), 0);
 }
@@ -146,16 +150,18 @@ fn harness_notices_stay_out_of_correction_analytics() {
     // Through the public service, so this exercises the same path the CLI and MCP use.
     let config = ai_session_search::config::Config::default();
     let run = ai_session_search::service::AnalysisService::new(&config, &db)
-        .run_skill(&ai_session_search::SkillRunQuery {
-            skill: ai_session_search::SkillSelector::name("corrections").unwrap(),
-            definition: None,
-            input: ai_session_search::SkillCapabilityInput::MessageClassification(
+        .run_skill(&ai_session_search::SkillRunQuery::new(
+            ai_session_search::SkillSelector::name("corrections").unwrap(),
+            ai_session_search::SkillCapabilityInput::MessageClassification(
                 ai_session_search::MessageClassificationQuery::default(),
             ),
-        })
+        ))
         .unwrap();
     let ai_session_search::SkillCapabilityOutput::MessageClassification(classification) =
-        run.output;
+        run.output
+    else {
+        panic!("message-classification query returned another capability output");
+    };
     let found = classification.report.matches;
     assert!(
         found

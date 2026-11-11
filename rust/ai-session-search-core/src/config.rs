@@ -125,6 +125,7 @@ pub struct Config {
 
 /// Per-invocation configuration overrides. `None` preserves lower-precedence sources.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ConfigOverrides {
     pub config_path: Option<PathBuf>,
     pub database_path: Option<PathBuf>,
@@ -135,6 +136,7 @@ pub struct ConfigOverrides {
 
 /// Process environment captured once so precedence can be tested without mutating global state.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ConfigEnvironment {
     pub config_path: Option<PathBuf>,
     pub database_path: Option<PathBuf>,
@@ -171,6 +173,7 @@ impl ConfigEnvironment {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ConfigOrigins {
     pub config: String,
     pub database: String,
@@ -196,6 +199,7 @@ pub struct ConfigOrigins {
 
 /// Validated effective configuration plus provenance.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResolvedConfig {
     pub config: Config,
     pub config_path: PathBuf,
@@ -204,6 +208,7 @@ pub struct ResolvedConfig {
 
 /// An ordinary key ignored by this binary, with a nearby spelling when one is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct UnknownConfigKey {
     pub path: String,
     pub suggestion: Option<String>,
@@ -526,6 +531,7 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum IndexRefresh {
     #[default]
     Auto,
@@ -686,6 +692,7 @@ pub struct SearchBudgetConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SearchScopeMode {
     #[default]
     All,
@@ -714,6 +721,7 @@ impl Default for SearchScopeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SearchOperation {
     MessageSearch,
 }
@@ -871,6 +879,7 @@ pub struct PerformanceConfig {
 /// `Fixed` is an explicit positive cap. Neither value changes the separate single-writer election
 /// used by index refresh.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum McpReadConcurrency {
     #[default]
     Auto,

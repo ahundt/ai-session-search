@@ -76,29 +76,32 @@ fn search_messages_honors_since_until_and_window() {
 
     // since excludes the Jun 1 turn.
     assert_eq!(
-        users(MessageFilters {
-            role: Some(Role::User),
-            since: Some(at("2026-06-05T00:00:00Z")),
-            ..Default::default()
+        users({
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.since = Some(at("2026-06-05T00:00:00Z"));
+            value
         }),
         2
     );
     // until excludes the Jun 20 turn.
     assert_eq!(
-        users(MessageFilters {
-            role: Some(Role::User),
-            until: Some(at("2026-06-15T00:00:00Z")),
-            ..Default::default()
+        users({
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.until = Some(at("2026-06-15T00:00:00Z"));
+            value
         }),
         2
     );
     // since+until brackets to the single Jun 10 turn.
     assert_eq!(
-        users(MessageFilters {
-            role: Some(Role::User),
-            since: Some(at("2026-06-05T00:00:00Z")),
-            until: Some(at("2026-06-15T00:00:00Z")),
-            ..Default::default()
+        users({
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.since = Some(at("2026-06-05T00:00:00Z"));
+            value.until = Some(at("2026-06-15T00:00:00Z"));
+            value
         }),
         1
     );
@@ -112,18 +115,20 @@ fn file_search_honors_date_bounds() {
     assert_eq!(count(FileQuery::default()), 3);
     // since Jun 5 drops early.txt.
     assert_eq!(
-        count(FileQuery {
-            since: Some(at("2026-06-05T00:00:00Z")),
-            ..Default::default()
+        count({
+            let mut value = FileQuery::default();
+            value.since = Some(at("2026-06-05T00:00:00Z"));
+            value
         }),
         2
     );
     // bracket to just the Jun 10 write.
     assert_eq!(
-        count(FileQuery {
-            since: Some(at("2026-06-05T00:00:00Z")),
-            until: Some(at("2026-06-15T00:00:00Z")),
-            ..Default::default()
+        count({
+            let mut value = FileQuery::default();
+            value.since = Some(at("2026-06-05T00:00:00Z"));
+            value.until = Some(at("2026-06-15T00:00:00Z"));
+            value
         }),
         1
     );
@@ -133,9 +138,10 @@ fn file_search_honors_date_bounds() {
 fn role_counts_reflect_date_filter() {
     let (_d, db) = indexed();
     let users_since = db
-        .message_role_counts(&MessageFilters {
-            since: Some(at("2026-06-05T00:00:00Z")),
-            ..Default::default()
+        .message_role_counts(&{
+            let mut value = MessageFilters::default();
+            value.since = Some(at("2026-06-05T00:00:00Z"));
+            value
         })
         .unwrap()
         .into_iter()
@@ -151,44 +157,38 @@ fn filters_compose_date_role_regex_limit_without_cancelling() {
 
     // date + role + regex: only the Jun 20 'cherry' user turn survives all three.
     let hits = db
-        .search_messages(
-            r"\bcherry\b",
-            &MessageFilters {
-                role: Some(Role::User),
-                since: Some(at("2026-06-05T00:00:00Z")),
-                match_mode: MessageSearchMode::Regex,
-                ..Default::default()
-            },
-        )
+        .search_messages(r"\bcherry\b", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.since = Some(at("2026-06-05T00:00:00Z"));
+            value.match_mode = MessageSearchMode::Regex;
+            value
+        })
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].content.contains("cherry"));
 
     // date + role + limit: two match the date+role, limit caps to one.
     let capped = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                role: Some(Role::User),
-                since: Some(at("2026-06-05T00:00:00Z")),
-                limit: 1,
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.since = Some(at("2026-06-05T00:00:00Z"));
+            value.limit = 1;
+            value
+        })
         .unwrap();
     assert_eq!(capped.len(), 1);
 
     // A regex that matches nothing yields zero even with a permissive date window —
     // filters AND together, none silently dominates.
     let none = db
-        .search_messages(
-            "zzz_nomatch",
-            &MessageFilters {
-                role: Some(Role::User),
-                match_mode: MessageSearchMode::Regex,
-                ..Default::default()
-            },
-        )
+        .search_messages("zzz_nomatch", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.match_mode = MessageSearchMode::Regex;
+            value
+        })
         .unwrap();
     assert!(none.is_empty());
 }
@@ -219,16 +219,20 @@ fn skill_message_classification_honors_date_window() {
     let run = |filters| {
         let report = app
             .analysis()
-            .run_skill(&SkillRunQuery {
-                skill: SkillSelector::name("date-filtering-test").unwrap(),
-                definition: None,
-                input: SkillCapabilityInput::MessageClassification(MessageClassificationQuery {
-                    filters,
-                    additional_skills: Vec::new(),
+            .run_skill(&SkillRunQuery::new(
+                SkillSelector::name("date-filtering-test").unwrap(),
+                SkillCapabilityInput::MessageClassification({
+                    let mut value = MessageClassificationQuery::default();
+                    value.filters = filters;
+
+                    value
                 }),
-            })
+            ))
             .unwrap();
-        let ai_session_search::SkillCapabilityOutput::MessageClassification(result) = report.output;
+        let ai_session_search::SkillCapabilityOutput::MessageClassification(result) = report.output
+        else {
+            panic!("message-classification query returned another capability output");
+        };
         result.report.matches
     };
 
@@ -238,9 +242,10 @@ fn skill_message_classification_honors_date_window() {
         "only the cherry turn matches"
     );
     // Window before Jun 20 excludes it.
-    let before = run(MessageFilters {
-        until: Some(at("2026-06-15T00:00:00Z")),
-        ..Default::default()
+    let before = run({
+        let mut value = MessageFilters::default();
+        value.until = Some(at("2026-06-15T00:00:00Z"));
+        value
     });
     assert!(
         before.is_empty(),

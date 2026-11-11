@@ -141,6 +141,7 @@ fn complete_prefix_offset_inner_until(
 }
 
 /// New rows discovered by an incremental tail parse (to be appended by `Db::append_tail`).
+#[non_exhaustive]
 pub struct TailParse {
     pub new_messages: Vec<Message>,
     pub new_file_edits: Vec<FileEdit>,

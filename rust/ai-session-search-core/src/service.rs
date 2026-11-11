@@ -1713,6 +1713,7 @@ pub struct AnalysisService<'app> {
 
 /// Immutable analytical provenance produced with one result under the same SQLite snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct AnalysisReceipt {
     /// Population strategy applied after structural session filtering.
     pub selection: crate::models::AnalysisSessionSelection,
@@ -1740,6 +1741,7 @@ pub struct AnalysisReceipt {
 
 /// Pure analysis result paired with the exact selection, snapshot input, policy, and result facts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ReceiptedAnalysis {
     /// Canonical classifications, relationships, vocabulary, and graph inputs.
     pub result: crate::analysis_pipeline::AnalysisResult,
@@ -2120,6 +2122,7 @@ impl<'config> SourceService<'config> {
 
 /// Measurements from one completed compaction transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CompactOutcome {
     pub before_bytes: u64,
     pub after_bytes: u64,

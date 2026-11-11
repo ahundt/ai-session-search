@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Whether a capability is used, and how that is decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum CapabilityMode {
     /// Read the environment, and prefer the richer rendering when it says nothing.
     #[default]

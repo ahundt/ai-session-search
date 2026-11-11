@@ -135,6 +135,7 @@ fn index_status_for_discovered(
 
 /// One discovered file that produced no session row, and why.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct UnindexedFile {
     pub provider: Provider,
     /// The discovered file that is absent from the index.

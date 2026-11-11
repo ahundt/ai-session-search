@@ -63,6 +63,7 @@ fn provider_parse_contract_fingerprint_from<'a>(
 
 /// Effective discovery configuration and current file count for one provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ProviderSourceStatus {
     /// Provider represented by this status.
     pub provider: Provider,
@@ -78,6 +79,7 @@ pub struct ProviderSourceStatus {
 
 /// One non-fatal filesystem or provider-sidecar discovery failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ProviderDiscoveryWarning {
     pub provider: Provider,
     pub path: String,

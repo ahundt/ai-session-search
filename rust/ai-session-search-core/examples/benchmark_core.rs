@@ -32,16 +32,11 @@ fn main() -> anyhow::Result<()> {
     config.index.refresh = IndexRefresh::ExistingOnly;
     config.performance.threads = 1;
     let app = SessionSearch::open(config)?;
-    let query = match mode {
-        MessageSearchMode::Literal => MessageQuery::literal(query)?,
-        MessageSearchMode::Regex => MessageQuery::regex(query)?,
-        MessageSearchMode::Fuzzy => MessageQuery::fuzzy(query)?,
-    };
-    let target = match field {
-        SearchField::Content => MessageTarget::content(),
-        SearchField::ToolName => MessageTarget::tool_name(),
-        SearchField::ToolArgument => MessageTarget::tool_argument("/cmd")?,
-    };
+    let query = MessageQuery::new(mode, query)?;
+    let target = MessageTarget::new(
+        field,
+        (field == SearchField::ToolArgument).then_some("/cmd"),
+    )?;
     let request = MessageSearchRequest::builder(query, target)
         .extent(RequestedExtent::page(Some(10), 0)?)
         .build()?;

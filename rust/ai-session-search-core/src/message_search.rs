@@ -26,6 +26,7 @@ pub const DEFAULT_MATCH_EVIDENCE_MAX_CHARS: usize = 220;
 pub const MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum MessageSearchError {
     #[error("{kind} query must not be empty")]
     EmptyQuery { kind: &'static str },
@@ -125,6 +126,7 @@ fn nonempty_query(
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "mode", content = "query", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MessageQuery {
     All,
     Literal(LiteralQuery),
@@ -133,6 +135,18 @@ pub enum MessageQuery {
 }
 
 impl MessageQuery {
+    /// The query `mode` selects for `value`; the inverse of [`Self::mode`].
+    pub fn new(
+        mode: MessageSearchMode,
+        value: impl Into<String>,
+    ) -> Result<Self, MessageSearchError> {
+        match mode {
+            MessageSearchMode::Literal => Self::literal(value),
+            MessageSearchMode::Regex => Self::regex(value),
+            MessageSearchMode::Fuzzy => Self::fuzzy(value),
+        }
+    }
+
     pub fn literal(value: impl Into<String>) -> Result<Self, MessageSearchError> {
         LiteralQuery::new(value).map(Self::Literal)
     }
@@ -204,6 +218,23 @@ pub struct MessageTarget {
 }
 
 impl MessageTarget {
+    /// The target `field` selects. For `tool_argument`, `argument_path` is a JSON pointer into the
+    /// call's arguments, and `None` selects the whole document; any other field with a path is a
+    /// `Conflict` error.
+    pub fn new(
+        field: SearchField,
+        argument_path: Option<&str>,
+    ) -> Result<Self, MessageSearchError> {
+        match (field, argument_path) {
+            (SearchField::ToolArgument, path) => Self::tool_argument(path.unwrap_or("")),
+            (_, Some(_)) => Err(MessageSearchError::Conflict(
+                "argument_path requires field='tool_argument'".to_string(),
+            )),
+            (SearchField::Content, None) => Ok(Self::content()),
+            (SearchField::ToolName, None) => Ok(Self::tool_name()),
+        }
+    }
+
     pub const fn content() -> Self {
         Self {
             field: SearchField::Content,
@@ -238,6 +269,7 @@ impl MessageTarget {
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MatchWindow {
     #[default]
     Earliest,
@@ -248,6 +280,7 @@ pub enum MatchWindow {
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReceiptLevel {
     #[default]
     None,
@@ -261,6 +294,7 @@ pub enum ReceiptLevel {
 /// are controlled independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum DetailLevel {
     Compact,
     Full,
@@ -269,6 +303,7 @@ pub enum DetailLevel {
 /// Character budget for the boundary/full-value view of one selected message field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FieldViewBudget {
     NoCharLimit,
     MaxChars { max_chars: NonZeroUsize },
@@ -288,6 +323,7 @@ impl FieldViewBudget {
 /// Character budget for the independently match-centered view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MatchViewBudget {
     MinimalSpan,
     MaxChars { max_chars: NonZeroUsize },
@@ -312,6 +348,7 @@ pub enum MatchViewBudget {
 )]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageSearchInclude {
     NormalizedSessionMetadata,
     ParsedReferences,
@@ -477,6 +514,7 @@ impl ContextWindow {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum LineWindow {
     #[default]
     Full,
@@ -534,6 +572,7 @@ impl LineWindow {
 /// finite page. Fuzzy search always requires a finite resolved page. `AllResults` is the explicit
 /// cross-surface override and is never silently converted into a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
 pub enum RequestedExtent {
     Page {
         limit: Option<NonZeroUsize>,
@@ -831,6 +870,7 @@ pub(crate) fn is_dash_separated_phrase(value: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SearchSurface {
     Rust,
     Cli,
@@ -848,6 +888,7 @@ impl SearchSurface {
 /// semantic owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageSearchParameter {
     Query,
     QueryMode,
@@ -916,6 +957,7 @@ impl MessageSearchParameter {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageSearchObjectFieldDomain {
     PositiveCharacterCount,
 }
@@ -936,6 +978,7 @@ pub struct MessageSearchObjectVariantSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageSearchParameterDomain {
     Text {
         non_empty: bool,
@@ -966,6 +1009,7 @@ pub enum MessageSearchParameterDomain {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageSearchOmission {
     AllEligible,
     TypedDefault,
@@ -1015,6 +1059,7 @@ impl MessageSearchParameterSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ValueOriginKind {
     Explicit,
     DetailPreset,
@@ -1028,6 +1073,7 @@ pub enum ValueOriginKind {
 /// Executable cross-parameter rule identity shared by request validation and caller specifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageSearchRule {
     DetailOwnsPresentationBudgets,
     SequenceRequiresSession,
@@ -1459,6 +1505,7 @@ impl MessageSearchSpecification {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ValueOrigin {
     Explicit,
     DetailPreset { detail: DetailLevel },
@@ -1527,12 +1574,14 @@ impl MessageSearchOrigins {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ExecutionOrder {
     SessionSequence,
     FuzzyRelevance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
 pub enum ResolvedExtent {
     Page { limit: NonZeroUsize, offset: usize },
     AllResults { offset: usize },
@@ -1648,6 +1697,7 @@ impl MessageSearchPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ProviderScope {
     All,
     Selected { providers: Vec<Provider> },
@@ -1655,6 +1705,7 @@ pub enum ProviderScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResolvedRequestExtent {
     Page { limit: NonZeroUsize, offset: usize },
     AllResults { offset: usize },
@@ -1674,6 +1725,7 @@ impl From<ResolvedExtent> for ResolvedRequestExtent {
 /// Public query-mode vocabulary shared by all search surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResolvedQueryMode {
     Literal,
     Regex,
@@ -1872,6 +1924,7 @@ impl PageInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PageSide {
     None,
     Present,
@@ -1890,6 +1943,7 @@ impl PageSide {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResultSetExtent {
     All,
     Partial,
@@ -1907,6 +1961,7 @@ impl ResultSetExtent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ViewCharRange {
     pub view_start_char: usize,
     pub view_end_char_exclusive: usize,
@@ -1914,6 +1969,7 @@ pub struct ViewCharRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MessageMatchViewMarkers {
     Characters {
         ranges: Vec<ViewCharRange>,
@@ -1926,6 +1982,7 @@ pub enum MessageMatchViewMarkers {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct MessageMatchEvidence {
     pub view_text: String,
     pub field_start_char: usize,
@@ -1939,6 +1996,7 @@ pub struct MessageMatchEvidence {
 /// the exact matched field text and absolute character coordinates without expanding regex or
 /// fuzzy evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct MessageLiteralMatch {
     pub text: String,
     pub field_start_char: usize,
@@ -1953,6 +2011,7 @@ struct FieldCharRange {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CoordinateUnit {
     UnicodeScalar,
 }
@@ -1960,6 +2019,7 @@ pub enum CoordinateUnit {
 /// Which portion of the selected field is present in one returned view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AdditionalFieldText {
     None,
     Before,

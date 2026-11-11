@@ -18,11 +18,23 @@ use crate::skill_catalog::{SkillName, SkillSelector};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillRunQuery {
     pub skill: SkillSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<MessageClassificationDefinition>,
     pub input: SkillCapabilityInput,
+}
+
+impl SkillRunQuery {
+    /// Run `input` with the selected skill's own classification rules.
+    pub fn new(skill: SkillSelector, input: SkillCapabilityInput) -> Self {
+        Self {
+            skill,
+            definition: None,
+            input,
+        }
+    }
 }
 
 /// Direct executable message-classification rules for the selected skill.
@@ -31,6 +43,7 @@ pub struct SkillRunQuery {
 /// identity. Supplying this value replaces only its adjacent `aise-capability.toml` rules for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageClassificationDefinition {
     pub categories: Vec<CorrectionCategorySpec>,
 }
@@ -42,12 +55,14 @@ pub struct MessageClassificationDefinition {
     rename_all = "kebab-case",
     deny_unknown_fields
 )]
+#[non_exhaustive]
 pub enum SkillCapabilityInput {
     MessageClassification(MessageClassificationQuery),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageClassificationQuery {
     pub filters: MessageFilters,
     pub additional_skills: Vec<SkillSelector>,
@@ -55,6 +70,7 @@ pub struct MessageClassificationQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillRunReport {
     pub requested_selector: SkillSelector,
     pub resolved_skill: ResolvedSkillReceipt,
@@ -68,12 +84,14 @@ pub struct SkillRunReport {
     rename_all = "kebab-case",
     deny_unknown_fields
 )]
+#[non_exhaustive]
 pub enum SkillCapabilityOutput {
     MessageClassification(MessageClassificationResult),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageClassificationResult {
     /// Receipt for the primary selected skill's compiled classification policy.
     ///
@@ -86,6 +104,7 @@ pub struct MessageClassificationResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ResolvedSkillReceipt {
     pub name: SkillName,
     pub package_version: Option<String>,
@@ -95,6 +114,7 @@ pub struct ResolvedSkillReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum SelectedSkillLocation {
     Embedded,
     Path { canonical_skill_md: PathBuf },
@@ -102,6 +122,7 @@ pub enum SelectedSkillLocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum CapabilityExecutionSource {
     Embedded,
     Path { canonical_capability_toml: PathBuf },

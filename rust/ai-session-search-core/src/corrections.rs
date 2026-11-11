@@ -392,6 +392,7 @@ impl ResolvedCorrectionPolicySet {
 
 /// Name, version, and digest of one message-classification capability evaluated for a report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CapabilityReceipt {
     pub name: String,
     pub version: String,
@@ -404,6 +405,7 @@ pub struct CapabilityReceipt {
 /// The receipts are not derivable from the matches — a policy that matched nothing still shaped
 /// the result, and its digest is what makes the run reproducible — so they travel together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageClassificationReport {
     /// Every evaluated message-classification capability, including those that matched nothing.
     ///

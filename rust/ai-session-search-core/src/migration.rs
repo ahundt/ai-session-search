@@ -23,6 +23,7 @@ use crate::durable_fs::{entry_exists, sync_file, sync_parent, StagedFile};
 use crate::indexer::{index_update_lock_path, open_index_update_lock};
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DatabaseMigrationOptions {
     pub source: PathBuf,
     pub destination: PathBuf,
@@ -77,12 +78,14 @@ impl DatabaseMigrationOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DatabaseMigrationPhase {
     Prepared,
     Published,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DatabaseMigrationReceipt {
     #[serde(default = "migration_format_version")]
     pub format_version: u32,
@@ -100,6 +103,7 @@ const fn migration_format_version() -> u32 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConfigImportReport {
     pub source: PathBuf,
     pub destination: PathBuf,
@@ -109,16 +113,29 @@ pub struct ConfigImportReport {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConfigImport {
     pub config: Config,
     pub report: ConfigImportReport,
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConfigPublishOptions {
     pub destination: PathBuf,
     pub replace_existing: bool,
     pub rollback_copy: Option<PathBuf>,
+}
+
+impl ConfigPublishOptions {
+    /// Publish to `destination`, refusing to replace an existing file and keeping no rollback copy.
+    pub fn new(destination: impl Into<PathBuf>) -> Self {
+        Self {
+            destination: destination.into(),
+            replace_existing: false,
+            rollback_copy: None,
+        }
+    }
 }
 
 pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMigrationReceipt> {

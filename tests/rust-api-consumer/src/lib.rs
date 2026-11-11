@@ -106,20 +106,11 @@ pub fn exercise_public_api(
     app: &SessionSearch,
     recovery_destination: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sessions = SearchFilters {
-        provider: None,
-        path_prefix: None,
-        exclude_path_prefixes: Vec::new(),
-        exclude_session_ids: Vec::new(),
-        // A downstream consumer can select session classes and follow the spawn link, both
-        // through public types: `SessionKind` and the parent's own session id.
-        session_kinds: Some(vec![SessionKind::User, SessionKind::Subagent]),
-        parent_session_id: None,
-        since: None,
-        until: None,
-        limit: 20,
-        warnings_only: false,
-    };
+    let mut sessions = SearchFilters::default();
+    // A downstream consumer can select session classes and follow the spawn link through public
+    // types: `SessionKind` and the parent's own session id.
+    sessions.session_kinds = Some(vec![SessionKind::User, SessionKind::Subagent]);
+    sessions.limit = 20;
     let _ = app.catalog().list_sessions(&sessions)?;
     let _ = app.index().status()?;
     let message_filters = MessageFilters::default();
@@ -136,21 +127,24 @@ pub fn exercise_public_api(
         hit.match_evidence()
             .map(|evidence| match &evidence.markers {
                 MessageMatchViewMarkers::Characters { ranges, .. } => ranges.len(),
-                MessageMatchViewMarkers::Boundary { .. } => 0,
+                // Marker kinds are non-exhaustive: a kind added later carries no ranges here.
+                _ => 0,
             })
     });
     let analysis = app.analysis();
     let page = analysis.documents(&sessions, None)?;
     let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());
-    let skill_report = analysis.run_skill(&SkillRunQuery {
-        skill: SkillSelector::name("corrections")?,
-        definition: None,
-        input: SkillCapabilityInput::MessageClassification(MessageClassificationQuery {
-            filters: message_filters.clone(),
-            additional_skills: Vec::new(),
+    let skill_report = analysis.run_skill(&SkillRunQuery::new(
+        SkillSelector::name("corrections")?,
+        SkillCapabilityInput::MessageClassification({
+            let mut value = MessageClassificationQuery::default();
+            value.filters = message_filters.clone();
+            value
         }),
-    })?;
-    let SkillCapabilityOutput::MessageClassification(classification) = skill_report.output;
+    ))?;
+    let SkillCapabilityOutput::MessageClassification(classification) = skill_report.output else {
+        return Err("message-classification query returned another capability output".into());
+    };
     let receipt: CapabilityReceipt = classification.receipt;
     let report: MessageClassificationReport = classification.report;
     let _ = receipt.sha256.as_str();
@@ -162,30 +156,29 @@ pub fn exercise_public_api(
         });
     let _ = analysis.planning(&message_filters, &[])?;
     let _ = analysis.role_statistics(&message_filters)?;
-    let policy = AnalysisPolicySpec {
-        classification_rules: vec![ClassificationRuleSpec {
-            dimension: "workflow".into(),
-            label: "testing".into(),
-            target: ClassificationTarget::UserText,
-            pattern: "(?i)\\btest".into(),
-            weight: 1,
-        }],
-        relationship_rules: Vec::new(),
-        phrase_vocabulary: Some(PhraseVocabularyPolicySpec {
-            widths: vec![1],
-            max_unique_phrases: 1_000,
-            min_document_tokens: 0,
-            excluded_tokens: Vec::new(),
-            exclude_numeric_tokens: false,
-            text_mode: PhraseTextMode::ProseOnly,
-        }),
-        max_classification_chars: Some(EXAMPLE_CLASSIFICATION_WINDOW_CHARS),
+    let policy = {
+        let mut value = AnalysisPolicySpec::default();
+        value.classification_rules = vec![ClassificationRuleSpec::new(
+            "workflow",
+            "testing",
+            ClassificationTarget::UserText,
+            "(?i)\\btest",
+            1,
+        )];
+        value.phrase_vocabulary = Some({
+            let mut value = PhraseVocabularyPolicySpec::new(vec![1], 1_000);
+            value.text_mode = PhraseTextMode::ProseOnly;
+            value
+        });
+        value.max_classification_chars = Some(EXAMPLE_CLASSIFICATION_WINDOW_CHARS);
+        value
     }
     .compile()?;
     let analysis_request = AnalysisRequest::new(
-        SearchFilters {
-            limit: 0,
-            ..sessions.clone()
+        {
+            let mut value = sessions.clone();
+            value.limit = 0;
+            value
         },
         AnalysisSessionSelection::AllEligible,
     )?;
@@ -229,3 +222,31 @@ pub fn publish_analysis(
     }
     Ok(plan.publish(analysis)?)
 }
+
+/// Build the inputs a caller supplies itself, which `#[non_exhaustive]` keeps out of struct
+/// literals: a transcript to parse, edits to replay, and config publication options.
+pub fn caller_built_inputs(
+    transcript: &std::path::Path,
+    config_destination: &std::path::Path,
+) -> Option<String> {
+    use ai_session_search::migration::ConfigPublishOptions;
+    use ai_session_search::models::{EditOp, FileEdit, Provider, SourceFile};
+    use ai_session_search::providers::claude::ClaudeAdapter;
+
+    let source = SourceFile::new(Provider::Claude, transcript, 0, 0);
+    let parsed = ClaudeAdapter::new(Vec::new()).parse(&source);
+    assert_eq!(parsed.session.provider, Provider::Claude);
+
+    let mut write = FileEdit::new(0, "Write", "src/app.py");
+    write.new_content = Some("print('one')\n".into());
+    let mut edit = FileEdit::new(1, "Edit", "src/app.py");
+    edit.edits.push(EditOp::new("one", "two"));
+    assert_eq!(edit.file_name, "app.py");
+
+    let mut options = ConfigPublishOptions::new(config_destination);
+    options.replace_existing = true;
+    assert!(options.rollback_copy.is_none());
+
+    ai_session_search::files::reconstruct(&[write, edit], 2)
+}
+

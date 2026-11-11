@@ -142,12 +142,17 @@ fn python_batch_open_error(error: anyhow::Error) -> PyErr {
     }
 }
 
-fn message_search_include_name(include: CoreMessageSearchInclude) -> &'static str {
-    match include {
-        CoreMessageSearchInclude::NormalizedSessionMetadata => "normalized_session_metadata",
-        CoreMessageSearchInclude::ParsedReferences => "parsed_references",
-        CoreMessageSearchInclude::RawProviderMetadata => "raw_provider_metadata",
-        CoreMessageSearchInclude::RuntimeDiagnostics => "runtime_diagnostics",
+/// The name core serializes for an enum value: a unit variant's string, or the `tag` field of an
+/// internally tagged variant. Python reads the same strings JSON output carries, and a variant
+/// core adds later arrives under its own name without a binding change.
+fn core_name<T: serde::Serialize>(value: &T, tag: &str) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        Ok(serde_json::Value::Object(fields)) => fields
+            .get(tag)
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| "unrecognized".to_string(), str::to_string),
+        _ => "unrecognized".to_string(),
     }
 }
 
@@ -333,24 +338,6 @@ fn paging_argument(argument: PagingArgument, value: i64) -> PyResult<usize> {
     })
 }
 
-const fn classification_target_name(target: ClassificationTarget) -> &'static str {
-    match target {
-        ClassificationTarget::Title => "title",
-        ClassificationTarget::Summary => "summary",
-        ClassificationTarget::FirstUserText => "first_user_text",
-        ClassificationTarget::UserText => "user_text",
-        ClassificationTarget::Any => "any",
-    }
-}
-
-const fn relationship_kind_name(kind: RelationshipKind) -> &'static str {
-    match kind {
-        RelationshipKind::Branch => "branch",
-        RelationshipKind::Copy => "copy",
-        RelationshipKind::Version => "version",
-    }
-}
-
 /// Canonical indexed session metadata and source provenance.
 #[pyclass(name = "SessionRecord", module = "ai_session_search._native", frozen)]
 struct NativeSessionRecord {
@@ -524,13 +511,7 @@ impl ClassificationRule {
                 )))
             }
         };
-        let inner = ClassificationRuleSpec {
-            dimension,
-            label,
-            target,
-            pattern,
-            weight,
-        };
+        let inner = ClassificationRuleSpec::new(dimension, label, target, pattern, weight);
         RustAnalysisPolicy::compile(vec![inner.clone()], Vec::new()).map_err(value_error)?;
         Ok(Self { inner })
     }
@@ -551,8 +532,8 @@ impl ClassificationRule {
     }
 
     #[getter]
-    fn target(&self) -> &'static str {
-        classification_target_name(self.inner.target)
+    fn target(&self) -> String {
+        core_name(&self.inner.target, "kind")
     }
 
     #[getter]
@@ -587,17 +568,17 @@ impl PhraseVocabulary {
         exclude_numeric_tokens: bool,
         prose_only: bool,
     ) -> PyResult<Self> {
-        let spec = PhraseVocabularyPolicySpec {
-            widths,
-            max_unique_phrases,
-            min_document_tokens,
-            excluded_tokens: excluded_tokens.unwrap_or_default(),
-            exclude_numeric_tokens,
-            text_mode: if prose_only {
+        let spec = {
+            let mut value = PhraseVocabularyPolicySpec::new(widths, max_unique_phrases);
+            value.min_document_tokens = min_document_tokens;
+            value.excluded_tokens = excluded_tokens.unwrap_or_default();
+            value.exclude_numeric_tokens = exclude_numeric_tokens;
+            value.text_mode = if prose_only {
                 PhraseTextMode::ProseOnly
             } else {
                 PhraseTextMode::UserText
-            },
+            };
+            value
         };
         spec.compile().map_err(value_error)?;
         Ok(Self { spec })
@@ -651,19 +632,21 @@ impl AnalysisPolicy {
         phrase_vocabulary: Option<PhraseVocabulary>,
         max_classification_chars: Option<usize>,
     ) -> PyResult<Self> {
-        let spec = RustAnalysisPolicySpec {
-            classification_rules: classification_rules
+        let spec = {
+            let mut value = RustAnalysisPolicySpec::default();
+            value.classification_rules = classification_rules
                 .unwrap_or_default()
                 .into_iter()
                 .map(|rule| rule.inner)
-                .collect(),
-            relationship_rules: relationship_rules
+                .collect();
+            value.relationship_rules = relationship_rules
                 .unwrap_or_default()
                 .into_iter()
                 .map(|rule| rule.inner)
-                .collect(),
-            phrase_vocabulary: phrase_vocabulary.map(|vocabulary| vocabulary.spec),
-            max_classification_chars,
+                .collect();
+            value.phrase_vocabulary = phrase_vocabulary.map(|vocabulary| vocabulary.spec);
+            value.max_classification_chars = max_classification_chars;
+            value
         };
         let inner = spec.compile().map_err(value_error)?;
         Ok(Self { inner })
@@ -684,7 +667,7 @@ impl RelationshipRule {
                 )))
             }
         };
-        let inner = RelationshipRuleSpec { id, kind, pattern };
+        let inner = RelationshipRuleSpec::new(id, kind, pattern);
         RustAnalysisPolicy::compile(Vec::new(), vec![inner.clone()]).map_err(value_error)?;
         Ok(Self { inner })
     }
@@ -695,8 +678,8 @@ impl RelationshipRule {
     }
 
     #[getter]
-    fn kind(&self) -> &'static str {
-        relationship_kind_name(self.inner.kind)
+    fn kind(&self) -> String {
+        core_name(&self.inner.kind, "kind")
     }
 
     #[getter]
@@ -727,7 +710,7 @@ impl From<ClassificationMatch> for NativeClassificationMatch {
         Self {
             dimension: value.dimension,
             label: value.label,
-            target: classification_target_name(value.target).into(),
+            target: core_name(&value.target, "kind"),
             weight: value.weight,
         }
     }
@@ -756,18 +739,17 @@ struct NativeRelationshipHint {
 
 impl From<RelationshipHint> for NativeRelationshipHint {
     fn from(value: RelationshipHint) -> Self {
-        let (status, resolved_session_id, candidate_session_ids) = match value.resolution {
-            RelationshipResolution::Unresolved => ("unresolved", None, Vec::new()),
-            RelationshipResolution::Resolved { session_id } => {
-                ("resolved", Some(session_id), Vec::new())
-            }
-            RelationshipResolution::Ambiguous { session_ids } => ("ambiguous", None, session_ids),
+        let status = core_name(&value.resolution, "status");
+        let (resolved_session_id, candidate_session_ids) = match value.resolution {
+            RelationshipResolution::Resolved { session_id } => (Some(session_id), Vec::new()),
+            RelationshipResolution::Ambiguous { session_ids } => (None, session_ids),
+            _ => (None, Vec::new()),
         };
         Self {
             rule_id: value.rule_id,
-            kind: relationship_kind_name(value.kind).into(),
+            kind: core_name(&value.kind, "kind"),
             parent_title: value.parent_title,
-            status: status.into(),
+            status,
             resolved_session_id,
             candidate_session_ids,
         }
@@ -903,22 +885,17 @@ struct NativeAnalysisReceipt {
 #[pymethods]
 impl NativeAnalysisReceipt {
     #[getter]
-    fn selection_kind(&self) -> &'static str {
-        match self.inner.selection {
-            CoreAnalysisSessionSelection::AllEligible => "all_eligible",
-            CoreAnalysisSessionSelection::FirstCanonicalSessions { .. } => {
-                "first_canonical_sessions"
-            }
-        }
+    fn selection_kind(&self) -> String {
+        core_name(&self.inner.selection, "kind")
     }
 
     #[getter]
     fn max_selected_sessions(&self) -> Option<usize> {
         match self.inner.selection {
-            CoreAnalysisSessionSelection::AllEligible => None,
             CoreAnalysisSessionSelection::FirstCanonicalSessions { max_sessions } => {
                 Some(max_sessions.get())
             }
+            _ => None,
         }
     }
 
@@ -1125,13 +1102,10 @@ impl NativeAnalysisPublicationPlan {
     }
 
     #[getter]
-    fn formats(&self) -> Vec<&'static str> {
+    fn formats(&self) -> Vec<String> {
         self.inner
             .formats()
-            .map(|format| match format {
-                RustAnalysisPublicationFormat::Json => "json",
-                RustAnalysisPublicationFormat::Markdown => "markdown",
-            })
+            .map(|format| core_name(&format, "kind"))
             .collect()
     }
 
@@ -1230,7 +1204,7 @@ impl From<SessionGraphEdge> for NativeSessionGraphEdge {
         Self {
             source_session_id: value.source_session_id,
             target_session_id: value.target_session_id,
-            kind: relationship_kind_name(value.kind).into(),
+            kind: core_name(&value.kind, "kind"),
             rule_id: value.rule_id,
         }
     }
@@ -1730,13 +1704,13 @@ impl NativeReconstructedFile {
 
 impl NativeReconstructedFile {
     fn into_core(self) -> ai_session_search::files::ReconstructedFile {
-        ai_session_search::files::ReconstructedFile {
-            session_id: self.session_id,
-            provider: self.provider,
-            version: self.version,
-            file_path: self.file_path,
-            content: self.content,
-        }
+        ai_session_search::files::ReconstructedFile::new(
+            self.session_id,
+            self.provider,
+            self.version,
+            self.file_path,
+            self.content,
+        )
     }
 }
 
@@ -2032,15 +2006,16 @@ struct NativeSelectedSkillLocation {
 
 impl From<ai_session_search::SelectedSkillLocation> for NativeSelectedSkillLocation {
     fn from(location: ai_session_search::SelectedSkillLocation) -> Self {
-        match location {
-            ai_session_search::SelectedSkillLocation::Embedded => Self {
-                kind: "embedded".to_string(),
-                canonical_skill_md: None,
-            },
-            ai_session_search::SelectedSkillLocation::Path { canonical_skill_md } => Self {
-                kind: "path".to_string(),
-                canonical_skill_md: Some(canonical_skill_md),
-            },
+        let kind = core_name(&location, "kind");
+        let canonical_skill_md = match location {
+            ai_session_search::SelectedSkillLocation::Path { canonical_skill_md } => {
+                Some(canonical_skill_md)
+            }
+            _ => None,
+        };
+        Self {
+            kind,
+            canonical_skill_md,
         }
     }
 }
@@ -2060,21 +2035,16 @@ struct NativeCapabilityExecutionSource {
 
 impl From<ai_session_search::CapabilityExecutionSource> for NativeCapabilityExecutionSource {
     fn from(source: ai_session_search::CapabilityExecutionSource) -> Self {
-        match source {
-            ai_session_search::CapabilityExecutionSource::Embedded => Self {
-                kind: "embedded".to_string(),
-                canonical_capability_toml: None,
-            },
+        let kind = core_name(&source, "kind");
+        let canonical_capability_toml = match source {
             ai_session_search::CapabilityExecutionSource::Path {
                 canonical_capability_toml,
-            } => Self {
-                kind: "path".to_string(),
-                canonical_capability_toml: Some(canonical_capability_toml),
-            },
-            ai_session_search::CapabilityExecutionSource::Inline => Self {
-                kind: "inline".to_string(),
-                canonical_capability_toml: None,
-            },
+            } => Some(canonical_capability_toml),
+            _ => None,
+        };
+        Self {
+            kind,
+            canonical_capability_toml,
         }
     }
 }
@@ -2135,7 +2105,12 @@ impl NativeSkillRunReport {
                 NativeCapabilityExecutionSource::from(resolved.execution_source),
             )?,
         };
-        let ai_session_search::SkillCapabilityOutput::MessageClassification(output) = report.output;
+        let ai_session_search::SkillCapabilityOutput::MessageClassification(output) = report.output
+        else {
+            return Err(PyRuntimeError::new_err(
+                "message-classification query returned an output this binding does not convert",
+            ));
+        };
         let result = NativeMessageClassificationResult {
             receipt: Py::new(py, NativeCapabilityReceipt::from(output.receipt))?,
             report: Py::new(
@@ -2425,20 +2400,21 @@ impl SessionQuery {
     fn into_filters(self) -> PyResult<(SearchFilters, Option<String>)> {
         let (since, until) = self.dates.resolve()?;
         let (exclude_path_prefixes, exclude_session_ids) = self.exclusions.into_filters();
-        let filters = SearchFilters {
-            provider: self.provider,
-            path_prefix: self
+        let filters = {
+            let mut value = SearchFilters::default();
+            value.provider = self.provider;
+            value.path_prefix = self
                 .path_prefix
                 .as_deref()
-                .map(ai_session_search::util::normalize_path_prefix),
-            exclude_path_prefixes,
-            exclude_session_ids,
-            session_kinds: self.session_kinds,
-            parent_session_id: self.parent_session_id,
-            since,
-            until,
-            limit: self.limit,
-            warnings_only: false,
+                .map(ai_session_search::util::normalize_path_prefix);
+            value.exclude_path_prefixes = exclude_path_prefixes;
+            value.exclude_session_ids = exclude_session_ids;
+            value.session_kinds = self.session_kinds;
+            value.parent_session_id = self.parent_session_id;
+            value.since = since;
+            value.until = until;
+            value.limit = self.limit;
+            value
         };
         filters.validate().map_err(value_error)?;
         Ok((filters, self.current_repo))
@@ -2986,19 +2962,13 @@ impl MessageSearchRequest {
     }
 
     #[getter]
-    fn match_window(&self) -> Option<&'static str> {
-        self.match_window.map(|window| match window {
-            CoreMatchWindow::Earliest => "earliest",
-            CoreMatchWindow::Latest => "latest",
-        })
+    fn match_window(&self) -> Option<String> {
+        self.match_window.map(|window| core_name(&window, "kind"))
     }
 
     #[getter]
-    fn detail(&self) -> Option<&'static str> {
-        self.detail.map(|detail| match detail {
-            CoreDetailLevel::Compact => "compact",
-            CoreDetailLevel::Full => "full",
-        })
+    fn detail(&self) -> Option<String> {
+        self.detail.map(|detail| core_name(&detail, "kind"))
     }
 
     #[getter]
@@ -3006,12 +2976,9 @@ impl MessageSearchRequest {
         self.field_view
             .map(|view| {
                 let result = PyDict::new(py);
-                match view {
-                    CoreFieldViewBudget::NoCharLimit => result.set_item("kind", "no_char_limit")?,
-                    CoreFieldViewBudget::MaxChars { max_chars } => {
-                        result.set_item("kind", "max_chars")?;
-                        result.set_item("max_chars", max_chars.get())?;
-                    }
+                result.set_item("kind", core_name(&view, "kind"))?;
+                if let CoreFieldViewBudget::MaxChars { max_chars } = view {
+                    result.set_item("max_chars", max_chars.get())?;
                 }
                 Ok(result)
             })
@@ -3023,12 +2990,9 @@ impl MessageSearchRequest {
         self.match_view
             .map(|view| {
                 let result = PyDict::new(py);
-                match view {
-                    CoreMatchViewBudget::MinimalSpan => result.set_item("kind", "minimal_span")?,
-                    CoreMatchViewBudget::MaxChars { max_chars } => {
-                        result.set_item("kind", "max_chars")?;
-                        result.set_item("max_chars", max_chars.get())?;
-                    }
+                result.set_item("kind", core_name(&view, "kind"))?;
+                if let CoreMatchViewBudget::MaxChars { max_chars } = view {
+                    result.set_item("max_chars", max_chars.get())?;
                 }
                 Ok(result)
             })
@@ -3046,21 +3010,17 @@ impl MessageSearchRequest {
     }
 
     #[getter]
-    fn receipt_level(&self) -> Option<&'static str> {
-        self.receipt_level.map(|level| match level {
-            CoreReceiptLevel::None => "none",
-            CoreReceiptLevel::Summary => "summary",
-            CoreReceiptLevel::Full => "full",
-        })
+    fn receipt_level(&self) -> Option<String> {
+        self.receipt_level.map(|level| core_name(&level, "kind"))
     }
 
     #[getter]
-    fn include(&self) -> Option<Vec<&'static str>> {
+    fn include(&self) -> Option<Vec<String>> {
         self.includes.as_ref().map(|includes| {
             includes
                 .iter()
                 .copied()
-                .map(message_search_include_name)
+                .map(|include| core_name(&include, "kind"))
                 .collect()
         })
     }
@@ -3101,14 +3061,8 @@ impl Default for MessageSearchRequest {
 impl MessageSearchRequest {
     fn into_request(self, query: CoreMessageQuery) -> PyResult<CoreMessageSearchRequest> {
         let (since, until) = self.scope.dates.resolve()?;
-        let target = match self.field {
-            SearchField::Content => CoreMessageTarget::content(),
-            SearchField::ToolName => CoreMessageTarget::tool_name(),
-            SearchField::ToolArgument => {
-                CoreMessageTarget::tool_argument(self.argument_path.unwrap_or_default())
-                    .map_err(value_error)?
-            }
-        };
+        let target = CoreMessageTarget::new(self.field, self.argument_path.as_deref())
+            .map_err(value_error)?;
         let mut builder = CoreMessageSearchRequest::builder(query, target)
             .time(CoreRequestedTimeRange::new(since, until).map_err(value_error)?)
             .include_compaction(self.include_compaction)
@@ -3235,16 +3189,17 @@ impl AnalysisQuery {
     fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
         let scope = self.scope.resolve(app)?;
         let (since, until) = scope.bounds;
-        Ok(MessageFilters {
-            providers: scope.provider.map(|provider| vec![provider]),
-            session_id: scope.session_id,
-            path_prefix: scope.path_prefix,
-            exclude_path_prefixes: scope.exclude_path_prefixes,
-            exclude_session_ids: scope.exclude_session_ids,
-            since,
-            until,
-            limit: self.limit,
-            ..Default::default()
+        Ok({
+            let mut value = MessageFilters::default();
+            value.providers = scope.provider.map(|provider| vec![provider]);
+            value.session_id = scope.session_id;
+            value.path_prefix = scope.path_prefix;
+            value.exclude_path_prefixes = scope.exclude_path_prefixes;
+            value.exclude_session_ids = scope.exclude_session_ids;
+            value.since = since;
+            value.until = until;
+            value.limit = self.limit;
+            value
         })
     }
 }
@@ -3298,15 +3253,15 @@ impl NativeSkillSelector {
             ai_session_search::SkillSelector::Name(selector) => {
                 Some(selector.name.as_str().to_string())
             }
-            ai_session_search::SkillSelector::Path(_) => None,
+            _ => None,
         }
     }
 
     #[getter]
     fn path(&self) -> Option<PathBuf> {
         match &self.inner {
-            ai_session_search::SkillSelector::Name(_) => None,
             ai_session_search::SkillSelector::Path(selector) => Some(selector.path.clone()),
+            _ => None,
         }
     }
 }
@@ -3386,29 +3341,32 @@ impl NativeMessageClassificationQuery {
     ) -> PyResult<ai_session_search::MessageClassificationQuery> {
         let scope = self.scope.resolve(app)?;
         let (since, until) = scope.bounds;
-        Ok(ai_session_search::MessageClassificationQuery {
-            filters: MessageFilters {
-                providers: scope.provider.map(|provider| vec![provider]),
-                session_id: scope.session_id,
-                path_prefix: scope.path_prefix,
-                exclude_path_prefixes: scope.exclude_path_prefixes,
-                exclude_session_ids: scope.exclude_session_ids,
-                since,
-                until,
-                // Omitted resolves to the same config default the CLI uses, so the two surfaces
-                // cannot drift apart: they read one value rather than each carrying a literal.
-                limit: self
+        Ok({
+            let mut value = ai_session_search::MessageClassificationQuery::default();
+            value.filters = {
+                let mut value = MessageFilters::default();
+                value.providers = scope.provider.map(|provider| vec![provider]);
+                value.session_id = scope.session_id;
+                value.path_prefix = scope.path_prefix;
+                value.exclude_path_prefixes = scope.exclude_path_prefixes;
+                value.exclude_session_ids = scope.exclude_session_ids;
+                value.since = since;
+                value.until = until;
+                // Omitted resolves to the same config default the CLI uses so the two surfaces cannot
+                // drift apart: they read one value rather than each carrying a literal.
+                value.limit = self
                     .limit
-                    .unwrap_or(app.config().capabilities.message_classification.limit),
-                offset: self.offset,
-                session_kinds: self.session_kinds,
-                ..Default::default()
-            },
-            additional_skills: self
+                    .unwrap_or(app.config().capabilities.message_classification.limit);
+                value.offset = self.offset;
+                value.session_kinds = self.session_kinds;
+                value
+            };
+            value.additional_skills = self
                 .additional_skills
                 .into_iter()
                 .map(|selector| selector.inner)
-                .collect(),
+                .collect();
+            value
         })
     }
 }
@@ -3464,12 +3422,15 @@ impl NativeSkillRunQuery {
 
 impl NativeSkillRunQuery {
     fn into_core(self, app: &CoreSessionSearch) -> PyResult<ai_session_search::SkillRunQuery> {
-        Ok(ai_session_search::SkillRunQuery {
-            skill: self.skill.inner,
-            definition: self.definition,
-            input: ai_session_search::SkillCapabilityInput::MessageClassification(
-                self.input.into_core(app)?,
-            ),
+        Ok({
+            let mut value = ai_session_search::SkillRunQuery::new(
+                self.skill.inner,
+                ai_session_search::SkillCapabilityInput::MessageClassification(
+                    self.input.into_core(app)?,
+                ),
+            );
+            value.definition = self.definition;
+            value
         })
     }
 }
@@ -3537,19 +3498,21 @@ impl FileQuery {
     ) -> PyResult<CoreFileQuery> {
         let scope = self.scope.resolve(app)?;
         let (since, until) = scope.bounds;
-        Ok(CoreFileQuery {
-            pattern,
-            provider: scope.provider,
-            session_id: scope.session_id,
-            path_prefix: scope.path_prefix,
-            exclude_path_prefixes: scope.exclude_path_prefixes,
-            exclude_session_ids: scope.exclude_session_ids,
-            since,
-            until,
-            min_edits: self.min_edits,
-            max_edits: self.max_edits,
-            limit: self.limit,
-            offset: self.offset,
+        Ok({
+            let mut value = CoreFileQuery::default();
+            value.pattern = pattern;
+            value.provider = scope.provider;
+            value.session_id = scope.session_id;
+            value.path_prefix = scope.path_prefix;
+            value.exclude_path_prefixes = scope.exclude_path_prefixes;
+            value.exclude_session_ids = scope.exclude_session_ids;
+            value.since = since;
+            value.until = until;
+            value.min_edits = self.min_edits;
+            value.max_edits = self.max_edits;
+            value.limit = self.limit;
+            value.offset = self.offset;
+            value
         })
     }
 }
@@ -3720,19 +3683,14 @@ struct NativeMessageSearchRuntimeDiagnostics {
     #[pyo3(get)]
     response_schema_version: u32,
     #[pyo3(get)]
-    surface: &'static str,
+    surface: String,
     #[pyo3(get)]
     config_digest: String,
 }
 
 impl From<&CoreMessageSearchRuntimeDiagnostics> for NativeMessageSearchRuntimeDiagnostics {
     fn from(diagnostics: &CoreMessageSearchRuntimeDiagnostics) -> Self {
-        let surface = match diagnostics.surface() {
-            CoreSearchSurface::Rust => "rust",
-            CoreSearchSurface::Cli => "cli",
-            CoreSearchSurface::Mcp => "mcp",
-            CoreSearchSurface::Python => "python",
-        };
+        let surface = core_name(&diagnostics.surface(), "kind");
         Self {
             package_version: diagnostics.package_version(),
             database_schema_version: diagnostics.database_schema_version(),
@@ -3963,6 +3921,12 @@ impl From<AutoReindexOutcome> for RefreshOutcome {
                 files_seen: None,
                 sessions_updated: None,
                 reason: Some(reason),
+            },
+            other => Self {
+                status: "unrecognized",
+                files_seen: None,
+                sessions_updated: None,
+                reason: Some(format!("{other:?}")),
             },
         }
     }
@@ -4346,12 +4310,13 @@ impl SessionSearch {
                  default, or a positive integer",
             ));
         }
-        let config = Config::resolve(ConfigOverrides {
-            config_path,
-            database_path: db_path,
-            cache_dir,
-            threads,
-            index_refresh: None,
+        let config = Config::resolve({
+            let mut value = ConfigOverrides::default();
+            value.config_path = config_path;
+            value.database_path = db_path;
+            value.cache_dir = cache_dir;
+            value.threads = threads;
+            value
         })
         .map_err(runtime_error)?
         .config;
@@ -4556,14 +4521,15 @@ impl SessionSearch {
                 .catalog()
                 .resolve_session(&session_id)
                 .map_err(runtime_error)?;
-            let filters = MessageFilters {
-                role,
-                session_id: Some(session.id),
-                seq_from,
-                seq_to,
-                limit,
-                offset,
-                ..Default::default()
+            let filters = {
+                let mut value = MessageFilters::default();
+                value.role = role;
+                value.session_id = Some(session.id);
+                value.seq_from = seq_from;
+                value.seq_to = seq_to;
+                value.limit = limit;
+                value.offset = offset;
+                value
             };
             app.messages()
                 .read_session(&filters, order)
@@ -4586,15 +4552,17 @@ impl SessionSearch {
                 "preview_chars must be greater than zero",
             ));
         }
-        let options = ai_session_search::inspect::InspectionOptions {
-            preview_chars: preview_chars
-                .unwrap_or(ai_session_search::inspect::DEFAULT_PREVIEW_CHARS),
-            evidence_window: ai_session_search::inspect::EvidenceWindow::from_signed_items(
+        let options = {
+            let mut value = ai_session_search::inspect::InspectionOptions::default();
+            value.preview_chars =
+                preview_chars.unwrap_or(ai_session_search::inspect::DEFAULT_PREVIEW_CHARS);
+            value.evidence_window = ai_session_search::inspect::EvidenceWindow::from_signed_items(
                 summary_items
                     .unwrap_or(-(ai_session_search::inspect::DEFAULT_EVIDENCE_LIMIT as i64)),
             )
-            .map_err(value_error)?,
-            include_time_profile,
+            .map_err(value_error)?;
+            value.include_time_profile = include_time_profile;
+            value
         };
         let inspection = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;

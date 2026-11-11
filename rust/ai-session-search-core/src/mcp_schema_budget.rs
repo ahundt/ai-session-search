@@ -57,6 +57,7 @@ pub const REJECTED_ROOT_COMBINATORS: [&str; 7] =
 /// margins, and reading them as the same thing is what makes a numerically smaller cap look
 /// like the one worth defaulting to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailureMode {
     /// The client neither errors nor marks the result. Nothing downstream reports it.
     Silent,
@@ -70,6 +71,7 @@ pub enum FailureMode {
 
 /// Which artifact a row measures, and therefore what the sweep iterates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AppliesTo {
     InputSchema,
     ToolDescription,
@@ -82,6 +84,7 @@ pub enum AppliesTo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Status {
     Pass,
     /// Inside the limit but past its notice line; this is not a client-limit warning.
@@ -104,6 +107,7 @@ impl Status {
 
 /// One (client, artifact, limit) triple, swept over every tool the catalogue advertises.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct HarnessLimit {
     pub name: &'static str,
     /// The external client, protocol, or repository policy that owns this rule.
@@ -614,6 +618,7 @@ pub fn ceiling_for(tool: &str) -> Option<(usize, usize)> {
 
 /// One measurement of one row against one tool.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Finding {
     pub limit: &'static HarnessLimit,
     /// The budget actually applied: what the operator configured, or the measured default.

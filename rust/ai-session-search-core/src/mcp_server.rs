@@ -6215,16 +6215,8 @@ fn tool_search_messages_cancellable(
     if args.get("argument_path").is_some() && field != crate::models::SearchField::ToolArgument {
         return Err("argument_path requires field='tool_argument'".to_string());
     }
-    let target = match field {
-        crate::models::SearchField::Content => MessageTarget::content(),
-        crate::models::SearchField::ToolName => MessageTarget::tool_name(),
-        crate::models::SearchField::ToolArgument => MessageTarget::tool_argument(
-            args.get("argument_path")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        )
-        .map_err(|error| error.to_string())?,
-    };
+    let target = MessageTarget::new(field, args.get("argument_path").and_then(Value::as_str))
+        .map_err(|error| error.to_string())?;
     let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
     if args.get("session").is_some() {
         return Err(

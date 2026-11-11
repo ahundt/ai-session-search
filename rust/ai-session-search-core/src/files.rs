@@ -364,12 +364,31 @@ fn version_line_counts(edits: &[FileEdit]) -> Vec<i64> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReconstructedFile {
     pub session_id: String,
     pub provider: Provider,
     pub version: usize,
     pub file_path: String,
     pub content: String,
+}
+
+impl ReconstructedFile {
+    pub fn new(
+        session_id: impl Into<String>,
+        provider: Provider,
+        version: usize,
+        file_path: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            provider,
+            version,
+            file_path: file_path.into(),
+            content: content.into(),
+        }
+    }
 }
 
 /// One published version: which session and version it was reconstructed from, where it landed,
@@ -380,6 +399,7 @@ pub struct ReconstructedFile {
 /// `name_vN` files whose provenance could be re-derived only by searching the index again, while
 /// the single-version restore beside it had always printed all four facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct PublishedFileVersion {
     pub source_session_id: String,
     pub version: usize,
@@ -389,6 +409,7 @@ pub struct PublishedFileVersion {
 
 /// Receipt for an atomically published, non-replacing directory of reconstructed versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct RecoveryPublicationReceipt {
     pub destination: PathBuf,
     pub files: Vec<PublishedFileVersion>,
@@ -676,6 +697,7 @@ impl Row for FileCrossRef {
 }
 
 #[derive(Debug, Subcommand)]
+#[non_exhaustive]
 pub enum FilesCmd {
     /// List files edited via tool calls, with edit/session counts.
     Search(FilesSearchArgs),
@@ -1071,6 +1093,7 @@ fn run_extract_all(db: &Db, args: &FilesExtractArgs) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[non_exhaustive]
 pub enum ReconstructedVersionsFormat {
     #[default]
     Framed,
@@ -1129,6 +1152,19 @@ fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructed_edits_replay_like_parsed_ones() {
+        use crate::models::EditOp;
+        let mut write = FileEdit::new(0, "Write", "src/app.py");
+        write.new_content = Some("print('one')\n".into());
+        let mut edit = FileEdit::new(1, "Edit", "src/app.py");
+        edit.edits.push(EditOp::new("one", "two"));
+        assert_eq!(edit.file_name, "app.py");
+        let edits = [write, edit];
+        assert_eq!(reconstruct(&edits, 1).as_deref(), Some("print('one')\n"));
+        assert_eq!(reconstruct(&edits, 2).as_deref(), Some("print('two')\n"));
+    }
     use clap::Parser;
 
     #[derive(Parser)]

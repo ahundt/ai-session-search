@@ -84,16 +84,9 @@ fn fixture() -> Fixture {
         "tool" => Role::Tool,
         other => panic!("fixture role {other}"),
     };
-    let message = |seq: i64, role: Role, content: String| Message {
-        seq,
-        role,
-        ts: None,
-        tool_name: None,
-        kind: MessageKind::Conversation,
-        tool_call_id: None,
-        content,
-        is_compaction: false,
-        provenance: {
+    let message = |seq: i64, role: Role, content: String| {
+        let mut value = Message::new(seq, role, content);
+        value.provenance = {
             let mut provenance = ai_session_search::models::MessageProvenance::default();
             provenance.authorship = if role == Role::User {
                 ai_session_search::models::MessageAuthorship::Human
@@ -102,7 +95,8 @@ fn fixture() -> Fixture {
             };
             provenance.record_relation = ai_session_search::models::MessageRecordRelation::Original;
             provenance
-        },
+        };
+        value
     };
     let mut messages: Vec<Message> = spec["messages"]
         .as_array()
@@ -161,32 +155,21 @@ fn fixture() -> Fixture {
     let session_id = spec["session_id"].as_str().unwrap().to_string();
     let db = Db::open(&db_path).unwrap();
     db.upsert_session(
-        &ParsedSession {
-            session: SessionRecord {
-                id: session_id.clone(),
-                provider: Provider::Claude,
-                provider_session_id: session_id.trim_start_matches("claude:").into(),
-                title: None,
-                summary: None,
-                cwd: None,
-                repo_root: None,
-                created_at: None,
-                updated_at: None,
-                last_message_at: None,
-                preview_text: String::new(),
-                source_path: "/fixture/parity.jsonl".into(),
-                message_count: Some(messages.len() as i64),
-                parse_version: "parity-fixture-v1".into(),
-                raw_metadata_json: None,
-                parse_warning: None,
-                discovery_source: "test-fixture".into(),
-                parent_session_id: None,
-                agent_label: None,
+        &ParsedSession::new(
+            {
+                let mut value = SessionRecord::new(
+                    session_id.clone(),
+                    Provider::Claude,
+                    session_id.trim_start_matches("claude:"),
+                    "/fixture/parity.jsonl",
+                    "parity-fixture-v1",
+                    "test-fixture",
+                );
+                value.message_count = Some(messages.len() as i64);
+                value
             },
-            transcript_text: String::new(),
             messages,
-            file_edits: Vec::new(),
-        },
+        ),
         0,
         0,
     )
@@ -745,11 +728,12 @@ fn reading_a_shared_seq_returns_every_row_in_one_order_on_every_interface() {
             hit_ids(service.context(&session_id, seq, 0, 0).unwrap()),
             &want,
         );
-        let range = MessageFilters {
-            session_id: Some(session_id.clone()),
-            seq_from: Some(seq),
-            seq_to: Some(seq),
-            ..Default::default()
+        let range = {
+            let mut value = MessageFilters::default();
+            value.session_id = Some(session_id.clone());
+            value.seq_from = Some(seq);
+            value.seq_to = Some(seq);
+            value
         };
         check(
             name,
@@ -801,10 +785,11 @@ fn reading_a_shared_seq_returns_every_row_in_one_order_on_every_interface() {
         let name = read["name"].as_str().unwrap();
         let want = expected(&f.spec, &read["expected"]);
         let limit = read["limit"].as_u64().unwrap() as usize;
-        let newest = MessageFilters {
-            session_id: Some(session_id.clone()),
-            limit,
-            ..Default::default()
+        let newest = {
+            let mut value = MessageFilters::default();
+            value.session_id = Some(session_id.clone());
+            value.limit = limit;
+            value
         };
         check(
             name,

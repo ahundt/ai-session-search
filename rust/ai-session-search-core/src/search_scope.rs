@@ -12,6 +12,7 @@ use crate::config::{SearchScopeConfig, SearchScopeMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum AccessRootOrigin {
     HarnessRoots,
     ExplicitConfig,
@@ -77,6 +78,7 @@ impl AccessRoot {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrustedAccessInputs {
     pub harness_roots: Vec<PathBuf>,
     pub invocation_directory: Option<PathBuf>,
@@ -100,6 +102,7 @@ impl TrustedAccessInputs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum EffectiveAccessScope {
     All,
     AllowedRoots { roots: Vec<AccessRoot> },

@@ -30,6 +30,7 @@ const MANIFEST_JSON: &str = "manifest.v1.json";
 /// One requested representation in an analysis publication bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AnalysisPublicationFormat {
     Json,
     Markdown,
@@ -67,6 +68,7 @@ impl AnalysisArtifact {
 
 /// Durable evidence for one atomically published immutable artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PublishedAnalysisArtifact {
     pub name: String,
     pub bytes: u64,
@@ -75,6 +77,7 @@ pub struct PublishedAnalysisArtifact {
 
 /// Receipt returned only after the complete publication directory is durable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AnalysisPublicationReceipt {
     pub destination: PathBuf,
     pub artifacts: Vec<PublishedAnalysisArtifact>,

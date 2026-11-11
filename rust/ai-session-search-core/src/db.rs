@@ -241,6 +241,7 @@ pub(crate) fn unknown_index_providers(conn: &Connection) -> Result<Vec<String>> 
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum MessageOrder {
     OldestFirst,
     NewestFirst,

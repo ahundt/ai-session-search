@@ -118,11 +118,12 @@ fn recorded_needles_survive_generated_copies_large_wrappers_and_refresh() {
             .unwrap();
         assert_eq!(marker_count, if phase == 0 { 3 } else { 0 });
         drop(stored);
-        let filters = MessageFilters {
-            role: Some(Role::User),
-            session_id: Some("claude:haystack".into()),
-            limit: 10,
-            ..Default::default()
+        let filters = {
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.session_id = Some("claude:haystack".into());
+            value.limit = 10;
+            value
         };
         for (query, mode, accelerated) in [
             ("ordinal needle", MessageSearchMode::Literal, true),
@@ -133,9 +134,10 @@ fn recorded_needles_survive_generated_copies_large_wrappers_and_refresh() {
             let (hits, explain) = db
                 .search_messages_with_explain(
                     query,
-                    &MessageFilters {
-                        match_mode: mode,
-                        ..filters.clone()
+                    &{
+                        let mut value = filters.clone();
+                        value.match_mode = mode;
+                        value
                     },
                     true,
                 )
@@ -159,15 +161,13 @@ fn recorded_needles_survive_generated_copies_large_wrappers_and_refresh() {
         }
         for offset in 0..5 {
             let hits = db
-                .search_messages(
-                    "ordinal needle",
-                    &MessageFilters {
-                        match_mode: MessageSearchMode::Fuzzy,
-                        limit: 1,
-                        offset,
-                        ..filters.clone()
-                    },
-                )
+                .search_messages("ordinal needle", &{
+                    let mut value = filters.clone();
+                    value.match_mode = MessageSearchMode::Fuzzy;
+                    value.limit = 1;
+                    value.offset = offset;
+                    value
+                })
                 .unwrap();
             assert_eq!(
                 hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
@@ -178,10 +178,11 @@ fn recorded_needles_survive_generated_copies_large_wrappers_and_refresh() {
                     .collect::<Vec<_>>()
             );
         }
-        let range = MessageFilters {
-            seq_from: Some(1400),
-            seq_to: Some(1600),
-            ..filters.clone()
+        let range = {
+            let mut value = filters.clone();
+            value.seq_from = Some(1400);
+            value.seq_to = Some(1600);
+            value
         };
         assert_eq!(
             db.read_session_messages(&range, MessageOrder::OldestFirst)
@@ -193,46 +194,38 @@ fn recorded_needles_survive_generated_copies_large_wrappers_and_refresh() {
         );
         let since = ai_session_search::util::parse_datetime("2026-06-02T00:00:00Z").unwrap();
         assert!(db
-            .search_messages(
-                "ordinal needle",
-                &MessageFilters {
-                    since: Some(since),
-                    ..filters.clone()
-                }
-            )
+            .search_messages("ordinal needle", &{
+                let mut value = filters.clone();
+                value.since = Some(since);
+                value
+            })
             .unwrap()
             .is_empty());
         assert_eq!(
-            db.search_messages(
-                "ordinal needle",
-                &MessageFilters {
-                    limit: 0,
-                    ..Default::default()
-                }
-            )
+            db.search_messages("ordinal needle", &{
+                let mut value = MessageFilters::default();
+                value.limit = 0;
+                value
+            })
             .unwrap()
             .len(),
             2004
         );
         assert!(db
-            .search_messages(
-                "ordinal needle",
-                &MessageFilters {
-                    path_prefix: Some("/wrong-workspace".into()),
-                    ..filters.clone()
-                }
-            )
+            .search_messages("ordinal needle", &{
+                let mut value = filters.clone();
+                value.path_prefix = Some("/wrong-workspace".into());
+                value
+            })
             .unwrap()
             .is_empty());
 
         assert_eq!(
-            db.search_messages(
-                "ordinal needle",
-                &MessageFilters {
-                    path_prefix: Some("/fixture/haystack".into()),
-                    ..filters.clone()
-                }
-            )
+            db.search_messages("ordinal needle", &{
+                let mut value = filters.clone();
+                value.path_prefix = Some("/fixture/haystack".into());
+                value
+            })
             .unwrap()
             .iter()
             .map(|hit| hit.seq)
@@ -453,11 +446,12 @@ fn user_input_search_preserves_nul_and_unicode_in_prompts_and_answers() {
         ("évidence", MessageSearchMode::Literal),
         ("évd", MessageSearchMode::Fuzzy),
     ] {
-        let filters = MessageFilters {
-            role: Some(Role::User),
-            match_mode,
-            limit: 10,
-            ..Default::default()
+        let filters = {
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value.match_mode = match_mode;
+            value.limit = 10;
+            value
         };
         assert_eq!(db.search_messages(query, &filters).unwrap().len(), 2);
     }
@@ -526,14 +520,12 @@ fn reindex_backfills_missing_message_timestamps_from_file_time() {
     indexer::reindex(&cfg, &db, true, None).unwrap();
 
     let hits = db
-        .search_messages(
-            "date-filterable",
-            &MessageFilters {
-                since: Some(chrono::Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap()),
-                until: Some(chrono::Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
-                ..Default::default()
-            },
-        )
+        .search_messages("date-filterable", &{
+            let mut value = MessageFilters::default();
+            value.since = Some(chrono::Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+            value.until = Some(chrono::Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap());
+            value
+        })
         .unwrap();
     assert_eq!(
         hits.len(),
@@ -703,13 +695,11 @@ fn search_messages_filters_by_role_substring_and_regex() {
 
     // User input includes the two prompts and the user-entered slash command.
     let users = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                role: Some(Role::User),
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value
+        })
         .unwrap();
     assert_eq!(users.len(), 3);
     assert_eq!(users.iter().filter(|m| m.role == Role::User).count(), 2);
@@ -717,13 +707,11 @@ fn search_messages_filters_by_role_substring_and_regex() {
 
     // Role::Slash matches the single slash-command turn.
     let slash = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                role: Some(Role::Slash),
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::Slash);
+            value
+        })
         .unwrap();
     assert_eq!(slash.len(), 1);
     assert!(slash[0].content.starts_with("/cmd-a"));
@@ -736,13 +724,11 @@ fn search_messages_filters_by_role_substring_and_regex() {
 
     // Regex over content (anchored).
     let re = db
-        .search_messages(
-            r"^/cmd-a\b",
-            &MessageFilters {
-                match_mode: MessageSearchMode::Regex,
-                ..Default::default()
-            },
-        )
+        .search_messages(r"^/cmd-a\b", &{
+            let mut value = MessageFilters::default();
+            value.match_mode = MessageSearchMode::Regex;
+            value
+        })
         .unwrap();
     assert_eq!(re.len(), 1);
 
@@ -754,25 +740,21 @@ fn search_messages_filters_by_role_substring_and_regex() {
         4
     );
     let capped = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                limit: 1,
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.limit = 1;
+            value
+        })
         .unwrap();
     assert_eq!(capped.len(), 1);
 
     // Invalid regex is a clean error, not a panic.
     assert!(db
-        .search_messages(
-            "(",
-            &MessageFilters {
-                match_mode: MessageSearchMode::Regex,
-                ..Default::default()
-            },
-        )
+        .search_messages("(", &{
+            let mut value = MessageFilters::default();
+            value.match_mode = MessageSearchMode::Regex;
+            value
+        },)
         .is_err());
 }
 
@@ -813,13 +795,11 @@ fn claude_compaction_summaries_are_compaction_role_not_user() {
 
     // The compaction digest's 'forgot/broke' keywords must not surface as a user message.
     let users = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                role: Some(Role::User),
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value
+        })
         .unwrap();
     assert_eq!(users.len(), 1);
     assert!(users[0].content.contains("real prompt"));
@@ -827,13 +807,11 @@ fn claude_compaction_summaries_are_compaction_role_not_user() {
 
     // --no-compaction excludes it from a plain (all-role) search.
     let without = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                no_compaction: true,
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.no_compaction = true;
+            value
+        })
         .unwrap();
     assert_eq!(without.len(), 1);
     assert_eq!(without[0].role, Role::User);
@@ -859,13 +837,11 @@ fn claude_tool_results_are_tool_role_not_user() {
 
     // The correction-keyword-laden tool output is searchable as `tool`, excluded from `user`.
     let users = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                role: Some(Role::User),
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::User);
+            value
+        })
         .unwrap();
     assert_eq!(users.len(), 1);
     assert!(users[0].content.contains("add the feature"));
@@ -875,13 +851,11 @@ fn claude_tool_results_are_tool_role_not_user() {
     );
 
     let tools = db
-        .search_messages(
-            "",
-            &MessageFilters {
-                role: Some(Role::Tool),
-                ..Default::default()
-            },
-        )
+        .search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.role = Some(Role::Tool);
+            value
+        })
         .unwrap();
     assert_eq!(tools.len(), 1);
     assert!(tools[0].content.contains("you broke the build"));

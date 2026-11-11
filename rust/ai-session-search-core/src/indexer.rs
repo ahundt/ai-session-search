@@ -21,12 +21,14 @@ use crate::util::normalize_path;
 use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReindexMode {
     Strict,
     Opportunistic { busy_timeout_ms: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReindexOutcome {
     Updated {
         files_seen: usize,
@@ -61,6 +63,7 @@ pub(crate) enum BackgroundRefreshOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AutoReindexOutcome {
     Updated {
         files_seen: usize,
@@ -670,6 +673,7 @@ pub fn reindex_with_mode(
     }
 }
 
+#[non_exhaustive]
 pub struct ExplicitReindexOutcome {
     pub files_seen: usize,
     pub sessions_updated: usize,

@@ -48,6 +48,7 @@ const CLI_MESSAGE_SEARCH_BATCH_ROWS: usize = 256;
 /// NOT used: a negative count is a CLI parser hazard and unprecedented among leading tools;
 /// the sign convention is reserved for per-item depth (--lines-per-message, --summary-items).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum ReadOrder {
     #[default]
     Oldest,
@@ -501,6 +502,7 @@ impl ContextBatchRow for ContextRowWithRefs {
 }
 
 #[derive(Debug, Subcommand)]
+#[non_exhaustive]
 pub enum MessagesCmd {
     /// Search messages by content / role / date across sessions.
     Search(Box<MessageSearchArgs>),
@@ -515,6 +517,7 @@ pub enum MessagesCmd {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum CliMessageQueryMode {
     #[default]
     Literal,
@@ -523,6 +526,7 @@ pub enum CliMessageQueryMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CliFieldViewChars {
     NoCharLimit,
     MaxChars(NonZeroUsize),
@@ -543,6 +547,7 @@ impl std::str::FromStr for CliFieldViewChars {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CliMatchViewChars {
     Minimal,
     MaxChars(NonZeroUsize),
@@ -563,6 +568,7 @@ impl std::str::FromStr for CliMatchViewChars {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CliMessageSearchInclude {
     None,
     Value(MessageSearchInclude),
@@ -645,6 +651,7 @@ const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-descri
         ])
         .multiple(true)
 ))]
+#[non_exhaustive]
 pub struct MessageSearchArgs {
     /// Text to find in the selected field. Literal mode is the default; choose regex or fuzzy with
     /// --query-mode. Punctuation is significant in literal mode. Omit the query to list all. Pass
@@ -971,6 +978,7 @@ pub struct MessageEvidenceArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum EvidenceInclude {
     TimeProfile,
 }
@@ -1139,13 +1147,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     if args.argument_path.is_some() && args.field != SearchField::ToolArgument {
         bail!("argument_path requires field='tool_argument'");
     }
-    let target = match args.field {
-        SearchField::Content => MessageTarget::content(),
-        SearchField::ToolName => MessageTarget::tool_name(),
-        SearchField::ToolArgument => {
-            MessageTarget::tool_argument(args.argument_path.clone().unwrap_or_default())?
-        }
-    };
+    let target = MessageTarget::new(args.field, args.argument_path.as_deref())?;
     let mut builder = MessageSearchRequest::builder(query, target)
         .time(RequestedTimeRange::new(since, until)?)
         .include_compaction(args.include_compaction)

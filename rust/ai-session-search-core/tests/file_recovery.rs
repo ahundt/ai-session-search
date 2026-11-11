@@ -105,25 +105,28 @@ fn file_search_pattern_and_min_edits_filters() {
     let (_dir, db) = indexed();
     // Glob over the basename.
     let py = db
-        .file_search(&FileQuery {
-            pattern: Some("*.py".into()),
-            ..Default::default()
+        .file_search(&{
+            let mut value = FileQuery::default();
+            value.pattern = Some("*.py".into());
+            value
         })
         .unwrap();
     assert_eq!(py.len(), 2);
     let app = db
-        .file_search(&FileQuery {
-            pattern: Some("app.py".into()),
-            ..Default::default()
+        .file_search(&{
+            let mut value = FileQuery::default();
+            value.pattern = Some("app.py".into());
+            value
         })
         .unwrap();
     assert_eq!(app.len(), 1);
     assert_eq!(app[0].file_name, "app.py");
     // min_edits prunes the single-edit util.py.
     let busy = db
-        .file_search(&FileQuery {
-            min_edits: Some(2),
-            ..Default::default()
+        .file_search(&{
+            let mut value = FileQuery::default();
+            value.min_edits = Some(2);
+            value
         })
         .unwrap();
     assert_eq!(busy.len(), 1);
@@ -134,48 +137,50 @@ fn file_search_pattern_and_min_edits_filters() {
 fn file_surfaces_apply_limit_and_offset_after_deterministic_ordering() {
     let (_dir, db) = indexed();
     let first_search = db
-        .file_search(&FileQuery {
-            limit: 1,
-            ..Default::default()
+        .file_search(&{
+            let mut value = FileQuery::default();
+            value.limit = 1;
+            value
         })
         .unwrap();
     let second_search = db
-        .file_search(&FileQuery {
-            limit: 1,
-            offset: 1,
-            ..Default::default()
+        .file_search(&{
+            let mut value = FileQuery::default();
+            value.limit = 1;
+            value.offset = 1;
+            value
         })
         .unwrap();
     assert_eq!(first_search[0].file_name, "app.py");
     assert_eq!(second_search[0].file_name, "util.py");
 
     let history = FileService::new(&db)
-        .history(
-            "app.py",
-            &FileQuery {
-                session_id: Some("claude:sess-fr-1".into()),
-                limit: 1,
-                offset: 1,
-                ..Default::default()
-            },
-        )
+        .history("app.py", &{
+            let mut value = FileQuery::default();
+            value.session_id = Some("claude:sess-fr-1".into());
+            value.limit = 1;
+            value.offset = 1;
+            value
+        })
         .unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].version, 2);
 
     let first_cross_ref = db
-        .file_cross_ref(&FileQuery {
-            pattern: Some("app.py".into()),
-            limit: 1,
-            ..Default::default()
+        .file_cross_ref(&{
+            let mut value = FileQuery::default();
+            value.pattern = Some("app.py".into());
+            value.limit = 1;
+            value
         })
         .unwrap();
     let second_cross_ref = db
-        .file_cross_ref(&FileQuery {
-            pattern: Some("app.py".into()),
-            limit: 1,
-            offset: 1,
-            ..Default::default()
+        .file_cross_ref(&{
+            let mut value = FileQuery::default();
+            value.pattern = Some("app.py".into());
+            value.limit = 1;
+            value.offset = 1;
+            value
         })
         .unwrap();
     assert_ne!(
@@ -187,16 +192,18 @@ fn file_surfaces_apply_limit_and_offset_after_deterministic_ordering() {
 #[test]
 fn file_queries_share_provider_and_path_filters() {
     let (_dir, db) = indexed();
-    let matching = FileQuery {
-        provider: Some(Provider::Claude),
-        path_prefix: Some("/repo".into()),
-        ..Default::default()
+    let matching = {
+        let mut value = FileQuery::default();
+        value.provider = Some(Provider::Claude);
+        value.path_prefix = Some("/repo".into());
+        value
     };
     assert_eq!(db.file_search(&matching).unwrap().len(), 2);
     assert_eq!(
-        db.file_cross_ref(&FileQuery {
-            pattern: Some("app.py".into()),
-            ..matching.clone()
+        db.file_cross_ref(&{
+            let mut value = matching.clone();
+            value.pattern = Some("app.py".into());
+            value
         })
         .unwrap()
         .len(),
@@ -207,9 +214,10 @@ fn file_queries_share_provider_and_path_filters() {
         4
     );
 
-    let wrong_provider = FileQuery {
-        provider: Some(Provider::Codex),
-        ..matching.clone()
+    let wrong_provider = {
+        let mut value = matching.clone();
+        value.provider = Some(Provider::Codex);
+        value
     };
     assert!(db.file_search(&wrong_provider).unwrap().is_empty());
     assert!(db.file_cross_ref(&wrong_provider).unwrap().is_empty());
@@ -218,9 +226,10 @@ fn file_queries_share_provider_and_path_filters() {
         .unwrap()
         .is_empty());
 
-    let wrong_path = FileQuery {
-        path_prefix: Some("/elsewhere".into()),
-        ..matching
+    let wrong_path = {
+        let mut value = matching;
+        value.path_prefix = Some("/elsewhere".into());
+        value
     };
     assert!(db.file_search(&wrong_path).unwrap().is_empty());
     assert!(db.file_cross_ref(&wrong_path).unwrap().is_empty());
@@ -234,18 +243,20 @@ fn file_queries_share_provider_and_path_filters() {
 fn file_queries_apply_shared_exclusions_before_grouping_and_limits() {
     let (_dir, db) = indexed();
     let all = db
-        .file_cross_ref(&FileQuery {
-            pattern: Some("app.py".into()),
-            ..Default::default()
+        .file_cross_ref(&{
+            let mut value = FileQuery::default();
+            value.pattern = Some("app.py".into());
+            value
         })
         .unwrap();
     assert_eq!(all.len(), 2);
 
-    let without_one_session = FileQuery {
-        pattern: Some("app.py".into()),
-        exclude_session_ids: vec![all[0].session_id.clone()],
-        limit: 1,
-        ..Default::default()
+    let without_one_session = {
+        let mut value = FileQuery::default();
+        value.pattern = Some("app.py".into());
+        value.exclude_session_ids = vec![all[0].session_id.clone()];
+        value.limit = 1;
+        value
     };
     let remaining = db.file_cross_ref(&without_one_session).unwrap();
     assert_eq!(remaining.len(), 1);
@@ -260,9 +271,10 @@ fn file_queries_apply_shared_exclusions_before_grouping_and_limits() {
         1
     );
 
-    let exclude_repo = FileQuery {
-        exclude_path_prefixes: vec!["/repo".into()],
-        ..Default::default()
+    let exclude_repo = {
+        let mut value = FileQuery::default();
+        value.exclude_path_prefixes = vec!["/repo".into()];
+        value
     };
     assert!(db.file_search(&exclude_repo).unwrap().is_empty());
     assert!(db.file_cross_ref(&exclude_repo).unwrap().is_empty());
@@ -304,9 +316,10 @@ fn reconstruct_each_version_from_db() {
 fn service_reconstruction_is_typed_scoped_and_read_only() {
     let (_dir, db) = indexed();
     let service = FileService::new(&db);
-    let query = FileQuery {
-        session_id: Some("claude:sess-fr-1".into()),
-        ..Default::default()
+    let query = {
+        let mut value = FileQuery::default();
+        value.session_id = Some("claude:sess-fr-1".into());
+        value
     };
 
     let latest = service.reconstruct("app.py", &query, None).unwrap();
@@ -358,9 +371,10 @@ fn service_reconstruction_is_typed_scoped_and_read_only() {
 fn cross_ref_links_file_to_each_session() {
     let (_dir, db) = indexed();
     let xref = db
-        .file_cross_ref(&FileQuery {
-            pattern: Some("app.py".into()),
-            ..Default::default()
+        .file_cross_ref(&{
+            let mut value = FileQuery::default();
+            value.pattern = Some("app.py".into());
+            value
         })
         .unwrap();
     // One row per (file, session): sess-fr-1 (3 edits) and sess-fr-2 (1 edit).
@@ -429,13 +443,13 @@ fn extract_reconstruct_and_restore_to_real_fs() {
     assert_eq!(content, "L1\nLINE2\nL3");
 
     let out = tempfile::tempdir().unwrap();
-    let recovered = ai_session_search::files::ReconstructedFile {
-        session_id: "claude:sess-fr-1".to_string(),
-        provider: Provider::Claude,
-        version: edits.len(),
-        file_path: out.path().join("app.py").to_string_lossy().into_owned(),
-        content: content.clone(),
-    };
+    let recovered = ai_session_search::files::ReconstructedFile::new(
+        "claude:sess-fr-1".to_string(),
+        Provider::Claude,
+        edits.len(),
+        out.path().join("app.py").to_string_lossy().into_owned(),
+        content.clone(),
+    );
     let t1 = ai_session_search::files::restore_reconstructed(&recovered, None).unwrap();
     assert_eq!(t1.file_name().unwrap(), "app.recovered.py");
     // Second restore must not overwrite the first.
@@ -451,13 +465,13 @@ fn concurrent_restores_claim_distinct_files_without_overwrite() {
     use std::sync::{Arc, Barrier};
 
     let out = tempfile::tempdir().unwrap();
-    let recovered = Arc::new(ai_session_search::files::ReconstructedFile {
-        session_id: "claude:concurrent".to_string(),
-        provider: Provider::Claude,
-        version: 1,
-        file_path: out.path().join("shared.rs").to_string_lossy().into_owned(),
-        content: "atomic recovery".to_string(),
-    });
+    let recovered = Arc::new(ai_session_search::files::ReconstructedFile::new(
+        "claude:concurrent".to_string(),
+        Provider::Claude,
+        1,
+        out.path().join("shared.rs").to_string_lossy().into_owned(),
+        "atomic recovery".to_string(),
+    ));
     let barrier = Arc::new(Barrier::new(4));
     let handles = (0..4)
         .map(|_| {
@@ -484,9 +498,10 @@ fn concurrent_restores_claim_distinct_files_without_overwrite() {
 fn all_versions_publish_as_one_complete_directory_without_overwrite() {
     let (_indexed_dir, db) = indexed();
     let service = FileService::new(&db);
-    let query = FileQuery {
-        session_id: Some("claude:sess-fr-1".into()),
-        ..Default::default()
+    let query = {
+        let mut value = FileQuery::default();
+        value.session_id = Some("claude:sess-fr-1".into());
+        value
     };
     let output_parent = tempfile::tempdir().unwrap();
     let destination = output_parent.path().join("versions");
@@ -541,13 +556,13 @@ fn all_versions_publish_as_one_complete_directory_without_overwrite() {
 #[test]
 fn restore_requires_an_explicit_directory_when_recorded_path_is_empty() {
     let out = tempfile::tempdir().unwrap();
-    let recovered = ai_session_search::files::ReconstructedFile {
-        session_id: "claude:empty-path".to_string(),
-        provider: Provider::Claude,
-        version: 1,
-        file_path: String::new(),
-        content: "recoverable".to_string(),
-    };
+    let recovered = ai_session_search::files::ReconstructedFile::new(
+        "claude:empty-path".to_string(),
+        Provider::Claude,
+        1,
+        String::new(),
+        "recoverable".to_string(),
+    );
 
     let error = ai_session_search::files::restore_reconstructed(&recovered, None).unwrap_err();
     assert!(error.to_string().contains("provide output_dir"));

@@ -17,6 +17,7 @@ use serde::Serialize;
 /// Output formats (table, json, jsonl, csv, plain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum OutputFormat {
     #[default]
     Table,

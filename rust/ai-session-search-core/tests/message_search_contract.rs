@@ -112,32 +112,25 @@ fn open_disposable_fixture() -> (tempfile::TempDir, Db, ContractFixture) {
 
     let db = Db::open(&database_path).unwrap();
     db.upsert_session(
-        &ParsedSession {
-            session: SessionRecord {
-                id: "claude:message-search-contract".into(),
-                provider: Provider::Claude,
-                provider_session_id: "message-search-contract".into(),
-                title: Some("Message search contract fixture".into()),
-                summary: None,
-                cwd: Some("/fixture/workspace".into()),
-                repo_root: Some("/fixture".into()),
-                created_at: None,
-                updated_at: None,
-                last_message_at: None,
-                preview_text: String::new(),
-                source_path: "/fixture/transcripts/contract.jsonl".into(),
-                message_count: Some(fixture.messages.len() as i64),
-                parse_version: "contract-fixture-v1".into(),
-                raw_metadata_json: Some(r#"{"model":"gpt-test"}"#.into()),
-                parse_warning: None,
-                discovery_source: "test-fixture".into(),
-                parent_session_id: None,
-                agent_label: None,
+        &ParsedSession::new(
+            {
+                let mut value = SessionRecord::new(
+                    "claude:message-search-contract",
+                    Provider::Claude,
+                    "message-search-contract",
+                    "/fixture/transcripts/contract.jsonl",
+                    "contract-fixture-v1",
+                    "test-fixture",
+                );
+                value.title = Some("Message search contract fixture".into());
+                value.cwd = Some("/fixture/workspace".into());
+                value.repo_root = Some("/fixture".into());
+                value.message_count = Some(fixture.messages.len() as i64);
+                value.raw_metadata_json = Some(r#"{"model":"gpt-test"}"#.into());
+                value
             },
-            transcript_text: String::new(),
-            messages: fixture.messages.clone(),
-            file_edits: Vec::new(),
-        },
+            fixture.messages.clone(),
+        ),
         0,
         0,
     )
@@ -160,54 +153,35 @@ fn seqs(hits: Vec<ai_session_search::models::MessageHit>) -> Vec<i64> {
 
 fn insert_semantic_response_case(db: &Db, case: &SemanticResponseCase) {
     db.upsert_session(
-        &ParsedSession {
-            session: SessionRecord {
-                id: case.session_id.clone(),
-                provider: Provider::Codex,
-                provider_session_id: case.provider_session_id.clone(),
-                title: Some("Semantic response contract fixture".into()),
-                summary: None,
-                cwd: Some("/fixture/workspace".into()),
-                repo_root: Some("/fixture".into()),
-                created_at: None,
-                updated_at: None,
-                last_message_at: None,
-                preview_text: String::new(),
-                source_path: "/fixture/transcripts/semantic-response.jsonl".into(),
-                message_count: Some(2),
-                parse_version: "contract-fixture-v1".into(),
-                raw_metadata_json: Some(r#"{"model":"gpt-test"}"#.into()),
-                parse_warning: None,
-                discovery_source: "test-fixture".into(),
-                parent_session_id: None,
-                agent_label: None,
-            },
-            transcript_text: case.content.clone(),
-            messages: vec![
-                Message {
-                    seq: case.message_seq,
-                    role: Role::User,
-                    ts: None,
-                    tool_name: None,
-                    kind: MessageKind::Conversation,
-                    tool_call_id: None,
-                    content: case.content.clone(),
-                    is_compaction: false,
-                    provenance: Default::default(),
+        &{
+            let mut value = ParsedSession::new(
+                {
+                    let mut value = SessionRecord::new(
+                        case.session_id.clone(),
+                        Provider::Codex,
+                        case.provider_session_id.clone(),
+                        "/fixture/transcripts/semantic-response.jsonl",
+                        "contract-fixture-v1",
+                        "test-fixture",
+                    );
+                    value.title = Some("Semantic response contract fixture".into());
+                    value.cwd = Some("/fixture/workspace".into());
+                    value.repo_root = Some("/fixture".into());
+                    value.message_count = Some(2);
+                    value.raw_metadata_json = Some(r#"{"model":"gpt-test"}"#.into());
+                    value
                 },
-                Message {
-                    seq: case.message_seq + 1,
-                    role: Role::Assistant,
-                    ts: None,
-                    tool_name: None,
-                    kind: MessageKind::Conversation,
-                    tool_call_id: None,
-                    content: format!("second {}", case.content),
-                    is_compaction: false,
-                    provenance: Default::default(),
-                },
-            ],
-            file_edits: Vec::new(),
+                vec![
+                    Message::new(case.message_seq, Role::User, case.content.clone()),
+                    Message::new(
+                        case.message_seq + 1,
+                        Role::Assistant,
+                        format!("second {}", case.content),
+                    ),
+                ],
+            );
+            value.transcript_text = case.content.clone();
+            value
         },
         0,
         0,
@@ -221,13 +195,14 @@ fn current_text_modes_fields_results_paging_and_planner_are_frozen() {
 
     assert_eq!(fixture.text_cases.len(), 9);
     for case in fixture.text_cases {
-        let filters = MessageFilters {
-            kinds: Some(vec![MessageKind::ToolCall]),
-            field: Some(case.field),
-            argument_path: case.argument_path.clone(),
-            match_mode: case.mode,
-            limit: 10,
-            ..Default::default()
+        let filters = {
+            let mut value = MessageFilters::default();
+            value.kinds = Some(vec![MessageKind::ToolCall]);
+            value.field = Some(case.field);
+            value.argument_path = case.argument_path.clone();
+            value.match_mode = case.mode;
+            value.limit = 10;
+            value
         };
         let (hits, receipt) = db
             .search_messages_with_explain(&case.query, &filters, true)
@@ -243,14 +218,12 @@ fn current_text_modes_fields_results_paging_and_planner_are_frozen() {
         );
 
         let page = db
-            .search_messages(
-                &case.query,
-                &MessageFilters {
-                    limit: 1,
-                    offset: 1,
-                    ..filters
-                },
-            )
+            .search_messages(&case.query, &{
+                let mut value = filters;
+                value.limit = 1;
+                value.offset = 1;
+                value
+            })
             .unwrap_or_else(|error| panic!("paged {:?}/{:?}: {error:#}", case.field, case.mode));
         assert_eq!(seqs(page), vec![case.expected_seq[1]], "paged {case:?}");
     }
@@ -263,15 +236,13 @@ fn current_no_text_field_presence_semantics_are_frozen() {
     assert_eq!(fixture.all_cases.len(), 3);
     for case in fixture.all_cases {
         let hits = db
-            .search_messages(
-                "",
-                &MessageFilters {
-                    field: Some(case.field),
-                    argument_path: case.argument_path.clone(),
-                    match_mode: MessageSearchMode::Literal,
-                    ..Default::default()
-                },
-            )
+            .search_messages("", &{
+                let mut value = MessageFilters::default();
+                value.field = Some(case.field);
+                value.argument_path = case.argument_path.clone();
+                value.match_mode = MessageSearchMode::Literal;
+                value
+            })
             .unwrap_or_else(|error| panic!("all {:?}: {error:#}", case.field));
         assert_eq!(seqs(hits), case.expected_seq, "{case:?}");
     }
@@ -286,12 +257,13 @@ fn current_validation_errors_are_consistent_across_fields() {
         SearchField::ToolName,
         SearchField::ToolArgument,
     ] {
-        let filters = |mode, limit| MessageFilters {
-            field: Some(field),
-            argument_path: (field == SearchField::ToolArgument).then(|| "/cmd".into()),
-            match_mode: mode,
-            limit,
-            ..Default::default()
+        let filters = |mode, limit| {
+            let mut value = MessageFilters::default();
+            value.field = Some(field);
+            value.argument_path = (field == SearchField::ToolArgument).then(|| "/cmd".into());
+            value.match_mode = mode;
+            value.limit = limit;
+            value
         };
         let invalid_regex = db
             .search_messages("[", &filters(MessageSearchMode::Regex, 10))
@@ -320,18 +292,8 @@ fn typed_service_preserves_frozen_modes_fields_results_and_planner_receipts() {
     let service = MessageService::new(&config, &db, SearchSurface::Rust);
 
     for case in fixture.text_cases {
-        let query = match case.mode {
-            MessageSearchMode::Literal => MessageQuery::literal(&case.query).unwrap(),
-            MessageSearchMode::Regex => MessageQuery::regex(&case.query).unwrap(),
-            MessageSearchMode::Fuzzy => MessageQuery::fuzzy(&case.query).unwrap(),
-        };
-        let target = match case.field {
-            SearchField::Content => MessageTarget::content(),
-            SearchField::ToolName => MessageTarget::tool_name(),
-            SearchField::ToolArgument => {
-                MessageTarget::tool_argument(case.argument_path.as_deref().unwrap_or("")).unwrap()
-            }
-        };
+        let query = MessageQuery::new(case.mode, &case.query).unwrap();
+        let target = MessageTarget::new(case.field, case.argument_path.as_deref()).unwrap();
         let request = MessageSearchRequest::builder(query, target)
             .kind(MessageKind::ToolCall)
             .extent(RequestedExtent::page(Some(10), 0).unwrap())
@@ -433,6 +395,7 @@ fn receipt_levels_distinguish_planner_summary_from_full_origins() {
                 assert!(document["receipt"]["parameter_origins"].is_object());
                 assert!(document["receipt"]["ordered_digest"].is_string());
             }
+            other => panic!("no receipt assertion for {other:?}"),
         }
     }
 }
@@ -517,13 +480,7 @@ fn typed_service_preserves_frozen_no_text_field_presence() {
     let service = MessageService::new(&config, &db, SearchSurface::Rust);
 
     for case in fixture.all_cases {
-        let target = match case.field {
-            SearchField::Content => MessageTarget::content(),
-            SearchField::ToolName => MessageTarget::tool_name(),
-            SearchField::ToolArgument => {
-                MessageTarget::tool_argument(case.argument_path.as_deref().unwrap_or("")).unwrap()
-            }
-        };
+        let target = MessageTarget::new(case.field, case.argument_path.as_deref()).unwrap();
         let response = service
             .search(
                 MessageSearchRequest::builder(MessageQuery::All, target)
@@ -927,41 +884,26 @@ fn boundary_line_window_cannot_erase_a_match_on_line_ten_thousand() {
         .join("\n");
     content.push_str("\nsemantic duplication survives");
     db.upsert_session(
-        &ParsedSession {
-            session: SessionRecord {
-                id: case.session_id.clone(),
-                provider: Provider::Codex,
-                provider_session_id: case.provider_session_id.clone(),
-                title: None,
-                summary: None,
-                cwd: Some("/fixture/workspace".into()),
-                repo_root: Some("/fixture".into()),
-                created_at: None,
-                updated_at: None,
-                last_message_at: None,
-                preview_text: String::new(),
-                source_path: "/fixture/transcripts/late-match.jsonl".into(),
-                message_count: Some(1),
-                parse_version: "contract-fixture-v1".into(),
-                raw_metadata_json: None,
-                parse_warning: None,
-                discovery_source: "test-fixture".into(),
-                parent_session_id: None,
-                agent_label: None,
-            },
-            transcript_text: content.clone(),
-            messages: vec![Message {
-                seq: case.message_seq,
-                role: Role::User,
-                ts: None,
-                tool_name: None,
-                kind: MessageKind::Conversation,
-                tool_call_id: None,
-                content,
-                is_compaction: false,
-                provenance: Default::default(),
-            }],
-            file_edits: Vec::new(),
+        &{
+            let mut value = ParsedSession::new(
+                {
+                    let mut value = SessionRecord::new(
+                        case.session_id.clone(),
+                        Provider::Codex,
+                        case.provider_session_id.clone(),
+                        "/fixture/transcripts/late-match.jsonl",
+                        "contract-fixture-v1",
+                        "test-fixture",
+                    );
+                    value.cwd = Some("/fixture/workspace".into());
+                    value.repo_root = Some("/fixture".into());
+                    value.message_count = Some(1);
+                    value
+                },
+                vec![Message::new(case.message_seq, Role::User, content.clone())],
+            );
+            value.transcript_text = content;
+            value
         },
         0,
         0,

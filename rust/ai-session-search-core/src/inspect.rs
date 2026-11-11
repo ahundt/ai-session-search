@@ -30,6 +30,7 @@ pub const DEFAULT_PREVIEW_CHARS: usize = 220;
 const REF_CANDIDATE_REGEX: &str = r#"https?://|file://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}/"#;
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SessionInspection {
     pub session: SessionRecord,
     pub user_intent: Vec<MessagePreview>,
@@ -48,6 +49,7 @@ pub struct SessionInspection {
 /// A compact-summary evidence category for which additional indexed entries are available.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EvidenceSection {
     /// Additional user messages classified as session intent are available.
     UserIntent,
@@ -74,6 +76,7 @@ impl EvidenceSection {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct InspectionOptions {
     pub preview_chars: usize,
     pub evidence_window: EvidenceWindow,
@@ -91,6 +94,7 @@ impl Default for InspectionOptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct MessagePreview {
     pub seq: i64,
     pub ts: Option<String>,
@@ -100,6 +104,7 @@ pub struct MessagePreview {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ToolActivity {
     pub seq: i64,
     pub ts: Option<String>,
@@ -111,6 +116,7 @@ pub struct ToolActivity {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct RefEvidence {
     pub seq: i64,
     pub role: String,
@@ -122,6 +128,7 @@ pub struct RefEvidence {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ChangedFileEvidence {
     pub file_path: String,
     pub provider: String,
@@ -130,6 +137,7 @@ pub struct ChangedFileEvidence {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct InspectionRow {
     pub section: String,
     pub key: String,
@@ -881,6 +889,7 @@ mod tests {
 /// Message-derived evidence is always rendered chronologically after selection. Changed-file
 /// evidence is an aggregate ordered by its file-summary query rather than message chronology.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum EvidenceWindow {
     /// Retain at most this many aggregate evidence records from the start of the session.
     First(NonZeroUsize),

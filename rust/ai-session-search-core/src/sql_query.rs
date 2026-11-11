@@ -144,6 +144,7 @@ fn db_query_long_help() -> String {
 }
 
 #[derive(Debug, Subcommand)]
+#[non_exhaustive]
 pub enum DbCmd {
     /// Print the AI session-history SQLite schema, or columns for one table.
     ///
@@ -195,6 +196,7 @@ pub struct DbQueryArgs {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<BTreeMap<String, Value>>,
@@ -202,11 +204,13 @@ pub struct QueryResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct QueryResultPayload {
     pub value: Value,
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResolvedDbQueryArgs {
     pub sql: String,
     pub limit: usize,
