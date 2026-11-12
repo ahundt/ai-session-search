@@ -180,7 +180,9 @@ Request and result values compare by value, have readable `repr()` output, and e
 `ts`; existing Python attributes keep `timestamp`. Resource owners and iterators retain
 identity semantics.
 
-Detailed result classes come from `ai_session_search.native`.
+Result and request classes are available directly from `ai_session_search`, including
+`SessionRecord`, `SearchHit`, `MessageHit`, `FileVersion`, and `IndexStatus`.
+`ai_session_search.native` remains a supported import path for the same classes.
 
 ## Rust
 

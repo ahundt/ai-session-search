@@ -60,3 +60,13 @@ def test_search_dictionary_omits_absent_optional_groups(tmp_path: Path):
     value = search.search_messages().to_dict()
     assert "included" not in value
     assert "receipt" not in value
+
+
+def test_package_root_exports_all_native_result_types():
+    import ai_session_search as package
+
+    for name in native.__all__:
+        value = getattr(native, name)
+        if inspect.isclass(value):
+            assert getattr(package, name, None) is value, name
+            assert name in package.__all__
