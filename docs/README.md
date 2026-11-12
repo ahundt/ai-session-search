@@ -25,12 +25,12 @@ A release starts at `RELEASING.md`'s "Before tagging, confirm" list, not at the 
 
 ## Architecture and migration records
 
-Completed design decisions and migration evidence, not checklists.
+Architecture records describe ownership and provenance; use the guides above for current workflows.
 
 | Record | Purpose |
 | --- | --- |
-| [Major migration](migration/ai-session-search-major-migration.md) | Ordered migration ledger, checkpoints, and remaining gates |
-| [Capability parity](migration/capability-parity.md) | Legacy capability disposition and semantic-duplication decisions |
+| [Major migration](migration/ai-session-search-major-migration.md) | Completed Rust migration and current reference links |
+| [Capability parity](migration/capability-parity.md) | Supported capability routes |
 | [Rust/Python API architecture](migration/rust-python-api-architecture.md) | Public API boundaries and distribution contract |
 | [Provenance](migration/provenance.md) | Source histories, transformation, licensing, and credit |
 | [1.0.0 release candidates](history/changelog-1.0.0-release-candidates.md) | Changelog entries for 1.0.0rc1 to 1.0.0rc4, moved out of CHANGELOG.md |

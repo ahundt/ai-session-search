@@ -6,7 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 # Changelog: 1.0.0 release candidates
 
 Release notes for 1.0.0rc1 to 1.0.0rc4, moved unchanged from [CHANGELOG.md](../../CHANGELOG.md),
-which carries 1.0.0 and later releases. Newest first.
+which carries 1.0.0 and later releases. Newest first. Commands and measurements below describe
+those historical builds; use the [current README](../../README.md) for supported spellings.
 
 ## [1.0.0rc4] - 2026-09-28
 

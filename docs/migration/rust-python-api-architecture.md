@@ -1,9 +1,9 @@
 # Rust and Python API architecture
 
-Related plans: [major migration](ai-session-search-major-migration.md) and
+Related references: [major migration](ai-session-search-major-migration.md) and
 [capability parity](capability-parity.md).
 
-## Current workspace and long-term split
+## Workspace
 
 ```text
 rust/ai-session-search-core/      public Rust services plus the one `aise` executable
@@ -23,8 +23,8 @@ Executable consolidation is complete: Cargo and Python distributions expose only
 
 - Rust is a first-class supported library with rustdoc examples, changelog, MSRV
   policy, feature matrix, and downstream compile tests.
-- Public request/result types live in core/service crates, have private fields where
-  future evolution requires builders, and implement appropriate standard traits.
+- Public request/result types are non-exhaustive and expose constructors, defaults, and
+  setters so callers can build requests as fields evolve.
 - Use newtypes/builders for paths, limits, cursors, time bounds, and operation modes
   when primitive values admit invalid states. Validate at construction boundaries.
 - Public functions document errors, cancellation, blocking, allocation, ordering,
@@ -34,9 +34,10 @@ Executable consolidation is complete: Cargo and Python distributions expose only
 - Filesystem effects are explicit. Single-file restore uses collision-safe create-new
   publication; multi-version recovery requires an absolute caller destination and one
   same-parent atomic no-replace directory transaction with a typed receipt.
-- Storage, clap, MCP, and PyO3 types remain private adapter details.
-- Feature flags stay capability-level: providers, analysis, Python. Do not create a
-  feature per command, format, or configuration field.
+- Application services use provider-neutral requests and results; transport and rendering
+  conversion stays in adapters. Retained low-level public modules are compatibility surfaces.
+- The core crate has one optional feature, `release-check`, enabled by default. Disabling it
+  omits the network release-check client; local parsing and query services remain available.
 
 ## Python API contract
 
@@ -48,14 +49,13 @@ Executable consolidation is complete: Cargo and Python distributions expose only
   of Python objects run through `Python::detach` so other Python threads progress.
 - Lazy reconstruction owns selected edit rows and releases the application mutex before
   Python iteration or explicit publication; Python never replays or renames versions itself.
-- Initial API is synchronous because legacy aise is synchronous. Async wrappers are
-  added only for measured consumers and must not duplicate service logic.
+- The library APIs are synchronous.
 - Ship `cp312-abi3` wheels for standard GIL-enabled CPython 3.12 through 3.14. The
   exact same wheel must install, import, and execute native calls on all three versions.
   Free-threaded CPython remains unsupported until separate `abi3t` or version-specific
   wheels pass dedicated runtime tests.
-- Python exceptions map from stable Rust error categories with actionable structured
-  fields; never parse Rust error strings to recover semantics.
+- Python exceptions map from stable Rust error categories with actionable recovery
+  guidance; never parse Rust error strings to recover semantics.
 
 ## Distribution contract
 
@@ -63,7 +63,7 @@ Executable consolidation is complete: Cargo and Python distributions expose only
 - `uv add`, `uv pip install`, and pip install the importable facade and extension.
 - `uv tool install`/uvx expose declared Python-distributed executables.
 - Cargo registry/Git/path installs expose native binaries and Rust libraries.
-- Signed native archives/installers serve users without Python or Rust.
+- Native archives/installers serve users without Python or Rust.
 - Clean builds use published dependency graphs (`uv build --no-sources`) and test
   sdist fallback explicitly. Wheels exist for every supported interpreter/platform
   so ordinary users do not unexpectedly compile Rust.

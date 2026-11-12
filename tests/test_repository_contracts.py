@@ -619,7 +619,7 @@ def test_internal_maintainer_skill_is_project_scoped_and_not_packaged() -> None:
     assert "### REQ023-accept-capability-parameters" in requirements_text
     assert "## Verification map" in requirements_text
     assert "~/.gemini/config/mcp_config.json" in requirements_text
-    assert "ModuleNotFoundError: No module named 'encodings'" in requirements_text
+    assert "Current measured installation evidence" not in requirements_text
     assert "Cumulative user requirements" not in requirements_text
     assert re.search(r"(?m)^\d+\. > ", requirements_text) is None
     assert re.search(r"REQ\d{3}(?!-)", requirements_text) is None
@@ -1426,21 +1426,11 @@ def test_dependency_automation_covers_each_locked_ecosystem() -> None:
     assert policy.count('interval: "weekly"') == 3
 
 
-def test_release_guide_records_standard_tool_adoption_decisions() -> None:
-    from pathlib import Path
-
-    guide = Path("docs/development/releasing-design-decisions.md").read_text(encoding="utf-8")
-    for tool in (
-        "maturin-action",
-        "cibuildwheel",
-        "cargo-dist",
-        "release-plz",
-        "cargo-semver-checks",
-        "cargo-binstall",
-        "Dependabot",
-        "zizmor",
-    ):
+def test_release_guide_names_the_tools_used_by_the_workflow() -> None:
+    guide = (ROOT / "docs/development/releasing-design-decisions.md").read_text(encoding="utf-8")
+    for tool in ("uv", "maturin-action", "cargo-deny", "actionlint", "zizmor", "Dependabot"):
         assert tool in guide
+    assert "Planned after the first public baseline" not in guide
 
 
 def test_temporal_complexity_contracts_are_kept_with_their_owners() -> None:
