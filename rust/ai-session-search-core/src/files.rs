@@ -443,10 +443,14 @@ fn recovery_publication_parent(destination: &Path) -> Result<&Path> {
             destination.display()
         )
     })? {
-        bail!(
-            "recovery publication destination already exists: {}",
-            destination.display()
-        );
+        return Err(crate::ServiceError::destination_exists(
+            destination,
+            format!(
+                "recovery publication destination already exists: {}",
+                destination.display()
+            ),
+        )
+        .into());
     }
     let parent = destination.parent().ok_or_else(|| {
         anyhow!(
@@ -512,9 +516,8 @@ pub fn reconstruct_query(
     let (session_id, provider, edits) = selected_edit_group(db, file, query)?;
     let selected = version.unwrap_or(edits.len());
     if selected == 0 || selected > edits.len() {
-        bail!(
-            "version {selected} is out of range for '{file}'; expected 1..={}",
-            edits.len()
+        return Err(
+            crate::ServiceError::file_version_out_of_range(file, selected, edits.len()).into(),
         );
     }
     let content = reconstruct(&edits, selected).ok_or_else(|| {
@@ -538,7 +541,7 @@ fn selected_edit_group(
 ) -> Result<(String, Provider, Vec<FileEdit>)> {
     let mut groups = group_by_session(db.file_edits_for_query(file, query)?);
     if groups.is_empty() {
-        bail!("no file edits found for '{file}'");
+        return Err(crate::ServiceError::file_not_found(file).into());
     }
     if groups.len() > 1 {
         bail!(
@@ -634,7 +637,7 @@ pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion
         }
     }
     if versions.is_empty() {
-        bail!("no file edits found for '{file}'");
+        return Err(crate::ServiceError::file_not_found(file).into());
     }
     let page = versions
         .into_iter()
@@ -915,7 +918,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
     }
     let mut groups = group_by_session(file_edits_for_scope(db, &args.file, &args.scope)?);
     let (session_id, provider, edits) = match groups.len() {
-        0 => bail!("no file edits found for '{}'", args.file),
+        0 => return Err(crate::ServiceError::file_not_found(&args.file).into()),
         1 => groups.remove(0),
         n => {
             let ids: Vec<String> = groups.into_iter().map(|(sid, _, _)| sid).collect();

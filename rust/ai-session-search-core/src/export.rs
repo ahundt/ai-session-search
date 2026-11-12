@@ -120,10 +120,14 @@ impl ExportPublicationPlan {
             bail!("export bundle destination must name a directory");
         }
         if entry_exists(&self.destination)? {
-            bail!(
-                "export bundle destination already exists: {}",
-                self.destination.display()
-            );
+            return Err(crate::ServiceError::destination_exists(
+                &self.destination,
+                format!(
+                    "export bundle destination already exists: {}",
+                    self.destination.display()
+                ),
+            )
+            .into());
         }
         Ok(())
     }

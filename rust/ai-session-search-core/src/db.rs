@@ -8782,27 +8782,13 @@ fn unique_session_match<T>(
         }
     }
     match matches.len() {
-        0 => Err(anyhow!(
-            "no session matches '{value}' — run `aise list` to see recent session \
-             ids, or `aise search <keywords>` to find one"
-        )),
+        0 => Err(crate::ServiceError::session_not_found(value).into()),
         1 => Ok(matches.remove(0)),
-        _ => {
-            let shown: Vec<&str> = matches.iter().take(8).map(id_of).collect();
-            let more = matches.len().saturating_sub(shown.len());
-            let suffix = if more > 0 {
-                format!(" (+{more} more)")
-            } else {
-                String::new()
-            };
-            Err(anyhow!(
-                "session prefix '{value}' is ambiguous — {} sessions match: {}{}. \
-                 Pass a longer prefix or the full id.",
-                matches.len(),
-                shown.join(", "),
-                suffix
-            ))
-        }
+        _ => Err(crate::ServiceError::session_prefix_ambiguous(
+            value,
+            matches.iter().map(|m| id_of(m).to_string()).collect(),
+        )
+        .into()),
     }
 }
 

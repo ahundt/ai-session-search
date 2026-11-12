@@ -986,10 +986,14 @@ impl SessionSearch {
         let schema_state = IndexCoordinator::new(&config).inspect_schema()?;
         match schema_state {
             SchemaState::Missing if config.index.refresh == IndexRefresh::ExistingOnly => {
-                anyhow::bail!(
-                    "existing-only index {} does not exist; run `aise reindex --full` without --index-refresh existing-only",
-                    config.db_path().display()
+                return Err(crate::ServiceError::index_missing(
+                    &config.db_path(),
+                    format!(
+                        "existing-only index {} does not exist; run `aise reindex --full` without --index-refresh existing-only",
+                        config.db_path().display()
+                    ),
                 )
+                .into())
             }
             SchemaState::Older { current, .. }
                 if config.index.refresh == IndexRefresh::ExistingOnly
@@ -1469,11 +1473,18 @@ mod execution_runtime_tests {
             .unwrap();
         assert_eq!(message_response.hits().len(), 1);
         assert_eq!(message_response.hits()[0].session_id, "claude:allowed");
-        assert!(app
+        // A session outside the access scope is not found, exactly like an unknown one.
+        let hidden = app
             .messages()
             .context("claude:hidden", 0, 1, 1)
-            .unwrap()
-            .is_empty());
+            .unwrap_err();
+        assert_eq!(
+            hidden
+                .downcast_ref::<crate::ServiceError>()
+                .map(crate::ServiceError::code),
+            Some("session-not-found"),
+            "{hidden:#}"
+        );
         assert!(app
             .messages()
             .session_metadata(&["claude:hidden".into()])
@@ -3176,11 +3187,23 @@ impl<'db> MessageService<'db> {
     /// Return every message whose seq lies within `before` sequence numbers before and `after`
     /// after `seq`, ordered by `(seq, id)`.
     ///
+    /// `session_id` is a canonical id or a unique prefix, resolved like
+    /// [`CatalogService::resolve_session`]. `before` and `after` count sequence numbers, not
+    /// messages, and must be zero or more; 0 and 0 return only the messages at `seq`. A window
+    /// past the end of an existing session returns an empty list.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) or
+    /// [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous)
+    /// when `session_id` names no session or several. Before 1.1.0 an unknown session returned
+    /// an empty list.
+    ///
     /// # Complexity
     ///
-    /// The `(session_id, seq)` index makes database work and memory proportional to the rows in
-    /// that window: `before + after + 1` sequence numbers times the messages each holds,
-    /// subject to messages available in the session.
+    /// One indexed session lookup, then the `(session_id, seq)` index makes database work and
+    /// memory proportional to the rows in that window: `before + after + 1` sequence numbers
+    /// times the messages each holds, subject to messages available in the session.
     pub fn context(
         &self,
         session_id: &str,
@@ -3188,7 +3211,8 @@ impl<'db> MessageService<'db> {
         before: i64,
         after: i64,
     ) -> Result<Vec<MessageHit>> {
-        self.db.message_context(session_id, seq, before, after)
+        let session = self.db.resolve_session_record(session_id)?;
+        self.db.message_context(&session.id, seq, before, after)
     }
 
     /// Read one session's messages, selecting the oldest or newest `filters.limit` by `order`,

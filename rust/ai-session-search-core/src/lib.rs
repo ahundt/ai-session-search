@@ -14,6 +14,7 @@ pub mod db;
 pub mod diagnostics;
 mod durable_fs;
 pub(crate) mod durable_path;
+mod error;
 mod executable_alias;
 pub mod export;
 pub mod files;
@@ -68,8 +69,13 @@ pub use analysis_pipeline::{
 pub use analysis_publication::{
     AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
 };
+/// The error crate every service method returns through `anyhow::Result`, re-exported so a caller
+/// can name `anyhow::Error` and downcast to [`ServiceError`] or [`MessageSearchError`] without
+/// adding a version-matched dependency of its own.
+pub use anyhow;
 pub use cli::run_from as run_cli_from;
 pub use corrections::{CapabilityReceipt, CorrectionCategorySpec, MessageClassificationReport};
+pub use error::ServiceError;
 pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
 pub use message_search::{

@@ -1343,9 +1343,10 @@ impl SearchFilters {
             !kinds.is_empty() && kinds.iter().all(|kind| *kind == SessionKind::User)
         });
         if self.parent_session_id.is_some() && only_user_sessions {
-            anyhow::bail!(
-                "session_kinds cannot contain only \"user\" when parent_session_id is set; pass [\"subagent\"], omit session_kinds to use both classes, or omit parent_session_id to search user-started sessions"
-            );
+            return Err(crate::ServiceError::invalid_argument(
+                "session_kinds cannot contain only \"user\" when parent_session_id is set; pass [\"subagent\"], omit session_kinds to use both classes, or omit parent_session_id to search user-started sessions",
+            )
+            .into());
         }
         Ok(())
     }
@@ -1387,13 +1388,14 @@ impl AnalysisRequest {
     pub fn new(scope: SearchFilters, selection: AnalysisSessionSelection) -> anyhow::Result<Self> {
         scope.validate()?;
         if scope.limit != 0 {
-            anyhow::bail!(
+            return Err(crate::ServiceError::invalid_argument(format!(
                 "analysis does not accept SearchFilters.limit={}; set it to 0 and choose \
                  AnalysisSessionSelection::FirstCanonicalSessions {{ max_sessions }} for the \
                  explicitly labeled canonical-order prefix, or AllEligible for every session in \
                  scope",
                 scope.limit
-            );
+            ))
+            .into());
         }
         Ok(Self { scope, selection })
     }

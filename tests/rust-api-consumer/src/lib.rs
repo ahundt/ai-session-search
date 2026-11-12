@@ -293,48 +293,106 @@ pub fn caller_built_queries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_session_search::ServiceError;
 
-    /// A one-session Claude transcript; its single user turn is what the custom category matches.
-    const TRANSCRIPT: &str = concat!(
-        r#"{"type":"user","sessionId":"consumer","timestamp":"2026-06-01T10:00:00Z","cwd":"/r","message":{"role":"user","content":[{"type":"text","text":"you skipped the migration step"}]}}"#,
-        "\n",
-    );
+    fn line(value: &str) -> String {
+        format!("{value}\n")
+    }
+
+    /// Two Claude sessions under `/r`. A's first user turn is what the custom category matches;
+    /// B writes and then edits `/r/app.py`, so it has two file versions, and ends with a harness
+    /// notice.
+    fn transcripts() -> [(&'static str, String); 2] {
+        let a = [
+            r#"{"type":"user","sessionId":"consumer-a","timestamp":"2026-06-01T10:00:00Z","cwd":"/r","uuid":"a0","message":{"role":"user","content":[{"type":"text","text":"you skipped the migration step. please run the tests before you commit"}]}}"#,
+            r#"{"type":"assistant","sessionId":"consumer-a","timestamp":"2026-06-01T10:00:05Z","cwd":"/r","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"running the tests now"}]}}"#,
+        ]
+        .map(line)
+        .concat();
+        let b = [
+            r#"{"type":"user","sessionId":"consumer-b","timestamp":"2026-06-02T10:00:00Z","cwd":"/r","uuid":"b0","message":{"role":"user","content":[{"type":"text","text":"please run the tests before you commit"}]}}"#,
+            r#"{"type":"assistant","sessionId":"consumer-b","timestamp":"2026-06-02T10:00:01Z","cwd":"/r","uuid":"b1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"/r/app.py","content":"one\n"}}]}}"#,
+            r#"{"type":"user","sessionId":"consumer-b","timestamp":"2026-06-02T10:00:02Z","cwd":"/r","uuid":"b2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","sessionId":"consumer-b","timestamp":"2026-06-02T10:00:03Z","cwd":"/r","uuid":"b3","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/r/app.py","old_string":"one","new_string":"two"}}]}}"#,
+            r#"{"type":"user","sessionId":"consumer-b","timestamp":"2026-06-02T10:00:04Z","cwd":"/r","uuid":"b4","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+            r#"{"type":"user","sessionId":"consumer-b","timestamp":"2026-06-02T10:00:05Z","cwd":"/r","uuid":"b5","isMeta":true,"message":{"role":"user","content":"Stop hook feedback: zebra notice"}}"#,
+        ]
+        .map(line)
+        .concat();
+        [("consumer-a", a), ("consumer-b", b)]
+    }
+
+    /// A temporary root holding the two transcripts and a configuration that reads only them.
+    struct Fixture {
+        root: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "aise-api-consumer-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let project = root.join("projects/p");
+            std::fs::create_dir_all(&project).unwrap();
+            for (id, text) in transcripts() {
+                std::fs::write(project.join(format!("{id}.jsonl")), text).unwrap();
+            }
+            Self { root }
+        }
+
+        fn config(&self) -> ai_session_search::config::Config {
+            let mut config = ai_session_search::config::Config::default();
+            let providers = &mut config.providers;
+            for provider in [
+                &mut providers.claude_desktop.enabled,
+                &mut providers.codex.enabled,
+                &mut providers.cursor.enabled,
+                &mut providers.antigravity.enabled,
+                &mut providers.pi.enabled,
+                &mut providers.prime_agent.enabled,
+                &mut providers.aistudio.enabled,
+                &mut providers.gemini_cli.enabled,
+            ] {
+                *provider = false;
+            }
+            providers.claude.enabled = true;
+            providers.claude.paths =
+                vec![self.root.join("projects").to_string_lossy().into_owned()];
+            config.skills.search_paths = Vec::new();
+            config.index.db_path = Some(self.root.join("index.db").to_string_lossy().into_owned());
+            config.index.cache_dir = Some(self.root.join("cache").to_string_lossy().into_owned());
+            config
+        }
+
+        /// Open and fully index the fixture.
+        fn indexed(&self) -> SessionSearch {
+            let app = SessionSearch::open(self.config()).unwrap();
+            app.index().reindex_report(true).unwrap();
+            app
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn service_error(error: &ai_session_search::anyhow::Error) -> &ServiceError {
+        error
+            .downcast_ref::<ServiceError>()
+            .unwrap_or_else(|| panic!("not a ServiceError: {error:#}"))
+    }
 
     #[test]
     fn caller_built_queries_run_against_a_temporary_index() {
-        let root = std::env::temp_dir().join(format!(
-            "aise-api-consumer-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let projects = root.join("projects");
-        std::fs::create_dir_all(projects.join("p")).unwrap();
-        std::fs::write(projects.join("p/consumer.jsonl"), TRANSCRIPT).unwrap();
-
-        let mut config = ai_session_search::config::Config::default();
-        let providers = &mut config.providers;
-        for provider in [
-            &mut providers.claude_desktop.enabled,
-            &mut providers.codex.enabled,
-            &mut providers.cursor.enabled,
-            &mut providers.antigravity.enabled,
-            &mut providers.pi.enabled,
-            &mut providers.prime_agent.enabled,
-            &mut providers.aistudio.enabled,
-            &mut providers.gemini_cli.enabled,
-        ] {
-            *provider = false;
-        }
-        providers.claude.enabled = true;
-        providers.claude.paths = vec![projects.to_string_lossy().into_owned()];
-        config.index.db_path = Some(root.join("index.db").to_string_lossy().into_owned());
-        config.index.cache_dir = Some(root.join("cache").to_string_lossy().into_owned());
-
-        let app = SessionSearch::open(config).unwrap();
-        app.index().reindex(true).unwrap();
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
         let (rows, categories) = caller_built_queries(
             &app,
             "select count(*) as sessions from sessions",
@@ -342,14 +400,92 @@ mod tests {
             r"\bskipped\b",
         )
         .unwrap();
-        drop(app);
-        std::fs::remove_dir_all(&root).unwrap();
 
         assert_eq!(rows.columns, ["sessions"]);
         assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0]["sessions"], 1);
+        assert_eq!(rows.rows[0]["sessions"], 2);
         assert!(!rows.truncated);
         assert_eq!(categories, ["skipped-step"]);
+    }
+
+    /// Each failure a caller must branch on arrives as a `ServiceError` with a stable code.
+    #[test]
+    fn typed_errors_downcast_from_service_results() {
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+
+        let error = app.catalog().resolve_session("claude:nope").unwrap_err();
+        assert!(matches!(
+            service_error(&error),
+            ServiceError::SessionNotFound { id_or_prefix, .. } if id_or_prefix == "claude:nope"
+        ));
+        assert_eq!(service_error(&error).code(), "session-not-found");
+        assert!(error
+            .to_string()
+            .starts_with("no session matches 'claude:nope'"));
+
+        let error = app
+            .catalog()
+            .resolve_session("claude:consumer-")
+            .unwrap_err();
+        let ServiceError::SessionPrefixAmbiguous { candidates, .. } = service_error(&error) else {
+            panic!("{error:#}")
+        };
+        assert_eq!(candidates, &["claude:consumer-a", "claude:consumer-b"]);
+
+        // An unknown session in a context read is the same not-found failure, not an empty list.
+        let error = app.messages().context("claude:nope", 0, 1, 1).unwrap_err();
+        assert_eq!(service_error(&error).code(), "session-not-found");
+
+        let error = app
+            .files()
+            .history("missing.py", &FileQuery::default())
+            .unwrap_err();
+        assert!(matches!(
+            service_error(&error),
+            ServiceError::FileNotFound { file, .. } if file == "missing.py"
+        ));
+
+        let error = app
+            .files()
+            .reconstruct("app.py", &FileQuery::default(), Some(9))
+            .unwrap_err();
+        let ServiceError::FileVersionOutOfRange {
+            requested, valid, ..
+        } = service_error(&error)
+        else {
+            panic!("{error:#}")
+        };
+        assert_eq!((*requested, valid.clone()), (9, 1..=2));
+
+        let existing = fixture.root.join("projects");
+        let error = app
+            .files()
+            .publish_versions("app.py", &FileQuery::default(), &existing)
+            .unwrap_err();
+        assert!(matches!(
+            service_error(&error),
+            ServiceError::DestinationExists { path, .. } if path == &existing
+        ));
+
+        let mut contradictory = SearchFilters::default();
+        contradictory.parent_session_id = Some("claude:consumer-a".into());
+        contradictory.session_kinds = Some(vec![SessionKind::User]);
+        let error = app.catalog().list_sessions(&contradictory).unwrap_err();
+        assert_eq!(service_error(&error).code(), "invalid-argument");
+        drop(app);
+
+        let mut missing = fixture.config();
+        missing.index.db_path = Some(
+            fixture
+                .root
+                .join("absent.db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        missing.index.refresh = ai_session_search::config::IndexRefresh::ExistingOnly;
+        let error = SessionSearch::open(missing).err().unwrap();
+        assert_eq!(service_error(&error).code(), "index-missing");
     }
 }
 

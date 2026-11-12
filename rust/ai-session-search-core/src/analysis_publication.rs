@@ -426,10 +426,14 @@ fn escape_markdown(value: &str) -> String {
 
 fn reject_existing(path: &Path) -> Result<()> {
     match entry_exists(path) {
-        Ok(true) => bail!(
-            "analysis publication destination already exists: {}",
-            path.display()
-        ),
+        Ok(true) => Err(crate::ServiceError::destination_exists(
+            path,
+            format!(
+                "analysis publication destination already exists: {}",
+                path.display()
+            ),
+        )
+        .into()),
         Ok(false) => Ok(()),
         Err(error) => Err(error).with_context(|| {
             format!(
