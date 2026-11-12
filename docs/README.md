@@ -18,6 +18,7 @@ The repository [README](../README.md) covers what `aise` does and a quick start.
 | Run a release, start to finish | [RELEASING.md](../RELEASING.md) |
 | Change how packaging, publishing, or the supported target matrix works | [Releasing: design decisions](development/releasing-design-decisions.md) |
 | Preserve cumulative product contracts while changing the repository | [Maintainer requirements and design decisions](development/maintainer-requirements-and-design-decisions.md) |
+| Change the integration installer, configuration resolution, or their acceptance tests | [Installer and configuration maintainer contracts](development/maintainer-contracts-for-install-and-config.md) |
 | Re-check client-imposed MCP limits when a harness or schema changes | [MCP client limits and measured evidence](development/mcp-client-limits-and-measured-evidence.md) |
 
 A release starts at `RELEASING.md`'s "Before tagging, confirm" list, not at the tag.

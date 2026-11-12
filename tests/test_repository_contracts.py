@@ -562,6 +562,7 @@ def test_skill_package_documentation_matches_the_one_shipped_package() -> None:
             "docs/development/configuration.md",
             "docs/development/installation.md",
             "docs/development/maintainer-requirements-and-design-decisions.md",
+            "docs/development/maintainer-contracts-for-install-and-config.md",
         )
     )
     for retired_claim in (
@@ -706,9 +707,12 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "~/.prime/agent/settings.json" in installation and 'type: "stdio"' in installation
     for mcp_path in ("~/.pi/agent/mcp.json", "~/.prime/agent/settings.json"):
         assert mcp_path in readme
-    acceptance = installation.split("The integration acceptance matrix", 1)[1]
+    maintainer_contracts = (ROOT / "docs/development/maintainer-contracts-for-install-and-config.md").read_text(
+        encoding="utf-8"
+    )
+    acceptance = maintainer_contracts.split("The integration acceptance matrix", 1)[1]
     assert "Pi" in acceptance and "Prime Agent" in acceptance
-    assert "toml_edit::DocumentMut" in configuration
+    assert "toml_edit::DocumentMut" in maintainer_contracts
     assert "ChatGPT Codex desktop" in configuration
     assert "~/.gemini/config/mcp_config.json" in configuration
     assert "~/.gemini/antigravity-cli/skills/" in configuration

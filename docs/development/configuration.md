@@ -570,56 +570,29 @@ stderr.
 
 ## Atomic configuration initialization
 
-`aise config init` uses the shared `durable_fs` staged-file transaction. Create-new mode refuses any
-existing entry. `--force` replaces only a regular file, preserves its permissions, rejects symbolic
-links and other file types, syncs file and parent directory data, and removes unpublished staging
-files on drop. A parent-directory sync error reports that publication already occurred so callers do
-not retry blindly.
+`aise config init` writes through a staged file. Create-new mode refuses any existing entry.
+`--force` replaces only a regular file, preserves its permissions, rejects symbolic links and other
+file types, syncs file and parent directory data, and removes unpublished staging files. A
+parent-directory sync error reports that publication already occurred so callers do not retry
+blindly.
 
 ## MCP client configuration transactions
 
-Cross-directory filesystem updates are not atomic. The MCP installer therefore uses an advisory
-lock and a versioned receipt containing exact UTF-8 before/after images and lossless platform path
-units. New receipt files use mode `0600` on Unix and the destination directory's inherited ACL on
-Windows. It validates every input before the receipt, revalidates each preimage before
-publication, atomically publishes each file, and syncs its parent. A handled failure rolls back
-unchanged outputs in reverse order. A crash, external edit, unreadable receipt, or durability-
-confirmation failure preserves evidence and prints a shell-independent executable/argv description
-plus the exact receipt path; recovery never overwrites
-content that differs from both recorded images. Successful publication or complete rollback removes
-the receipt. The adjacent advisory lock file remains because deleting a lock pathname can split
-concurrent waiters across different inodes.
+Install, uninstall, and recovery change files in several directories, and cross-directory
+filesystem updates are not atomic. The installer therefore records a versioned receipt holding
+each file's exact before and after contents. New receipt files use mode `0600` on Unix and the
+destination directory's inherited ACL on Windows. A handled failure rolls back unchanged outputs
+in reverse order. A crash, external edit, unreadable receipt, or durability-confirmation failure
+preserves evidence and prints a shell-independent executable/argv description plus the exact
+receipt path; recovery never overwrites content that differs from both recorded images.
+Successful publication or complete rollback removes the receipt. The adjacent advisory lock file
+remains because deleting a lock pathname can split concurrent waiters across different inodes.
 
-Status holds an `fd_lock` shared guard across the receipt check and every selected config/instruction
-read; install, uninstall, and recovery take the corresponding exclusive guard. Codex TOML edits use
-`toml_edit::DocumentMut` to remove/replace the semantic `mcp_servers.ai-session-search` item, including quoted and
-nested table forms, while preserving unrelated comments and ordering. Generated TOML is reparsed
-before the durable transaction can publish it. Executable paths that cannot be represented as UTF-8
-are rejected before any JSON or TOML mutation instead of being lossily rewritten.
+`aise integrations status` reads under the same lock that install, uninstall, and recovery hold,
+so it never reports a half-applied install. Codex TOML edits replace the
+`mcp_servers.ai-session-search` item, including quoted and nested table forms, while preserving
+unrelated comments and ordering. Executable paths that cannot be represented as UTF-8 are
+rejected before any JSON or TOML mutation instead of being lossily rewritten.
 
-The implementation retains the shared `durable_fs` primitive rather than adding a second atomic-file
-crate. Rust's [`OsStrExt`](https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStrExt.html) defines the
-lossless Unix byte representation used in receipts, and the formatting-preserving TOML API and
-keyed removal contract come from
-[`toml_edit::DocumentMut`](https://docs.rs/toml_edit/latest/toml_edit/struct.DocumentMut.html).
-Receipts record explicit platform-native units, because the alternatives either change encoding
-between releases or reject non-Unicode paths.
-
-## Maintainer checks
-
-Nothing below this point is needed to configure `aise`; it is what a change to configuration
-itself has to satisfy.
-
-Configuration changes require focused tests for all four precedence levels, invalid canonical
-environment values, canonical/legacy conflicts, omitted versus explicit-empty provider paths,
-unknown TOML keys, CLI/MCP/Python parity, and effective-config provenance. Tests must inject
-`ConfigEnvironment`; do not mutate process environment in parallel Rust tests.
-
-The embedded `config.example.toml` is documentation, not a second runtime-default source. Typed
-Rust defaults remain canonical, and the example contract test must compare each uncommented
-tunable with those typed defaults. An embedded default config is acceptable only if it replaces
-rather than duplicates those defaults, and only with a test proving the serialized example,
-parser, CLI help, MCP schemas, and API defaults cannot drift.
-
-Runtime-derived paths and CPU or thread counts stay typed functions, never literal paths or
-machine-specific values embedded in the binary.
+How these guarantees are implemented, and the checks a configuration change must pass, are in
+[installer and configuration maintainer contracts](maintainer-contracts-for-install-and-config.md).

@@ -148,6 +148,15 @@ Cursor receives `type: "stdio"` under `mcpServers` in `~/.cursor/mcp.json`, as r
 post-upgrade refresh adds the field to earlier untyped aise registrations, keeping their
 executable path and file comments. Other clients using `mcpServers` keep their own entry format.
 
+Antigravity App/IDE and CLI share the current
+`~/.gemini/config/mcp_config.json` while the installer also maintains the two legacy Antigravity
+MCP locations for older harness versions; they use distinct skill roots and share managed
+`~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.servers.ai-session-search`
+with `type: "local"` in `~/.config/opencode/opencode.json`, the layout
+[OpenCode 2 reads](https://opencode.ai/docs/mcp-servers/), and a managed block in
+`~/.config/opencode/AGENTS.md`. Reinstall moves an entry an earlier aise wrote directly under
+`mcp`, which OpenCode 2 ignores.
+
 ### Instruction files and hooks
 
 The installer adds managed instruction guidance for Claude, Codex, OpenCode, Gemini, Antigravity,
@@ -497,57 +506,8 @@ cargo install ai-session-search \
   --locked
 ```
 
-## Maintainer acceptance contract
-
-The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desktop and Codex
-CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, **Pi**, **Prime Agent**, Cursor, Windsurf, VS
-Code, Zed, **OpenCode**, OpenClaw, and KiloCode. Each target must pass
-install, content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe uninstall
-tests. Pi and Prime Agent acceptance includes strict-JSON MCP registration, MCP-first guidance,
-native skill discovery, managed `AGENTS.md`, explicit selection, status, idempotent reinstall,
-dry-run, and ownership-safe uninstall. Antigravity App/IDE and CLI share the current
-`~/.gemini/config/mcp_config.json` while the installer also maintains the two legacy Antigravity
-MCP locations for older harness versions; they use distinct skill roots and share managed
-`~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.servers.ai-session-search`
-with `type: "local"` in `~/.config/opencode/opencode.json`, the layout
-[OpenCode 2 reads](https://opencode.ai/docs/mcp-servers/), and a managed block in
-`~/.config/opencode/AGENTS.md`. Reinstall moves an entry an earlier aise wrote directly under
-`mcp`, which OpenCode 2 ignores.
-
-Maintainers install from a repository checkout with
-`sh scripts/install-native.sh --bin-dir DIR`; the packaged archive ships the same script as
-`install.sh`.
-
-The canonical repository URL is `https://github.com/ahundt/ai-session-search`. Keep it equal to
-`project.urls.Repository` in `pyproject.toml` and `workspace.package.repository` in `Cargo.toml`;
-installation documentation must not introduce a second repository identity. When a harness
-changes its configuration syntax or security guidance, update this guide, the CI workflow, and
-the installer acceptance tests in the same commit.
-
-CI checks direct-Git installation without depending on GitHub availability. It
-uses the checked-out repository as a `file://` remote and `$GITHUB_SHA` as the
-immutable revision, then verifies pip, `uv add`, `uv tool install`, `uvx`, and
-`cargo install --git`. The Python acceptance harness is reusable locally:
-
-```bash
-uv run --isolated --no-project python scripts/verify_python_install_methods.py \
-  --git-url "file://$(git rev-parse --show-toplevel)" \
-  --git-rev "$(git rev-parse HEAD)" \
-  --source-root "$(git rev-parse --show-toplevel)" \
-  --timeout-seconds 600
-```
-
-The harness deliberately accepts the repository and revision as parameters. It
-rejects mutable or abbreviated revisions, insecure HTTP, embedded credentials,
-and relative local paths. Temporary virtual environments, tool installations,
-configuration, and application caches are scoped to one temporary root and removed
-on success or failure. The harness deliberately inherits the caller's content-addressed
-uv cache and `CARGO_TARGET_DIR`: normal standalone invocations reuse uv's platform cache,
-while `run_ci_local.sh` selects the workspace `target` directory. Set either environment
-variable explicitly to use a different shared cache; the harness never deletes it.
-
-On `No space left on device`, reclaim with `cargo clean`, or `cargo clean -p <package>`. Never
-delete `$CARGO_HOME` or uv's shared cache to recover space.
+Rules for changing the installer, its acceptance tests, and the install documentation are in
+[installer and configuration maintainer contracts](maintainer-contracts-for-install-and-config.md).
 
 ## Primary references
 
