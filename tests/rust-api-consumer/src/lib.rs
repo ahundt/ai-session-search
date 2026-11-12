@@ -26,15 +26,17 @@
 //! }
 //! ```
 
+use ai_session_search::sql_query::{QueryResult, ResolvedDbQueryArgs};
 use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
     AnalysisPublicationReceipt, AnalysisRequest, AnalysisSessionSelection, CapabilityReceipt,
-    ClassificationRuleSpec, ClassificationTarget, ExportFormat, ExportPublicationPlan, FileQuery,
-    InspectionOptions, MessageClassificationMatch, MessageClassificationQuery,
-    MessageClassificationReport, MessageFilters, MessageMatchViewMarkers, MessageQuery,
-    MessageSearchMode, MessageSearchRequest, MessageTarget, PhraseTextMode,
-    PhraseVocabularyPolicySpec, ReceiptedAnalysis, SearchFilters, SessionKind, SessionSearch,
-    SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery, SkillSelector,
+    ClassificationRuleSpec, ClassificationTarget, CorrectionCategorySpec, ExportFormat,
+    ExportPublicationPlan, FileQuery, InspectionOptions, MessageClassificationDefinition,
+    MessageClassificationMatch, MessageClassificationQuery, MessageClassificationReport,
+    MessageFilters, MessageMatchViewMarkers, MessageQuery, MessageSearchMode, MessageSearchRequest,
+    MessageTarget, PhraseTextMode, PhraseVocabularyPolicySpec, ReceiptedAnalysis, SearchFilters,
+    SessionKind, SessionSearch, SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery,
+    SkillSelector,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -248,6 +250,107 @@ pub fn caller_built_inputs(
     assert!(options.rollback_copy.is_none());
 
     ai_session_search::files::reconstruct(&[write, edit], 2)
+}
+
+/// Build the query inputs that have no other construction path and run each one: read-only SQL
+/// through `sql_query::query_path`, and a typed custom correction category through `run_skill`.
+///
+/// Returns the SQL result and the categories the custom definition matched, in report order.
+pub fn caller_built_queries(
+    app: &SessionSearch,
+    sql: &str,
+    category: &str,
+    pattern: &str,
+) -> Result<(QueryResult, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let args = ResolvedDbQueryArgs::new(sql, 10);
+    let rows = ai_session_search::sql_query::query_path(
+        &app.config().db_path(),
+        app.config().index.busy_timeout_ms,
+        &args,
+    )?;
+
+    let mut query = SkillRunQuery::new(
+        SkillSelector::name("corrections")?,
+        SkillCapabilityInput::MessageClassification(MessageClassificationQuery::default()),
+    );
+    query.definition = Some(MessageClassificationDefinition::new(vec![
+        CorrectionCategorySpec::new(category, [pattern]),
+    ]));
+    let SkillCapabilityOutput::MessageClassification(result) =
+        app.analysis().run_skill(&query)?.output
+    else {
+        return Err("message-classification query returned another capability output".into());
+    };
+    let categories = result
+        .report
+        .matches
+        .into_iter()
+        .map(|hit| hit.category)
+        .collect();
+    Ok((rows, categories))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-session Claude transcript; its single user turn is what the custom category matches.
+    const TRANSCRIPT: &str = concat!(
+        r#"{"type":"user","sessionId":"consumer","timestamp":"2026-06-01T10:00:00Z","cwd":"/r","message":{"role":"user","content":[{"type":"text","text":"you skipped the migration step"}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn caller_built_queries_run_against_a_temporary_index() {
+        let root = std::env::temp_dir().join(format!(
+            "aise-api-consumer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = root.join("projects");
+        std::fs::create_dir_all(projects.join("p")).unwrap();
+        std::fs::write(projects.join("p/consumer.jsonl"), TRANSCRIPT).unwrap();
+
+        let mut config = ai_session_search::config::Config::default();
+        let providers = &mut config.providers;
+        for provider in [
+            &mut providers.claude_desktop.enabled,
+            &mut providers.codex.enabled,
+            &mut providers.cursor.enabled,
+            &mut providers.antigravity.enabled,
+            &mut providers.pi.enabled,
+            &mut providers.prime_agent.enabled,
+            &mut providers.aistudio.enabled,
+            &mut providers.gemini_cli.enabled,
+        ] {
+            *provider = false;
+        }
+        providers.claude.enabled = true;
+        providers.claude.paths = vec![projects.to_string_lossy().into_owned()];
+        config.index.db_path = Some(root.join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(root.join("cache").to_string_lossy().into_owned());
+
+        let app = SessionSearch::open(config).unwrap();
+        app.index().reindex(true).unwrap();
+        let (rows, categories) = caller_built_queries(
+            &app,
+            "select count(*) as sessions from sessions",
+            "skipped-step",
+            r"\bskipped\b",
+        )
+        .unwrap();
+        drop(app);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(rows.columns, ["sessions"]);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0]["sessions"], 1);
+        assert!(!rows.truncated);
+        assert_eq!(categories, ["skipped-step"]);
+    }
 }
 
 // Compile the Rust examples in the repository README and the library guide. They live outside the
