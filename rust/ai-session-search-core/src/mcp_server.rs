@@ -651,7 +651,12 @@ fn execute_official_tool_call(
         /// connection and scans the catalogue, which is blocking database work; the type-level
         /// contract above says a tool call does that with the mutex released.
         SchemaOnly(Config, usize, ToolRecovery),
-        Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
+        Reader(
+            Config,
+            crate::search_scope::TrustedAccessInputs,
+            bool,
+            ToolRecovery,
+        ),
     }
 
     let args = Value::Object(request.arguments.unwrap_or_default());
@@ -720,7 +725,12 @@ fn execute_official_tool_call(
             .map_err(|error| format!("{error:#}"))?;
         let refresh_after_call = config.index.refresh == crate::config::IndexRefresh::Auto;
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        Ok(Preparation::Reader(config, inputs, refresh_after_call))
+        Ok(Preparation::Reader(
+            config,
+            inputs,
+            refresh_after_call,
+            recovery,
+        ))
     })();
 
     let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
@@ -734,7 +744,7 @@ fn execute_official_tool_call(
         ),
         Err(error) => rmcp_tool_error(error),
     };
-    let (config, inputs, refresh_after_call) = match prepared {
+    let (config, inputs, refresh_after_call, recovery) = match prepared {
         Ok(Preparation::Direct(result, ceiling, recovery)) => {
             return (deliver(result, ceiling, recovery), false);
         }
@@ -746,8 +756,8 @@ fn execute_official_tool_call(
             let result = tool_query_session_index_cancellable(&args, &config, Some(&cancellation));
             return (deliver(result, ceiling, recovery), false);
         }
-        Ok(Preparation::Reader(config, inputs, refresh_after_call)) => {
-            (config, inputs, refresh_after_call)
+        Ok(Preparation::Reader(config, inputs, refresh_after_call, recovery)) => {
+            (config, inputs, refresh_after_call, recovery)
         }
         Err(error) => return (rmcp_tool_error(error), false),
     };
@@ -791,12 +801,9 @@ fn execute_official_tool_call(
             tool_response_to_rmcp(response),
             &tool_name,
             app.config().mcp.max_tool_result_chars,
-            ToolRecovery::for_call(
-                &tool_name,
-                &args,
-                &advertised_tools(app.config()),
-                app.config(),
-            ),
+            // Reuse preparation's cached-catalogue decision: O(1) time and memory here,
+            // instead of rebuilding O(T) catalogue bytes and opening another schema reader.
+            recovery,
             Some(cancellation.flag()),
         ),
         Err(error) => rmcp_tool_error(error),
@@ -4177,12 +4184,19 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
     schema
 }
 
+#[cfg(test)]
+thread_local! {
+    static CATALOGUE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The `tools[]` array this server advertises, without the JSON-RPC envelope around it.
 ///
 /// Callers that measure the catalogue want the array; callers that measure transport want the
 /// message. Those are two stages that differ by the wrapper, and reporting one figure for the
 /// other is how a wire cost gets read as a model-context cost, so the two have separate accessors.
 pub fn advertised_tools(config: &Config) -> Value {
+    #[cfg(test)]
+    CATALOGUE_BUILDS.with(|count| count.set(count.get() + 1));
     handle_tools_list(None, config)["result"]["tools"].clone()
 }
 
@@ -6989,6 +7003,37 @@ mod tests {
 
     /// A temp index holding one session rooted at [`FIXTURE_PROJECT`] with three messages,
     /// built entirely through the public API so these tests exercise the real persist path.
+    #[test]
+    fn reader_calls_reuse_the_connection_catalogue_and_preserve_ordered_rows() {
+        let (dir, db) = fixture();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let server = OfficialMcpServer::new(config.clone()).unwrap();
+        server.inner.lock().unwrap().advertised_tools();
+        let before = CATALOGUE_BUILDS.with(|count| count.get());
+        let args = json!({"query": "hello", "index_refresh": "existing-only"});
+        let expected = tool_response_to_rmcp(
+            dispatch_tool_cancellable("search_messages", &args, &config, &db, None).unwrap(),
+        );
+        for _ in 0..2 {
+            let request = rmcp::model::CallToolRequestParams::new("search_messages")
+                .with_arguments(args.as_object().unwrap().clone());
+            let (actual, refresh) = execute_official_tool_call(
+                &server.inner,
+                &server.reader_runtime,
+                request,
+                Arc::new(QueryCancellation::new()),
+                None,
+            );
+            assert!(!refresh);
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+        }
+        assert_eq!(CATALOGUE_BUILDS.with(|count| count.get()), before);
+    }
+
     fn fixture() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
