@@ -2,7 +2,7 @@
 #
 # THIS FILE IS THE PRODUCT DEFAULT. It is embedded in the executable, so `aise skills corrections`
 # uses these bytes whether or not the skill is installed anywhere. An installed copy is
-# agent-facing documentation; editing it does not change what Aise measures.
+# agent-facing documentation; editing it does not change what aise measures.
 #
 # HOW IT IS EVALUATED. Categories run top to bottom and the FIRST match wins, so `other` is
 # deliberately last: order is behavior, not presentation. Patterns within one category are ORed

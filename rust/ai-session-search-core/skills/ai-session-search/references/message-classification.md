@@ -176,7 +176,7 @@ only, never classification, ordering, page membership, or policy receipts.
 
 Page with `--limit` and `--offset` (newest first). `--limit 0` returns every match.
 Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety
-ceiling. If their combined canonical input exceeds it, Aise reports the consumed and attempted byte
+ceiling. If their combined canonical input exceeds it, aise reports the consumed and attempted byte
 counts with guidance; it never truncates rules or search results to fit.
 
 ### Other surfaces

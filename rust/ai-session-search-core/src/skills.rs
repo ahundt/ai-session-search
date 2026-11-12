@@ -61,7 +61,7 @@ pub enum SkillsCmd {
     #[command(
         after_help = "The scaffold is YOURS: it carries no managed marker, so \
                             `aise integrations install` and `aise skills update` will never \
-                            rewrite it. Add `--capability message-classification` only when Aise \
+                            rewrite it. Add `--capability message-classification` only when aise \
                             should execute deterministic categories via `aise skills <name>`."
     )]
     Create(SkillsCreateArgs),
@@ -90,7 +90,7 @@ pub enum SkillsCmd {
     #[command(
         after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
                       parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
-                      counts with guidance; Aise never truncates rules or results to fit."
+                      counts with guidance; aise never truncates rules or results to fit."
     )]
     Run(SkillRunEscapeArgs),
     /// Run the named/path-selected skill's read-only deterministic capability.
@@ -123,7 +123,7 @@ pub(crate) struct SkillExecution {
     disable_help_subcommand = true,
     after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
                   parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
-                  counts with guidance; Aise never truncates rules or results to fit."
+                  counts with guidance; aise never truncates rules or results to fit."
 )]
 struct MessageClassificationCommand {
     #[command(flatten)]
