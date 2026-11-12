@@ -674,7 +674,7 @@ impl ClaudeAdapter {
                 Some(kind) if IGNORED_RECORD_TYPES.contains(&kind) => true,
                 other => {
                     unrecognized.count(other);
-                    true
+                    continue;
                 }
             };
 
@@ -4572,6 +4572,46 @@ mod tests {
             metadata[super::UNRECOGNIZED_RECORD_TYPES_KEY],
             json!({"brand-new-kind": 2})
         );
+    }
+
+    #[test]
+    fn unknown_record_types_preserve_legacy_rows_and_report_health() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("unknown.jsonl");
+        let adapter = ClaudeAdapter::new(vec![]);
+        let record = json!({"type":"future-kind","sessionId":"unknown",
+            "message":{"role":"user","content":"future payload"}});
+        let current = adapter
+            .parse_reader(std::io::Cursor::new(record.to_string()), &path)
+            .unwrap();
+        let mut old_record = record.clone();
+        old_record["type"] = json!("user");
+        let mut old = adapter
+            .parse_reader(std::io::Cursor::new(old_record.to_string()), &path)
+            .unwrap();
+        old.session.parse_version = "claude-v4".into();
+        let db_path = temp.path().join("unknown.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.upsert_session(&old, 1, 1).unwrap();
+        db.upsert_session(&current, 2, 2).unwrap();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "select count(*) from messages where content='future payload'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(current.messages.is_empty());
+        assert!(current.retracted.messages.is_empty());
+        let health = db.parser_health().unwrap();
+        assert_eq!(
+            health.unrecognized_record_types[0].record_type,
+            "future-kind"
+        );
+        assert_eq!(health.unrecognized_record_types[0].records, 1);
     }
 
     #[test]
