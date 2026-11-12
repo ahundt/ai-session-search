@@ -580,6 +580,11 @@ impl ClaudeAdapter {
                     continue;
                 }
                 Some("attachment") => {
+                    if event_id.is_some_and(|id| {
+                        !seen_records.insert((id.to_owned(), sha256(value.to_string().as_bytes())))
+                    }) {
+                        continue;
+                    }
                     if let Some(queued) = QueuedCommand::from_attachment(
                         &value,
                         timestamp,
@@ -4622,13 +4627,19 @@ mod tests {
     #[test]
     fn queued_command_attachments_add_only_prompts_no_other_record_holds() {
         let attachment = |uuid: &str, prompt: &str| {
-            json!({"type":"attachment","uuid":uuid,"timestamp":"2026-11-01T00:00:00Z",
+            let timestamp = if uuid == "q-4" {
+                "2026-11-01T00:00:03Z"
+            } else {
+                "2026-11-01T00:00:00Z"
+            };
+            json!({"type":"attachment","uuid":uuid,"timestamp":timestamp,
                 "sessionId":"queued","attachment":{"type":"queued_command","prompt":prompt,
                 "commandMode":"prompt"}})
             .to_string()
         };
         let lines = [
             // Delivered before the user record that also holds it.
+            attachment("q-1", "held by a later user record"),
             attachment("q-1", "held by a later user record"),
             json!({"type":"user","uuid":"u-1","sessionId":"queued",
                 "message":{"role":"user","content":"held by a later user record"}})
@@ -4638,10 +4649,12 @@ mod tests {
                 "timestamp":"2026-11-01T00:00:01Z"})
             .to_string(),
             attachment("q-2", "only in the attachment"),
+            attachment("q-2", "only in the attachment"),
             // The same text submitted twice, enqueued once with content.
             json!({"type":"queue-operation","operation":"enqueue","sessionId":"queued",
                 "timestamp":"2026-11-01T00:00:02Z","content":"submitted twice"})
             .to_string(),
+            attachment("q-3", "submitted twice"),
             attachment("q-3", "submitted twice"),
             attachment("q-4", "submitted twice"),
         ]
@@ -4666,6 +4679,27 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
         assert_eq!(metadata["requires_full_parse_for_tail"], json!(true));
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("queued.db");
+        crate::db::Db::open(&path)
+            .unwrap()
+            .upsert_session(&parsed, 1, 1)
+            .unwrap();
+        let stored = rusqlite::Connection::open(&path).unwrap();
+        let duplicates: i64 = stored.query_row(
+            "select count(*) from (select 1 from messages where role='user' and input_origin='queued' group by session_id, content, ts having count(*)>1)",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            stored
+                .query_row(
+                    "select count(*) from messages where content='only in the attachment'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(duplicates, 0);
     }
 
     /// A `queue-operation` enqueue says only that something was queued. The `queued_command`
