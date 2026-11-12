@@ -4525,6 +4525,163 @@ impl SessionSearch {
         json_compatible(py, &specification)
     }
 
+    /// Report indexed term frequencies. None uses analytics.vocab_limit; 0 returns all terms.
+    /// Refused under allowed-roots because these counts span the complete index.
+    #[pyo3(signature = (*, prefix=None, trigram=false, limit=None))]
+    fn vocabulary<'py>(
+        &self,
+        py: Python<'py>,
+        prefix: Option<String>,
+        trigram: bool,
+        limit: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut query = ai_session_search::VocabularyQuery::default().with_trigram(trigram);
+        query.prefix = prefix;
+        query.limit = limit
+            .map(|v| paging_argument(PagingArgument::Limit, v))
+            .transpose()?;
+        let rows = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.analysis().vocabulary(&query).map_err(service_error)
+        })?;
+        json_compatible(py, &rows)
+    }
+
+    /// Mine recurring phrases and return groups, examples, and unattributed-input counts.
+    /// Omitted bounds use analytics settings; 0 max_groups or max_examples_per_group means all.
+    /// query_mode accepts literal or regex. Scope filters intersect before mining.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (query=None, *, scope=None, role=None, query_mode="literal", limit=0, include_unattributed_input=false, max_groups=None, max_examples_per_group=None, min_matches=None, phrase_min_words=None, phrase_max_words=None, context=0))]
+    fn repeats<'py>(
+        &self,
+        py: Python<'py>,
+        query: Option<String>,
+        scope: Option<QueryScope>,
+        role: Option<&str>,
+        query_mode: &str,
+        limit: i64,
+        include_unattributed_input: bool,
+        max_groups: Option<i64>,
+        max_examples_per_group: Option<i64>,
+        min_matches: Option<i64>,
+        phrase_min_words: Option<i64>,
+        phrase_max_words: Option<i64>,
+        context: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let count = |name: &str, value: Option<i64>| {
+            value
+                .map(|v| {
+                    usize::try_from(v).map_err(|_| {
+                        invalid_argument_error(format!("{name} must be 0 or greater; got {v}"))
+                    })
+                })
+                .transpose()
+        };
+        let mode = match query_mode {
+            "literal" => ai_session_search::MessageSearchMode::Literal,
+            "regex" if query.is_some() => ai_session_search::MessageSearchMode::Regex,
+            _ => {
+                return Err(invalid_argument_error(
+                    "query_mode must be literal, or regex with a query",
+                ))
+            }
+        };
+        let mut request = ai_session_search::RepeatsQuery::default();
+        request.text = query;
+        request.max_groups = count("max_groups", max_groups)?;
+        request.max_examples_per_group = count("max_examples_per_group", max_examples_per_group)?;
+        request.min_matches = count("min_matches", min_matches)?;
+        request.phrase_min_words = count("phrase_min_words", phrase_min_words)?;
+        request.phrase_max_words = count("phrase_max_words", phrase_max_words)?;
+        request.include_unattributed_input = include_unattributed_input;
+        let role = role
+            .map(str::parse::<Role>)
+            .transpose()
+            .map_err(value_error)?;
+        let limit = paging_argument(PagingArgument::Limit, limit)?;
+        let report = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let scope = scope.unwrap_or_default().resolve(&app)?;
+            request.filters = MessageFilters::default()
+                .with_limit(limit)
+                .with_match_mode(mode);
+            request.filters.role = role;
+            request.filters.providers = scope.provider.map(|p| vec![p]);
+            request.filters.session_id = scope.session_id;
+            request.filters.path_prefix = scope.path_prefix;
+            request.filters.exclude_path_prefixes = scope.exclude_path_prefixes;
+            request.filters.exclude_session_ids = scope.exclude_session_ids;
+            request.filters.since = scope.bounds.0;
+            request.filters.until = scope.bounds.1;
+            app.analysis().repeats(&request).map_err(service_error)
+        })?;
+        json_compatible(py, &report.to_json(context))
+    }
+
+    /// Execute one read-only SELECT or WITH through SqlService and return rows and paging facts.
+    /// None uses db.query_limit/db.query_timeout_ms. A zero limit or timeout means unbounded.
+    /// Writes, attachments, state-changing pragmas, and allowed-roots access are refused.
+    #[pyo3(signature = (sql, *, limit=None, offset=0, timeout_ms=None, max_cell_chars=0))]
+    fn query_sql<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        limit: Option<i64>,
+        offset: i64,
+        timeout_ms: Option<u64>,
+        max_cell_chars: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut query = ai_session_search::SqlQuery::new(sql);
+        query.limit = limit
+            .map(|v| paging_argument(PagingArgument::Limit, v))
+            .transpose()?;
+        query.offset = paging_argument(PagingArgument::Offset, offset)?;
+        query.timeout_ms = timeout_ms;
+        query.max_cell_chars = max_cell_chars;
+        let result = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.sql().query(&query).map_err(service_error)
+        })?;
+        let mut payload =
+            ai_session_search::sql_query::query_result_payload(&result, query.offset, 0).value;
+        payload["truncated_cell_char_limit"] = serde_json::json!(result.truncated_cell_char_limit);
+        json_compatible(py, &payload)
+    }
+
+    /// Return the native resume argv and cwd without executing a command.
+    /// An unavailable provider returns argv=None with an unavailable_reason.
+    #[pyo3(signature = (session_id))]
+    fn resume_command<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let command = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.catalog()
+                .resume_command(session_id)
+                .map_err(service_error)
+        })?;
+        json_compatible(py, &command)
+    }
+
+    /// Read a transcript window. Positive lines keeps the head, negative the tail, 0 all.
+    #[pyo3(signature = (session_id, *, lines=0))]
+    fn transcript<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: &str,
+        lines: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let window = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.catalog()
+                .transcript(session_id, lines)
+                .map_err(service_error)
+        })?;
+        json_compatible(py, &window)
+    }
+
     #[pyo3(signature = (query="", request=None, *, query_mode="literal"))]
     /// Search messages through the shared typed planner and return results with aligned context,
     /// paging, resolved presentation, and optional planner receipts.

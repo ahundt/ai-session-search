@@ -113,6 +113,17 @@ eligible session/transcript bytes before retaining its top page. Runtime, memory
 output-growth bounds are recorded under `REQ010-protect-complexity-bounds` in the
 [maintainer requirements](maintainer-requirements-and-design-decisions.md).
 
+`repeats()` returns the CLI report dictionary (`groups` with example message references,
+`unattributed_input_count`, and `unattributed_input_included`). Its bounds resolve from
+`[analytics]`, and `include_unattributed_input=True` includes queued input of unknown authorship.
+`vocabulary()` returns term/count dictionaries using `[analytics].vocab_limit`.
+`query_sql()` returns `columns`, `rows`, `next_offset`, and `truncated_cell_char_limit`, through
+`SqlService` with the same read-only authorizer and configured bounds as `aise db query`.
+SQL and index-wide vocabulary refuse `allowed-roots` access. `resume_command(id)` returns
+`session_id`, `argv`, `cwd`, and `unavailable_reason` without launching a provider.
+`transcript(id, lines=N)` returns the Rust transcript window including completeness metadata;
+positive N keeps the head, negative N the tail, and 0 every line.
+
 Python exposes `NotFoundError`, `AmbiguousPrefixError`, `AlreadyExistsError`,
 `InvalidArgumentError`, and `IndexNotRefreshedError`. They preserve existing `RuntimeError`
 handlers. Validation also preserves `ValueError`; signed version validation preserves the

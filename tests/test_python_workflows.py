@@ -16,7 +16,11 @@ CLI = Path(__file__).resolve().parents[1] / "target/release/aise"
 
 
 @pytest.fixture
-def corpus(tmp_path: Path):
+def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    executable = tmp_path / "claude"
+    executable.write_text("#!/bin/sh\nexit 1\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     database = tmp_path / "index.db"
     search = aise.SessionSearch(database)
     search.refresh()
@@ -47,10 +51,17 @@ def corpus(tmp_path: Path):
 
 def cli(search, *args):
     env = dict(os.environ, AI_SESSION_SEARCH_DATABASE=str(search.db_path))
+    preparation = [] if args[0] == "db" else ["--index-refresh", "existing-only"]
     result = subprocess.run(
-        [str(CLI), "--index-refresh", "existing-only", *args], env=env,
-        text=True, capture_output=True, check=True,
+        [str(CLI), *preparation, *args], env=env,
+        text=True, capture_output=True, check=False,
     )
+    assert result.returncode == 0, result.stderr
+    if args[0] == "db":
+        # SQL JSON appends a truncation comment when a row limit applies.
+        value, end = json.JSONDecoder().raw_decode(result.stdout)
+        assert not result.stdout[end:].strip() or result.stdout[end:].lstrip().startswith("# truncated")
+        return value
     return json.loads(result.stdout)
 
 
@@ -91,3 +102,59 @@ def test_invalid_version_keeps_legacy_overflow_handler(corpus):
     assert isinstance(invalid.value, (ValueError, RuntimeError))
     assert isinstance(invalid.value, OverflowError)
     assert "version" in str(invalid.value)
+
+
+def test_analysis_calls_match_cli(corpus):
+    assert corpus.vocabulary(limit=4) == cli(corpus, "vocab", "--limit", "4", "--format", "json")
+    assert corpus.repeats(max_groups=3) == cli(corpus, "repeats", "--max-groups", "3", "--report", "--format", "json")
+    assert corpus.repeats("forgot", query_mode="regex", min_matches=2)["groups"]
+
+
+def test_sql_uses_shared_read_only_service(corpus):
+    sql = "select id from sessions order by id"
+    result = corpus.query_sql(sql, limit=2)
+    assert result["rows"] == cli(corpus, "db", "query", sql, "--limit", "2", "--format", "json")
+    assert result["next_offset"] == 2
+    assert len(corpus.query_sql(sql, limit=0)["rows"]) == 3
+    for statement in ("delete from sessions", "attach database ':memory:' as other"):
+        with pytest.raises(RuntimeError):
+            corpus.query_sql(statement)
+    assert len(corpus.list_sessions()) == 3
+
+
+def test_resume_command_and_transcript_use_catalog(corpus):
+    command = corpus.resume_command("synthetic-0")
+    assert command["session_id"] == "claude:synthetic-0"
+    assert command["argv"] == ["claude", "--resume", "synthetic-0"]
+    result = subprocess.run(
+        [str(CLI), "--index-refresh", "existing-only", "resume", "synthetic-0", "--dry-run"],
+        env=dict(os.environ, AI_SESSION_SEARCH_DATABASE=str(corpus.db_path)),
+        text=True, capture_output=True, check=True,
+    )
+    assert " ".join(command["argv"]) in result.stdout
+    assert isinstance(corpus.transcript("synthetic-0")["text"], str)
+
+
+def test_sql_and_vocabulary_enforce_access_scope(corpus, tmp_path: Path):
+    config = tmp_path / "scoped.toml"
+    config.write_text('[search.scope]\nmode = "allowed-roots"\nroots = ["/synthetic/project"]\n')
+    scoped = aise.SessionSearch(corpus.db_path, config_path=config)
+    with pytest.raises(RuntimeError, match="allowed-roots"):
+        scoped.query_sql("select * from sessions")
+    with pytest.raises(RuntimeError, match="allowed-roots"):
+        scoped.vocabulary()
+
+
+def test_analysis_call_bounds_and_scopes(corpus):
+    with pytest.raises(aise.InvalidArgumentError, match=r"min.matches"):
+        corpus.repeats(min_matches=0)
+    with pytest.raises(aise.InvalidArgumentError, match="max_groups"):
+        corpus.repeats(max_groups=-1)
+    report = corpus.repeats(scope=aise.QueryScope(session_id="synthetic-0"), max_groups=1)
+    assert report["groups"][0]["sessions"] == 1
+    assert corpus.query_sql("select title from sessions", max_cell_chars=3)["rows"][0]["title"] == "ret... [truncated]"
+
+
+def test_sql_cell_truncation_retains_receipt(corpus):
+    result = corpus.query_sql("select title from sessions", max_cell_chars=3)
+    assert result["truncated_cell_char_limit"] == 3

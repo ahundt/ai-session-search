@@ -734,6 +734,21 @@ pub struct RepeatsReport {
     pub unattributed_input_included: bool,
 }
 
+impl RepeatsReport {
+    /// JSON report rendered by `aise repeats --report --format json`.
+    ///
+    /// `context` is the signed message window in each example's follow-up command; it does
+    /// not change the mined groups or example membership. Conversion allocates `O(E + G)`
+    /// rows for `E` examples and `G` groups, plus their text bytes.
+    pub fn to_json(&self, context: i64) -> serde_json::Value {
+        serde_json::json!({
+            "groups": self.groups.iter().map(|group| RepeatGroupRow::new(group, context)).collect::<Vec<_>>(),
+            "unattributed_input_count": self.unattributed_input_count,
+            "unattributed_input_included": self.unattributed_input_included,
+        })
+    }
+}
+
 /// One recurring phrase and where it appears.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
@@ -946,11 +961,7 @@ pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Resul
         .map(|group| RepeatGroupRow::new(group, args.context))
         .collect::<Vec<_>>();
     if args.report {
-        let envelope = serde_json::json!({
-            "groups": rows,
-            "unattributed_input_count": report.unattributed_input_count,
-            "unattributed_input_included": report.unattributed_input_included,
-        });
+        let envelope = report.to_json(args.context);
         if args.format == OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&envelope)?);
         } else {

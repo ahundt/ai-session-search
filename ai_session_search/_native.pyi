@@ -1742,6 +1742,17 @@ class CompactOutcome:
 
 @final
 class SessionSearch:
+    def vocabulary(self, *, prefix: str | None = None, trigram: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
+        """Report index-wide terms and counts; refused under allowed-roots."""
+    def repeats(self, query: str | None = None, *, scope: QueryScope | None = None, role: str | None = None, query_mode: str = "literal", limit: int = 0, include_unattributed_input: bool = False, max_groups: int | None = None, max_examples_per_group: int | None = None, min_matches: int | None = None, phrase_min_words: int | None = None, phrase_max_words: int | None = None, context: int = 0) -> dict[str, Any]:
+        """Mine recurring phrases with examples and unattributed-input counts."""
+    def query_sql(self, sql: str, *, limit: int | None = None, offset: int = 0, timeout_ms: int | None = None, max_cell_chars: int = 0) -> dict[str, Any]:
+        """Run one read-only SQL statement with configured access restrictions and bounds."""
+    def resume_command(self, session_id: str) -> dict[str, Any]:
+        """Return native resume argv and cwd, or the reason the session cannot be resumed."""
+    def transcript(self, session_id: str, *, lines: int = 0) -> dict[str, Any]:
+        """Read first N (positive), last N (negative), or all (0) transcript lines."""
+
     """Rust-backed search, recovery, export, and analysis service.
 
     Methods accepting ``session_id`` accept a canonical provider-qualified ID or a unique ID
