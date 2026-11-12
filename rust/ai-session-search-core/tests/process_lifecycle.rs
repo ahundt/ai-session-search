@@ -3281,3 +3281,42 @@ fn skills_update_works_with_a_config_outside_the_default_location() {
     );
     assert!(!skill.exists(), "a deleted skill must stay deleted");
 }
+
+fn deprecated_cli_output(arguments: &[&str]) -> std::process::Output {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let index = aise(root.path())
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    aise(root.path())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+        ])
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_repeat_limit_notice_names_max_candidates() {
+    let output = deprecated_cli_output(&["repeats", "--limit", "0"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("--max-candidates"),
+        "{stderr}"
+    );
+}

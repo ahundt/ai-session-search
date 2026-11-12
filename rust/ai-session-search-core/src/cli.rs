@@ -924,6 +924,21 @@ where
     {
         eprintln!("aise: planning is deprecated; use slash-commands");
     }
+    if command_tokens
+        .first()
+        .is_some_and(|token| token == "repeats")
+        && command_tokens
+            .iter()
+            .skip(1)
+            .take_while(|token| *token != "--")
+            .any(|token| {
+                token
+                    .to_str()
+                    .is_some_and(|text| text == "--limit" || text.starts_with("--limit="))
+            })
+    {
+        eprintln!("aise: repeats --limit is deprecated; use --max-candidates to bound examined messages, or --max-groups to bound output");
+    }
     Ok(cli)
 }
 
@@ -5031,6 +5046,17 @@ mod tests {
         .unwrap();
         assert_eq!(definition.categories[0].name, "accuracy");
         assert_eq!(definition.categories[0].patterns, [r"\bwrong\b"]);
+    }
+
+    #[test]
+    fn repeats_names_its_candidate_limit() {
+        for flag in ["--max-candidates", "--limit"] {
+            let parsed = parse_cli_from(["aise", "repeats", flag, "20"]).unwrap();
+            let Commands::Repeats(args) = parsed.command else {
+                panic!("expected repeats");
+            };
+            assert_eq!(args.limit, 20);
+        }
     }
 
     #[test]

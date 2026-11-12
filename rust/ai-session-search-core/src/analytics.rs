@@ -897,8 +897,9 @@ pub(crate) struct RepeatsArgs {
     /// Neighboring messages before/after each match in generated follow-up commands.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
     pub context: i64,
-    /// Max candidate messages to scan. 0 = every candidate message.
-    #[arg(long, default_value_t = 0)]
+    /// Max candidate messages to examine; 0 (default) examines every candidate.
+    /// Deprecated alias: --limit. Use --max-groups to cap returned groups.
+    #[arg(long = "max-candidates", alias = "limit", default_value_t = 0)]
     pub limit: usize,
     /// Also mine messages typed while the agent was working whose transcript does not record who
     /// sent them (older Claude Code versions). Off by default because a program may have sent
