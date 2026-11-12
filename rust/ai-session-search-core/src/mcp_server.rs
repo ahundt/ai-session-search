@@ -921,7 +921,7 @@ enum ToolPaging {
     /// The tool returns one whole answer and advertises no `limit`, so naming one would send the
     /// caller to an argument its own schema rejects.
     Unpaged,
-    /// The caller asked for every match with `limit=0`. There is no requested page to halve, but
+    /// The caller asked for every match with `limit=0` or `all_results`. There is no page to halve, but
     /// the tool does page, so a finite retry exists and is sized from what came back.
     EveryMatch,
     /// The call resolved to this page, explicitly or from the advertised default.
@@ -969,7 +969,11 @@ impl ToolRecovery {
         // so the omission value is read from the configuration that rendered it into the prose.
         // `limit=0` means "every match" on the session tools: unbounded, so there is no requested
         // page to halve, but the tool still pages and a finite retry is still available.
-        let explicit = args.get("limit").and_then(Value::as_u64);
+        let explicit = if accepts("all_results") && args["all_results"] == true {
+            Some(0)
+        } else {
+            args.get("limit").and_then(Value::as_u64)
+        };
         let paging = match explicit.or_else(|| configured_omitted_page(tool_name, config)) {
             Some(0) | None => ToolPaging::EveryMatch,
             Some(page) => usize::try_from(page)
@@ -1310,7 +1314,8 @@ fn returned_count(structured: &Value) -> Option<usize> {
 /// hand-listed table of those names is one more thing to keep in step with the tools. The response
 /// already says how many items it returned, so the array that *is* those items is the top-level
 /// array of that length -- and where more than one matches, the largest, since a page shrinks the
-/// payload rather than a same-length index beside it.
+/// payload rather than a same-length index beside it. Skill matches live under
+/// `run.output.result.report.matches` and follow the same sizing rule.
 fn returned_items<'a>(
     structured: &'a Value,
     returned: Option<usize>,
@@ -1327,6 +1332,11 @@ fn returned_items<'a>(
     for items in object
         .values()
         .filter_map(Value::as_array)
+        .chain(
+            structured
+                .pointer("/run/output/result/report/matches")
+                .and_then(Value::as_array),
+        )
         .filter(|items| items.len() == returned)
     {
         let chars = serialized_char_count_or_zero(items, cancellation)?;
@@ -1438,6 +1448,11 @@ fn recovery_advice(
 
     match suggested_retry_limit(measured, ceiling, resolved_page, shape) {
         Some(suggested) => {
+            let extent = if matches!(tool_name, "search_messages" | "run_skill_capability") {
+                " Omit all_results when setting limit."
+            } else {
+                ""
+            };
             let also = match &reduce_each_result {
                 Some(clauses) => format!(", or {clauses}"),
                 None => String::new(),
@@ -1445,7 +1460,7 @@ fn recovery_advice(
             format!(
                 "The retrieval plan and the selected page are unchanged, so a retry at the same \
                  offset returns the same results and you do not need to re-scope the query. Retry \
-                 with limit={suggested} at the same offset{also}. {raise_the_ceiling} The retry \
+                 with limit={suggested} at the same offset{also}.{extent} {raise_the_ceiling} The retry \
                  succeeded when the response carries {} and {}; continue from {}.",
                 paging_paths.returned, paging_paths.has_more, paging_paths.next_offset
             )
@@ -13165,6 +13180,45 @@ mod tests {
 
     /// `limit` asks for one page and `all_results` asks for every match; accepting both would
     /// mean silently honoring one and dropping the other.
+    #[test]
+    fn all_results_skill_overflow_names_a_working_finite_retry() {
+        let (dir, db) = corrections_fixture();
+        let mut config = config_for_fixture(&dir);
+        config.mcp.run_message_classification_limit = 1;
+        let tool = "run_skill_capability";
+        let args = json!({"skill":{"name":"corrections"},"all_results":true});
+        let first_args = json!({"skill":{"name":"corrections"},"limit":1});
+        let first =
+            tool_response_to_rmcp(tool_run_skill_capability(&first_args, &config, &db).unwrap());
+        let ceiling = serde_json::to_string(&first).unwrap().chars().count() + 100;
+        let full = tool_response_to_rmcp(tool_run_skill_capability(&args, &config, &db).unwrap());
+        let advertised = handle_tools_list(None, &config);
+        let recovery = ToolRecovery::for_call(tool, &args, &advertised["result"]["tools"], &config);
+        let error = enforce_tool_result_ceiling(full, tool, ceiling, recovery).unwrap_err();
+        assert!(error.contains("limit="), "{error}");
+        assert!(error.contains("all_results"), "{error}");
+        assert!(!error.contains("A single result exceeds"), "{error}");
+        let suggested: usize = error
+            .split("limit=")
+            .nth(1)
+            .unwrap()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let retry_args = json!({"skill":{"name":"corrections"},"limit":suggested});
+        let retry =
+            tool_response_to_rmcp(tool_run_skill_capability(&retry_args, &config, &db).unwrap());
+        assert!(enforce_tool_result_ceiling(
+            retry,
+            tool,
+            ceiling,
+            ToolRecovery::for_call(tool, &retry_args, &advertised["result"]["tools"], &config)
+        )
+        .is_ok());
+    }
+
     #[test]
     fn run_skill_pages_exactly_and_refuses_contradictory_paging() {
         let (dir, db) = corrections_fixture();

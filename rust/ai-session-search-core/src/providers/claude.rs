@@ -83,8 +83,7 @@ const IGNORED_RECORD_TYPES: [&str; 27] = [
     "result",
     "session-owner",
     "started",
-    // Conversation-summary records of Claude Code releases before this machine's earliest
-    // transcript; no message content.
+    // Conversation-summary records from older Claude Code releases; no message content.
     "summary",
     "tool_progress",
     "tool_use_summary",

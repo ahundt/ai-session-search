@@ -2018,11 +2018,8 @@ mod tests {
         assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/fork"));
     }
 
-    /// A forked rollout replays the parent's history between its second `session_meta` and the
-    /// fork's first `thread_settings_applied` event, then records what happened in the fork
-    /// (on this machine 233 of 233 forks; every user message in that window is in the parent's
-    /// file). The replayed rows are kept, so nothing is lost when the parent file is gone, but
-    /// as known mirrors: not the fork's input, not its session text, title or preview.
+    /// Parent replay remains searchable as mirror content and is excluded from the fork's
+    /// input, transcript, title and preview once its settings event arrives.
     #[test]
     fn fork_without_parent_metadata_marks_replay_only_after_settings_arrive() {
         use crate::models::MessageRecordRelation;

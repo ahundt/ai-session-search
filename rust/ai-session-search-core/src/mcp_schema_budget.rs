@@ -592,9 +592,8 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     ("search_messages", 4_732, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
     // and `all_results` say "omit for" like every other property so the tool description's
-    // omitted-values sentence can read them back. 279 bytes of headroom remain before Codex's
-    // 5,000-byte cliff, past which it deletes every parameter description with no marker to the
-    // model.
+    // omitted-values sentence can read them back. Codex deletes parameter descriptions beyond
+    // its 5,000-byte limit without marking the removal for the model.
     // 4_721 -> 4_883: `include_unattributed_input` opts in to queued messages with no recorded
     // sender, which the run otherwise leaves out and counts. 117 bytes remain before the cliff.
     ("run_skill_capability", 4_883, 9),
