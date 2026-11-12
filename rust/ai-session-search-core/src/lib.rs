@@ -163,7 +163,8 @@ pub use models::{
 };
 pub use service::{
     AnalysisService, CatalogService, CompactOutcome, ExportService, FileService, IndexService,
-    MaintenanceService, MessageService, ResumeCommand, SourceService, SqlService,
+    MaintenanceService, MessageService, ResumeCommand, SourceService, SqlService, TranscriptEdge,
+    TranscriptWindow,
 };
 pub use skill_run::{
     CapabilityExecutionSource, MessageClassificationDefinition, MessageClassificationQuery,

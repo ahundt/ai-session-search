@@ -30,7 +30,7 @@ use crate::service::SessionSearch;
 use crate::tui;
 use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
-    select_transcript_lines, truncate_for_display,
+    truncate_for_display,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -1391,13 +1391,13 @@ fn execute(cli: Cli) -> Result<()> {
                 );
                 return Ok(());
             }
-            let session = db.resolve_session(&args.id)?;
-            print_session_detail(&session.session);
-            let transcript_lines = args
-                .transcript_lines
-                .unwrap_or(config.cli.show_transcript_lines);
-            let (transcript, returned_lines) =
-                select_transcript_lines(&session.transcript_text, transcript_lines);
+            let window = app.catalog().transcript(
+                &args.id,
+                args.transcript_lines
+                    .unwrap_or(config.cli.show_transcript_lines),
+            )?;
+            print_session_detail(&window.session);
+            let (transcript, returned_lines) = (window.text, window.lines_label);
             if args.raw {
                 println!("\n{transcript}");
             } else {

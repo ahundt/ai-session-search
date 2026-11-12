@@ -30,8 +30,7 @@ use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
-    current_repo, normalize_path_prefix, render_posix_shell_command, select_transcript_lines,
-    truncate_for_display,
+    current_repo, normalize_path_prefix, render_posix_shell_command, truncate_for_display,
 };
 
 /// Context radius in the generated one-call `get_session` continuation for a message hit.
@@ -5190,21 +5189,15 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     reject_present(args, "lines_per_message", "lines_per_message caps each message and only applies with message_seq; transcript output windows the whole session with transcript_lines")?;
     let selected_lines = transcript_lines.unwrap_or(config.mcp.get_session_transcript_lines);
 
-    let full = db
-        .resolve_session(session_id)
+    let window = crate::service::CatalogService::new(db)
+        .transcript(session_id, selected_lines)
         .map_err(|e| format!("{e:#}"))?;
-    let s = &full.session;
-
-    let (transcript, returned_lines_label) =
-        select_transcript_lines(&full.transcript_text, selected_lines);
-    let total_lines = full.transcript_text.lines().count();
-    let returned_lines = transcript.lines().count();
-    let selected_edge = match selected_lines.cmp(&0) {
-        std::cmp::Ordering::Less => "tail",
-        std::cmp::Ordering::Equal => "all",
-        std::cmp::Ordering::Greater => "head",
-    };
-    let complete = returned_lines == total_lines;
+    let s = &window.session;
+    let transcript = &window.text;
+    let returned_lines_label = &window.lines_label;
+    let (total_lines, returned_lines, complete) =
+        (window.total_lines, window.lines_returned, window.complete);
+    let selected_edge = window.edge;
 
     let title = s.title.as_deref().unwrap_or("(untitled)");
     let cwd = s.cwd.as_deref().unwrap_or("-");

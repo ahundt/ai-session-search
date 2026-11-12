@@ -666,6 +666,36 @@ mod tests {
             .is_ok());
     }
 
+    /// Transcript windows use the CLI's signed convention: first N, last N, or all for 0.
+    #[test]
+    fn transcript_window_reads_first_last_or_all_lines() {
+        use ai_session_search::{TranscriptEdge, TranscriptWindow};
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        let all: TranscriptWindow = app.catalog().transcript("claude:consumer-b", 0).unwrap();
+        assert!(all.complete && all.total_lines == 2, "{all:?}");
+        assert_eq!(
+            (all.edge, all.lines_label.as_str()),
+            (TranscriptEdge::All, "all")
+        );
+        assert_eq!(all.session.id, "claude:consumer-b");
+
+        let head = app.catalog().transcript("claude:consumer-b", 1).unwrap();
+        assert_eq!(
+            (head.edge, head.lines_returned, head.complete),
+            (TranscriptEdge::Head, 1, false)
+        );
+        assert_eq!(head.text, all.text.lines().next().unwrap());
+        assert!(head.lines_label.starts_with("first 1 (truncated"));
+
+        let tail = app.catalog().transcript("claude:consumer-b", -1).unwrap();
+        assert_eq!(tail.text, all.text.lines().last().unwrap());
+        assert_eq!(tail.edge, TranscriptEdge::Tail);
+
+        let error = app.catalog().transcript("claude:consumer-", 0).unwrap_err();
+        assert_eq!(service_error(&error).code(), "session-prefix-ambiguous");
+    }
+
     /// The resume command is a named struct; a session the provider cannot reopen has no argv
     /// and says why.
     #[test]

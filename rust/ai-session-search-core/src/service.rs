@@ -2369,6 +2369,40 @@ impl<'app> IndexService<'app> {
     }
 }
 
+/// Which end of a transcript [`CatalogService::transcript`] kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TranscriptEdge {
+    /// The first lines (`lines` > 0).
+    Head,
+    /// The last lines (`lines` < 0).
+    Tail,
+    /// The whole transcript (`lines` == 0).
+    All,
+}
+
+/// A window of one session's transcript, from [`CatalogService::transcript`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct TranscriptWindow {
+    /// The resolved session.
+    pub session: SessionRecord,
+    /// The selected lines joined with `\n`.
+    pub text: String,
+    /// Lines in the whole transcript.
+    pub total_lines: usize,
+    /// Lines in `text`.
+    pub lines_returned: usize,
+    /// Which end was kept.
+    pub edge: TranscriptEdge,
+    /// `true` when `text` is the whole transcript.
+    pub complete: bool,
+    /// The count as `aise show` prints it after "Transcript lines returned:", for example `12`,
+    /// `all`, or `first 40 (truncated; 0 returns the entire transcript and may be very large)`.
+    pub lines_label: String,
+}
+
 /// How to reopen one session in its provider's CLI, from [`CatalogService::resume_command`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
@@ -2468,6 +2502,43 @@ impl<'db> CatalogService<'db> {
     /// Resolve one canonical session ID or unique prefix; ambiguous errors list candidates.
     pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
         self.db.resolve_session_record(id_or_prefix)
+    }
+
+    /// The first or last lines of one session's transcript, as `aise show --transcript-lines`
+    /// and MCP `get_session` `transcript_lines` select them.
+    ///
+    /// `lines` is signed: a positive N keeps the first N lines, a negative N keeps the last
+    /// `|N|` lines, and 0 keeps the whole transcript. `id_or_prefix` resolves like
+    /// [`CatalogService::resolve_session`].
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) or
+    /// [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous).
+    ///
+    /// # Complexity
+    ///
+    /// Reads the whole stored transcript once; retained memory is the transcript plus the
+    /// selected window.
+    pub fn transcript(&self, id_or_prefix: &str, lines: i64) -> Result<TranscriptWindow> {
+        let full = self.db.resolve_session(id_or_prefix)?;
+        let (text, lines_label) =
+            crate::util::select_transcript_lines(&full.transcript_text, lines);
+        let total_lines = full.transcript_text.lines().count();
+        let lines_returned = text.lines().count();
+        Ok(TranscriptWindow {
+            session: full.session,
+            edge: match lines.cmp(&0) {
+                std::cmp::Ordering::Less => TranscriptEdge::Tail,
+                std::cmp::Ordering::Equal => TranscriptEdge::All,
+                std::cmp::Ordering::Greater => TranscriptEdge::Head,
+            },
+            complete: lines_returned == total_lines,
+            text,
+            total_lines,
+            lines_returned,
+            lines_label,
+        })
     }
 
     /// The native command that reopens a session in the provider's own CLI, without running it.
