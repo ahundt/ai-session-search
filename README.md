@@ -146,8 +146,8 @@ never shows you a half-applied state.
 
 ## Speed
 
-Measured on macOS with Apple silicon against an index of about 6 million messages, best of three
-warm runs, each with `--index-refresh existing-only --format json` so no refresh runs:
+Measured on 2026-11-07 on macOS with Apple silicon against an index of 5,975,817 messages, best
+of three warm runs, each with `--index-refresh existing-only --format json` so no refresh runs:
 
 | Command | Time |
 | --- | ---: |
