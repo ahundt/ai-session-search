@@ -1,0 +1,425 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
+# aise example config
+#
+# Write a starting config from it, with every setting but the state paths commented out:
+#   aise config init
+# Print this example:
+#   aise config example
+#
+# Most users can leave this file absent. Built-in defaults are the same values shown here for
+# tunables. `aise config init` writes every setting commented out except the database and cache
+# paths: uncomment a line to change it, and later releases' defaults keep applying to the rest.
+# Provider paths are commented out below so a restored config keeps platform-specific built-in
+# discovery unless you deliberately override paths.
+#
+# Durable settings use one precedence rule on every supported surface:
+# explicit CLI/API argument > AI_SESSION_SEARCH_* environment variable > this file > typed default.
+# Use `aise config origins` to see the source selected for database, cache, threads, and refresh.
+# Canonical operational variables are AI_SESSION_SEARCH_CONFIG, AI_SESSION_SEARCH_DATABASE,
+# AI_SESSION_SEARCH_CACHE_DIR, AI_SESSION_SEARCH_THREADS, and
+# AI_SESSION_SEARCH_INDEX_REFRESH.
+
+[release_notifications]
+# After ordinary interactive CLI output, check at most once per interval for the
+# latest completed stable GitHub release. MCP and library calls never check.
+enabled = true
+minimum_check_interval_hours = 24
+# End-to-end timeout for the infrequent request. Explicit `aise package check|update`
+# uses a longer bounded timeout and reports failures.
+request_timeout_ms = 1000
+
+[integrations]
+# After an upgrade by any package manager, the first command (including `aise integrations status`
+# and the MCP server) rewrites installed ai-session-search skill files and instruction blocks that
+# still match what aise wrote, so upgrading never needs `aise integrations install`. Anything you
+# edited is left alone and reported once. It runs when the install included the skill.
+refresh_after_upgrade = true
+
+[index]
+# Optional explicit state paths. Relative values resolve from ~/.ai-session-search/.
+# Unset, they follow the platform data/cache defaults; set db_path to reuse an existing database
+# without moving a large index.
+# db_path = "/absolute/path/to/index.db"
+# cache_dir = "/absolute/path/to/cache"
+# Implicit read refresh policy: auto, before-query, or existing-only.
+refresh = "auto"
+# SQLite busy timeout for normal CLI/MCP reads and writes.
+busy_timeout_ms = 5000
+# Timeout for automatic pre-read reindex refreshes. If SQLite is still busy after this,
+# aise serves the existing valid index instead of failing the read.
+auto_reindex_busy_timeout_ms = 10000
+# After one process completes automatic refresh, other read commands skip refresh for
+# this many milliseconds and stay read-only.
+auto_reindex_interval_ms = 1500
+
+[search]
+# CLI default for session-level `aise list` and `aise search` when
+# `--limit` is omitted. An explicit `--limit 0` requests every matching session.
+# Does not affect message search or MCP page sizes.
+default_limit = 50
+# Prefer sessions from the current repository when ranking session-level search.
+prefer_current_repo = true
+
+[search.scoring]
+# Ranking weights for session-level search (`aise search`, `aise tui`, MCP `search_sessions`).
+# They do not decide which sessions match, only the order the matches come back in: a session
+# is a hit if any haystack contains the whole query, contains one of its tokens, or fuzzy-matches
+# it. Message search does not use these.
+#
+# Six haystacks are scored per session: title, summary, cwd, repo root, preview, transcript.
+# A caseless substring hit on the whole query adds that haystack's weight.
+title_score = 600
+summary_score = 450
+# cwd and repo root share this one.
+path_score = 350
+preview_score = 250
+# The transcript body, and any haystack not named above.
+other_score = 100
+# Added once per query token found in a haystack, so a two-token query matching both in the
+# title adds it twice there.
+token_bonus = 40
+# Added once when a query has more than one token and every token matched somewhere.
+all_tokens_bonus = 150
+# Recency adds `(recency_max_days - age_in_days) * recency_weight`, with the age clamped to the
+# range, so a session touched today gets the full 180 and one older than the window gets 0.
+# A session with no recorded update time gets nothing either way.
+recency_weight = 2
+recency_max_days = 90
+# Added when the session's repo root equals the invoking repository, and only while
+# [search].prefer_current_repo is true.
+current_repo_bonus = 200
+
+[search.message-search]
+# Optional shared page size for message search. Omission preserves each surface's
+# contract: Rust, CLI, and Python return all literal/regex/no-text matches when no
+# purpose or call limit applies; MCP uses [mcp].search_messages_limit. Fuzzy search
+# always requires a finite page. Request every result explicitly with all_results
+# rather than using zero.
+# default_limit = <positive integer>
+# Maximum Unicode scalar characters in each automatic selected-field match excerpt.
+# This is presentation-only and does not change matching, ranking, or pagination.
+# match_evidence_max_chars = 220
+
+[search.message-search.context]
+# Default neighboring messages added after hit selection. A per-call value wins, and a purpose
+# bundle outranks this. Commented out like every other optional key in this file: omitting them
+# and writing an explicit 0 resolve to the same window and differ only in the origin
+# `aise config origins` reports, so the file no longer records a choice the reader did not make.
+# context_before = 0
+# context_after = 0
+
+[search.budgets]
+# Optional hard ceilings. Omission preserves current runtime behavior and does not
+# introduce an implicit unlimited value or a new numeric ceiling.
+# max_hits_per_page = <positive integer>
+# Maximum total neighboring messages before plus after each returned hit.
+# max_context_neighbors_per_hit = <positive integer>
+
+[search.scope]
+# `all` preserves current unrestricted behavior. `allowed-roots` is opt-in and is
+# enforced below adapters; a restricted invocation with no authoritative roots fails closed.
+mode = "all"
+roots = []
+include_invocation_directory = false
+
+# Optional versioned purpose bundles fill only omitted soft preferences. They cannot
+# change query interpretation, caller filters, authority, or hard budgets. No built-in
+# purpose ships without labeled replay evidence.
+# [search.purposes.descriptive-purpose-name]
+# version = <positive integer>
+# operation = "message-search"
+#
+# [search.purposes.descriptive-purpose-name.preferences]
+# default_limit = <positive integer>
+# context_before = <nonnegative integer>
+# context_after = <nonnegative integer>
+# receipt_level = "none" | "summary" | "full"
+# include_refs = <boolean>
+# lines_per_message = <signed integer>
+# match_evidence_max_chars = <positive integer>
+
+[mcp]
+# Maximum simultaneous read-only SQLite tool calls per MCP server process. "auto" admits half the
+# available logical CPUs, rounded up, because fuzzy reads share a separate host-sized worker pool.
+# "host" admits one call per logical CPU; a positive integer sets an exact cap.
+max_concurrent_reads = "auto"
+# MCP defaults apply only when an MCP tool call omits the matching argument.
+# Explicit tool arguments always win. These matter because MCP responses usually go
+# straight into an agent context window.
+
+# Default `search_sessions.limit`: session-level search page size.
+search_sessions_limit = 10
+# Default `list_sessions.limit`: recent-session page size.
+list_sessions_limit = 20
+# Default `search_messages.limit`: message-hit page size. Must be at least 1 so
+# pagination always makes progress. Sized against max_tool_result_chars below: at the
+# measured per-result cost this lands an ordinary call near half the ceiling, leaving
+# room for a long matched message and for detail=full or parsed_references, which
+# measured 4.8x and 2.7x and compose.
+search_messages_limit = 15
+# Default `run_skill_capability` message-classification page size. Smaller than the CLI and
+# Python default (`[capabilities.message_classification].limit`) on purpose: an MCP result goes
+# straight into an agent context window and each correction row carries a whole
+# user message.
+run_message_classification_limit = 20
+# Ceiling on one serialized MCP CallToolResult, in characters. A call that would exceed it
+# returns an actionable error naming what fits instead; nothing is silently trimmed, so no
+# response arrives with results, context, evidence, include groups or receipts quietly
+# removed. 48,000 is Codex's model-facing result cap, and Codex is the only measured client
+# that truncates from the middle with no marker -- a smaller cap that announces its overflow,
+# like Gemini CLI's 40,000, loses nothing and is not the one to defend against. Override per
+# registration with AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS in that server's env block.
+# MCP tools/call only: the CLI, Rust and Python surfaces return every result by design.
+max_tool_result_chars = 48000
+# Default `get_session.transcript_lines`: positive=head, negative=tail,
+# 0=entire transcript. The bounded tail default keeps transcript responses small
+# enough for an agent context window while showing how a session ended; callers
+# pass explicit values to see how it started or to fetch everything. Does not
+# affect focused `message_seq` calls.
+get_session_transcript_lines = -40
+# Default `lines_per_message` for `search_messages` hits/context and `get_session`
+# focused `message_seq` output: caps each individual message's content to this many
+# lines (positive=head, negative=tail, 0=full content). Distinct from
+# `get_session_transcript_lines`, which windows one whole session transcript. This
+# changes presentation only, never matches, ranking, result count, pagination,
+# context membership, or reference extraction.
+lines_per_message = 0
+# Default `preview_chars` for concise MCP hit/context previews and `get_session`
+# summary or focused-message output. Explicit tool-call values win. Does not affect
+# transcript output. Must be at least 1.
+preview_chars = 220
+# Aggregate compact evidence: positive=first, negative=last, 0=all. The bounded default protects
+# agent context; zero is available explicitly for pipelines that consume complete structured data.
+summary_items = -12
+# Default `query_session_index.max_cell_chars`: truncates long string cells in MCP
+# JSON responses only. It does not change SQL execution or CLI `db query` output.
+# 0 disables MCP string-cell truncation.
+query_max_cell_chars = 1000
+# MCP raw-SQL execution timeout in milliseconds. 0 disables interruption and is
+# the default until representative valid-query/concurrency calibration justifies
+# a finite availability guard. This never applies to indexed search tools.
+query_timeout_ms = 0
+[mcp.internal]
+# Internal MCP presentation budgets. These affect only generated tool descriptions,
+# not search/query results. They exist to keep tool descriptions concise while still
+# giving agents enough live schema context to form valid SQL.
+schema_summary_tables = 4
+schema_summary_columns = 12
+
+# What each MCP client accepts before it truncates or drops what the server sends. Every row
+# ships with the value measured from that client's own source at a pinned version, recorded in
+# docs/development/mcp-client-limits-and-measured-evidence.md, so this table is only for a client
+# that has since moved. Set a row by the name `aise mcp schema-budget` reports; an unknown name
+# is rejected rather than ignored, so a typo cannot leave the shipped budget quietly in force.
+#
+# A config file is per machine while these numbers are per client, so an MCP registration can
+# instead set its own in its `env` block:
+# AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES=6000
+#
+# [mcp.client_limits]
+# codex-input-schema-bytes = 6000
+
+[cli]
+# Default transcript lines for `aise show` when `--transcript-lines` is omitted:
+# positive=head, negative=tail, 0=entire transcript. A bounded default keeps long
+# sessions skimmable; use `--transcript-lines 0` explicitly when you really want
+# the full transcript.
+show_transcript_lines = -40
+# Default `aise messages search/get/timeline --lines-per-message`: caps each
+# individual message's content to this many lines (positive=head, negative=tail,
+# 0=full content). Distinct from `show_transcript_lines`, which windows one whole
+# session transcript. This changes presentation only and never discards results.
+lines_per_message = 0
+# Default compact preview characters for `aise messages evidence` when
+# `--preview-chars` is omitted. Does not affect full JSON message content.
+# Must be at least 1.
+evidence_preview_chars = 220
+# Aggregate records for show --summary and messages evidence: positive=first, negative=last,
+# 0=all. This affects presentation only.
+summary_items = -12
+
+[db]
+# Native CLI/Rust default maximum rows for raw read-only SQL. MCP currently uses
+# this row default too, but has a separate execution-time guard above. 0 means
+# unlimited rows and can produce huge output.
+query_limit = 100
+# Native CLI/Rust raw-SQL timeout in milliseconds. 0 (the default) disables
+# interruption; pass a finite value explicitly when the caller wants a deadline.
+query_timeout_ms = 0
+
+[performance]
+# Worker threads for data-parallel scans. 0 = auto, 1 = sequential.
+threads = 0
+
+[skills]
+# Directories scanned for Agent Skill packages. Each entry is either a skill directory (one
+# holding SKILL.md) or a directory containing skill directories. `~` is expanded.
+#
+# These are DISCOVERY roots, not the install destinations `aise integrations install` writes to:
+# install writes the same bundled skill to three client roots, so scanning those would find three
+# copies of one name. Discovery is not activation: a skill found here changes nothing until it is
+# selected by `aise skills <name-or-path>` or a repeatable `--skill`.
+search_paths = []
+# Parent directory `aise skills create` writes into when --output-dir is omitted. Unset = require
+# the flag rather than guess where a new directory belongs.
+# authoring_root = "~/.claude/skills"
+
+[capabilities.message_classification]
+# Default native CLI and Python result count. 0 = every match. An explicit CLI --limit wins.
+limit = 50
+
+[analytics]
+# Optional slash-command filters for `aise planning`. Empty = count every slash command.
+planning_commands = []
+# Default `aise planning --limit`. 0 = every command.
+planning_limit = 50
+# Default `aise vocab --limit`. 0 = unlimited.
+vocab_limit = 50
+# Default `aise repeats` output and phrase-mining controls. Command-line flags win.
+# Zero means all groups/examples; minimum matches and phrase widths must be at least 1.
+repeat_max_groups = 50
+# Representative examples serialized per repeat group. Aggregate match and session counts remain
+# complete. The table has always shown at most three examples; use 0 for every matching message.
+repeat_max_examples_per_group = 3
+repeat_min_matches = 2
+repeat_phrase_min_words = 2
+repeat_phrase_max_words = 5
+
+[ui]
+# Interactive TUI (`aise tui`) pacing and step behavior.
+# Total preview body budget: the transcript summary's sections scale proportionally to
+# their weights (first prompt, first reply, final prompt, final reply), each floored at one
+# line so a small budget cannot erase a bookend. The 1.0.0rc2 name `preview_lines` is still
+# accepted; when both are set, `preview_body_lines` wins.
+preview_body_lines = 34
+# Idle wake interval for the TUI event loop, in milliseconds (minimum 1). Every key redraws
+# immediately; this value paces settled idle turns, while active worker output is checked sooner.
+# Values must fit the platform monotonic clock; unrepresentable intervals are rejected.
+idle_poll_interval_ms = 150
+# Milliseconds an edited query must stay unchanged before it becomes a search. Typing never
+# waits on this: every keystroke echoes immediately and the search runs off the input thread.
+# 0 searches on every keystroke, and Enter searches the current query at once whatever the
+# value. Raise it on a large index, where one search costs seconds and a typed burst would
+# otherwise start a scan per character that the next keystroke cancels.
+search_debounce_ms = 150
+# Rows the selection moves for PageDown/PageUp in the session list.
+list_page_rows = 10
+# Rendered rows the preview scrolls for K/J (and Shift+Up/Shift+Down). Rows, not transcript
+# lines: a
+# long line occupies several rows once the pane wraps it.
+preview_scroll_rows = 5
+# Rendered rows the preview scrolls for Ctrl-d/Ctrl-u.
+preview_page_rows = 15
+# Provider label column width in the session list. Normal panes clamp to the longest label;
+# exceptionally narrow panes clamp to their actual interior and may truncate labels.
+provider_label_width = 9
+# Percent of the body width for the session-list pane; the preview pane gets the remainder.
+list_pane_percent = 45
+# Whether the TUI draws characters outside ASCII: box borders, the ellipsis, and the preview's
+# section rules and elision markers. "auto" reads LC_ALL, LC_CTYPE, then LANG and falls back to
+# ASCII only when one of them names an encoding that cannot carry them (C, POSIX, or a charset
+# that is not UTF-8); an unset locale keeps the box drawing. "on" and "off" decide it outright.
+unicode = "auto"
+# Whether the TUI colours anything. "auto" honours NO_COLOR (set and non-empty, whatever the
+# value) and TERM=dumb. Emphasis that does not need colour is drawn either way: the selected row
+# carries a marker, and bold survives.
+color = "auto"
+
+# What each key press means. Name only the actions you want to change: the rest keep the
+# defaults shown here, the same way a [providers.<name>] table overrides only the fields it
+# names. An action set to [] is deliberately unbound, and the status bar stops advertising it.
+#
+# A binding is a single character, f1 through f35, or one of enter, esc, tab, backtab,
+# backspace, delete, insert, space, up, down, left, right, home, end, pageup, pagedown — with
+# any of ctrl, alt, shift, super joined to it by +. Shift is not written for a capital letter:
+# "G" is the binding, because a terminal may or may not report the shift flag beside it. For the
+# same reason a chorded letter ignores its case, so "ctrl+c" and "ctrl+C" are one binding.
+#
+# A command may be reached by as many keys as you list, so adding your own keeps the shipped
+# one. Listing a key an action already has is a repeat and is kept once; the same key on two
+# commands reachable from one mode is a conflict and is refused.
+#
+# `interrupt` is answered in both modes and takes two presses: the first says so in the status
+# bar and the second quits. It exists because a full-screen terminal application turns off the
+# terminal's own interrupt character, so nothing else would stop it. Binding both `quit` and
+# `interrupt` to nothing is refused, because it would leave no way out.
+#
+# [ui.keys]
+# interrupt = ["ctrl+c"]
+# quit = ["q", "esc"]
+# enter_search = ["/"]
+# leave_search = ["enter", "esc"]
+# move_down = ["j", "down"]
+# move_up = ["k", "up"]
+# page_down = ["pagedown"]
+# page_up = ["pageup"]
+# top = ["g"]
+# bottom = ["G"]
+# cycle_provider = ["p"]
+# cycle_session_kind = ["f"]
+# cycle_time_window = ["s"]
+# toggle_warnings_only = ["w"]
+# preview_scroll_down = ["J", "shift+down"]
+# preview_scroll_up = ["K", "shift+up"]
+# preview_page_down = ["ctrl+d"]
+# preview_page_up = ["ctrl+u"]
+# resume = ["enter", "r"]
+# help = ["?"]
+#
+# The search box's own editing. Typing a character is not bound here, because it is the text
+# itself; everything a reader presses to change the text or move the caret is.
+# clear_query = ["ctrl+u"]
+# delete_backward = ["backspace"]
+# delete_forward = ["delete"]
+# delete_word_backward = ["ctrl+w"]
+# cursor_left = ["left"]
+# cursor_right = ["right"]
+# cursor_start = ["home", "ctrl+a"]
+# cursor_end = ["end", "ctrl+e"]
+
+# Uncomment provider tables only when you want to disable a provider or replace the platform
+# defaults with explicit paths. If `paths` is absent, aise uses built-in OS-aware defaults;
+# explicit `paths = []` means search no roots for that enabled provider.
+#
+# [providers.claude]
+# enabled = true
+# paths = ["~/.claude/projects"]
+#
+# [providers.claude-desktop]
+# enabled = true
+# paths = [
+#   "~/Library/Application Support/Claude/local-agent-mode-sessions",
+# ]
+#
+# [providers.codex]
+# enabled = true
+# paths = ["~/.codex/sessions"]
+#
+# [providers.cursor]
+# enabled = true
+# paths = ["~/.cursor/projects"]
+#
+# [providers.antigravity]
+# enabled = true
+# paths = [
+#   "~/.gemini/antigravity-cli/brain",
+#   "~/.gemini/antigravity/brain",
+# ]
+#
+# [providers.pi]
+# enabled = true
+# paths = ["~/.pi/agent/sessions"]
+#
+# [providers.prime-agent]
+# enabled = true
+# paths = ["~/.prime/agent/sessions", "~/.prime/agent/session-artifacts"]
+#
+# [providers.aistudio]
+# enabled = true
+# paths = []
+#
+# [providers.gemini-cli]
+# enabled = true
+# paths = ["~/.gemini/tmp"]

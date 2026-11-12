@@ -4722,3 +4722,16 @@ paths = ["sessions/gemini-cli"]
         assert_eq!(read_config_text(&missing, false).unwrap(), "");
     }
 }
+
+#[cfg(test)]
+mod published_configuration_compatibility {
+    use super::*;
+
+    #[test]
+    fn published_example_loads_without_ignored_keys() {
+        let config: Config =
+            toml::from_str(include_str!("../tests/fixtures/v1_0_0_config.toml")).unwrap();
+        assert!(config.unknown_config_keys.is_empty());
+        config.validate().unwrap();
+    }
+}
