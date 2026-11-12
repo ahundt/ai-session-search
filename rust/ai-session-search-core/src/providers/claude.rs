@@ -410,6 +410,7 @@ fn queued_input_message(
     timestamp: Option<DateTime<Utc>>,
     semantics: Option<ClaudeNativeMessageSemantics>,
 ) -> RawMessage {
+    let agent_wrapper = content.trim_start().starts_with("<agent-message");
     let raw_message = RawMessage::message("user", content, timestamp, None)
         .with_input_delivery_state(InputDeliveryState::Submitted);
     match semantics {
@@ -422,7 +423,11 @@ fn queued_input_message(
             }
         }
         None => raw_message
-            .with_authorship(MessageAuthorship::Unknown)
+            .with_authorship(if agent_wrapper {
+                MessageAuthorship::Agent
+            } else {
+                MessageAuthorship::Unknown
+            })
             .with_input_origin(MessageInputOrigin::Queued),
     }
 }
@@ -5027,6 +5032,32 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn queued_agent_wrappers_without_origin_are_not_unattributed_input() {
+        let temp = tempdir().unwrap();
+        let wrapper = "<agent-message agent_id=\"worker\">check the tests</agent-message>";
+        let lines = [json!({"type":"queue-operation","operation":"enqueue","sessionId":"agent-wrapper","content":wrapper}),
+            json!({"type":"attachment","uuid":"q1","sessionId":"agent-wrapper","attachment":{"type":"queued_command","commandMode":"prompt","prompt":wrapper}})]
+            .map(|v| v.to_string()).join("\n");
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(lines),
+                &temp.path().join("agent-wrapper.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        let db = crate::db::Db::open(&temp.path().join("agent-wrapper.db")).unwrap();
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        assert!(db
+            .search_attributable_human_messages("check the tests", &Default::default(), true)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
