@@ -21,6 +21,9 @@ coordinates in that message. Tool-name and tool-argument queries use their own f
 Views and context may include generated text. Results include concise source
 provenance. The index retains full partition and correlation details for existing read-only SQL
 inspection; ordinary search hits do not emit those internal arrays.
+Structured message-search hits include `timestamp` (RFC 3339 UTC, or None when unknown),
+including queryless hits and batches.
+
 Origin and delivery evidence use `null` in JSON and `None` in Rust/Python when absent.
 Legacy indexes remain searchable through an internal storage marker; `unknown` is not an
 origin or delivery enum value. Both Rust enums are non-exhaustive.

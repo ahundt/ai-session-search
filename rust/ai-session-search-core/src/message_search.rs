@@ -2961,7 +2961,7 @@ impl Serialize for SemanticResult<'_> {
             .target
             .map_or(SearchField::Content, MessageTarget::field);
         let has_match = hit.match_evidence.is_some() || hit.literal_match.is_some();
-        let mut entry_count = if has_match { 4 } else { 3 };
+        let mut entry_count = if has_match { 5 } else { 4 };
         if hit.parsed_references.is_some() {
             entry_count += 1;
         }
@@ -2970,6 +2970,7 @@ impl Serialize for SemanticResult<'_> {
         }
         let mut map = serializer.serialize_map(Some(entry_count))?;
         map.serialize_entry("message_ref", &message_ref)?;
+        map.serialize_entry("timestamp", &hit.message.ts)?;
         map.serialize_entry(
             "message_metadata",
             &SemanticMessageMetadata {

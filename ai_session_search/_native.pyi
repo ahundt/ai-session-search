@@ -1462,6 +1462,7 @@ class _MessageSearchResultIncluded(TypedDict):
     parsed_references: list[dict[str, object]]
 
 class _MessageSearchResult(TypedDict):
+    timestamp: str | None
     message_ref: _MessageSearchMessageRef
     message_metadata: _MessageSearchMessageMetadata
     match: NotRequired[_MessageSearchMatch]

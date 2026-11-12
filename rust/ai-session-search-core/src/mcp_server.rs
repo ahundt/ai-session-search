@@ -3026,6 +3026,7 @@ fn search_messages_output_schema() -> Value {
         "properties": {
             "message_ref": message_ref,
             "message_metadata": message_metadata,
+            "timestamp": { "type": ["string", "null"], "format": "date-time" },
             "match": {
                 "type": "object",
                 "properties": {
@@ -3078,7 +3079,7 @@ fn search_messages_output_schema() -> Value {
                 "additionalProperties": false
             }
         },
-        "required": ["message_ref", "message_metadata", "presentation"],
+        "required": ["message_ref", "message_metadata", "timestamp", "presentation"],
         "additionalProperties": false
     });
     json!({

@@ -12,7 +12,7 @@ import pytest
 
 import ai_session_search as aise
 
-CLI = Path(__file__).resolve().parents[1] / "target/release/aise"
+CLI = Path(__file__).resolve().parents[1] / "target/debug/aise"
 
 
 @pytest.fixture
@@ -65,16 +65,19 @@ def cli(search, *args):
     return json.loads(result.stdout)
 
 
+@pytest.mark.integration
 def test_session_dictionary_matches_cli(corpus):
     actual = [row.to_dict() for row in corpus.list_sessions()]
     assert actual == cli(corpus, "list", "--format", "json")
     assert [row.to_dict() for row in corpus.search_sessions("retry")] == cli(corpus, "search", "retry", "--format", "json")
 
 
+@pytest.mark.integration
 def test_message_dictionary_uses_cli_timestamp_name(corpus):
     message = corpus.read_session_messages("synthetic-0", limit=1)[0]
     assert message.to_dict()["ts"] == message.timestamp
     assert "timestamp" not in message.to_dict()
+    assert corpus.search_messages("forgot").to_dict() == cli(corpus, "messages", "search", "forgot", "--format", "json")
 
 
 def test_service_errors_are_named_and_keep_runtime_handlers(corpus):
@@ -105,12 +108,14 @@ def test_invalid_version_keeps_legacy_overflow_handler(corpus):
     assert "version" in str(invalid.value)
 
 
+@pytest.mark.integration
 def test_analysis_calls_match_cli(corpus):
     assert corpus.vocabulary(limit=4) == cli(corpus, "vocab", "--limit", "4", "--format", "json")
     assert corpus.repeats(max_groups=3) == cli(corpus, "repeats", "--max-groups", "3", "--report", "--format", "json")
     assert corpus.repeats("forgot", query_mode="regex", min_matches=2)["groups"]
 
 
+@pytest.mark.integration
 def test_sql_uses_shared_read_only_service(corpus):
     sql = "select id from sessions order by id"
     result = corpus.query_sql(sql, limit=2)
@@ -123,6 +128,7 @@ def test_sql_uses_shared_read_only_service(corpus):
     assert len(corpus.list_sessions()) == 3
 
 
+@pytest.mark.integration
 def test_resume_command_and_transcript_use_catalog(corpus):
     command = corpus.resume_command("synthetic-0")
     assert command["session_id"] == "claude:synthetic-0"
@@ -161,6 +167,7 @@ def test_sql_cell_truncation_retains_receipt(corpus):
     assert result["truncated_cell_char_limit"] == 3
 
 
+@pytest.mark.integration
 def test_direct_classification_returns_cli_rows(corpus):
     matches = corpus.classify_messages(skill="corrections", include_unattributed_input=True)
     expected = cli(corpus, "skills", "corrections", "--include-unattributed-input", "--format", "json")
@@ -170,6 +177,7 @@ def test_direct_classification_returns_cli_rows(corpus):
     assert {row.session_id for row in scoped} == {"claude:synthetic-0"}
 
 
+@pytest.mark.integration
 def test_session_limits_follow_configuration(corpus, tmp_path: Path):
     config = tmp_path / "limits.toml"
     config.write_text('[search]\ndefault_limit = 2\n')
@@ -230,6 +238,7 @@ def test_message_query_mode_can_travel_with_request(corpus):
         corpus.search_messages("forgot", request, query_mode="literal")
 
 
+@pytest.mark.integration
 def test_session_pages_match_unpaged_cli_order(corpus):
     all_listed = cli(corpus, "list", "--limit", "0", "--format", "json")
     all_ranked = cli(corpus, "search", "retry", "--limit", "0", "--format", "json")
@@ -241,3 +250,13 @@ def test_session_pages_match_unpaged_cli_order(corpus):
         ranked.extend(row.to_dict() for row in corpus.search_sessions("retry", request))
     assert listed == all_listed
     assert ranked == all_ranked
+
+
+@pytest.mark.integration
+def test_structured_search_hits_include_timestamp(corpus):
+    response = corpus.search_messages("forgot")
+    assert response.results[0]["timestamp"] == "2026-01-15T12:00:00Z"
+    assert response.to_dict() == cli(corpus, "messages", "search", "forgot", "--format", "json")
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute("UPDATE messages SET ts = NULL")
+    assert all(row["timestamp"] is None for row in corpus.search_messages("forgot").results)
