@@ -91,9 +91,78 @@ const IGNORED_RECORD_TYPES: [&str; 27] = [
     "worktree-state",
 ];
 
-/// `raw_metadata_json` key holding `{record type: count}` for records of unrecognized types,
+/// `raw_metadata_json` key holding counts of unrecognized record types and attachment layouts,
 /// which `Db::parser_health` aggregates across sessions.
 pub(crate) const UNRECOGNIZED_RECORD_TYPES_KEY: &str = "unrecognized_record_types";
+
+// File, Context and Queued are STORED; Skipped types are classified non-content or duplicates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttachmentPolicy {
+    File,
+    Context,
+    Queued,
+    Skipped,
+}
+
+const ATTACHMENT_TYPES: &[(&str, AttachmentPolicy)] = &[
+    ("file", AttachmentPolicy::File),             // Attached file text.
+    ("edited_text_file", AttachmentPolicy::File), // Attached file snippet.
+    ("nested_memory", AttachmentPolicy::File),    // Memory file content needed for recovery.
+    ("plan_file_reference", AttachmentPolicy::File), // Plan text or its attached file reference.
+    ("directory", AttachmentPolicy::File),        // Attached directory listing.
+    ("invoked_skills", AttachmentPolicy::File),   // Invoked skill file contents.
+    ("dynamic_skill", AttachmentPolicy::File),    // Loaded skill file contents.
+    ("skill_mention", AttachmentPolicy::File),    // Mentioned skill contents or reference.
+    ("instructions", AttachmentPolicy::Context),  // Harness instruction files.
+    ("session_context", AttachmentPolicy::Context), // Harness session context.
+    ("diagnostics", AttachmentPolicy::Context),   // Diagnostics explain failures.
+    ("hook_blocking_error", AttachmentPolicy::Context), // Hook errors and commands explain blocked actions.
+    ("hook_non_blocking_error", AttachmentPolicy::Context), // Hook errors explain degraded actions.
+    ("hook_additional_context", AttachmentPolicy::Context), // Additional hook context is otherwise missing.
+    ("hook_cancelled", AttachmentPolicy::Context), // Cancellation messages explain interrupted hooks.
+    ("hook_permission_decision", AttachmentPolicy::Context), // Permission messages explain allowed or blocked actions.
+    ("async_hook_response", AttachmentPolicy::Context), // Asynchronous hook messages explain later actions.
+    ("read_truncation_notice", AttachmentPolicy::Context), // Truncation messages explain incomplete reads.
+    ("max_turns_reached", AttachmentPolicy::Context), // Turn-limit messages explain stopped sessions.
+    ("session_cron_carry", AttachmentPolicy::Skipped), // Scheduled prompts already in indexed rows.
+    ("queued_command", AttachmentPolicy::Queued), // Queued input is reconciled with submitted turns.
+    ("hook_success", AttachmentPolicy::Skipped),  // High-volume hook success boilerplate.
+    ("total_tokens_reminder", AttachmentPolicy::Skipped), // Token-budget boilerplate.
+    ("hook_system_message", AttachmentPolicy::Skipped), // Messages mostly repeat indexed hook feedback.
+    ("task_reminder", AttachmentPolicy::Skipped), // High-volume task-state snapshots; task operations stay indexed.
+    ("environment", AttachmentPolicy::Skipped),   // Environment metadata, not message content.
+    ("deferred_tools_delta", AttachmentPolicy::Skipped), // Tool catalogue boilerplate.
+    ("batching_reminder_sent", AttachmentPolicy::Skipped), // Batching instruction boilerplate.
+    ("skill_listing", AttachmentPolicy::Skipped), // Repeated skill catalogue boilerplate.
+    ("bash_output_audience_note", AttachmentPolicy::Skipped), // Shell output framing boilerplate.
+    ("silent_turn_reminder", AttachmentPolicy::Skipped), // Turn instruction boilerplate.
+    ("mcp_instructions_delta", AttachmentPolicy::Skipped), // MCP instruction boilerplate.
+    ("agent_listing_delta", AttachmentPolicy::Skipped), // Agent catalogue boilerplate.
+    ("compact_file_reference", AttachmentPolicy::Skipped), // File references already present in indexed rows.
+    ("auto_mode", AttachmentPolicy::Skipped),              // Automatic-mode settings.
+    ("prompt_snapshot", AttachmentPolicy::Context), // System prompt text explains the harness instructions.
+    ("goal_status", AttachmentPolicy::Skipped), // Goal prose mostly repeats indexed instructions.
+    ("date", AttachmentPolicy::Skipped),        // Calendar metadata.
+    ("model", AttachmentPolicy::Skipped),       // Model identity metadata.
+    ("credential_org", AttachmentPolicy::Skipped), // Credential organization metadata.
+    ("command_permissions", AttachmentPolicy::Skipped), // Permission configuration metadata.
+    ("deferred_tools_record", AttachmentPolicy::Skipped), // Tool schema catalogue boilerplate.
+    ("date_change", AttachmentPolicy::Skipped), // Calendar metadata.
+    ("task_status", AttachmentPolicy::Skipped), // Task descriptions already in indexed task rows.
+    ("budget_usd", AttachmentPolicy::Skipped),  // Numeric cost budget.
+    ("thinking_drop", AttachmentPolicy::Skipped), // Reason codes and counters, not prose.
+    ("plan_mode", AttachmentPolicy::Skipped),   // Plan-mode instruction boilerplate.
+    ("plan_mode_exit", AttachmentPolicy::Skipped), // Plan-mode transition boilerplate.
+    ("plan_mode_reentry", AttachmentPolicy::Skipped), // Plan-mode transition boilerplate.
+    ("workflow_keyword_request", AttachmentPolicy::Skipped), // Workflow instruction boilerplate.
+    ("auto_mode_exit", AttachmentPolicy::Skipped), // Automatic-mode transition metadata.
+];
+
+fn attachment_policy(kind: &str) -> Option<AttachmentPolicy> {
+    ATTACHMENT_TYPES
+        .iter()
+        .find_map(|(name, policy)| (*name == kind).then_some(*policy))
+}
 
 const ATTACHMENT_ID_PREFIX: &str = "claude_attachment:";
 
@@ -115,7 +184,6 @@ pub(crate) fn is_attachment_message(message: &crate::models::Message) -> bool {
 struct AttachmentRows {
     rows: Vec<RawMessage>,
     by_identity: HashMap<String, Vec<usize>>,
-    binary: usize,
 }
 
 impl AttachmentRows {
@@ -128,7 +196,7 @@ impl AttachmentRows {
         if positions.iter().any(|&i| self.rows[i].content() == text) {
             return;
         }
-        let row = if matches!(kind, "instructions" | "session_context") {
+        let row = if attachment_policy(kind) == Some(AttachmentPolicy::Context) {
             RawMessage::harness_notice(text.to_owned(), None)
         } else {
             // Included file text came through the harness; it is searchable but was not typed.
@@ -143,7 +211,7 @@ impl AttachmentRows {
     // Only named text fields are read: paths, encodings and other metadata are not content.
     fn text(&mut self, kind: &str, path: Option<&str>, value: &Value) -> bool {
         if matches!(value["type"].as_str(), Some("image" | "binary" | "base64")) {
-            self.binary += 1;
+            // Encoded image and binary payloads are classified but never indexed.
             return true;
         }
         match value {
@@ -161,11 +229,39 @@ impl AttachmentRows {
             Value::Object(fields) => {
                 let path = fields
                     .get("filePath")
-                    .or_else(|| fields.get("path"))
                     .and_then(Value::as_str)
+                    .or_else(|| fields.get("path").and_then(Value::as_str))
+                    .or_else(|| fields.get("filename").and_then(Value::as_str))
                     .or(path);
                 let mut found = false;
-                for key in ["file", "content", "text", "snippet"] {
+                for key in [
+                    "file",
+                    "files",
+                    "content",
+                    "text",
+                    "snippet",
+                    "body",
+                    "message",
+                    "messages",
+                    "error",
+                    "blockingError",
+                    "command",
+                    "skills",
+                    "skill",
+                    "description",
+                    "stdout",
+                    "stderr",
+                    "memory",
+                    "diagnostics",
+                    "listing",
+                    "banner",
+                    "prompt",
+                    "tasks",
+                    "systemPrompt",
+                    "response",
+                    "additionalContext",
+                    "systemMessage",
+                ] {
                     if let Some(value) = fields.get(key) {
                         found |= self.text(kind, path, value);
                     }
@@ -201,11 +297,22 @@ impl AttachmentRows {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("(no type)");
-        let path = attachment.get("filename").and_then(Value::as_str);
+        let path = attachment
+            .get("filename")
+            .and_then(Value::as_str)
+            .or_else(|| attachment.get("path").and_then(Value::as_str))
+            .or_else(|| attachment.get("filePath").and_then(Value::as_str));
+        match attachment_policy(kind) {
+            None => {
+                health.count(Some(&format!("attachment/{kind}")));
+                return;
+            }
+            Some(AttachmentPolicy::Skipped) => return,
+            _ => {}
+        }
         match kind {
             "file" => {
-                if !self.text(kind, path, &attachment["content"])
-                    && !self.text(kind, path, &record["rendered"])
+                if !self.text(kind, path, attachment) && !self.text(kind, path, &record["rendered"])
                 {
                     health.layout(kind, "text missing", &attachment["content"]);
                 }
@@ -234,12 +341,23 @@ impl AttachmentRows {
                     health.layout(kind, "context not strings", &attachment["context"]);
                 }
             }
-            _ => health.count(Some(&format!("attachment/{kind}"))),
+            _ => {
+                if !self.text(kind, path, attachment) && !self.text(kind, path, &record["rendered"])
+                {
+                    if let Some(path) =
+                        path.filter(|_| matches!(kind, "plan_file_reference" | "skill_mention"))
+                    {
+                        self.push(kind, Some(path), path);
+                    } else {
+                        health.layout(kind, "text missing", attachment);
+                    }
+                }
+            }
         }
     }
 }
 
-/// Records of types in neither `MESSAGE_RECORD_TYPES` nor `IGNORED_RECORD_TYPES`, by type name.
+/// Unclassified record types and attachment layouts, named without payload text.
 /// Bounded: at most `MAX_TYPES` names of at most `MAX_NAME_CHARS` characters each are kept, and
 /// records of any further type are counted under one overflow name.
 #[derive(Default)]
@@ -787,7 +905,7 @@ impl ClaudeAdapter {
                         }
                     } else if value["attachment"]["type"] != "queued_command" {
                         attachments.read(&value, &mut unrecognized);
-                    } else {
+                    } else if !value["attachment"]["prompt"].is_string() {
                         unrecognized.layout(
                             "queued_command",
                             "prompt not string",
@@ -1187,8 +1305,6 @@ impl ClaudeAdapter {
 
         let parse_warning = [
             super::malformed_jsonl_warning(malformed_line_count),
-            (attachments.binary > 0)
-                .then(|| format!("skipped {} binary attachment payloads", attachments.binary)),
             unrecognized.warning(),
         ]
         .into_iter()
@@ -4782,6 +4898,100 @@ mod tests {
     }
 
     #[test]
+    fn empty_queued_attachment_strings_have_a_classified_layout() {
+        let lines = ["", "  "].iter().map(|text| json!({"type":"attachment","attachment":{"type":"queued_command","prompt":text,"commandMode":"prompt"}}).to_string()).collect::<Vec<_>>().join("\n");
+        let temp = tempdir().unwrap();
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(lines),
+                &temp.path().join("empty-queued.jsonl"),
+            )
+            .unwrap();
+        assert!(parsed.messages.is_empty());
+        assert!(
+            parsed.session.parse_warning.is_none(),
+            "{:?}",
+            parsed.session.parse_warning
+        );
+    }
+
+    #[test]
+    fn attachment_classification_leaves_only_new_types_in_health() {
+        use super::{AttachmentPolicy, ATTACHMENT_TYPES};
+        let names = ATTACHMENT_TYPES
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ATTACHMENT_TYPES.len(), 51);
+        assert_eq!(names.len(), 51);
+        let mut rows = super::AttachmentRows::default();
+        let mut health = super::UnrecognizedRecordTypes::default();
+        for (kind, policy) in ATTACHMENT_TYPES {
+            if *policy == AttachmentPolicy::Skipped {
+                for _ in 0..100 {
+                    rows.read(&json!({"attachment":{"type":kind}}), &mut health);
+                }
+            }
+        }
+        rows.read(
+            &json!({"attachment":{"type":"file","content":{"type":"binary","content":"not text"}}}),
+            &mut health,
+        );
+        assert!(rows.rows.is_empty());
+        assert!(health.counts.is_empty());
+        rows.read(&json!({"attachment":{"type":"future-type"}}), &mut health);
+        assert_eq!(
+            health.counts,
+            std::collections::BTreeMap::from([("attachment/future-type".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn classified_attachments_store_recovery_text_and_skip_boilerplate() {
+        use crate::models::MessageKind;
+        let records = [
+            json!({"type":"hook_blocking_error","blockingError":{"blockingError":"blocked by policy","command":"validate action"}}),
+            json!({"type":"hook_additional_context","content":["hook context\r\n"]}),
+            json!({"type":"invoked_skills","skills":[{"name":"sample","path":"/tmp/SKILL.md","content":"skill body\r\n"}]}),
+            json!({"type":"read_truncation_notice","banner":"read was truncated"}),
+            json!({"type":"prompt_snapshot","systemPrompt":["system instructions"],"tools":[{"description":"schema boilerplate"}]}),
+            json!({"type":"nested_memory","content":"memory body"}),
+            json!({"type":"plan_file_reference","filename":"/tmp/plan.md"}),
+            json!({"type":"session_cron_carry","tasks":[{"prompt":"scheduled prompt"}]}),
+            json!({"type":"hook_success","content":"success boilerplate"}),
+            json!({"type":"skill_listing","content":"catalog boilerplate"}),
+            json!({"type":"task_status","description":"duplicate task description"}),
+        ];
+        let temp = tempdir().unwrap();
+        let lines = records.iter().chain(records.iter()).enumerate().map(|(i, a)|
+            json!({"type":"attachment","uuid":format!("a{i}"),"sessionId":"classified","attachment":a}).to_string()
+        ).collect::<Vec<_>>().join("\n");
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(lines),
+                &temp.path().join("classified.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(parsed.messages.len(), 8);
+        assert!(parsed.file_edits.is_empty());
+        assert!(
+            parsed.session.parse_warning.is_none(),
+            "{:?}",
+            parsed.session.parse_warning
+        );
+        for m in &parsed.messages {
+            assert_eq!(
+                m.kind,
+                if ["skill body\r\n", "memory body", "/tmp/plan.md"].contains(&m.content.as_str()) {
+                    MessageKind::ToolResult
+                } else {
+                    MessageKind::HarnessNotice
+                }
+            );
+        }
+    }
+
+    #[test]
     fn attachment_text_is_recovered_from_alternate_layouts() {
         let records = [
             json!({"type":"file","filename":"/tmp/a","content":"direct\r\n"}),
@@ -4830,7 +5040,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ),
-                &temp.path().join("malformed.jsonl"),
+                &temp.path().join("unread-layout.jsonl"),
             )
             .unwrap();
         let warning = parsed.session.parse_warning.as_deref().unwrap();
@@ -4838,10 +5048,7 @@ mod tests {
             warning.contains("attachment/instructions (files not array; keys: files,type)"),
             "{warning}"
         );
-        assert!(
-            warning.contains("skipped 1 binary attachment payload"),
-            "{warning}"
-        );
+        assert!(!warning.contains("binary"), "{warning}");
         assert!(!warning.contains("malformed"), "{warning}");
         let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
         db.upsert_session(&parsed, 1, 1).unwrap();
@@ -4941,7 +5148,7 @@ mod tests {
             .any(|t| t.record_type == "attachment/future-attachment"));
         let warning = parsed.session.parse_warning.as_deref().unwrap();
         assert!(warning.contains("attachment/file (text missing; keys: type)"));
-        assert!(warning.contains("skipped 1 binary attachment payload"));
+        assert!(!warning.contains("binary"));
     }
 
     #[test]
