@@ -277,6 +277,11 @@ requests and existing evidence/read surfaces; require a concrete user benefit fo
 
 ### REQ003-preserve-surface-semantics
 
+Python retains `search_sessions("")` for compatibility and emits `DeprecationWarning` naming
+`list_sessions()` as the replacement. The CLI rejects empty ranked queries. This temporary
+surface difference preserves published Python calls during deprecation rather than removing an
+accepted argument value in a minor release.
+
 Intentional defaults are part of the API:
 
 | Surface | Omitted literal, regex, or queryless message-search limit | Rationale |

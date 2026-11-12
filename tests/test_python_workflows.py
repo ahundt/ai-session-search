@@ -335,3 +335,9 @@ def test_service_close_is_idempotent_and_context_managed(corpus):
             raise LookupError("test exit")
     with pytest.raises(RuntimeError, match="closed"):
         other.index_status()
+
+
+def test_empty_ranked_query_is_deprecated_with_working_replacement(corpus):
+    with pytest.warns(DeprecationWarning, match="list_sessions"):
+        hits = corpus.search_sessions("")
+    assert [hit.session for hit in hits] == corpus.list_sessions()

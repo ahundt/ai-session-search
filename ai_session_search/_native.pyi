@@ -1898,6 +1898,8 @@ class SessionSearch:
     ) -> list[SearchHit]:
         """Rank matching sessions after metadata and session-span filtering.
 
+        Empty queries are deprecated; use list_sessions(request) instead.
+
         A finite limit bounds retained top-K results, not eligible transcript bytes scored;
         ``request.limit=0`` can retain and return every match.
         """

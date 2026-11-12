@@ -5248,6 +5248,7 @@ impl SessionSearch {
     }
 
     /// Rank sessions through the shared catalog query.
+    /// Empty queries are deprecated; use list_sessions(request) instead.
     ///
     /// Scanning/scoring bounds are owned by `CatalogService::search_sessions`; this adapter adds
     /// `O(K + D_K)` conversion and retained output work, with no second database query.
@@ -5258,6 +5259,9 @@ impl SessionSearch {
         query: String,
         request: Option<SessionQuery>,
     ) -> PyResult<Vec<NativeSessionSearchHit>> {
+        if query.trim().is_empty() {
+            PyErr::warn(py, py.get_type::<pyo3::exceptions::PyDeprecationWarning>().as_any(), c"search_sessions with an empty query is deprecated; use list_sessions(request) to list sessions", 1)?;
+        }
         let hits = py.detach(|| {
             let app = self.app()?;
             let mut request = request.unwrap_or_default();

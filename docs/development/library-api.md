@@ -131,6 +131,10 @@ Passing both a scope and flat filters raises `InvalidArgumentError`. Session lis
 `MessageSearchRequest(query_mode="regex")` carries its search mode; the function keyword also
 works, and conflicting values raise `InvalidArgumentError`.
 
+`search_sessions("")` is deprecated and emits DeprecationWarning naming `list_sessions()`;
+the historical ranked result remains available during the deprecation period. Use a nonempty
+query to rank sessions, or `list_sessions(request)` for metadata-only retrieval.
+
 An omitted `SessionQuery.limit` (None) resolves `[search].default_limit` on list and ranked
 search calls, including when the request supplies other filters. An explicit 0 returns every
 session; a positive count overrides configuration.
