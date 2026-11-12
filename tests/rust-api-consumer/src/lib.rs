@@ -337,7 +337,8 @@ pub fn root_reexports_name_service_types(
         .with_since(since)
         .with_limit(5);
     let sessions = catalog.list_sessions(&filters)?;
-    let hits = catalog.search_sessions("tests", &filters, None, &app.config().search.scoring)?;
+    let hits = catalog.search("tests", &filters)?;
+    let _ = catalog.search_sessions("tests", &filters, None, &app.config().search.scoring)?;
     let message_filters = MessageFilters::default()
         .with_role(Role::User)
         .with_kinds(vec![MessageKind::Conversation]);

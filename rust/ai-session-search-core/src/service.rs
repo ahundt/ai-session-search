@@ -1117,7 +1117,7 @@ impl SessionSearch {
 
     /// Session catalog operations.
     pub const fn catalog(&self) -> CatalogService<'_> {
-        CatalogService::new(&self.db)
+        CatalogService::with_config(&self.db, &self.config)
     }
 
     /// Message search and context operations.
@@ -2497,11 +2497,48 @@ pub struct ResumeCommand {
 /// Typed session listing, search, resolution, and compact inspection operations.
 pub struct CatalogService<'db> {
     db: &'db Db,
+    config: Option<&'db Config>,
 }
 
 impl<'db> CatalogService<'db> {
+    /// Create a catalog over `db` with no configuration: [`CatalogService::search`] then ranks
+    /// with the built-in [`ScoringConfig`] and no current-repository boost.
+    /// [`SessionSearch::catalog`] supplies the application's configuration instead.
     pub const fn new(db: &'db Db) -> Self {
-        Self { db }
+        Self { db, config: None }
+    }
+
+    const fn with_config(db: &'db Db, config: &'db Config) -> Self {
+        Self {
+            db,
+            config: Some(config),
+        }
+    }
+
+    /// Rank sessions for `query` with the configured scoring, as `aise search` does.
+    ///
+    /// Uses `[search.scoring]` and, when `search.prefer_current_repo` is true, boosts sessions
+    /// in the repository containing the process's current directory. Use
+    /// [`CatalogService::search_sessions`] to pass both explicitly.
+    ///
+    /// ```no_run
+    /// # let app = ai_session_search::SessionSearch::load()?;
+    /// use ai_session_search::SearchFilters;
+    /// let hits = app
+    ///     .catalog()
+    ///     .search("flaky login test", &SearchFilters::default().with_limit(10))?;
+    /// # Ok::<(), ai_session_search::anyhow::Error>(())
+    /// ```
+    pub fn search(&self, query: &str, filters: &SearchFilters) -> Result<Vec<SearchHit>> {
+        match self.config {
+            Some(config) => self.search_sessions(
+                query,
+                filters,
+                crate::util::current_repo(config).as_deref(),
+                &config.search.scoring,
+            ),
+            None => self.search_sessions(query, filters, None, &ScoringConfig::default()),
+        }
     }
 
     /// List filtered sessions in database order.
@@ -2533,7 +2570,11 @@ impl<'db> CatalogService<'db> {
         self.db.list_recent_page(filters, offset)
     }
 
-    /// Search all structurally eligible session fields with configured relevance scoring.
+    /// Search all structurally eligible session fields with the given relevance scoring.
+    ///
+    /// `current_repo` boosts sessions in that repository root; `None` applies no boost.
+    /// `scoring` is usually `&app.config().search.scoring`; [`CatalogService::search`] fills both
+    /// from the configuration.
     ///
     /// # Complexity
     ///
