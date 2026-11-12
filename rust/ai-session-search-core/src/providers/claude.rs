@@ -610,7 +610,6 @@ impl ClaudeAdapter {
         // What earlier parsers made of the records this one declines; see `RetractedRows`.
         let mut retracted_messages = Vec::new();
         let mut retracted_file_edits = Vec::new();
-        let mut retracted_file_mutations = PendingFileMutations::default();
         let mut retracted_transcript_lines = Vec::new();
         // Assistant rows earlier parsers stored with `tool_use` input as text; see
         // `conversation_text`. Held apart because `retracted_messages` is borrowed per record.
@@ -819,14 +818,10 @@ impl ClaudeAdapter {
 
             // A declined record runs through the same rendering into separate sinks, so what an
             // earlier parser stored from it can be recognised and removed; see `RetractedRows`.
-            let (out, edits, pending) = if retract {
-                (
-                    &mut retracted_messages,
-                    &mut retracted_file_edits,
-                    &mut retracted_file_mutations,
-                )
+            let (out, edits) = if retract {
+                (&mut retracted_messages, &mut retracted_file_edits)
             } else {
-                (&mut messages, &mut file_edits, &mut pending_file_mutations)
+                (&mut messages, &mut file_edits)
             };
             let mut role = record_type.map(str::to_string);
             let mut text = String::new();
@@ -884,8 +879,14 @@ impl ClaudeAdapter {
                 }
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
-                stage_file_edits(message, timestamp, pending);
-                collect_file_edit_results(message, pending, edits);
+                if retract {
+                    // Earlier parsers emitted edits at the call, even without a result copy.
+                    let mut seq = edits.len() as i64;
+                    collect_file_edits(message, timestamp, &mut seq, edits);
+                } else {
+                    stage_file_edits(message, timestamp, &mut pending_file_mutations);
+                    collect_file_edit_results(message, &mut pending_file_mutations, edits);
+                }
                 collect_tool_use_names(message, &mut tool_use_names);
                 append_tool_use_messages(message, timestamp, out);
                 // One scan for the first tool_result block: `tool_result` is true when a block
@@ -4934,6 +4935,13 @@ mod tests {
                 "name":"Write","input":{"file_path":"/tmp/example.txt","content":"written body"}}]}});
         let result = json!({"type":"user","uuid":"r1","sessionId":"upgrade",
             "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"written"}]}});
+        let mut second_call = call.clone();
+        second_call["uuid"] = json!("a2");
+        second_call["message"]["content"][0]["id"] = json!("t2");
+        second_call["message"]["content"][0]["input"]["content"] = json!("second body");
+        let mut second_result = result.clone();
+        second_result["uuid"] = json!("r2");
+        second_result["message"]["content"][0]["tool_use_id"] = json!("t2");
         let blob = |record: &Value| json!({"type":"api-request-blob","sessionId":"upgrade","message":record["message"]});
         let notice = "<task-notification>complete</task-notification>";
         let mut records = vec![
@@ -4941,8 +4949,11 @@ mod tests {
             user,
             call.clone(),
             result.clone(),
+            call.clone(),
             blob(&call),
             blob(&result),
+            second_call,
+            second_result,
             json!({"type":"queue-operation","operation":"enqueue","sessionId":"upgrade","content":notice}),
             json!({"type":"attachment","uuid":"q1","sessionId":"upgrade",
                 "attachment":{"type":"queued_command","commandMode":"task-notification","prompt":notice}}),
@@ -5020,7 +5031,9 @@ mod tests {
                 .unwrap();
             for query in [
                 "select json_array(role,kind,content,ts,tool_name,tool_call_id,authorship,input_origin) from messages order by 1",
-                "select json_array(tool,file_path,new_content,edits_json) from file_edits order by 1",
+                "select json_array(ts,tool,file_path,new_content,edits_json) from file_edits order by 1",
+                "select json_array(role,kind,content,ts,tool_name,tool_call_id,authorship,input_origin) from messages order by session_id,seq,id",
+                "select json_array(ts,tool,file_path,new_content,edits_json) from file_edits order by session_id,seq,id",
                 "select transcript_text from transcripts order by session_id",
             ] {
                 assert_eq!(snapshot(&old_path, query), snapshot(&fresh_path, query), "{query}");

@@ -235,8 +235,9 @@ Destructive cleanup requires an exact target and explicit authorization.
 The index is a session-history archive. A source shrink or rewrite under the same parser retains
 stored messages and file edits absent from the new parse. A parser transition repairs each stored
 row it matches (native correlation identity first, role and content for legacy rows), retains
-archive-only rows, and appends parse-only rows after the highest stored sequence. Matches are
-counted, so repeated text cannot stand in for a missing occurrence.
+archive-only rows, and appends parse-only rows after the highest stored sequence when archive-only
+rows remain. With no archive-only rows, messages and file edits follow the current parser’s source
+order. Matches are counted, so repeated text cannot stand in for a missing occurrence.
 
 Index compatibility uses three independent controls. Generation 6 fences executables that predate
 archive preservation; the healthy generation 5 to 6 promotion inserts only compatibility metadata

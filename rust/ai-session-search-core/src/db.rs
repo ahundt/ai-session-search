@@ -7094,7 +7094,8 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 ///   without deleting archive history.
 ///
 /// Key work is O(stored + parsed rows and bytes), with O(rows) memory for 32-byte keys.
-/// Attachment identity checks additionally retain O(stored attachment bytes) for exact comparison.
+/// When every stored row is matched or retracted, restore parser order; archive-only rows keep
+/// their stored coordinates. Attachment identity checks retain O(stored attachment bytes).
 /// Mixed-row equality additionally performs the indexed checks in [`message_parts_match`].
 fn store_parsed_messages(
     tx: &rusqlite::Transaction<'_>,
@@ -7250,6 +7251,7 @@ fn store_parsed_messages(
         }
     }
     let mut unseen = Vec::new();
+    let mut source_sequences = Vec::new();
     for (message, keys) in parsed.messages.iter().zip(&parsed_keys) {
         let position = keys
             .correlation
@@ -7289,6 +7291,7 @@ fn store_parsed_messages(
             });
         if let Some(position) = position {
             matched[position] = true;
+            source_sequences.push((stored[position].0, stored[position].1.seq, message.seq));
             // A parser upgrade can change part attribution without changing message columns.
             if preserve_family_history
                 && same_parser
@@ -7320,15 +7323,30 @@ fn store_parsed_messages(
     for id in take_retracted_rows(&stored, &mut matched, &parsed.retracted.messages) {
         delete.execute(params![id])?;
     }
+    let has_archive = matched.iter().any(|matched| !matched);
+    let restore_source_order = !has_archive && !preserve_family_sequences;
+    if restore_source_order {
+        // With no archive-only rows, the parser owns the complete source order.
+        let mut renumber = tx.prepare("update messages set seq = ?1 where id = ?2")?;
+        for (id, stored_seq, parsed_seq) in source_sequences {
+            if stored_seq != parsed_seq {
+                renumber.execute(params![parsed_seq, id])?;
+            }
+        }
+    }
     insert_messages(
         tx,
         session,
-        unseen
-            .into_iter()
-            .enumerate()
-            .map(|(offset, message)| (next_seq + offset as i64, message)),
+        unseen.into_iter().enumerate().map(|(offset, message)| {
+            let seq = if restore_source_order {
+                message.seq
+            } else {
+                next_seq + offset as i64
+            };
+            (seq, message)
+        }),
     )?;
-    Ok(matched.iter().any(|matched| !matched))
+    Ok(has_archive)
 }
 
 /// Row ids of stored messages derived from records the parse declines (`RetractedRows`), each
@@ -7633,6 +7651,22 @@ fn store_parsed_file_edits(
         if let Some(position) = positions.get_mut(&key).and_then(|queue| queue.pop_front()) {
             retracted[position] = true;
         }
+    }
+    let mut retained = retracted.clone();
+    for position in matched.iter().flatten() {
+        retained[*position] = true;
+    }
+    if retained.iter().all(|retained| *retained) {
+        tx.execute(
+            "delete from file_edits where session_id = ?1",
+            params![session.id],
+        )?;
+        insert_file_edits(
+            tx,
+            session,
+            parsed.file_edits.iter().map(|edit| (edit.seq, edit)),
+        )?;
+        return Ok(());
     }
     let mut delete = tx.prepare("delete from file_edits where id = ?1")?;
     for (position, (id, _, _)) in stored.iter().enumerate() {
@@ -20314,6 +20348,28 @@ mod tests {
                 row(2, "assistant", "yes")
             ]
         );
+    }
+
+    #[test]
+    fn parser_upgrade_without_archive_rows_restores_source_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let old = parsed_with_messages("claude:source-order", &["first", "last"]);
+        db.upsert_session(&old, 1, 1).unwrap();
+        let mut current =
+            parsed_with_messages("claude:source-order", &["first", "new middle", "last"]);
+        current.session.parse_version = "next-parser".into();
+        for generation in [2, 3] {
+            db.upsert_session(&current, generation, generation).unwrap();
+            assert_eq!(
+                session_rows(&db, "claude:source-order"),
+                [
+                    row(0, "user", "first"),
+                    row(1, "user", "new middle"),
+                    row(2, "user", "last"),
+                ]
+            );
+        }
     }
 
     #[test]
