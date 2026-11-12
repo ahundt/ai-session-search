@@ -839,6 +839,51 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
     assert compact.reclaimed_bytes == max(0, compact.before_bytes - compact.after_bytes)
 
 
+HARNESS_RECORDS = Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/tests/fixtures/claude_harness_records.jsonl"
+
+
+def test_run_skill_and_search_read_only_what_people_typed_in_claude_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Claude Code request copies (`api-request-blob`), mid-turn wrappers, compaction summaries,
+    # Stop-hook notices and instruction attachments sit beside the real turns in this fixture. A
+    # prompt typed while the agent worked exists only in a `queued_command` attachment.
+    project = tmp_path / "projects" / "-tmp-harness-proj"
+    project.mkdir(parents=True)
+    (project / "cafe0002-cafe-cafe-cafe-000000000001.jsonl").write_bytes(HARNESS_RECORDS.read_bytes())
+    disabled = ["claude-desktop", "codex", "cursor", "antigravity", "pi", "prime-agent", "aistudio", "gemini-cli"]
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"[providers.claude]\nenabled = true\npaths = [{json.dumps(str(tmp_path / 'projects'))}]\n"
+        + "\n".join(f"[providers.{provider}]\nenabled = false" for provider in disabled),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_SESSION_SEARCH_CONFIG", str(config))
+    search = native.SessionSearch(tmp_path / "index.db", config_path=config, cache_dir=tmp_path / "cache")
+    assert search.reindex().sessions_updated == 1
+
+    run = search.run_skill(
+        native.SkillRunQuery(
+            skill=native.SkillSelector(name="corrections"),
+            input=native.MessageClassificationQuery(limit=50),
+        )
+    )
+    assert [match.content for match in run.output.report.matches] == ["you missed the second directory"]
+
+    user_rows = search.search_messages("", native.MessageSearchRequest(role="user", limit=50)).results
+    texts = [hit["presentation"]["field_view"]["text"] for hit in user_rows]
+    assert "also rename the output folder" in texts
+    assert texts.count("you forgot to check the tests") == 1
+    for needle in ("while you were working", "being continued", "Stop hook feedback", "contributing guide", "future record"):
+        assert not any(needle in text for text in texts), (needle, texts)
+
+    unrecognized = search.diagnostics().index_status.parser_health.unrecognized_record_types
+    assert [(item.provider, item.record_type, item.records, item.sessions) for item in unrecognized] == [
+        ("claude", "future-record", 1, 1)
+    ]
+
+
 def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
