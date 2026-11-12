@@ -528,7 +528,7 @@ A config file is per machine and these numbers are per client, so each MCP regis
 its own in its `env` block, which every client config format carries:
 
 ```jsonc
-"mcpServers": { "aise": {
+"mcpServers": { "ai-session-search": {
   "command": "aise", "args": ["mcp", "serve"],
   "env": { "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES": "6000" } } }
 ```
