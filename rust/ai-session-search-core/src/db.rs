@@ -13352,7 +13352,7 @@ mod tests {
         db.conn
             .execute_batch(
                 "update messages set authorship='human', record_relation='original';
-            update messages set input_origin='queued' where seq=1;
+            update messages set input_origin='queued' where seq=0;
             alter table messages drop column input_delivery_state;",
             )
             .unwrap();
@@ -13366,7 +13366,7 @@ mod tests {
         let hits = db
             .search_attributable_human_messages("needle", &MessageFilters::default(), false)
             .unwrap();
-        assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), [0]);
+        assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), [1]);
         assert_eq!(
             db.search_messages("needle", &MessageFilters::default())
                 .unwrap()
