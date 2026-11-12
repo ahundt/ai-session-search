@@ -597,7 +597,7 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     // its 5,000-byte limit without marking the removal for the model.
     // 4_721 -> 4_883: `include_unattributed_input` opts in to queued messages with no recorded
     // sender, which the run otherwise leaves out and counts. 117 bytes remain before the cliff.
-    ("run_skill_capability", 4_883, 9),
+    ("run_skill_capability", 4_723, 9),
     // Explicit range kinds include harness notices without changing the default class set.
     // Canonical detail compact/full retains the deprecated response_format spelling.
     ("get_session", 4_272, 10),

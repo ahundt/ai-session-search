@@ -4633,9 +4633,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "required": ["categories"],
                         "additionalProperties": false
                     },
-                    "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset: compact returns bounded views; full returns the complete message in field_view plus a bounded match view. Conflicts with field_view and match_view." },
+                    "detail": { "type": "string", "enum": ["compact", "full"], "description": "Preset: compact bounds both views; full keeps the whole message in field_view and bounds match_view. Conflicts with field_view and match_view." },
                     "field_view": {
-                        "description": format!("View budget for the returned message: no_char_limit returns the complete message; max_chars retains at most that many Unicode scalar characters. Omit for {{kind:max_chars,max_chars:{}}}.", config.mcp.preview_chars.max(1)),
+                        "description": format!("Message view: no_char_limit keeps all; max_chars caps Unicode scalar characters (1 or greater). Omit for {{kind:max_chars,max_chars:{}}}.", config.mcp.preview_chars.max(1)),
                         "oneOf": [
                             {
                                 "type": "object",
@@ -4655,7 +4655,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         ]
                     },
                     "match_view": {
-                        "description": "Independent match-centered view: minimal_span returns the complete regex match; max_chars adds surrounding text without changing the match coordinates.",
+                        "description": "Independent match view: minimal_span keeps the whole regex match; max_chars adds context without changing coordinates.",
                         "oneOf": [
                             {
                                 "type": "object",
@@ -4683,7 +4683,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "until": { "type": "string", "description": "Upper bound on the message's own timestamp, inclusive; omit for no bound." },
                     "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
                     "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size; omit for the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit) },
-                    "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide. Omit for false." },
+                    "all_results": { "type": "boolean", "description": "Every match; conflicts with limit. Matches contain whole user messages, so page wide ranges. Omit for false." },
                     "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." },
                     "include_unattributed_input": { "type": "boolean", "description": "Also read queued messages with no recorded sender. Omit for false: they are left out and counted." }
                 },
@@ -9473,6 +9473,19 @@ mod tests {
         assert_eq!(filters.limit, 7);
         assert_eq!(filters.until, Some(now));
         assert!(filters.since.is_some_and(|since| since < now));
+    }
+
+    #[test]
+    fn capability_schema_stays_below_description_margin() {
+        let tools = handle_tools_list(None, &Config::default());
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "run_skill_capability")
+            .unwrap();
+        let bytes = crate::mcp_schema_budget::codex_measured_bytes(&tool["inputSchema"]);
+        assert!(bytes < 4_750, "{bytes} bytes");
     }
 
     #[test]
