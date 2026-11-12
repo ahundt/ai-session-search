@@ -554,9 +554,9 @@ operator running a client that has since moved sets the new number here rather t
 a release built against it.
 
 Your own settings change the schema size, because generated descriptions interpolate resolved
-values. `search_messages` measures 4,741 bytes as Codex counts it, the figure pinned in
-`EMITTED_ARTIFACT_CEILINGS`, leaving 259 bytes under Codex's 5,000. A first configured
-`[search.purposes.<name>]` bundle spends about 100 of those, and each later one roughly twice its
+values. With the shipped defaults, `search_messages` measures 4,732 bytes as Codex counts it, the
+figure pinned in `EMITTED_ARTIFACT_CEILINGS`, leaving 268 bytes under Codex's 5,000-byte limit. A
+first configured `[search.purposes.<name>]` bundle spends about 100 of those, and each later one roughly twice its
 name's length, because the name lands both in an enum Codex keeps and in the prose listing
 configured bundles. Past that limit Codex deletes every parameter description and emits no
 marker, so the server measures its own catalogue when it builds it and writes any breach to
