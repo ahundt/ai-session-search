@@ -1998,6 +1998,51 @@ impl<'app> AnalysisService<'app> {
         Ok(rows.into_iter().skip(filters.offset).take(limit).collect())
     }
 
+    /// Report indexed terms by frequency, as `aise vocab` does.
+    ///
+    /// Counts come from the full-text index and cover every indexed message, so they cannot be
+    /// limited to some sessions. For that reason this call is refused when the application's
+    /// access scope is `allowed-roots`; use message search for scoped counts.
+    ///
+    /// # Errors
+    ///
+    /// Fails under an `allowed-roots` access scope or when the index query fails.
+    ///
+    /// # Complexity
+    ///
+    /// A prefix is answered from the term index order in `O(log T + K)` for `T` terms and `K`
+    /// returned rows; without one SQLite reads and sorts every term, `O(T log T)`. The first
+    /// trigram read on an older schema builds the trigram table once.
+    pub fn vocabulary(
+        &self,
+        query: &crate::analytics::VocabularyQuery,
+    ) -> Result<Vec<crate::analytics::TermFrequency>> {
+        if !matches!(
+            self.db.access_scope(),
+            crate::search_scope::EffectiveAccessScope::All
+        ) {
+            bail!(
+                "term frequency is unavailable under an allowed-roots access scope because the \
+                 index counts terms across every session; use message search for scoped counts"
+            );
+        }
+        self.index_vocabulary(query)
+    }
+
+    /// Index-wide term counts without the access-scope refusal, for `aise vocab`.
+    pub(crate) fn index_vocabulary(
+        &self,
+        query: &crate::analytics::VocabularyQuery,
+    ) -> Result<Vec<crate::analytics::TermFrequency>> {
+        let limit = query.limit.unwrap_or(self.config.analytics.vocab_limit);
+        Ok(self
+            .db
+            .vocabulary(query.trigram, limit, query.prefix.as_deref())?
+            .into_iter()
+            .map(|(term, docs, count)| crate::analytics::TermFrequency { term, docs, count })
+            .collect())
+    }
+
     /// Return one bounded keyset page of provider-normalized session text for outward analysis.
     ///
     /// # Complexity

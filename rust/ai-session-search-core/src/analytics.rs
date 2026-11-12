@@ -580,17 +580,47 @@ pub(crate) fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()
     emit(&rows, args.format)
 }
 
-/// One vocabulary term and its frequency (rendered by `vocab`).
-#[derive(Debug, Serialize)]
-struct VocabRow {
-    term: String,
-    /// Documents (messages) containing the term.
-    docs: i64,
-    /// Total occurrences across all messages.
-    count: i64,
+/// Which terms [`AnalysisService::vocabulary`](crate::service::AnalysisService::vocabulary)
+/// reports, as `aise vocab` selects them.
+///
+/// ```
+/// use ai_session_search::VocabularyQuery;
+/// let query = VocabularyQuery::default().with_prefix("retr").with_limit(20);
+/// assert!(!query.trigram);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VocabularyQuery {
+    /// Keep only terms starting with this text, compared case-insensitively. `None` (the default)
+    /// and `Some("")` report every term.
+    pub prefix: Option<String>,
+    /// Read the 3-character substring index instead of word tokens. Terms are then 3 characters,
+    /// spaces and punctuation included, and both counts are messages. Default `false`.
+    pub trigram: bool,
+    /// Maximum terms, most frequent first. `None` uses `[analytics].vocab_limit` (50 by
+    /// default), as `aise vocab` does; `Some(0)` returns every term.
+    pub limit: Option<usize>,
 }
 
-impl Row for VocabRow {
+chainable_setters!(VocabularyQuery {
+    with_prefix(prefix: impl Into<String>) some;
+    with_trigram(trigram: bool) value;
+    with_limit(limit: usize) some;
+});
+
+/// One indexed term and how often it occurs, in `aise vocab` row order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct TermFrequency {
+    /// The case-folded term.
+    pub term: String,
+    /// Messages containing the term.
+    pub docs: i64,
+    /// Occurrences across all messages. For the trigram index this is also a message count.
+    pub count: i64,
+}
+
+impl Row for TermFrequency {
     fn headers() -> &'static [&'static str] {
         &["term", "docs", "count"]
     }
@@ -622,13 +652,15 @@ pub(crate) struct VocabArgs {
     pub format: OutputFormat,
 }
 
-pub(crate) fn run_vocab(db: &Db, config: &AnalyticsConfig, args: &VocabArgs) -> Result<()> {
-    let limit = args.limit.unwrap_or(config.vocab_limit);
-    let rows: Vec<VocabRow> = db
-        .vocabulary(args.trigram, limit, args.prefix.as_deref())?
-        .into_iter()
-        .map(|(term, docs, count)| VocabRow { term, docs, count })
-        .collect();
+pub(crate) fn run_vocab(db: &Db, config: &Config, args: &VocabArgs) -> Result<()> {
+    let query = VocabularyQuery {
+        prefix: args.prefix.clone(),
+        trigram: args.trigram,
+        limit: args.limit,
+    };
+    // The command line keeps reading index-wide counts under every search scope, as it always
+    // has; the library call refuses under allowed-roots (see AnalysisService::vocabulary).
+    let rows = crate::service::AnalysisService::new(config, db).index_vocabulary(&query)?;
     emit(&rows, args.format)
 }
 

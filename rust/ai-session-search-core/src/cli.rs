@@ -1535,7 +1535,7 @@ fn execute(cli: Cli) -> Result<()> {
             );
         }
         Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
-        Commands::Vocab(args) => crate::analytics::run_vocab(db, &config.analytics, &args)?,
+        Commands::Vocab(args) => crate::analytics::run_vocab(db, &config, &args)?,
         Commands::Repeats(args) => crate::analytics::run_repeats(db, &config.analytics, &args)?,
         Commands::Files(cmd) => crate::files::run(db, &cmd)?,
         Commands::Compact => {

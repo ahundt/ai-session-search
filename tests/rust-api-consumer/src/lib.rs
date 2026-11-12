@@ -659,6 +659,48 @@ mod tests {
             .is_ok());
     }
 
+    /// Term frequency is a typed call; it is refused under an allowed-roots access scope because
+    /// index-wide counts cannot be limited to the allowed sessions.
+    #[test]
+    fn vocabulary_returns_typed_term_counts() {
+        use ai_session_search::{TermFrequency, VocabularyQuery};
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        let terms: Vec<TermFrequency> = app
+            .analysis()
+            .vocabulary(&VocabularyQuery::default().with_prefix("TEST").with_limit(0))
+            .unwrap();
+        let tests = terms.iter().find(|row| row.term == "tests").unwrap();
+        assert_eq!((tests.docs, tests.count), (3, 3), "{terms:?}");
+        let one = app
+            .analysis()
+            .vocabulary(&VocabularyQuery::default().with_limit(1))
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        let trigrams = app
+            .analysis()
+            .vocabulary(
+                &VocabularyQuery::default()
+                    .with_trigram(true)
+                    .with_prefix("tes"),
+            )
+            .unwrap();
+        assert!(trigrams
+            .iter()
+            .all(|row| row.term.starts_with("tes") && row.term.chars().count() == 3));
+        drop(app);
+
+        let mut restricted = fixture.config();
+        restricted.search.scope.mode = ai_session_search::config::SearchScopeMode::AllowedRoots;
+        restricted.search.scope.roots = vec![fixture.root.to_string_lossy().into_owned()];
+        let app = SessionSearch::open(restricted).unwrap();
+        let error = app
+            .analysis()
+            .vocabulary(&VocabularyQuery::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("allowed-roots"), "{error:#}");
+    }
+
     #[test]
     fn setters_set_the_named_fields_and_keep_the_other_defaults() {
         let (sessions, messages, files, inspection, classification, overrides) =
