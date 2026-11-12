@@ -5196,3 +5196,20 @@ mod tests {
         ]);
     }
 }
+
+#[cfg(test)]
+mod published_cli_compatibility {
+    use super::*;
+
+    #[test]
+    fn published_command_spellings_remain_parseable() {
+        let cases: Vec<Vec<String>> = serde_json::from_str(include_str!(
+            "../tests/fixtures/v1_0_0_cli_invocations.json"
+        ))
+        .unwrap();
+        for argv in cases {
+            let parsed = Cli::try_parse_from(&argv);
+            assert!(parsed.is_ok(), "failed to parse {argv:?}: {parsed:?}");
+        }
+    }
+}
