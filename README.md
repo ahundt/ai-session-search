@@ -63,7 +63,11 @@ every write.
 
 Stop-hook feedback, a PreToolUse block, a local-command caveat, a task notification come from the
 harness, so ordinary results leave them out. They are usually why an agent stopped mid-task;
-`--kinds harness-notice` searches them.
+`--kinds harness-notice` searches them. Claude Code also keeps a stored copy of each API request
+message (`api-request-blob` records); aise does not index those copies, so the sentence Claude Code
+wraps around a prompt typed mid-turn, and repeated turns, never count as something you wrote. The
+prompt itself is indexed once, as a queued submission. `aise doctor` names any record type a parser
+did not recognize; its records are not indexed.
 
 A subagent's work lives in its own session, so the parent transcript shows only that it ran.
 `--session-kinds subagent` lists those sessions, and `--parent-session` narrows to one run's

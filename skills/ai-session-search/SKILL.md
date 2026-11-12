@@ -109,7 +109,10 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
   rows (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications) are what
   the harness told the agent; they are indexed and left out of ordinary results, so
   `corrections`, `repeats`, and a user-role search see what people wrote. Search them with
-  `--kinds harness-notice` to learn why an agent stopped, looped, or was blocked.
+  `--kinds harness-notice` to learn why an agent stopped, looped, or was blocked. Claude Code's
+  stored request copies (`api-request-blob`) are not indexed, so its mid-turn wrapper sentence and
+  repeated turns never appear as user text; a prompt typed mid-turn is indexed once as a queued
+  submission. `aise doctor` names record types a parser did not recognize and did not index.
 - **Leading dash.** A bare positional query starting with `-` is parsed as a flag. Put every
   other flag first, then `--`, then the query (`aise search --limit 5 -- --path`); `messages
   search` also accepts `-e`. This applies to `search`, `messages search`, and `repeats`; MCP
