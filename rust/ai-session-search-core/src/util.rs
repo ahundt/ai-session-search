@@ -2029,7 +2029,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude-v11",
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v11",
-        Provider::Codex => "codex-v8",
+        Provider::Codex => "codex-v9",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v5",
         Provider::Pi => "pi-v5",

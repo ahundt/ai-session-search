@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 
 use crate::models::{
     ContentPartAuthorship, ContentPartOrigin, FileEdit, MessageAuthorship, MessageContentPart,
-    MessageCorrelationAuthority, MessageInputOrigin, ParsedSession, Provider, SessionRecord,
-    SourceFile,
+    MessageCorrelationAuthority, MessageInputOrigin, MessageRecordRelation, ParsedSession,
+    Provider, SessionRecord, SourceFile,
 };
 use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
@@ -219,6 +219,9 @@ impl CodexAdapter {
         let mut first_user = None;
         let mut last_user = None;
         let mut latest_goal: Option<Value> = None;
+        // A fork replays its parent's history between its second `session_meta` and its first
+        // `thread_settings_applied` event; see `ForkReplay`.
+        let mut fork_replay = ForkReplay::default();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -246,7 +249,19 @@ impl CodexAdapter {
                         // this file's content to the parent's session, and the
                         // `on conflict(id) do update` upsert in db.rs would then overwrite
                         // the parent's row wholesale instead of storing this one.
+                        if session_id_bound && fork_replay.forked {
+                            fork_replay.start(
+                                messages.len(),
+                                transcript_lines.len(),
+                                &first_user,
+                                &last_user,
+                            );
+                        }
                         if !session_id_bound {
+                            fork_replay.forked = payload
+                                .get("forked_from_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty());
                             let (parent, label) = codex_spawn_origin(payload);
                             session_is_agent |= parent.is_some() || label.is_some();
                             header_spawn_origin = (parent, label);
@@ -541,6 +556,14 @@ impl CodexAdapter {
                         .get("type")
                         .or_else(|| payload.get("event_type"))
                         .and_then(Value::as_str);
+                    if event_type == Some("thread_settings_applied") {
+                        fork_replay.end(
+                            messages.len(),
+                            transcript_lines.len(),
+                            &mut first_user,
+                            &mut last_user,
+                        );
+                    }
                     if event_type == Some("thread_goal_updated") {
                         latest_goal = payload
                             .get("goal")
@@ -562,6 +585,7 @@ impl CodexAdapter {
             }
         }
 
+        let messages = fork_replay.mark(messages, &mut transcript_lines);
         let root_metadata = self.metadata_for_path(path);
         let meta = root_metadata
             .and_then(|metadata| metadata.threads.get(&provider_session_id))
@@ -1406,6 +1430,83 @@ fn codex_apply_patch_succeeded(output: Option<&Value>) -> bool {
 /// Read Codex's spawn record out of session metadata as (parent session id, agent label).
 /// `source` is an object in native rollout records and an encoded JSON string in state_5.sqlite;
 /// both carry `{"subagent":{"thread_spawn":...}}` (or a label-only `other` record).
+/// The parent history a forked rollout replays before its own records.
+///
+/// Codex writes a fork's file as its own `session_meta`, the parent's `session_meta`, a copy of
+/// the parent's records, then the fork's first `event_msg` of type `thread_settings_applied`
+/// and what happened in the fork. The copied rows are kept, so nothing is lost when the parent
+/// file is gone, but marked as mirrors of the parent: they are not the fork's input, analytics
+/// do not count them, and they stay out of its session text, title and preview. Only a file
+/// whose own `session_meta` names `forked_from_id` is read this way, and a replay that never
+/// reaches that event is left as it is.
+#[derive(Default)]
+struct ForkReplay {
+    /// The file's own `session_meta` names the session it was forked from.
+    forked: bool,
+    /// `messages.len()`, `transcript_lines.len()`, and whether a first user prompt was known,
+    /// with the last one, when the parent's `session_meta` was read.
+    open: Option<(usize, usize, bool, Option<String>)>,
+    /// Replayed `messages` and `transcript_lines` ranges once the fork's own records begin.
+    closed: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+}
+
+impl ForkReplay {
+    fn start(
+        &mut self,
+        messages: usize,
+        transcript: usize,
+        first_user: &Option<String>,
+        last_user: &Option<String>,
+    ) {
+        if self.open.is_none() && self.closed.is_none() {
+            self.open = Some((
+                messages,
+                transcript,
+                first_user.is_some(),
+                last_user.clone(),
+            ));
+        }
+    }
+
+    fn end(
+        &mut self,
+        messages: usize,
+        transcript: usize,
+        first_user: &mut Option<String>,
+        last_user: &mut Option<String>,
+    ) {
+        if let Some((message_start, transcript_start, had_first, last)) = self.open.take() {
+            if !had_first {
+                *first_user = None;
+            }
+            *last_user = last;
+            self.closed = Some((message_start..messages, transcript_start..transcript));
+        }
+    }
+
+    fn mark(
+        &self,
+        messages: Vec<RawMessage>,
+        transcript_lines: &mut Vec<String>,
+    ) -> Vec<RawMessage> {
+        let Some((replayed, transcript)) = &self.closed else {
+            return messages;
+        };
+        transcript_lines.drain(transcript.clone());
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| {
+                if replayed.contains(&index) {
+                    message.with_record_relation(MessageRecordRelation::Mirror)
+                } else {
+                    message
+                }
+            })
+            .collect()
+    }
+}
+
 fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) {
     let Some(source) = raw_metadata.get("source") else {
         return (None, None);
@@ -1913,6 +2014,59 @@ mod tests {
         );
         // The first meta also supplies cwd, so the parent's later meta must not win there either.
         assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/fork"));
+    }
+
+    /// A forked rollout replays the parent's history between its second `session_meta` and the
+    /// fork's first `thread_settings_applied` event, then records what happened in the fork
+    /// (on this machine 233 of 233 forks; every user message in that window is in the parent's
+    /// file). The replayed rows are kept, so nothing is lost when the parent file is gone, but
+    /// as known mirrors: not the fork's input, not its session text, title or preview.
+    #[test]
+    fn forked_session_keeps_replayed_parent_history_only_as_mirror_rows() {
+        use crate::models::MessageRecordRelation;
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let own = "019f5ce8-afff-76a3-86f2-174307f3fa08";
+        let parent = "019f4a0e-d714-7cc3-8003-543a04a1a822";
+        let file = root.join(format!("rollout-2026-07-13T15-16-21-{own}.jsonl"));
+        let lines = [
+            json!({"timestamp":"2026-07-13T19:16:21.425Z","type":"session_meta","payload":{"id":own,"forked_from_id":parent,"timestamp":"2026-07-13T19:16:21.181Z","cwd":"/tmp/fork","source":{"subagent":{"thread_spawn":{"parent_thread_id":parent,"agent_nickname":"worker"}}}}}),
+            json!({"timestamp":"2026-07-13T19:16:21.425Z","type":"session_meta","payload":{"id":parent,"timestamp":"2026-07-10T03:25:14.410Z","cwd":"/tmp/parent"}}),
+            json!({"timestamp":"2026-07-13T19:16:21.426Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"parent prompt"}]}}),
+            json!({"timestamp":"2026-07-13T19:16:21.426Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"parent answer"}]}}),
+            json!({"timestamp":"2026-07-13T19:16:21.427Z","type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+            json!({"timestamp":"2026-07-13T19:16:24.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fork task"}]}}),
+        ]
+        .map(|line| line.to_string())
+        .join("\n");
+        fs::write(&file, lines).unwrap();
+
+        let adapter = CodexAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let rows: Vec<_> = parsed
+            .messages
+            .iter()
+            .map(|m| (m.content.as_str(), m.provenance.record_relation))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("parent prompt", MessageRecordRelation::Mirror),
+                ("parent answer", MessageRecordRelation::Mirror),
+                ("fork task", MessageRecordRelation::Original),
+            ]
+        );
+        assert!(
+            !parsed.transcript_text.contains("parent"),
+            "{}",
+            parsed.transcript_text
+        );
+        assert!(parsed.transcript_text.contains("fork task"));
+        assert_eq!(parsed.session.preview_text, "fork task");
+        assert_eq!(
+            parsed.session.parent_session_id.as_deref(),
+            Some(format!("codex:{parent}").as_str())
+        );
     }
 
     #[test]
