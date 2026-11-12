@@ -335,6 +335,11 @@ aise config paths     # resolved paths and per-source roots
 | `AI_SESSION_SEARCH_DATABASE` | SQLite index file |
 | `AI_SESSION_SEARCH_CACHE_DIR` | Disposable cache directory |
 | `AI_SESSION_SEARCH_THREADS` | Positive worker-thread count |
+| `AI_SESSION_SEARCH_INDEX_REFRESH` | Index refresh policy for read commands: `auto`, `before-query`, or `existing-only` |
+| `AI_SESSION_SEARCH_HARNESS_HOME` | Home directory under which `aise integrations` finds harness files |
+| `AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION` | Set to `1` to skip the release notification and its network check |
+| `AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS` | Largest MCP tool result, in characters (MCP only) |
+| `AI_SESSION_SEARCH_CLIENT_LIMIT_<ROW>` | Per-client MCP schema budget for one `aise mcp schema-budget` row |
 
 Precedence runs from CLI argument, to environment variable, to TOML, to the platform default.
 

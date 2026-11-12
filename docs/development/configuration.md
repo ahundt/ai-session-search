@@ -68,10 +68,16 @@ unknown server fields and the user's `env` block, including in the Codex plugin 
 If an existing state argument or environment value conflicts with the intended selection,
 preflight refuses before writing and names the file, key, both values, and how to resolve it.
 
-Five root CLI options feed the resolver: `--config`, `--database`, `--cache-dir`, `--threads`,
-and `--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
-`AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and
-`AI_SESSION_SEARCH_INDEX_REFRESH`.
+`aise` has seven root CLI options. Five of them select configuration values: `--config`,
+`--database`, `--cache-dir`, `--threads`, and `--index-refresh`. Their canonical environment
+equivalents are `AI_SESSION_SEARCH_CONFIG`, `AI_SESSION_SEARCH_DATABASE`,
+`AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and `AI_SESSION_SEARCH_INDEX_REFRESH`.
+The other two are `--harness-home` (`AI_SESSION_SEARCH_HARNESS_HOME`, described above) and
+`--skip-release-notification` (`AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION`, see
+[stable-release notifications](#stable-release-notifications)). Two settings have an environment
+variable and no CLI option, because an MCP registration sets them in its `env` block:
+`AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS` (`[mcp].max_tool_result_chars`) and
+`AI_SESSION_SEARCH_CLIENT_LIMIT_<ROW>` (see [client limit budgets](#client-limit-budgets)).
 
 `aise config init` records the selected database and cache as absolute paths, including CLI and
 environment overrides, even when the destination config does not exist yet. Other settings stay
