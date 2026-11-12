@@ -54,7 +54,7 @@ const GLOBAL_OPTIONS_HEADING: &str =
 const ROOT_COMMAND_GROUPS: &str = "\
 Start here (everyday):   search, messages, show, list, resume, files
 Export and maintenance:  export, reindex, doctor, integrations, package, config, dates
-Analytics:               stats, repeats, vocab, planning, analyze, skills
+Analytics:               stats, repeats, planning, analyze, skills
 Expert:                  db, migrate, compact, mcp, tui
 
 Typical path: `aise search \"<topic>\" --when 30d` or `aise list --path <dir> --when 7d` to find a
@@ -173,7 +173,7 @@ enum Commands {
     /// This counts the index itself, so unlike `aise stats` it counts every indexed message,
     /// harness notices included: hook and tool wording ranks here beside what people and models
     /// wrote. It reports how often, never which messages — `aise messages search` returns those.
-    #[command(display_order = 32)]
+    #[command(display_order = 32, hide = true)]
     Vocab(crate::analytics::VocabArgs),
     /// Find recurring phrases in what people wrote.
     ///
@@ -3081,6 +3081,26 @@ mod tests {
             rendered.contains("Start here (everyday):"),
             "the group legend is printed after the options"
         );
+    }
+
+    /// `aise vocab` is kept, with its own help and behavior, but left out of the root command list
+    /// and its group legend.
+    #[test]
+    fn vocab_is_hidden_from_the_root_help_and_keeps_its_own_help() {
+        let root_help = parse_cli_from(["aise", "--help"]).unwrap_err().to_string();
+        assert!(
+            !root_help
+                .split_whitespace()
+                .any(|word| word.trim_end_matches(',') == "vocab"),
+            "{root_help}"
+        );
+        let vocab_help = parse_cli_from(["aise", "vocab", "--help"]).unwrap_err();
+        assert_eq!(vocab_help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            vocab_help.to_string().contains("Usage: aise vocab"),
+            "{vocab_help}"
+        );
+        assert_parses(["aise", "vocab", "--prefix", "cargo"]);
     }
 
     /// `aise messages search` has thirty-nine options; every one is filed under a section so the
