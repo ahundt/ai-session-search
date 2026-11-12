@@ -2750,6 +2750,12 @@ def test_python_interfaces_read_every_row_of_a_shared_seq_in_one_order(tmp_path:
         ranged = search.read_session_messages(session, seq_from=seq, seq_to=seq)
         assert [(hit.seq, hit.role) for hit in ranged] == want, read["name"]
         assert _parity_entry_point_read(database, spec, ["--seq", str(seq)], tmp_path) == want, read["name"]
+    for read in spec["context_reads"]:
+        want = _parity_expected(spec, read["expected"])
+        rows = search.message_context(session, read["seq"], context_before=read["before"], context_after=read["after"])
+        assert [(hit.seq, hit.role) for hit in rows] == want, read["name"]
+        selector = ["--seq", str(read["seq"]), "--context-before", str(read["before"]), "--context-after", str(read["after"])]
+        assert _parity_entry_point_read(database, spec, selector, tmp_path) == want, read["name"]
     for read in spec["newest_reads"]:
         want = _parity_expected(spec, read["expected"])
         newest = search.read_session_messages(session, order="newest", limit=read["limit"])

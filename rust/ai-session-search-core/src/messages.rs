@@ -849,6 +849,14 @@ pub struct MessageGetArgs {
     /// selected seq; 0 (the default) shows only the selected message.
     #[arg(long, default_value_t = 0, value_parser = parse_context_count)]
     pub context: i64,
+    /// With --seq, override the number of messages before the anchor (0 or greater).
+    /// Omit to use --context.
+    #[arg(long, requires = "seq", value_parser = parse_context_count)]
+    pub context_before: Option<i64>,
+    /// With --seq, override the number of messages after the anchor (0 or greater).
+    /// Omit to use --context.
+    #[arg(long, requires = "seq", value_parser = parse_context_count)]
+    pub context_after: Option<i64>,
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
@@ -1016,7 +1024,12 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                 let context = args.context;
                 let matched_rows: HashSet<(String, i64)> =
                     HashSet::from([(session.id.clone(), seq)]);
-                let rows = db.message_context(&session.id, seq, context, context)?;
+                let rows = db.message_context(
+                    &session.id,
+                    seq,
+                    args.context_before.unwrap_or(context),
+                    args.context_after.unwrap_or(context),
+                )?;
                 if args.refs {
                     let rows = rows
                         .into_iter()
@@ -2366,6 +2379,21 @@ mod tests {
             "2",
             "--seq-to",
             "5",
+        ]);
+    }
+
+    #[test]
+    fn focused_read_accepts_asymmetric_context() {
+        assert_parses([
+            "sg",
+            "get",
+            "claude:s1",
+            "--seq",
+            "2",
+            "--context-before",
+            "0",
+            "--context-after",
+            "3",
         ]);
     }
 

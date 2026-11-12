@@ -823,3 +823,44 @@ fn reading_a_shared_seq_returns_every_row_in_one_order_on_every_interface() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn asymmetric_context_reads_agree_across_surfaces() {
+    let f = fixture();
+    let db = Db::open(&f.db_path).unwrap();
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    let session = f.spec["session_id"].as_str().unwrap();
+    for read in f.spec["context_reads"].as_array().unwrap() {
+        let seq = read["seq"].as_i64().unwrap();
+        let before = read["before"].as_i64().unwrap();
+        let after = read["after"].as_i64().unwrap();
+        let want = expected(&f.spec, &read["expected"]);
+        assert_eq!(
+            hit_ids(service.context(session, seq, before, after).unwrap()),
+            want
+        );
+        assert_eq!(
+            cli_read(
+                &f,
+                &[
+                    "--seq".into(),
+                    seq.to_string(),
+                    "--context-before".into(),
+                    before.to_string(),
+                    "--context-after".into(),
+                    after.to_string()
+                ]
+            ),
+            want
+        );
+        let results = mcp_calls(
+            &f,
+            &[(
+                "get_session",
+                json!({"session_id":session,"message_seq":seq,"context_before":before,"context_after":after}),
+            )],
+        );
+        assert_eq!(read_rows(results[0].as_ref().unwrap()), want);
+    }
+}

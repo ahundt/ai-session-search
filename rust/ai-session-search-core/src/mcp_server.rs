@@ -4746,7 +4746,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true." },
                             "transcript_lines": {
                                 "type": "integer",
-                                "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Bound this when skimming many sessions: a negative tail shows how a session ended, a positive head shows how it started, and 0 is for complete capture only. To pinpoint one turn, use search_messages and pass its message_seq here instead of reading a large window. Mutually exclusive with summary and message_seq. Default when no output selector is provided: {}.", config.mcp.get_session_transcript_lines)
+                                "description": format!("Transcript lines: positive=head/start, negative=tail/end, 0=all (may be large). Prefer message_seq from search_messages for one turn. Conflicts with summary, message_seq and ranges. Omit for {} when no selector is given.", config.mcp.get_session_transcript_lines)
                             },
                             "message_seq": {
                                 "type": "integer", "minimum": 0,
@@ -4754,13 +4754,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "seq_from": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Lower inclusive message-sequence bound for an absolute range read of this session's messages. seq numbers are session-local, which this per-session tool already scopes. Pair with seq_to to read one session in non-overlapping chunks (e.g. 0..499, then 500..999) instead of re-reading a larger transcript_lines head/tail. Mutually exclusive with summary, transcript_lines, and message_seq."
+                                "description": "Lower inclusive session-local sequence bound. Pair with seq_to for chunks (0..499, then 500..999); advance last seq + 1 to avoid re-reading. Conflicts with summary, transcript_lines and message_seq. Omit to start at the first message."
                             },
                             "seq_to": {
                                 "type": "integer", "minimum": 0,
                                 "description": "Upper inclusive message-sequence bound for an absolute range read. See seq_from for non-overlapping chunked reads. Must be >= seq_from when both are given."
                             },
                             "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Message classes for seq_from/seq_to ranges. Omit for every class except harness_notice. Include harness_notice in an explicit class list to read notices too; focused message_seq context already includes every class." },
+                            "context_before": { "type": "integer", "minimum": 0, "description": "Messages before message_seq; omit for context. 0 selects none." },
+                            "context_after": { "type": "integer", "minimum": 0, "description": "Messages after message_seq; omit for context. 0 selects none." },
                             "context": {
                                 "type": "integer", "minimum": 0,
                                 "description": "When message_seq is provided, include this many turns before and after that message (default 0)."
@@ -5117,6 +5119,15 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
     let has_range = seq_from.is_some() || seq_to.is_some();
 
+    if message_seq.is_none() {
+        for name in ["context_before", "context_after"] {
+            reject_present(
+                args,
+                name,
+                "asymmetric context only applies with message_seq",
+            )?;
+        }
+    }
     if !has_range {
         reject_present(
             args,
@@ -5180,7 +5191,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .map_err(|e| format!("{e:#}"))?;
         let context = mcp_nonnegative_i64_arg(args, "context", 0)?;
         let presentation = MessagePresentation::from_args(args, config)?;
-        return message_window_value(&session, seq, context, &presentation, db)
+        let before = mcp_nonnegative_i64_arg(args, "context_before", context)?;
+        let after = mcp_nonnegative_i64_arg(args, "context_after", context)?;
+        return message_window_value(&session, seq, (before, after), &presentation, db)
             .and_then(ToolResponse::structured);
     }
 
@@ -6785,12 +6798,11 @@ impl MessagePresentation {
 fn message_window_value(
     session: &SessionRecord,
     seq: i64,
-    context: i64,
+    context: (i64, i64),
     presentation: &MessagePresentation,
     db: &Db,
 ) -> Result<Value, String> {
-    let before = context;
-    let after = context;
+    let (before, after) = context;
     let rows = db
         .message_context(&session.id, seq, before, after)
         .map_err(|e| format!("{e:#}"))?;
@@ -9453,6 +9465,34 @@ mod tests {
         assert_eq!(filters.limit, 7);
         assert_eq!(filters.until, Some(now));
         assert!(filters.since.is_some_and(|since| since < now));
+    }
+
+    #[test]
+    fn focused_read_accepts_asymmetric_context() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let out = parse(
+            &tool_get_session(
+                &json!({"session_id":"test1", "message_seq":1, "context":1,
+                    "context_before":0, "context_after":1}),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        let seqs: Vec<_> = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+        for args in [
+            json!({"session_id":"test1", "context_before":0}),
+            json!({"session_id":"test1", "message_seq":1, "context_after":-1}),
+        ] {
+            assert!(tool_get_session(&args, &config, &db).is_err());
+        }
     }
 
     #[test]
