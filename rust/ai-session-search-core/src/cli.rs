@@ -709,13 +709,16 @@ struct ShowArgs {
     /// Omit to use `[cli].show_transcript_lines` from config.
     #[arg(long, allow_hyphen_values = true)]
     transcript_lines: Option<i64>,
-    /// Print a compact session summary: purpose, tool activity, refs, changed files, and follow-ups.
+    /// Deprecated: use aise messages evidence ID.
+    /// Print compact purpose, tool activity, refs, changed files, and follow-ups.
     #[arg(long, conflicts_with_all = ["transcript_lines", "raw"])]
     summary: bool,
+    /// Deprecated: use aise messages evidence ID --summary-items N.
     /// With --summary, select aggregate evidence records: positive=first, negative=last, 0=all.
     /// Omit to use [cli].summary_items from config.
     #[arg(long, allow_hyphen_values = true, requires = "summary")]
     summary_items: Option<i64>,
+    /// Deprecated: use aise messages evidence ID --preview-chars N.
     /// With --summary, cap each evidence preview to this many characters (1 or greater).
     /// Omit to use [cli].evidence_preview_chars from config.
     #[arg(long, requires = "summary", value_parser = parse_positive_usize)]
@@ -1398,6 +1401,7 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Show(args) => {
             if args.summary {
+                eprintln!("aise: show --summary/--summary-items/--preview-chars are deprecated; use aise messages evidence ID with --summary-items/--preview-chars");
                 let options = InspectionOptions {
                     preview_chars: args
                         .preview_chars

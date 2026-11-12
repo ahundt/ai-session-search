@@ -3335,3 +3335,21 @@ fn cli_cross_ref_pattern_notice_names_positional_argument() {
         "{stderr}"
     );
 }
+
+#[test]
+fn cli_show_summary_notice_names_messages_evidence() {
+    let output = deprecated_cli_output(&[
+        "show",
+        "missing",
+        "--summary",
+        "--summary-items",
+        "2",
+        "--preview-chars",
+        "20",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("aise messages evidence"),
+        "{stderr}"
+    );
+}
