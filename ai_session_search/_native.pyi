@@ -1044,6 +1044,7 @@ class SessionQuery:
     current_repo: str | None
     dates: DateRange
     limit: int | None
+    offset: int
 
     def __new__(
         cls,
@@ -1056,6 +1057,8 @@ class SessionQuery:
         current_repo: str | None = None,
         dates: DateRange | None = None,
         limit: int | None = None,
+        offset: int = 0,
+        scope: QueryScope | None = None,
     ) -> Self: ...
 
 @final
@@ -1164,6 +1167,7 @@ class MessageSearchRequest:
     def __repr__(self) -> str: ...
     def __eq__(self, other: object, /) -> bool: ...
 
+    query_mode: _MessageQueryMode | None
     scope: MessageScope
     role: _MessageRole | None
     kind: _MessageKind | None
@@ -1193,7 +1197,7 @@ class MessageSearchRequest:
     def __new__(
         cls,
         *,
-        scope: MessageScope | None = None,
+        scope: MessageScope | QueryScope | None = None,
         role: _MessageRole | None = None,
         kind: _MessageKind | None = None,
         kinds: list[_MessageKind] | None = None,
@@ -1218,6 +1222,11 @@ class MessageSearchRequest:
         purpose: str | None = None,
         purpose_version: int | None = None,
         receipt_level: _ReceiptLevel | None = None,
+        query_mode: _MessageQueryMode | None = None,
+        provider: _ProviderId | None = None,
+        session_id: str | None = None,
+        path_prefix: str | None = None,
+        dates: DateRange | None = None,
     ) -> Self: ...
 
 @final
@@ -1349,6 +1358,11 @@ class FileQuery:
         max_edits: int | None = None,
         limit: int = 50,
         offset: int = 0,
+        provider: _ProviderId | None = None,
+        session_id: str | None = None,
+        path_prefix: str | None = None,
+        exclusions: QueryExclusions | None = None,
+        dates: DateRange | None = None,
     ) -> Self: ...
 
 @final
@@ -1785,7 +1799,7 @@ class SessionSearch:
         query: str = "",
         request: MessageSearchRequest | None = None,
         *,
-        query_mode: _MessageQueryMode = "literal",
+        query_mode: _MessageQueryMode | None = None,
     ) -> MessageSearchResponse:
         """Search through the shared planner and return results, context, paging, and receipts.
 
@@ -1802,7 +1816,7 @@ class SessionSearch:
         query: str = "",
         request: MessageSearchRequest | None = None,
         *,
-        query_mode: _MessageQueryMode = "literal",
+        query_mode: _MessageQueryMode | None = None,
         batch_rows: int = 256,
     ) -> MessageSearchBatches:
         """Open advanced exhaustive batches.

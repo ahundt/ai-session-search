@@ -2463,14 +2463,14 @@ struct SessionQuery {
     dates: DateRange,
     #[pyo3(get)]
     limit: Option<usize>,
+    #[pyo3(get)]
+    offset: usize,
 }
 
-python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","current_repo","dates","limit"]);
+python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","current_repo","dates","limit","offset"]);
     #[new]
-    // Independent session filters stay flat and keyword-only, matching MessageSearchRequest;
-    // grouping them would restore the one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, dates=None, limit=None))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, dates=None, limit=None, offset=0, scope=None))]
     fn new(
         provider: Option<String>,
         path_prefix: Option<String>,
@@ -2480,16 +2480,23 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
         current_repo: Option<String>,
         dates: Option<DateRange>,
         limit: Option<i64>,
+        offset: i64,
+        scope: Option<QueryScope>,
     ) -> PyResult<Self> {
+        let scope = query_scope_input(scope, provider, None, path_prefix, exclusions, dates)?;
+        if scope.session_id.is_some() {
+            return Err(invalid_argument_error("SessionQuery.scope.session_id is not a listing filter; use read_session_messages for one session"));
+        }
         Ok(Self {
-            provider: parse_provider(provider)?,
-            path_prefix,
-            exclusions: exclusions.unwrap_or_default(),
+            provider: scope.provider,
+            path_prefix: scope.path_prefix,
+            exclusions: scope.exclusions,
             session_kinds: parse_session_kinds(session_kinds)?,
             parent_session_id,
             current_repo,
-            dates: dates.unwrap_or_default(),
+            dates: scope.dates,
             limit: limit.map(|value| paging_argument(PagingArgument::Limit, value)).transpose()?,
+            offset: paging_argument(PagingArgument::Offset, offset)?,
         })
     }
 
@@ -2536,6 +2543,7 @@ impl Default for SessionQuery {
             current_repo: None,
             dates: DateRange::default(),
             limit: None,
+            offset: 0,
         }
     }
 }
@@ -2673,6 +2681,7 @@ impl NativeAnalysisRequest {
             current_repo: None,
             dates: self.dates,
             limit: Some(0),
+            offset: 0,
         }
         .into_filters()?;
         CoreAnalysisRequest::new(scope, selection).map_err(value_error)
@@ -2742,6 +2751,55 @@ struct ResolvedQueryScope {
     exclude_path_prefixes: Vec<String>,
     exclude_session_ids: Vec<String>,
     bounds: ai_session_search::dates::Bounds,
+}
+
+fn query_scope_input(
+    scope: Option<QueryScope>,
+    provider: Option<String>,
+    session_id: Option<String>,
+    path_prefix: Option<String>,
+    exclusions: Option<QueryExclusions>,
+    dates: Option<DateRange>,
+) -> PyResult<QueryScope> {
+    if let Some(scope) = scope {
+        if provider.is_some()
+            || session_id.is_some()
+            || path_prefix.is_some()
+            || exclusions.is_some()
+            || dates.is_some()
+        {
+            return Err(invalid_argument_error("scope cannot be combined with flat provider, session_id, path_prefix, exclusions, or dates filters"));
+        }
+        Ok(scope)
+    } else {
+        QueryScope::new(provider, session_id, path_prefix, exclusions, dates)
+    }
+}
+
+#[derive(FromPyObject)]
+enum MessageScopeInput {
+    Message(MessageScope),
+    Shared(QueryScope),
+}
+
+impl MessageScopeInput {
+    fn into_scope(self) -> MessageScope {
+        match self {
+            Self::Message(scope) => scope,
+            Self::Shared(scope) => MessageScope {
+                providers: scope.provider.map(|provider| vec![provider]),
+                session_id: scope.session_id,
+                workspace_path_prefix: scope.path_prefix,
+                transcript_path_prefix: None,
+                exclusions: MessageExclusions {
+                    workspace_path_prefixes: scope.exclusions.path_prefixes,
+                    transcript_path_prefixes: Vec::new(),
+                    session_ids: scope.exclusions.session_ids,
+                },
+                dates: scope.dates,
+            },
+        }
+    }
 }
 
 impl QueryScope {
@@ -2867,6 +2925,8 @@ python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","s
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageSearchRequest {
+    #[pyo3(get)]
+    query_mode: Option<String>,
     scope: MessageScope,
     role: Option<Role>,
     kind: Option<MessageKind>,
@@ -2904,14 +2964,14 @@ struct MessageSearchRequest {
     receipt_level: Option<CoreReceiptLevel>,
 }
 
-python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope","role","kind","kinds","field","argument_path","seq_from","seq_to","tool_name_contains","include_compaction","limit","all_results","offset","match_window","context","context_before","context_after","include","lines_per_message","detail","field_view","match_view","purpose","purpose_version","receipt_level"]);
+python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query_mode","scope","role","kind","kinds","field","argument_path","seq_from","seq_to","tool_name_contains","include_compaction","limit","all_results","offset","match_window","context","context_before","context_after","include","lines_per_message","detail","field_view","match_view","purpose","purpose_version","receipt_level"]);
     #[new]
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None, query_mode=None, provider=None, session_id=None, path_prefix=None, dates=None))]
     fn new(
-        scope: Option<MessageScope>,
+        scope: Option<MessageScopeInput>,
         role: Option<&str>,
         kind: Option<&str>,
         kinds: Option<Vec<String>>,
@@ -2936,7 +2996,22 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
         purpose: Option<String>,
         purpose_version: Option<u32>,
         receipt_level: Option<&str>,
+        query_mode: Option<String>,
+        provider: Option<String>,
+        session_id: Option<String>,
+        path_prefix: Option<String>,
+        dates: Option<DateRange>,
     ) -> PyResult<Self> {
+        if query_mode.as_deref().is_some_and(|mode| !matches!(mode, "literal" | "regex" | "fuzzy")) {
+            return Err(invalid_argument_error("query_mode must be literal, regex, or fuzzy"));
+        }
+        if scope.is_some() && (provider.is_some() || session_id.is_some() || path_prefix.is_some() || dates.is_some()) {
+            return Err(invalid_argument_error("scope cannot be combined with flat provider, session_id, path_prefix, or dates filters"));
+        }
+        let scope = match scope {
+            Some(scope) => scope.into_scope(),
+            None => MessageScopeInput::Shared(QueryScope::new(provider, session_id, path_prefix, None, dates)?).into_scope(),
+        };
         let nonnegative = |name: &'static str, value: Option<i64>| -> PyResult<Option<usize>> {
             value
                 .map(|value| {
@@ -2992,7 +3067,8 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
             })
             .transpose()?;
         Ok(Self {
-            scope: scope.unwrap_or_default(),
+            query_mode,
+            scope,
             role: role
                 .map(str::parse)
                 .transpose()
@@ -3168,6 +3244,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
 impl Default for MessageSearchRequest {
     fn default() -> Self {
         Self {
+            query_mode: None,
             scope: MessageScope::default(),
             role: None,
             kind: None,
@@ -3593,16 +3670,22 @@ struct FileQuery {
 
 python_value! { FileQuery, slf => value_fields(slf.as_any(), &["scope","min_edits","max_edits","limit","offset"]);
     #[new]
-    #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=50, offset=0))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=50, offset=0, provider=None, session_id=None, path_prefix=None, exclusions=None, dates=None))]
     fn new(
         scope: Option<QueryScope>,
         min_edits: Option<i64>,
         max_edits: Option<i64>,
         limit: i64,
         offset: i64,
+        provider: Option<String>,
+        session_id: Option<String>,
+        path_prefix: Option<String>,
+        exclusions: Option<QueryExclusions>,
+        dates: Option<DateRange>,
     ) -> PyResult<Self> {
         Ok(Self {
-            scope: scope.unwrap_or_default(),
+            scope: query_scope_input(scope, provider, session_id, path_prefix, exclusions, dates)?,
             min_edits,
             max_edits,
             limit: paging_argument(PagingArgument::Limit, limit)?,
@@ -4746,7 +4829,7 @@ impl SessionSearch {
         json_compatible(py, &window)
     }
 
-    #[pyo3(signature = (query="", request=None, *, query_mode="literal"))]
+    #[pyo3(signature = (query="", request=None, *, query_mode=None))]
     /// Search messages through the shared typed planner and return results with aligned context,
     /// paging, resolved presentation, and optional planner receipts.
     ///
@@ -4760,12 +4843,24 @@ impl SessionSearch {
         py: Python<'_>,
         query: &str,
         request: Option<MessageSearchRequest>,
-        query_mode: &str,
+        query_mode: Option<&str>,
     ) -> PyResult<NativeMessageSearchResponse> {
-        let (query, _has_content_query) = core_message_query(query.to_owned(), query_mode)?;
+        let request = request.unwrap_or_default();
+        if let (Some(call), Some(owned)) = (query_mode, request.query_mode.as_deref()) {
+            if call != owned {
+                return Err(invalid_argument_error(
+                    "query_mode conflicts with request.query_mode",
+                ));
+            }
+        }
+        let query_mode = query_mode
+            .or(request.query_mode.as_deref())
+            .unwrap_or("literal")
+            .to_string();
+        let (query, _has_content_query) = core_message_query(query.to_owned(), &query_mode)?;
         let response = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let request = request.unwrap_or_default().into_request(query)?;
+            let request = request.into_request(query)?;
             app.messages_for_surface(ai_session_search::message_search::SearchSurface::Python)
                 .search(request)
                 .map_err(python_message_search_error)
@@ -4773,7 +4868,7 @@ impl SessionSearch {
         NativeMessageSearchResponse::from_response(py, response)
     }
 
-    #[pyo3(signature = (query="", request=None, *, query_mode="literal", batch_rows=256))]
+    #[pyo3(signature = (query="", request=None, *, query_mode=None, batch_rows=256))]
     /// Open advanced, bounded-retention batches for one exhaustive message search.
     ///
     /// Prefer `search_messages` for ordinary use: it returns a response whose `results` is a normal
@@ -4788,7 +4883,7 @@ impl SessionSearch {
         py: Python<'_>,
         query: &str,
         request: Option<MessageSearchRequest>,
-        query_mode: &str,
+        query_mode: Option<&str>,
         batch_rows: i64,
     ) -> PyResult<NativeMessageSearchBatches> {
         let batch_rows = usize::try_from(batch_rows)
@@ -4799,7 +4894,19 @@ impl SessionSearch {
                     "batch_rows must be a positive integer; use 256 for the default balance or a smaller positive value to reduce active result memory; got {batch_rows}"
                 ))
             })?;
-        let (query, _has_content_query) = core_message_query(query.to_owned(), query_mode)?;
+        let request = request.unwrap_or_default();
+        if let (Some(call), Some(owned)) = (query_mode, request.query_mode.as_deref()) {
+            if call != owned {
+                return Err(invalid_argument_error(
+                    "query_mode conflicts with request.query_mode",
+                ));
+            }
+        }
+        let query_mode = query_mode
+            .or(request.query_mode.as_deref())
+            .unwrap_or("literal")
+            .to_string();
+        let (query, _has_content_query) = core_message_query(query.to_owned(), &query_mode)?;
         if query_mode == "fuzzy" {
             return Err(invalid_argument_error(
                 "fuzzy search is not available from search_message_batches; use \
@@ -4809,7 +4916,7 @@ impl SessionSearch {
         }
         let batches = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let request = request.unwrap_or_default().into_request(query)?;
+            let request = request.into_request(query)?;
             app.message_search_batches_for_surface(
                 ai_session_search::message_search::SearchSurface::Python,
                 request,
@@ -4986,9 +5093,10 @@ impl SessionSearch {
             let app = self.inner.lock().map_err(runtime_error)?;
             let mut request = request.unwrap_or_default();
             request.limit = Some(request.limit.unwrap_or(app.config().search.default_limit));
+            let offset = request.offset;
             let (filters, _) = request.into_filters()?;
             app.catalog()
-                .list_sessions(&filters)
+                .list_sessions_page(&filters, offset)
                 .map(|sessions| {
                     sessions
                         .into_iter()
@@ -5014,15 +5122,23 @@ impl SessionSearch {
             let app = self.inner.lock().map_err(runtime_error)?;
             let mut request = request.unwrap_or_default();
             request.limit = Some(request.limit.unwrap_or(app.config().search.default_limit));
+            let offset = request.offset;
             let (filters, current_repo) = request.into_filters()?;
+            if offset == 0 && current_repo.is_none() {
+                return app
+                    .catalog()
+                    .search(&query, &filters)
+                    .map_err(service_error);
+            }
             let current_repo =
                 current_repo.or_else(|| ai_session_search::util::current_repo(app.config()));
             app.catalog()
-                .search_sessions(
+                .search_sessions_page(
                     &query,
                     &filters,
                     current_repo.as_deref(),
                     &app.config().search.scoring,
+                    offset,
                 )
                 .map_err(service_error)
         })?;

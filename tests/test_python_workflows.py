@@ -208,3 +208,36 @@ def test_prepare_for_read_applies_auto_refresh(tmp_path: Path):
         search.list_sessions()
     search.prepare_for_read()
     assert search.list_sessions() == []
+
+
+def test_query_filters_accept_flat_and_scope_shapes(corpus):
+    scope = aise.QueryScope(provider="claude", path_prefix="/synthetic")
+    assert corpus.list_sessions(aise.SessionQuery(scope=scope)) == corpus.list_sessions(aise.SessionQuery(provider="claude", path_prefix="/synthetic"))
+    assert corpus.search_files("*.py", aise.FileQuery(scope=scope)) == corpus.search_files("*.py", aise.FileQuery(provider="claude", path_prefix="/synthetic"))
+    flat = corpus.search_messages("forgot", aise.MessageSearchRequest(provider="claude", path_prefix="/synthetic"))
+    grouped = corpus.search_messages("forgot", aise.MessageSearchRequest(scope=scope))
+    assert flat == grouped
+    with pytest.raises(aise.InvalidArgumentError, match="scope"):
+        aise.FileQuery(scope=scope, path_prefix="/different")
+    with pytest.raises(aise.InvalidArgumentError, match="scope"):
+        aise.SessionQuery(scope=scope, path_prefix="/different")
+
+
+def test_message_query_mode_can_travel_with_request(corpus):
+    request = aise.MessageSearchRequest(query_mode="regex")
+    assert corpus.search_messages("forgot.*retry", request) == corpus.search_messages("forgot.*retry", query_mode="regex")
+    with pytest.raises(aise.InvalidArgumentError, match="query_mode"):
+        corpus.search_messages("forgot", request, query_mode="literal")
+
+
+def test_session_pages_match_unpaged_cli_order(corpus):
+    all_listed = cli(corpus, "list", "--limit", "0", "--format", "json")
+    all_ranked = cli(corpus, "search", "retry", "--limit", "0", "--format", "json")
+    listed: list[dict[str, object]] = []
+    ranked: list[dict[str, object]] = []
+    for offset in range(3):
+        request = aise.SessionQuery(limit=1, offset=offset)
+        listed.extend(row.to_dict() for row in corpus.list_sessions(request))
+        ranked.extend(row.to_dict() for row in corpus.search_sessions("retry", request))
+    assert listed == all_listed
+    assert ranked == all_ranked

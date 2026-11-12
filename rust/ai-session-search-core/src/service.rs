@@ -2609,6 +2609,34 @@ impl<'db> CatalogService<'db> {
         self.db.search(query, filters, current_repo, scoring)
     }
 
+    /// Return a ranked offset page with the same order as `search_sessions`.
+    ///
+    /// Scoring still visits the eligible corpus. A positive limit retains `offset + limit`
+    /// candidates before discarding the prefix; memory is proportional to that window and its
+    /// text bytes. A zero limit returns every match after the offset.
+    pub fn search_sessions_page(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        current_repo: Option<&str>,
+        scoring: &ScoringConfig,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let mut window = filters.clone();
+        if window.limit > 0 {
+            window.limit = window.limit.checked_add(offset).ok_or_else(|| {
+                crate::ServiceError::invalid_argument(
+                    "session offset + limit exceeds the platform size",
+                )
+            })?;
+        }
+        Ok(self
+            .search_sessions(query, &window, current_repo, scoring)?
+            .into_iter()
+            .skip(offset)
+            .collect())
+    }
+
     /// Crate-internal session-search path with cooperative cancellation between scoring batches
     /// and before retained-set compaction/sort. Public callers keep the stable method above.
     pub(crate) fn search_sessions_cancellable(
@@ -5060,6 +5088,54 @@ mod tests {
         assert!(files.is_empty());
         assert!(status.parser_health.schema_current);
         assert_eq!(status.parser_health.indexed_sessions, 0);
+    }
+
+    #[test]
+    fn catalog_ranked_pages_preserve_the_complete_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for n in 0..3 {
+            let mut session = SessionRecord::new(
+                format!("claude:page-{n}"),
+                crate::Provider::Claude,
+                format!("page-{n}"),
+                format!("/synthetic/{n}.jsonl"),
+                "test",
+                "fixture",
+            );
+            session.title = Some("shared needle".into());
+            db.upsert_session(&crate::models::ParsedSession::new(session, vec![]), 0, 0)
+                .unwrap();
+        }
+        let catalog = CatalogService::new(&db);
+        let scoring = ScoringConfig::default();
+        let all = catalog.search("needle", &SearchFilters::default()).unwrap();
+        let ids = |hits: Vec<SearchHit>| {
+            hits.into_iter()
+                .map(|hit| hit.session.id)
+                .collect::<Vec<_>>()
+        };
+        for offset in 0..4 {
+            let page = catalog
+                .search_sessions_page(
+                    "needle",
+                    &SearchFilters::default().with_limit(1),
+                    None,
+                    &scoring,
+                    offset,
+                )
+                .unwrap();
+            assert_eq!(
+                ids(page),
+                ids(all.iter().skip(offset).take(1).cloned().collect())
+            );
+        }
+        assert_eq!(
+            ids(catalog
+                .search_sessions_page("needle", &SearchFilters::default(), None, &scoring, 1)
+                .unwrap()),
+            ids(all.into_iter().skip(1).collect())
+        );
     }
 
     #[test]

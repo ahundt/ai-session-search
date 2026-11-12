@@ -109,6 +109,16 @@ without creating its directory, and an unrefreshed empty index raises `IndexNotR
 `prepare_for_read()`. Omitting the argument preserves the older empty-index read behavior unless
 configuration explicitly selects existing-only.
 
+`SessionQuery` and `FileQuery` accept either flat `provider`, `path_prefix`, and `dates`
+filters or `scope=QueryScope(...)`. File queries also accept a flat `session_id`.
+`MessageSearchRequest` accepts the same flat filters or a `QueryScope`; its path filter means
+workspace path. Use `MessageScope` for multiple providers and independent transcript-path filters.
+Passing both a scope and flat filters raises `InvalidArgumentError`. Session lists do not accept
+`scope.session_id`; read a resolved session directly instead.
+`SessionQuery(limit=N, offset=M)` pages both lists and ranked search in their existing order.
+`MessageSearchRequest(query_mode="regex")` carries its search mode; the function keyword also
+works, and conflicting values raise `InvalidArgumentError`.
+
 An omitted `SessionQuery.limit` (None) resolves `[search].default_limit` on list and ranked
 search calls, including when the request supplies other filters. An explicit 0 returns every
 session; a positive count overrides configuration.
