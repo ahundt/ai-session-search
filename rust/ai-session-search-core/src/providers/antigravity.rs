@@ -306,13 +306,13 @@ impl AntigravityAdapter {
         let messages = crate::util::normalize_raw_messages_with_evidence(
             messages,
             Some(&session.id),
-            crate::util::UserRoleAuthorshipEvidence::Unverified,
+            crate::util::UserRoleEvidence::Unverified,
         );
         let retracted = crate::models::RetractedRows {
             messages: crate::util::normalize_raw_messages_with_evidence(
                 retracted_messages,
                 Some(&session.id),
-                crate::util::UserRoleAuthorshipEvidence::Unverified,
+                crate::util::UserRoleEvidence::Unverified,
             ),
             ..Default::default()
         };

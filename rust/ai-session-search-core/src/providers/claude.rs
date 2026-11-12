@@ -26,7 +26,7 @@ use crate::providers::{
 use crate::util::{
     canonical_source_path, extract_text, find_repo_root, format_transcript_line, minimal_record,
     normalize_path, observe_session_end, observe_session_start, parse_datetime, preview_from_text,
-    substantive_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    substantive_text, truncate_for_display, RawMessage, UserRoleEvidence,
 };
 
 /// The workflow engine's own log, written beside the agent transcripts it spawned. It records
@@ -1365,9 +1365,9 @@ impl ClaudeAdapter {
         };
 
         let evidence = if subagent {
-            UserRoleAuthorshipEvidence::AgentDelegationEvent
+            UserRoleEvidence::AgentDelegationEvent
         } else {
-            UserRoleAuthorshipEvidence::HumanInputEvent
+            UserRoleEvidence::HumanInputEvent
         };
         messages.extend(attachments.rows);
         let mut messages = crate::util::normalize_raw_messages_with_evidence(

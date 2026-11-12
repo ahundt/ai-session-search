@@ -1256,3 +1256,51 @@ struct RepositoryReadmeExamples;
 #[cfg(doctest)]
 #[doc = include_str!("../../../docs/development/library-api.md")]
 struct LibraryGuideExamples;
+
+#[test]
+#[allow(deprecated)]
+fn legacy_user_role_authorship_preserves_provider_evidence() {
+    use ai_session_search::{
+        models::{MessageAuthorship, MessageKind},
+        util::{
+            apply_user_role_authorship, to_messages_with_tools, RawMessage,
+            UserRoleAuthorshipEvidence,
+        },
+    };
+    for (evidence, expected) in [
+        (
+            UserRoleAuthorshipEvidence::HumanInputEvent,
+            MessageAuthorship::Human,
+        ),
+        (
+            UserRoleAuthorshipEvidence::AgentDelegationEvent,
+            MessageAuthorship::Agent,
+        ),
+        (
+            UserRoleAuthorshipEvidence::Unverified,
+            MessageAuthorship::Unknown,
+        ),
+    ] {
+        let raw = || RawMessage::message("user", "prompt".into(), None, None);
+        let mut messages = to_messages_with_tools(vec![raw(), raw(), raw(), raw(), raw()]);
+        messages[1].role = ai_session_search::models::Role::Slash;
+        messages[2].provenance.authorship = MessageAuthorship::Agent;
+        messages[3].kind = MessageKind::HarnessNotice;
+        messages[4].role = ai_session_search::models::Role::Assistant;
+        let before = messages.clone();
+        apply_user_role_authorship(&mut messages, evidence);
+        assert_eq!(messages[0].provenance.authorship, expected);
+        assert_eq!(messages[1].provenance.authorship, expected);
+        for index in 2..messages.len() {
+            assert_eq!(
+                messages[index].provenance.authorship,
+                before[index].provenance.authorship
+            );
+        }
+        let replacement = to_messages_with_tools(vec![raw().with_authorship(expected)]);
+        assert_eq!(
+            messages[0].provenance.authorship,
+            replacement[0].provenance.authorship
+        );
+    }
+}

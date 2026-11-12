@@ -24,7 +24,7 @@ use crate::providers::snapshot::{
 };
 use crate::providers::{walk_roots, ProviderDiscovery};
 use crate::util::{
-    format_transcript_line, minimal_record, parse_datetime, RawMessage, UserRoleAuthorshipEvidence,
+    format_transcript_line, minimal_record, parse_datetime, RawMessage, UserRoleEvidence,
 };
 
 pub struct GeminiCliAdapter {
@@ -851,7 +851,7 @@ impl NativeReplay {
         self.history.insert(key, raw);
     }
 
-    fn render(&self, evidence: UserRoleAuthorshipEvidence, provider_id: &str) -> RenderedMessages {
+    fn render(&self, evidence: UserRoleEvidence, provider_id: &str) -> RenderedMessages {
         let mut rendered = RenderedMessages {
             messages: Vec::new(),
             keys: HashSet::new(),
@@ -869,7 +869,7 @@ impl NativeReplay {
         &self,
         record: &Value,
         id: &str,
-        evidence: UserRoleAuthorshipEvidence,
+        evidence: UserRoleEvidence,
         _provider_id: &str,
         rendered: &mut RenderedMessages,
     ) {
@@ -898,14 +898,14 @@ impl NativeReplay {
                     let first_end = first.chars().count();
                     let current_start = first_end + 1;
                     let content_end = content.chars().count();
-                    let original_authorship =
-                        if evidence == UserRoleAuthorshipEvidence::AgentDelegationEvent {
-                            ContentPartAuthorship::Agent
-                        } else if evidence == UserRoleAuthorshipEvidence::Unverified {
-                            ContentPartAuthorship::Unknown
-                        } else {
-                            ContentPartAuthorship::Human
-                        };
+                    let original_authorship = if evidence == UserRoleEvidence::AgentDelegationEvent
+                    {
+                        ContentPartAuthorship::Agent
+                    } else if evidence == UserRoleEvidence::Unverified {
+                        ContentPartAuthorship::Unknown
+                    } else {
+                        ContentPartAuthorship::Human
+                    };
                     RawMessage::message("user", content, timestamp, None).with_content_parts(vec![
                         MessageContentPart {
                             ordinal: 0,
@@ -931,7 +931,7 @@ impl NativeReplay {
                     ])
                 } else {
                     let mut raw = RawMessage::message("user", text, timestamp, None);
-                    if evidence == UserRoleAuthorshipEvidence::AgentDelegationEvent {
+                    if evidence == UserRoleEvidence::AgentDelegationEvent {
                         raw = raw.with_authorship(MessageAuthorship::Agent);
                     }
                     raw
@@ -1070,7 +1070,7 @@ impl NativeReplay {
 
     fn history_messages(
         &self,
-        evidence: UserRoleAuthorshipEvidence,
+        evidence: UserRoleEvidence,
         active_keys: &HashSet<String>,
     ) -> Vec<RawMessage> {
         self.history_order
@@ -1078,13 +1078,11 @@ impl NativeReplay {
             .filter(|key| !active_keys.contains(*key))
             .filter_map(|key| {
                 let mut raw = self.history.get(key)?.clone();
-                if evidence == UserRoleAuthorshipEvidence::AgentDelegationEvent
-                    && key.starts_with("record:")
+                if evidence == UserRoleEvidence::AgentDelegationEvent && key.starts_with("record:")
                 {
                     raw = raw.with_authorship(MessageAuthorship::Agent);
                 }
-                if key.starts_with("answer:")
-                    && evidence == UserRoleAuthorshipEvidence::AgentDelegationEvent
+                if key.starts_with("answer:") && evidence == UserRoleEvidence::AgentDelegationEvent
                 {
                     raw = raw.with_authorship(MessageAuthorship::Agent);
                 }
@@ -1130,11 +1128,11 @@ fn is_message_record(value: &Value) -> bool {
     ) && value.get("id").is_some()
 }
 
-fn gemini_session_evidence(kind: Option<&str>) -> UserRoleAuthorshipEvidence {
+fn gemini_session_evidence(kind: Option<&str>) -> UserRoleEvidence {
     match kind {
-        Some("subagent") => UserRoleAuthorshipEvidence::AgentDelegationEvent,
-        Some("main") | None => UserRoleAuthorshipEvidence::HumanInputEvent,
-        Some(_) => UserRoleAuthorshipEvidence::Unverified,
+        Some("subagent") => UserRoleEvidence::AgentDelegationEvent,
+        Some("main") | None => UserRoleEvidence::HumanInputEvent,
+        Some(_) => UserRoleEvidence::Unverified,
     }
 }
 
@@ -1254,7 +1252,7 @@ fn answer_raw(
             Some(answers),
             Some(call_id),
             ts,
-            UserRoleAuthorshipEvidence::HumanInputEvent,
+            UserRoleEvidence::HumanInputEvent,
         )
     };
     raw = raw.with_input_origin(MessageInputOrigin::InteractiveAnswer);
@@ -1316,7 +1314,7 @@ fn tool_result_with_answer(
     answers: Option<&[String]>,
     call_id: Option<&str>,
     ts: Option<DateTime<Utc>>,
-    evidence: UserRoleAuthorshipEvidence,
+    evidence: UserRoleEvidence,
 ) -> RawMessage {
     tool_result_with_answer_history(name, result, None, answers, call_id, ts, evidence)
 }
@@ -1328,7 +1326,7 @@ fn tool_result_with_answer_history(
     current_answers: Option<&[String]>,
     call_id: Option<&str>,
     ts: Option<DateTime<Utc>>,
-    evidence: UserRoleAuthorshipEvidence,
+    evidence: UserRoleEvidence,
 ) -> RawMessage {
     let historical_answers = nonempty_answers(historical_answers);
     let current_answers = nonempty_answers(current_answers);
@@ -1338,7 +1336,7 @@ fn tool_result_with_answer_history(
             |result| RawMessage::tool_result(name, result, call_id, ts),
         );
     }
-    let answer_authorship = if evidence == UserRoleAuthorshipEvidence::AgentDelegationEvent {
+    let answer_authorship = if evidence == UserRoleEvidence::AgentDelegationEvent {
         ContentPartAuthorship::Agent
     } else {
         ContentPartAuthorship::Unknown
@@ -1375,7 +1373,7 @@ fn tool_result_with_answer_history(
         },
     );
     if parts.len() == 1 {
-        let authorship = if evidence == UserRoleAuthorshipEvidence::AgentDelegationEvent {
+        let authorship = if evidence == UserRoleEvidence::AgentDelegationEvent {
             MessageAuthorship::Agent
         } else {
             MessageAuthorship::Unknown

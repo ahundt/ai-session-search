@@ -1580,18 +1580,52 @@ fn infer_message_authorship(role: Role, kind: MessageKind) -> MessageAuthorship 
 
 /// Provider evidence that can resolve an otherwise-unknown user-role conversation row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UserRoleAuthorshipEvidence {
+#[doc(hidden)]
+pub enum UserRoleEvidence {
     HumanInputEvent,
     AgentDelegationEvent,
     Unverified,
 }
 
-impl UserRoleAuthorshipEvidence {
+impl UserRoleEvidence {
     fn authorship(self) -> MessageAuthorship {
         match self {
             Self::HumanInputEvent => MessageAuthorship::Human,
             Self::AgentDelegationEvent => MessageAuthorship::Agent,
             Self::Unverified => MessageAuthorship::Unknown,
+        }
+    }
+}
+
+/// Deprecated provider evidence for resolving normalized user-role messages.
+#[doc(inline)]
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage::with_authorship before normalization"
+)]
+pub use UserRoleEvidence as UserRoleAuthorshipEvidence;
+
+/// Resolve still-unknown user/slash conversation authorship without changing other provenance.
+/// New providers attach evidence with [`RawMessage::with_authorship`] before normalization.
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage::with_authorship before normalization"
+)]
+#[allow(deprecated)]
+pub fn apply_user_role_authorship(messages: &mut [Message], evidence: UserRoleAuthorshipEvidence) {
+    let authorship = evidence.authorship();
+    if authorship == MessageAuthorship::Unknown {
+        return;
+    }
+    for message in messages {
+        if message.provenance.authorship == MessageAuthorship::Unknown
+            && matches!(message.role, Role::User | Role::Slash)
+            && matches!(
+                message.kind,
+                MessageKind::Conversation | MessageKind::Unknown
+            )
+        {
+            message.provenance.authorship = authorship;
         }
     }
 }
@@ -1628,7 +1662,7 @@ pub fn to_messages_with_tools<T>(raw: Vec<T>) -> Vec<Message>
 where
     T: Into<RawMessage>,
 {
-    normalize_raw_messages_with_evidence(raw, None, UserRoleAuthorshipEvidence::Unverified)
+    normalize_raw_messages_with_evidence(raw, None, UserRoleEvidence::Unverified)
 }
 
 /// Normalize provider records while binding deferred native event IDs to one canonical session.
@@ -1645,13 +1679,13 @@ pub fn to_messages_with_tools_in_scope<T>(raw: Vec<T>, scope: &str) -> Vec<Messa
 where
     T: Into<RawMessage>,
 {
-    normalize_raw_messages_with_evidence(raw, Some(scope), UserRoleAuthorshipEvidence::Unverified)
+    normalize_raw_messages_with_evidence(raw, Some(scope), UserRoleEvidence::Unverified)
 }
 
 pub(crate) fn normalize_raw_messages_with_evidence<T>(
     raw: Vec<T>,
     correlation_scope: Option<&str>,
-    evidence: UserRoleAuthorshipEvidence,
+    evidence: UserRoleEvidence,
 ) -> Vec<Message>
 where
     T: Into<RawMessage>,
@@ -1745,9 +1779,9 @@ mod role_classification_tests {
     #[test]
     fn explicit_authorship_survives_session_evidence() {
         for evidence in [
-            UserRoleAuthorshipEvidence::HumanInputEvent,
-            UserRoleAuthorshipEvidence::AgentDelegationEvent,
-            UserRoleAuthorshipEvidence::Unverified,
+            UserRoleEvidence::HumanInputEvent,
+            UserRoleEvidence::AgentDelegationEvent,
+            UserRoleEvidence::Unverified,
         ] {
             for authorship in [
                 MessageAuthorship::Unknown,
@@ -1773,18 +1807,12 @@ mod role_classification_tests {
     #[test]
     fn session_evidence_only_resolves_unclassified_input() {
         for (evidence, expected) in [
+            (UserRoleEvidence::HumanInputEvent, MessageAuthorship::Human),
             (
-                UserRoleAuthorshipEvidence::HumanInputEvent,
-                MessageAuthorship::Human,
-            ),
-            (
-                UserRoleAuthorshipEvidence::AgentDelegationEvent,
+                UserRoleEvidence::AgentDelegationEvent,
                 MessageAuthorship::Agent,
             ),
-            (
-                UserRoleAuthorshipEvidence::Unverified,
-                MessageAuthorship::Unknown,
-            ),
+            (UserRoleEvidence::Unverified, MessageAuthorship::Unknown),
         ] {
             let messages = normalize_raw_messages_with_evidence(
                 vec![
@@ -1855,7 +1883,7 @@ mod role_classification_tests {
         let messages = normalize_raw_messages_with_evidence(
             vec![raw, invalid],
             Some("claude:session"),
-            UserRoleAuthorshipEvidence::AgentDelegationEvent,
+            UserRoleEvidence::AgentDelegationEvent,
         );
         let provenance = &messages[0].provenance;
         assert_eq!(provenance.authorship, MessageAuthorship::Mixed);
@@ -1884,7 +1912,7 @@ mod role_classification_tests {
                 .with_authorship(MessageAuthorship::Human)
                 .with_authorship(MessageAuthorship::Unknown)],
             None,
-            UserRoleAuthorshipEvidence::HumanInputEvent,
+            UserRoleEvidence::HumanInputEvent,
         );
         assert_eq!(unknown[0].provenance.authorship, MessageAuthorship::Unknown);
         assert_eq!(unknown[0].provenance.input_origin, None);

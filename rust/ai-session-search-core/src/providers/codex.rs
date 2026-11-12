@@ -21,7 +21,7 @@ use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     observe_session_end, parse_datetime, parse_unix_millis, parse_unix_seconds, preview_from_text,
-    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    truncate_for_display, RawMessage, UserRoleEvidence,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -723,9 +723,9 @@ impl CodexAdapter {
             messages,
             Some(&session.id),
             if agent_started {
-                UserRoleAuthorshipEvidence::AgentDelegationEvent
+                UserRoleEvidence::AgentDelegationEvent
             } else {
-                UserRoleAuthorshipEvidence::HumanInputEvent
+                UserRoleEvidence::HumanInputEvent
             },
         );
         Ok(ParsedSession {

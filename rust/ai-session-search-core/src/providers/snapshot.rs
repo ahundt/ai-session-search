@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     format_transcript_line, normalize_path, normalize_raw_messages_with_evidence,
-    provider_parse_version, RawMessage, UserRoleAuthorshipEvidence,
+    provider_parse_version, RawMessage, UserRoleEvidence,
 };
 
 pub(super) type Turn = (String, String, Option<DateTime<Utc>>);
@@ -67,7 +67,7 @@ pub(super) fn parsed_session_from_raw(
         path,
         metadata,
         raw_messages,
-        UserRoleAuthorshipEvidence::HumanInputEvent,
+        UserRoleEvidence::HumanInputEvent,
     )
 }
 
@@ -76,7 +76,7 @@ pub(super) fn parsed_session_from_raw_with_evidence(
     path: &Path,
     metadata: SnapshotMetadata<'_>,
     raw_messages: Vec<RawMessage>,
-    evidence: UserRoleAuthorshipEvidence,
+    evidence: UserRoleEvidence,
 ) -> ParsedSession {
     let correlation_scope = format!("{}:{}", provider.as_str(), metadata.provider_session_id);
     let messages =

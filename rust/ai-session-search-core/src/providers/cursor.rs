@@ -13,8 +13,7 @@ use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile
 use crate::providers::{spawn, walk_roots, ProviderDiscovery};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    preview_from_text, substantive_text, truncate_for_display, RawMessage,
-    UserRoleAuthorshipEvidence,
+    preview_from_text, substantive_text, truncate_for_display, RawMessage, UserRoleEvidence,
 };
 
 pub struct CursorAdapter {
@@ -257,9 +256,9 @@ impl CursorAdapter {
             messages,
             None,
             if spawned.is_some() {
-                UserRoleAuthorshipEvidence::AgentDelegationEvent
+                UserRoleEvidence::AgentDelegationEvent
             } else {
-                UserRoleAuthorshipEvidence::HumanInputEvent
+                UserRoleEvidence::HumanInputEvent
             },
         );
         Ok(ParsedSession {

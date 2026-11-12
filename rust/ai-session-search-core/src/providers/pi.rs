@@ -20,7 +20,7 @@ use crate::providers::{spawn::SpawnOrigin, walk_roots, ProviderDiscovery};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     observe_session_end, observe_session_start, parse_datetime, preview_from_text,
-    substantive_text, truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
+    substantive_text, truncate_for_display, RawMessage, UserRoleEvidence,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,9 +441,9 @@ impl PiAdapter {
             messages,
             Some(&session.id),
             if spawned.is_some() {
-                UserRoleAuthorshipEvidence::AgentDelegationEvent
+                UserRoleEvidence::AgentDelegationEvent
             } else {
-                UserRoleAuthorshipEvidence::HumanInputEvent
+                UserRoleEvidence::HumanInputEvent
             },
         );
         Ok(ParsedSession {
