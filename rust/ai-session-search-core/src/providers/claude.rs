@@ -228,6 +228,7 @@ impl QueuedCommand {
         enqueued: &HashMap<usize, usize>,
         messages: &mut Vec<RawMessage>,
         transcript_lines: &mut Vec<String>,
+        retracted_transcript_lines: &mut Vec<String>,
         created_at: &mut Option<DateTime<Utc>>,
         updated_at: &mut Option<DateTime<Utc>>,
     ) {
@@ -263,7 +264,7 @@ impl QueuedCommand {
             if !queued.prompt {
                 row.retag_harness_notice();
                 // Harness notices are not conversation, so they leave the session transcript.
-                transcript_lines[line].clear();
+                retracted_transcript_lines.push(std::mem::take(&mut transcript_lines[line]));
                 retired_lines = true;
             } else if let Some(semantics) = queued.semantics {
                 row.set_authorship(semantics.content_authorship.into());
@@ -719,7 +720,7 @@ impl ClaudeAdapter {
                         .or(role);
                 }
                 text = conversation_text(message);
-                if role.as_deref() == Some("assistant") && !retract {
+                if role.as_deref() == Some("assistant") {
                     // Earlier parsers also read `tool_use` inputs as the turn's text, so a turn
                     // holding a `Write` call was stored with the written file as assistant prose.
                     // Render that row too, so reindex removes it; see `RetractedRows`.
@@ -909,6 +910,7 @@ impl ClaudeAdapter {
             &enqueued,
             &mut messages,
             &mut transcript_lines,
+            &mut retracted_transcript_lines,
             &mut created_at,
             &mut updated_at,
         );
@@ -4572,6 +4574,107 @@ mod tests {
             metadata[super::UNRECOGNIZED_RECORD_TYPES_KEY],
             json!({"brand-new-kind": 2})
         );
+    }
+
+    #[test]
+    fn legacy_request_copies_and_queue_notices_upgrade_to_fresh_content() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("upgrade.jsonl");
+        let adapter = ClaudeAdapter::new(vec![]);
+        let user = json!({"type":"user","uuid":"u1","sessionId":"upgrade",
+            "message":{"role":"user","content":"write a file"}});
+        let call = json!({"type":"assistant","uuid":"a1","sessionId":"upgrade",
+            "message":{"role":"assistant","content":[{"type":"tool_use","id":"t1",
+                "name":"Write","input":{"file_path":"/tmp/example.txt","content":"written body"}}]}});
+        let result = json!({"type":"user","uuid":"r1","sessionId":"upgrade",
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"written"}]}});
+        let blob = |record: &Value| json!({"type":"api-request-blob","sessionId":"upgrade","message":record["message"]});
+        let notice = "<task-notification>complete</task-notification>";
+        let records = vec![
+            user.clone(),
+            user,
+            call.clone(),
+            result.clone(),
+            blob(&call),
+            blob(&result),
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":"upgrade","content":notice}),
+            json!({"type":"attachment","uuid":"q1","sessionId":"upgrade",
+                "attachment":{"type":"queued_command","commandMode":"task-notification","prompt":notice}}),
+        ];
+        let lines = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current = adapter
+            .parse_reader(std::io::Cursor::new(lines), &path)
+            .unwrap();
+        let mut old = current.clone();
+        old.messages.clear();
+        old.file_edits.clear();
+        old.retracted = Default::default();
+        old.session.parse_version = "claude-v4".into();
+        let mut raw = Vec::new();
+        let mut transcript = Vec::new();
+        let mut edit_seq = 0;
+        // The legacy renderer read request copies as turns and tool inputs as assistant prose.
+        for record in &records {
+            if let Some(message) = record.get("message") {
+                let role = message["role"].as_str().unwrap();
+                let text = crate::util::extract_text(message);
+                if role == "assistant" {
+                    super::append_tool_use_messages(message, None, &mut raw);
+                    super::collect_file_edits(message, None, &mut edit_seq, &mut old.file_edits);
+                }
+                if let Some(id) = super::tool_result_id(message) {
+                    raw.push(crate::util::RawMessage::tool_result(
+                        "Write",
+                        text,
+                        Some(id),
+                        None,
+                    ));
+                } else if !text.is_empty() {
+                    transcript.push(crate::util::format_transcript_line(role, None, &text));
+                    raw.push(crate::util::RawMessage::message(role, text, None, None));
+                }
+            } else if record["type"] == "queue-operation" {
+                raw.push(crate::util::RawMessage::message(
+                    "user",
+                    notice.into(),
+                    None,
+                    None,
+                ));
+                transcript.push(crate::util::format_transcript_line("user", None, notice));
+            }
+        }
+        old.messages = crate::util::to_messages_with_tools(raw);
+        old.transcript_text = transcript.join("\n\n");
+        let old_path = temp.path().join("old.db");
+        let fresh_path = temp.path().join("fresh.db");
+        let upgraded = crate::db::Db::open(&old_path).unwrap();
+        let fresh = crate::db::Db::open(&fresh_path).unwrap();
+        upgraded.upsert_session(&old, 1, 1).unwrap();
+        fresh.upsert_session(&current, 1, 1).unwrap();
+        let snapshot = |path: &std::path::Path, query: &str| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mut stmt = conn.prepare(query).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for generation in [2, 3] {
+            upgraded
+                .upsert_session(&current, generation, generation)
+                .unwrap();
+            for query in [
+                "select json_array(role,kind,content,ts,tool_name,tool_call_id,authorship,input_origin) from messages order by 1",
+                "select json_array(tool,file_path,new_content,edits_json) from file_edits order by 1",
+                "select transcript_text from transcripts order by session_id",
+            ] {
+                assert_eq!(snapshot(&old_path, query), snapshot(&fresh_path, query), "{query}");
+            }
+        }
     }
 
     #[test]
