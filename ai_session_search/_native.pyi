@@ -1766,6 +1766,10 @@ class CompactOutcome:
 
 @final
 class SessionSearch:
+    def close(self) -> None:
+        """Release the connection and owned workers; repeated calls are safe."""
+    def __enter__(self) -> Self: ...
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> bool: ...
     def prepare_for_read(self) -> RefreshOutcome | None:
         """Apply the configured refresh policy before reading; existing-only never refreshes."""
     def classify_messages(self, *, skill: str = "corrections", request: MessageClassificationQuery | None = None, include_unattributed_input: bool | None = None, definition: MessageClassificationDefinition | None = None) -> list[MessageClassificationMatch]:

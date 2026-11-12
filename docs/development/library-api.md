@@ -169,6 +169,11 @@ legacy `OverflowError` handler. Error causes are classified from Rust types.
 
 ### Concurrency and resource ownership
 
+Use `with SessionSearch(...) as search:` to close the connection on normal or exceptional
+exit, or call `search.close()` explicitly. Repeated close calls are safe; subsequent service
+operations raise RuntimeError. Detached results and independently opened iterators remain usable
+and those iterators retain their own close obligations.
+
 Long native operations release the GIL, so a refresh or a large search does not
 block other Python threads. Reconstruction iterators own their selected rows
 without holding the database lock, so a slow consumer cannot hold the index

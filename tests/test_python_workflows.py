@@ -314,3 +314,24 @@ def test_restore_documents_and_preserves_destinations(corpus, tmp_path: Path):
     assert first.read_text() == second.read_text() == "print(42)"
     assert original.read_text() == "current file"
     assert recovered.restore(output_dir=tmp_path / "copies").name == "app.recovered.py"
+
+
+def test_service_close_is_idempotent_and_context_managed(corpus):
+    versions = corpus.reconstruct_file_versions("app.py", request=aise.FileQuery(session_id="synthetic-0"))
+    batches = corpus.search_message_batches("forgot")
+    corpus.close()
+    corpus.close()
+    assert next(versions).content == "print(42)"
+    with batches:
+        assert next(batches).results
+    with pytest.raises(RuntimeError, match="closed"):
+        corpus.list_sessions()
+    with pytest.raises(RuntimeError, match="closed"):
+        corpus.query_sql("select 1")
+    with pytest.raises(RuntimeError, match="closed"):
+        corpus.refresh()
+    with pytest.raises(LookupError):
+        with aise.SessionSearch() as other:
+            raise LookupError("test exit")
+    with pytest.raises(RuntimeError, match="closed"):
+        other.index_status()

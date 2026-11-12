@@ -4616,7 +4616,31 @@ impl From<CompactOutcome> for NativeCompactOutcome {
 /// for.
 #[pyclass(module = "ai_session_search._native", frozen)]
 struct SessionSearch {
-    inner: Mutex<CoreSessionSearch>,
+    inner: Mutex<Option<CoreSessionSearch>>,
+}
+
+// The held lock keeps the validated Some value alive for the whole operation.
+struct OpenApplication<'a>(std::sync::MutexGuard<'a, Option<CoreSessionSearch>>);
+
+impl std::ops::Deref for OpenApplication<'_> {
+    type Target = CoreSessionSearch;
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("OpenApplication holds a validated live service")
+    }
+}
+
+impl SessionSearch {
+    fn app(&self) -> PyResult<OpenApplication<'_>> {
+        let guard = self.inner.lock().map_err(runtime_error)?;
+        if guard.is_none() {
+            return Err(runtime_error(
+                "SessionSearch is closed; create a new SessionSearch instance",
+            ));
+        }
+        Ok(OpenApplication(guard))
+    }
 }
 
 #[pymethods]
@@ -4670,13 +4694,39 @@ impl SessionSearch {
             inner.serve_unrefreshed_index_as_empty();
         }
         Ok(Self {
-            inner: Mutex::new(inner),
+            inner: Mutex::new(Some(inner)),
         })
+    }
+
+    /// Release the database connection and owned workers. Repeated calls are safe.
+    /// Detached results and independently opened iterators remain usable.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            let application = self.inner.lock().map_err(runtime_error)?.take();
+            drop(application);
+            Ok(())
+        })
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        drop(slf.app()?);
+        Ok(slf)
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exception_type: &Bound<'_, PyAny>,
+        _exception: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 
     #[getter]
     fn db_path(&self) -> PyResult<PathBuf> {
-        let app = self.inner.lock().map_err(runtime_error)?;
+        let app = self.app()?;
         Ok(app.config().db_path())
     }
 
@@ -4687,7 +4737,7 @@ impl SessionSearch {
     /// This call reads no indexed sessions or messages.
     fn message_search_spec<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let specification = {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.messages_for_surface(CoreSearchSurface::Python)
                 .message_search_spec()
                 .map_err(service_error)?
@@ -4699,7 +4749,7 @@ impl SessionSearch {
     /// Returns a refresh outcome if work was attempted, otherwise None. existing-only never writes.
     fn prepare_for_read(&self, py: Python<'_>) -> PyResult<Option<RefreshOutcome>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.index()
                 .prepare_for_read()
                 .map(|outcome| outcome.map(RefreshOutcome::from))
@@ -4721,7 +4771,7 @@ impl SessionSearch {
         let selector = ai_session_search::SkillSelector::name(skill).map_err(value_error)?;
         let definition = python_message_classification_definition(definition)?;
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let mut input = request.unwrap_or_default();
             if let Some(include) = include_unattributed_input {
                 input.include_unattributed_input = include;
@@ -4766,7 +4816,7 @@ impl SessionSearch {
             .map(|v| paging_argument(PagingArgument::Limit, v))
             .transpose()?;
         let rows = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.analysis().vocabulary(&query).map_err(service_error)
         })?;
         json_compatible(py, &rows)
@@ -4825,7 +4875,7 @@ impl SessionSearch {
             .map_err(value_error)?;
         let limit = paging_argument(PagingArgument::Limit, limit)?;
         let report = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let scope = scope.unwrap_or_default().resolve(&app)?;
             request.filters = MessageFilters::default()
                 .with_limit(limit)
@@ -4864,7 +4914,7 @@ impl SessionSearch {
         query.timeout_ms = timeout_ms;
         query.max_cell_chars = max_cell_chars;
         let result = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.sql().query(&query).map_err(service_error)
         })?;
         let mut payload =
@@ -4882,7 +4932,7 @@ impl SessionSearch {
         session_id: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let command = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.catalog()
                 .resume_command(session_id)
                 .map_err(service_error)
@@ -4899,7 +4949,7 @@ impl SessionSearch {
         lines: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let window = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.catalog()
                 .transcript(session_id, lines)
                 .map_err(service_error)
@@ -4937,7 +4987,7 @@ impl SessionSearch {
             .to_string();
         let (query, _has_content_query) = core_message_query(query.to_owned(), &query_mode)?;
         let response = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let request = request.into_request(query)?;
             app.messages_for_surface(ai_session_search::message_search::SearchSurface::Python)
                 .search(request)
@@ -4993,7 +5043,7 @@ impl SessionSearch {
             ));
         }
         let batches = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let request = request.into_request(query)?;
             app.message_search_batches_for_surface(
                 ai_session_search::message_search::SearchSurface::Python,
@@ -5043,7 +5093,7 @@ impl SessionSearch {
             ));
         }
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let session = app
                 .catalog()
                 .resolve_session(&session_id)
@@ -5111,7 +5161,7 @@ impl SessionSearch {
             }
         }
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let session = app
                 .catalog()
                 .resolve_session(&session_id)
@@ -5161,7 +5211,7 @@ impl SessionSearch {
             value
         };
         let inspection = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.catalog()
                 .inspect(&session_id, options)
                 .map_err(service_error)
@@ -5180,7 +5230,7 @@ impl SessionSearch {
         request: Option<SessionQuery>,
     ) -> PyResult<Vec<NativeSessionRecord>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let mut request = request.unwrap_or_default();
             request.limit = Some(request.limit.unwrap_or(app.config().search.default_limit));
             let offset = request.offset;
@@ -5209,7 +5259,7 @@ impl SessionSearch {
         request: Option<SessionQuery>,
     ) -> PyResult<Vec<NativeSessionSearchHit>> {
         let hits = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let mut request = request.unwrap_or_default();
             request.limit = Some(request.limit.unwrap_or(app.config().search.default_limit));
             let offset = request.offset;
@@ -5245,7 +5295,7 @@ impl SessionSearch {
         request: Option<FileQuery>,
     ) -> PyResult<Vec<NativeFileEditSummary>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let query = request.unwrap_or_default().into_query(pattern, &app)?;
             app.files()
                 .search(&query)
@@ -5262,7 +5312,7 @@ impl SessionSearch {
         request: Option<FileQuery>,
     ) -> PyResult<Vec<NativeFileVersion>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let query = request.unwrap_or_default().into_query(None, &app)?;
             app.files()
                 .history(&file, &query)
@@ -5279,7 +5329,7 @@ impl SessionSearch {
         request: Option<FileQuery>,
     ) -> PyResult<Vec<NativeFileCrossRef>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let query = request.unwrap_or_default().into_query(pattern, &app)?;
             app.files()
                 .cross_reference(&query)
@@ -5309,7 +5359,7 @@ impl SessionSearch {
             })
             .transpose()?;
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let query = request.unwrap_or_default().into_query(None, &app)?;
             app.files()
                 .reconstruct(&file, &query, version)
@@ -5326,7 +5376,7 @@ impl SessionSearch {
         request: Option<FileQuery>,
     ) -> PyResult<NativeReconstructedFileVersions> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let query = request.unwrap_or_default().into_query(None, &app)?;
             app.files()
                 .reconstruct_versions(&file, &query)
@@ -5345,7 +5395,7 @@ impl SessionSearch {
     ) -> PyResult<NativeRecoveryPublicationReceipt> {
         py.detach(|| {
             let versions = {
-                let app = self.inner.lock().map_err(runtime_error)?;
+                let app = self.app()?;
                 let query = request.unwrap_or_default().into_query(None, &app)?;
                 app.files()
                     .reconstruct_versions(&file, &query)
@@ -5368,7 +5418,7 @@ impl SessionSearch {
             .parse::<ai_session_search::export::ExportFormat>()
             .map_err(value_error)?;
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.exports()
                 .render_full(&session_id, format)
                 .map(NativeExportDocument::from)
@@ -5391,7 +5441,7 @@ impl SessionSearch {
             .map_err(value_error)?;
         let (filters, _) = request.unwrap_or_default().into_filters()?;
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.exports()
                 .publish_bundle(&filters, &plan)
                 .map(NativeExportPublicationReceipt::from)
@@ -5401,7 +5451,7 @@ impl SessionSearch {
 
     fn source_inventory(&self, py: Python<'_>) -> PyResult<Vec<NativeProviderSourceStatus>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             Ok(app
                 .sources()
                 .inventory()
@@ -5432,7 +5482,7 @@ impl SessionSearch {
         }
         let (filters, _) = request.into_filters()?;
         let page = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.analysis()
                 .documents(&filters, cursor.as_ref().map(|value| &value.inner))
                 .map_err(service_error)
@@ -5455,7 +5505,7 @@ impl SessionSearch {
                 .expect("empty analysis policy is valid")
         });
         let result = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.analysis().run(&request, &policy).map_err(service_error)
         })?;
         Ok(NativeReceiptedAnalysis {
@@ -5469,7 +5519,7 @@ impl SessionSearch {
         request: NativeSkillRunQuery,
     ) -> PyResult<NativeSkillRunReport> {
         let report = py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let query = request.into_core(&app)?;
             app.analysis().run_skill(&query).map_err(service_error)
         })?;
@@ -5484,7 +5534,7 @@ impl SessionSearch {
         command_patterns: Option<Vec<String>>,
     ) -> PyResult<Vec<NativePlanningCount>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let filters = request.unwrap_or_default().into_filters(&app)?;
             app.analysis()
                 .planning(&filters, command_patterns.as_deref().unwrap_or_default())
@@ -5500,7 +5550,7 @@ impl SessionSearch {
         request: Option<AnalysisQuery>,
     ) -> PyResult<Vec<NativeRoleStatistic>> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             let filters = request.unwrap_or_default().into_filters(&app)?;
             app.analysis()
                 .role_statistics(&filters)
@@ -5511,7 +5561,7 @@ impl SessionSearch {
 
     fn refresh(&self, py: Python<'_>) -> PyResult<RefreshOutcome> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.index()
                 .refresh()
                 .map(RefreshOutcome::from)
@@ -5521,7 +5571,7 @@ impl SessionSearch {
 
     fn index_status(&self, py: Python<'_>) -> PyResult<NativeIndexStatus> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.index()
                 .status()
                 .map(NativeIndexStatus::from)
@@ -5532,7 +5582,7 @@ impl SessionSearch {
     #[pyo3(signature = (*, full=false))]
     fn reindex(&self, py: Python<'_>, full: bool) -> PyResult<NativeReindexOutcome> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.index()
                 .reindex_report(full)
                 .map(|outcome| NativeReindexOutcome {
@@ -5550,7 +5600,7 @@ impl SessionSearch {
 
     fn diagnostics(&self, py: Python<'_>) -> PyResult<NativeDiagnosticStatus> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.maintenance()
                 .diagnostics()
                 .map(|status| NativeDiagnosticStatus {
@@ -5569,7 +5619,7 @@ impl SessionSearch {
 
     fn compact(&self, py: Python<'_>) -> PyResult<NativeCompactOutcome> {
         py.detach(|| {
-            let app = self.inner.lock().map_err(runtime_error)?;
+            let app = self.app()?;
             app.maintenance()
                 .compact()
                 .map(NativeCompactOutcome::from)
