@@ -53,6 +53,12 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    months, and `P1Y` for calendar years. A trailing zone such as `[America/New_York]` selects a
    local calendar explicitly. JSON, MCP, and Python timestamps use UTC `Z`; human displays use
    local time with an offset.
+7. The bundled SQLite binding moves from rusqlite 0.40 to 0.41 to fix RUSTSEC-2026-0459.
+   Rust callers of the six deprecated `trigram_index` helpers (`ensure_schema`,
+   `schema_is_compatible`, `base_max_id`, `build`, `build_in_current_transaction`, and
+   `candidates`) must use rusqlite 0.41 connections, available through
+   `ai_session_search::rusqlite` without a separate dependency. Replace these helpers with
+   `IndexService::reindex_report` for index preparation and `MessageService::search` for queries.
 
 ### Added
 
@@ -209,9 +215,10 @@ they describe the named workloads, not a release-build latency guarantee.
 
 ### Security
 
-1. Bundled SQLite moves to 3.54.1 to address RUSTSEC-2026-0459; `rmcp` moves to 3.9.0 to address
-   RUSTSEC-2026-0462. Source builds require Rust 1.89 or newer; prebuilt CLI and MCP installations
-   need no Rust compiler.
+1. Bundled SQLite 3.54.1 fixes RUSTSEC-2026-0459, which could expose process memory when opening
+   a database beside a crafted write-ahead-log file with a different page size.
+2. `rmcp` moves to 3.9.0 to address RUSTSEC-2026-0462. Source builds require Rust 1.89 or newer;
+   prebuilt CLI and MCP installations need no Rust compiler.
 
 ## [1.0.0] - 2026-11-05
 

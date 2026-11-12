@@ -1355,21 +1355,30 @@ fn legacy_user_role_authorship_preserves_provider_evidence() {
 
 #[test]
 #[allow(deprecated)]
-fn published_trigram_helpers_accept_a_rusqlite_0_40_connection() {
-    use ai_session_search::{runtime::ExecutionRuntime, trigram_index};
+fn deprecated_trigram_helpers_accept_the_reexported_connection() {
+    use ai_session_search::{runtime::ExecutionRuntime, rusqlite, trigram_index};
     let connection = rusqlite::Connection::open_in_memory().unwrap();
     trigram_index::ensure_schema(&connection).unwrap();
     assert!(trigram_index::schema_is_compatible(&connection).unwrap());
     assert_eq!(trigram_index::base_max_id(&connection).unwrap(), 0);
-    let _build: fn(
-        &rusqlite::Connection,
-        &ExecutionRuntime,
-    ) -> ai_session_search::anyhow::Result<i64> = trigram_index::build;
-    let _transaction: fn(
-        &rusqlite::Connection,
-        &ExecutionRuntime,
-    ) -> ai_session_search::anyhow::Result<i64> = trigram_index::build_in_current_transaction;
-    assert!(trigram_index::candidates(&connection, &[])
-        .unwrap()
-        .is_empty());
+    connection
+        .execute_batch(
+            "create table messages (id integer primary key, content text);
+                        insert into messages values (1, 'hello sqlite');",
+        )
+        .unwrap();
+    let runtime = ExecutionRuntime::new(std::num::NonZeroUsize::new(1).unwrap());
+    assert_eq!(trigram_index::build(&connection, &runtime).unwrap(), 1);
+    let transaction = connection.unchecked_transaction().unwrap();
+    assert_eq!(
+        trigram_index::build_in_current_transaction(&transaction, &runtime).unwrap(),
+        1
+    );
+    transaction.commit().unwrap();
+    assert_eq!(trigram_index::base_max_id(&connection).unwrap(), 1);
+    assert!(
+        trigram_index::candidates(&connection, &[vec!["hel".into()]])
+            .unwrap()
+            .contains(&1)
+    );
 }

@@ -125,6 +125,9 @@ pub use models::{
     FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,
     SessionKind, SessionQuery,
 };
+/// The SQLite binding used by the deprecated [`trigram_index`] helpers, re-exported so callers
+/// can construct their exact `Connection` type without a separate version-matched dependency.
+pub use rusqlite;
 pub use search_scope::{
     AccessRoot, AccessRootOrigin, AccessRootSource, EffectiveAccessScope, TrustedAccessInputs,
 };
