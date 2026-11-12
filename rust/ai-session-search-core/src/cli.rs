@@ -878,26 +878,79 @@ where
         .chain(command_tokens.iter().cloned())
         .collect::<Vec<_>>();
     Cli::try_parse_from(&normalized)
-        .map_err(|error| clarify_stale_message_argument(error, &command_tokens))
+        .map_err(|error| clarify_mistaken_argument(error, &command_tokens))
 }
 
-/// Replace Clap's edit-distance guess only for removed message-search arguments whose meaning is
-/// known. The stale names remain rejected: accepting aliases would silently preserve old scope
-/// semantics. `command_tokens` are the arguments after the hoisted globals, so a leading
-/// `--index-refresh` does not hide the subcommand; the offending flag comes from the error's own
-/// `InvalidArg` context, so `--project=/x` is recognized too, and the usage line is replaced with
-/// the subcommand's real usage rather than the one clap built around its guess. O(A) over the
-/// argument vector with O(1) extra state.
-fn clarify_stale_message_argument(
-    mut error: clap::Error,
-    command_tokens: &[OsString],
-) -> clap::Error {
+/// An argument name that a command rejects but whose intended meaning is known.
+struct MistakenArgument {
+    /// Subcommand path below `aise` that rejects the name.
+    command: &'static [&'static str],
+    /// The rejected long flag, as typed.
+    name: &'static str,
+    /// What to type instead; rendered as clap's "a similar argument exists" tip.
+    replacement: &'static str,
+    /// A further tip line, or "" for none.
+    note: &'static str,
+}
+
+/// Mistaken argument names and what replaces each. They stay rejected: accepting aliases would
+/// silently preserve old or different semantics (`--path` on `aise search` scopes sessions, so the
+/// same spelling on a message command would mean two things).
+///
+/// Two shapes of rename, neither reachable through clap's edit distance. A scope rename maps name
+/// to name, where clap either guesses a near-miss with the wrong meaning (`--project` guesses
+/// `--role`) or guesses nothing (`--type`, `--path`). A mode rename maps a bare flag to a flag AND
+/// a value, so no single argument name is close enough and clap offers nothing at all. Removing any
+/// row restores that build's behavior, which the tests cover in both directions.
+const MISTAKEN_ARGUMENTS: &[MistakenArgument] = &[
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--project",
+        replacement: "--workspace-path",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--path",
+        replacement: "--workspace-path",
+        note: "--path is the session-level filter of `aise search` and `aise list`",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--type",
+        replacement: "--role",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--regex",
+        replacement: "--query-mode regex",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--fuzzy",
+        replacement: "--query-mode fuzzy",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--explain",
+        replacement: "--receipt-level summary",
+        note: "",
+    },
+];
+
+/// Replace Clap's edit-distance guess for a [`MISTAKEN_ARGUMENTS`] row. `command_tokens` are the
+/// arguments after the hoisted globals, so a leading `--index-refresh` does not hide the
+/// subcommand; the offending flag comes from the error's own `InvalidArg` context, so
+/// `--project=/x` is recognized too, and the usage line is replaced with the subcommand's real
+/// usage rather than the one clap built around its guess. O(A + R) over the argument vector and
+/// the table.
+fn clarify_mistaken_argument(mut error: clap::Error, command_tokens: &[OsString]) -> clap::Error {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
 
-    if error.kind() != ErrorKind::UnknownArgument
-        || command_tokens.first().and_then(|value| value.to_str()) != Some("messages")
-        || command_tokens.get(1).and_then(|value| value.to_str()) != Some("search")
-    {
+    if error.kind() != ErrorKind::UnknownArgument {
         return error;
     }
     let invalid = match error.get(ContextKind::InvalidArg) {
@@ -907,46 +960,47 @@ fn clarify_stale_message_argument(
     let stale = invalid
         .split_once('=')
         .map_or(invalid.as_str(), |(name, _)| name);
-    // Two shapes of rename, neither reachable through clap's edit distance. A scope rename maps name
-    // to name, where clap either guesses a near-miss with the wrong meaning — `--project` guesses
-    // `--role`, the defect this table was built for — or, as with `--type`, guesses nothing. A mode
-    // rename maps a bare flag to a flag AND a value, so no single argument name is close enough and
-    // clap offers nothing at all. Removing any row below restores that build's behavior, which the
-    // tests cover in both directions.
-    let replacement = match stale {
-        "--project" => "--workspace-path",
-        "--type" => "--role",
-        "--regex" => "--query-mode regex",
-        "--fuzzy" => "--query-mode fuzzy",
-        "--explain" => "--receipt-level summary",
-        _ => return error,
+    let Some(row) = MISTAKEN_ARGUMENTS.iter().find(|row| {
+        row.name == stale
+            && command_tokens.len() >= row.command.len()
+            && row
+                .command
+                .iter()
+                .zip(command_tokens)
+                .all(|(name, token)| token.to_str() == Some(name))
+    }) else {
+        return error;
     };
     error.insert(
         ContextKind::SuggestedArg,
-        ContextValue::String(replacement.to_string()),
+        ContextValue::String(row.replacement.to_string()),
     );
     // clap adds `to pass '--type' as a value, use '-- --type'` whenever it has no suggestion of its
-    // own, which is every mode rename plus `--type`. Searching for the literal text `--type` is
-    // never what someone who typed a retired flag meant, so that tip competes with the answer this
-    // table just supplied. Clearing it is also what makes all five renames render alike: `--project`
-    // never showed the tip, because clap did have a guess there — the wrong one.
+    // own. Searching for the literal text `--type` is never what someone who typed a retired flag
+    // meant, so that tip competes with the answer this table just supplied; the row's own note, if
+    // any, takes its place.
     //
-    // This clears a whole context slot, and for an unknown argument clap fills that slot with one of
-    // exactly two things: the pass-as-value tip above, or `'<subcommand> <flag>' exists` when the
+    // This replaces a whole context slot, and for an unknown argument clap fills that slot with one
+    // of exactly two things: the pass-as-value tip above, or `'<subcommand> <flag>' exists` when the
     // flag belongs to a child command. Only the first is reachable here, because clap looks for that
-    // second case among the current command's children and `messages search` has none — an invariant
-    // `message_search_has_no_subcommands_so_clearing_the_suggestion_slot_drops_only_the_value_tip`
+    // second case among the current command's children and no command in the table has any, an
+    // invariant `mistaken_argument_commands_have_no_subcommands_so_the_suggestion_slot_holds_only_the_value_tip`
     // holds, so adding a child command fails there rather than silently deleting its suggestion.
-    error.insert(ContextKind::Suggested, ContextValue::None);
+    let note = if row.note.is_empty() {
+        ContextValue::None
+    } else {
+        ContextValue::StyledStrs(vec![row.note.into()])
+    };
+    error.insert(ContextKind::Suggested, note);
     // `build()` propagates the binary-name chain, so the usage reads `aise messages search ...`
     // rather than the bare `search ...` an unbuilt subcommand renders.
     let mut root = Cli::command();
     root.build();
-    if let Some(usage) = root
-        .find_subcommand_mut("messages")
-        .and_then(|messages| messages.find_subcommand_mut("search"))
-        .map(clap::Command::render_usage)
-    {
+    let mut command = Some(&mut root);
+    for name in row.command {
+        command = command.and_then(|parent| parent.find_subcommand_mut(name));
+    }
+    if let Some(usage) = command.map(|command| command.render_usage()) {
         error.insert(ContextKind::Usage, ContextValue::StyledStr(usage));
     }
     error
@@ -4143,33 +4197,83 @@ mod tests {
         }
     }
 
-    /// Clearing clap's suggestion slot for a renamed flag can only drop the pass-as-value tip.
+    /// Replacing clap's suggestion slot for a renamed flag can only drop the pass-as-value tip.
     ///
-    /// `clarify_stale_message_argument` clears `ContextKind::Suggested` whole. For an unknown
+    /// `clarify_mistaken_argument` replaces `ContextKind::Suggested` whole. For an unknown
     /// argument clap fills that slot with one of two things: the pass-as-value tip, or
     /// `'<subcommand> <flag>' exists` when the flag belongs to a child of the command that rejected
-    /// it. The second is what makes clearing the slot lossy, and it is unreachable only while
-    /// `messages search` has no children — `--regex`, for one, is a real flag on `aise repeats`, so
-    /// the case is not hypothetical, only out of reach from this command. Giving `messages search`
-    /// a subcommand would put it in reach; this fails first.
+    /// it. The second is what makes replacing the slot lossy, and it is unreachable only while
+    /// every command in `MISTAKEN_ARGUMENTS` has no children. `--regex`, for one, is a real flag
+    /// on `aise repeats`, so the case is not hypothetical. Giving one of those commands a
+    /// subcommand would put it in reach; this fails first.
     #[test]
-    fn message_search_has_no_subcommands_so_clearing_the_suggestion_slot_drops_only_the_value_tip()
-    {
+    fn mistaken_argument_commands_have_no_subcommands_so_the_suggestion_slot_holds_only_the_value_tip(
+    ) {
         let mut root = Cli::command();
         root.build();
-        let search = root
-            .find_subcommand_mut("messages")
-            .and_then(|messages| messages.find_subcommand_mut("search"))
-            .expect("messages search exists");
-        let children: Vec<_> = search
-            .get_subcommands()
-            .map(clap::Command::get_name)
-            .collect();
-        assert!(
-            children.is_empty(),
-            "clearing the suggestion slot would now delete clap's `'<subcommand> <flag>' exists` \
-             tip: {children:?}"
-        );
+        for row in MISTAKEN_ARGUMENTS {
+            let mut command = Some(&mut root);
+            for name in row.command {
+                command = command.and_then(|parent| parent.find_subcommand_mut(name));
+            }
+            let command = command.unwrap_or_else(|| panic!("{:?} exists", row.command));
+            let children: Vec<_> = command
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .collect();
+            assert!(
+                children.is_empty(),
+                "{:?}: replacing the suggestion slot would now delete clap's \
+                 `'<subcommand> <flag>' exists` tip: {children:?}",
+                row.command
+            );
+            // A row whose name the command accepts would never be reached, and would hide a
+            // working flag behind a rename if clap's matching ever changed.
+            assert!(
+                command
+                    .get_arguments()
+                    .all(|argument| argument.get_long() != row.name.strip_prefix("--")),
+                "{:?} accepts {}",
+                row.command,
+                row.name
+            );
+        }
+    }
+
+    /// `--path` is the session-level filter of `aise search` and `aise list`; on
+    /// `aise messages search` the same scope is `--workspace-path`. Before the table named it,
+    /// clap answered with its pass-as-value tip, telling the caller to search for the text `--path`.
+    #[test]
+    fn messages_search_path_names_workspace_path_and_where_path_belongs() {
+        for invocation in [
+            vec!["aise", "messages", "search", "workflow", "--path", "/tmp/p"],
+            vec!["aise", "messages", "search", "--path=/tmp/p", "workflow"],
+        ] {
+            let error = parse_cli_from(invocation.clone()).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{invocation:?}"
+            );
+            assert_ne!(error.exit_code(), 0, "{invocation:?}");
+            let text = error.to_string();
+            assert!(
+                text.contains("a similar argument exists: '--workspace-path'"),
+                "{invocation:?}: {text}"
+            );
+            assert!(
+                text.contains("session-level filter of `aise search` and `aise list`"),
+                "{invocation:?}: {text}"
+            );
+            assert!(!text.contains("as a value"), "{invocation:?}: {text}");
+            assert!(
+                text.contains("Usage: aise messages search [OPTIONS] [QUERY]"),
+                "{invocation:?}: {text}"
+            );
+        }
+        // The session-level commands keep their own `--path`.
+        assert_parses(["aise", "search", "workflow", "--path", "/tmp/p"]);
+        assert_parses(["aise", "list", "--path", "/tmp/p"]);
     }
 
     /// The renames stay rejections, never working aliases: accepting `--regex` would keep two
