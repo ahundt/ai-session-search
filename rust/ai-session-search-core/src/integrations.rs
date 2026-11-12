@@ -2877,7 +2877,9 @@ fn custom_skill_targets(paths: &[PathBuf]) -> Result<Vec<SkillTarget>> {
 
 fn client_detected(path: &Path, detect_paths: &[PathBuf], detect_binaries: &[&str]) -> bool {
     path.exists()
-        || detect_paths.iter().any(|path| path.exists() && path.is_dir())
+        || detect_paths
+            .iter()
+            .any(|path| path.exists() && path.is_dir())
         || detect_binaries.iter().any(|binary| which(binary).is_some())
 }
 
