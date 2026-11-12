@@ -4322,6 +4322,18 @@ const REPLACED_TOOL_PARAMETERS: &[ReplacedToolParameter] = &[
     },
     ReplacedToolParameter {
         tool: "search_messages",
+        name: "regex",
+        replacements: &["query", "query_mode"],
+        value_change: "pass the pattern as query with query_mode \"regex\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "fuzzy_query",
+        replacements: &["query", "query_mode"],
+        value_change: "pass the text as query with query_mode \"fuzzy\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
         name: "tool",
         replacements: &["tool_name_contains"],
         value_change: "",
@@ -11604,6 +11616,14 @@ mod tests {
                     "search_messages",
                     json!({"query": "hello", "path_prefix": "/x"}),
                     &["use \"workspace_path_prefix\" or \"transcript_path_prefix\" instead"],
+                ),
+                (
+                    "search_messages",
+                    json!({"regex": "hel+o"}),
+                    &[
+                        "use \"query\" or \"query_mode\" instead",
+                        "query_mode \"regex\"",
+                    ],
                 ),
                 (
                     "get_session",
