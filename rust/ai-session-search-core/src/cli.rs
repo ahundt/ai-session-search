@@ -17,7 +17,7 @@ use crate::dates::DateRange;
 use crate::db::Db;
 use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
 use crate::indexer;
-use crate::inspect::{inspection_rows, InspectionOptions};
+use crate::inspect::InspectionOptions;
 use crate::migration::{
     import_legacy_config, load_receipt, migrate_database, publish_imported_config,
     recover_database_migration, verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
@@ -726,6 +726,10 @@ struct ShowArgs {
     /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
     raw: bool,
+    /// Output format. Table (default) keeps the transcript view; JSON/JSONL include text,
+    /// normalized session metadata and line-window extent. CSV/plain emit one transcript row.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table, conflicts_with = "raw")]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -1413,7 +1417,7 @@ fn execute(cli: Cli) -> Result<()> {
                     include_time_profile: false,
                 };
                 let inspection = app.catalog().inspect(&args.id, options)?;
-                render_rows(&inspection_rows(&inspection, options), OutputFormat::Table)?;
+                crate::messages::emit_inspection(&inspection, options, args.format)?;
                 schedule_auto_refresh_after_output(
                     &config,
                     db,
@@ -1427,13 +1431,26 @@ fn execute(cli: Cli) -> Result<()> {
                 args.transcript_lines
                     .unwrap_or(config.cli.show_transcript_lines),
             )?;
-            print_session_detail(&window.session);
-            let (transcript, returned_lines) = (window.text, window.lines_label);
-            if args.raw {
-                println!("\n{transcript}");
+            if args.format == OutputFormat::Table {
+                print_session_detail(&window.session);
+                let (transcript, returned_lines) = (window.text, window.lines_label);
+                if args.raw {
+                    println!("\n{transcript}");
+                } else {
+                    println!("\nTranscript lines returned: {returned_lines}");
+                    println!("\nTranscript\n{transcript}\n");
+                }
             } else {
-                println!("\nTranscript lines returned: {returned_lines}");
-                println!("\nTranscript\n{transcript}\n");
+                let mut record = serde_json::to_value(&window)?;
+                if let Some(session) = record["session"].as_object_mut() {
+                    session.remove("raw_metadata_json");
+                }
+                crate::render::render_record(
+                    &record,
+                    std::slice::from_ref(&window),
+                    args.format,
+                    &mut io::stdout().lock(),
+                )?;
             }
         }
         Commands::Resume(args) => {
@@ -2097,15 +2114,6 @@ fn run_background_refresh_from_stdin() -> Result<()> {
     Ok(())
 }
 
-/// Render rows to stdout in a non-table machine format (json/jsonl/csv/plain).
-fn render_rows<T: serde::Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
-}
-
 struct SessionRecordOutput<'a> {
     session: &'a SessionRecord,
     include_raw_metadata: bool,
@@ -2236,6 +2244,30 @@ fn render_session_rows_to<T: SessionMachineOutput, W: Write>(
         }
     }
     Ok(())
+}
+
+impl Row for crate::service::TranscriptWindow {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "session",
+            "provider",
+            "total_lines",
+            "lines_returned",
+            "complete",
+            "text",
+        ]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.session.id.clone(),
+            self.session.provider.as_str().into(),
+            self.total_lines.to_string(),
+            self.lines_returned.to_string(),
+            self.complete.to_string(),
+            self.text.clone(),
+        ]
+    }
 }
 
 fn configured_search_limit(limit: Option<usize>, config: &Config) -> usize {

@@ -92,6 +92,7 @@
     {"name": "the last tied conversation pair", "seq": 239, "expected": [[239, "user"], [239, "assistant"]]},
     {"name": "a tool call and its result sharing a seq", "seq": 305, "expected": [[305, "assistant"], [305, "tool"]]}
   ],
+  "transcript_read": {"source":"first\nsecond\nthird","lines":-2,"expected":"second\nthird","total_lines":3,"lines_returned":2},
   "context_reads": [
     {"name":"forward context only","seq_parameters":["seq","message_seq"],"seq":0,"before":0,"after":2,"expected":[[0,"user"],[1,"user"],[2,"user"]]}
   ],

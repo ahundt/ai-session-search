@@ -1847,7 +1847,7 @@ fn emit_message_hits(
     emit(&rows, format)
 }
 
-fn emit_inspection(
+pub(crate) fn emit_inspection(
     inspection: &crate::inspect::SessionInspection,
     options: InspectionOptions,
     format: OutputFormat,

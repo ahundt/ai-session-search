@@ -928,3 +928,52 @@ fn timeline_keeps_all_rows_when_search_has_an_operation_default() {
         String::from_utf8_lossy(&help.stdout).contains("ignores message-search operation limits")
     );
 }
+
+#[test]
+fn show_json_preserves_the_shared_transcript_window() {
+    let f = fixture();
+    let db = Db::open(&f.db_path).unwrap();
+    let read = &f.spec["transcript_read"];
+    let mut parsed = ParsedSession::new(
+        SessionRecord::new(
+            "claude:show",
+            Provider::Claude,
+            "show",
+            "/fixture/show.jsonl",
+            "test",
+            "fixture",
+        ),
+        vec![],
+    );
+    parsed.transcript_text = read["source"].as_str().unwrap().into();
+    db.upsert_session(&parsed, 0, 0).unwrap();
+    let expected = ai_session_search::service::CatalogService::new(&db)
+        .transcript("claude:show", -2)
+        .unwrap();
+    let output = aise(&f)
+        .args([
+            "show",
+            "claude:show",
+            "--transcript-lines",
+            "-2",
+            "--format",
+            "json",
+            "--index-refresh",
+            "existing-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let got: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(got["text"], expected.text);
+    assert_eq!(got["text"], read["expected"]);
+    assert_eq!(got["total_lines"], read["total_lines"]);
+    assert_eq!(got["lines_returned"], read["lines_returned"]);
+    assert_eq!(got["edge"], "tail");
+    assert_eq!(got["complete"], false);
+    assert!(got["session"].get("raw_metadata_json").is_none());
+}
