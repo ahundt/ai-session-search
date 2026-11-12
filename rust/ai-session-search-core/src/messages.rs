@@ -913,6 +913,9 @@ pub struct MessageGetArgs {
 
 #[derive(Debug, Args)]
 #[non_exhaustive]
+#[command(
+    after_help = "Unlike messages search, timeline ignores message-search operation limits and purpose defaults: omitted --limit reads every selected message. --order newest selects the final N, then prints them chronologically."
+)]
 pub struct TimelineArgs {
     /// Session id or prefix.
     pub id: String,

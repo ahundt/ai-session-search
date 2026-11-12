@@ -863,3 +863,68 @@ fn asymmetric_context_reads_agree_across_surfaces() {
         }
     }
 }
+
+#[test]
+fn timeline_keeps_all_rows_when_search_has_an_operation_default() {
+    let f = fixture();
+    let mut config = std::fs::read_to_string(&f.config).unwrap();
+    config.push_str("\n[search.message-search]\ndefault_limit = 1\n");
+    std::fs::write(&f.config, config).unwrap();
+    let session = f.spec["session_id"].as_str().unwrap();
+    let difference = &f.spec["deliberate_differences"]["timeline_operation_limit"];
+    let timeline = aise(&f)
+        .args([
+            "messages",
+            "timeline",
+            session,
+            "--grep",
+            "bulk row",
+            "--format",
+            "json",
+            "--index-refresh",
+            "existing-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        timeline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&timeline.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&timeline.stdout).unwrap();
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        difference["timeline_rows"].as_u64().unwrap() as usize
+    );
+    let search = aise(&f)
+        .args([
+            "messages",
+            "search",
+            "bulk row",
+            "--session-id",
+            session,
+            "--format",
+            "json",
+            "--index-refresh",
+            "existing-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(
+        rows["results"].as_array().unwrap().len(),
+        difference["search_rows"].as_u64().unwrap() as usize
+    );
+    let help = aise(&f)
+        .args(["messages", "timeline", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("ignores message-search operation limits")
+    );
+}

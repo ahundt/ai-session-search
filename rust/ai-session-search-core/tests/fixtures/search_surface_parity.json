@@ -99,6 +99,7 @@
     {"name": "the newest three rows cut inside a tied pair", "limit": 3, "expected": [[304, "tool"], [305, "assistant"], [305, "tool"]]}
   ],
   "deliberate_differences": {
+    "timeline_operation_limit": {"operation_limit":1,"timeline_rows":20,"search_rows":1},
     "omitted_limit": {
       "requirement": "REQ003-preserve-surface-semantics",
       "query": "bulk row",
