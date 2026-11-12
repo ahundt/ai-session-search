@@ -299,6 +299,11 @@ deliberately supply a finite operation-level default before the surface default 
 This distinction applies to result membership. Separate presentation windows may shorten displayed
 content without removing a result.
 
+MCP `get_session` and message search use `detail=compact|full` for character presentation.
+`get_session.response_format=concise|detailed` remains an accepted deprecated alias with matching
+values; conflicting simultaneous settings fail. MCP describes deprecation in the schema and
+keeps stderr silent. Neither spelling changes message membership or the signed line window.
+
 ### REQ004-separate-retrieval-presentation
 
 Line windows, field-view limits, match-view budgets, response formats, and whitespace

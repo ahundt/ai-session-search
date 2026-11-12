@@ -52,7 +52,7 @@ def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def cli(search, *args):
     env = dict(os.environ, AI_SESSION_SEARCH_DATABASE=str(search.db_path))
-    preparation = [] if args[0] == "db" else ["--index-refresh", "existing-only"]
+    preparation = [] if args[0] in {"db", "mcp"} else ["--index-refresh", "existing-only"]
     result = subprocess.run(
         [str(CLI), *preparation, *args], env=env,
         text=True, capture_output=True, check=False,
@@ -361,3 +361,31 @@ def test_file_query_default_matches_cli_without_hidden_fifty_row_limit(corpus):
     assert len(files) == 60
     assert [row.to_dict() for row in files] == cli(corpus, "files", "search", "generated-*.py", "--format", "json")
     assert len(corpus.search_files("generated-*.py", aise.FileQuery(limit=1))) == 1
+
+
+def mcp_call(search, arguments):
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "synthetic-test", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_session", "arguments": dict(arguments, index_refresh="existing-only")}},
+    ]
+    result = subprocess.run([str(CLI), "mcp", "serve"], input="".join(json.dumps(row) + "\n" for row in requests), env=dict(os.environ, AI_SESSION_SEARCH_DATABASE=str(search.db_path)), text=True, capture_output=True, check=True, timeout=15)
+    response = next(row for line in result.stdout.splitlines() if (row := json.loads(line)).get("id") == 2)
+    assert "error" not in response, response
+    return response["result"]
+
+
+@pytest.mark.integration
+def test_detail_vocabulary_is_shared_and_legacy_spelling_is_deprecated(corpus):
+    args = {"session_id": "synthetic-0", "message_seq": 0, "preview_chars": 5}
+    full = mcp_call(corpus, dict(args, detail="full"))
+    assert not full.get("isError"), full
+    legacy = mcp_call(corpus, dict(args, response_format="detailed"))
+    assert full["structuredContent"] == legacy["structuredContent"]
+    compact = mcp_call(corpus, dict(args, detail="compact"))
+    assert len(full["structuredContent"]["messages"][0]["content"]) > len(compact["structuredContent"]["messages"][0]["content"])
+    conflict = mcp_call(corpus, dict(args, detail="full", response_format="concise"))
+    assert conflict["isError"]
+    catalogue = cli(corpus, "mcp", "schema-budget", "--catalogue")
+    tool = next(tool for tool in catalogue if tool["name"] == "get_session")
+    assert tool["inputSchema"]["properties"]["response_format"]["description"].startswith("Deprecated: use detail")

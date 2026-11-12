@@ -4407,12 +4407,6 @@ const REPLACED_TOOL_PARAMETERS: &[ReplacedToolParameter] = &[
         value_change: "include_refs true is include [\"parsed_references\"]",
     },
     ReplacedToolParameter {
-        tool: "get_session",
-        name: "detail",
-        replacements: &["response_format"],
-        value_change: "response_format takes \"concise\" or \"detailed\" where search_messages detail takes \"compact\" or \"full\"",
-    },
-    ReplacedToolParameter {
         tool: "search_sessions",
         name: "workspace_path_prefix",
         replacements: &["path_prefix"],
@@ -4780,10 +4774,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer",
                                 "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message)
                             },
+                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "For focused context or ranges: compact caps content at preview_chars; full keeps all characters after lines_per_message. Omit for compact." },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
-                                "description": "When message_seq is provided, concise (default) applies preview_chars after the per-message line window; detailed applies no additional character cap after that line window."
+                                "description": "Deprecated: use detail compact/full instead of response_format concise/detailed. Applies to focused context and ranges. Omit for concise when detail is absent."
                             }
                         },
                         "required": ["session_id"],
@@ -5127,6 +5122,13 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             args,
             "kinds",
             "kinds only applies with seq_from/seq_to; focused context already includes every class",
+        )?;
+    }
+    if !has_range && message_seq.is_none() {
+        reject_present(
+            args,
+            "detail",
+            "detail only applies with message_seq or seq_from/seq_to",
         )?;
     }
     let selector_count = summary as usize
@@ -6737,8 +6739,19 @@ impl MessagePresentation {
     fn from_args(args: &Value, config: &Config) -> Result<Self, String> {
         let preview_chars =
             mcp_positive_usize_arg(args, "preview_chars", config.mcp.preview_chars.max(1))?;
-        let field_view = if args.get("response_format").and_then(Value::as_str) == Some("detailed")
-        {
+        let detail = parse_message_search_detail(args)?;
+        let legacy = match args.get("response_format").and_then(Value::as_str) {
+            Some("concise") => Some(DetailLevel::Compact),
+            Some("detailed") => Some(DetailLevel::Full),
+            None => None,
+            Some(other) => return Err(format!("response_format must be concise or detailed; got {other:?}; use detail compact/full")),
+        };
+        if let (Some(detail), Some(legacy)) = (detail, legacy) {
+            if detail != legacy {
+                return Err("detail conflicts with deprecated response_format; use detail compact/full alone".to_string());
+            }
+        }
+        let field_view = if detail.or(legacy) == Some(DetailLevel::Full) {
             FieldViewBudget::NoCharLimit
         } else {
             FieldViewBudget::max_chars(preview_chars).map_err(|error| error.to_string())?
@@ -11717,14 +11730,6 @@ mod tests {
                     &[
                         "use \"query\" or \"query_mode\" instead",
                         "query_mode \"regex\"",
-                    ],
-                ),
-                (
-                    "get_session",
-                    json!({"session_id": "claude:test1", "detail": "full"}),
-                    &[
-                        "unknown get_session parameter at arguments: detail",
-                        "use \"response_format\" instead",
                     ],
                 ),
                 (

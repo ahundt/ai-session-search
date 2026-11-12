@@ -215,7 +215,8 @@ aise resume SESSION_ID
 
 Range reads omit harness notices by default; an explicit `--kinds` list can include them.
 MCP `get_session` ranges accept `kinds=["conversation", "harness_notice"]`. Focused context
-already includes every class.
+already includes every class. MCP focused/range reads use `detail="compact"|"full"`, like
+message search; `response_format="concise"|"detailed"` remains a deprecated alias.
 
 Signed windows share one convention on every surface: positive keeps the first N records or
 lines, negative the last N, zero everything (which may be large). `--limit` on `messages get`
