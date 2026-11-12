@@ -12715,6 +12715,39 @@ mod tests {
     }
 
     #[test]
+    fn session_search_limited_snippets_equal_the_unlimited_ordered_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for n in 0..140 {
+            let mut parsed = crate::util::minimal_record(
+                Provider::Claude,
+                Path::new("/fixture/session.jsonl"),
+                String::new(),
+            );
+            parsed.session.id = format!("claude:snippet-{n:03}");
+            parsed.session.source_path = format!("/fixture/snippet-{n:03}.jsonl");
+            parsed.session.provider_session_id = format!("snippet-{n:03}");
+            parsed.session.title = Some(format!("session {n}"));
+            parsed.transcript_text = format!("{} needle-{n} final", "background ".repeat(300));
+            db.upsert_session(&parsed, 0, 0).unwrap();
+        }
+        let mut scoring = crate::config::ScoringConfig::default();
+        scoring.recency_weight = 0;
+        let mut filters = SearchFilters::default();
+        let all = db.search("needle", &filters, None, &scoring).unwrap();
+        assert_eq!(all.len(), 140);
+        assert!(all
+            .iter()
+            .all(|hit| hit.match_source == "transcript" && hit.match_snippet.contains("needle")));
+        filters.limit = 3;
+        let limited = db.search("needle", &filters, None, &scoring).unwrap();
+        assert_eq!(
+            serde_json::to_value(&limited).unwrap(),
+            serde_json::to_value(&all[..3]).unwrap()
+        );
+    }
+
+    #[test]
     fn session_search_uses_the_application_worker_runtime_without_changing_ranking() {
         let root = tempfile::tempdir().unwrap();
         let one = Db::open_with_threads(
