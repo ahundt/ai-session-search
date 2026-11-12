@@ -69,7 +69,7 @@ pub use analysis_publication::{
     AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
 };
 pub use cli::run_from as run_cli_from;
-pub use corrections::{CapabilityReceipt, MessageClassificationReport};
+pub use corrections::{CapabilityReceipt, CorrectionCategorySpec, MessageClassificationReport};
 pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
 pub use message_search::{

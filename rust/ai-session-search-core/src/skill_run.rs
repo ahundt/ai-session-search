@@ -48,6 +48,17 @@ pub struct MessageClassificationDefinition {
     pub categories: Vec<CorrectionCategorySpec>,
 }
 
+impl MessageClassificationDefinition {
+    /// Classify with `categories`, evaluated in order; the first category whose patterns match
+    /// a message is the one reported.
+    ///
+    /// The run that uses this definition rejects an empty list, a repeated category name, a
+    /// category without patterns, and a pattern that is invalid or matches empty text.
+    pub fn new(categories: Vec<CorrectionCategorySpec>) -> Self {
+        Self { categories }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "capability",

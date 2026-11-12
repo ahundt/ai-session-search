@@ -70,9 +70,27 @@ pub struct CorrectionPolicySpec {
 /// One named category. Patterns within a category are ORed; the category is the reported label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CorrectionCategorySpec {
     pub name: String,
     pub patterns: Vec<String>,
+}
+
+impl CorrectionCategorySpec {
+    /// Category `name`, reported as the match label, matching any of `patterns`.
+    ///
+    /// Patterns are Rust `regex` syntax and are combined into one case-insensitive alternation,
+    /// so a message is reported at the leftmost text any pattern matches. They are validated
+    /// when a run compiles the category, not here.
+    pub fn new(
+        name: impl Into<String>,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            patterns: patterns.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// Name, version, and source-appropriate digest of the rules that produced a result.
