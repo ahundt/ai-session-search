@@ -2237,6 +2237,14 @@ pub(crate) fn tool_result_id(message: &Value) -> Option<&str> {
 /// leaving the evidence reachable.
 fn is_harness_notice(value: &Value, text: &str) -> bool {
     let normalized = text.trim();
+    if value["type"] == "user"
+        && matches!(
+            normalized,
+            "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
+        )
+    {
+        return true;
+    }
     // Claude Code's own marker for bookkeeping injected as role:user: local-command caveats,
     // hook feedback ("Stop hook feedback: …"), system notices.
     if value
@@ -5032,6 +5040,43 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn interrupt_only_user_records_are_harness_notices() {
+        let lines = [
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
+            "the marker [Request interrupted by user] is documented",
+        ]
+        .into_iter()
+        .map(|text| {
+            json!({"type":"user","sessionId":"interrupt","message":{"role":"user","content":text}})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(lines),
+                std::path::Path::new("/tmp/interrupt.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(
+            parsed.messages.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            [
+                crate::models::MessageKind::HarnessNotice,
+                crate::models::MessageKind::HarnessNotice,
+                crate::models::MessageKind::Conversation
+            ]
+        );
+        assert_eq!(
+            parsed.messages[2].provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        assert!(!parsed
+            .transcript_text
+            .contains("user\n[Request interrupted"));
     }
 
     #[test]

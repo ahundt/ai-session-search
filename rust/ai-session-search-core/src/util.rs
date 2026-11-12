@@ -2027,8 +2027,8 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v11",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v11",
+        Provider::Claude => "claude-v12",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v12",
         Provider::Codex => "codex-v9",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v5",
