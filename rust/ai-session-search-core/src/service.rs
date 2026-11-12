@@ -2335,11 +2335,14 @@ impl<'config> SqlService<'config> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CompactOutcome {
+    /// Bytes the database and its WAL occupied before compaction.
     pub before_bytes: u64,
+    /// Bytes they occupy after it.
     pub after_bytes: u64,
 }
 
 impl CompactOutcome {
+    /// `before_bytes - after_bytes`, or 0 when the database grew.
     pub const fn reclaimed_bytes(self) -> u64 {
         self.before_bytes.saturating_sub(self.after_bytes)
     }
@@ -2353,10 +2356,14 @@ pub struct MaintenanceService<'app> {
 }
 
 impl<'app> MaintenanceService<'app> {
+    /// Create a maintenance service; [`SessionSearch::maintenance`] is the usual way.
     pub const fn new(config: &'app Config, db: &'app Db) -> Self {
         Self { config, db }
     }
 
+    /// What `aise doctor --format json` reports: the database path, unknown config keys,
+    /// [`IndexStatus`] (parser health, stale sessions, readiness, repair commands), discovery
+    /// warnings, and per-provider health. Reads only; never refreshes.
     pub fn diagnostics(&self) -> Result<DiagnosticStatus> {
         crate::diagnostics::collect(self.config, self.db)
     }
@@ -2385,6 +2392,7 @@ pub struct IndexService<'app> {
 }
 
 impl<'app> IndexService<'app> {
+    /// Create an index service; [`SessionSearch::index`] is the usual way.
     pub const fn new(config: &'app Config, db: &'app Db) -> Self {
         Self { config, db }
     }
@@ -2729,6 +2737,8 @@ pub(crate) struct MessageSearchBatchVisitOutcome {
 }
 
 impl<'db> MessageService<'db> {
+    /// Create a message service whose unset limits follow `surface`'s documented defaults;
+    /// [`SessionSearch::messages`] is the usual way and uses the Rust surface.
     pub const fn new(config: &'db Config, db: &'db Db, surface: SearchSurface) -> Self {
         Self {
             config,
@@ -2814,6 +2824,9 @@ impl<'db> MessageService<'db> {
         self.db.search_messages(query, filters)
     }
 
+    /// Resolve a request into the plan [`MessageService::search`] would run, without searching:
+    /// the effective limits, context, presentation, and where each value came from (request,
+    /// purpose, configuration, or surface default). A session prefix is resolved here.
     pub fn plan(&self, request: MessageSearchRequest) -> Result<MessageSearchPlan> {
         self.db.ensure_refreshed_for_read()?;
         Self::plan_with_session_resolver(self.config, self.surface, request, |value| {

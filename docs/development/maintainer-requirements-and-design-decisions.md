@@ -748,6 +748,11 @@ whether to retire them is the maintainer's call because it removes a public tool
 `resume_plan` string formatting per returned session; no index read. Deferred until decided; the
 `REQ002-share-typed-contract` gap (Python has no resume) is part of the same change.
 
+Partly answered in 1.1.0: `CatalogService::resume_command` computes the command once at the
+shared typed layer as `ResumeCommand {session_id, argv, cwd, unavailable_reason}`, and `aise
+resume` and `get_resume_command` render it. Whether `get_session`, `aise show`, and the Python
+`SessionRecord` carry it is still open, as is the Python method.
+
 Recorded 2026-10-31 before 1.0.0 froze the surface: **what the public Rust API exposes.**
 
 `anyhow::Error` appears in the public signatures of the `lib.rs` error helpers,
@@ -758,12 +763,22 @@ wrapped, because a crate-local error enum would have to reproduce the downcast a
 behavior the CLI already depends on, and `anyhow` has held 1.x since 2019. Revisit if `anyhow`
 announces a 2.0.
 
-`aise vocab` and `aise repeats` reach `analytics::run_vocab` and `analytics::run_repeats` directly
-from `cli.rs`; neither is in `service.rs`, so neither has a typed request, an MCP tool, or a Python
-method. That is the same `REQ002-share-typed-contract` shape as the resume decision above, and it
-is recorded rather than fixed because both functions render to stdout and giving them a typed
-response is a design task, not a rename. Filling the gap later stays additive: a new typed request,
-a new Python method, and a new MCP tool break nothing, so 1.0.0 does not block it.
+`aise vocab` and `aise repeats` reached `analytics::run_vocab` and `analytics::run_repeats`
+directly from `cli.rs` through 1.0.0. In 1.1.0 both run through `AnalysisService::vocabulary`
+(`VocabularyQuery` to `TermFrequency` rows) and `AnalysisService::repeats` (`RepeatsQuery` to
+`RepeatsReport`), and the CLI functions only build the request and render. `aise repeats --format
+json` keeps its bare array of groups; `--report` prints the report object, which carries the
+unattributed-input count. The Rust vocabulary call refuses under an `allowed-roots` access scope
+because full-text term counts span every session; `aise vocab` still reads them under every scope,
+which is the remaining gap to decide. Neither has an MCP tool or a Python method yet; adding them
+stays additive.
+
+Read-only SQL goes through `SqlService` (`SessionSearch::sql`), which applies the `allowed-roots`
+refusal itself; `sql_query::run`, which took a path and skipped it, is deprecated. A library
+caller's first read on an index that has never been refreshed fails with
+`ServiceError::IndexNotRefreshed` until `IndexService::prepare_for_read` applies the configured
+policy; the CLI, MCP server, and Python binding keep serving such an index as empty through
+`SessionSearch::serve_unrefreshed_index_as_empty`.
 
 Those two decisions are why the clap argument structs are shaped the way they are. The externally
 reachable ones carry `#[non_exhaustive]` so that adding a flag stays an additive change

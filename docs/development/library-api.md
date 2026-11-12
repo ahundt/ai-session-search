@@ -154,6 +154,112 @@ Rustdoc on each service covers operation ordering, allocation, pagination,
 stale-index semantics, and errors. Filesystem writes take an explicit
 restore or publication plan, so no call chooses a destination on its own.
 
+Everything below is imported from the crate root. Library defaults differ from the command line
+in one way: a list or classification limit you leave at 0 returns every row, where the CLI
+applies `[search].default_limit` and `[analytics].corrections_limit` (50 each). Set a limit when
+the index may be large.
+
+```rust,no_run
+use ai_session_search::{
+    MessageClassificationQuery, MessageFilters, MessageKind, MessageOrder, MessageQuery,
+    MessageSearchRequest, MessageTarget, SearchFilters, SessionSearch, SkillCapabilityInput,
+    SkillCapabilityOutput, SkillRunQuery, SkillSelector, SqlQuery, FileQuery,
+};
+
+fn main() -> ai_session_search::anyhow::Result<()> {
+    let app = SessionSearch::load()?;
+    app.index().prepare_for_read()?;
+
+    // The 5 most recent sessions whose working directory is under a project.
+    let recent = app.catalog().list_sessions(
+        &SearchFilters::default()
+            .with_path_prefix("/home/me/project")
+            .with_limit(5),
+    )?;
+
+    // The exact message where something was said, with one message of context each side.
+    let request = MessageSearchRequest::builder(
+        MessageQuery::literal("run the tests")?,
+        MessageTarget::content(),
+    )
+    .context(ai_session_search::ContextWindow::symmetric(1))
+    .build()?;
+    for hit in app.messages().search(request)?.hits() {
+        println!("{} #{}", hit.session_id, hit.seq);
+    }
+
+    // How a session ended: its last 10 messages, returned oldest first.
+    if let Some(session) = recent.first() {
+        let last = app.messages().read_session(
+            &MessageFilters::default()
+                .with_session_id(session.id.clone())
+                .with_limit(10),
+            MessageOrder::NewestFirst,
+        )?;
+        println!("{} messages", last.len());
+    }
+
+    // An overwritten file: version 2 of every recorded edit to retry.py.
+    let version = app.files().reconstruct("retry.py", &FileQuery::default(), Some(2))?;
+    println!("{} bytes", version.content.len());
+
+    // Where the agent went wrong: user corrections, with the built-in categories.
+    let report = app.analysis().run_skill(&SkillRunQuery::new(
+        SkillSelector::name("corrections")?,
+        SkillCapabilityInput::MessageClassification(
+            MessageClassificationQuery::default()
+                .with_filters(MessageFilters::default().with_limit(50)),
+        ),
+    ))?;
+    if let SkillCapabilityOutput::MessageClassification(result) = report.output {
+        println!("{} corrections", result.report.matches.len());
+    }
+
+    // Harness notices (Stop-hook feedback and similar), which search leaves out by default.
+    let notices = MessageSearchRequest::builder(MessageQuery::All, MessageTarget::content())
+        .kind(MessageKind::HarnessNotice)
+        .build()?;
+    println!("{} notices", app.messages().search(notices)?.hits().len());
+
+    // Read-only SQL with the configured row limit.
+    let rows = app.sql().query(&SqlQuery::new("select provider, count(*) as n from sessions group by provider"))?;
+    println!("{:?}", rows.rows);
+    Ok(())
+}
+```
+
+### Errors
+
+Every call returns `anyhow::Result`. Failures a program branches on are
+`ai_session_search::ServiceError` (session not found, ambiguous prefix with its candidates, file
+not found, version out of range with the valid range, destination exists, index missing, index
+not refreshed, invalid argument) or `MessageSearchError`, each with a stable `code()`. Downcast
+the `anyhow::Error` before converting it: `?` into `Box<dyn std::error::Error>` keeps the message
+and loses the type.
+
+```rust,no_run
+use ai_session_search::{ServiceError, SessionSearch};
+
+fn main() -> ai_session_search::anyhow::Result<()> {
+    let app = SessionSearch::load()?;
+    app.index().prepare_for_read()?;
+    match app.catalog().resolve_session("claude:1234") {
+        Ok(session) => println!("{}", session.id),
+        Err(error) => match error.downcast_ref::<ServiceError>() {
+            Some(ServiceError::SessionPrefixAmbiguous { candidates, .. }) => {
+                println!("which one? {candidates:?}")
+            }
+            Some(other) => println!("{}: {other}", other.code()),
+            None => return Err(error),
+        },
+    }
+    Ok(())
+}
+```
+
+`SessionSearch` is `Send` but not `Sync`: it owns one SQLite connection. Move it to a thread,
+open one per thread, or share one behind a `Mutex`.
+
 ### Features
 
 To drop the network version-check dependency, disable the default feature:

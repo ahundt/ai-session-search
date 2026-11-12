@@ -25,7 +25,22 @@ use ai_session_search::{MessageFilters, SearchFilters, SessionSearch};
 
 `SessionSearch` owns the configuration, the SQLite connection, and the worker pool. Keep one
 instance for a related unit of work, then compose the immutable filter and publication types
-re-exported beside it. The crate root is the entry point to build against; the storage, CLI, MCP,
+re-exported beside it. Opening never reads your session files: call
+`app.index().prepare_for_read()` once to apply the configured refresh policy, or reads on a
+never-indexed database fail with `ServiceError::IndexNotRefreshed`.
+
+```rust,no_run
+use ai_session_search::{SearchFilters, SessionSearch};
+
+fn main() -> ai_session_search::anyhow::Result<()> {
+    let app = SessionSearch::load()?;
+    app.index().prepare_for_read()?;
+    let recent = app.catalog().list_sessions(&SearchFilters::default().with_limit(5))?;
+    println!("{} sessions", recent.len());
+    Ok(())
+}
+```
+ The crate root is the entry point to build against; the storage, CLI, MCP,
 provider, and PyO3 modules are implementation surfaces.
 
 Set `default-features = false` to omit the CLI's `release-check` network client; search, index,

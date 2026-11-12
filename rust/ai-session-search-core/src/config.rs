@@ -1841,10 +1841,18 @@ impl Config {
             .map_or_else(Self::config_path, expand_override_path)
     }
 
+    /// Resolve the configuration with no overrides: environment, config file, then defaults.
     pub fn load() -> Result<Self> {
         Ok(Self::resolve(ConfigOverrides::default())?.config)
     }
 
+    /// Resolve the configuration from `overrides`, the `AI_SESSION_SEARCH_*` environment, the
+    /// config file, and built-in defaults, in that order of precedence.
+    ///
+    /// Returns the configuration, the config file path, and
+    /// [`ResolvedConfig::origins`] naming where each path and setting came from. A missing
+    /// config file is fine unless `overrides.config_path` or `AI_SESSION_SEARCH_CONFIG` names
+    /// it. Reads only; nothing is created.
     pub fn resolve(overrides: ConfigOverrides) -> Result<ResolvedConfig> {
         Self::resolve_with_environment(overrides, ConfigEnvironment::capture())
     }

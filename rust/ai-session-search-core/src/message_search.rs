@@ -485,6 +485,9 @@ pub fn decode_match_view_budget(
     }
 }
 
+/// Messages returned before and after each search match, from the same session.
+///
+/// Counts are messages, not sequence numbers. The default is `0` and `0`: the match alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContextWindow {
     messages_before: usize,
@@ -492,6 +495,7 @@ pub struct ContextWindow {
 }
 
 impl ContextWindow {
+    /// `messages_before` messages before each match and `messages_after` after it.
     pub const fn new(messages_before: usize, messages_after: usize) -> Self {
         Self {
             messages_before,
@@ -499,14 +503,17 @@ impl ContextWindow {
         }
     }
 
+    /// `count` messages on each side of every match.
     pub const fn symmetric(count: usize) -> Self {
         Self::new(count, count)
     }
 
+    /// Messages returned before each match.
     pub const fn messages_before(self) -> usize {
         self.messages_before
     }
 
+    /// Messages returned after each match.
     pub const fn messages_after(self) -> usize {
         self.messages_after
     }
@@ -3289,6 +3296,8 @@ pub struct MessageSearchRequestBuilder {
 }
 
 impl MessageSearchRequestBuilder {
+    /// Keep messages with this role. `Role::User` selects input a person is recorded as typing
+    /// across source roles. Unset: every role.
     pub fn role(mut self, role: Role) -> Self {
         self.request.predicates.role = Some(role);
         self
@@ -3307,6 +3316,8 @@ impl MessageSearchRequestBuilder {
         self
     }
 
+    /// Keep messages from one session source; [`Self::providers`] takes several. Unset: every
+    /// provider.
     pub fn provider(mut self, provider: Provider) -> Self {
         self.request.predicates.providers = Some(vec![provider]);
         self
@@ -3330,11 +3341,15 @@ impl MessageSearchRequestBuilder {
         Ok(self)
     }
 
+    /// Keep messages from one session: a canonical id or a unique prefix, resolved when the
+    /// request is planned. Fails on an empty string.
     pub fn session_id(mut self, session: impl Into<String>) -> Result<Self, MessageSearchError> {
         self.request.predicates.session = Some(NonEmptyValue::new("session_id", session)?);
         Ok(self)
     }
 
+    /// Keep sessions whose cwd or repository root is this directory or below it, matched on
+    /// whole path components. Fails on an empty string.
     pub fn workspace_path_prefix(
         mut self,
         path: impl Into<String>,
@@ -3344,6 +3359,7 @@ impl MessageSearchRequestBuilder {
         Ok(self)
     }
 
+    /// Keep sessions whose transcript file is under this directory. Fails on an empty string.
     pub fn transcript_path_prefix(
         mut self,
         path: impl Into<String>,
@@ -3353,6 +3369,7 @@ impl MessageSearchRequestBuilder {
         Ok(self)
     }
 
+    /// Drop sessions whose cwd or repository root is under this directory. Repeatable.
     pub fn exclude_workspace_path_prefix(
         mut self,
         path: impl Into<String>,
@@ -3364,6 +3381,7 @@ impl MessageSearchRequestBuilder {
         Ok(self)
     }
 
+    /// Drop sessions whose transcript file is under this directory. Repeatable.
     pub fn exclude_transcript_path_prefix(
         mut self,
         path: impl Into<String>,
@@ -3375,6 +3393,7 @@ impl MessageSearchRequestBuilder {
         Ok(self)
     }
 
+    /// Drop one exact canonical session id. Repeatable.
     pub fn exclude_session_id(
         mut self,
         session: impl Into<String>,
@@ -3386,16 +3405,21 @@ impl MessageSearchRequestBuilder {
         Ok(self)
     }
 
+    /// Keep messages whose own timestamp lies in this inclusive range. Default: no bound.
     pub fn time(mut self, time: RequestedTimeRange) -> Self {
         self.request.predicates.time = time;
         self
     }
 
+    /// Keep messages whose sequence number lies in this inclusive range. Sequence numbers are
+    /// per session, so this is meant together with [`Self::session_id`]. Unset: no bound.
     pub fn sequence(mut self, sequence: SequenceRange) -> Self {
         self.request.predicates.sequence = Some(sequence);
         self
     }
 
+    /// Keep tool messages whose canonical tool name contains this text, case-insensitively
+    /// (`edit` matches `Edit` and `MultiEdit`). Fails on an empty string.
     pub fn tool_name_contains(
         mut self,
         value: impl Into<String>,
@@ -3405,51 +3429,84 @@ impl MessageSearchRequestBuilder {
         Ok(self)
     }
 
+    /// Whether compaction summaries are searched. Default `true`.
     pub fn include_compaction(mut self, include: bool) -> Self {
         self.request.predicates.include_compaction = include;
         self
     }
 
+    /// Return the earliest or the latest matches when a page is smaller than the result set;
+    /// results are presented in chronological order either way.
+
+    /// Unset, the planner applies the surface's configured default (see
+    /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn match_window(mut self, window: MatchWindow) -> Self {
         self.request.match_window = Some(window);
         self
     }
 
+    /// Messages returned before and after each match, counted in messages of the same session.
+
+    /// Unset, the planner applies the surface's configured default (see
+    /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn context(mut self, context: ContextWindow) -> Self {
         self.request.context = Some(context);
         self
     }
 
+    /// Keep the first or last lines of each returned message, or all of it. Presentation only:
+    /// it never changes which messages matched.
+
+    /// Unset, the planner applies the surface's configured default (see
+    /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn message_lines(mut self, window: LineWindow) -> Self {
         self.request.presentation.message_lines = Some(window);
         self
     }
 
+    /// Preset for how much of each message is returned: compact previews or full values.
+
+    /// Unset, the planner applies the surface's configured default (see
+    /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn detail(mut self, detail: DetailLevel) -> Self {
         self.request.presentation.detail = Some(detail);
         self
     }
 
+    /// Character budget for the selected field of each message.
+
+    /// Unset, the planner applies the surface's configured default (see
+    /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn field_view(mut self, budget: FieldViewBudget) -> Self {
         self.request.presentation.field_view = Some(budget);
         self
     }
 
+    /// Character budget for the text shown around each match.
+
+    /// Unset, the planner applies the surface's configured default (see
+    /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn match_view(mut self, budget: MatchViewBudget) -> Self {
         self.request.presentation.match_view = Some(budget);
         self
     }
 
+    /// Page or complete result set. Default: [`RequestedExtent`]'s default, which defers to
+    /// operation, purpose, and surface limits; the Rust surface then returns every literal,
+    /// regex, or queryless match.
     pub fn extent(mut self, extent: RequestedExtent) -> Self {
         self.request.extent = extent;
         self
     }
 
+    /// Apply a configured search purpose's preset limits and filters. Unset: none.
     pub fn purpose(mut self, purpose: PurposeSelection) -> Self {
         self.request.purpose = Some(purpose);
         self
     }
 
+    /// How much planner evidence the response carries: none, a summary, or the full receipt
+    /// with parameter origins and the ordered digest. Default `ReceiptLevel::None`.
     pub fn receipt_level(mut self, level: ReceiptLevel) -> Self {
         self.request.receipt = Some(level);
         self
@@ -3464,6 +3521,12 @@ impl MessageSearchRequestBuilder {
         self
     }
 
+    /// Validate the combination of settings and return the request.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageSearchError`] for a conflicting or invalid combination, for example fuzzy
+    /// matching with an all-results extent.
     pub fn build(self) -> Result<MessageSearchRequest, MessageSearchError> {
         self.request.validate()?;
         Ok(self.request)
