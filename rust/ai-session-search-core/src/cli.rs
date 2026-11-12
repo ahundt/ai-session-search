@@ -4931,6 +4931,25 @@ mod tests {
     }
 
     #[test]
+    fn classification_accepts_comma_separated_session_kinds() {
+        let parsed = Cli::try_parse_from([
+            "aise",
+            "skills",
+            "corrections",
+            "--session-kinds",
+            "user,subagent",
+        ])
+        .unwrap();
+        let Commands::Skills(command) = parsed.command else {
+            panic!("expected skills");
+        };
+        assert_eq!(
+            command.into_execution().unwrap().args.session_kinds,
+            vec![SessionKind::User, SessionKind::Subagent]
+        );
+    }
+
+    #[test]
     fn analytics_commands_accept_exact_session_id_scope() {
         let parsed = Cli::try_parse_from([
             "aise",

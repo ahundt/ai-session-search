@@ -256,7 +256,7 @@ pub struct CorrectionsArgs {
     /// something a person told the agent: in a spawned run the `user` rows are the calling
     /// agent's delegation prompt. Pass `user subagent` for both, as `search` and `list` return
     /// by default.
-    #[arg(long = "session-kinds", value_enum, num_args = 1..)]
+    #[arg(long = "session-kinds", value_enum, num_args = 1.., value_delimiter = ',')]
     pub session_kinds: Vec<crate::models::SessionKind>,
     /// Additional message-classification skills to evaluate, in argument order after the primary
     /// selected skill. Each value is a catalog name, skill directory, or exact SKILL.md path.
