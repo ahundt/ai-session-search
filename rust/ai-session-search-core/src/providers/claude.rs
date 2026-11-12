@@ -695,8 +695,15 @@ impl ClaudeAdapter {
                 Some("attachment") => {
                     if value["attachment"]["type"] == "queued_command"
                         && event_id.is_some_and(|id| {
-                            !seen_records
-                                .insert((id.to_owned(), sha256(value.to_string().as_bytes())))
+                            // Branch metadata can change when the same attachment is replayed.
+                            !seen_records.insert((
+                                id.to_owned(),
+                                sha256(
+                                    json!([value["attachment"], value["timestamp"]])
+                                        .to_string()
+                                        .as_bytes(),
+                                ),
+                            ))
                         })
                     {
                         continue;
@@ -5188,6 +5195,40 @@ mod tests {
                 .filter(|m| m.kind == crate::models::MessageKind::ToolCall)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn queued_attachment_replay_ignores_changed_branch_metadata() {
+        let temp = tempdir().unwrap();
+        let attachment = json!({"type":"attachment","uuid":"q1","sessionId":"replay",
+            "timestamp":"2026-01-01T00:00:00Z","gitBranch":"first",
+            "attachment":{"type":"queued_command","commandMode":"prompt",
+                "prompt":"synthetic queued input","origin":{"kind":"human"}}});
+        let mut replay = attachment.clone();
+        replay["gitBranch"] = json!("second");
+        let records = [
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":"replay",
+                "timestamp":"2026-01-01T00:00:00Z","content":"synthetic queued input"}),
+            attachment,
+            replay,
+        ];
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(
+                    records
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                &temp.path().join("replay.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Human
         );
     }
 
