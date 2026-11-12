@@ -362,5 +362,5 @@ def test_registry_metadata_version_tracks_the_release(tmp_path: Path, package: b
     else:
         metadata["version"] = "0.9.0"
     path.write_text(json.dumps(metadata))
-    with pytest.raises(ReleaseMetadataError, match="server.json.*version"):
+    with pytest.raises(ReleaseMetadataError, match=r"server\.json.*version"):
         verify_release_metadata(tmp_path, "v1.0.0")

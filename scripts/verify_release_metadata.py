@@ -256,6 +256,15 @@ def previous_release(root: pathlib.Path, version: str) -> str | None:
     return versions[index + 1] if index + 1 < len(versions) else None
 
 
+def _verify_registry_versions(root: pathlib.Path, cargo_version: str) -> None:
+    registry = json.loads((root / "server.json").read_text(encoding="utf-8"))
+    if registry["version"] != cargo_version:
+        raise ReleaseMetadataError(f"server.json version must equal {cargo_version!r}")
+    for package in registry["packages"]:
+        if package["version"] != cargo_version:
+            raise ReleaseMetadataError(f"server.json package version must equal {cargo_version!r}")
+
+
 def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
     project = _manifest(root / "pyproject.toml")
     core = _manifest(root / "rust/ai-session-search-core/Cargo.toml")
@@ -291,12 +300,7 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
                 f"{relative} declares {skill_version!r} "
                 f"instead of the release version {cargo_version!r}"
             )
-    registry = json.loads((root / "server.json").read_text(encoding="utf-8"))
-    if registry["version"] != cargo_version:
-        raise ReleaseMetadataError(f"server.json version must equal {cargo_version!r}")
-    for package in registry["packages"]:
-        if package["version"] != cargo_version:
-            raise ReleaseMetadataError(f"server.json package version must equal {cargo_version!r}")
+    _verify_registry_versions(root, cargo_version)
     _verify_documented_requirements(root, cargo_version)
     release_body(root, version)
     return version
