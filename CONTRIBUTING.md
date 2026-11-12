@@ -75,6 +75,7 @@ cargo test -p ai-session-search <test name>
 uv run pytest tests/<file>.py -k <test name>
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 uv run ruff check . && uv run mypy ai_session_search tests
+uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
 ```
 
 [`clippy.toml`](clippy.toml) lists calls that must go through a shared helper, such as parsing

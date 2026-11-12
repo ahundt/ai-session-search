@@ -677,8 +677,10 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     architecture = (ROOT / "docs/migration/rust-python-api-architecture.md").read_text(encoding="utf-8")
     parity = (ROOT / "docs/migration/capability-parity.md").read_text(encoding="utf-8")
 
-    assert "uv sync --locked --all-extras" in readme
-    assert "mypy.stubtest ai_session_search" in readme
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    assert "[CONTRIBUTING.md](CONTRIBUTING.md)" in readme
+    assert "uv sync --locked --all-extras" in contributing
+    assert "mypy.stubtest ai_session_search" in contributing
     assert "closed schemas" in readme
     configuration = (ROOT / "docs/development/configuration.md").read_text(encoding="utf-8")
     # Both line-window scopes stay documented with their shared sign convention.
@@ -748,7 +750,7 @@ def test_readme_opening_and_format_count_cover_every_provider() -> None:
     # One count-word anchor, in the prose. A second assertion pinned the same word in a heading,
     # which forced the heading to stay a noun phrase; the prose anchor alone still fails when a
     # new provider changes PROVIDER_COUNT_WORD without the README following.
-    assert f"parses all {PROVIDER_COUNT_WORD} formats" in readme
+    assert f"Search {PROVIDER_COUNT_WORD} providers from one index" in readme
     for provider_id in PROVIDER_IDS:
         assert f"`{provider_id}`" in readme, f"README has no session-source row for {provider_id}"
 
@@ -801,7 +803,7 @@ def test_message_search_default_extent_is_documented_consistently() -> None:
     assert "Rust, CLI, or Python message search" in normalized_readme
     assert "every literal, regex, or no-text match" in normalized_readme
     assert "--all-results" in normalized_readme
-    assert "Session-level and MCP searches page instead" in normalized_readme
+    assert "Session-level and MCP searches page by default" in normalized_readme
     assert "Fuzzy search always needs a finite page" in normalized_readme
     assert "every literal, regex, or no-text CLI match" in cli
     assert "Rust, CLI, and Python" in core and "MCP" in core
@@ -1458,7 +1460,7 @@ def test_readme_and_packaged_skill_explain_temporal_and_recent_directory_retriev
         "`until` tests the span start",
         "may contain gaps",
         "component-boundary descendant",
-        "leaves lexical siblings",
+        "excluding siblings such as `project-other`",
     ):
         assert phrase in skill
 

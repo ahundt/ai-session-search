@@ -6,7 +6,9 @@ each into a named category. The deterministic rules live in `aise-capability.tom
 
 ## How it works
 
-1. `aise` scans messages with `role = 'user'` in **user-started** sessions.
+1. `aise` scans input with structural evidence of a human sender in user-started sessions,
+   including prompts typed while the agent was busy. `--include-unattributed-input` also reads
+   queued input with no recorded sender; reports count it separately.
 2. Each message is tested against the selected policies in order, and within a policy against its
    categories in declaration order.
 3. The **first** matching category wins. The result records the category name and the exact
@@ -14,7 +16,12 @@ each into a named category. The deterministic rules live in `aise-capability.tom
 4. Every result carries package and capability provenance plus a receipt per evaluated rule set:
    name, version, and the SHA-256 of the exact `aise-capability.toml` bytes.
 
-Three consequences worth knowing before you write rules:
+The shipped categories are a small starter set of fixed phrasings. They will miss corrections
+worded for the situation. Use them as a quick first filter, then list recorded input and read it
+with context as described in [the skill](../SKILL.md#analyze-repeated-behavior). Add categories for
+wording you see repeatedly using [Writing your own](#writing-your-own).
+
+Pattern behavior:
 
 - **Order is behavior.** A catch-all category must be last, or it swallows everything below it.
 - **Every pattern is case-insensitive.** All of a category's patterns are joined into one `(?i)`
@@ -109,7 +116,7 @@ The most common mistake is a rule that matches ordinary conversation. Anchor on 
 Check a candidate against real data before keeping it:
 
 ```sh
-aise skills my-corrections --limit 0 --format json \
+aise skills my-corrections --all-results --format json \
   | jq -r '.output.result.report.matches[].content'
 ```
 
@@ -124,7 +131,7 @@ aise skills corrections --format json
   "requested_selector": { "name": "corrections" },
   "resolved_skill": {
     "name": "corrections",
-    "package_version": "1.0.0",
+    "package_version": "1.1.0",
     "selected_location": { "kind": "embedded" },
     "execution_source": { "kind": "embedded" }
   },
@@ -133,12 +140,12 @@ aise skills corrections --format json
     "result": {
       "receipt": {
         "name": "corrections",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "sha256": "cc76…"
       },
       "report": {
         "policies": [
-          { "name": "corrections", "version": "1.0.0", "sha256": "cc76…" }
+          { "name": "corrections", "version": "1.1.0", "sha256": "cc76…" }
         ],
         "matches": [
           {
@@ -174,7 +181,8 @@ coordinates, and bounded `presentation` views instead of the full `content`. Use
 with `aise messages get --seq` when the complete turn is needed. These flags affect presentation
 only, never classification, ordering, page membership, or policy receipts.
 
-Page with `--limit` and `--offset` (newest first). `--limit 0` returns every match.
+Page with `--limit` and `--offset` (newest first). Use `--all-results` for every match;
+`--limit 0` remains a deprecated alias.
 Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety
 ceiling. If their combined canonical input exceeds it, aise reports the consumed and attempted byte
 counts with guidance; it never truncates rules or search results to fit.
@@ -195,14 +203,16 @@ from ai_session_search import (
     SkillSelector,
 )
 
-report = SessionSearch().run_skill(
-    SkillRunQuery(
-        skill=SkillSelector(name="my-corrections"),
-        input=MessageClassificationQuery(limit=0),
+with SessionSearch(index_refresh="auto") as search:
+    search.prepare_for_read()
+    report = search.run_skill(
+        SkillRunQuery(
+            skill=SkillSelector(name="corrections"),
+            input=MessageClassificationQuery(limit=0),
+        )
     )
-)
-for receipt in report.output.report.policies:
-    print(receipt.name, receipt.version, receipt.sha256[:12])
+    for receipt in report.output.report.policies:
+        print(receipt.name, receipt.version, receipt.sha256[:12])
 ```
 
 MCP agents call `run_skill_capability`. It executes only the deterministic
@@ -213,12 +223,7 @@ context window, and explicit path selectors must be authorized by `[skills].sear
 
 ## Subagent sessions
 
-By default only user-started sessions are scanned. In a spawned subagent run the `role='user'`
-rows are the **calling agent's** delegation prompt, not anything a person typed — and a prompt like
-"don't forget to check the tests" matches a built-in category exactly. On the machine this was
-measured, Claude Code subagent sessions outnumbered user-started ones roughly five to one, so
-including them by default would drown real corrections.
-
-Pass `--session-kinds user subagent` to scan both, or `--session-kinds subagent` for delegation
-prompts alone. This default deliberately differs from `aise search` and `aise list`, which return
-both classes.
+By default only user-started sessions are scanned. Use `--session-kinds user subagent` to
+include attributable human input in both classes, or `--session-kinds subagent` for that class
+alone. A known parent-agent delegation prompt does not become human input because its stored
+role is `user`. Session search and listing return both classes by default.

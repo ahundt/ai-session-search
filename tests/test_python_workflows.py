@@ -445,3 +445,21 @@ def test_file_search_keeps_percent_and_underscore_literal(corpus, pattern):
     expected = {"rate_%.py", "rate_12.py"} if pattern == "rate_*.py" else {"rate_%.py"}
     assert {row.file_name for row in rows} == expected
     assert [row.to_dict() for row in rows] == cli(corpus, "files", "search", pattern, "--format", "json")
+
+
+def test_readme_and_classification_reference_python_examples(corpus, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("AI_SESSION_SEARCH_DATABASE", str(corpus.db_path))
+    monkeypatch.chdir(tmp_path)
+    for relative in ("README.md", "skills/ai-session-search/references/message-classification.md"):
+        examples = re.findall(r"```python\n(.*?)```", (root / relative).read_text(), re.DOTALL)
+        assert examples, relative
+        for number, example in enumerate(examples):
+            namespace: dict[str, Any] = {}
+            exec(compile(example, f"{relative}:python-example-{number + 1}", "exec"), namespace)
+            if "search" in namespace:
+                namespace["search"].close()
+            if relative == "README.md":
+                assert isinstance(namespace["messages"], aise.MessageSearchResponse)
+            else:
+                assert namespace["report"].output.report.policies

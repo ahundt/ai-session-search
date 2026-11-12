@@ -1,30 +1,21 @@
 # AI Session Search (`aise`)
 
-Ultra-fast Rust-based search of your local AI coding sessions, reindexing on the fly. Reads
-Claude Code, Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Prime Agent,
-Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
+Search and recover your local AI coding-agent session history from Claude Code, Claude Desktop
+local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and
+Gemini CLI. Use one index from the CLI, an MCP server, Python, or Rust on macOS, Linux, and Windows.
 
 [![PyPI](https://img.shields.io/pypi/v/ai-session-search)](https://pypi.org/project/ai-session-search/)
 [![crates.io](https://img.shields.io/crates/v/ai-session-search)](https://crates.io/crates/ai-session-search)
 [![CI](https://github.com/ahundt/ai-session-search/actions/workflows/ci.yml/badge.svg)](https://github.com/ahundt/ai-session-search/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-
-<!-- Demo goes here: drag demo.gif into the GitHub web editor, which uploads it and
-     inserts a user-attachments image link in place of this comment. The recording
-     itself is untracked; regenerate it with uv run python tests/test_demo.py --record -->
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/ahundt/ai-session-search/blob/main/LICENSE)
 
 <img width="1561" height="1098" alt="aise searching indexed AI coding sessions from the terminal" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
 
 ## Search nine providers from one index
 
-Useful AI coding history is already on disk. It is just hard to find, and in a range of totally
-different formats.
-
-`aise` parses all nine formats into one index and searches it efficiently. Your fixes from last
-month, the files an agent overwrote, and the record of why a run failed become instantly findable.
-
-Query that index from the command line, a Rust crate, a Python package, or an MCP server your
-coding agent calls mid-conversation.
+`aise` indexes local transcripts so you can find earlier messages, recover file versions, and
+read the context around a failed run. Queries refresh the index as needed; use
+`--index-refresh existing-only` to read the index without refreshing it.
 
 ## Install
 
@@ -61,27 +52,42 @@ every write.
 | Export a session to Markdown | `aise export SESSION_ID --format markdown` |
 | Check index health and effective paths | `aise doctor`, `aise config paths` |
 
-Stop-hook feedback, a PreToolUse block, a local-command caveat, a task notification come from the
-harness, so ordinary results leave them out. They are usually why an agent stopped mid-task;
-`--kinds harness-notice` searches them. Claude Code also keeps a stored copy of each API request
-message (`api-request-blob` records); aise does not index those copies, so the sentence Claude Code
-wraps around a prompt typed mid-turn, and repeated turns, never count as something you wrote. The
-prompt itself is indexed once, as a queued submission. Attached files and edited-file snippets
-are searchable as tool results; instructions and session context use `--kinds harness-notice`.
-Attachment text is retained from its own records, once per type, path, and exact content.
-`aise doctor` names any record type a parser did not recognize; its records are not indexed.
-Malformed attachments and skipped binary payloads are counted as parse warnings instead.
+Human input includes prompts typed while the agent was busy and answers recorded through tools.
+`--role user` searches those recorded input regions across stored roles; returned context can
+contain generated text. Known prompts from a parent agent to a subagent stay outside that
+selector. Omit `--role` to search complete content.
 
-`aise skills corrections` and `aise repeats` read messages with evidence that a person typed them,
-including messages typed while the agent was working when the transcript records a human sender
-(recent Claude Code versions do). Older Claude Code versions recorded no sender for those queued
-messages, and a program can queue messages too, so they are left out by default; the output counts
-them (`unattributed_input_count` in JSON, a one-line note in table output and on stderr for
-`repeats`, and `unattributed_input_count` in `aise repeats --format json --report`), and
-`--include-unattributed-input` reads them. A queued message that was also delivered
-as its own prompt is read once, as the prompt.
+Claude Code conversation and attachment records supply the searchable text; saved API request
+copies do not add repeated turns or file edits. A queued submission delivered as a prompt counts
+as that prompt; independent same-text submissions remain distinct. Files a person mentions,
+attached file snippets, memory and plan text, and invoked skill contents are searchable by default.
+Injected instructions, session context, hook messages, and interrupt notices are harness notices:
+find them with `--kinds harness-notice`. `aise doctor` reports unrecognized record and attachment
+types; malformed attachments and skipped binary payloads appear as parse warnings.
 
-A subagent's work lives in its own session, so the parent transcript shows only that it ran.
+Corrections and repeats use input with evidence of a human sender, including queued input. Older
+Claude Code transcripts can omit the sender: reports count those rows as `unattributed_input_count`
+and leave them out by default. Pass `--include-unattributed-input` to include them; a program may
+have sent them. `aise repeats --format json --report` includes that count alongside its groups.
+
+The shipped correction categories are a small starter set of fixed phrasings. They will miss
+corrections worded for the situation. To find where a session went wrong, list its recorded input
+and read it with context; use categories as a quick first filter:
+
+```bash
+aise list --path ~/source/project --when 7d --limit 10
+aise messages search "" --session-id SESSION_ID --role user --all-results --format json
+aise messages get SESSION_ID --seq 42 --context 3
+```
+
+With MCP, use `list_sessions(path_prefix="/path/to/project", when="7d", limit=10)`,
+`search_messages(session_id="SESSION_ID", role="user", all_results=true)`, then
+`get_session(session_id="SESSION_ID", seq=42, context=3)`. Read the provenance when sender
+attribution is uncertain. For a large MCP result, replace `all_results=true` with `limit=50` and
+follow `page.next_offset`. Add categories for wording you see repeatedly using the
+[skill package creation steps](skills/ai-session-search/SKILL.md#create-your-own-classification-package).
+
+A subagent's full work lives in its own session; the parent may show only delegation and its result.
 `--session-kinds subagent` lists those sessions, and `--parent-session` narrows to one run's
 children.
 
@@ -105,11 +111,12 @@ aise files history src/app.py
 aise files extract src/app.py --restore
 ```
 
-Find recorded prompts, queued submissions and linked answers with
-`aise messages search "correction" --role user`.
-Matches identify recorded input regions; displayed context can include generated text. Known
-parent-agent prompts sent to spawned sessions are excluded from this selector, while sender and
-delivery can be unknown. Omit `--role` to search complete message content.
+When an empty message search prints a hint, the active query and filters found no matches.
+The hint suggests related content that may live in harness notices, decoded tool arguments, or
+file history; it does not prove that such content exists.
+
+`aise resume SESSION_ID` prints its command when stdin or stdout is redirected; use `--dry-run`
+to request that explicitly in a terminal.
 
 `aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
 [EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,
@@ -119,7 +126,7 @@ read in your local time zone unless the value names an offset or a trailing
 
 ## MCP server
 
-Ask Claude Code why last Tuesday's run stopped, or which version of a file it wrote before the
+Ask Claude Code why last Tuesday's run stopped, or what happened before the
 refactor, and it queries this index and answers inline without you leaving the conversation.
 The server is a subcommand of the same executable, so there is nothing else to install.
 
@@ -138,7 +145,8 @@ What a harness receives depends on what it can read, in the format and location 
 
 | Harness | Receives |
 | --- | --- |
-| Claude Code, Claude Desktop | MCP config, `CLAUDE.md` guidance, skill |
+| Claude Code CLI/Desktop | MCP config, `CLAUDE.md` guidance, skill |
+| Claude Desktop local agent | MCP config |
 | ChatGPT Codex desktop and CLI/IDE | MCP config, managed `AGENTS.md` block, skill |
 | OpenCode | MCP config, managed `AGENTS.md` block |
 | Gemini CLI, Antigravity App/IDE/CLI | MCP config, shared `~/.gemini/GEMINI.md` block, skill |
@@ -146,8 +154,8 @@ What a harness receives depends on what it can read, in the format and location 
 | Prime Agent | MCP config in `~/.prime/agent/settings.json` with `type: "stdio"`, skill, native `AGENTS.md` guidance |
 | Cursor, Windsurf, VS Code, Zed, OpenClaw, KiloCode | MCP config |
 
-No MCP tool changes your sessions or configuration, and publishing a bundle stays a CLI and
-library operation. A query does refresh the index, writing `aise`'s own state;
+File recovery, export, analysis, and explicit reindexing use `aise files extract`, `aise export`,
+`aise analyze`, and `aise reindex`, or the library APIs. A query may refresh the index, writing `aise`'s own state;
 `--index-refresh existing-only` opens SQLite read-only. Tool inputs are closed schemas, so a
 misspelled field fails with its exact argument path.
 
@@ -156,27 +164,16 @@ it keeps the receipt and prints the exact `aise integrations recover` command.
 `aise integrations status` reads every target under the installer's own transaction lock, so it
 never shows you a half-applied state.
 
-## Speed
+## Search cost
 
-Measured on 2026-11-07 on macOS with Apple silicon against an index of 5,975,817 messages, best
-of three warm runs, each with `--index-refresh existing-only --format json` so no refresh runs:
+Literal and regex queries use word and trigram indexes to narrow candidates, then verify the
+requested match. A selective fragment and structural filters reduce the scan. Fuzzy search scores
+every eligible row, so narrow by project, provider, session, or date first. `--receipt-level
+summary` explains the selected query plan.
 
-| Command | Time |
-| --- | ---: |
-| `aise list --limit 20` | 9 ms |
-| `aise files search "*.rs" --limit 50` | 0.37 s |
-| `aise messages search "ECONNRESET\|socket hang" --query-mode regex --limit 50` | 0.3 s |
-| `aise messages search "permission denied" --limit 50` | 0.3 s |
-
-Parsing, indexing, and querying are native code, and the binary starts in about 6 ms. `cargo
-install` puts it on your `PATH`; the `uv` install reaches it through a small Python console script.
-
-Indexing is incremental: a refresh reparses only the sessions whose bytes changed. On an earlier,
-smaller index, a refresh walked 6,324 source files in 13 s and reparsed 6 sessions. Refresh runs on
-access by default, including when an MCP client asks a question; `--index-refresh existing-only`
-skips it.
-
-Scoped queries cost less ([filters and scopes](#filters-and-scopes)), and a smaller index is faster.
+Refresh reads changed source bytes; it is separate from query cost. Use `--index-refresh
+before-query` to wait for source updates, or `existing-only` to skip refresh. See the
+[search cost reference](skills/ai-session-search/references/search-costs-and-receipts.md).
 
 ## Providers
 
@@ -221,7 +218,7 @@ aise messages search "regression" --role user --include-compaction false
 # Find which tool call touched a file, by searching the argument rather than the prose
 aise messages search "Cargo.toml" --field tool-argument --argument-path /path --tool-name-contains Edit
 
-# Skim a long result page: keep each message's first 5 lines, or its last 5 with -5
+# Keep each message's first 5 lines; use -5 for its last 5
 aise messages get SESSION_ID --role user --lines-per-message 5
 
 # Read the 75 most recent user turns. --order picks which 75; they print oldest-first
@@ -230,8 +227,9 @@ aise messages get SESSION_ID --role user --limit 75 --order newest
 # Walk a long session in non-overlapping chunks instead of growing --limit
 aise messages get SESSION_ID --seq-from 0 --seq-to 499
 aise messages get SESSION_ID --seq-from 500 --seq-to 999
+aise messages get SESSION_ID --seq-from 0 --seq-to 99 --kinds conversation,harness-notice
 
-# Get every version of a file the session can account for, one JSON object per version
+# One JSON object per version; --all requests the complete recorded history
 aise files extract path/to/file.rs --all --format jsonl
 
 # See which setting or default decided a surprising result
@@ -246,7 +244,7 @@ timestamp.
 With no configured operation or purpose default, omitting the limit on a Rust, CLI, or Python
 message search returns every literal, regex, or no-text match; `--all-results` says so explicitly
 in a script. Session-level and MCP searches
-page instead, so a client is never flooded. Fuzzy search always needs a finite page, and
+page by default. Fuzzy search always needs a finite page, and
 `--limit 0` means the whole corpus only where that command's help says so.
 
 Line windows share one sign convention: positive keeps the first N lines, negative the last N,
@@ -312,9 +310,9 @@ fn main() -> ai_session_search::anyhow::Result<()> {
 }
 ```
 
-A long refresh or search releases the GIL, so it will not block your other Python threads. The
-Rust crate keeps MCP, SQLite row, and PyO3 types out of its public contracts, so you work with
-provider-neutral types. The
+Long native operations release the GIL so other Python threads can progress. The
+application service API uses provider-neutral requests and results. Word counts are available through Python `vocabulary()` and Rust
+`AnalysisService::vocabulary`; `aise vocab` remains a hidden compatibility command. The
 [library guide](docs/development/library-api.md) has the full API, feature flags, and concurrency
 semantics.
 
@@ -380,12 +378,12 @@ source, so run `aise compact` against the published destination.
 | `aise files search\|history\|cross-ref\|extract` | Locate and reconstruct edited files |
 | `aise skills corrections`, `aise slash-commands`, `aise stats` | Deterministic message classification and indexed behavioral summaries |
 | `aise skills list\|show\|validate\|create\|update\|restore\|run` | Inspect, author, repair, and run skill packages |
-| `aise vocab`, `aise repeats` | How often a term appears, and in how many messages (`vocab --prefix TERM` for one term); or recurring phrases |
+| `aise repeats` | Recurring phrases; `--max-candidates` bounds examined messages, `--max-groups` bounds returned groups, and `--query-mode regex` selects regex matching |
 | `aise export` | Render one session, or publish an explicitly selected bundle |
 | `aise analyze` | Apply a validated policy and publish an immutable analysis bundle |
 | `aise reindex`, `compact`, `doctor` | Maintain and diagnose the index |
 | `aise migrate database\|config\|verify\|recover` | Verified, reversible migration |
-| `aise config file\|example\|init\|show\|origins\|paths` | Inspect or initialize TOML configuration and resolved paths |
+| `aise config file\|example\|init\|show\|origins\|paths\|check` | Inspect or initialize TOML configuration and resolved paths |
 | `aise package status\|check\|update` | Package ownership, release checks, and manager-driven updates |
 | `aise integrations install\|status\|uninstall\|recover`, `aise mcp serve` | Aliases, MCP registrations, owned instructions and skills, and the MCP transport |
 | `aise db schema\|query` | Read-only SQL. `aise db schema` prints the tables; `aise db query --help` lists the columns whose stored values differ from the CLI's spelling, where a wrong guess returns no rows and no error |
@@ -440,30 +438,9 @@ per-component flags, custom destinations, updates through `aise package update`,
 
 ## Development
 
-```bash
-uv sync --locked --all-extras
-uv run maturin develop --uv    # required: Python tests import the compiled extension
-./run_ci_local.sh              # authoritative gate; run before proposing a commit
-```
-
-The gate builds isolated config, cache, and database state, so it never touches a real user
-index. Run it with no environment prefix: prefixing `RUSTC_WRAPPER=` disables
-[sccache](https://github.com/mozilla/sccache) and forces a cold rebuild.
-
-While iterating:
-
-```bash
-cargo test -p ai-session-search <test name>
-uv run pytest tests/<file>.py -k <test name>
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-uv run ruff check . && uv run mypy ai_session_search tests
-uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
-```
-
-[CHANGELOG.md](CHANGELOG.md) records what changed in each release.
-[CONTRIBUTING.md](CONTRIBUTING.md) covers review expectations, and the
-[documentation index](docs/README.md) separates user guides from maintainer and migration
-records.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers builds, the local verification gate, and review.
+[CHANGELOG.md](CHANGELOG.md) describes release changes; the
+[documentation index](docs/README.md) links user guides and maintainer references.
 
 ## License
 

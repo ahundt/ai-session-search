@@ -63,15 +63,17 @@ const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use
 /// The block for a harness that registers the MCP server (and the server's own `initialize`
 /// instructions). It names the same four steps as `CLI_INSTRUCTIONS_LINE` in the same order,
 /// with the MCP tool for each, so an agent reads one workflow whichever surface it holds.
-const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) via the `ai-session-search` MCP server: `list_sessions(path_prefix, when, limit)` for recent sessions by directory or period, `search_sessions(query, when, limit)` for sessions by topic, `search_messages(query, context, limit)` for the exact turn, then read it with `get_session(session_id, message_seq)`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, path, context, and time range. The installed `ai-session-search` skill has the full workflow; without MCP, `aise` on the shell does the same (`aise <command> --help`).";
+const INSTRUCTIONS_LINE: &str = "Before guessing about prior work, use AI Session Search (`aise`) via `ai-session-search` MCP server: `list_sessions(path_prefix, when, limit)` for recent sessions; `search_sessions(query, when, limit)` by topic; `search_messages(query, context, limit)` for the exact turn; then read it with `get_session(session_id, seq)`. Providers: Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, Gemini CLI. CLI: file recovery `aise files extract`, export `aise export`, analysis `aise analyze`, reindexing `aise reindex`. The installed `ai-session-search` skill: full workflow; CLI fallback `aise <command> --help`.";
 /// Historical CLI-only guidance, retained verbatim to recognize and refresh owned blocks.
 const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; on this harness the `aise` command and the installed skill are the whole integration. List recent sessions with `aise list --path <dir> --when 7d --limit 10`, find sessions by topic with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; `aise <command> --help` lists every current flag.";
 /// SHA-256 of each instruction line an earlier release wrote and this build no longer does:
 /// 1.0.0rc1's `INSTRUCTIONS_LINE`. The post-upgrade refresh replaces a block that still holds one
 /// of these, or any line above, because aise wrote it; any other text is the user's. When a line
 /// above changes, add the digest of its old text here.
-const EARLIER_INSTRUCTION_LINE_DIGESTS: [&str; 1] =
-    ["3efca133a9dfaf9e359dce78582c83601c4a31c832ebfd6ef1caf5aa4398cfc6"];
+const EARLIER_INSTRUCTION_LINE_DIGESTS: [&str; 2] = [
+    "3efca133a9dfaf9e359dce78582c83601c4a31c832ebfd6ef1caf5aa4398cfc6",
+    "80e00c44e12fb57a3ba7cebd804880a7ce28ebd004e7442a0415ea32cb5399ab",
+];
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
@@ -8894,7 +8896,8 @@ mod tests {
         assert!(skill_content.contains("Literal is the default: the query text as typed"));
         assert!(skill_content.contains("List recent sessions by metadata, then read them"));
         assert!(skill_content.contains("aise list --path ~/source/project --when 7d --limit 10"));
-        assert!(skill_content.contains("one-significant-figure measurements"));
+        assert!(skill_content.contains("small starter set of fixed phrasings"));
+        assert!(!skill_content.contains("on this machine"));
         assert!(skill_content.contains("Recover an edited file"));
         assert!(skill_content
             .contains("aise messages search \"foreign key\" --workspace-path ~/source/project"));
@@ -9809,13 +9812,15 @@ mod tests {
         // `EARLIER_INSTRUCTION_LINE_DIGESTS`, then update the pin here.
         assert_eq!(
             crate::hashing::sha256(INSTRUCTIONS_LINE.as_bytes()),
-            "80e00c44e12fb57a3ba7cebd804880a7ce28ebd004e7442a0415ea32cb5399ab"
+            "6b824ac87aadc3fce7156ebdf72cca29d5f4a70ec88416bba759b82128f2f4d3"
         );
         assert_eq!(
             crate::hashing::sha256(CLI_INSTRUCTIONS_LINE.as_bytes()),
             "a7bfbb5efc4fd40b0268ce38c0091e17844e2edddd9b8cdfbf7be91588c54442"
         );
         assert!(is_aise_instruction_line(RC1_INSTRUCTIONS_LINE));
+        assert!(EARLIER_INSTRUCTION_LINE_DIGESTS
+            .contains(&"80e00c44e12fb57a3ba7cebd804880a7ce28ebd004e7442a0415ea32cb5399ab"));
     }
 
     /// The line 1.0.0rc1 wrote into every instruction block, including Pi's.

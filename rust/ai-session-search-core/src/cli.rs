@@ -795,7 +795,7 @@ enum ConfigCmd {
     ///
     /// Use `aise config show` for the values themselves, or `aise config paths` for the files consulted.
     Origins,
-    /// Print resolved config, state, search-scope, and session-source paths.
+    /// Print resolved config, state, search-scope, and provider-source paths.
     ///
     /// Use `aise config file` for the active configuration path, or `aise doctor` when one is unreadable.
     Paths(ReportArgs),

@@ -133,9 +133,9 @@ person), and a `task-notification` attachment makes it a harness notice.
 Recurrence and correction analytics read rows with structural evidence of a human author,
 queued rows included. Queued rows with no recorded sender are left out and counted in
 `MessageClassificationReport.unattributed_input_count`;
-`MessageClassificationQuery.include_unattributed_input` reads them. Matching a later message by
-text alone does not prove identity, so a queued row whose exact text is also a non-queued human
-row of the same session is not read: the input counts once, as the delivered prompt.
+`MessageClassificationQuery.include_unattributed_input` reads them. A queued submission
+that was delivered as a prompt counts as that prompt. Independent same-text submissions stay
+distinct; text equality alone does not establish that two submissions are the same event.
 
 Recurrence analytics join attributable fragments within a message before matching; their
 coordinates and phrase grouping describe that projection. Content search with `role="user"`
@@ -172,6 +172,8 @@ Passing both a scope and flat filters raises `InvalidArgumentError`. Session lis
 `MessageSearchRequest(query_mode="regex")` carries its search mode; the function keyword also
 works, and conflicting values raise `InvalidArgumentError`.
 
+`diagnostics()` is deprecated; use `doctor()` for the full health report.
+
 `search_sessions("")` is deprecated and emits DeprecationWarning naming `list_sessions()`;
 the historical ranked result remains available during the deprecation period. Use a nonempty
 query to rank sessions, or `list_sessions(request)` for metadata-only retrieval.
@@ -207,9 +209,9 @@ SQL and index-wide vocabulary refuse `allowed-roots` access. `resume_command(id)
 `transcript(id, lines=N)` returns the Rust transcript window including completeness metadata;
 positive N keeps the head, negative N the tail, and 0 every line.
 
-Fuzzy message search matches query letters in order, allowing gaps. It can match a missing
-letter, while an extra query letter can prevent a match; it is not an edit-distance search.
-It requires a positive finite limit. Typed error messages name Python methods for lookup and
+Fuzzy message search matches query letters in order, allowing gaps. A shorter query may skip characters in the text; every query character must occur in order.
+It is not an edit-distance search.
+It requires at least 3 Unicode scalar values and a positive finite limit. Typed error messages name Python methods for lookup and
 index preparation, while preserving error causes.
 
 Python exposes `NotFoundError`, `AmbiguousPrefixError`, `AlreadyExistsError`,
@@ -226,8 +228,7 @@ and those iterators retain their own close obligations.
 
 Long native operations release the GIL, so a refresh or a large search does not
 block other Python threads. Reconstruction iterators own their selected rows
-without holding the database lock, so a slow consumer cannot hold the index
-open. Publication is explicit: no library call writes a bundle to disk as a side
+without holding the database lock, so a slow consumer does not block database work. Publication is explicit: no library call writes a bundle to disk as a side
 effect.
 
 Request and result values compare by value, have readable `repr()` output, and expose
@@ -246,9 +247,8 @@ Result and request classes are available directly from `ai_session_search`, incl
 
 ## Rust
 
-The `ai-session-search` crate exposes provider-neutral services. MCP, SQLite
-row, and PyO3 types stay out of its public contracts, so a library consumer
-works with the same typed requests and responses every other surface uses.
+The `ai-session-search` application services use provider-neutral requests and results.
+The adapters convert them for the CLI, MCP, and Python; use those services for new library code.
 
 ```rust,no_run
 use ai_session_search::{SearchFilters, SessionSearch};
@@ -275,10 +275,11 @@ Rustdoc on each service covers operation ordering, allocation, pagination,
 stale-index semantics, and errors. Filesystem writes take an explicit
 restore or publication plan, so no call chooses a destination on its own.
 
-Everything below is imported from the crate root. Library defaults differ from the command line
-in one way: a list or classification limit you leave at 0 returns every row, where the CLI
-applies `[search].default_limit` and `[analytics].corrections_limit` (50 each). Set a limit when
-the index may be large.
+Everything below is imported from the crate root. `SearchFilters::default()` and
+`MessageClassificationQuery` retain zero-means-all limits. Use `SessionQuery` with
+`CatalogService::list_query` or `search_query` to resolve an omitted limit from
+`[search].default_limit`, like the CLI; see [configured Rust session limits](#configured-rust-session-limits).
+Set a finite limit when the index may be large.
 
 ```rust,no_run
 use ai_session_search::{
@@ -349,6 +350,13 @@ fn main() -> ai_session_search::anyhow::Result<()> {
 }
 ```
 
+### Deprecated Rust entry points
+
+Use the service handles above for new code. The [1.1.0 deprecation table](../../CHANGELOG.md#deprecated)
+lists retained low-level helpers, command-printing functions, compatibility search methods,
+and selector aliases with their replacements. `Db::purge_injected_messages` now reclassifies
+harness notices through `classify_injected_messages`; it preserves stored history.
+
 ### Errors
 
 Every call returns `anyhow::Result`. Failures a program branches on are
@@ -392,12 +400,6 @@ ai-session-search = { version = "1.1.0", default-features = false }
 
 `release-check` stays enabled for `cargo install`, published Python wheels, and
 normal CLI builds.
-
-### Depending on a release candidate
-
-Cargo excludes prereleases from an ordinary requirement, so `version = "1"`
-resolves 1.0.0 or a later stable and never a candidate. Name a candidate
-exactly: `version = "1.1.0-rc.1"`.
 
 ### Result shapes
 

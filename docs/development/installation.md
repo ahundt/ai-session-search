@@ -73,7 +73,7 @@ one only when a `--version` requirement asks for it. You never need to name a ve
 pre-release; name one to install a specific release.
 
 None of these commands creates aliases, registers MCP servers, writes managed Markdown or skills,
-or installs client hooks. `aise integrations install` does all of that, and it points at the
+or reads transcripts. `aise integrations install` creates the integrations and starts indexing, and it points at the
 package-owned executable rather than copying it.
 
 After any installation method, register the same `aise` executable with detected
@@ -241,7 +241,7 @@ To downgrade, stop every aise process, then:
 
 ```bash
 # The index 1.1.0 uses, before anything moves.
-DB="$(aise config show | sed -n 's/^db_path = "\(.*\)"$/\1/p')"
+DB="$(aise config paths --format json | python -c 'import json, sys; print(json.load(sys.stdin)["database"])')"
 # Move the index and its WAL files aside together.
 for f in "$DB" "$DB-wal" "$DB-shm"; do [ -e "$f" ] && mv "$f" "$f.from-1.1.0"; done
 uv tool install --force 'ai-session-search==1.0.0'   # or your package manager's command below
@@ -250,8 +250,8 @@ aise --database "$DB" reindex --full                 # rebuild at the same path 
 
 Name the path for the rebuild: with the file moved, 1.0.0 could otherwise resolve its default to a
 different directory. 1.0.0 loads the config and integration state 1.1.0 leaves. History that only
-1.1.0 kept stays in the `.from-1.1.0` files; after upgrading again, move them back over the rebuilt
-index.
+1.1.0 kept stays in the `.from-1.1.0` files; after upgrading again and stopping every aise process, move the rebuilt index and its WAL files
+to a separate backup before restoring the retained files to their original paths.
 
 Use the same owner for installation, update, and removal. Before removing a
 global command, remove its MCP registrations while the command is still

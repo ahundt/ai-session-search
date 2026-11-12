@@ -231,19 +231,13 @@ causes the next `auto` read to retry in the background.
 
 ## Rust, Python, and MCP
 
-No struct read from `config.toml` can be built with a struct literal: `Config` and the settings
-tables under it are `#[non_exhaustive]`, and `[ui.keys]` wraps a private map. A downstream crate
-therefore starts from `Default::default()` and assigns the fields it wants, so a new setting does
-not break code that compiles today; `[ui]` alone gained ten fields in the cycle before 1.0.0.
-`ConfigOverrides`
-is deliberately not among them, because it carries CLI and API overrides rather than file
-contents and a literal is how an embedder builds one. `tests/rust-api-consumer` compiles the
-supported pattern from outside the crate, where a struct expression fails with
-`error[E0639]: cannot create non-exhaustive struct using struct expression`.
+Public configuration structs, including `ConfigOverrides`, are `#[non_exhaustive]`. Start with
+`Default::default()`, use `with_*` setters, or assign public fields. Enum matches need a wildcard
+arm. The downstream consumer tests compile these patterns from outside the crate.
 
-Rust embedders should construct `ConfigOverrides` and call `Config::resolve`, then retain the
-returned `ResolvedConfig` for diagnostics and provenance. `SessionSearch::open` and
-`OfficialMcpServer::new` accept the resolved typed configuration without rereading process state.
+Rust embedders pass `ConfigOverrides` to `Config::resolve` and retain `ResolvedConfig.origins`
+for diagnostics. Pass its `config` field to `SessionSearch::open` or `OfficialMcpServer::new`;
+those constructors use the supplied `Config` without rereading process state.
 
 Python's `SessionSearch` accepts `db_path`, `config_path`, `cache_dir`, and `threads`; explicit
 arguments use the same precedence as CLI flags. Each Rust or Python `SessionSearch` owns a

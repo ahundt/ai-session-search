@@ -1,6 +1,6 @@
 ---
 name: ai-session-search
-description: Search, recover, inspect, export, and analyze local AI session history with AI Session Search (`aise`) across Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI. Use when asked to "find prior AI work", "recover context after compaction", "inspect tool calls or corrections", "reconstruct a file", "export a session", "analyze repeated mistakes", or turn session evidence into durable agent guidance.
+description: Search, recover, inspect, export, and analyze local AI coding-agent session history with AI Session Search (`aise`) across Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI. Use when asked to "find prior AI work", "recover context after compaction", "inspect tool calls or corrections", "reconstruct a file", "export a session", "analyze repeated mistakes", "search past conversations", "what did we decide last session", "resume a previous session", or turn session evidence into durable agent guidance.
 metadata:
   version: 1.1.0
 ---
@@ -45,27 +45,27 @@ environment variable, then `config.toml`, then the embedded default; `aise confi
 The MCP server key and protocol identity are `ai-session-search` (title **AI Session Search**).
 The same operations exist on the CLI, so choose by what is known, then narrow:
 
-| You know | CLI | MCP | Cost |
-| --- | --- | --- | --- |
-| Metadata only (a directory, provider, or period) and want the newest sessions | `aise list --path DIR --when 7d --limit 10` | `list_sessions(path_prefix, when, limit)` | ms, indexed; newest first |
-| A topic, title, repository, or remembered phrase | `aise search "topic"` | `search_sessions(query, path_prefix, when, limit)` | reads every eligible session's text; seconds on a large index |
-| An exact string, identifier, correction, or tool activity | `aise messages search "text"` | `search_messages(query, workspace_path_prefix, role/kinds/tool_name_contains, context, limit)` | sub-second with a selective prefilter; fuzzy is seconds |
-| A session id (from any of the above) | `aise messages evidence ID`, `aise show ID`, `aise messages get ID` | `get_session(session_id, summary=true \| transcript_lines=N \| seq=N \| seq_from/seq_to)` | ms |
-| A `(session_id, seq)` hit | `aise messages get ID --seq N --context 2` | `get_session(session_id, seq, context)` | ms |
-| A structural question: counts, grouping, time series, cross-provider | `aise db query "SQL"` | `query_session_index(sql \| schema_table)` | ~0.01 s indexed aggregate; >1 s full scan |
-| You want to reopen a session | `aise resume ID` | `get_resume_command(session_id)` | ms |
-| Index health | `aise doctor` | `get_index_status()` | ~0.2 s warm |
+| You know | CLI | MCP |
+| --- | --- | --- |
+| Metadata (directory, provider, period) | `aise list --path DIR --when 7d --limit 10` | `list_sessions(path_prefix, when, limit)` |
+| A topic or remembered phrase | `aise search "topic"` | `search_sessions(query, path_prefix, when, limit)` |
+| An exact string or tool activity | `aise messages search "text"` | `search_messages(query, workspace_path_prefix, role, kinds, context, limit)` |
+| A session id | `aise messages evidence ID`, `aise show ID` | `get_session(session_id, summary=true)` or `get_session(session_id, transcript_lines=N)` |
+| A `(session_id, seq)` hit | `aise messages get ID --seq N --context 2` | `get_session(session_id, seq, context)` |
+| Counts, grouping, or a structural question | `aise db query "SQL"` | `query_session_index(sql)` or `query_session_index(schema_table)` |
+| A session to reopen | `aise resume ID` | `get_resume_command(session_id)` |
+| Index health | `aise doctor` | `get_index_status()` |
 
-In an MCP-capable harness prefer the MCP tools; export, file recovery, analysis, and reindexing
-are CLI-only, and the CLI covers everything when MCP is unavailable. Skip session discovery when
-the string is already distinctive: go straight to message search. Timings are warm-cache
-one-significant-figure measurements on one machine; MCP transport and result size add overhead.
+In an MCP-capable harness prefer MCP. File recovery, export, analysis, and explicit reindexing use
+`aise files extract`, `aise export`, `aise analyze`, and `aise reindex`, or the library APIs.
+When the string is distinctive, start with message search. Session search reads eligible session
+text; fuzzy message search scores every eligible row. Narrow the scope before either.
 
 Result extent differs by surface, deliberately: MCP pages are bounded by default (follow
 `next_offset` for non-overlapping pages; pass `all_results=true` instead of `limit` for every
 match of a literal or regex query and expect a bounded-ceiling refusal with retry guidance when
-that is too large), while the CLI and Python return every literal, regex, or query-less match
-when `--limit` is omitted and `--all-results` says so explicitly. Fuzzy search always needs a
+that is too large), while CLI and Python return every literal, regex, or query-less match
+when no request, purpose, or operation limit applies. CLI `--all-results` requests that explicitly. Fuzzy search always needs a
 positive limit on every surface. Presentation options never change which rows match.
 
 ## 3. Narrow, then read, then act
@@ -98,8 +98,9 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
   an exact event boundary pass a timestamp with `Z` or an explicit offset, and fractional seconds
   are preserved for same-second ordering. Forms: `7d`, `yesterday`, `2026-01`, `2026-01/..`,
   RFC 3339; `aise dates` is the reference.
-- **Path.** `--path` (and MCP `path_prefix`) matches the exact directory and its
-  component-boundary descendants and leaves lexical siblings such as `project-other` out.
+- **Path.** Session commands use `--path` (MCP `path_prefix`) for a directory and its
+  component-boundary descendants, excluding siblings such as `project-other`. Message search
+  separates workspace and transcript paths with `--workspace-path` and `--transcript-path`.
 - **Session class.** A run spawned by another session is indexed as a session of its own with
   `parent_session_id` (the spawning session's whole id) and `agent_label` (`Explore`,
   `general-purpose`, a Codex agent nickname). Both classes come back by default;
@@ -110,9 +111,12 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
   the harness told the agent; they are indexed and left out of ordinary results, so
   `corrections`, `repeats`, and a user-role search see what people wrote. Search them with
   `--kinds harness-notice` to learn why an agent stopped, looped, or was blocked. Claude Code's
-  stored request copies (`api-request-blob`) are not indexed, so its mid-turn wrapper sentence and
-  repeated turns never appear as user text; a prompt typed mid-turn is indexed once as a queued
-  submission. `aise doctor` names record types a parser did not recognize and did not index.
+  conversation and attachment records supply searchable text; saved API request copies do not add
+  repeated turns or file edits. A queued submission delivered as a prompt counts as that prompt;
+  independent same-text submissions remain distinct. Files a person mentions, memory and plan text,
+  and invoked skill contents are searchable by default. Injected instructions, session context,
+  and hook messages use `--kinds harness-notice`. `aise doctor` reports unrecognized record and
+  attachment types; malformed attachments and skipped binary payloads produce parse warnings.
 - **Leading dash.** A bare positional query starting with `-` is parsed as a flag. Put every
   other flag first, then `--`, then the query (`aise search --limit 5 -- --path`); `messages
   search` also accepts `-e`. This applies to `search`, `messages search`, and `repeats`; MCP
@@ -132,15 +136,11 @@ boolean operators: the whole query and each word match as case-insensitive subst
 summary, cwd, repo, preview, and transcript, plus a fuzzy match on title and paths, and sessions
 matching every word rank first.
 
-Cost order on one corpus, cheapest first: indexed lookups (`list`, `messages get`, `show`;
-milliseconds) < literal or regex with a selective prefilter (word and trigram indexes admit
-candidates, then the exact predicate is verified: sub-second on a multi-million-message index for
-a rare fragment such as `ECONNRESET`, more for a common phrase such as `permission denied` because
-more candidates are verified) < fuzzy (every eligible row's selected field is read and scored,
-`O(T + N)` bytes and rows: seconds on the same index). Structural filters shrink every mode's
-work before the query runs, so add them before widening a query and before choosing fuzzy.
-`--all-results` grows output with the match count, `--context N` multiplies rows per hit, and
-`--receipt-level summary|full` adds one index pass for the corpus count.
+Indexed session lists and focused reads avoid scanning message text. Literal and regex searches
+use a prefilter when a safe anchor exists, then verify the exact predicate. Fuzzy search reads and
+scores every eligible row. Structural filters reduce that work before matching. `--all-results`
+grows output with the match count, `--context N` adds neighbors to each hit, and a summary or full
+receipt adds a pass to count eligible rows.
 
 To learn how a search was planned, add `--receipt-level summary` (MCP `receipt_level=summary`);
 `full` adds the origin of every resolved parameter. The receipt names the prefilter used or
@@ -193,11 +193,9 @@ aise messages search -e --path --limit 5
 ```
 
 `--field tool-name` and `--field tool-argument` (with `--argument-path`, an RFC 6901 pointer)
-search canonical tool fields without scanning rendered output. The current message-search names
-are `--workspace-path`, `--role`, `--query-mode`, and `--receipt-level` (earlier releases spelled
-them `--project`, `--type`, `--regex`/`--fuzzy`, and `--explain`). Output formats are `table`,
-`json`, `jsonl`, `csv`, and `plain`; `--include` accepts `normalized_session_metadata`,
-`parsed_references`, `raw_provider_metadata`, `runtime_diagnostics`, or `none`.
+search canonical tool fields without scanning rendered output. Use `--workspace-path` for message
+search and `--path` for session search. `--include` accepts `normalized_session_metadata`,
+`parsed_references`, `raw-metadata`, `runtime_diagnostics`, or `none`.
 
 ### Read one session, page without re-reading, and bound each hit
 
@@ -213,13 +211,16 @@ aise show SESSION_ID --transcript-lines 0
 aise resume SESSION_ID
 ```
 
+`aise resume ID` prints its command when stdin or stdout is redirected; `--dry-run` also
+prints it in a terminal.
+
 Range reads omit harness notices by default; an explicit `--kinds` list can include them.
 MCP `get_session` ranges accept `kinds=["conversation", "harness_notice"]`. Focused context
-already includes every class. MCP focused/range reads use `detail="compact"|"full"`, like
+already includes every class. Use MCP `seq` for a focused read. MCP focused/range reads use `detail="compact"|"full"`, like
 message search; `response_format="concise"|"detailed"` remains a deprecated alias.
 
-Signed windows share one convention on every surface: positive keeps the first N records or
-lines, negative the last N, zero everything (which may be large). `--limit` on `messages get`
+Signed transcript, per-message, and evidence windows share one convention: positive keeps the
+first N lines or evidence records, negative the last N, and zero everything (which may be large). `--limit` on `messages get`
 selects oldest-first unless `--order newest`, which selects the last N and prints them
 oldest-first. To read further, continue from the next seq range (`seq_from = last seq + 1`)
 rather than re-requesting a larger `--limit` or `transcript_lines`, which re-sends what you
@@ -253,24 +254,39 @@ A filtered bundle creates a new immutable directory; `--limit` defaults to
 aise skills corrections --path ~/source/project --when 30d --limit 50
 aise slash-commands --path ~/source/project --when 30d --limit 50
 aise stats --path ~/source/project --when 30d
-aise repeats --path ~/source/project --when 30d
+aise repeats --path ~/source/project --when 30d --max-candidates 5000 --max-groups 20
 aise analyze --provider codex --when 7d --output /absolute/new/analysis
 ```
 
 `aise skills corrections` and default/user-role `aise repeats` scan only source-attributable
-human text; generated, harness, unknown-authorship, and mirror rows do not count as recurrence.
-That includes messages typed while the agent was working when the transcript records a human
-sender. Queued messages with no recorded sender (older Claude Code) are left out and counted:
+human text, including messages typed while the agent was working when the transcript records a
+human sender. Harness notices and copied parent history in Codex forks remain searchable but do
+not count as new human input. Queued messages with no recorded sender (older Claude Code) are left out and counted:
 `unattributed_input_count` in the JSON report, a note in table output, a stderr note for
 `repeats` (or the count inside `aise repeats --format json --report`). Pass `--include-unattributed-input` (MCP `include_unattributed_input: true`) to read
 them; a program may have sent them. A queued message also delivered as its own prompt counts once.
 Corrections default to user-started sessions; pass `--session-kinds user subagent` to include
 attributable human text in both classes. `--format json` returns a tagged skill-run receipt plus
-the classification report. Search precise correction phrases such as `misunderstood`, `wrong repo`, `you forgot`, and
-`should have`, then add `--context 2`; treat mirrored provider records as correlated unless their
-content proves they are independent conversations. Counts differ by
-surface: `aise stats` omits harness notices while `aise vocab` and a raw `group by role` count
-them, and one `tool_call_id` can appear on several rows, so count distinct ids rather than rows.
+the classification report.
+
+The shipped correction categories are a small starter set of fixed phrasings. They will miss
+corrections worded for the situation. Use them as a quick first filter. To find where sessions
+went wrong, list their recorded input, inspect sender provenance, and read the surrounding turns:
+
+```sh
+aise list --path ~/source/project --when 7d --limit 10
+aise messages search "" --session-id SESSION_ID --role user --all-results --format json
+aise messages get SESSION_ID --seq 42 --context 3
+```
+
+MCP: `list_sessions(path_prefix="/path/to/project", when="7d", limit=10)`, then
+`search_messages(session_id="SESSION_ID", role="user", all_results=true)` and
+`get_session(session_id="SESSION_ID", seq=42, context=3)`. For a large session, use a positive
+`limit` and follow `page.next_offset` instead of `all_results`. Add categories for wording you
+see repeatedly using [Create your own classification package](#create-your-own-classification-package).
+A copied parent conversation is correlated evidence, not an independent correction.
+`aise stats` omits harness notices; raw SQL role counts include the classes its predicate selects.
+Count distinct `tool_call_id` values when measuring calls, since several rows can share an id.
 Publish analysis only to a new absolute directory; add `--policy` only for a validated JSON
 `AnalysisPolicySpec`.
 
@@ -321,8 +337,7 @@ provider's own spelling (namespaced on Claude, a bare leaf name on Codex; match 
 
 ### Recover an edited file
 
-Use this path only when the request is to reconstruct an edited file
-*(~0.01 s search/history, ~0.06 s cross-reference; `O(E + K log K)` filtered edits/results)*:
+To reconstruct an edited file:
 
 ```sh
 aise files search '*.rs' --path ~/source/project --limit 50
@@ -340,12 +355,20 @@ required.
 
 `--index-refresh auto` (the default) keeps a compatible existing index available and performs
 needed incremental maintenance. Use `--index-refresh before-query` when this query must wait for
-current source files to be indexed, `--index-refresh existing-only` for a reproducible read with
+current source files to be indexed, `--index-refresh existing-only` to read with
 no implicit refresh, `aise reindex` for an explicit incremental rebuild, and `aise reindex --full`
 only when a complete reparse is required. Run `compact` only when asked, after `aise doctor` and
 a disk check: compaction mutates the database and may need temporary space. Refresh is separate
-from query cost: a forced refresh on this machine exceeded 100 s before cancellation
-*(incremental `O(B_new)`; full `O(B_all)` bytes)*.
+from query cost: incremental refresh reads new source bytes; a full reparse reads all source bytes.
+
+For library use, Python `search_sessions()`/`list_sessions()`, `search_messages()`,
+`read_session_messages()`/`message_context()`, `reconstruct_file()`, `classify_messages()` and
+`repeats()` cover discovery, search, reading, recovery, and analysis. Rust exposes those routes
+through `SessionSearch::catalog()`, `messages()`, `files()`, and `analysis()`; `index()` controls
+freshness. See the [library guide](https://github.com/ahundt/ai-session-search/blob/main/docs/development/library-api.md).
+
+An empty search hint suggests other content classes or file history to try. It means the current
+query found no matches, not that the suggested alternatives contain an answer.
 
 ## 8. Turn evidence into durable guidance
 
