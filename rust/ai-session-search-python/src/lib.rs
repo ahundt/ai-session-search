@@ -213,6 +213,54 @@ fn add_service_exceptions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+fn path_text(path: PathBuf) -> PyResult<String> {
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| invalid_argument_error("path must contain valid Unicode"))
+}
+
+fn path_argument(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    path_text(value.extract::<PathBuf>()?)
+}
+
+fn optional_path_argument(value: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    if value.is_none() {
+        Ok(None)
+    } else {
+        path_argument(value).map(Some)
+    }
+}
+
+fn optional_paths_argument(value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<String>>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    value
+        .extract::<Vec<PathBuf>>()?
+        .into_iter()
+        .map(path_text)
+        .collect::<PyResult<Vec<_>>>()
+        .map(Some)
+}
+
+fn optional_date_argument(value: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(Some(text));
+    }
+    if value.is_instance(&value.py().import("datetime")?.getattr("date")?)? {
+        return value
+            .call_method0("isoformat")?
+            .extract::<String>()
+            .map(Some);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "date expression must be str, datetime.date, datetime.datetime, or None",
+    ))
+}
+
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     // The alternate flag renders an anyhow chain as "top: cause1: cause2" on one line instead
     // of just the top-level `.context(...)` message, so a wrapped failure (e.g. a migration
@@ -2376,7 +2424,7 @@ impl From<ai_session_search::dates::Bounds> for ResolvedDateRange {
 python_value! { DateRange, slf => value_fields(slf.as_any(), &["since","until","when"]);
     #[new]
     #[pyo3(signature = (*, since=None, until=None, when=None))]
-    fn new(since: Option<String>, until: Option<String>, when: Option<String>) -> PyResult<Self> {
+    fn new(#[pyo3(from_py_with = optional_date_argument)] since: Option<String>, #[pyo3(from_py_with = optional_date_argument)] until: Option<String>, #[pyo3(from_py_with = optional_date_argument)] when: Option<String>) -> PyResult<Self> {
         if when.is_some() && (since.is_some() || until.is_some()) {
             return Err(invalid_argument_error(
                 "when is mutually exclusive with since and until",
@@ -2443,7 +2491,7 @@ struct QueryExclusions {
 python_value! { QueryExclusions, slf => value_fields(slf.as_any(), &["path_prefixes","session_ids"]);
     #[new]
     #[pyo3(signature = (*, path_prefixes=None, session_ids=None))]
-    fn new(path_prefixes: Option<Vec<String>>, session_ids: Option<Vec<String>>) -> Self {
+    fn new(#[pyo3(from_py_with = optional_paths_argument)] path_prefixes: Option<Vec<String>>, session_ids: Option<Vec<String>>) -> Self {
         Self {
             path_prefixes: path_prefixes.unwrap_or_default(),
             session_ids: session_ids.unwrap_or_default(),
@@ -2490,10 +2538,12 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
     #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, dates=None, limit=None, offset=0, scope=None))]
     fn new(
         provider: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
         session_kinds: Option<Vec<String>>,
         parent_session_id: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         current_repo: Option<String>,
         dates: Option<DateRange>,
         limit: Option<i64>,
@@ -2620,6 +2670,7 @@ python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["prov
     #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, dates=None, first_canonical_sessions=None))]
     fn new(
         provider: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
         session_kinds: Option<Vec<String>>,
@@ -2722,6 +2773,7 @@ python_value! { QueryScope, slf => value_fields(slf.as_any(), &["provider","sess
     fn new(
         provider: Option<String>,
         session_id: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
         dates: Option<DateRange>,
@@ -2862,7 +2914,9 @@ python_value! { MessageExclusions, slf => value_fields(slf.as_any(), &["workspac
     #[new]
     #[pyo3(signature = (*, workspace_path_prefixes=None, transcript_path_prefixes=None, session_ids=None))]
     fn new(
+        #[pyo3(from_py_with = optional_paths_argument)]
         workspace_path_prefixes: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_paths_argument)]
         transcript_path_prefixes: Option<Vec<String>>,
         session_ids: Option<Vec<String>>,
     ) -> Self {
@@ -2895,7 +2949,9 @@ python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","s
     fn new(
         providers: Option<Vec<String>>,
         session_id: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         workspace_path_prefix: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         transcript_path_prefix: Option<String>,
         exclusions: Option<MessageExclusions>,
         dates: Option<DateRange>,
@@ -3016,6 +3072,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
         query_mode: Option<String>,
         provider: Option<String>,
         session_id: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         dates: Option<DateRange>,
     ) -> PyResult<Self> {
@@ -3697,6 +3754,7 @@ python_value! { FileQuery, slf => value_fields(slf.as_any(), &["scope","min_edit
         offset: i64,
         provider: Option<String>,
         session_id: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
         dates: Option<DateRange>,
@@ -5180,7 +5238,7 @@ impl SessionSearch {
     fn search_files(
         &self,
         py: Python<'_>,
-        pattern: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)] pattern: Option<String>,
         request: Option<FileQuery>,
     ) -> PyResult<Vec<NativeFileEditSummary>> {
         py.detach(|| {
@@ -5197,7 +5255,7 @@ impl SessionSearch {
     fn file_history(
         &self,
         py: Python<'_>,
-        file: String,
+        #[pyo3(from_py_with = path_argument)] file: String,
         request: Option<FileQuery>,
     ) -> PyResult<Vec<NativeFileVersion>> {
         py.detach(|| {
@@ -5214,7 +5272,7 @@ impl SessionSearch {
     fn cross_reference_files(
         &self,
         py: Python<'_>,
-        pattern: Option<String>,
+        #[pyo3(from_py_with = optional_path_argument)] pattern: Option<String>,
         request: Option<FileQuery>,
     ) -> PyResult<Vec<NativeFileCrossRef>> {
         py.detach(|| {
@@ -5236,7 +5294,7 @@ impl SessionSearch {
     fn reconstruct_file(
         &self,
         py: Python<'_>,
-        file: String,
+        #[pyo3(from_py_with = path_argument)] file: String,
         version: Option<i64>,
         request: Option<FileQuery>,
     ) -> PyResult<NativeReconstructedFile> {
@@ -5261,7 +5319,7 @@ impl SessionSearch {
     fn reconstruct_file_versions(
         &self,
         py: Python<'_>,
-        file: String,
+        #[pyo3(from_py_with = path_argument)] file: String,
         request: Option<FileQuery>,
     ) -> PyResult<NativeReconstructedFileVersions> {
         py.detach(|| {
@@ -5278,7 +5336,7 @@ impl SessionSearch {
     fn publish_file_versions(
         &self,
         py: Python<'_>,
-        file: String,
+        #[pyo3(from_py_with = path_argument)] file: String,
         destination: PathBuf,
         request: Option<FileQuery>,
     ) -> PyResult<NativeRecoveryPublicationReceipt> {

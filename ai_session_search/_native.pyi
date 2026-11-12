@@ -1,7 +1,11 @@
+from datetime import date, datetime
+from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Self, TypedDict, final
 
 from .types import FieldView, MatchView, MessageClassificationDefinition
+
+_PathInput = str | PathLike[str]
 
 _ProviderId = Literal["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "prime-agent", "aistudio", "gemini-cli"]
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
@@ -425,7 +429,7 @@ class AnalysisPublicationPlan:
         """Return a detached JSON-ready dictionary using structured-output field names."""
     def __repr__(self) -> str: ...
     def __eq__(self, other: object, /) -> bool: ...
-    def __new__(cls, destination: str | Path, formats: list[Literal["json", "markdown"]] | None = None) -> Self: ...
+    def __new__(cls, destination: _PathInput, formats: list[Literal["json", "markdown"]] | None = None) -> Self: ...
     @property
     def destination(self) -> Path: ...
     @property
@@ -693,7 +697,7 @@ class ReconstructedFile:
     version: int
     file_path: str
     content: str
-    def restore(self, *, output_dir: str | Path | None = None) -> Path: ...
+    def restore(self, *, output_dir: _PathInput | None = None) -> Path: ...
 
 @final
 class ReconstructedFileVersions:
@@ -950,9 +954,9 @@ class DateRange:
     def __new__(
         cls,
         *,
-        since: str | None = None,
-        until: str | None = None,
-        when: str | None = None,
+        since: str | date | datetime | None = None,
+        until: str | date | datetime | None = None,
+        when: str | date | datetime | None = None,
     ) -> Self: ...
     def resolve_bounds(
         self,
@@ -991,7 +995,7 @@ class QueryExclusions:
     def __new__(
         cls,
         *,
-        path_prefixes: list[str] | None = None,
+        path_prefixes: list[_PathInput] | None = None,
         session_ids: list[str] | None = None,
     ) -> Self: ...
 
@@ -1015,7 +1019,7 @@ class QueryScope:
         *,
         provider: _ProviderId | None = None,
         session_id: str | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
         dates: DateRange | None = None,
     ) -> Self: ...
@@ -1050,11 +1054,11 @@ class SessionQuery:
         cls,
         *,
         provider: _ProviderId | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
         session_kinds: list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
-        current_repo: str | None = None,
+        current_repo: _PathInput | None = None,
         dates: DateRange | None = None,
         limit: int | None = None,
         offset: int = 0,
@@ -1087,7 +1091,7 @@ class AnalysisRequest:
         cls,
         *,
         provider: _ProviderId | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
         session_kinds: list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
@@ -1111,8 +1115,8 @@ class MessageExclusions:
     def __new__(
         cls,
         *,
-        workspace_path_prefixes: list[str] | None = None,
-        transcript_path_prefixes: list[str] | None = None,
+        workspace_path_prefixes: list[_PathInput] | None = None,
+        transcript_path_prefixes: list[_PathInput] | None = None,
         session_ids: list[str] | None = None,
     ) -> Self: ...
 
@@ -1137,8 +1141,8 @@ class MessageScope:
         *,
         providers: list[_ProviderId] | None = None,
         session_id: str | None = None,
-        workspace_path_prefix: str | None = None,
-        transcript_path_prefix: str | None = None,
+        workspace_path_prefix: _PathInput | None = None,
+        transcript_path_prefix: _PathInput | None = None,
         exclusions: MessageExclusions | None = None,
         dates: DateRange | None = None,
     ) -> Self: ...
@@ -1225,7 +1229,7 @@ class MessageSearchRequest:
         query_mode: _MessageQueryMode | None = None,
         provider: _ProviderId | None = None,
         session_id: str | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         dates: DateRange | None = None,
     ) -> Self: ...
 
@@ -1264,7 +1268,7 @@ class SkillSelector:
         cls,
         *,
         name: str | None = None,
-        path: str | Path | None = None,
+        path: _PathInput | None = None,
     ) -> Self: ...
 
 @final
@@ -1360,7 +1364,7 @@ class FileQuery:
         offset: int = 0,
         provider: _ProviderId | None = None,
         session_id: str | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
         dates: DateRange | None = None,
     ) -> Self: ...
@@ -1779,10 +1783,10 @@ class SessionSearch:
     """
     def __new__(
         cls,
-        db_path: str | Path | None = None,
+        db_path: _PathInput | None = None,
         *,
-        config_path: str | Path | None = None,
-        cache_dir: str | Path | None = None,
+        config_path: _PathInput | None = None,
+        cache_dir: _PathInput | None = None,
         threads: int | None = None,
         index_refresh: Literal["auto", "before-query", "existing-only"] | None = None,
     ) -> Self: ...
@@ -1891,36 +1895,36 @@ class SessionSearch:
         ...
     def search_files(
         self,
-        pattern: str | None = None,
+        pattern: _PathInput | None = None,
         request: FileQuery | None = None,
     ) -> list[FileEditSummary]: ...
     def file_history(
         self,
-        file: str,
+        file: _PathInput,
         request: FileQuery | None = None,
     ) -> list[FileVersion]: ...
     def cross_reference_files(
         self,
-        pattern: str | None = None,
+        pattern: _PathInput | None = None,
         request: FileQuery | None = None,
     ) -> list[FileCrossRef]: ...
     def reconstruct_file(
         self,
-        file: str,
+        file: _PathInput,
         *,
         version: int | None = None,
         request: FileQuery | None = None,
     ) -> ReconstructedFile: ...
     def reconstruct_file_versions(
         self,
-        file: str,
+        file: _PathInput,
         *,
         request: FileQuery | None = None,
     ) -> ReconstructedFileVersions: ...
     def publish_file_versions(
         self,
-        file: str,
-        destination: str | Path,
+        file: _PathInput,
+        destination: _PathInput,
         *,
         request: FileQuery | None = None,
     ) -> RecoveryPublicationReceipt: ...
@@ -1931,7 +1935,7 @@ class SessionSearch:
     ) -> ExportDocument: ...
     def export_sessions(
         self,
-        destination: str | Path,
+        destination: _PathInput,
         request: SessionQuery | None = None,
         *,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
