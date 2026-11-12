@@ -3437,7 +3437,7 @@ impl MessageSearchRequestBuilder {
 
     /// Return the earliest or the latest matches when a page is smaller than the result set;
     /// results are presented in chronological order either way.
-
+    ///
     /// Unset, the planner applies the surface's configured default (see
     /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn match_window(mut self, window: MatchWindow) -> Self {
@@ -3446,7 +3446,7 @@ impl MessageSearchRequestBuilder {
     }
 
     /// Messages returned before and after each match, counted in messages of the same session.
-
+    ///
     /// Unset, the planner applies the surface's configured default (see
     /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn context(mut self, context: ContextWindow) -> Self {
@@ -3456,7 +3456,7 @@ impl MessageSearchRequestBuilder {
 
     /// Keep the first or last lines of each returned message, or all of it. Presentation only:
     /// it never changes which messages matched.
-
+    ///
     /// Unset, the planner applies the surface's configured default (see
     /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn message_lines(mut self, window: LineWindow) -> Self {
@@ -3465,7 +3465,7 @@ impl MessageSearchRequestBuilder {
     }
 
     /// Preset for how much of each message is returned: compact previews or full values.
-
+    ///
     /// Unset, the planner applies the surface's configured default (see
     /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn detail(mut self, detail: DetailLevel) -> Self {
@@ -3474,7 +3474,7 @@ impl MessageSearchRequestBuilder {
     }
 
     /// Character budget for the selected field of each message.
-
+    ///
     /// Unset, the planner applies the surface's configured default (see
     /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn field_view(mut self, budget: FieldViewBudget) -> Self {
@@ -3483,7 +3483,7 @@ impl MessageSearchRequestBuilder {
     }
 
     /// Character budget for the text shown around each match.
-
+    ///
     /// Unset, the planner applies the surface's configured default (see
     /// [`MessageService::plan`](crate::service::MessageService::plan)).
     pub fn match_view(mut self, budget: MatchViewBudget) -> Self {
