@@ -68,6 +68,7 @@ def cli(search, *args):
 def test_session_dictionary_matches_cli(corpus):
     actual = [row.to_dict() for row in corpus.list_sessions()]
     assert actual == cli(corpus, "list", "--format", "json")
+    assert [row.to_dict() for row in corpus.search_sessions("retry")] == cli(corpus, "search", "retry", "--format", "json")
 
 
 def test_message_dictionary_uses_cli_timestamp_name(corpus):

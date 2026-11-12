@@ -5494,7 +5494,16 @@ python_value! { NativeSessionGraphGroup, slf => value_fields(slf.as_any(), &["di
 
 python_value! { NativeSessionGraph, slf => value_fields(slf.as_any(), &["nodes","edges","groups"]); }
 
-python_value! { NativeSessionSearchHit, slf => value_fields(slf.as_any(), &["session","score","match_source","match_snippet"]); }
+fn search_hit_value<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let session = value.getattr("session")?.call_method0("to_dict")?;
+    let result = session.cast::<PyDict>()?;
+    for field in ["score", "match_source", "match_snippet"] {
+        result.set_item(field, value_json(&value.getattr(field)?)?)?;
+    }
+    Ok(session)
+}
+
+python_value! { NativeSessionSearchHit, slf => search_hit_value(slf.as_any()); }
 
 python_value! { NativeMessagePreview, slf => value_fields(slf.as_any(), &["seq","timestamp","chars","preview","expand_command"]); }
 
