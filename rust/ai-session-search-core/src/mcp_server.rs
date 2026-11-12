@@ -4753,8 +4753,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer",
                                 "description": format!("Transcript lines: positive=head/start, negative=tail/end, 0=all (may be large). Prefer seq for one turn. Conflicts with summary, seq and ranges. Omit for {} when no selector is given.", config.mcp.get_session_transcript_lines)
                             },
-                            "seq": { "type": "integer", "minimum": 0, "description": "0-based message sequence from search_messages results[].message_ref.message_seq; selects focused context instead of transcript lines. Omit for transcript output." },
-                            "message_seq": { "type": "integer", "minimum": 0, "description": "Deprecated: use seq. Same focused-message selector; conflicting values fail." },
+                            "seq": { "type": "integer", "minimum": 0, "description": "0-based signed 64-bit focused sequence from results[].message_ref.message_seq of search_messages. Omit for transcript lines." },
+                            "message_seq": { "type": "integer", "minimum": 0, "description": "Deprecated: use seq; conflicts fail." },
                             "seq_from": {
                                 "type": "integer", "minimum": 0,
                                 "description": "Lower inclusive session-local sequence bound. Pair with seq_to for chunks (0..499, then 500..999); advance last seq + 1 to avoid re-reading. Conflicts with summary, transcript_lines and seq. Omit to start at the first message."
@@ -5113,8 +5113,15 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
     let summary = mcp_bool_arg(args, "summary", false);
-    let old_seq = args.get("message_seq").and_then(Value::as_i64);
-    let seq = args.get("seq").and_then(Value::as_i64);
+    let sequence_arg = |key: &str| {
+        args.get(key).filter(|value| !value.is_null()).map(|raw| {
+            mcp_nonnegative_i64_arg(args, key, 0).map_err(|_| format!(
+                "{key} must be an integer from 0 through {} (got {raw}); pass a session-local sequence as seq", i64::MAX
+            ))
+        }).transpose()
+    };
+    let old_seq = sequence_arg("message_seq")?;
+    let seq = sequence_arg("seq")?;
     if seq.is_some() && old_seq.is_some() && seq != old_seq {
         return Err("seq conflicts with deprecated message_seq; pass seq only".to_string());
     }
@@ -9569,6 +9576,14 @@ mod tests {
             &db
         )
         .is_err());
+        for name in ["seq", "message_seq"] {
+            for value in [json!(u64::MAX), json!(-1), json!("1")] {
+                let mut arguments = json!({"session_id":"test1"});
+                arguments[name] = value;
+                let error = tool_get_session(&arguments, &config, &db).unwrap_err();
+                assert!(error.contains(name), "{error}");
+            }
+        }
         let tools = handle_tools_list(None, &config);
         let tool = tools["result"]["tools"]
             .as_array()
@@ -9576,6 +9591,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "get_session")
             .unwrap();
+        assert!(tool["inputSchema"]["properties"]["seq"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("64-bit"));
         assert!(
             tool["inputSchema"]["properties"]["message_seq"]["description"]
                 .as_str()
