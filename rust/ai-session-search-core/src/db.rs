@@ -496,9 +496,9 @@ const ATTRIBUTED_OR_UNATTRIBUTED_INPUT_SQL: &str = concat!(
     "))"
 );
 const UNATTRIBUTED_QUEUED_INPUT_SQL: &str = concat!("(", unattributed_queued_input_sql!(), ")");
-/// Excludes a queued row whose exact text is also an original human row of the same session
-/// that was not queued: one input recorded twice, once when it was queued and once when it was
-/// delivered as its own prompt. The delivered row is the one read, so the input counts once.
+/// Excludes the latest queued copy whose text equals the next direct human input in its session.
+/// An intervening direct input breaks the pair; each direct row absorbs at most one queue row.
+/// The delivered row is the one read, so the input counts once.
 /// The lookup reads the session's human rows through
 /// `idx_messages_session_authorship_relation_seq`.
 const NOT_DELIVERED_QUEUED_COPY_SQL: &str = "not (
@@ -510,6 +510,23 @@ const NOT_DELIVERED_QUEUED_COPY_SQL: &str = "not (
                  and delivered.record_relation = 'original'
                  and coalesce(delivered.input_origin, 'unknown') != 'queued'
                  and delivered.content = m.content
+                 and delivered.seq > m.seq
+                 and not exists (
+                     select 1 from messages next_direct
+                     where next_direct.session_id=m.session_id
+                       and next_direct.authorship='human' and next_direct.record_relation='original'
+                       and coalesce(next_direct.input_origin, 'unknown') != 'queued'
+                       and next_direct.seq > m.seq and next_direct.seq < delivered.seq
+                 )
+                 and not exists (
+                     select 1 from messages next_queued
+                     where next_queued.session_id=m.session_id
+                       and next_queued.input_origin='queued'
+                       and next_queued.authorship in ('human','unknown')
+                       and next_queued.record_relation='original'
+                       and next_queued.content=m.content
+                       and next_queued.seq > m.seq and next_queued.seq < delivered.seq
+                 )
            )
        )";
 /// The scope a correction run reads: forced to `role = user`, and to user-started sessions when the
@@ -13294,6 +13311,48 @@ mod tests {
     /// origin is read; a queued row with no recorded sender is counted and read only on request;
     /// a queued row also delivered as its own prompt is read once, as the prompt.
     #[test]
+    fn queued_delivery_pairs_only_the_next_direct_input_one_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &parsed_with_messages(
+                "claude:delivery",
+                &[
+                    "go",
+                    "unrelated delivery",
+                    "go",
+                    "go",
+                    "repeat",
+                    "repeat",
+                    "repeat",
+                ],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn.execute_batch("update messages set authorship='human', record_relation='original', input_origin='direct_conversation';
+            update messages set input_origin='queued' where seq in (0,3,4,5);").unwrap();
+        let seqs = |text| {
+            db.search_attributable_human_messages(text, &MessageFilters::default(), false)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seqs("go"),
+            [0, 2, 3],
+            "unrelated delivery and earlier direct text cannot absorb a queue row"
+        );
+        assert_eq!(
+            seqs("repeat").len(),
+            2,
+            "one direct row absorbs at most one queued row"
+        );
+    }
+
+    #[test]
     fn analytics_read_attributed_queued_input_and_count_unattributed_input() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -13309,8 +13368,8 @@ mod tests {
         db.conn
             .execute_batch(
                 "update messages set authorship = 'human', record_relation = 'original';
-                 update messages set input_origin = 'queued' where seq in (1, 2, 3);
-                 update messages set authorship = 'unknown' where seq in (1, 2);",
+                 update messages set input_origin = 'queued' where seq in (0, 2, 3);
+                 update messages set authorship = 'unknown' where seq in (0, 2);",
             )
             .unwrap();
         let filters = MessageFilters::default();
@@ -13321,11 +13380,11 @@ mod tests {
                 .map(|hit| hit.seq)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(seqs(false), [0, 3]);
+        assert_eq!(seqs(false), [1, 3]);
         assert_eq!(
             seqs(true),
-            [0, 2, 3],
-            "the delivered copy at seq 1 is never read"
+            [1, 2, 3],
+            "the delivered queue copy at seq 0 is never read"
         );
         assert_eq!(db.unattributed_input_count(&filters).unwrap(), 1);
     }
