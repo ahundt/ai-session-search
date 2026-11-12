@@ -48,9 +48,11 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    copies and repeated record identities no longer add extra turns or edits. Queued submissions
    delivered as prompts count as those prompts; independent same-text submissions stay distinct.
    Copied parent history in Codex forks stays searchable but does not count as new human input.
-6. `--since 1m` now means one minute. Use `1M` or `1mo` for one month. Months and years step by
-   calendar months. Offset-free dates use the local zone (or `TZ`), so `yesterday` means the local
-   day. JSON, MCP, and Python timestamps use UTC `Z`; human displays use local time with an offset.
+6. Date input keeps the published UTC default and fixed-duration shorthand: `m` or `M` means
+   30 days, and `y` or `Y` means 365 days. Use `min` for minutes, `mo` or `P1M` for calendar
+   months, and `P1Y` for calendar years. A trailing zone such as `[America/New_York]` selects a
+   local calendar explicitly. JSON, MCP, and Python timestamps use UTC `Z`; human displays use
+   local time with an offset.
 
 ### Added
 

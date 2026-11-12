@@ -88,7 +88,7 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
 
 ## 4. Filters that apply everywhere
 
-- **Time.** Values without an offset are local time (`TZ` or the system zone); a trailing
+- **Time.** Values without an offset use UTC; a trailing
   [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) zone, as in `2026-01-15[Europe/Berlin]`,
   reads one value in another zone. Session list/search/export/analysis date filters intersect
   the inclusive query period with each known indexed span from `created_at` through

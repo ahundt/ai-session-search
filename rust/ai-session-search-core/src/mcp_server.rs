@@ -6327,8 +6327,7 @@ fn parse_string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
 }
 
 /// `since`/`until`/`when` through the same [`dates::DateRange`] resolution the CLI flags use, so
-/// MCP and CLI accept identical strings and read values without an offset or zone in the local
-/// time zone of the machine running aise.
+/// MCP and CLI accept identical strings and preserve UTC for values without an offset or zone.
 fn parse_date_bounds(
     args: &Value,
     now: chrono::DateTime<chrono::Utc>,
@@ -6342,10 +6341,7 @@ fn parse_date_bounds(
     if range.when.is_some() && (range.since.is_some() || range.until.is_some()) {
         return Err("provide `when` OR `since`/`until`, not both".to_string());
     }
-    let local = dates::in_local_zone(now).map_err(|error| error.to_string())?;
-    range
-        .resolve_zoned(&local)
-        .map_err(|error| error.to_string())
+    range.resolve(now).map_err(|error| error.to_string())
 }
 
 fn search_filters_from_args(
@@ -9551,13 +9547,14 @@ mod tests {
             crate::util::display_timestamp(until.unwrap()),
             "2026-01-31T23:59:59.999999999Z"
         );
-        // Durations reach MCP through the same dates.rs parser: a window ending now, with `m`
-        // as minutes and `M` as a calendar month.
+        // Published m/M shorthand keeps 30-day months; min is minutes and mo is calendar months.
         for (duration, start) in [
             ("2h", "2026-06-15T10:00:00Z"),
             ("2d", "2026-06-13T12:00:00Z"),
-            ("30m", "2026-06-15T11:30:00Z"),
-            ("1M", "2026-05-15T12:00:00Z"),
+            ("30min", "2026-06-15T11:30:00Z"),
+            ("1m", "2026-05-16T12:00:00Z"),
+            ("1M", "2026-05-16T12:00:00Z"),
+            ("1mo", "2026-05-15T12:00:00Z"),
         ] {
             let (since, until) = parse_date_bounds(&json!({ "when": duration }), now).unwrap();
             assert_eq!(
@@ -9567,14 +9564,14 @@ mod tests {
             );
             assert_eq!(until, Some(now), "{duration}");
         }
-        // Without a zone the server's local zone applies, the same as the CLI.
+        // Without an explicit zone, the published UTC default applies on every surface.
         assert_eq!(
             parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap(),
             dates::DateRange {
                 when: Some("2026-01".to_string()),
                 ..dates::DateRange::default()
             }
-            .resolve_zoned(&dates::in_local_zone(now).unwrap())
+            .resolve(now)
             .unwrap()
         );
         assert!(

@@ -120,7 +120,7 @@ to request that explicitly in a terminal.
 
 `aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
 [EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,
-read in your local time zone unless the value names an offset or a trailing
+read in UTC unless the value names an offset or a trailing
 [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) zone such as `[Europe/Berlin]`;
 `aise dates` lists each accepted family with examples.
 

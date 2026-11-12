@@ -2462,7 +2462,7 @@ python_value! { DateRange, slf => value_fields(slf.as_any(), &["since","until","
 
     /// Resolve all expressions through the canonical Rust date parser.
     ///
-    /// Values without an offset are read in the local time zone (`TZ` or the system zone).
+    /// Values without an offset or explicit zone use UTC, preserving published date queries.
     /// `reference_time` fixes "now" for reproducible results: an RFC 3339 timestamp, whose offset
     /// becomes the zone, or an RFC 9557 one naming a zone, such as
     /// `2026-06-15T12:00:00[America/New_York]`.

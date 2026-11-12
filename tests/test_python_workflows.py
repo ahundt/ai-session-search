@@ -7,7 +7,7 @@ import os
 import re
 import sqlite3
 import subprocess
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -476,3 +476,18 @@ def test_readme_and_classification_reference_python_examples(corpus, tmp_path: P
                 assert isinstance(namespace["messages"], aise.MessageSearchResponse)
             else:
                 assert namespace["report"].output.report.policies
+
+
+@pytest.mark.parametrize("case", ["month-shorthand", "utc-date"])
+def test_cli_preserves_published_date_interpretations(corpus, monkeypatch: pytest.MonkeyPatch, case):
+    monkeypatch.setenv("TZ", "America/New_York")
+    timestamp = (datetime.now(UTC) - timedelta(days=2)).isoformat() if case == "month-shorthand" else "2026-01-15T00:30:00Z"
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute(
+            "INSERT INTO messages (session_id, provider, seq, role, kind, ts, content, authorship) "
+            "VALUES ('claude:synthetic-0', 'claude', 50, 'user', 'conversation', ?, 'compatibility-date-boundary', 'human')",
+            (timestamp,),
+        )
+    bounds = ["--since", "1m"] if case == "month-shorthand" else ["--when", "2026-01-15"]
+    response = cli(corpus, "messages", "search", "compatibility-date-boundary", *bounds, "--all-results", "--format", "json")
+    assert [row["message_ref"]["message_seq"] for row in response["results"]] == [50]
