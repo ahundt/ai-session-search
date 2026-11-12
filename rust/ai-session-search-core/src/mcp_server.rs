@@ -1699,9 +1699,12 @@ fn validate_schema_value(
                         let accepted: Vec<&str> = properties
                             .map(|properties| properties.keys().map(String::as_str).collect())
                             .unwrap_or_default();
+                        let hint = (path == "arguments")
+                            .then(|| replaced_parameter_hint(tool_name, key, &accepted))
+                            .flatten()
+                            .unwrap_or_else(|| unknown_key_hint(key, &accepted));
                         return Err(format!(
-                            "unknown {tool_name} parameter at {path}: {key}{}",
-                            unknown_key_hint(key, &accepted)
+                            "unknown {tool_name} parameter at {path}: {key}{hint}"
                         ));
                     }
                 }
@@ -4263,6 +4266,145 @@ pub(crate) fn measure_representative_response(config: &Config) -> Result<Measure
     measured
 }
 
+/// A top-level parameter name a tool rejects whose intended meaning is known: a name the tool
+/// used to accept, or the name a sibling tool uses for the same thing.
+struct ReplacedToolParameter {
+    tool: &'static str,
+    name: &'static str,
+    /// Accepted parameters of `tool` that replace `name`; a test holds each to the served schema.
+    replacements: &'static [&'static str],
+    /// How the value changes, or "" when it carries over unchanged.
+    value_change: &'static str,
+}
+
+/// Rejected-but-understood parameter names, kept beside the catalogue below so a rename there
+/// shows up here. They stay rejected: an alias would keep two vocabularies alive. The error names
+/// the replacement and still lists every accepted parameter.
+const REPLACED_TOOL_PARAMETERS: &[ReplacedToolParameter] = &[
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "response_format",
+        replacements: &["detail"],
+        value_change: "detail takes \"compact\" or \"full\" where response_format took \"concise\" or \"detailed\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "preview_chars",
+        replacements: &["field_view", "match_view"],
+        value_change: "pass {\"kind\":\"max_chars\",\"max_chars\":N} instead of N",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "match_evidence_max_chars",
+        replacements: &["match_view"],
+        value_change: "pass {\"kind\":\"max_chars\",\"max_chars\":N} instead of N",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "path_prefix",
+        replacements: &["workspace_path_prefix", "transcript_path_prefix"],
+        value_change: "workspace_path_prefix matches the working directory or repository root, transcript_path_prefix the transcript file",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "exclude_path_prefixes",
+        replacements: &[
+            "exclude_workspace_path_prefixes",
+            "exclude_transcript_path_prefixes",
+        ],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "match_mode",
+        replacements: &["query_mode"],
+        value_change: "query_mode takes \"literal\", \"regex\" or \"fuzzy\"; match_mode \"exact\" is query_mode \"literal\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "tool",
+        replacements: &["tool_name_contains"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "no_compaction",
+        replacements: &["include_compaction"],
+        value_change: "no_compaction true is include_compaction false",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "explain",
+        replacements: &["receipt_level"],
+        value_change: "explain true is receipt_level \"summary\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "order",
+        replacements: &["match_window"],
+        value_change: "order \"oldest\" is match_window \"earliest\", \"newest\" is \"latest\"; fuzzy queries rank by relevance without it",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "include_refs",
+        replacements: &["include"],
+        value_change: "include_refs true is include [\"parsed_references\"]",
+    },
+    ReplacedToolParameter {
+        tool: "get_session",
+        name: "detail",
+        replacements: &["response_format"],
+        value_change: "response_format takes \"concise\" or \"detailed\" where search_messages detail takes \"compact\" or \"full\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_sessions",
+        name: "workspace_path_prefix",
+        replacements: &["path_prefix"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "list_sessions",
+        name: "workspace_path_prefix",
+        replacements: &["path_prefix"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "search_sessions",
+        name: "exclude_workspace_path_prefixes",
+        replacements: &["exclude_path_prefixes"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "list_sessions",
+        name: "exclude_workspace_path_prefixes",
+        replacements: &["exclude_path_prefixes"],
+        value_change: "",
+    },
+];
+
+/// Hint for a top-level `name` that [`REPLACED_TOOL_PARAMETERS`] knows for `tool`: which accepted
+/// parameter replaces it, how its value changes, and then every accepted parameter.
+fn replaced_parameter_hint(tool: &str, name: &str, accepted: &[&str]) -> Option<String> {
+    let row = REPLACED_TOOL_PARAMETERS
+        .iter()
+        .find(|row| row.tool == tool && row.name == name)?;
+    let replacements: Vec<String> = row
+        .replacements
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect();
+    let value_change = if row.value_change.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", row.value_change)
+    };
+    Some(format!(
+        " — use {} instead{value_change}; accepted parameters are {}",
+        replacements.join(" or "),
+        quoted_sorted_names(accepted)
+    ))
+}
+
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let provider_values: Vec<_> = crate::source::PROVIDERS
         .into_iter()
@@ -5601,13 +5743,18 @@ fn unknown_key_hint(key: &str, accepted: &[&str]) -> String {
     }
     match nearest_name(key, accepted) {
         Some(candidate) => format!(" — did you mean {candidate:?}?"),
-        None => {
-            let mut accepted: Vec<&str> = accepted.to_vec();
-            accepted.sort_unstable();
-            let accepted: Vec<String> = accepted.iter().map(|name| format!("{name:?}")).collect();
-            format!(" — accepted parameters are {}", accepted.join(", "))
-        }
+        None => format!(
+            " — accepted parameters are {}",
+            quoted_sorted_names(accepted)
+        ),
     }
+}
+
+fn quoted_sorted_names(names: &[&str]) -> String {
+    let mut names = names.to_vec();
+    names.sort_unstable();
+    let names: Vec<String> = names.iter().map(|name| format!("{name:?}")).collect();
+    names.join(", ")
 }
 
 /// Quoted, comma-separated list of every tool name in the served tool list, in declaration order,
@@ -11375,6 +11522,126 @@ mod tests {
             );
             assert!(unknown_text.contains("\"get_session\""), "{unknown_text}");
 
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    /// Every row of `REPLACED_TOOL_PARAMETERS` points at the served catalogue: the tool exists,
+    /// it rejects the old name, and every replacement the error names is a parameter it accepts.
+    #[test]
+    fn replaced_tool_parameters_name_only_parameters_their_tool_accepts() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = handle_tools_list(None, &config)["result"]["tools"].clone();
+        for row in REPLACED_TOOL_PARAMETERS {
+            let properties = tools
+                .as_array()
+                .and_then(|tools| tools.iter().find(|tool| tool["name"] == row.tool))
+                .unwrap_or_else(|| panic!("{} is served", row.tool))["inputSchema"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} has properties", row.tool));
+            assert!(
+                !properties.contains_key(row.name),
+                "{} accepts {}, so the row is never reached",
+                row.tool,
+                row.name
+            );
+            for replacement in row.replacements {
+                assert!(
+                    properties.contains_key(*replacement),
+                    "{} does not accept {replacement}, named as the replacement for {}",
+                    row.tool,
+                    row.name
+                );
+            }
+        }
+    }
+
+    /// A caller sending an old or sibling-tool parameter name is told which accepted parameter
+    /// replaces it and how the value changes, through a real `tools/call`, as an MCP tool error
+    /// that still lists every accepted parameter.
+    #[test]
+    fn official_rmcp_transport_names_the_replacement_for_a_replaced_parameter() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                OfficialMcpServer::new(config)
+                    .unwrap()
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            for (tool, arguments, expected) in [
+                (
+                    "search_messages",
+                    json!({"query": "hello", "response_format": "detailed"}),
+                    &[
+                        "unknown search_messages parameter at arguments: response_format",
+                        "use \"detail\" instead",
+                        "\"compact\" or \"full\"",
+                    ][..],
+                ),
+                (
+                    "search_messages",
+                    json!({"query": "hello", "preview_chars": 80}),
+                    &[
+                        "use \"field_view\" or \"match_view\" instead",
+                        "{\"kind\":\"max_chars\",\"max_chars\":N}",
+                    ],
+                ),
+                (
+                    "search_messages",
+                    json!({"query": "hello", "path_prefix": "/x"}),
+                    &["use \"workspace_path_prefix\" or \"transcript_path_prefix\" instead"],
+                ),
+                (
+                    "get_session",
+                    json!({"session_id": "claude:test1", "detail": "full"}),
+                    &[
+                        "unknown get_session parameter at arguments: detail",
+                        "use \"response_format\" instead",
+                    ],
+                ),
+                (
+                    "list_sessions",
+                    json!({"workspace_path_prefix": "/x"}),
+                    &["use \"path_prefix\" instead"],
+                ),
+                (
+                    "search_sessions",
+                    json!({"query": "hello", "workspace_path_prefix": "/x"}),
+                    &["use \"path_prefix\" instead"],
+                ),
+            ] {
+                let result = client
+                    .peer()
+                    .call_tool(
+                        rmcp::model::CallToolRequestParams::new(tool)
+                            .with_arguments(arguments.as_object().unwrap().clone()),
+                    )
+                    .await
+                    .expect("a rejected parameter is a caller-visible tool result");
+                assert_eq!(result.is_error, Some(true), "{tool} {arguments}");
+                let text = &result.content[0].as_text().unwrap().text;
+                for expected in expected {
+                    assert!(text.contains(expected), "{tool}: {expected}: {text}");
+                }
+                assert!(
+                    text.contains("; accepted parameters are "),
+                    "{tool}: still lists accepted parameters: {text}"
+                );
+            }
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");
         });
