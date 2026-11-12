@@ -54,7 +54,7 @@ const GLOBAL_OPTIONS_HEADING: &str =
 const ROOT_COMMAND_GROUPS: &str = "\
 Start here (everyday):   search, messages, show, list, resume, files
 Export and maintenance:  export, reindex, doctor, integrations, package, config, dates
-Analytics:               stats, repeats, planning, analyze, skills
+Analytics:               stats, repeats, slash-commands, analyze, skills
 Expert:                  db, migrate, compact, mcp, tui
 
 Typical path: `aise search \"<topic>\" --when 30d` or `aise list --path <dir> --when 7d` to find a
@@ -148,8 +148,8 @@ enum Commands {
     /// Search and read individual messages: conversation turns and tool evidence (search|get|timeline|evidence).
     #[command(display_order = 11, subcommand)]
     Messages(crate::messages::MessagesCmd),
-    /// Aggregate slash-command usage frequency.
-    #[command(display_order = 33)]
+    /// Aggregate slash-command usage frequency. `planning` is a deprecated alias.
+    #[command(name = "slash-commands", alias = "planning", display_order = 33)]
     Planning(crate::analytics::PlanningArgs),
     /// Analyze indexed sessions with an optional validated JSON policy and publish one immutable bundle.
     #[command(display_order = 34)]
@@ -918,6 +918,12 @@ where
     let mut cli =
         Cli::from_arg_matches_mut(&mut matches).map_err(|error| error.format(&mut command))?;
     cli.command_path = command_path;
+    if command_tokens
+        .first()
+        .is_some_and(|token| token == "planning")
+    {
+        eprintln!("aise: planning is deprecated; use slash-commands");
+    }
     Ok(cli)
 }
 
@@ -4915,6 +4921,13 @@ mod tests {
         assert!(help.contains("ranks every eligible match"), "{help}");
         assert!(help.contains("Fuzzy offsets apply after"), "{help}");
         assert!(help.contains("Fuzzy search is always bounded"), "{help}");
+    }
+
+    #[test]
+    fn slash_commands_is_the_canonical_usage_command() {
+        assert_parses(["aise", "slash-commands", "--commands", "^/review$"]);
+        assert_parses(["aise", "planning", "--commands", "^/review$"]);
+        assert!(Cli::command().find_subcommand("slash-commands").is_some());
     }
 
     #[test]

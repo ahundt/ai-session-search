@@ -251,7 +251,7 @@ A filtered bundle creates a new immutable directory; `--limit` defaults to
 
 ```sh
 aise skills corrections --path ~/source/project --when 30d --limit 50
-aise planning --path ~/source/project --when 30d --limit 50
+aise slash-commands --path ~/source/project --when 30d --limit 50
 aise stats --path ~/source/project --when 30d
 aise repeats --path ~/source/project --when 30d
 aise analyze --provider codex --when 7d --output /absolute/new/analysis

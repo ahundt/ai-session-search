@@ -389,7 +389,7 @@ source, so run `aise compact` against the published destination.
 | `aise list`, `search`, `show`, `resume` | Find, read, and re-enter sessions |
 | `aise messages search\|get\|timeline\|evidence` | Query normalized turns and tool evidence |
 | `aise files search\|history\|cross-ref\|extract` | Locate and reconstruct edited files |
-| `aise skills corrections`, `aise planning`, `aise stats` | Deterministic message classification and indexed behavioral summaries |
+| `aise skills corrections`, `aise slash-commands`, `aise stats` | Deterministic message classification and indexed behavioral summaries |
 | `aise skills list\|show\|validate\|create\|update\|restore\|run` | Inspect, author, repair, and run skill packages |
 | `aise vocab`, `aise repeats` | How often a term appears, and in how many messages (`vocab --prefix TERM` for one term); or recurring phrases |
 | `aise export` | Render one session, or publish an explicitly selected bundle |
