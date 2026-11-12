@@ -2526,7 +2526,7 @@ impl QueryExclusions {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 /// Session list/search filters; an omitted limit follows search.default_limit, and 0 selects all.
 /// offset skips sessions in the existing list or ranked order. Accept flat filters or QueryScope.
 /// `current_repo` overrides repository-aware ranking; omission honors `prefer_current_repo` and
@@ -2612,22 +2612,6 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
     #[getter]
     fn dates(&self) -> DateRange {
         self.dates.clone()
-    }
-}
-
-impl Default for SessionQuery {
-    fn default() -> Self {
-        Self {
-            provider: None,
-            path_prefix: None,
-            exclusions: QueryExclusions::default(),
-            session_kinds: None,
-            parent_session_id: None,
-            current_repo: None,
-            dates: DateRange::default(),
-            limit: None,
-            offset: 0,
-        }
     }
 }
 
@@ -3743,7 +3727,7 @@ impl NativeSkillRunQuery {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 /// Typed file-history filters shared by search, reconstruction, restore, and publication.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct FileQuery {
@@ -3787,20 +3771,6 @@ python_value! { FileQuery, slf => value_fields(slf.as_any(), &["scope","min_edit
     #[getter]
     fn scope(&self) -> QueryScope {
         self.scope.clone()
-    }
-}
-
-impl Default for FileQuery {
-    fn default() -> Self {
-        // Constructed directly rather than through `new`, whose paging validation is fallible;
-        // these literals are non-negative by construction, so there is no error path to handle.
-        Self {
-            scope: QueryScope::default(),
-            min_edits: None,
-            max_edits: None,
-            limit: 0,
-            offset: 0,
-        }
     }
 }
 
