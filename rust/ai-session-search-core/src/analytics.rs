@@ -31,7 +31,7 @@ use crate::models::{
     MessageClassificationMatch, MessageFilters, MessageHit, MessageSearchMode, PlanningCount,
     Provider, Role,
 };
-use crate::render::{render, OutputFormat, Row};
+use crate::render::{emit, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
 const TABLE_CONTENT_CHARS: usize = 100;
@@ -1297,14 +1297,6 @@ fn phrase_word_count(phrase: &str) -> usize {
 
 fn context_command(session_id: &str, seq: i64, context: i64) -> String {
     format!("aise messages get {session_id} --seq {seq} --context {context}")
-}
-
-fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
 }
 
 #[cfg(test)]

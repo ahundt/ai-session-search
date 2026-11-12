@@ -31,7 +31,7 @@ use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
 };
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
-use crate::render::{render, OutputFormat, Row, RowBatchRenderer};
+use crate::render::{emit, render, OutputFormat, Row, RowBatchRenderer};
 use crate::service::{CatalogService, MessageService};
 use crate::util::{select_message_lines, truncate_for_display};
 
@@ -1799,14 +1799,6 @@ fn parse_context_count(raw: &str) -> std::result::Result<i64, String> {
         ));
     }
     Ok(value)
-}
-
-fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
 }
 
 fn emit_message_search_hits(

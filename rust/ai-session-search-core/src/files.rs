@@ -43,7 +43,7 @@ use crate::durable_fs::{entry_exists, StagedDirectory};
 use crate::models::{
     EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, FileVersion, Provider,
 };
-use crate::render::{render, OutputFormat, Row};
+use crate::render::{emit, OutputFormat, Row};
 
 pub(crate) type FileMutationPayload = (String, Option<String>, Vec<EditOp>);
 
@@ -1165,14 +1165,6 @@ where
     Ok(count)
 }
 
-fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,7 +1351,7 @@ mod tests {
             offset: 0,
             format: OutputFormat::Json,
         };
-        assert!(run(&db, &FilesCmd::CrossRef(args)).is_err());
+        assert!(run_command(&db, &FilesCmd::CrossRef(args)).is_err());
     }
 
     #[test]
