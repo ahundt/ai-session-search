@@ -475,7 +475,7 @@ struct SessionFilterArgs {
     /// Restrict to one indexed session source; omit to include all nine.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     provider: Option<Provider>,
-    /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
+    /// Restrict to sessions whose cwd, repo root, or transcript path is this directory or a descendant of it
     /// (a component boundary: `project` matches `project/src`, never `project-other`).
     /// Omit to search every allowed root.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
@@ -3123,6 +3123,30 @@ mod tests {
     /// Both path scopes match the exact directory and its component-boundary descendants
     /// (`db::path_prefix_patterns`: exact, or `prefix/`-anchored `LIKE`), so `project` never
     /// admits `project-other`; the help must say the same thing on both commands.
+    #[test]
+    fn session_path_help_includes_transcript_location() {
+        let root = Cli::command();
+        let command = root.find_subcommand("list").unwrap();
+        let help = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "path")
+            .unwrap()
+            .get_long_help()
+            .or_else(|| {
+                command
+                    .get_arguments()
+                    .find(|arg| arg.get_id() == "path")
+                    .unwrap()
+                    .get_help()
+            })
+            .unwrap()
+            .to_string();
+        assert!(
+            help.contains("cwd, repo root, or transcript path is this directory"),
+            "{help}"
+        );
+    }
+
     #[test]
     fn path_scope_help_states_component_boundary_matching_on_both_commands() {
         let root = Cli::command();
