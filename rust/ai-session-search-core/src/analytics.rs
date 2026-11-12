@@ -737,7 +737,7 @@ pub struct RepeatsReport {
 impl RepeatsReport {
     /// JSON report rendered by `aise repeats --report --format json`.
     ///
-    /// `context` is the signed message window in each example's follow-up command; it does
+    /// `context` supplies the neighbor count in each example's follow-up command; it does
     /// not change the mined groups or example membership. Conversion allocates `O(E + G)`
     /// rows for `E` examples and `G` groups, plus their text bytes.
     pub fn to_json(&self, context: i64) -> serde_json::Value {
