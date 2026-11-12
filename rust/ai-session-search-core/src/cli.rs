@@ -2504,6 +2504,15 @@ fn print_doctor(
         println!("Index refresh next command: {command}");
     }
     println!("Parse warnings indexed: {warnings}");
+    for unrecognized in &status.parser_health.unrecognized_record_types {
+        println!(
+            "Unrecognized record type, not indexed: {} {:?} ({} records in {} sessions)",
+            unrecognized.provider,
+            unrecognized.record_type,
+            unrecognized.records,
+            unrecognized.sessions
+        );
+    }
     for warning in &diagnostics.discovery_warnings {
         println!(
             "Discovery warning: {} {} {}: {} {}",

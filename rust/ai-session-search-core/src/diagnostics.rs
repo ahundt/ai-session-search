@@ -249,6 +249,7 @@ mod tests {
             stale_sessions,
             parse_warnings: 0,
             providers: Vec::new(),
+            unrecognized_record_types: Vec::new(),
         }
     }
 

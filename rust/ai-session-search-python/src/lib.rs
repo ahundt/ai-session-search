@@ -42,6 +42,7 @@ use ai_session_search::models::{
     FileQuery as CoreFileQuery, FileVersion, IndexReadinessStatus, IndexRefreshStatus, IndexStatus,
     MessageFilters, MessageHit, MessageKind, ParserHealth, Provider, ProviderHealth,
     ProviderParserHealth, Role, SearchField, SearchFilters, SearchHit, SessionKind, SessionRecord,
+    UnrecognizedRecordType,
 };
 use ai_session_search::service::{
     AnalysisReceipt as CoreAnalysisReceipt, CompactOutcome,
@@ -3964,6 +3965,36 @@ struct NativeProviderParserHealth {
     stale_sessions: i64,
 }
 
+#[derive(Clone)]
+/// One record type a provider's parser did not recognize, across the sessions containing it.
+#[pyclass(
+    name = "UnrecognizedRecordType",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
+struct NativeUnrecognizedRecordType {
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    record_type: String,
+    #[pyo3(get)]
+    records: i64,
+    #[pyo3(get)]
+    sessions: i64,
+}
+
+impl From<UnrecognizedRecordType> for NativeUnrecognizedRecordType {
+    fn from(item: UnrecognizedRecordType) -> Self {
+        Self {
+            provider: item.provider.as_str().to_string(),
+            record_type: item.record_type,
+            records: item.records,
+            sessions: item.sessions,
+        }
+    }
+}
+
 impl From<ProviderParserHealth> for NativeProviderParserHealth {
     fn from(health: ProviderParserHealth) -> Self {
         Self {
@@ -4001,6 +4032,8 @@ struct NativeParserHealth {
     parse_warnings: i64,
     #[pyo3(get)]
     providers: Vec<NativeProviderParserHealth>,
+    #[pyo3(get)]
+    unrecognized_record_types: Vec<NativeUnrecognizedRecordType>,
 }
 
 impl From<ParserHealth> for NativeParserHealth {
@@ -4014,6 +4047,11 @@ impl From<ParserHealth> for NativeParserHealth {
             stale_sessions: health.stale_sessions,
             parse_warnings: health.parse_warnings,
             providers: health.providers.into_iter().map(Into::into).collect(),
+            unrecognized_record_types: health
+                .unrecognized_record_types
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -5041,6 +5079,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<RefreshOutcome>()?;
     module.add_class::<NativeReindexOutcome>()?;
     module.add_class::<NativeProviderParserHealth>()?;
+    module.add_class::<NativeUnrecognizedRecordType>()?;
     module.add_class::<NativeParserHealth>()?;
     module.add_class::<NativeIndexStatus>()?;
     module.add_class::<NativeIndexReadinessStatus>()?;

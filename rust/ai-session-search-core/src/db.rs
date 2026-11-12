@@ -5804,7 +5804,47 @@ impl Db {
             stale_sessions: indexed_sessions - current_sessions,
             parse_warnings: self.count_parse_warnings()?,
             providers,
+            unrecognized_record_types: self.unrecognized_record_types()?,
         })
+    }
+
+    /// Unrecognized record types summed over every session's parse metadata, most records first.
+    /// One pass over the sessions table; the `like` prefilter skips JSON parsing for sessions
+    /// without the key, which is nearly all of them.
+    fn unrecognized_record_types(&self) -> Result<Vec<crate::models::UnrecognizedRecordType>> {
+        let mut statement = self.conn.prepare(&format!(
+            "select s.provider, entry.key, sum(entry.value), count(*)
+             from sessions s, json_each(s.raw_metadata_json, '$.{key}') entry
+             where s.raw_metadata_json like '%\"{key}\"%' and json_valid(s.raw_metadata_json)
+             group by s.provider, entry.key
+             order by sum(entry.value) desc, s.provider, entry.key
+             limit {limit}",
+            key = crate::providers::claude::UNRECOGNIZED_RECORD_TYPES_KEY,
+            limit = crate::models::UnrecognizedRecordType::LIMIT,
+        ))?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut types = Vec::new();
+        for row in rows {
+            let (provider, record_type, records, sessions) = row?;
+            // A provider name this build does not know is another build's row; skip it.
+            let Ok(provider) = Provider::from_db_str(&provider) else {
+                continue;
+            };
+            types.push(crate::models::UnrecognizedRecordType {
+                provider,
+                record_type,
+                records,
+                sessions,
+            });
+        }
+        Ok(types)
     }
 
     pub(crate) fn stale_session_sources(&self) -> Result<Vec<(Provider, String)>> {

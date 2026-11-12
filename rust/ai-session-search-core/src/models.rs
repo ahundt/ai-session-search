@@ -1775,6 +1775,29 @@ pub struct ParserHealth {
     pub stale_sessions: i64,
     pub parse_warnings: i64,
     pub providers: Vec<ProviderParserHealth>,
+    /// Records of a type the provider's parser does not recognize, which were not indexed,
+    /// summed across indexed sessions, most records first. Names and counts only; at most
+    /// `UnrecognizedRecordType::LIMIT` entries. Empty when every record type was recognized.
+    pub unrecognized_record_types: Vec<UnrecognizedRecordType>,
+}
+
+/// One record type a provider's parser did not recognize, across the sessions that contain it.
+/// A new harness release that adds a record kind appears here instead of silently changing what
+/// is indexed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct UnrecognizedRecordType {
+    pub provider: Provider,
+    pub record_type: String,
+    /// Records of this type that were not indexed.
+    pub records: i64,
+    /// Indexed sessions containing at least one such record.
+    pub sessions: i64,
+}
+
+impl UnrecognizedRecordType {
+    /// Most entries `ParserHealth::unrecognized_record_types` reports.
+    pub const LIMIT: usize = 20;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

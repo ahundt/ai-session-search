@@ -1216,6 +1216,19 @@ class ParserHealth:
     stale_sessions: int
     parse_warnings: int
     providers: list[ProviderParserHealth]
+    unrecognized_record_types: list[UnrecognizedRecordType]
+
+@final
+class UnrecognizedRecordType:
+    """One record type a provider's parser did not recognize, across the sessions containing it.
+
+    ``records`` were not indexed; ``sessions`` counts indexed sessions holding at least one.
+    """
+
+    provider: str
+    record_type: str
+    records: int
+    sessions: int
 
 @final
 class IndexStatus:
