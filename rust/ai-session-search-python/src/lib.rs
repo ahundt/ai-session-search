@@ -56,6 +56,67 @@ use pyo3::exceptions::{PyBrokenPipeError, PyOSError, PyRuntimeError, PyValueErro
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+// Value protocols live at the binding boundary; query and result semantics stay in core.
+macro_rules! python_value {
+    ($class:ident, $slf:ident => $value:expr; $($methods:tt)*) => {
+        #[pymethods]
+        impl $class {
+            /// Return a detached JSON-ready dictionary using structured-output field names.
+            fn to_dict<'py>($slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+                $value
+            }
+
+            fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
+                Ok(format!("{}({})", slf.get_type().name()?, Self::to_dict(slf)?.repr()?))
+            }
+
+            fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+                if !slf.get_type().is(&other.get_type()) {
+                    return Ok(false);
+                }
+                Self::to_dict(slf)?.eq(other.call_method0("to_dict")?)
+            }
+
+            $($methods)*
+        }
+    };
+}
+
+fn value_fields<'py>(value: &Bound<'py, PyAny>, fields: &[&str]) -> PyResult<Bound<'py, PyAny>> {
+    let result = PyDict::new(value.py());
+    for field in fields {
+        let key = if *field == "timestamp" { "ts" } else { field };
+        result.set_item(key, value_json(&value.getattr(*field)?)?)?;
+    }
+    Ok(result.into_any())
+}
+
+fn value_json<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if value.hasattr("to_dict")? {
+        return value.call_method0("to_dict");
+    }
+    if let Ok(mapping) = value.cast::<PyDict>() {
+        let result = PyDict::new(value.py());
+        for (key, item) in mapping {
+            result.set_item(key, value_json(&item)?)?;
+        }
+        return Ok(result.into_any());
+    }
+    if value.is_instance_of::<pyo3::types::PyList>()
+        || value.is_instance_of::<pyo3::types::PyTuple>()
+    {
+        let items = value
+            .try_iter()?
+            .map(|item| value_json(&item?))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(pyo3::types::PyList::new(value.py(), items)?.into_any());
+    }
+    if value.hasattr("__fspath__")? {
+        return value.call_method0("__fspath__");
+    }
+    Ok(value.clone())
+}
+
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     // The alternate flag renders an anyhow chain as "top: cause1: cause2" on one line instead
     // of just the top-level `.context(...)` message, so a wrapped failure (e.g. a migration
@@ -343,6 +404,10 @@ fn paging_argument(argument: PagingArgument, value: i64) -> PyResult<usize> {
 #[pyclass(name = "SessionRecord", module = "ai_session_search._native", frozen)]
 struct NativeSessionRecord {
     #[pyo3(get)]
+    discovery_source: String,
+    #[pyo3(get)]
+    parse_version: String,
+    #[pyo3(get)]
     id: String,
     #[pyo3(get)]
     provider: String,
@@ -381,6 +446,8 @@ struct NativeSessionRecord {
 impl From<SessionRecord> for NativeSessionRecord {
     fn from(session: SessionRecord) -> Self {
         Self {
+            discovery_source: session.discovery_source,
+            parse_version: session.parse_version,
             id: session.id,
             provider: session.provider.as_str().to_string(),
             provider_session_id: session.provider_session_id,
@@ -489,8 +556,7 @@ struct ClassificationRule {
     inner: ClassificationRuleSpec,
 }
 
-#[pymethods]
-impl ClassificationRule {
+python_value! { ClassificationRule, slf => value_fields(slf.as_any(), &["dimension","label","pattern","target","weight"]);
     #[new]
     #[pyo3(signature = (dimension, label, pattern, *, target="user_text", weight=0))]
     fn new(
@@ -557,8 +623,7 @@ struct PhraseVocabulary {
     spec: PhraseVocabularyPolicySpec,
 }
 
-#[pymethods]
-impl PhraseVocabulary {
+python_value! { PhraseVocabulary, slf => value_fields(slf.as_any(), &["widths","max_unique_phrases","min_document_tokens","excluded_tokens","exclude_numeric_tokens","prose_only"]);
     #[new]
     #[pyo3(signature = (widths, max_unique_phrases, *, min_document_tokens=0, excluded_tokens=None, exclude_numeric_tokens=true, prose_only=false))]
     fn new(
@@ -623,8 +688,7 @@ struct AnalysisPolicy {
     inner: RustAnalysisPolicy,
 }
 
-#[pymethods]
-impl AnalysisPolicy {
+python_value! { AnalysisPolicy, slf => json_compatible(slf.py(), &serde_json::json!({"classification_rules": slf.borrow().inner.classification_specs().collect::<Vec<_>>(), "relationship_rules": slf.borrow().inner.relationship_specs().collect::<Vec<_>>(), "phrase_vocabulary": slf.borrow().inner.phrase_vocabulary(), "max_classification_chars": slf.borrow().inner.max_classification_chars()}));
     #[new]
     #[pyo3(signature = (*, classification_rules=None, relationship_rules=None, phrase_vocabulary=None, max_classification_chars=None))]
     fn new(
@@ -654,8 +718,7 @@ impl AnalysisPolicy {
     }
 }
 
-#[pymethods]
-impl RelationshipRule {
+python_value! { RelationshipRule, slf => value_fields(slf.as_any(), &["id","kind","pattern"]);
     #[new]
     fn new(id: String, kind: &str, pattern: String) -> PyResult<Self> {
         let kind = match kind {
@@ -842,8 +905,7 @@ impl NativeAnalysisResult {
     }
 }
 
-#[pymethods]
-impl NativeAnalysisResult {
+python_value! { NativeAnalysisResult, slf => value_fields(slf.as_any(), &["sessions","vocabulary","graph"]);
     #[getter]
     fn sessions(&self, py: Python<'_>) -> PyResult<BTreeMap<String, Py<NativeAnalyzedSession>>> {
         self.result()
@@ -883,8 +945,7 @@ struct NativeAnalysisReceipt {
     inner: CoreAnalysisReceipt,
 }
 
-#[pymethods]
-impl NativeAnalysisReceipt {
+python_value! { NativeAnalysisReceipt, slf => value_fields(slf.as_any(), &["selection_kind","max_selected_sessions","database_schema_version","selected_sessions","messages_in_selected_sessions","analyzed_user_messages","has_more","last_selected_session_id","max_selected_session_updated_at","policy_digest","corpus_digest","result_digest"]);
     #[getter]
     fn selection_kind(&self) -> String {
         core_name(&self.inner.selection, "kind")
@@ -961,8 +1022,7 @@ struct NativeReceiptedAnalysis {
     inner: Arc<CoreReceiptedAnalysis>,
 }
 
-#[pymethods]
-impl NativeReceiptedAnalysis {
+python_value! { NativeReceiptedAnalysis, slf => value_fields(slf.as_any(), &["result","receipt"]);
     #[getter]
     fn result(&self) -> NativeAnalysisResult {
         NativeAnalysisResult::from_receipted(Arc::clone(&self.inner))
@@ -1086,8 +1146,7 @@ fn parse_publication_formats(
         .collect()
 }
 
-#[pymethods]
-impl NativeAnalysisPublicationPlan {
+python_value! { NativeAnalysisPublicationPlan, slf => value_fields(slf.as_any(), &["destination","formats"]);
     #[new]
     #[pyo3(signature = (destination, formats=None))]
     fn new(destination: PathBuf, formats: Option<Vec<String>>) -> PyResult<Self> {
@@ -1686,8 +1745,7 @@ struct NativeReconstructedFile {
     content: String,
 }
 
-#[pymethods]
-impl NativeReconstructedFile {
+python_value! { NativeReconstructedFile, slf => value_fields(slf.as_any(), &["session_id","provider","version","file_path","content"]);
     #[getter]
     fn provider(&self) -> String {
         self.provider.as_str().to_string()
@@ -2219,8 +2277,7 @@ impl From<ai_session_search::dates::Bounds> for ResolvedDateRange {
     }
 }
 
-#[pymethods]
-impl DateRange {
+python_value! { DateRange, slf => value_fields(slf.as_any(), &["since","until","when"]);
     #[new]
     #[pyo3(signature = (*, since=None, until=None, when=None))]
     fn new(since: Option<String>, until: Option<String>, when: Option<String>) -> PyResult<Self> {
@@ -2287,8 +2344,7 @@ struct QueryExclusions {
     session_ids: Vec<String>,
 }
 
-#[pymethods]
-impl QueryExclusions {
+python_value! { QueryExclusions, slf => value_fields(slf.as_any(), &["path_prefixes","session_ids"]);
     #[new]
     #[pyo3(signature = (*, path_prefixes=None, session_ids=None))]
     fn new(path_prefixes: Option<Vec<String>>, session_ids: Option<Vec<String>>) -> Self {
@@ -2330,8 +2386,7 @@ struct SessionQuery {
     limit: usize,
 }
 
-#[pymethods]
-impl SessionQuery {
+python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","current_repo","dates","limit"]);
     #[new]
     // Independent session filters stay flat and keyword-only, matching MessageSearchRequest;
     // grouping them would restore the one-use wrapper types this API intentionally removed.
@@ -2455,8 +2510,7 @@ struct NativeAnalysisRequest {
     first_canonical_sessions: Option<usize>,
 }
 
-#[pymethods]
-impl NativeAnalysisRequest {
+python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","dates","first_canonical_sessions"]);
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, dates=None, first_canonical_sessions=None))]
@@ -2557,8 +2611,7 @@ struct QueryScope {
     dates: DateRange,
 }
 
-#[pymethods]
-impl QueryScope {
+python_value! { QueryScope, slf => value_fields(slf.as_any(), &["provider","session_id","path_prefix","exclusions","dates"]);
     #[new]
     #[pyo3(signature = (*, provider=None, session_id=None, path_prefix=None, exclusions=None, dates=None))]
     fn new(
@@ -2651,8 +2704,7 @@ struct MessageExclusions {
     session_ids: Vec<String>,
 }
 
-#[pymethods]
-impl MessageExclusions {
+python_value! { MessageExclusions, slf => value_fields(slf.as_any(), &["workspace_path_prefixes","transcript_path_prefixes","session_ids"]);
     #[new]
     #[pyo3(signature = (*, workspace_path_prefixes=None, transcript_path_prefixes=None, session_ids=None))]
     fn new(
@@ -2683,8 +2735,7 @@ struct MessageScope {
     dates: DateRange,
 }
 
-#[pymethods]
-impl MessageScope {
+python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","session_id","workspace_path_prefix","transcript_path_prefix","exclusions","dates"]);
     #[new]
     #[pyo3(signature = (*, providers=None, session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
     fn new(
@@ -2774,8 +2825,7 @@ struct MessageSearchRequest {
     receipt_level: Option<CoreReceiptLevel>,
 }
 
-#[pymethods]
-impl MessageSearchRequest {
+python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope","role","kind","kinds","field","argument_path","seq_from","seq_to","tool_name_contains","include_compaction","limit","all_results","offset","match_window","context","context_before","context_after","include","lines_per_message","detail","field_view","match_view","purpose","purpose_version","receipt_level"]);
     #[new]
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
@@ -3169,8 +3219,7 @@ struct AnalysisQuery {
     limit: usize,
 }
 
-#[pymethods]
-impl AnalysisQuery {
+python_value! { AnalysisQuery, slf => value_fields(slf.as_any(), &["scope","limit"]);
     #[new]
     #[pyo3(signature = (*, scope=None, limit=50))]
     fn new(scope: Option<QueryScope>, limit: i64) -> PyResult<Self> {
@@ -3226,8 +3275,7 @@ struct NativeSkillSelector {
     inner: ai_session_search::SkillSelector,
 }
 
-#[pymethods]
-impl NativeSkillSelector {
+python_value! { NativeSkillSelector, slf => value_fields(slf.as_any(), &["name","path"]);
     #[new]
     #[pyo3(signature = (*, name=None, path=None))]
     fn new(name: Option<String>, path: Option<PathBuf>) -> PyResult<Self> {
@@ -3303,8 +3351,7 @@ struct NativeMessageClassificationQuery {
     include_unattributed_input: bool,
 }
 
-#[pymethods]
-impl NativeMessageClassificationQuery {
+python_value! { NativeMessageClassificationQuery, slf => value_fields(slf.as_any(), &["scope","session_kinds","additional_skills","limit","offset","include_unattributed_input"]);
     #[new]
     #[pyo3(signature = (*, scope=None, session_kinds=None, additional_skills=None, limit=None, offset=0, include_unattributed_input=false))]
     fn new(
@@ -3401,8 +3448,7 @@ struct NativeSkillRunQuery {
     input: NativeMessageClassificationQuery,
 }
 
-#[pymethods]
-impl NativeSkillRunQuery {
+python_value! { NativeSkillRunQuery, slf => value_fields(slf.as_any(), &["skill","definition","input"]);
     #[new]
     #[pyo3(signature = (*, skill, input, definition=None))]
     fn new(
@@ -3466,8 +3512,7 @@ struct FileQuery {
     offset: usize,
 }
 
-#[pymethods]
-impl FileQuery {
+python_value! { FileQuery, slf => value_fields(slf.as_any(), &["scope","min_edits","max_edits","limit","offset"]);
     #[new]
     #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=50, offset=0))]
     fn new(
@@ -3562,8 +3607,7 @@ struct NativeMessageHit {
     refs: Vec<ai_session_search::refs::MessageRef>,
 }
 
-#[pymethods]
-impl NativeMessageHit {
+python_value! { NativeMessageHit, slf => value_fields(slf.as_any(), &["provenance","session_id","provider","seq","role","kind","timestamp","tool_name","tool_call_id","fuzzy_score","content","refs","ref_summary"]);
     #[getter]
     fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         py.import("json")?
@@ -5107,3 +5151,119 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeCompactOutcome>()?;
     Ok(())
 }
+
+python_value! { NativeSessionRecord, slf => value_fields(slf.as_any(), &["id","provider","provider_session_id","title","summary","cwd","repo_root","created_at","updated_at","last_message_at","preview_text","source_path","message_count","parse_warning","parent_session_id","agent_label","discovery_source","parse_version"]); }
+
+python_value! { NativeAnalysisCursor, slf => json_compatible(slf.py(), &serde_json::json!({"after_session_id": slf.borrow().inner.as_str()})); }
+
+python_value! { NativeAnalysisDocument, slf => value_fields(slf.as_any(), &["session","user_text","first_user_text","message_count","user_message_count"]); }
+
+python_value! { NativeAnalysisDocumentPage, slf => value_fields(slf.as_any(), &["documents","next_cursor"]); }
+
+python_value! { NativeClassificationMatch, slf => value_fields(slf.as_any(), &["dimension","label","target","weight"]); }
+
+python_value! { NativeRelationshipHint, slf => value_fields(slf.as_any(), &["rule_id","kind","parent_title","status","resolved_session_id","candidate_session_ids"]); }
+
+python_value! { NativeAnalyzedSession, slf => value_fields(slf.as_any(), &["session","classifications","score","relationship_hints","has_user_text","message_count","user_message_count"]); }
+
+python_value! { NativePhraseFrequency, slf => value_fields(slf.as_any(), &["phrase","words","documents","occurrences"]); }
+
+python_value! { NativeAnalysisArtifact, slf => value_fields(slf.as_any(), &["name","content","sha256","bytes"]); }
+
+python_value! { NativePublishedAnalysisArtifact, slf => value_fields(slf.as_any(), &["name","bytes","sha256"]); }
+
+python_value! { NativeAnalysisPublicationReceipt, slf => value_fields(slf.as_any(), &["destination","artifacts"]); }
+
+python_value! { NativeSessionGraphNode, slf => value_fields(slf.as_any(), &["session_id","provider","title","cwd","repo_root","created_at","updated_at","score","classifications"]); }
+
+python_value! { NativeSessionGraphEdge, slf => value_fields(slf.as_any(), &["source_session_id","target_session_id","kind","rule_id"]); }
+
+python_value! { NativeSessionGraphGroup, slf => value_fields(slf.as_any(), &["dimension","key","session_ids"]); }
+
+python_value! { NativeSessionGraph, slf => value_fields(slf.as_any(), &["nodes","edges","groups"]); }
+
+python_value! { NativeSessionSearchHit, slf => value_fields(slf.as_any(), &["session","score","match_source","match_snippet"]); }
+
+python_value! { NativeMessagePreview, slf => value_fields(slf.as_any(), &["seq","timestamp","chars","preview","expand_command"]); }
+
+python_value! { NativeToolActivity, slf => value_fields(slf.as_any(), &["seq","timestamp","tool_name","kind","chars","preview","expand_command"]); }
+
+python_value! { NativeMessageRef, slf => value_fields(slf.as_any(), &["kind","value","normalized_value","host","source_tool","source_field","confidence","span_start","span_end"]); }
+
+python_value! { NativeRefEvidence, slf => value_fields(slf.as_any(), &["seq","role","tool_name","ref_summary","refs","preview","expand_command"]); }
+
+python_value! { NativeChangedFileEvidence, slf => value_fields(slf.as_any(), &["file_path","provider","edits","follow_up_command"]); }
+
+python_value! { NativeSessionTimeProfile, slf => value_fields(slf.as_any(), &["messages","timestamped_messages","undated_messages","first_timestamp","last_timestamp","observed_span_seconds","max_message_gap_seconds","tool_calls","tool_results"]); }
+
+python_value! { NativeSessionInspection, slf => value_fields(slf.as_any(), &["session","user_intent","tool_activity","refs","changed_files","truncated_evidence","time_profile","next_commands"]); }
+
+python_value! { NativeFileEditSummary, slf => value_fields(slf.as_any(), &["file_path","file_name","edits","sessions","last_edited"]); }
+
+python_value! { NativeFileVersion, slf => value_fields(slf.as_any(), &["session_id","provider","version","tool","timestamp","lines","file_path"]); }
+
+python_value! { NativeFileCrossRef, slf => value_fields(slf.as_any(), &["file_path","session_id","provider","edits"]); }
+
+python_value! { NativePublishedFileVersion, slf => value_fields(slf.as_any(), &["source_session_id","version","path","sha256"]); }
+
+python_value! { NativeRecoveryPublicationReceipt, slf => value_fields(slf.as_any(), &["destination","files"]); }
+
+python_value! { NativeExportDocument, slf => value_fields(slf.as_any(), &["format","content"]); }
+
+python_value! { NativeExportPublicationReceipt, slf => value_fields(slf.as_any(), &["destination","format","sessions","files"]); }
+
+python_value! { NativeProviderSourceStatus, slf => value_fields(slf.as_any(), &["provider","enabled","roots","discovered_files","warnings"]); }
+
+python_value! { NativeMessageClassificationMatch, slf => value_fields(slf.as_any(), &["session_id","message_seq","provider","timestamp","policy_name","category","matched_text","match_start_char","match_end_char_exclusive","content"]); }
+
+python_value! { NativeCapabilityReceipt, slf => value_fields(slf.as_any(), &["name","version","sha256"]); }
+
+python_value! { NativeMessageClassificationReport, slf => value_fields(slf.as_any(), &["policies","matches","unattributed_input_count","unattributed_input_included"]); }
+
+python_value! { NativeSelectedSkillLocation, slf => value_fields(slf.as_any(), &["kind","canonical_skill_md"]); }
+
+python_value! { NativeCapabilityExecutionSource, slf => value_fields(slf.as_any(), &["kind","canonical_capability_toml"]); }
+
+python_value! { NativeResolvedSkillReceipt, slf => value_fields(slf.as_any(), &["name","package_version","selected_location","execution_source"]); }
+
+python_value! { NativeMessageClassificationResult, slf => value_fields(slf.as_any(), &["receipt","report"]); }
+
+python_value! { NativeSkillRunReport, slf => value_fields(slf.as_any(), &["requested_selector","resolved_skill","output"]); }
+
+python_value! { NativePlanningCount, slf => value_fields(slf.as_any(), &["command","count","unique_sessions","unique_projects"]); }
+
+python_value! { NativeRoleStatistic, slf => value_fields(slf.as_any(), &["role","count"]); }
+
+python_value! { ResolvedDateRange, slf => value_fields(slf.as_any(), &["since","until"]); }
+
+python_value! { NativeMessageSearchResponse, slf => value_fields(slf.as_any(), &["response_schema_version","coordinate_unit","effective_request","results","page","included","receipt"]); }
+
+python_value! { NativeMessageSearchRuntimeDiagnostics, slf => value_fields(slf.as_any(), &["package_version","database_schema_version","response_schema_version","surface","config_digest"]); }
+
+python_value! { NativeMessageSearchBatch, slf => value_fields(slf.as_any(), &["results","included"]); }
+
+python_value! { NativeMessageSearchCompletion, slf => value_fields(slf.as_any(), &["page","receipt"]); }
+
+python_value! { RefreshOutcome, slf => value_fields(slf.as_any(), &["status","files_seen","sessions_updated","reason"]); }
+
+python_value! { NativeReindexOutcome, slf => value_fields(slf.as_any(), &["files_seen","sessions_updated","discovery_warnings"]); }
+
+python_value! { NativeProviderParserHealth, slf => value_fields(slf.as_any(), &["provider","expected_parse_version","indexed_sessions","current_sessions","stale_sessions"]); }
+
+python_value! { NativeUnrecognizedRecordType, slf => value_fields(slf.as_any(), &["provider","record_type","records","sessions"]); }
+
+python_value! { NativeParserHealth, slf => value_fields(slf.as_any(), &["schema_version","expected_schema_version","schema_current","indexed_sessions","current_sessions","stale_sessions","parse_warnings","providers","unrecognized_record_types"]); }
+
+python_value! { NativeIndexStatus, slf => value_fields(slf.as_any(), &["parser_health","repairable_stale_sessions","unavailable_stale_sessions","repair_commands","readiness"]); }
+
+python_value! { NativeIndexReadinessStatus, slf => value_fields(slf.as_any(), &["snapshot_availability","last_successful_refresh_at","refresh"]); }
+
+python_value! { NativeIndexRefreshStatus, slf => value_fields(slf.as_any(), &["state","started_by","started_at","finished_at","files_discovered","files_processed","sessions_updated","retry_after_ms","message","next_command"]); }
+
+python_value! { NativeProviderHealth, slf => value_fields(slf.as_any(), &["provider","enabled","cli_available","roots","discovered_files","indexed_sessions","expected_parse_version","current_sessions","stale_sessions","repairable_stale_sessions","unavailable_stale_sessions","resume_command"]); }
+
+python_value! { NativeDiagnosticStatus, slf => value_fields(slf.as_any(), &["db_path","index_status","discovery_warnings","providers"]); }
+
+python_value! { NativeProviderDiscoveryWarning, slf => value_fields(slf.as_any(), &["provider","path","operation","message","readable_sources_preserved","verification_command","guidance"]); }
+
+python_value! { NativeCompactOutcome, slf => value_fields(slf.as_any(), &["before_bytes","after_bytes","reclaimed_bytes"]); }

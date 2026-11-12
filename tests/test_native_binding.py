@@ -246,7 +246,7 @@ def test_message_classification_public_result_names_and_fields_are_pinned() -> N
     assert hasattr(native, "CapabilityReceipt")
     assert hasattr(native, "MessageClassificationReport")
 
-    fields = {name for name in dir(native.MessageClassificationMatch) if not name.startswith("_")}
+    fields = {name for name in dir(native.MessageClassificationMatch) if not name.startswith("_") and name != "to_dict"}
     assert fields == {
         "session_id",
         "provider",
@@ -261,8 +261,8 @@ def test_message_classification_public_result_names_and_fields_are_pinned() -> N
     }
     assert "ts" not in fields, "Rust's `ts` must stay renamed to `timestamp` on this surface"
     assert "matched_pattern" not in fields, "the field names the matched text, not the rule"
-    assert {name for name in dir(native.CapabilityReceipt) if not name.startswith("_")} == {"name", "version", "sha256"}
-    assert {name for name in dir(native.MessageClassificationReport) if not name.startswith("_")} == {
+    assert {name for name in dir(native.CapabilityReceipt) if not name.startswith("_") and name != "to_dict"} == {"name", "version", "sha256"}
+    assert {name for name in dir(native.MessageClassificationReport) if not name.startswith("_") and name != "to_dict"} == {
         "policies",
         "matches",
         "unattributed_input_count",

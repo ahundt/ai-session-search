@@ -121,6 +121,11 @@ without holding the database lock, so a slow consumer cannot hold the index
 open. Publication is explicit: no library call writes a bundle to disk as a side
 effect.
 
+Request and result values compare by value, have readable `repr()` output, and expose
+`to_dict()` for a detached JSON-ready dictionary. Dictionaries use CLI field names, including
+`ts`; existing Python attributes keep `timestamp`. Resource owners and iterators retain
+identity semantics.
+
 Detailed result classes come from `ai_session_search.native`.
 
 ## Rust
