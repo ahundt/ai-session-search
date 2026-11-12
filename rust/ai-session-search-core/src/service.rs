@@ -950,12 +950,9 @@ impl SessionSearch {
     /// may create a new current-schema database and later perform the configured incremental
     /// refresh. Newer, hybrid, and incomplete current schemas fail before an ordinary query.
     ///
-    /// Opening never reads session sources. Until the index holds a session or has completed a
-    /// refresh, typed reads (listing, search, messages, files, export, analysis) return
-    /// [`ServiceError::IndexNotRefreshed`](crate::ServiceError::IndexNotRefreshed) rather than an
-    /// empty result that would look like "no matches". Call [`IndexService::prepare_for_read`]
-    /// once after opening to apply the configured refresh policy, as `aise` does before every
-    /// command.
+    /// Opening never reads session sources. This published constructor preserves empty reads
+    /// before the first refresh. Use [`SessionSearch::open_strict`] to distinguish an unrefreshed
+    /// index from an empty history, then call [`IndexService::prepare_for_read`] before querying.
     ///
     /// # Threads
     ///
@@ -966,16 +963,27 @@ impl SessionSearch {
         Self::open_with_access_inputs(config, inputs)
     }
 
-    /// Open an index with trusted runtime roots supplied by a harness integration.
-    ///
-    /// Like [`SessionSearch::open`], the returned application refuses typed reads on an index
-    /// that holds no sessions and has never completed a refresh; see
-    /// [`IndexService::prepare_for_read`].
+    /// Open an index with trusted runtime roots, preserving published empty-read behavior.
     pub fn open_with_access_inputs(
         config: Config,
         access_inputs: TrustedAccessInputs,
     ) -> Result<Self> {
-        let mut app = Self::open_with_access_inputs_and_runtime(config, access_inputs, None)?;
+        Self::open_with_access_inputs_and_runtime(config, access_inputs, None)
+    }
+
+    /// Open without reading sources, refusing reads until the index contains sessions or has
+    /// completed a refresh. Call [`IndexService::prepare_for_read`] to apply the refresh policy.
+    pub fn open_strict(config: Config) -> Result<Self> {
+        let inputs = TrustedAccessInputs::capture(&config.search.scope, Vec::new())?;
+        Self::open_strict_with_access_inputs(config, inputs)
+    }
+
+    /// Like [`SessionSearch::open_strict`], with trusted roots supplied by a harness integration.
+    pub fn open_strict_with_access_inputs(
+        config: Config,
+        access_inputs: TrustedAccessInputs,
+    ) -> Result<Self> {
+        let mut app = Self::open_with_access_inputs(config, access_inputs)?;
         app.db.set_reject_unrefreshed_reads(true);
         Ok(app)
     }
@@ -1511,10 +1519,15 @@ mod execution_runtime_tests {
             .unwrap();
         assert_eq!(message_response.hits().len(), 1);
         assert_eq!(message_response.hits()[0].session_id, "claude:allowed");
-        // A session outside the access scope is not found, exactly like an unknown one.
-        let hidden = app
+        // Legacy exact-ID reads and resolving reads both preserve the access boundary.
+        assert!(app
             .messages()
             .context("claude:hidden", 0, 1, 1)
+            .unwrap()
+            .is_empty());
+        let hidden = app
+            .messages()
+            .context_resolved("claude:hidden", 0, 1, 1)
             .unwrap_err();
         assert_eq!(
             hidden
@@ -3658,27 +3671,30 @@ impl<'db> MessageService<'db> {
         self.db.session_metadata(session_ids)
     }
 
-    /// Return every message whose seq lies within `before` sequence numbers before and `after`
-    /// after `seq`, ordered by `(seq, id)`.
+    /// Read context for an exact canonical session ID. Unknown, inaccessible or partial IDs
+    /// return an empty list, preserving the published behavior. Use [`Self::context_resolved`]
+    /// for prefix lookup and missing-session errors. `before` and `after` count sequence
+    /// numbers, must be nonnegative, and select an inclusive window ordered by `(seq, id)`.
+    /// Zero on both sides returns only the anchor sequence; a window past the session is empty.
     ///
-    /// `session_id` is a canonical id or a unique prefix, resolved like
-    /// [`CatalogService::resolve_session`]. `before` and `after` count sequence numbers, not
-    /// messages, and must be zero or more; 0 and 0 return only the messages at `seq`. A window
-    /// past the end of an existing session returns an empty list.
-    ///
-    /// # Errors
-    ///
-    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) or
-    /// [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous)
-    /// when `session_id` names no session or several. Before 1.1.0 an unknown session returned
-    /// an empty list.
-    ///
-    /// # Complexity
-    ///
-    /// One indexed session lookup, then the `(session_id, seq)` index makes database work and
-    /// memory proportional to the rows in that window: `before + after + 1` sequence numbers
-    /// times the messages each holds, subject to messages available in the session.
+    /// Database work and memory follow the indexed `before + after + 1` sequence window and
+    /// the number of messages it contains.
     pub fn context(
+        &self,
+        session_id: &str,
+        seq: i64,
+        before: i64,
+        after: i64,
+    ) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
+        self.db.message_context(session_id, seq, before, after)
+    }
+
+    /// Resolve a session prefix before reading context; missing or inaccessible sessions return
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound), and ambiguous
+    /// prefixes return [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous).
+    /// Window semantics and indexed work follow [`Self::context`].
+    pub fn context_resolved(
         &self,
         session_id: &str,
         seq: i64,

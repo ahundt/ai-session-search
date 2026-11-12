@@ -591,7 +591,10 @@ mod tests {
         assert_eq!(candidates, &["claude:consumer-a", "claude:consumer-b"]);
 
         // An unknown session in a context read is the same not-found failure, not an empty list.
-        let error = app.messages().context("claude:nope", 0, 1, 1).unwrap_err();
+        let error = app
+            .messages()
+            .context_resolved("claude:nope", 0, 1, 1)
+            .unwrap_err();
         assert_eq!(service_error(&error).code(), "session-not-found");
 
         let error = app
@@ -706,7 +709,7 @@ mod tests {
     fn a_never_refreshed_index_is_distinguishable_from_no_matches() {
         use ai_session_search::AutoReindexOutcome;
         let fixture = Fixture::new();
-        let app = SessionSearch::open(fixture.config()).unwrap();
+        let app = SessionSearch::open_strict(fixture.config()).unwrap();
         let error = app
             .catalog()
             .list_sessions(&SearchFilters::default())
@@ -1244,6 +1247,51 @@ mod tests {
             ai_session_search::trigram::trigram_prefilter_all(["needle"]),
             Some("(\"dle\" AND \"edl\" AND \"eed\" AND \"nee\")".into())
         );
+    }
+    #[test]
+    fn published_legacy_open_serves_an_unrefreshed_empty_index() {
+        let fixture = Fixture::new();
+        let app = SessionSearch::open(fixture.config()).unwrap();
+        assert!(app
+            .catalog()
+            .list_sessions(&SearchFilters::default())
+            .unwrap()
+            .is_empty());
+        assert!(app
+            .messages()
+            .context("missing", 0, 0, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn published_legacy_context_uses_exact_ids_and_empty_missing_results() {
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        assert_eq!(
+            app.messages()
+                .context("claude:consumer-a", 0, 0, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(app
+            .messages()
+            .context("consumer-a", 0, 0, 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            app.messages()
+                .context_resolved("consumer-a", 0, 0, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(app
+            .messages()
+            .context("missing", 0, 0, 0)
+            .unwrap()
+            .is_empty());
     }
 }
 

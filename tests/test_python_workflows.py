@@ -200,6 +200,19 @@ def test_existing_index_mode_never_creates_missing_database(tmp_path: Path):
     assert not database.parent.exists()
 
 
+def test_configured_existing_only_preserves_published_empty_reads(tmp_path: Path):
+    database = tmp_path / "empty.db"
+    with aise.SessionSearch(database):
+        pass
+    config = tmp_path / "existing-only.toml"
+    config.write_text('[index]\nrefresh = "existing-only"\n')
+    with aise.SessionSearch(database, config_path=config) as legacy:
+        assert legacy.list_sessions() == []
+    with aise.SessionSearch(database, config_path=config, index_refresh="existing-only") as strict:
+        with pytest.raises(aise.IndexNotRefreshedError):
+            strict.list_sessions()
+
+
 def test_strict_unprepared_index_has_actionable_error(tmp_path: Path):
     database = tmp_path / "index.db"
     aise.SessionSearch(database)

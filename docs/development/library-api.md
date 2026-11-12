@@ -152,8 +152,8 @@ before a first query. To require an existing index, pass
 `SessionSearch(db_path, index_refresh="existing-only")`: a missing path raises `NotFoundError`
 without creating its directory, and an unrefreshed empty index raises `IndexNotRefreshedError`.
 `index_refresh="auto"` and `"before-query"` use the corresponding CLI policy when you call
-`prepare_for_read()`. Omitting the argument preserves the older empty-index read behavior unless
-configuration explicitly selects existing-only.
+`prepare_for_read()`. Omitting the argument preserves published empty-index reads, including when
+configuration selects existing-only; that policy still refuses missing indexes and opens read-only.
 
 Path arguments also accept `pathlib.Path` and other `os.PathLike` values. `DateRange`
 accepts `datetime.date` and `datetime.datetime` as well as text; it sends their ISO representation
@@ -249,12 +249,15 @@ Result and request classes are available directly from `ai_session_search`, incl
 
 The `ai-session-search` application services use provider-neutral requests and results.
 The adapters convert them for the CLI, MCP, and Python; use those services for new library code.
+`load()`, `open()`, and `open_with_access_inputs()` retain published empty-index reads. Use
+`open_strict()` or `open_strict_with_access_inputs()` to require a prepared index. `messages().context()`
+keeps exact-ID lookup and empty missing results; `context_resolved()` adds prefix lookup and lookup errors.
 
 ```rust,no_run
 use ai_session_search::{SearchFilters, SessionSearch};
 
 fn main() -> ai_session_search::anyhow::Result<()> {
-    let app = SessionSearch::load()?;
+    let app = SessionSearch::open_strict(ai_session_search::Config::load()?)?;
     // Opening never reads your session files. This applies the configured refresh policy, as
     // `aise` does before every command; with the default `auto` policy it indexes the sources
     // the first time. Without it, reads on a never-indexed database fail with

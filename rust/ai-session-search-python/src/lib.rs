@@ -4650,9 +4650,8 @@ impl SessionSearch {
         })
         .map_err(service_error)?
         .config;
-        let strict = index_refresh.is_some()
-            || config.index.refresh == ai_session_search::config::IndexRefresh::ExistingOnly;
-        let mut inner = CoreSessionSearch::open(config).map_err(service_error)?;
+        let strict = index_refresh.is_some();
+        let mut inner = CoreSessionSearch::open_strict(config).map_err(service_error)?;
         if !strict {
             // Preserve pre-1.1 opening semantics when no read policy was requested.
             inner.serve_unrefreshed_index_as_empty();
@@ -5067,7 +5066,7 @@ impl SessionSearch {
                 .resolve_session(&session_id)
                 .map_err(service_error)?;
             app.messages()
-                .context(&session.id, seq, before, after)
+                .context_resolved(&session.id, seq, before, after)
                 .map(|hits| capped_native_hits(hits, lines_per_message))
                 .map_err(service_error)
         })

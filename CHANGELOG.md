@@ -33,10 +33,11 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    `SearchFilters::default().with_path_prefix(dir)` instead of a `SearchFilters { ... }` literal.
    `util::apply_user_role_authorship` and `util::UserRoleAuthorshipEvidence` remain callable
    deprecated paths; use `RawMessage::with_authorship` before normalization.
-3. Rust typed reads on a never-refreshed empty index return `ServiceError::IndexNotRefreshed`.
-   Call `app.index().prepare_for_read()` after opening to apply the configured refresh policy.
-   `MessageService::context` resolves session prefixes and reports an unknown session as
-   `ServiceError::SessionNotFound`.
+3. Rust keeps empty-index reads through `load()`, `open()`, and `open_with_access_inputs()`.
+   Use `open_strict()` or `open_strict_with_access_inputs()` to receive
+   `ServiceError::IndexNotRefreshed` until `app.index().prepare_for_read()` applies the refresh
+   policy. `MessageService::context` keeps exact-ID lookup and empty missing results;
+   `context_resolved` adds prefix lookup and `ServiceError::SessionNotFound`.
 4. Python file queries return every matching file or version by default, instead of stopping at
    50. Supply a positive limit for a page. Omitted session-list and ranked-search limits now
    follow `[search].default_limit`; explicit zero still returns every session.
