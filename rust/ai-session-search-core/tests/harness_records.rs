@@ -365,7 +365,9 @@ fn mcp_corrections_search_and_status_read_only_typed_text() {
     let unrecognized = &results[&6]["parser_health"]["unrecognized_record_types"];
     assert_eq!(
         unrecognized,
-        &json!([{"provider": "claude", "record_type": "future-record",
+        &json!([{"provider": "claude", "record_type": "attachment/instructions (malformed)",
+                 "records": 1, "sessions": 1},
+                {"provider": "claude", "record_type": "future-record",
                  "records": 1, "sessions": 1}]),
         "{:#}",
         results[&6]
