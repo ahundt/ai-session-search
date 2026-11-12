@@ -429,3 +429,19 @@ def test_signed_windows_keep_head_tail_or_all(corpus):
     assert len(first) == len(last) == 1
     assert first[0].seq == 0 and last[0].seq == 2
     assert len(corpus.inspect_session("synthetic-0", summary_items=0).user_intent) == 3
+
+
+@pytest.mark.parametrize("pattern", ["rate_%.py", "*/rate_%.py", "rate_*.py"])
+def test_file_search_keeps_percent_and_underscore_literal(corpus, pattern):
+    with sqlite3.connect(corpus.db_path) as db:
+        for n, name in enumerate(["rate_%.py", "rateXY.py", "rate_12.py"]):
+            db.execute(
+                "INSERT INTO file_edits (session_id, provider, seq, tool, file_path, "
+                "file_name, new_content) VALUES ('claude:synthetic-0', 'claude', ?, "
+                "'Write', ?, ?, 'fixture')",
+                (100 + n, f"/synthetic/{name}", name),
+            )
+    rows = corpus.search_files(pattern)
+    expected = {"rate_%.py", "rate_12.py"} if pattern == "rate_*.py" else {"rate_%.py"}
+    assert {row.file_name for row in rows} == expected
+    assert [row.to_dict() for row in rows] == cli(corpus, "files", "search", pattern, "--format", "json")
