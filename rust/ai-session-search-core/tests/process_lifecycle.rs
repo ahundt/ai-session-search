@@ -2856,7 +2856,7 @@ fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
 #[test]
 fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
     let root = tempfile::tempdir().unwrap();
-    // One invalid SKILL.md and one invalid capability.toml prove diagnostics from both files are
+    // One invalid SKILL.md and one invalid aise-capability.toml prove diagnostics from both files are
     // reported in one run.
     write_test_skill(
         root.path(),

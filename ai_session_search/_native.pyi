@@ -1502,7 +1502,7 @@ class SessionSearch:
     ) -> SkillRunReport:
         """Execute one deterministic skill capability.
 
-        Selected ``capability.toml`` documents share a 1 MiB aggregate parsing
+        Selected ``aise-capability.toml`` documents share a 1 MiB aggregate parsing
         safety ceiling. Exceeding it raises an actionable error with byte counts;
         rules and results are never truncated to fit.
         """
