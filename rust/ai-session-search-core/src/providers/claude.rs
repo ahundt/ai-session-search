@@ -503,6 +503,8 @@ impl ClaudeAdapter {
         // Assistant rows earlier parsers stored with `tool_use` input as text; see
         // `conversation_text`. Held apart because `retracted_messages` is borrowed per record.
         let mut earlier_assistant_rows = Vec::new();
+        // Retain fixed-size digests rather than another copy of the transcript's bodies.
+        let mut seen_records = std::collections::HashSet::new();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -565,7 +567,9 @@ impl ClaudeAdapter {
             // type outside `MESSAGE_RECORD_TYPES` yields no message, tool call, tool result or
             // file edit, whatever fields it carries; see that constant for why.
             let retract = match record_type {
-                Some(kind) if MESSAGE_RECORD_TYPES.contains(&kind) => false,
+                Some(kind) if MESSAGE_RECORD_TYPES.contains(&kind) => event_id.is_some_and(|id| {
+                    !seen_records.insert((id.to_owned(), sha256(value.to_string().as_bytes())))
+                }),
                 Some("last-prompt") => {
                     if let Some(prompt) = value.get("lastPrompt").and_then(Value::as_str) {
                         let prompt = prompt.trim();
@@ -1007,7 +1011,7 @@ impl ClaudeAdapter {
             },
         };
 
-        let session = SessionRecord {
+        let mut session = SessionRecord {
             id: format!("{provider}:{provider_session_id}"),
             provider,
             provider_session_id,
@@ -1041,12 +1045,12 @@ impl ClaudeAdapter {
         } else {
             UserRoleAuthorshipEvidence::HumanInputEvent
         };
-        let messages = crate::util::normalize_raw_messages_with_evidence(
+        let mut messages = crate::util::normalize_raw_messages_with_evidence(
             messages,
             Some(&session.id),
             evidence,
         );
-        let retracted = crate::models::RetractedRows {
+        let mut retracted = crate::models::RetractedRows {
             messages: crate::util::normalize_raw_messages_with_evidence(
                 retracted_messages,
                 Some(&session.id),
@@ -1055,6 +1059,22 @@ impl ClaudeAdapter {
             file_edits: retracted_file_edits,
             transcript: retracted_transcript_lines,
         };
+        let mut seen_calls = std::collections::HashSet::new();
+        messages.retain(|message| {
+            if message.kind == crate::models::MessageKind::ToolCall {
+                if let Some(id) = &message.tool_call_id {
+                    if !seen_calls.insert((id.clone(), sha256(message.content.as_bytes()))) {
+                        retracted.messages.push(message.clone());
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        for (seq, message) in messages.iter_mut().enumerate() {
+            message.seq = seq as i64;
+        }
+        session.message_count = Some(messages.len() as i64);
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
@@ -4546,6 +4566,53 @@ mod tests {
         assert_eq!(
             metadata[super::UNRECOGNIZED_RECORD_TYPES_KEY],
             json!({"brand-new-kind": 2})
+        );
+    }
+
+    #[test]
+    fn repeated_record_uuids_and_tool_ids_keep_distinct_bodies() {
+        let user = |body| {
+            json!({"type":"user","uuid":"u1","sessionId":"dedup",
+            "message":{"role":"user","content":body}})
+        };
+        let call = |uuid, body| {
+            json!({"type":"assistant","uuid":uuid,"sessionId":"dedup",
+            "message":{"role":"assistant","content":[{"type":"tool_use","id":"t1",
+                "name":"Write","input":{"file_path":"/tmp/test.txt","content":body}}]}})
+        };
+        let lines = [
+            user("first"),
+            user("first"),
+            user("changed"),
+            call("a1", "one"),
+            call("a1", "one"),
+            call("a2", "one"),
+            call("a3", "two"),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(lines),
+                std::path::Path::new("/tmp/dedup.jsonl"),
+            )
+            .unwrap();
+        let users: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::models::Role::User)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(users, ["first", "changed"]);
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .filter(|m| m.kind == crate::models::MessageKind::ToolCall)
+                .count(),
+            2
         );
     }
 
