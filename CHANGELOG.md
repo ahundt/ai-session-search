@@ -16,8 +16,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 1.1.0 keeps the messages and file edits aise has indexed when an agent shrinks, rewrites,
 compresses or deletes its transcript, and returns a page of literal or regex search results in
 under a second on an index of 5.7 million messages. Stop running aise processes before upgrading
-(Changed item 1). Rust callers need code changes (Changed items 2 and 3); the Python, CLI and MCP
-interfaces are unchanged.
+(Changed item 1). Rust callers need code changes (Changed items 2 and 3). On the command line,
+`--since 1m` now means one minute, not one month (Changed item 4).
 
 ### Highlights
 
@@ -141,7 +141,7 @@ interfaces are unchanged.
 3. Messages that tie on session and sequence number come back in one fixed order. Their order
    was undefined, so `--match-window latest` could keep the wrong message, and literal or fuzzy
    paging could move one between pages.
-4. `aise corrections` returned messages tied on timestamp, session and sequence number in
+4. `aise skills corrections` returned messages tied on timestamp, session and sequence number in
    reverse insertion order, and `aise repeats` did the same under its default user-role filter.
    Both now page in one order whatever the filters. Context windows and file-edit history use
    the same tie-breaker, so several edits made by one message replay in the order they were
