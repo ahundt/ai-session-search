@@ -2032,10 +2032,20 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
     }
 }
 
+#[test]
+fn parser_versions_pin_claude_attachment_and_codex_fork_rules() {
+    assert_eq!(provider_parse_version(Provider::Claude), "claude-v13");
+    assert_eq!(
+        provider_parse_version(Provider::ClaudeDesktop),
+        "claude-desktop-local-agent-v13"
+    );
+    assert_eq!(provider_parse_version(Provider::Codex), "codex-v10");
+}
+
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v12",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v12",
+        Provider::Claude => "claude-v13",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v13",
         Provider::Codex => "codex-v10",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v5",

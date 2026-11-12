@@ -70,6 +70,7 @@ prompt itself is indexed once, as a queued submission. Attached files and edited
 are searchable as tool results; instructions and session context use `--kinds harness-notice`.
 Attachment text is retained from its own records, once per type, path, and exact content.
 `aise doctor` names any record type a parser did not recognize; its records are not indexed.
+Malformed attachments and skipped binary payloads are counted as parse warnings instead.
 
 `aise skills corrections` and `aise repeats` read messages with evidence that a person typed them,
 including messages typed while the agent was working when the transcript records a human sender

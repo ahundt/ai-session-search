@@ -115,6 +115,8 @@ pub(crate) fn is_attachment_message(message: &crate::models::Message) -> bool {
 struct AttachmentRows {
     rows: Vec<RawMessage>,
     by_identity: HashMap<String, Vec<usize>>,
+    malformed: usize,
+    binary: usize,
 }
 
 impl AttachmentRows {
@@ -144,8 +146,6 @@ impl AttachmentRows {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("(no type)");
-        let malformed = format!("attachment/{kind} (malformed)");
-        let binary = format!("attachment/{kind} (binary)");
         let path = attachment.get("filename").and_then(Value::as_str);
         match kind {
             "file" => {
@@ -154,30 +154,30 @@ impl AttachmentRows {
                     content["type"].as_str(),
                     Some("image" | "binary" | "base64")
                 ) {
-                    health.count(Some(&binary));
+                    self.binary += 1;
                 } else if let Some(text) = content["file"]["content"].as_str() {
                     let path = content["file"]["filePath"].as_str().or(path);
                     self.push(kind, path, text);
                 } else {
-                    health.count(Some(&malformed));
+                    self.malformed += 1;
                 }
             }
             "edited_text_file" => match attachment["snippet"].as_str() {
                 Some(text) => self.push(kind, path, text),
-                None => health.count(Some(&malformed)),
+                None => self.malformed += 1,
             },
             "instructions" => {
                 let Some(files) = attachment["files"].as_array() else {
-                    health.count(Some(&malformed));
+                    self.malformed += 1;
                     return;
                 };
                 for file in files {
                     if matches!(file["type"].as_str(), Some("image" | "binary" | "base64")) {
-                        health.count(Some(&binary));
+                        self.binary += 1;
                     } else if let Some(text) = file["content"].as_str() {
                         self.push(kind, file["path"].as_str(), text);
                     } else {
-                        health.count(Some(&malformed));
+                        self.malformed += 1;
                     }
                 }
             }
@@ -189,11 +189,11 @@ impl AttachmentRows {
                         if let Some(text) = value.as_str() {
                             self.push(kind, Some(name), text);
                         } else {
-                            health.count(Some(&malformed));
+                            self.malformed += 1;
                         }
                     }
                 } else {
-                    health.count(Some(&malformed));
+                    self.malformed += 1;
                 }
             }
             _ => health.count(Some(&format!("attachment/{kind}"))),
@@ -721,7 +721,7 @@ impl ClaudeAdapter {
                     } else if value["attachment"]["type"] != "queued_command" {
                         attachments.read(&value["attachment"], &mut unrecognized);
                     } else {
-                        unrecognized.count(Some("attachment/queued_command (malformed)"));
+                        attachments.malformed += 1;
                     }
                     continue;
                 }
@@ -1116,6 +1116,14 @@ impl ClaudeAdapter {
 
         let parse_warning = [
             super::malformed_jsonl_warning(malformed_line_count),
+            (attachments.malformed > 0).then(|| {
+                format!(
+                    "skipped {} malformed attachment payloads",
+                    attachments.malformed
+                )
+            }),
+            (attachments.binary > 0)
+                .then(|| format!("skipped {} binary attachment payloads", attachments.binary)),
             unrecognized.warning(),
         ]
         .into_iter()
@@ -4713,6 +4721,45 @@ mod tests {
     }
 
     #[test]
+    fn malformed_attachments_are_parse_warnings_not_unknown_record_types() {
+        let temp = tempdir().unwrap();
+        let records = [
+            json!({"type":"attachment","attachment":{"type":"instructions","files":false}}),
+            json!({"type":"attachment","attachment":{"type":"file","content":{"type":"text"}}}),
+            json!({"type":"attachment","attachment":{"type":"queued_command","prompt":false}}),
+            json!({"type":"attachment","attachment":{"type":"file","content":{"type":"image"}}}),
+        ];
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(
+                    records
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                &temp.path().join("malformed.jsonl"),
+            )
+            .unwrap();
+        let warning = parsed.session.parse_warning.as_deref().unwrap();
+        assert!(
+            warning.contains("skipped 3 malformed attachment payloads"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("skipped 1 binary attachment payload"),
+            "{warning}"
+        );
+        assert!(!warning.contains("unrecognized"), "{warning}");
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        let health = db.parser_health().unwrap();
+        assert_eq!(health.parse_warnings, 1);
+        assert!(health.unrecognized_record_types.is_empty());
+        assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
     fn attachment_text_is_exact_distinct_and_has_existing_search_visibility() {
         use crate::models::{MessageFilters, MessageKind, Role};
         let temp = tempdir().unwrap();
@@ -4794,19 +4841,15 @@ mod tests {
         };
         assert!(db.search_messages("sentinel", &human).unwrap().is_empty());
         let health = db.parser_health().unwrap();
-        for name in [
-            "attachment/file (binary)",
-            "attachment/file (malformed)",
-            "attachment/future-attachment",
-        ] {
-            assert!(
-                health
-                    .unrecognized_record_types
-                    .iter()
-                    .any(|r| r.record_type == name),
-                "{name}"
-            );
-        }
+        assert_eq!(health.parse_warnings, 1);
+        assert_eq!(health.unrecognized_record_types.len(), 1);
+        assert_eq!(
+            health.unrecognized_record_types[0].record_type,
+            "attachment/future-attachment"
+        );
+        let warning = parsed.session.parse_warning.as_deref().unwrap();
+        assert!(warning.contains("skipped 1 malformed attachment payload"));
+        assert!(warning.contains("skipped 1 binary attachment payload"));
     }
 
     #[test]
