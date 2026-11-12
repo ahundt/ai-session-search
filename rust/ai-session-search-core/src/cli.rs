@@ -33,7 +33,7 @@ use crate::util::{
     resume_plan, select_transcript_lines, truncate_for_display,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 
 /// Help section shared by the root-level flags.
@@ -96,6 +96,10 @@ struct Cli {
     skip_release_notification: bool,
     #[command(subcommand)]
     command: Commands,
+    /// Subcommand names below `aise`, as parsed; `parse_cli_from` fills it from clap's matches
+    /// so `validate_root_options` and the help read one table keyed by the same path.
+    #[arg(skip)]
+    command_path: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -230,6 +234,29 @@ enum RootOption {
 }
 
 impl RootOption {
+    const ALL: [Self; 7] = [
+        Self::ConfigFile,
+        Self::Database,
+        Self::CacheDirectory,
+        Self::WorkerThreads,
+        Self::IndexRefresh,
+        Self::ReleaseNotification,
+        Self::HarnessHome,
+    ];
+
+    /// Clap argument id: the `Cli` field name.
+    fn id(self) -> &'static str {
+        match self {
+            Self::ConfigFile => "config",
+            Self::Database => "database",
+            Self::CacheDirectory => "cache_dir",
+            Self::HarnessHome => "harness_home",
+            Self::WorkerThreads => "threads",
+            Self::IndexRefresh => "index_refresh",
+            Self::ReleaseNotification => "skip_release_notification",
+        }
+    }
+
     fn flag(self) -> &'static str {
         match self {
             Self::ConfigFile => "--config",
@@ -877,8 +904,20 @@ where
         .chain(global_tokens)
         .chain(command_tokens.iter().cloned())
         .collect::<Vec<_>>();
-    Cli::try_parse_from(&normalized)
-        .map_err(|error| clarify_mistaken_argument(error, &command_tokens))
+    let mut command = cli_command();
+    let mut matches = command
+        .try_get_matches_from_mut(&normalized)
+        .map_err(|error| clarify_mistaken_argument(error, &command_tokens))?;
+    let mut command_path = Vec::new();
+    let mut level = &matches;
+    while let Some((name, child)) = level.subcommand() {
+        command_path.push(name.to_string());
+        level = child;
+    }
+    let mut cli =
+        Cli::from_arg_matches_mut(&mut matches).map_err(|error| error.format(&mut command))?;
+    cli.command_path = command_path;
+    Ok(cli)
 }
 
 /// An argument name that a command rejects but whose intended meaning is known.
@@ -1588,98 +1627,151 @@ fn execute(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn validate_root_options(cli: &Cli) -> Result<()> {
+/// The shared (root-global) options a command accepts, by its subcommand path below `aise`.
+///
+/// Every shared option is `global = true`, so clap parses it on every command; this decides which
+/// ones a command actually uses. `validate_root_options` rejects the rest at run time and
+/// `cli_command` hides the rest from that command's help, so help never lists an option the
+/// command refuses. O(1).
+fn root_options_for(path: &[&str]) -> &'static [RootOption] {
+    use RootOption::{
+        CacheDirectory, ConfigFile, Database, HarnessHome, IndexRefresh, ReleaseNotification,
+        WorkerThreads,
+    };
     const CONFIG_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
     ];
     const MCP_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
-        RootOption::HarnessHome,
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
+        HarnessHome,
     ];
-    const CONFIG_AND_CACHE: &[RootOption] = &[RootOption::ConfigFile, RootOption::CacheDirectory];
-    const CONFIG_DATABASE_AND_CACHE: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-    ];
-    const INTEGRATION_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::HarnessHome,
-    ];
-    const CONFIG_FILE_ONLY: &[RootOption] = &[RootOption::ConfigFile];
-    const DATABASE_COMMAND_INPUTS: &[RootOption] = &[RootOption::ConfigFile, RootOption::Database];
+    const CONFIG_AND_CACHE: &[RootOption] = &[ConfigFile, CacheDirectory];
+    const CONFIG_DATABASE_AND_CACHE: &[RootOption] = &[ConfigFile, Database, CacheDirectory];
+    const INTEGRATION_INPUTS: &[RootOption] = &[ConfigFile, Database, CacheDirectory, HarnessHome];
+    const CONFIG_FILE_ONLY: &[RootOption] = &[ConfigFile];
+    const DATABASE_COMMAND_INPUTS: &[RootOption] = &[ConfigFile, Database];
     const ORDINARY_COMMAND_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
-        RootOption::ReleaseNotification,
-        RootOption::HarnessHome,
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
+        ReleaseNotification,
+        HarnessHome,
+    ];
+    // Skill-package management reads skill directories, never harness files; `skills update`
+    // refreshes installed integrations first and so does read them.
+    const SKILL_MANAGEMENT_INPUTS: &[RootOption] = &[
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
+        ReleaseNotification,
     ];
     const NO_ROOT_OPTIONS: &[RootOption] = &[];
 
-    let (command_name, allowed) = match &cli.command {
-        Commands::Integrations(IntegrationsCmd::Install(_)) => {
-            ("aise integrations install", INTEGRATION_INPUTS)
-        }
-        Commands::Integrations(IntegrationsCmd::Status(_)) => {
-            ("aise integrations status", INTEGRATION_INPUTS)
-        }
-        Commands::Integrations(IntegrationsCmd::Uninstall(_)) => {
-            ("aise integrations uninstall", INTEGRATION_INPUTS)
-        }
-        Commands::Integrations(IntegrationsCmd::Recover(_)) => {
-            ("aise integrations recover", CONFIG_FILE_ONLY)
-        }
-        Commands::Package(PackageCmd::Status(_)) => ("aise package status", NO_ROOT_OPTIONS),
-        Commands::Package(PackageCmd::Check(_)) => ("aise package check", CONFIG_AND_CACHE),
-        Commands::Package(PackageCmd::Update(_)) => ("aise package update", INTEGRATION_INPUTS),
-        Commands::Mcp(_) => ("aise mcp serve", MCP_INPUTS),
-        Commands::Config(ConfigCmd::File) => ("aise config file", CONFIG_FILE_ONLY),
-        Commands::Config(ConfigCmd::Example) => ("aise config example", NO_ROOT_OPTIONS),
-        Commands::Config(ConfigCmd::Init(_)) => ("aise config init", CONFIG_DATABASE_AND_CACHE),
-        Commands::Config(ConfigCmd::Show(_)) => ("aise config show", CONFIG_INPUTS),
-        Commands::Config(ConfigCmd::Check) => ("aise config check", CONFIG_INPUTS),
-        Commands::Config(ConfigCmd::Origins) => ("aise config origins", CONFIG_INPUTS),
-        Commands::Config(ConfigCmd::Paths(_)) => ("aise config paths", CONFIG_DATABASE_AND_CACHE),
-        Commands::Db(_) => ("aise db", DATABASE_COMMAND_INPUTS),
-        Commands::Migrate(_) => ("aise migrate", NO_ROOT_OPTIONS),
-        Commands::Dates => ("aise dates", NO_ROOT_OPTIONS),
-        Commands::RefreshIndex => ("aise __refresh-index", NO_ROOT_OPTIONS),
-        _ => ("this command", ORDINARY_COMMAND_INPUTS),
-    };
+    match path {
+        ["integrations", "install" | "status" | "uninstall"] => INTEGRATION_INPUTS,
+        ["integrations", "recover"] => CONFIG_FILE_ONLY,
+        ["package", "status"] => NO_ROOT_OPTIONS,
+        ["package", "check"] => CONFIG_AND_CACHE,
+        ["package", "update"] => INTEGRATION_INPUTS,
+        ["mcp", ..] => MCP_INPUTS,
+        ["config", "file"] => CONFIG_FILE_ONLY,
+        ["config", "example"] => NO_ROOT_OPTIONS,
+        ["config", "init" | "paths"] => CONFIG_DATABASE_AND_CACHE,
+        ["config", "show" | "check" | "origins"] => CONFIG_INPUTS,
+        ["db", ..] => DATABASE_COMMAND_INPUTS,
+        ["migrate", ..] | ["dates"] | ["__refresh-index"] => NO_ROOT_OPTIONS,
+        ["skills", "list" | "show" | "validate" | "create" | "restore"] => SKILL_MANAGEMENT_INPUTS,
+        _ => ORDINARY_COMMAND_INPUTS,
+    }
+}
 
-    for option in [
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
-        RootOption::ReleaseNotification,
-        RootOption::HarnessHome,
-    ] {
-        let unrelated_harness_home = option == RootOption::HarnessHome
-            && matches!(&cli.command,
-            Commands::Skills(cmd) if cmd.is_management() && !matches!(cmd, crate::skills::SkillsCmd::Update(_)));
-        if option.is_present(cli) && (!allowed.contains(&option) || unrelated_harness_home) {
+fn validate_root_options(cli: &Cli) -> Result<()> {
+    let path: Vec<&str> = cli.command_path.iter().map(String::as_str).collect();
+    let allowed = root_options_for(&path);
+    for option in RootOption::ALL {
+        if option.is_present(cli) && !allowed.contains(&option) {
             bail!(
-                "{} does not apply to `{command_name}`; remove it",
-                option.flag()
+                "{} does not apply to `aise {}`; remove it",
+                option.flag(),
+                path.join(" ")
             );
         }
     }
     Ok(())
+}
+
+/// The root command with each subcommand's help listing only the shared options
+/// [`root_options_for`] lets it accept. A command with subcommands lists the options any of them
+/// accepts; the root lists all. The options stay parseable everywhere, so a misplaced one still
+/// reaches `validate_root_options` and its "does not apply" message rather than clap's generic
+/// unknown-argument error. Visits each command once.
+fn cli_command() -> clap::Command {
+    /// Gives `command` a hidden copy of each global option that neither it nor any command below
+    /// it accepts. Clap propagates a global option only into a subcommand that lacks one with the
+    /// same id, so the hidden copy is what that subcommand keeps, and it still parses and reaches
+    /// the root's value. This runs before `build()`: mutating a built command's arguments leaves
+    /// clap's flag lookup pointing at the old positions.
+    fn hide_inapplicable(
+        mut command: clap::Command,
+        path: &mut Vec<String>,
+        globals: &[clap::Arg],
+    ) -> (clap::Command, Vec<RootOption>) {
+        let children: Vec<String> = command
+            .get_subcommands()
+            .map(|child| child.get_name().to_string())
+            .collect();
+        let mut accepted = Vec::new();
+        if children.is_empty() {
+            let names: Vec<&str> = path.iter().map(String::as_str).collect();
+            accepted.extend_from_slice(root_options_for(&names));
+        }
+        for name in children {
+            path.push(name.clone());
+            command = command.mut_subcommand(&name, |child| {
+                let (child, child_accepted) = hide_inapplicable(child, path, globals);
+                accepted.extend(child_accepted);
+                child
+            });
+            path.pop();
+        }
+        if !path.is_empty() {
+            for global in globals {
+                let option = RootOption::ALL
+                    .into_iter()
+                    .find(|option| global.get_id() == option.id())
+                    .expect("every global option is a RootOption");
+                // `migrate config` declares its own `--cache-dir`, which clap keeps in place of
+                // the global one; that one is the command's own and stays visible.
+                let declared = command
+                    .get_arguments()
+                    .any(|argument| argument.get_id() == global.get_id());
+                if !declared && !accepted.contains(&option) {
+                    command = command.arg(global.clone().hide(true));
+                }
+            }
+        }
+        (command, accepted)
+    }
+
+    let root = Cli::command();
+    let globals: Vec<clap::Arg> = root
+        .get_arguments()
+        .filter(|argument| argument.is_global_set())
+        .cloned()
+        .collect();
+    hide_inapplicable(root, &mut Vec::new(), &globals).0
 }
 
 fn run_migration(command: MigrationCmd) -> Result<()> {
@@ -2760,14 +2852,14 @@ mod tests {
     }
 
     fn assert_root_options_apply<const N: usize>(args: [&str; N]) {
-        let cli = Cli::try_parse_from(args)
+        let cli = parse_cli_from(args)
             .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
         validate_root_options(&cli)
             .unwrap_or_else(|err| panic!("expected root options to apply: {args:?}: {err}"));
     }
 
     fn assert_root_option_is_irrelevant<const N: usize>(args: [&str; N], flag: &str) {
-        let cli = Cli::try_parse_from(args)
+        let cli = parse_cli_from(args)
             .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
         let error = validate_root_options(&cli).unwrap_err().to_string();
         assert!(error.contains(flag), "{error}");
@@ -3721,6 +3813,136 @@ mod tests {
             ["aise", "--skip-release-notification", "mcp", "serve"],
             "--skip-release-notification",
         );
+    }
+
+    /// Every leaf command's help lists under the shared-options heading exactly the shared options
+    /// it accepts: each listed one passes `validate_root_options` and each unlisted one is
+    /// rejected with "does not apply". Both sides go through `parse_cli_from`, the parser
+    /// `aise` runs. `aise db --help` used to list `--index-refresh` and
+    /// `--skip-release-notification`, which `aise db schema` then refused.
+    #[test]
+    fn every_leaf_command_help_lists_exactly_the_shared_options_it_accepts() {
+        fn leaves(command: &clap::Command, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            let children: Vec<_> = command
+                .get_subcommands()
+                .filter(|child| child.get_name() != "help")
+                .collect();
+            if children.is_empty() {
+                out.push(path.clone());
+            }
+            for child in children {
+                path.push(child.get_name().to_string());
+                leaves(child, path, out);
+                path.pop();
+            }
+        }
+        /// Placeholder values for a leaf's required arguments, so a parse reaches the shared
+        /// option check instead of stopping at a missing argument.
+        fn required_arguments(root: &clap::Command, path: &[String]) -> Vec<String> {
+            let mut command = root;
+            for name in path {
+                command = command.find_subcommand(name).expect("leaf exists");
+            }
+            let mut out = Vec::new();
+            for argument in command.get_arguments() {
+                if !argument.is_required_set() || argument.is_global_set() {
+                    continue;
+                }
+                if let Some(long) = argument.get_long() {
+                    out.push(format!("--{long}"));
+                }
+                out.push("/tmp/placeholder".to_string());
+            }
+            out
+        }
+        fn listed_shared_options(help: &str) -> Vec<&'static str> {
+            let section = help
+                .split(&format!("{GLOBAL_OPTIONS_HEADING}:"))
+                .nth(1)
+                .map(|rest| {
+                    rest.lines()
+                        .skip(1)
+                        .take_while(|line| line.is_empty() || line.starts_with(' '))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            RootOption::ALL
+                .iter()
+                .map(|option| option.flag())
+                .filter(|flag| {
+                    section
+                        .split_whitespace()
+                        .any(|word| word.trim_end_matches(',') == *flag)
+                })
+                .collect()
+        }
+
+        let mut root = Cli::command();
+        root.build();
+        let mut paths = Vec::new();
+        leaves(&root, &mut Vec::new(), &mut paths);
+        assert!(paths.len() > 20, "{paths:?}");
+        for path in paths {
+            // `migrate config` requires its own `--cache-dir`, and `parse_cli_from` hoists every
+            // `--cache-dir` token as the shared option, so no argument vector reaches its
+            // shared-option check. Its help is still checked against the table above.
+            let unreachable = path == ["migrate", "config"];
+            let help = parse_cli_from(
+                std::iter::once("aise".to_string())
+                    .chain(path.iter().cloned())
+                    .chain(["--help".to_string()]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                help.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "{path:?}: {help}"
+            );
+            let help = help.to_string();
+            let listed = listed_shared_options(&help);
+            if unreachable {
+                let names: Vec<&str> = path.iter().map(String::as_str).collect();
+                let expected: Vec<&str> = root_options_for(&names)
+                    .iter()
+                    .map(|option| option.flag())
+                    .filter(|flag| *flag != "--cache-dir")
+                    .collect();
+                let mut listed = listed;
+                listed.retain(|flag| *flag != "--cache-dir");
+                assert_eq!(listed, expected, "{path:?}: {help}");
+                continue;
+            }
+            for option in RootOption::ALL {
+                let mut argv = vec!["aise".to_string(), option.flag().to_string()];
+                match option {
+                    RootOption::ReleaseNotification => {}
+                    RootOption::WorkerThreads => argv.push("2".to_string()),
+                    RootOption::IndexRefresh => argv.push("existing-only".to_string()),
+                    _ => argv.push("/tmp/placeholder".to_string()),
+                }
+                argv.extend(path.iter().cloned());
+                argv.extend(required_arguments(&root, &path));
+                let cli = parse_cli_from(&argv)
+                    .unwrap_or_else(|error| panic!("{argv:?} parses: {error}"));
+                let verdict = validate_root_options(&cli);
+                if listed.contains(&option.flag()) {
+                    assert!(
+                        verdict.is_ok(),
+                        "{path:?} help lists {} but rejects it: {verdict:?}",
+                        option.flag()
+                    );
+                } else {
+                    let error = verdict
+                        .err()
+                        .unwrap_or_else(|| {
+                            panic!("{path:?} accepts {} but its help omits it", option.flag())
+                        })
+                        .to_string();
+                    assert!(error.contains("does not apply"), "{path:?}: {error}");
+                }
+            }
+        }
     }
 
     #[test]
