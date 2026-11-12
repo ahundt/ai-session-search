@@ -3244,12 +3244,16 @@ impl Db {
             let literal_query =
                 filters.match_mode == MessageSearchMode::Literal && !query.is_empty();
             if literal_query {
-                append_content_match(&mut sql, filters, false);
+                let escaped = crate::util::json_escaped_literal(query);
+                append_content_match(&mut sql, filters, false, escaped.is_some());
                 args.push(Value::Text(fold_caseless(query)));
+                if let Some(escaped) = escaped {
+                    args.push(Value::Text(fold_caseless(&escaped)));
+                }
             }
             if filters.match_mode == MessageSearchMode::Regex {
                 regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
-                append_content_match(&mut sql, filters, true);
+                append_content_match(&mut sql, filters, true, false);
                 args.push(Value::Text(query.to_string()));
             }
             let prefilter_pattern = content_prefilter_pattern(query, filters.match_mode);
@@ -6523,7 +6527,14 @@ enum ClassSelection<'a> {
 fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Option<String> {
     match match_mode {
         MessageSearchMode::Regex => Some(query.to_string()),
-        MessageSearchMode::Literal if !query.is_empty() => Some(regex::escape(query)),
+        MessageSearchMode::Literal if !query.is_empty() => {
+            Some(match crate::util::json_escaped_literal(query) {
+                Some(escaped) => {
+                    format!("(?:{}|{})", regex::escape(query), regex::escape(&escaped))
+                }
+                None => regex::escape(query),
+            })
+        }
         MessageSearchMode::Literal | MessageSearchMode::Fuzzy => None,
     }
 }
@@ -6560,11 +6571,22 @@ fn input_provenance_projection(filters: &MessageFilters) -> String {
     ) as source_provenance")
 }
 
-fn append_content_match(sql: &mut String, filters: &MessageFilters, regex: bool) {
+fn append_content_match(sql: &mut String, filters: &MessageFilters, regex: bool, escaped: bool) {
+    sql.push_str(" and (");
+    append_content_match_call(sql, filters, regex);
+    if escaped {
+        sql.push_str(" or (m.kind='tool_call' and ");
+        append_content_match_call(sql, filters, false);
+        sql.push(')');
+    }
+    sql.push(')');
+}
+
+fn append_content_match_call(sql: &mut String, filters: &MessageFilters, regex: bool) {
     sql.push_str(if regex {
-        " and rust_regexp(?, m.content"
+        "rust_regexp(?, m.content"
     } else {
-        " and unicode_lower_contains(m.content, ?"
+        "unicode_lower_contains(m.content, ?"
     });
     if filters.input_scope() == crate::models::MessageInputScope::UserInput {
         sql.push_str(", case when m.authorship='mixed' then ");
@@ -10222,6 +10244,52 @@ mod tests {
                 .is_empty(),
             "complete-content search remains available on a readable legacy layout"
         );
+    }
+
+    #[test]
+    fn literal_content_search_finds_json_escaped_write_lines_with_valid_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let query = "let path = \"C:\\work\\é\";";
+        let mut parsed = parsed_with_messages("claude:quoted-write", &["unused"]);
+        parsed.messages =
+            crate::util::to_messages_with_tools(vec![crate::util::RawMessage::tool_call(
+                "Write",
+                serde_json::json!({"file_path":"/tmp/quoted.rs","content":query}),
+                Some("write1"),
+                None,
+            )]);
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        for version in [4, 3] {
+            db.conn
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            let hits = db
+                .search_messages(query, &MessageFilters::default())
+                .unwrap();
+            assert_eq!(hits.len(), 1, "schema {version}");
+            let enriched = crate::message_search::attach_match_evidence(
+                crate::models::MessageInputScope::Any,
+                &crate::message_search::MessageQuery::literal(query).unwrap(),
+                &crate::message_search::MessageTarget::content(),
+                crate::message_search::MatchViewBudget::MinimalSpan,
+                hits,
+            )
+            .unwrap();
+            let literal = enriched[0].literal_match.as_ref().unwrap();
+            let slice: String = enriched[0]
+                .message
+                .content
+                .chars()
+                .skip(literal.field_start_char)
+                .take(literal.field_end_char_exclusive - literal.field_start_char)
+                .collect();
+            assert_eq!(
+                slice,
+                serde_json::to_string(query).unwrap()
+                    [1..serde_json::to_string(query).unwrap().len() - 1]
+            );
+        }
     }
 
     #[test]

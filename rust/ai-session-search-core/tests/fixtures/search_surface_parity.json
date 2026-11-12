@@ -24,7 +24,8 @@
     {"seq": 65, "role": "assistant", "content": ""},
     {"seq": 70, "role": "user", "content": "legacy marker", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": "unknown", "input_delivery_state": null, "content_parts": []}},
     {"seq": 71, "role": "user", "content": "legacy marker", "provenance": {"authorship": "unknown", "record_relation": "unknown", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}},
-    {"seq": 72, "role": "user", "content": "legacy marker", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}}
+    {"seq": 72, "role": "user", "content": "legacy marker", "provenance": {"authorship": "unknown", "record_relation": "original", "correlation_identity": null, "input_origin": null, "input_delivery_state": null, "content_parts": []}},
+    {"seq":80,"role":"tool","kind":"tool_call","content":"{\"args\":{\"content\":\"Ω = \\\"C:\\\\α\\\\β\\\";\"}}"}
   ],
   "bulk": {
     "first_seq": 100,
@@ -33,6 +34,8 @@
     "content_prefix": "bulk row"
   },
   "cases": [
+    {"name":"literal quoted Write body","mode":"literal","query":"Ω = \"C:\\α\\β\";","all_results":true,"expected":[[80,"tool"]]},
+    {"name":"literal backslashes in Write body","mode":"literal","query":"C:\\α\\β","all_results":true,"expected":[[80,"tool"]]},
     {"name": "literal legacy markers select recorded input", "mode": "literal", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"]], "role": "user"},
     {"name": "literal legacy markers retain complete history", "mode": "literal", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"], [72, "user"]]},
     {"name": "regex legacy markers select recorded input", "mode": "regex", "query": "legacy marker", "limit": 10, "expected": [[70, "user"], [71, "user"]], "role": "user"},

@@ -1585,6 +1585,13 @@ impl UserRoleAuthorshipEvidence {
     }
 }
 
+/// The spelling of a literal inside stored tool-argument JSON, only when escaping changes it.
+pub(crate) fn json_escaped_literal(query: &str) -> Option<String> {
+    let encoded = serde_json::to_string(query).expect("serializing a string cannot fail");
+    let escaped = &encoded[1..encoded.len() - 1];
+    (escaped != query).then(|| escaped.to_owned())
+}
+
 /// Compact, provider-neutral searchable content for a tool-call input row. Tool outputs remain
 /// separate messages; this records what the agent attempted to call so commands, URLs, paths, and
 /// MCP arguments are discoverable without reading raw JSONL files.

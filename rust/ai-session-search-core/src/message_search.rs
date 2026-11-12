@@ -3643,7 +3643,11 @@ pub(crate) fn attach_match_evidence_cancellable(
                     let field_total_chars = selected.chars().count();
                     for (offset, region) in matching_content_regions(&message, input_scope) {
                         check_active()?;
-                        if let Some((score, mut evidence)) = prepared.build(region, match_view) {
+                        if let Some((score, mut evidence)) = prepared.build(
+                            region,
+                            match_view,
+                            message.kind == crate::models::MessageKind::ToolCall,
+                        ) {
                             if best_score.is_none_or(|best| score > best) {
                                 evidence.field_start_char += offset;
                                 evidence.field_total_chars = field_total_chars;
@@ -3658,7 +3662,12 @@ pub(crate) fn attach_match_evidence_cancellable(
                     selected_evidence
                 } else {
                     prepared
-                        .build(&selected, match_view)
+                        .build(
+                            &selected,
+                            match_view,
+                            target.field() == SearchField::Content
+                                && message.kind == crate::models::MessageKind::ToolCall,
+                        )
                         .map(|(_, evidence)| evidence)
                 };
                 let evidence = evidence.ok_or_else(|| {
@@ -3985,6 +3994,7 @@ enum PreparedMatchEvidence {
     All,
     Literal {
         lowered_query: String,
+        escaped_lowered_query: Option<String>,
     },
     Regex(regex::Regex),
     Fuzzy {
@@ -4001,6 +4011,8 @@ impl PreparedMatchEvidence {
             MessageQuery::All => Self::All,
             MessageQuery::Literal(query) => Self::Literal {
                 lowered_query: crate::util::fold_caseless(query.as_str()),
+                escaped_lowered_query: crate::util::json_escaped_literal(query.as_str())
+                    .map(|q| crate::util::fold_caseless(&q)),
             },
             MessageQuery::Regex(query) => Self::Regex(regex::Regex::new(query.as_str())?),
             MessageQuery::Fuzzy(query) => Self::Fuzzy {
@@ -4021,12 +4033,21 @@ impl PreparedMatchEvidence {
         &mut self,
         selected: &str,
         match_view: MatchViewBudget,
+        allow_escaped: bool,
     ) -> Option<(u32, MessageMatchEvidence)> {
         let field_total_chars = selected.chars().count();
         match self {
             Self::All => None,
-            Self::Literal { lowered_query } => {
-                let range = literal_char_range(selected, lowered_query)?;
+            Self::Literal {
+                lowered_query,
+                escaped_lowered_query,
+            } => {
+                let range = literal_char_range(selected, lowered_query).or_else(|| {
+                    allow_escaped
+                        .then_some(escaped_lowered_query.as_deref())
+                        .flatten()
+                        .and_then(|q| literal_char_range(selected, q))
+                })?;
                 let maximum = match_view_max_chars(
                     match_view,
                     field_total_chars,
