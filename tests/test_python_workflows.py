@@ -167,3 +167,15 @@ def test_direct_classification_returns_cli_rows(corpus):
     assert [row.to_dict() for row in matches] == expected["output"]["result"]["report"]["matches"]
     scoped = corpus.classify_messages(request=aise.MessageClassificationQuery(scope=aise.QueryScope(session_id="synthetic-0")))
     assert {row.session_id for row in scoped} == {"claude:synthetic-0"}
+
+
+def test_session_limits_follow_configuration(corpus, tmp_path: Path):
+    config = tmp_path / "limits.toml"
+    config.write_text('[search]\ndefault_limit = 2\n')
+    search = aise.SessionSearch(corpus.db_path, config_path=config)
+    for request in (None, aise.SessionQuery(), aise.SessionQuery(path_prefix="/synthetic")):
+        assert len(search.list_sessions(request)) == 2
+        assert len(search.search_sessions("retry", request)) == 2
+    assert [row.to_dict() for row in search.list_sessions()] == cli(search, "list", "--config", str(config), "--format", "json")
+    assert len(search.list_sessions(aise.SessionQuery(limit=0))) == 3
+    assert len(search.search_sessions("retry", aise.SessionQuery(limit=1))) == 1

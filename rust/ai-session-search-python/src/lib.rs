@@ -2462,7 +2462,7 @@ struct SessionQuery {
     current_repo: Option<String>,
     dates: DateRange,
     #[pyo3(get)]
-    limit: usize,
+    limit: Option<usize>,
 }
 
 python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","current_repo","dates","limit"]);
@@ -2470,7 +2470,7 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
     // Independent session filters stay flat and keyword-only, matching MessageSearchRequest;
     // grouping them would restore the one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, dates=None, limit=50))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, dates=None, limit=None))]
     fn new(
         provider: Option<String>,
         path_prefix: Option<String>,
@@ -2479,7 +2479,7 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
         parent_session_id: Option<String>,
         current_repo: Option<String>,
         dates: Option<DateRange>,
-        limit: i64,
+        limit: Option<i64>,
     ) -> PyResult<Self> {
         Ok(Self {
             provider: parse_provider(provider)?,
@@ -2489,7 +2489,7 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
             parent_session_id,
             current_repo,
             dates: dates.unwrap_or_default(),
-            limit: paging_argument(PagingArgument::Limit, limit)?,
+            limit: limit.map(|value| paging_argument(PagingArgument::Limit, value)).transpose()?,
         })
     }
 
@@ -2535,7 +2535,7 @@ impl Default for SessionQuery {
             parent_session_id: None,
             current_repo: None,
             dates: DateRange::default(),
-            limit: 50,
+            limit: None,
         }
     }
 }
@@ -2557,7 +2557,7 @@ impl SessionQuery {
             value.parent_session_id = self.parent_session_id;
             value.since = since;
             value.until = until;
-            value.limit = self.limit;
+            value.limit = self.limit.unwrap_or(50);
             value
         };
         filters.validate().map_err(value_error)?;
@@ -2672,7 +2672,7 @@ impl NativeAnalysisRequest {
             parent_session_id: self.parent_session_id,
             current_repo: None,
             dates: self.dates,
-            limit: 0,
+            limit: Some(0),
         }
         .into_filters()?;
         CoreAnalysisRequest::new(scope, selection).map_err(value_error)
@@ -4961,9 +4961,11 @@ impl SessionSearch {
         py: Python<'_>,
         request: Option<SessionQuery>,
     ) -> PyResult<Vec<NativeSessionRecord>> {
-        let (filters, _) = request.unwrap_or_default().into_filters()?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
+            let mut request = request.unwrap_or_default();
+            request.limit = Some(request.limit.unwrap_or(app.config().search.default_limit));
+            let (filters, _) = request.into_filters()?;
             app.catalog()
                 .list_sessions(&filters)
                 .map(|sessions| {
@@ -4987,9 +4989,11 @@ impl SessionSearch {
         query: String,
         request: Option<SessionQuery>,
     ) -> PyResult<Vec<NativeSessionSearchHit>> {
-        let (filters, current_repo) = request.unwrap_or_default().into_filters()?;
         let hits = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
+            let mut request = request.unwrap_or_default();
+            request.limit = Some(request.limit.unwrap_or(app.config().search.default_limit));
+            let (filters, current_repo) = request.into_filters()?;
             let current_repo =
                 current_repo.or_else(|| ai_session_search::util::current_repo(app.config()));
             app.catalog()
@@ -5193,7 +5197,7 @@ impl SessionSearch {
         cursor: Option<NativeAnalysisCursor>,
     ) -> PyResult<NativeAnalysisDocumentPage> {
         let request = request.unwrap_or_default();
-        if NonZeroUsize::new(request.limit).is_none() {
+        if NonZeroUsize::new(request.limit.unwrap_or(50)).is_none() {
             return Err(invalid_argument_error(
                 "analysis_documents request limit must be greater than zero; pass a positive page \
                  size and follow next_cursor until it is None",

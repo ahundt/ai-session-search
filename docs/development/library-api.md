@@ -101,6 +101,10 @@ if sessions:
 status = search.index_status()
 ```
 
+An omitted `SessionQuery.limit` (None) resolves `[search].default_limit` on list and ranked
+search calls, including when the request supplies other filters. An explicit 0 returns every
+session; a positive count overrides configuration.
+
 `SessionQuery.dates` intersects the inclusive query period with each indexed session span,
 `created_at` through `updated_at`. An exact RFC 3339 value is a zero-width period and matches a
 span containing that instant. A span can contain gaps, so a session matching a one-week period

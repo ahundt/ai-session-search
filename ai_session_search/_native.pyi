@@ -1022,7 +1022,7 @@ class QueryScope:
 
 @final
 class SessionQuery:
-    """Session list/search filters; limit=0 explicitly selects every match.
+    """Session list/search filters; None uses search.default_limit, 0 selects every match.
 
     ``dates`` intersects an inclusive query period with each known indexed session span from
     ``created_at`` through ``updated_at``. The span can contain gaps and does not assert continuous
@@ -1043,7 +1043,7 @@ class SessionQuery:
     parent_session_id: str | None
     current_repo: str | None
     dates: DateRange
-    limit: int
+    limit: int | None
 
     def __new__(
         cls,
@@ -1055,7 +1055,7 @@ class SessionQuery:
         parent_session_id: str | None = None,
         current_repo: str | None = None,
         dates: DateRange | None = None,
-        limit: int = 50,
+        limit: int | None = None,
     ) -> Self: ...
 
 @final
