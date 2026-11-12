@@ -4839,7 +4839,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     // `tool.description` is a separate field with its own 2,048-character cap that
                     // no measured client charges to the schema. A fact many parameters share also
                     // reads better stated once here than transcribed onto each of them.
-                    "description": format!("{} {}", format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Packaged and direct definitions share a 1 MiB parsing ceiling; exceeding it returns byte counts and guidance rather than truncated rules. since/until/when bound the message's own timestamp, not session activity: an RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01. session_kinds omits subagent runs, unlike search_messages and list_sessions: in a spawned run, 'user' rows hold the calling agent's delegation prompt, not a person's text. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."), omitted_values_sentence(&run_skill_capability_input_schema).trim_end()),
+                    "description": format!("{} {}", format!("Execute deterministic message-classification rules under one selected aise skill package across {provider_summary}. By default aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Packaged and direct definitions share a 1 MiB parsing ceiling; exceeding it returns byte counts and guidance rather than truncated rules. since/until/when bound the message's own timestamp, not session activity: an RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01. session_kinds omits subagent runs, unlike search_messages and list_sessions: in a spawned run, 'user' rows hold the calling agent's delegation prompt, not a person's text. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."), omitted_values_sentence(&run_skill_capability_input_schema).trim_end()),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": run_skill_capability_input_schema
                 },
@@ -13319,7 +13319,7 @@ mod tests {
         assert!(
             description.contains("deterministic")
                 && description.contains("capability")
-                && description.contains("By default Aise reads")
+                && description.contains("By default aise reads")
                 && description.contains("definition can supply typed categories")
                 && description.contains("SKILL.md")
                 && description.contains("MCP client or AI harness"),
@@ -13328,7 +13328,7 @@ mod tests {
         );
         assert!(
             !description.contains("run a skill") && !description.contains("Run one"),
-            "the description must not claim that Aise executes AI skill instructions: \
+            "the description must not claim that aise executes AI skill instructions: \
              {description}"
         );
 

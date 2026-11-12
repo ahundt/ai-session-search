@@ -30,7 +30,7 @@ pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// Structural depth ceiling for metadata we inspect.
 const MAX_YAML_DEPTH: usize = 32;
 
-/// Standard Agent Skill metadata consumed by Aise.
+/// Standard Agent Skill metadata consumed by aise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentSkillFrontmatter {
     pub(crate) name: String,
