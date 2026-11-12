@@ -815,6 +815,7 @@ fn execute_official_tool_call(
 struct TestReaderProbe {
     rendezvous: std::sync::Barrier,
     rendezvous_entries: usize,
+    first_release: Option<(Mutex<bool>, std::sync::Condvar)>,
     admission_attempts: std::sync::atomic::AtomicUsize,
     entries: std::sync::atomic::AtomicUsize,
     dispatches: std::sync::atomic::AtomicUsize,
@@ -830,6 +831,7 @@ impl TestReaderProbe {
         Self {
             rendezvous: std::sync::Barrier::new(readers),
             rendezvous_entries: readers,
+            first_release: None,
             admission_attempts: std::sync::atomic::AtomicUsize::new(0),
             entries: std::sync::atomic::AtomicUsize::new(0),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
@@ -844,6 +846,7 @@ impl TestReaderProbe {
         Self {
             rendezvous: std::sync::Barrier::new(2),
             rendezvous_entries: 1,
+            first_release: Some((Mutex::new(false), std::sync::Condvar::new())),
             admission_attempts: std::sync::atomic::AtomicUsize::new(0),
             entries: std::sync::atomic::AtomicUsize::new(0),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
@@ -859,13 +862,23 @@ impl TestReaderProbe {
         let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
         self.max_active.fetch_max(active, Ordering::AcqRel);
         if entry <= self.rendezvous_entries {
-            self.rendezvous.wait();
+            if let Some((released, changed)) = &self.first_release {
+                drop(
+                    changed
+                        .wait_while(released.lock().unwrap(), |released| !*released)
+                        .unwrap(),
+                );
+            } else {
+                self.rendezvous.wait();
+            }
         }
         TestReaderActivity(self)
     }
 
     fn release_first(&self) {
-        self.rendezvous.wait();
+        let (released, changed) = self.first_release.as_ref().unwrap();
+        *released.lock().unwrap() = true;
+        changed.notify_all();
     }
 
     fn record_dispatch(&self) {
@@ -882,6 +895,17 @@ impl TestReaderProbe {
 
     fn record_cancelled_active(&self) {
         self.cancelled_active.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+// Release blocked readers during assertion unwinding before the Tokio runtime waits for them.
+#[cfg(test)]
+struct ReleaseTestReaderOnDrop(Arc<TestReaderProbe>);
+
+#[cfg(test)]
+impl Drop for ReleaseTestReaderOnDrop {
+    fn drop(&mut self) {
+        self.0.release_first();
     }
 }
 
@@ -7017,6 +7041,15 @@ mod tests {
         assert_eq!(CATALOGUE_BUILDS.with(|count| count.get()), before);
     }
 
+    fn test_runtime() -> tokio::runtime::Runtime {
+        // Parallel tests need two async workers each, not one pool per available CPU.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
     fn fixture() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -10296,7 +10329,7 @@ mod tests {
         let config = config_for_fixture(&dir);
         let index_path = config.db_path();
         assert!(!index_path.exists(), "fixture starts without an index");
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -10407,7 +10440,7 @@ mod tests {
         let (dir, db) = fixture();
         drop(db);
         let config = config_for_fixture(&dir);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -10454,7 +10487,7 @@ mod tests {
         .unwrap();
         let _writer = lock.try_write().unwrap();
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -10529,7 +10562,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::BeforeQuery;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -10578,7 +10611,7 @@ mod tests {
         let missing_db = missing_parent.join("index.db");
         config.index.db_path = Some(missing_db.to_string_lossy().into_owned());
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -10637,7 +10670,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, responses) = official_roots_client(true);
             responses
@@ -10690,7 +10723,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, _responses) = official_roots_client(false);
             let requests = Arc::clone(&client_handler.request_count);
@@ -10732,7 +10765,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, responses) = official_roots_client(true);
             responses
@@ -10878,7 +10911,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, responses) =
                 official_roots_client_with_capabilities(true, false);
@@ -10965,7 +10998,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, _responses) = official_roots_client(true);
             let requests = Arc::clone(&client_handler.request_count);
@@ -11010,7 +11043,7 @@ mod tests {
         drop(db);
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -11042,7 +11075,7 @@ mod tests {
         let (dir, db) = fixture();
         drop(db);
         let config = config_for_fixture(&dir);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11128,7 +11161,7 @@ mod tests {
         let gate_enabled = Arc::new(AtomicBool::new(false));
         let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
         let release_response = Arc::new(tokio::sync::Semaphore::new(0));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config)
@@ -11219,7 +11252,7 @@ mod tests {
         let runner_runs = Arc::clone(&refresh_runs);
         let fail_enabled = Arc::new(AtomicBool::new(false));
         let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11309,7 +11342,7 @@ mod tests {
         let gate_enabled = Arc::new(AtomicBool::new(false));
         let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
         let release_response = Arc::new(tokio::sync::Semaphore::new(0));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11407,7 +11440,7 @@ mod tests {
         let config = config_for_fixture(&dir);
         let refresh_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let runner_runs = Arc::clone(&refresh_runs);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config)
@@ -11579,7 +11612,7 @@ mod tests {
             let generation = runner_runs.fetch_add(1, Ordering::AcqRel) + 1;
             refresh_finished.send(generation).unwrap();
         });
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config)
@@ -11792,7 +11825,7 @@ mod tests {
         drop(db);
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server_task = tokio::spawn(async move {
@@ -11910,7 +11943,7 @@ mod tests {
         drop(db);
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server_task = tokio::spawn(async move {
@@ -11997,7 +12030,7 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::new(2));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -12068,7 +12101,8 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::block_first_until_test());
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
+        let _release = ReleaseTestReaderOnDrop(Arc::clone(&probe));
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -12137,7 +12171,8 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::block_first_until_test());
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
+        let _release = ReleaseTestReaderOnDrop(Arc::clone(&probe));
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -12234,6 +12269,24 @@ mod tests {
     }
 
     #[test]
+    fn blocked_test_reader_can_be_released_before_entry() {
+        let probe = Arc::new(TestReaderProbe::block_first_until_test());
+        let release = Arc::clone(&probe);
+        let (finished, received) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            release.release_first();
+            finished.send(()).unwrap();
+        });
+        let released = received.recv_timeout(std::time::Duration::from_secs(1));
+        let _activity = probe.enter();
+        worker.join().unwrap();
+        assert!(
+            released.is_ok(),
+            "cleanup must not depend on reader admission"
+        );
+    }
+
+    #[test]
     fn dropping_an_official_request_guard_cancels_its_blocking_work() {
         let cancellation = Arc::new(QueryCancellation::new());
         {
@@ -12252,7 +12305,8 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::block_first_until_test());
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
+        let _release = ReleaseTestReaderOnDrop(Arc::clone(&probe));
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -12335,7 +12389,7 @@ mod tests {
         drop(db);
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::with_reader_bound(
@@ -12445,7 +12499,7 @@ mod tests {
             .unwrap();
         });
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
