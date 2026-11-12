@@ -33,6 +33,7 @@ Completed design decisions and migration evidence, not checklists.
 | [Capability parity](migration/capability-parity.md) | Legacy capability disposition and semantic-duplication decisions |
 | [Rust/Python API architecture](migration/rust-python-api-architecture.md) | Public API boundaries and distribution contract |
 | [Provenance](migration/provenance.md) | Source histories, transformation, licensing, and credit |
+| [1.0.0 release candidates](history/changelog-1.0.0-release-candidates.md) | Changelog entries for 1.0.0rc1 to 1.0.0rc4, moved out of CHANGELOG.md |
 
 <!-- aise-message-search-contract:start -->
 ## Generated message-search caller contract
