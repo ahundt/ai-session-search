@@ -27,9 +27,16 @@ origin or delivery enum value. Both Rust enums are non-exhaustive.
 
 Legacy Claude queue operations lack per-item sender receipts and links proving delivery. They
 remain `authorship=unknown`, `input_origin=queued`, and `input_delivery_state=submitted`, while
-`role="user"` still finds the recorded submission. Matching a later message by text
-alone does not prove identity. Recurrence/correction analytics keep their stricter attribution
-rules and exclude unverified queue copies; their existing behavior is unchanged.
+`role="user"` still finds the recorded submission. When Claude Code also wrote a
+`queued_command` attachment naming the sender, the queued row takes that sender (`human` for a
+person), and a `task-notification` attachment makes it a harness notice.
+
+Recurrence and correction analytics read rows with structural evidence of a human author,
+queued rows included. Queued rows with no recorded sender are left out and counted in
+`MessageClassificationReport.unattributed_input_count`;
+`MessageClassificationQuery.include_unattributed_input` reads them. Matching a later message by
+text alone does not prove identity, so a queued row whose exact text is also a non-queued human
+row of the same session is not read: the input counts once, as the delivered prompt.
 
 Recurrence analytics join attributable fragments within a message before matching; their
 coordinates and phrase grouping describe that projection. Content search with `role="user"`

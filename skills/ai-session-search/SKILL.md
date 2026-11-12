@@ -253,6 +253,11 @@ aise analyze --provider codex --when 7d --output /absolute/new/analysis
 
 `aise skills corrections` and default/user-role `aise repeats` scan only source-attributable
 human text; generated, harness, unknown-authorship, and mirror rows do not count as recurrence.
+That includes messages typed while the agent was working when the transcript records a human
+sender. Queued messages with no recorded sender (older Claude Code) are left out and counted:
+`unattributed_input_count` in the JSON report, a note in table output, a stderr note for
+`repeats`. Pass `--include-unattributed-input` (MCP `include_unattributed_input: true`) to read
+them; a program may have sent them. A queued message also delivered as its own prompt counts once.
 Corrections default to user-started sessions; pass `--session-kinds user subagent` to include
 attributable human text in both classes. `--format json` returns a tagged skill-run receipt plus
 the classification report. Search precise correction phrases such as `misunderstood`, `wrong repo`, `you forgot`, and
