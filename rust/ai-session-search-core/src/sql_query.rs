@@ -209,14 +209,38 @@ pub struct QueryResultPayload {
     pub value: Value,
 }
 
+/// One read-only SQL query with every option decided, as [`query_path`] runs it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ResolvedDbQueryArgs {
+    /// One read-only, row-producing SQL statement.
     pub sql: String,
+    /// Maximum rows to return; 0 returns every row. When rows remain past the limit,
+    /// [`QueryResult::truncated`] is `true`.
     pub limit: usize,
+    /// Rows to skip after the statement runs and before `limit` counts.
     pub offset: usize,
+    /// Interrupt the query after this many milliseconds; 0 means no timeout.
     pub timeout_ms: u64,
+    /// How [`render_query_result`] prints the result. [`query_path`] ignores it.
     pub format: OutputFormat,
+}
+
+impl ResolvedDbQueryArgs {
+    /// Query `sql`, returning at most `limit` rows (0 returns every row).
+    ///
+    /// The other options start at offset 0, no timeout (`timeout_ms` 0), and
+    /// [`OutputFormat::Table`]; set the public fields to change them. The statement is
+    /// checked when [`query_path`] runs it, not here.
+    pub fn new(sql: impl Into<String>, limit: usize) -> Self {
+        Self {
+            sql: sql.into(),
+            limit,
+            offset: 0,
+            timeout_ms: 0,
+            format: OutputFormat::Table,
+        }
+    }
 }
 
 impl DbQueryArgs {
