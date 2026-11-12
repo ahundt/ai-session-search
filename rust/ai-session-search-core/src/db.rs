@@ -457,9 +457,13 @@ const CORRECTION_CANDIDATES_PREFIX: &str =
      from messages m
      where m.record_relation = 'original'
        and ";
-const CORRECTION_CANDIDATES_SUFFIX: &str = "
-       and (
-           m.authorship = 'human'
+/// The human-authored clause of [`ATTRIBUTED_HUMAN_INPUT_SQL`], written once for every predicate
+/// that includes it. `human` rows are whole input a person typed: a prompt in a user-started
+/// session, or a queued prompt whose `queued_command` attachment names a human origin. `mixed`
+/// rows qualify through their human parts only.
+macro_rules! attributed_human_input_sql {
+    () => {
+        "m.authorship = 'human'
            or (
                m.authorship = 'mixed'
                and exists (
@@ -467,8 +471,77 @@ const CORRECTION_CANDIDATES_SUFFIX: &str = "
                    from message_content_parts p
                    where p.message_id = m.id and p.authorship = 'human'
                )
+           )"
+    };
+}
+/// Queued input whose transcript does not say who typed it: Claude Code versions that wrote a
+/// `queue-operation` enqueue without a `queued_command` attachment naming its origin. A person
+/// or a program may have sent it, so corrections and repeats leave it out unless asked, and
+/// report how many such rows their scope held.
+macro_rules! unattributed_queued_input_sql {
+    () => {
+        "m.authorship = 'unknown' and m.input_origin = 'queued' and m.kind = 'conversation'"
+    };
+}
+/// What corrections, repeats and analysis read: rows with structural evidence that a person
+/// typed them. Callers add `record_relation = 'original'` and [`Db::delivered_copy_exclusion`].
+const ATTRIBUTED_HUMAN_INPUT_SQL: &str = concat!("(", attributed_human_input_sql!(), ")");
+/// [`ATTRIBUTED_HUMAN_INPUT_SQL`] plus [`UNATTRIBUTED_QUEUED_INPUT_SQL`], for a caller that opted
+/// in to queued input with no recorded sender.
+const ATTRIBUTED_OR_UNATTRIBUTED_INPUT_SQL: &str = concat!(
+    "(",
+    attributed_human_input_sql!(),
+    " or (",
+    unattributed_queued_input_sql!(),
+    "))"
+);
+const UNATTRIBUTED_QUEUED_INPUT_SQL: &str = concat!("(", unattributed_queued_input_sql!(), ")");
+/// Excludes a queued row whose exact text is also an original human row of the same session
+/// that was not queued: one input recorded twice, once when it was queued and once when it was
+/// delivered as its own prompt. The delivered row is the one read, so the input counts once.
+/// The lookup reads the session's human rows through
+/// `idx_messages_session_authorship_relation_seq`.
+const NOT_DELIVERED_QUEUED_COPY_SQL: &str = "not (
+           coalesce(m.input_origin, 'unknown') = 'queued'
+           and exists (
+               select 1 from messages delivered
+               where delivered.session_id = m.session_id
+                 and delivered.authorship = 'human'
+                 and delivered.record_relation = 'original'
+                 and coalesce(delivered.input_origin, 'unknown') != 'queued'
+                 and delivered.content = m.content
            )
        )";
+/// The scope a correction run reads: forced to `role = user`, and to user-started sessions when the
+/// caller named no session class.
+fn correction_scope(filters: &MessageFilters) -> MessageFilters {
+    let mut filters = filters.clone();
+    filters.role = Some(Role::User);
+    // A correction is what a PERSON told the agent. In a subagent transcript the `role='user'`
+    // rows are the SPAWNING AGENT's delegation prompt, not anything a human typed, and
+    // subagents outnumber user-started sessions roughly five to one (models.rs SessionKind).
+    // Leaving them in lets ordinary orchestrator instructions register as corrections --
+    // `\bdon'?t forget\b` matches "don't forget to check the tests" exactly.
+    //
+    // Narrowed here, beside the forced role, because both are the same kind of claim about
+    // what the operation intrinsically means rather than a caller preference.
+    // `--session-kinds` can reopen subagent session scope, but it never overrides source
+    // authorship: agent delegation prompts remain excluded while genuinely human content in
+    // that scope remains reachable. The SET is the mechanism, never an
+    // `include_subagents` boolean.
+    filters
+        .session_kinds
+        .get_or_insert_with(|| vec![crate::models::SessionKind::User]);
+    filters
+}
+
+fn input_eligibility_sql(include_unattributed_input: bool) -> &'static str {
+    if include_unattributed_input {
+        ATTRIBUTED_OR_UNATTRIBUTED_INPUT_SQL
+    } else {
+        ATTRIBUTED_HUMAN_INPUT_SQL
+    }
+}
 /// Published order of correction candidates, newest first. Timestamp alone is not a total order:
 /// providers may omit it and several messages may share one. Nor is `(session_id, seq)`, which is
 /// not unique, so the row id ends the order; without it SQLite returns tied rows in whichever
@@ -4060,24 +4133,53 @@ impl Db {
         Ok(())
     }
 
-    /// Return the one queued-delivery exclusion used by source-authoritative analytics.
+    /// Whether this index stores `messages.input_origin`.
     ///
-    /// Schema-5 indexes released before input provenance was added have no `input_origin` column.
-    /// Their providers did not produce queued-delivery rows, so every stored original human row is
-    /// equivalent to the current non-queued predicate. Keeping that compatibility decision here
-    /// lets corrections, repeats, and analysis documents remain readable without mutating a
-    /// read-only index or duplicating schema probes in each SQL owner.
-    fn nonqueued_input_predicate(&self) -> Result<&'static str> {
-        // Delivery metadata can be missing while origin still proves that a row was queued.
-        let has_origin: bool = self.conn.query_row(
+    /// Schema-5 indexes released before input provenance was added have no such column. Their
+    /// providers did not produce queued rows, so no stored row there is queued, delivered twice
+    /// or unattributed queued input. Keeping that compatibility decision here lets corrections,
+    /// repeats, and analysis documents remain readable without mutating a read-only index or
+    /// duplicating schema probes in each SQL owner.
+    fn stores_input_origin(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
             "select exists(select 1 from pragma_table_info('messages') where name = 'input_origin')",
             [], |row| row.get(0),
-        )?;
-        Ok(if has_origin {
-            "coalesce(m.input_origin, 'unknown') != 'queued'"
+        )?)
+    }
+
+    /// The one delivered-copy exclusion used by corrections, repeats and analysis; see
+    /// [`NOT_DELIVERED_QUEUED_COPY_SQL`].
+    fn delivered_copy_exclusion(&self) -> Result<&'static str> {
+        Ok(if self.stores_input_origin()? {
+            NOT_DELIVERED_QUEUED_COPY_SQL
         } else {
             "1 = 1"
         })
+    }
+
+    /// Rows in `filters`' scope that corrections and repeats leave out because the transcript does
+    /// not record who typed them ([`UNATTRIBUTED_QUEUED_INPUT_SQL`]), not counting delivered copies.
+    /// Content filters do not apply; one indexed count over the structural filters.
+    pub(crate) fn unattributed_input_count(&self, filters: &MessageFilters) -> Result<u64> {
+        use rusqlite::types::Value;
+
+        if !self.stores_input_origin()? {
+            return Ok(0);
+        }
+        let mut sql = format!(
+            "select count(*) from messages m
+             where m.record_relation = 'original'
+               and {NOT_DELIVERED_QUEUED_COPY_SQL}
+               and {UNATTRIBUTED_QUEUED_INPUT_SQL}"
+        );
+        let mut args: Vec<Value> = Vec::new();
+        append_stored_role_filters(&mut sql, &mut args, filters, &self.access_scope);
+        let count: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                    row.get(0)
+                })?;
+        Ok(count as u64)
     }
 
     /// Count the messages matching the structural filters (role / provider / session / path / time /
@@ -4663,6 +4765,7 @@ impl Db {
         &self,
         query: &str,
         filters: &MessageFilters,
+        include_unattributed_input: bool,
     ) -> Result<Vec<MessageHit>> {
         use rusqlite::types::Value;
 
@@ -4677,12 +4780,15 @@ impl Db {
             regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
         }
 
-        let nonqueued = self.nonqueued_input_predicate()?;
+        let copy_exclusion = self.delivered_copy_exclusion()?;
+        // A legacy index without `input_origin` holds no queued rows to opt in to.
+        let eligible =
+            input_eligibility_sql(include_unattributed_input && self.stores_input_origin()?);
         let mut inner = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind,
                     m.tool_call_id,
                     case
-                      when m.authorship = 'human' then m.content
+                      when m.authorship != 'mixed' then m.content
                       else (
                         select group_concat(fragment, '')
                         from (
@@ -4697,17 +4803,8 @@ impl Db {
                     m.id as message_id
              from messages m
              where m.record_relation = 'original'
-       and {nonqueued}
-               and (
-                 m.authorship = 'human'
-                 or (
-                   m.authorship = 'mixed'
-                   and exists (
-                     select 1 from message_content_parts p
-                     where p.message_id = m.id and p.authorship = 'human'
-                   )
-                 )
-               )",
+               and {copy_exclusion}
+               and {eligible}",
         );
         let mut args: Vec<Value> = Vec::new();
         append_stored_role_filters(&mut inner, &mut args, filters, &self.access_scope);
@@ -4756,47 +4853,56 @@ impl Db {
     /// (95% of which is tool output the `role='user'` filter then discards) AND trigger its lazy
     /// build — measured ~21 s, strictly slower than scanning the user rows outright. The structural
     /// `role='user'` filter is the selective one here, so we lean on it alone.
+    #[cfg(test)]
     pub(crate) fn find_corrections(
         &self,
         policies: &crate::corrections::ResolvedCorrectionPolicySet,
         filters: &MessageFilters,
     ) -> Result<Vec<MessageClassificationMatch>> {
+        Ok(self
+            .find_corrections_with_receipt(policies, filters, false)?
+            .0)
+    }
+
+    /// [`Db::find_corrections`] with the opt-in for unattributed queued input, also returning how
+    /// many rows of the run's scope are unattributed queued input
+    /// ([`Db::unattributed_input_count`]), whether or not they were read.
+    pub(crate) fn find_corrections_with_receipt(
+        &self,
+        policies: &crate::corrections::ResolvedCorrectionPolicySet,
+        filters: &MessageFilters,
+        include_unattributed_input: bool,
+    ) -> Result<(Vec<MessageClassificationMatch>, u64)> {
         self.validate_access_scope()?;
         // An empty selection (`[skills].enabled = []`) defines no categories, so no row can match.
         // Returning here skips a full scan of the user slice whose only possible result is this
         // same empty vector. Placed AFTER the scope check so "no rules" cannot become a way to
         // query an index the caller is not allowed to touch.
         if policies.is_empty() {
-            return Ok(Vec::new());
+            let unattributed = self.unattributed_input_count(&correction_scope(filters))?;
+            return Ok((Vec::new(), unattributed));
         }
-        self.find_corrections_with_after_candidates(policies, filters, || {})
+        self.find_corrections_with_after_candidates(
+            policies,
+            filters,
+            include_unattributed_input,
+            || {},
+        )
     }
 
     fn find_corrections_with_after_candidates(
         &self,
         policies: &crate::corrections::ResolvedCorrectionPolicySet,
         filters: &MessageFilters,
+        include_unattributed_input: bool,
         after_candidates: impl FnOnce(),
-    ) -> Result<Vec<MessageClassificationMatch>> {
+    ) -> Result<(Vec<MessageClassificationMatch>, u64)> {
         use rusqlite::types::Value;
 
-        let mut filters = filters.clone();
-        filters.role = Some(Role::User);
-        // A correction is what a PERSON told the agent. In a subagent transcript the `role='user'`
-        // rows are the SPAWNING AGENT's delegation prompt, not anything a human typed, and
-        // subagents outnumber user-started sessions roughly five to one (models.rs SessionKind).
-        // Leaving them in lets ordinary orchestrator instructions register as corrections --
-        // `\bdon'?t forget\b` matches "don't forget to check the tests" exactly.
-        //
-        // Narrowed here, beside the forced role, because both are the same kind of claim about
-        // what the operation intrinsically means rather than a caller preference.
-        // `--session-kinds` can reopen subagent session scope, but it never overrides source
-        // authorship: agent delegation prompts remain excluded while genuinely human content in
-        // that scope remains reachable. The SET is the mechanism, never an
-        // `include_subagents` boolean.
-        filters
-            .session_kinds
-            .get_or_insert_with(|| vec![crate::models::SessionKind::User]);
+        let filters = correction_scope(filters);
+        // A legacy index without `input_origin` holds no queued rows to opt in to.
+        let include_unattributed_input =
+            include_unattributed_input && self.stores_input_origin()?;
 
         struct CorrectionCandidate {
             message_id: i64,
@@ -4851,13 +4957,14 @@ impl Db {
 
         // Keep candidate rows and their content-part ranges in one SQLite read snapshot, then
         // release the transaction before CPU-bound parallel regex classification.
-        let rows = self.with_read_snapshot(|| {
+        let (rows, unattributed) = self.with_read_snapshot(|| {
             // Select only source-authoritative human content. Unknown schema-5 authorship stays
             // excluded rather than being guessed; unavailable source transcripts retain their
             // index rows but cannot become evidence about what a person said.
-            let nonqueued = self.nonqueued_input_predicate()?;
+            let copy_exclusion = self.delivered_copy_exclusion()?;
             let mut sql = format!(
-                "{CORRECTION_CANDIDATES_PREFIX}{nonqueued}{CORRECTION_CANDIDATES_SUFFIX}"
+                "{CORRECTION_CANDIDATES_PREFIX}{copy_exclusion}\n and {}",
+                input_eligibility_sql(include_unattributed_input)
             );
             let mut args: Vec<Value> = Vec::new();
             append_stored_role_filters(&mut sql, &mut args, &filters, &self.access_scope);
@@ -4894,7 +5001,7 @@ impl Db {
             // fragment text. This is two set-oriented queries total, never one query per message.
             if rows.iter().any(|row| row.human_parts.is_some()) {
                 let mut parts_sql = format!(
-                    "{CORRECTION_HUMAN_PARTS_PREFIX}{nonqueued}{CORRECTION_HUMAN_PARTS_SUFFIX}"
+                    "{CORRECTION_HUMAN_PARTS_PREFIX}{copy_exclusion}{CORRECTION_HUMAN_PARTS_SUFFIX}"
                 );
                 let mut parts_args: Vec<Value> = Vec::new();
                 append_stored_role_filters(
@@ -4941,7 +5048,7 @@ impl Db {
                     }
                 }
             }
-            Ok(rows)
+            Ok((rows, self.unattributed_input_count(&filters)?))
         })?;
 
         // Classify one candidate against whole human messages or source-ordered human fragments.
@@ -5013,7 +5120,7 @@ impl Db {
         if filters.limit > 0 {
             out.truncate(filters.limit);
         }
-        Ok(out)
+        Ok((out, unattributed))
     }
 
     /// Aggregate slash-command frequency: count, distinct sessions, distinct projects
@@ -5375,7 +5482,7 @@ impl Db {
         }
         // Keep session metadata and all per-session message reads on one SQLite snapshot.
         // The read-only transaction rolls back via RAII on every return/error path.
-        let nonqueued = self.nonqueued_input_predicate()?;
+        let copy_exclusion = self.delivered_copy_exclusion()?;
         let transaction = self.conn.unchecked_transaction()?;
         analysis_document_page(
             &transaction,
@@ -5383,7 +5490,7 @@ impl Db {
             cursor,
             filters.limit,
             &self.access_scope,
-            nonqueued,
+            copy_exclusion,
         )
     }
 
@@ -5406,11 +5513,11 @@ impl Db {
         ) -> Result<()>,
     ) -> Result<AnalysisTraversalReceipt> {
         self.validate_access_scope()?;
-        let nonqueued = self.nonqueued_input_predicate()?;
+        let copy_exclusion = self.delivered_copy_exclusion()?;
         let transaction = self.conn.unchecked_transaction()?;
-        let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(nonqueued))?;
+        let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(copy_exclusion))?;
         let mut human_message_stmt =
-            transaction.prepare(&analysis_attributable_human_messages_sql(nonqueued))?;
+            transaction.prepare(&analysis_attributable_human_messages_sql(copy_exclusion))?;
         let mut cursor = None;
         let mut selected_sessions = 0_u64;
         let mut messages_in_selected_sessions = 0_u64;
@@ -5963,8 +6070,10 @@ const ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX: &str = "
      from messages m indexed by idx_messages_session_authorship_relation_seq
      where m.session_id = ?1";
 
-fn analysis_message_counts_sql(nonqueued: &str) -> String {
-    format!("{ANALYSIS_MESSAGE_COUNTS_SQL_PREFIX}{nonqueued}{ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX}")
+fn analysis_message_counts_sql(copy_exclusion: &str) -> String {
+    format!(
+        "{ANALYSIS_MESSAGE_COUNTS_SQL_PREFIX}{copy_exclusion}{ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX}"
+    )
 }
 
 /// One ordered text row per original message with attributable human-authored content.
@@ -6002,9 +6111,9 @@ const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX: &str = "
      group by message_id, seq
      order by seq, message_id";
 
-fn analysis_attributable_human_messages_sql(nonqueued: &str) -> String {
+fn analysis_attributable_human_messages_sql(copy_exclusion: &str) -> String {
     format!(
-        "{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_PREFIX}{nonqueued}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_MIDDLE}{nonqueued}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX}"
+        "{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_PREFIX}{copy_exclusion}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_MIDDLE}{copy_exclusion}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX}"
     )
 }
 
@@ -6061,15 +6170,15 @@ fn analysis_document_page(
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
     access: &crate::search_scope::EffectiveAccessScope,
-    nonqueued: &str,
+    copy_exclusion: &str,
 ) -> Result<crate::models::AnalysisDocumentPage> {
     use crate::models::{AnalysisDocument, AnalysisDocumentPage};
 
     let (sessions, next_cursor) =
         analysis_session_page(transaction, filters, cursor, page_limit, access)?;
-    let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(nonqueued))?;
+    let mut count_stmt = transaction.prepare(&analysis_message_counts_sql(copy_exclusion))?;
     let mut human_message_stmt =
-        transaction.prepare(&analysis_attributable_human_messages_sql(nonqueued))?;
+        transaction.prepare(&analysis_attributable_human_messages_sql(copy_exclusion))?;
     let mut documents = Vec::with_capacity(sessions.len());
     for session in sessions {
         let (message_count, human_message_count) = count_stmt.query_row([&session.id], |row| {
@@ -9518,7 +9627,7 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].role, Role::Tool);
         assert_eq!(
-            db.search_attributable_human_messages("answer", &filters)
+            db.search_attributable_human_messages("answer", &filters, false)
                 .unwrap()
                 .len(),
             1,
@@ -9975,12 +10084,13 @@ mod tests {
                 &MessageFilters {
                     role: None,
                     ..all_human.clone()
-                }
+                },
+                false,
             )
             .unwrap()
             .len(),
-            1,
-            "unlinked queue copies are evidence but must not inflate recurrence counts"
+            2,
+            "a queued human row is read; only the mirror row of the same text is not"
         );
         db.conn
             .execute_batch(
@@ -13050,12 +13160,12 @@ mod tests {
     }
 
     #[test]
-    fn partial_input_storage_keeps_known_queues_out_of_read_only_analytics() {
+    fn partial_input_storage_reads_a_delivered_queue_copy_once_in_read_only_analytics() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         let db = Db::open(&path).unwrap();
         db.upsert_session(
-            &parsed_with_messages("claude:partial", &["direct needle", "queued needle"]),
+            &parsed_with_messages("claude:partial", &["direct needle", "direct needle"]),
             1,
             1,
         )
@@ -13075,7 +13185,7 @@ mod tests {
         )
         .unwrap();
         let hits = db
-            .search_attributable_human_messages("needle", &MessageFilters::default())
+            .search_attributable_human_messages("needle", &MessageFilters::default(), false)
             .unwrap();
         assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), [0]);
         assert_eq!(
@@ -13084,6 +13194,42 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// Queued input counts once and only with evidence of who typed it. A queued row with a human
+    /// origin is read; a queued row with no recorded sender is counted and read only on request;
+    /// a queued row also delivered as its own prompt is read once, as the prompt.
+    #[test]
+    fn analytics_read_attributed_queued_input_and_count_unattributed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &parsed_with_messages(
+                "claude:queued",
+                &["typed", "typed", "sender unknown", "queued by a person"],
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "update messages set authorship = 'human', record_relation = 'original';
+                 update messages set input_origin = 'queued' where seq in (1, 2, 3);
+                 update messages set authorship = 'unknown' where seq in (1, 2);",
+            )
+            .unwrap();
+        let filters = MessageFilters::default();
+        let seqs = |include| {
+            db.search_attributable_human_messages("", &filters, include)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.seq)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(seqs(false), [0, 3]);
+        assert_eq!(seqs(true), [0, 2, 3], "the delivered copy at seq 1 is never read");
+        assert_eq!(db.unattributed_input_count(&filters).unwrap(), 1);
     }
 
     #[test]
@@ -13457,10 +13603,10 @@ mod tests {
             assert!(!plan.contains("SCAN messages"), "{plan}");
         }
 
-        let nonqueued = db.nonqueued_input_predicate().unwrap();
+        let copy_exclusion = db.delivered_copy_exclusion().unwrap();
         for sql in [
-            analysis_message_counts_sql(nonqueued),
-            analysis_attributable_human_messages_sql(nonqueued),
+            analysis_message_counts_sql(copy_exclusion),
+            analysis_attributable_human_messages_sql(copy_exclusion),
         ] {
             let plan = db
                 .conn
@@ -13486,9 +13632,10 @@ mod tests {
     fn correction_candidate_and_part_queries_use_provenance_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        let nonqueued = db.nonqueued_input_predicate().unwrap();
+        let copy_exclusion = db.delivered_copy_exclusion().unwrap();
         let candidates = format!(
-            "explain query plan {CORRECTION_CANDIDATES_PREFIX}{nonqueued}{CORRECTION_CANDIDATES_SUFFIX}{CORRECTION_ORDER_SQL}"
+            "explain query plan {CORRECTION_CANDIDATES_PREFIX}{copy_exclusion}
+ and {ATTRIBUTED_HUMAN_INPUT_SQL}{CORRECTION_ORDER_SQL}"
         );
         let candidate_plan = db
             .conn
@@ -13506,7 +13653,7 @@ mod tests {
         assert!(!candidate_plan.contains("SCAN m"), "{candidate_plan}");
 
         let parts = format!(
-            "explain query plan {CORRECTION_HUMAN_PARTS_PREFIX}{nonqueued}{CORRECTION_HUMAN_PARTS_SUFFIX}
+            "explain query plan {CORRECTION_HUMAN_PARTS_PREFIX}{copy_exclusion}{CORRECTION_HUMAN_PARTS_SUFFIX}
              order by m.id, p.ordinal"
         );
         let parts_plan = db
@@ -18033,6 +18180,7 @@ mod tests {
                     limit,
                     ..Default::default()
                 },
+                false,
             )
             .unwrap()
             .into_iter()
@@ -18315,11 +18463,15 @@ mod tests {
 
         let policies = test_policies(&[("skip_step", &[r"\byou forgot\b"])]);
         let hits = db
-            .find_corrections_with_after_candidates(&policies, &MessageFilters::default(), || {
-                writer
-                    .conn
-                    .execute_batch(
-                        "begin immediate;
+            .find_corrections_with_after_candidates(
+                &policies,
+                &MessageFilters::default(),
+                false,
+                || {
+                    writer
+                        .conn
+                        .execute_batch(
+                            "begin immediate;
                              update messages
                              set content = 'generated you forgot | human okay'
                              where id = 301;
@@ -18330,10 +18482,12 @@ mod tests {
                                (301, 0, 0, 23, 'generated', 'generated_summary'),
                                (301, 1, 23, 33, 'human', 'direct_input');
                              commit;",
-                    )
-                    .unwrap();
-            })
-            .unwrap();
+                        )
+                        .unwrap();
+                },
+            )
+            .unwrap()
+            .0;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].content, "human you forgot");

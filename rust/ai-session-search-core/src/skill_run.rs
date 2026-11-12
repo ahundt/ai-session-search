@@ -77,6 +77,10 @@ pub enum SkillCapabilityInput {
 pub struct MessageClassificationQuery {
     pub filters: MessageFilters,
     pub additional_skills: Vec<SkillSelector>,
+    /// Also classify messages typed while the agent was working whose transcript does not
+    /// record who sent them. Default false: such a message may have been sent by a program, so
+    /// it is left out and counted in `MessageClassificationReport::unattributed_input_count`.
+    pub include_unattributed_input: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +233,8 @@ mod tests {
                     match_end_char_exclusive: 8,
                     content: "Actually, use the other command.".to_string(),
                 }],
+                unattributed_input_count: 0,
+                unattributed_input_included: false,
             },
         };
 
@@ -257,7 +263,9 @@ mod tests {
                         "match_start_char": 0,
                         "match_end_char_exclusive": 8,
                         "content": "Actually, use the other command."
-                    }]
+                    }],
+                    "unattributed_input_count": 0,
+                    "unattributed_input_included": false
                 }
             })
         );

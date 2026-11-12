@@ -1608,6 +1608,7 @@ fn execute(cli: Cli) -> Result<()> {
                     crate::skill_run::MessageClassificationQuery {
                         filters,
                         additional_skills,
+                        include_unattributed_input: args.include_unattributed_input,
                     },
                 ),
             })?;

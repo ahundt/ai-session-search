@@ -4275,6 +4275,7 @@ mod tests {
                 (Role::Assistant, "first draft"),
                 (Role::User, "you forgot to check the tests"),
                 (Role::User, "also rename the output folder"),
+                (Role::User, "you forgot to check the second directory"),
                 (Role::User, "you missed the second directory"),
             ],
             "every conversation row is a turn a person or the model wrote, once: {rows:#?}"
@@ -4301,9 +4302,10 @@ mod tests {
             .filter(|(_, kind, _)| *kind == MessageKind::HarnessNotice)
             .map(|(_, _, content)| *content)
             .collect();
-        assert_eq!(notices.len(), 2, "{notices:#?}");
+        assert_eq!(notices.len(), 3, "{notices:#?}");
         assert!(notices[0].starts_with("<task-notification>"));
-        assert!(notices[1].starts_with("Stop hook feedback"));
+        assert!(notices[1].starts_with("Background job report"));
+        assert!(notices[2].starts_with("Stop hook feedback"));
         assert_eq!(
             rows.iter()
                 .filter(|(role, _, _)| *role == Role::Compaction)

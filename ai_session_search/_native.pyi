@@ -607,6 +607,16 @@ class MessageClassificationReport:
     """
     matches: list[MessageClassificationMatch]
     """Matches newest first, after ``offset`` is skipped and ``limit`` taken."""
+    unattributed_input_count: int
+    """Messages in scope typed while the agent was working whose transcript does not record
+    who sent them (Claude Code versions that wrote no sender for queued input).
+
+    Counted whether or not they were read. A queued message also delivered as its own prompt
+    is read once, as that prompt, and not counted here.
+    """
+    unattributed_input_included: bool
+    """Whether :attr:`matches` read those messages. ``False`` unless the query set
+    ``include_unattributed_input=True``."""
 
 @final
 class SelectedSkillLocation:
@@ -959,6 +969,13 @@ class MessageClassificationQuery:
     """
     offset: int
     """Matches to skip before ``limit`` applies, newest first. ``0`` starts at the newest."""
+    include_unattributed_input: bool
+    """Also classify messages typed while the agent was working whose transcript does not
+    record who sent them.
+
+    ``False`` by default because a program may have sent them; the report counts them in
+    :attr:`MessageClassificationReport.unattributed_input_count` either way.
+    """
 
     def __new__(
         cls,
@@ -968,6 +985,7 @@ class MessageClassificationQuery:
         additional_skills: list[SkillSelector] | None = None,
         limit: int | None = None,
         offset: int = 0,
+        include_unattributed_input: bool = False,
     ) -> Self: ...
 
 @final

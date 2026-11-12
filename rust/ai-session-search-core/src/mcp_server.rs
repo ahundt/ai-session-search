@@ -2834,9 +2834,18 @@ fn run_skill_capability_output_schema() -> Value {
                 "matches": {
                     "type": "array",
                     "items": { "$ref": "#/$defs/ClassifiedMatch" }
+                },
+                "unattributed_input_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Queued messages in scope whose transcript does not record who sent them."
+                },
+                "unattributed_input_included": {
+                    "type": "boolean",
+                    "description": "Whether matches read those messages."
                 }
             },
-            "required": ["policies", "matches"],
+            "required": ["policies", "matches", "unattributed_input_count", "unattributed_input_included"],
             "additionalProperties": false
         },
         // Two tagged unions, each a branch per variant, so their inline form costs four levels
@@ -4658,7 +4667,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
                     "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size; omit for the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit) },
                     "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide. Omit for false." },
-                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." }
+                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." },
+                    "include_unattributed_input": { "type": "boolean", "description": "Also read queued messages with no recorded sender. Omit for false: they are left out and counted." }
                 },
                 "required": ["skill"],
                 "additionalProperties": false
@@ -5387,6 +5397,7 @@ fn tool_run_skill_capability(
     db: &Db,
 ) -> Result<ToolResponse, String> {
     let all_results = mcp_bool_arg(args, "all_results", false);
+    let include_unattributed_input = mcp_bool_arg(args, "include_unattributed_input", false);
     let requested_limit = mcp_optional_positive_usize_arg(args, "limit")?;
     if all_results && requested_limit.is_some() {
         return Err(
@@ -5499,6 +5510,7 @@ fn tool_run_skill_capability(
                 crate::skill_run::MessageClassificationQuery {
                     filters,
                     additional_skills: additional,
+                    include_unattributed_input,
                 },
             ),
         })

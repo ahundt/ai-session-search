@@ -9,6 +9,10 @@
 //! `aise repeats` report the harness's own sentences as what the user keeps saying. A prompt
 //! typed while the agent worked can exist only in a `queued_command` attachment, which was not
 //! indexed at all. The fixture holds each of these beside the real turns.
+//!
+//! Queued input (typed while the agent worked) is read when the transcript records that a person
+//! sent it, left out and counted when it records no sender, and never read when it records a
+//! harness notification.
 
 mod support;
 
@@ -24,8 +28,13 @@ const SESSION: &str = "cafe0002-cafe-cafe-cafe-000000000001";
 const CORRECTION: &str = "you missed the second directory";
 /// A prompt that exists only in a `queued_command` attachment.
 const QUEUED_ONLY: &str = "also rename the output folder";
+/// A queued prompt whose attachment names a human origin.
+const QUEUED_HUMAN: &str = "you forgot to check the tests";
+/// A queued prompt with no attachment, so no recorded sender.
+const QUEUED_UNATTRIBUTED: &str = "you forgot to check the second directory";
 /// Text the harness wrote, or that only request copies and unknown records hold.
-const NOT_TYPED: [&str; 8] = [
+const NOT_TYPED: [&str; 9] = [
+    "Background job report",
     "while you were working",
     "harness shows",
     "being continued",
@@ -113,28 +122,75 @@ fn strings(values: impl IntoIterator<Item = Value>) -> Vec<String> {
 fn cli_corrections_repeats_and_doctor_read_only_typed_text() {
     let indexed = Indexed::new();
 
-    let corrections = indexed.json(&["skills", "corrections", "--format", "json"]);
-    let matched = strings(
-        corrections["output"]["result"]["report"]["matches"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|hit| hit["content"].clone()),
+    let corrections = |extra: &[&str]| {
+        let mut args = vec!["skills", "corrections", "--format", "json"];
+        args.extend_from_slice(extra);
+        let report = indexed.json(&args)["output"]["result"]["report"].clone();
+        let matched = strings(
+            report["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["content"].clone()),
+        );
+        (matched, report)
+    };
+    let (matched, report) = corrections(&[]);
+    assert_eq!(matched, [CORRECTION, QUEUED_HUMAN], "{report:#}");
+    assert_eq!(report["unattributed_input_count"], json!(1), "{report:#}");
+    assert_eq!(report["unattributed_input_included"], json!(false));
+    let (matched, report) = corrections(&["--include-unattributed-input"]);
+    assert_eq!(
+        matched,
+        [CORRECTION, QUEUED_UNATTRIBUTED, QUEUED_HUMAN],
+        "{report:#}"
     );
-    assert_eq!(matched, [CORRECTION], "{corrections:#}");
+    assert_eq!(report["unattributed_input_count"], json!(1), "{report:#}");
+    assert_eq!(report["unattributed_input_included"], json!(true));
+    let table = indexed
+        .aise()
+        .args(["skills", "corrections"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&table.stdout).contains(
+            "1 queued message left out because its transcript does not record who sent it; \
+             --include-unattributed-input reads it"
+        ),
+        "{table:?}"
+    );
 
-    let repeats = indexed.json(&["repeats", "--format", "json"]);
-    let groups = repeats.as_array().unwrap();
-    let mut texts = strings(groups.iter().map(|group| group["repeat"].clone()));
-    texts.extend(strings(groups.iter().flat_map(|group| {
-        group["examples"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|example| example["preview"].clone())
-            .collect::<Vec<_>>()
-    })));
-    assert_typed_only(&texts, "aise repeats");
+    let repeats = |extra: &[&str]| {
+        let mut args = vec!["repeats", "--format", "json"];
+        args.extend_from_slice(extra);
+        let output = indexed.aise().args(&args).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let groups: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let groups = groups.as_array().unwrap();
+        let mut texts = strings(groups.iter().map(|group| group["repeat"].clone()));
+        texts.extend(strings(groups.iter().flat_map(|group| {
+            group["examples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|example| example["preview"].clone())
+                .collect::<Vec<_>>()
+        })));
+        assert_typed_only(&texts, "aise repeats");
+        (texts, String::from_utf8_lossy(&output.stderr).into_owned())
+    };
+    let (texts, stderr) = repeats(&[]);
+    assert!(
+        !texts.iter().any(|text| text == QUEUED_UNATTRIBUTED),
+        "{texts:#?}"
+    );
+    assert!(stderr.contains("1 queued message left out"), "{stderr}");
+    let (texts, stderr) = repeats(&["--include-unattributed-input"]);
+    assert!(
+        texts.iter().any(|text| text == QUEUED_UNATTRIBUTED),
+        "{texts:#?}"
+    );
+    assert!(!stderr.contains("left out"), "{stderr}");
 
     let queued = indexed.json(&[
         "messages",
@@ -181,6 +237,11 @@ fn mcp_corrections_search_and_status_read_only_typed_text() {
         (
             "run_skill_capability",
             json!({"skill": {"name": "corrections"}, "index_refresh": "existing-only"}),
+        ),
+        (
+            "run_skill_capability",
+            json!({"skill": {"name": "corrections"}, "include_unattributed_input": true,
+                   "index_refresh": "existing-only"}),
         ),
         (
             "search_messages",
@@ -246,28 +307,40 @@ fn mcp_corrections_search_and_status_read_only_typed_text() {
 
     // MCP returns each hit's text as a bounded field view.
     let text = |hit: &Value| hit["presentation"]["field_view"]["text"].clone();
-    let matched = strings(
-        results[&1]["run"]["output"]["result"]["report"]["matches"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{:#}", results[&1]))
-            .iter()
-            .map(text),
+    let report = |id: u64| results[&id]["run"]["output"]["result"]["report"].clone();
+    let matched = |id: u64| {
+        strings(
+            report(id)["matches"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{:#}", results[&id]))
+                .iter()
+                .map(text),
+        )
+    };
+    assert_eq!(matched(1), [CORRECTION, QUEUED_HUMAN], "{:#}", results[&1]);
+    assert_eq!(report(1)["unattributed_input_count"], json!(1));
+    assert_eq!(report(1)["unattributed_input_included"], json!(false));
+    assert_eq!(
+        matched(2),
+        [CORRECTION, QUEUED_UNATTRIBUTED, QUEUED_HUMAN],
+        "{:#}",
+        results[&2]
     );
-    assert_eq!(matched, [CORRECTION], "{:#}", results[&1]);
+    assert_eq!(report(2)["unattributed_input_included"], json!(true));
 
     let hits = |id: u64| results[&id]["results"].as_array().unwrap().clone();
-    assert_eq!(hits(2).len(), 1, "{:#}", results[&2]);
-    assert!(hits(3).is_empty(), "{:#}", results[&3]);
-    let user_texts = strings(hits(4).iter().map(text));
-    assert!(!user_texts.is_empty(), "{:#}", results[&4]);
+    assert_eq!(hits(3).len(), 1, "{:#}", results[&3]);
+    assert!(hits(4).is_empty(), "{:#}", results[&4]);
+    let user_texts = strings(hits(5).iter().map(text));
+    assert!(!user_texts.is_empty(), "{:#}", results[&5]);
     assert_typed_only(&user_texts, "MCP search_messages role=user");
 
-    let unrecognized = &results[&5]["parser_health"]["unrecognized_record_types"];
+    let unrecognized = &results[&6]["parser_health"]["unrecognized_record_types"];
     assert_eq!(
         unrecognized,
         &json!([{"provider": "claude", "record_type": "future-record",
                  "records": 1, "sessions": 1}]),
         "{:#}",
-        results[&5]
+        results[&6]
     );
 }

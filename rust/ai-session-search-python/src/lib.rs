@@ -1970,6 +1970,13 @@ struct NativeMessageClassificationReport {
     /// `len(report.matches)` into a full copy.
     #[pyo3(get)]
     matches: Vec<Py<NativeMessageClassificationMatch>>,
+    /// Messages in scope typed while the agent was working whose transcript does not record who
+    /// sent them. Counted whether or not they were read.
+    #[pyo3(get)]
+    unattributed_input_count: u64,
+    /// Whether `matches` read those messages (`include_unattributed_input=True`).
+    #[pyo3(get)]
+    unattributed_input_included: bool,
 }
 
 impl NativeMessageClassificationReport {
@@ -1988,6 +1995,8 @@ impl NativeMessageClassificationReport {
                 .into_iter()
                 .map(|hit| Py::new(py, NativeMessageClassificationMatch::from(hit)))
                 .collect::<PyResult<Vec<_>>>()?,
+            unattributed_input_count: report.unattributed_input_count,
+            unattributed_input_included: report.unattributed_input_included,
         })
     }
 }
@@ -3289,18 +3298,22 @@ struct NativeMessageClassificationQuery {
     limit: Option<usize>,
     #[pyo3(get)]
     offset: usize,
+    /// Also classify queued messages whose transcript does not record who sent them.
+    #[pyo3(get)]
+    include_unattributed_input: bool,
 }
 
 #[pymethods]
 impl NativeMessageClassificationQuery {
     #[new]
-    #[pyo3(signature = (*, scope=None, session_kinds=None, additional_skills=None, limit=None, offset=0))]
+    #[pyo3(signature = (*, scope=None, session_kinds=None, additional_skills=None, limit=None, offset=0, include_unattributed_input=false))]
     fn new(
         scope: Option<QueryScope>,
         session_kinds: Option<Vec<String>>,
         additional_skills: Option<Vec<NativeSkillSelector>>,
         limit: Option<i64>,
         offset: i64,
+        include_unattributed_input: bool,
     ) -> PyResult<Self> {
         Ok(Self {
             scope: scope.unwrap_or_default(),
@@ -3310,6 +3323,7 @@ impl NativeMessageClassificationQuery {
                 .map(|value| paging_argument(PagingArgument::Limit, value))
                 .transpose()?,
             offset: paging_argument(PagingArgument::Offset, offset)?,
+            include_unattributed_input,
         })
     }
 
@@ -3367,6 +3381,7 @@ impl NativeMessageClassificationQuery {
                 .into_iter()
                 .map(|selector| selector.inner)
                 .collect();
+            value.include_unattributed_input = self.include_unattributed_input;
             value
         })
     }

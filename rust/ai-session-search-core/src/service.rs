@@ -138,6 +138,7 @@ mod analysis_service_tests {
                     crate::skill_run::MessageClassificationQuery {
                         filters,
                         additional_skills: Vec::new(),
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -182,6 +183,7 @@ mod analysis_service_tests {
                     crate::skill_run::MessageClassificationQuery {
                         filters: MessageFilters::default(),
                         additional_skills: Vec::new(),
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -224,6 +226,7 @@ mod analysis_service_tests {
                         additional_skills: vec![crate::skill_catalog::SkillSelector::Path(
                             crate::skill_catalog::SkillPathSelector { path: skill_root },
                         )],
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -430,6 +433,7 @@ mod analysis_service_tests {
                             "additional",
                         )
                         .unwrap()],
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -1760,13 +1764,19 @@ impl<'app> AnalysisService<'app> {
 
     pub(crate) fn corrections_with_resolved_policies(
         &self,
-        filters: &crate::models::MessageFilters,
+        query: &crate::skill_run::MessageClassificationQuery,
         policies: &crate::corrections::ResolvedCorrectionPolicySet,
     ) -> Result<crate::corrections::MessageClassificationReport> {
-        let matches = self.db.find_corrections(policies, filters)?;
+        let (matches, unattributed_input_count) = self.db.find_corrections_with_receipt(
+            policies,
+            &query.filters,
+            query.include_unattributed_input,
+        )?;
         Ok(crate::corrections::MessageClassificationReport {
             policies: policies.receipts(),
             matches,
+            unattributed_input_count,
+            unattributed_input_included: query.include_unattributed_input,
         })
     }
 
@@ -1914,7 +1924,7 @@ impl<'app> AnalysisService<'app> {
             };
             (resolved_skill, policies)
         };
-        let report = self.corrections_with_resolved_policies(&arguments.filters, &policies)?;
+        let report = self.corrections_with_resolved_policies(arguments, &policies)?;
         let receipt = report
             .policies
             .first()
@@ -3496,7 +3506,10 @@ mod message_search_service_tests {
             crate::corrections::embedded_policy().unwrap(),
         ]);
         app.analysis()
-            .corrections_with_resolved_policies(&MessageFilters::default(), &policies)
+            .corrections_with_resolved_policies(
+                &crate::skill_run::MessageClassificationQuery::default(),
+                &policies,
+            )
             .unwrap();
         let policy = crate::analysis_pipeline::AnalysisPolicySpec::default()
             .compile()

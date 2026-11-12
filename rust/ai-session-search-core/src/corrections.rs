@@ -432,6 +432,16 @@ pub struct MessageClassificationReport {
     pub policies: Vec<CapabilityReceipt>,
     /// Matches in newest-first order, after `filters.offset` is skipped and `filters.limit` taken.
     pub matches: Vec<crate::models::MessageClassificationMatch>,
+    /// Messages in the run's scope that were typed while the agent was working and whose
+    /// transcript does not record who sent them (Claude Code versions that wrote no
+    /// `queued_command` origin). A person or a program may have sent each one. Counted whether or
+    /// not they were read; a queued message also delivered as its own prompt is not counted.
+    #[serde(default)]
+    pub unattributed_input_count: u64,
+    /// Whether the run read those messages: false by default, true when the caller passed
+    /// `include_unattributed_input`. When false, matches leave them out.
+    #[serde(default)]
+    pub unattributed_input_included: bool,
 }
 
 /// The product-default correction policy, compiled into the executable.

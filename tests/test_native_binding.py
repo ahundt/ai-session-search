@@ -12,6 +12,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -261,7 +262,12 @@ def test_message_classification_public_result_names_and_fields_are_pinned() -> N
     assert "ts" not in fields, "Rust's `ts` must stay renamed to `timestamp` on this surface"
     assert "matched_pattern" not in fields, "the field names the matched text, not the rule"
     assert {name for name in dir(native.CapabilityReceipt) if not name.startswith("_")} == {"name", "version", "sha256"}
-    assert {name for name in dir(native.MessageClassificationReport) if not name.startswith("_")} == {"policies", "matches"}
+    assert {name for name in dir(native.MessageClassificationReport) if not name.startswith("_")} == {
+        "policies",
+        "matches",
+        "unattributed_input_count",
+        "unattributed_input_included",
+    }
 
 
 def test_advanced_facade_exports_every_session_search_result_type() -> None:
@@ -863,19 +869,44 @@ def test_run_skill_and_search_read_only_what_people_typed_in_claude_records(
     search = native.SessionSearch(tmp_path / "index.db", config_path=config, cache_dir=tmp_path / "cache")
     assert search.reindex().sessions_updated == 1
 
-    run = search.run_skill(
-        native.SkillRunQuery(
-            skill=native.SkillSelector(name="corrections"),
-            input=native.MessageClassificationQuery(limit=50),
-        )
-    )
-    assert [match.content for match in run.output.report.matches] == ["you missed the second directory"]
+    def corrections(include_unattributed_input: bool) -> Any:
+        return search.run_skill(
+            native.SkillRunQuery(
+                skill=native.SkillSelector(name="corrections"),
+                input=native.MessageClassificationQuery(
+                    limit=50, include_unattributed_input=include_unattributed_input
+                ),
+            )
+        ).output.report
+
+    # A queued prompt whose attachment names a human origin is read; one with no recorded sender
+    # is left out and counted unless asked for; a queued harness notification is never read.
+    report = corrections(False)
+    assert [match.content for match in report.matches] == [
+        "you missed the second directory",
+        "you forgot to check the tests",
+    ]
+    assert (report.unattributed_input_count, report.unattributed_input_included) == (1, False)
+    report = corrections(True)
+    assert [match.content for match in report.matches] == [
+        "you missed the second directory",
+        "you forgot to check the second directory",
+        "you forgot to check the tests",
+    ]
+    assert (report.unattributed_input_count, report.unattributed_input_included) == (1, True)
 
     user_rows = search.search_messages("", native.MessageSearchRequest(role="user", limit=50)).results
     texts = [hit["presentation"]["field_view"]["text"] for hit in user_rows]
     assert "also rename the output folder" in texts
     assert texts.count("you forgot to check the tests") == 1
-    for needle in ("while you were working", "being continued", "Stop hook feedback", "contributing guide", "future record"):
+    for needle in (
+        "while you were working",
+        "being continued",
+        "Stop hook feedback",
+        "contributing guide",
+        "future record",
+        "Background job report",
+    ):
         assert not any(needle in text for text in texts), (needle, texts)
 
     unrecognized = search.diagnostics().index_status.parser_health.unrecognized_record_types

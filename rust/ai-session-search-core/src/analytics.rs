@@ -262,6 +262,11 @@ pub struct CorrectionsArgs {
     /// selected skill. Each value is a catalog name, skill directory, or exact SKILL.md path.
     #[arg(long = "skill", value_name = "NAME_OR_PATH")]
     pub additional_skills: Vec<std::ffi::OsString>,
+    /// Also read messages typed while the agent was working whose transcript does not record who
+    /// sent them (older Claude Code versions). Off by default because a program may have sent
+    /// them; the output counts how many were left out.
+    #[arg(long)]
+    pub include_unattributed_input: bool,
     /// Presentation preset for JSON/JSONL results: compact bounds the selected field and match
     /// view; full keeps the complete field and only the exact match span. Omit to preserve the
     /// complete typed report. The bounded form keeps the full message recoverable by message_ref.
@@ -510,6 +515,16 @@ fn render_correction_report(
     let stdout = io::stdout();
     let mut out = stdout.lock();
     crate::render::render_record(report, &report.matches, format, &mut out)?;
+    if !report.unattributed_input_included {
+        if let Some(note) = unattributed_input_note(report.unattributed_input_count) {
+            // Below the table; on stderr for CSV and plain output, so their rows stay parseable.
+            if format == OutputFormat::Table {
+                writeln!(out, "{note}")?;
+            } else {
+                eprintln!("{note}");
+            }
+        }
+    }
     out.flush()?;
     Ok(())
 }
@@ -705,6 +720,11 @@ pub(crate) struct RepeatsArgs {
     /// Max candidate messages to scan. 0 = every candidate message.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Also mine messages typed while the agent was working whose transcript does not record who
+    /// sent them (older Claude Code versions). Off by default because a program may have sent
+    /// them; a note on stderr counts how many were left out. Applies to user text only.
+    #[arg(long)]
+    pub include_unattributed_input: bool,
     /// Max repeat groups to output. Omit to use `[analytics].repeat_max_groups`. 0 = every group.
     #[arg(long)]
     pub max_groups: Option<usize>,
@@ -798,8 +818,9 @@ fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> 
     // Default/user repeat mining is evidence about what a person wrote, not every provider row
     // stored with `role=user`. Explicit assistant/tool/slash/compaction analysis retains its
     // role-based contract because those roles do not claim human authorship.
-    let hits = if args.role.is_none() || args.role == Some(Role::User) {
-        db.search_attributable_human_messages(query, &filters)?
+    let human_text = args.role.is_none() || args.role == Some(Role::User);
+    let hits = if human_text {
+        db.search_attributable_human_messages(query, &filters, args.include_unattributed_input)?
     } else {
         db.search_messages(query, &filters)?
     };
@@ -812,7 +833,30 @@ fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> 
         max_groups,
         max_examples_per_group,
     );
-    emit(&rows, args.format)
+    emit(&rows, args.format)?;
+    if human_text && !args.include_unattributed_input {
+        // On stderr: the JSON output is a bare array of groups, which a receipt cannot join.
+        if let Some(note) = unattributed_input_note(db.unattributed_input_count(&filters)?) {
+            eprintln!("{note}");
+        }
+    }
+    Ok(())
+}
+
+/// One line telling a reader how many messages a corrections or repeats run left out because
+/// their transcript does not record who sent them, and how to read them; `None` for zero.
+pub(crate) fn unattributed_input_note(count: u64) -> Option<String> {
+    let (noun, possessive, object) = if count == 1 {
+        ("message", "its", "it")
+    } else {
+        ("messages", "their", "them")
+    };
+    (count > 0).then(|| {
+        format!(
+            "{count} queued {noun} left out because {possessive} transcript does not record who \
+             sent {object}; --include-unattributed-input reads {object}"
+        )
+    })
 }
 
 fn repeat_phrase_groups(
@@ -1203,6 +1247,7 @@ mod tests {
             dates: DateRange::default(),
             context: 0,
             limit: 0,
+            include_unattributed_input: false,
             max_groups: Some(0),
             max_examples_per_group: Some(0),
             min_matches: Some(2),
@@ -1211,7 +1256,9 @@ mod tests {
             format: OutputFormat::Json,
         };
         let filters = repeat_filters(&db, &args, Some(Role::User)).unwrap();
-        let hits = db.search_attributable_human_messages("", &filters).unwrap();
+        let hits = db
+            .search_attributable_human_messages("", &filters, false)
+            .unwrap();
         assert_eq!(
             hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
             [0, 1, 6, 7]
@@ -1268,6 +1315,7 @@ mod tests {
             dates: DateRange::default(),
             context: 0,
             limit: 0,
+            include_unattributed_input: false,
             max_groups: Some(0),
             max_examples_per_group: Some(0),
             min_matches: Some(2),
@@ -1280,7 +1328,7 @@ mod tests {
         let filters = repeat_filters(&db, &slash, Some(Role::User)).unwrap();
         assert_eq!(filters.match_mode, MessageSearchMode::Regex);
         let hits = db
-            .search_attributable_human_messages(repeat_query(&slash), &filters)
+            .search_attributable_human_messages(repeat_query(&slash), &filters, false)
             .unwrap();
         assert_eq!(
             hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
@@ -1291,14 +1339,14 @@ mod tests {
         let none = regex_args("zzz_no_match");
         let filters = repeat_filters(&db, &none, Some(Role::User)).unwrap();
         assert!(db
-            .search_attributable_human_messages(repeat_query(&none), &filters)
+            .search_attributable_human_messages(repeat_query(&none), &filters, false)
             .unwrap()
             .is_empty());
 
         let invalid = regex_args("[unclosed");
         let filters = repeat_filters(&db, &invalid, Some(Role::User)).unwrap();
         let error = db
-            .search_attributable_human_messages(repeat_query(&invalid), &filters)
+            .search_attributable_human_messages(repeat_query(&invalid), &filters, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("invalid regex"), "{error}");
