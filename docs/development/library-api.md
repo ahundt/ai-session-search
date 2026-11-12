@@ -180,6 +180,11 @@ Request and result values compare by value, have readable `repr()` output, and e
 `ts`; existing Python attributes keep `timestamp`. Resource owners and iterators retain
 identity semantics.
 
+`ReconstructedFile.restore(output_dir=...)` writes a `.recovered` copy using only the recorded
+basename under your chosen directory. With no output_dir it writes beside the recorded original
+path. It preserves existing files, adding `_2`, `_3`, and so on for occupied recovery names,
+and returns the actual destination path.
+
 Result and request classes are available directly from `ai_session_search`, including
 `SessionRecord`, `SearchHit`, `MessageHit`, `FileVersion`, and `IndexStatus`.
 `ai_session_search.native` remains a supported import path for the same classes.

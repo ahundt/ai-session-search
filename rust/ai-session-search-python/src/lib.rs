@@ -1895,6 +1895,9 @@ python_value! { NativeReconstructedFile, slf => value_fields(slf.as_any(), &["se
         self.provider.as_str().to_string()
     }
 
+    /// Write a collision-safe .recovered copy and return its path; existing files are preserved.
+    /// Without output_dir, write beside the session-recorded original path. With output_dir,
+    /// use only the recorded basename in that directory. Existing copies add _2, _3, and so on.
     #[pyo3(signature = (*, output_dir=None))]
     fn restore(&self, py: Python<'_>, output_dir: Option<PathBuf>) -> PyResult<PathBuf> {
         let reconstructed = self.clone().into_core();

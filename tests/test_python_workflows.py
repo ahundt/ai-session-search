@@ -297,3 +297,20 @@ def test_standard_dates_and_paths_are_native_inputs(corpus):
         aise.QueryScope(path_prefix=object())  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         aise.QueryExclusions(path_prefixes="/bad")  # type: ignore[arg-type]
+
+
+def test_restore_documents_and_preserves_destinations(corpus, tmp_path: Path):
+    doc = aise.ReconstructedFile.restore.__doc__
+    assert doc and "output_dir" in doc and ".recovered" in doc
+    original = tmp_path / "app.py"
+    original.write_text("current file")
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute("UPDATE file_edits SET file_path = ? WHERE session_id = 'claude:synthetic-0'", (str(original),))
+    recovered = corpus.reconstruct_file(original, request=aise.FileQuery(session_id="synthetic-0"))
+    first = recovered.restore()
+    second = recovered.restore()
+    assert first == tmp_path / "app.recovered.py"
+    assert second == tmp_path / "app.recovered_2.py"
+    assert first.read_text() == second.read_text() == "print(42)"
+    assert original.read_text() == "current file"
+    assert recovered.restore(output_dir=tmp_path / "copies").name == "app.recovered.py"

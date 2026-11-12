@@ -697,7 +697,12 @@ class ReconstructedFile:
     version: int
     file_path: str
     content: str
-    def restore(self, *, output_dir: _PathInput | None = None) -> Path: ...
+    def restore(self, *, output_dir: _PathInput | None = None) -> Path:
+        """Write a collision-safe .recovered copy and return its path; preserve existing files.
+
+        Omit output_dir to write beside the recorded original; otherwise use only its basename
+        inside output_dir. Existing copies add _2, _3, and so on.
+        """
 
 @final
 class ReconstructedFileVersions:
