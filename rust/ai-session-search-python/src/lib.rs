@@ -117,6 +117,85 @@ fn value_json<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     Ok(value.clone())
 }
 
+fn named_error(name: &str, message: String) -> PyErr {
+    Python::attach(|py| {
+        match py
+            .import("ai_session_search._native")
+            .and_then(|module| module.getattr(name))
+            .and_then(|class| class.call1((message,)))
+        {
+            Ok(exception) => PyErr::from_value(exception),
+            Err(error) => error,
+        }
+    })
+}
+
+fn invalid_argument_error(error: impl std::fmt::Display) -> PyErr {
+    named_error("InvalidArgumentError", format!("{error:#}"))
+}
+
+fn service_error(error: anyhow::Error) -> PyErr {
+    use ai_session_search::ServiceError;
+    let name = match error.downcast_ref::<ServiceError>() {
+        Some(
+            ServiceError::SessionNotFound { .. }
+            | ServiceError::FileNotFound { .. }
+            | ServiceError::IndexMissing { .. },
+        ) => "NotFoundError",
+        Some(ServiceError::SessionPrefixAmbiguous { .. }) => "AmbiguousPrefixError",
+        Some(ServiceError::DestinationExists { .. }) => "AlreadyExistsError",
+        Some(ServiceError::FileVersionOutOfRange { .. } | ServiceError::InvalidArgument { .. }) => {
+            "InvalidArgumentError"
+        }
+        Some(ServiceError::IndexNotRefreshed { .. }) => "IndexNotRefreshedError",
+        _ => return runtime_error(error),
+    };
+    named_error(name, format!("{error:#}"))
+}
+
+fn add_service_exceptions(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = module.py();
+    for (name, doc) in [
+        (
+            "NotFoundError",
+            "The requested session, file, or existing index was not found.",
+        ),
+        (
+            "AmbiguousPrefixError",
+            "The session prefix identifies more than one session.",
+        ),
+        (
+            "AlreadyExistsError",
+            "The publication destination already exists and was preserved.",
+        ),
+        (
+            "IndexNotRefreshedError",
+            "Refresh or prepare_for_read before querying this index.",
+        ),
+        (
+            "InvalidArgumentError",
+            "An argument or combination of arguments is invalid.",
+        ),
+    ] {
+        let namespace = PyDict::new(py);
+        namespace.set_item("__module__", "ai_session_search._native")?;
+        namespace.set_item("__doc__", doc)?;
+        let mut bases = vec![py.get_type::<PyRuntimeError>()];
+        if name == "InvalidArgumentError" {
+            // Preserve both validation and legacy unsigned-integer extraction handlers.
+            bases.push(py.get_type::<PyValueError>());
+            bases.push(py.get_type::<pyo3::exceptions::PyOverflowError>());
+        }
+        let bases = pyo3::types::PyTuple::new(py, bases)?;
+        module.add(
+            name,
+            py.get_type::<pyo3::types::PyType>()
+                .call1((name, bases, namespace))?,
+        )?;
+    }
+    Ok(())
+}
+
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     // The alternate flag renders an anyhow chain as "top: cause1: cause2" on one line instead
     // of just the top-level `.context(...)` message, so a wrapped failure (e.g. a migration
@@ -128,7 +207,7 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
     // Same rationale as runtime_error: the alternate flag preserves any anyhow context chain
     // instead of only the top-level message. Harmless no-op for the flat MessageSearchError
     // callers (no source chain to render differently) and a real fix for anyhow::Error callers.
-    PyValueError::new_err(format!("{error:#}"))
+    invalid_argument_error(format!("{error:#}"))
 }
 
 fn python_view_budget_value(
@@ -140,14 +219,14 @@ fn python_view_budget_value(
             let mut object = serde_json::Map::new();
             for (key, value) in mapping {
                 let key = key.extract::<String>().map_err(|_| {
-                    PyValueError::new_err(format!("{parameter} keys must be strings"))
+                    invalid_argument_error(format!("{parameter} keys must be strings"))
                 })?;
                 let value = if let Ok(text) = value.extract::<String>() {
                     serde_json::Value::String(text)
                 } else if let Ok(integer) = value.extract::<u64>() {
                     serde_json::Value::from(integer)
                 } else {
-                    return Err(PyValueError::new_err(format!(
+                    return Err(invalid_argument_error(format!(
                         "{parameter}.{key} must be a string or non-negative integer"
                     )));
                 };
@@ -166,12 +245,12 @@ fn core_message_query(query: String, query_mode: &str) -> PyResult<(CoreMessageQ
         ("regex", false) => CoreMessageQuery::regex(query),
         ("fuzzy", false) => CoreMessageQuery::fuzzy(query),
         ("regex" | "fuzzy", true) => {
-            return Err(PyValueError::new_err(format!(
+            return Err(invalid_argument_error(format!(
                 "query_mode={query_mode} requires a nonempty query"
             )));
         }
         _ => {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "query_mode must be 'literal', 'regex', or 'fuzzy'",
             ));
         }
@@ -190,7 +269,7 @@ fn python_message_search_error(error: anyhow::Error) -> PyErr {
     if error.downcast_ref::<CoreMessageSearchError>().is_some() {
         value_error(error)
     } else {
-        runtime_error(error)
+        service_error(error)
     }
 }
 
@@ -198,9 +277,9 @@ fn python_batch_open_error(error: anyhow::Error) -> PyErr {
     let caller_input = error.downcast_ref::<CoreMessageSearchError>().is_some();
     let rendered = format!("{error:#}").replace("search()", "search_messages()");
     if caller_input {
-        PyValueError::new_err(rendered)
+        invalid_argument_error(rendered)
     } else {
-        PyRuntimeError::new_err(rendered)
+        service_error(error)
     }
 }
 
@@ -232,7 +311,7 @@ fn parse_message_search_includes(
                     "parsed_references" => Ok(CoreMessageSearchInclude::ParsedReferences),
                     "raw_provider_metadata" => Ok(CoreMessageSearchInclude::RawProviderMetadata),
                     "runtime_diagnostics" => Ok(CoreMessageSearchInclude::RuntimeDiagnostics),
-                    _ => Err(PyValueError::new_err(format!(
+                    _ => Err(invalid_argument_error(format!(
                         "unknown include {include:?}; accepted values are normalized_session_metadata, parsed_references, raw_provider_metadata, and runtime_diagnostics"
                     ))),
                 })
@@ -268,7 +347,7 @@ fn python_message_classification_definition(
                 .call_method1("dumps", (mapping,))?
                 .extract::<String>()?;
             serde_json::from_str(&encoded).map_err(|error| {
-                PyValueError::new_err(format!(
+                invalid_argument_error(format!(
                     "definition must contain only categories with name and patterns fields: \
                      {error}"
                 ))
@@ -335,7 +414,7 @@ fn parse_provider_set(values: Option<Vec<String>>) -> PyResult<Option<Vec<Provid
     values
         .map(|values| {
             if values.is_empty() {
-                return Err(PyValueError::new_err(
+                return Err(invalid_argument_error(
                     "providers must contain at least one provider; omit providers to search all sources",
                 ));
             }
@@ -392,7 +471,7 @@ impl PagingArgument {
 /// the schema or docstring.
 fn paging_argument(argument: PagingArgument, value: i64) -> PyResult<usize> {
     usize::try_from(value).map_err(|_| {
-        PyValueError::new_err(format!(
+        invalid_argument_error(format!(
             "{} must be 0 or greater, got {value}; {}",
             argument.name(),
             argument.guidance()
@@ -573,7 +652,7 @@ python_value! { ClassificationRule, slf => value_fields(slf.as_any(), &["dimensi
             "user_text" => ClassificationTarget::UserText,
             "any" => ClassificationTarget::Any,
             value => {
-                return Err(PyValueError::new_err(format!(
+                return Err(invalid_argument_error(format!(
                     "invalid classification target '{value}'; expected title, summary, first_user_text, user_text, or any"
                 )))
             }
@@ -726,7 +805,7 @@ python_value! { RelationshipRule, slf => value_fields(slf.as_any(), &["id","kind
             "copy" => RelationshipKind::Copy,
             "version" => RelationshipKind::Version,
             value => {
-                return Err(PyValueError::new_err(format!(
+                return Err(invalid_argument_error(format!(
                     "invalid relationship kind '{value}'; expected branch, copy, or version"
                 )))
             }
@@ -1139,7 +1218,7 @@ fn parse_publication_formats(
         .map(|format| match format.as_str() {
             "json" => Ok(RustAnalysisPublicationFormat::Json),
             "markdown" => Ok(RustAnalysisPublicationFormat::Markdown),
-            _ => Err(PyValueError::new_err(format!(
+            _ => Err(invalid_argument_error(format!(
                 "unknown analysis publication format '{format}'; expected json or markdown"
             ))),
         })
@@ -1176,7 +1255,7 @@ python_value! { NativeAnalysisPublicationPlan, slf => value_fields(slf.as_any(),
     ) -> PyResult<Vec<Py<NativeAnalysisArtifact>>> {
         let plan = self.inner.clone();
         let analysis = Arc::clone(&analysis.inner);
-        let artifacts = py.detach(move || plan.render(&analysis).map_err(runtime_error))?;
+        let artifacts = py.detach(move || plan.render(&analysis).map_err(service_error))?;
         artifacts
             .into_iter()
             .map(|artifact| Py::new(py, NativeAnalysisArtifact::from(artifact)))
@@ -1190,7 +1269,7 @@ python_value! { NativeAnalysisPublicationPlan, slf => value_fields(slf.as_any(),
     ) -> PyResult<NativeAnalysisPublicationReceipt> {
         let plan = self.inner.clone();
         let analysis = Arc::clone(&analysis.inner);
-        let receipt = py.detach(move || plan.publish(&analysis).map_err(runtime_error))?;
+        let receipt = py.detach(move || plan.publish(&analysis).map_err(service_error))?;
         NativeAnalysisPublicationReceipt::from_receipt(py, receipt)
     }
 }
@@ -1756,7 +1835,7 @@ python_value! { NativeReconstructedFile, slf => value_fields(slf.as_any(), &["se
         let reconstructed = self.clone().into_core();
         py.detach(move || {
             ai_session_search::files::restore_reconstructed(&reconstructed, output_dir.as_deref())
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 }
@@ -2282,7 +2361,7 @@ python_value! { DateRange, slf => value_fields(slf.as_any(), &["since","until","
     #[pyo3(signature = (*, since=None, until=None, when=None))]
     fn new(since: Option<String>, until: Option<String>, when: Option<String>) -> PyResult<Self> {
         if when.is_some() && (since.is_some() || until.is_some()) {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "when is mutually exclusive with since and until",
             ));
         }
@@ -2530,7 +2609,7 @@ python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["prov
                     .and_then(NonZeroUsize::new)
                     .map(NonZeroUsize::get)
                     .ok_or_else(|| {
-                        PyValueError::new_err(format!(
+                        invalid_argument_error(format!(
                             "first_canonical_sessions must be greater than zero; omit it to \
                              analyze every eligible session; got {value}"
                         ))
@@ -2675,7 +2754,7 @@ impl QueryScope {
                 app.catalog()
                     .resolve_session(&id)
                     .map(|session| session.id)
-                    .map_err(runtime_error)
+                    .map_err(service_error)
             })
             .transpose()?;
         Ok(ResolvedQueryScope {
@@ -2862,41 +2941,41 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
             value
                 .map(|value| {
                     usize::try_from(value).map_err(|_| {
-                        PyValueError::new_err(format!("{name} must be an integer 0 or greater"))
+                        invalid_argument_error(format!("{name} must be an integer 0 or greater"))
                     })
                 })
                 .transpose()
         };
         if kind.is_some() && kinds.is_some() {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "kind and kinds cannot be used together; use kind for one class or kinds for several",
             ));
         }
         if all_results && limit.is_some() {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "limit and all_results cannot be used together",
             ));
         }
         if purpose.is_none() && purpose_version.is_some() {
-            return Err(PyValueError::new_err("purpose_version requires purpose"));
+            return Err(invalid_argument_error("purpose_version requires purpose"));
         }
         let field = field.parse().map_err(PyValueError::new_err)?;
         if argument_path.is_some() && field != SearchField::ToolArgument {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "argument_path requires field='tool_argument'",
             ));
         }
         let limit = limit
             .map(|value| {
                 usize::try_from(value).map_err(|_| {
-                    PyValueError::new_err(format!(
+                    invalid_argument_error(format!(
                         "limit must be greater than zero; use all_results=True for every match; got {value}"
                     ))
                 })
             })
             .transpose()?;
         if limit == Some(0) {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "limit must be greater than zero; use all_results=True for every match",
             ));
         }
@@ -2944,7 +3023,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
                 .map(|value| match value {
                     "earliest" => Ok(CoreMatchWindow::Earliest),
                     "latest" => Ok(CoreMatchWindow::Latest),
-                    _ => Err(PyValueError::new_err(
+                    _ => Err(invalid_argument_error(
                         "match_window must be 'earliest' or 'latest'",
                     )),
                 })
@@ -2958,7 +3037,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
                 .map(|value| match value {
                     "compact" => Ok(CoreDetailLevel::Compact),
                     "full" => Ok(CoreDetailLevel::Full),
-                    _ => Err(PyValueError::new_err("detail must be 'compact' or 'full'")),
+                    _ => Err(invalid_argument_error("detail must be 'compact' or 'full'")),
                 })
                 .transpose()?,
             field_view,
@@ -2967,7 +3046,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
             purpose_version: purpose_version
                 .map(|value| {
                     std::num::NonZeroU32::new(value).ok_or_else(|| {
-                        PyValueError::new_err("purpose_version must be greater than zero")
+                        invalid_argument_error("purpose_version must be greater than zero")
                     })
                 })
                 .transpose()?,
@@ -2976,7 +3055,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["scope
                     "none" => Ok(CoreReceiptLevel::None),
                     "summary" => Ok(CoreReceiptLevel::Summary),
                     "full" => Ok(CoreReceiptLevel::Full),
-                    _ => Err(PyValueError::new_err(
+                    _ => Err(invalid_argument_error(
                         "receipt_level must be 'none', 'summary', or 'full'",
                     )),
                 })
@@ -3287,17 +3366,17 @@ python_value! { NativeSkillSelector, slf => value_fields(slf.as_any(), &["name",
                 ai_session_search::SkillSelector::path(path)
             }
             (None, Some(_)) => {
-                return Err(PyValueError::new_err(
+                return Err(invalid_argument_error(
                     "skill path is empty; pass a skill directory or exact SKILL.md path",
                 ))
             }
             (None, None) => {
-                return Err(PyValueError::new_err(
+                return Err(invalid_argument_error(
                     "SkillSelector requires exactly one of name or path",
                 ))
             }
             (Some(_), Some(_)) => {
-                return Err(PyValueError::new_err(
+                return Err(invalid_argument_error(
                     "SkillSelector accepts exactly one of name or path, not both",
                 ))
             }
@@ -4395,14 +4474,14 @@ impl SessionSearch {
             ("cache_dir", cache_dir.as_ref()),
         ] {
             if path.is_some_and(|path| path.as_os_str().is_empty()) {
-                return Err(PyValueError::new_err(format!(
+                return Err(invalid_argument_error(format!(
                     "{name} must not be empty; omit it (pass None) to use the default \
                      {name}, or pass a non-empty path"
                 )));
             }
         }
         if threads == Some(0) {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "threads must be greater than zero; pass threads=None to use the platform \
                  default, or a positive integer",
             ));
@@ -4415,9 +4494,9 @@ impl SessionSearch {
             value.threads = threads;
             value
         })
-        .map_err(runtime_error)?
+        .map_err(service_error)?
         .config;
-        let mut inner = CoreSessionSearch::open(config).map_err(runtime_error)?;
+        let mut inner = CoreSessionSearch::open(config).map_err(service_error)?;
         // Keep the binding's existing behaviour: a never-refreshed index reads as empty.
         inner.serve_unrefreshed_index_as_empty();
         Ok(Self {
@@ -4441,7 +4520,7 @@ impl SessionSearch {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.messages_for_surface(CoreSearchSurface::Python)
                 .message_search_spec()
-                .map_err(runtime_error)?
+                .map_err(service_error)?
         };
         json_compatible(py, &specification)
     }
@@ -4495,13 +4574,13 @@ impl SessionSearch {
             .ok()
             .and_then(NonZeroUsize::new)
             .ok_or_else(|| {
-                PyValueError::new_err(format!(
+                invalid_argument_error(format!(
                     "batch_rows must be a positive integer; use 256 for the default balance or a smaller positive value to reduce active result memory; got {batch_rows}"
                 ))
             })?;
         let (query, _has_content_query) = core_message_query(query.to_owned(), query_mode)?;
         if query_mode == "fuzzy" {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "fuzzy search is not available from search_message_batches; use \
                  search_messages() with query_mode='fuzzy' and a positive limit; exhaustive batches \
                  support literal, regex, and queryless searches",
@@ -4553,7 +4632,7 @@ impl SessionSearch {
         let before = context_before.unwrap_or(context);
         let after = context_after.unwrap_or(context);
         if seq < 0 || context < 0 || before < 0 || after < 0 {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "seq, context, context_before, and context_after must be non-negative",
             ));
         }
@@ -4562,11 +4641,11 @@ impl SessionSearch {
             let session = app
                 .catalog()
                 .resolve_session(&session_id)
-                .map_err(runtime_error)?;
+                .map_err(service_error)?;
             app.messages()
                 .context(&session.id, seq, before, after)
                 .map(|hits| capped_native_hits(hits, lines_per_message))
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4596,7 +4675,7 @@ impl SessionSearch {
             "oldest" => ai_session_search::db::MessageOrder::OldestFirst,
             "newest" => ai_session_search::db::MessageOrder::NewestFirst,
             other => {
-                return Err(PyValueError::new_err(format!(
+                return Err(invalid_argument_error(format!(
                     "order must be 'oldest' or 'newest', got {other:?}"
                 )))
             }
@@ -4611,7 +4690,7 @@ impl SessionSearch {
         // way as the other input errors here rather than surfacing later as a RuntimeError.
         if let (Some(from), Some(to)) = (seq_from, seq_to) {
             if from > to {
-                return Err(PyValueError::new_err("seq_from must be <= seq_to"));
+                return Err(invalid_argument_error("seq_from must be <= seq_to"));
             }
         }
         py.detach(|| {
@@ -4619,7 +4698,7 @@ impl SessionSearch {
             let session = app
                 .catalog()
                 .resolve_session(&session_id)
-                .map_err(runtime_error)?;
+                .map_err(service_error)?;
             let filters = {
                 let mut value = MessageFilters::default();
                 value.role = role;
@@ -4633,7 +4712,7 @@ impl SessionSearch {
             app.messages()
                 .read_session(&filters, order)
                 .map(|hits| capped_native_hits(hits, lines_per_message))
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4647,7 +4726,7 @@ impl SessionSearch {
         include_time_profile: bool,
     ) -> PyResult<NativeSessionInspection> {
         if preview_chars == Some(0) {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "preview_chars must be greater than zero",
             ));
         }
@@ -4667,7 +4746,7 @@ impl SessionSearch {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.catalog()
                 .inspect(&session_id, options)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })?;
         NativeSessionInspection::from_inspection(py, inspection)
     }
@@ -4693,7 +4772,7 @@ impl SessionSearch {
                         .map(NativeSessionRecord::from)
                         .collect()
                 })
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4720,7 +4799,7 @@ impl SessionSearch {
                     current_repo.as_deref(),
                     &app.config().search.scoring,
                 )
-                .map_err(runtime_error)
+                .map_err(service_error)
         })?;
         hits.into_iter()
             .map(|hit| NativeSessionSearchHit::from_hit(py, hit))
@@ -4740,7 +4819,7 @@ impl SessionSearch {
             app.files()
                 .search(&query)
                 .map(|files| files.into_iter().map(NativeFileEditSummary::from).collect())
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4757,7 +4836,7 @@ impl SessionSearch {
             app.files()
                 .history(&file, &query)
                 .map(|versions| versions.into_iter().map(NativeFileVersion::from).collect())
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4779,7 +4858,7 @@ impl SessionSearch {
                         .map(NativeFileCrossRef::from)
                         .collect()
                 })
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4788,16 +4867,23 @@ impl SessionSearch {
         &self,
         py: Python<'_>,
         file: String,
-        version: Option<usize>,
+        version: Option<i64>,
         request: Option<FileQuery>,
     ) -> PyResult<NativeReconstructedFile> {
+        let version = version
+            .map(|value| {
+                usize::try_from(value).map_err(|_| {
+                    invalid_argument_error(format!("version must be 1 or greater; got {value}"))
+                })
+            })
+            .transpose()?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let query = request.unwrap_or_default().into_query(None, &app)?;
             app.files()
                 .reconstruct(&file, &query, version)
                 .map(NativeReconstructedFile::from)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4814,7 +4900,7 @@ impl SessionSearch {
             app.files()
                 .reconstruct_versions(&file, &query)
                 .map(|inner| NativeReconstructedFileVersions { inner })
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4832,11 +4918,11 @@ impl SessionSearch {
                 let query = request.unwrap_or_default().into_query(None, &app)?;
                 app.files()
                     .reconstruct_versions(&file, &query)
-                    .map_err(runtime_error)?
+                    .map_err(service_error)?
             };
             ai_session_search::files::publish_reconstructed_versions(versions, &destination)
                 .map(NativeRecoveryPublicationReceipt::from)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4855,7 +4941,7 @@ impl SessionSearch {
             app.exports()
                 .render_full(&session_id, format)
                 .map(NativeExportDocument::from)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4878,7 +4964,7 @@ impl SessionSearch {
             app.exports()
                 .publish_bundle(&filters, &plan)
                 .map(NativeExportPublicationReceipt::from)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4908,7 +4994,7 @@ impl SessionSearch {
     ) -> PyResult<NativeAnalysisDocumentPage> {
         let request = request.unwrap_or_default();
         if NonZeroUsize::new(request.limit).is_none() {
-            return Err(PyValueError::new_err(
+            return Err(invalid_argument_error(
                 "analysis_documents request limit must be greater than zero; pass a positive page \
                  size and follow next_cursor until it is None",
             ));
@@ -4918,7 +5004,7 @@ impl SessionSearch {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.analysis()
                 .documents(&filters, cursor.as_ref().map(|value| &value.inner))
-                .map_err(runtime_error)
+                .map_err(service_error)
         })?;
         NativeAnalysisDocumentPage::from_page(py, page)
     }
@@ -4939,7 +5025,7 @@ impl SessionSearch {
         });
         let result = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            app.analysis().run(&request, &policy).map_err(runtime_error)
+            app.analysis().run(&request, &policy).map_err(service_error)
         })?;
         Ok(NativeReceiptedAnalysis {
             inner: Arc::new(result),
@@ -4954,7 +5040,7 @@ impl SessionSearch {
         let report = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let query = request.into_core(&app)?;
-            app.analysis().run_skill(&query).map_err(runtime_error)
+            app.analysis().run_skill(&query).map_err(service_error)
         })?;
         NativeSkillRunReport::from_report(py, report)
     }
@@ -4972,7 +5058,7 @@ impl SessionSearch {
             app.analysis()
                 .planning(&filters, command_patterns.as_deref().unwrap_or_default())
                 .map(|counts| counts.into_iter().map(NativePlanningCount::from).collect())
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4988,7 +5074,7 @@ impl SessionSearch {
             app.analysis()
                 .role_statistics(&filters)
                 .map(|rows| rows.into_iter().map(NativeRoleStatistic::from).collect())
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -4998,7 +5084,7 @@ impl SessionSearch {
             app.index()
                 .refresh()
                 .map(RefreshOutcome::from)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -5008,7 +5094,7 @@ impl SessionSearch {
             app.index()
                 .status()
                 .map(NativeIndexStatus::from)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -5027,7 +5113,7 @@ impl SessionSearch {
                         .map(Into::into)
                         .collect(),
                 })
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -5046,7 +5132,7 @@ impl SessionSearch {
                         .collect(),
                     providers: status.providers.into_iter().map(Into::into).collect(),
                 })
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 
@@ -5056,13 +5142,14 @@ impl SessionSearch {
             app.maintenance()
                 .compact()
                 .map(NativeCompactOutcome::from)
-                .map_err(runtime_error)
+                .map_err(service_error)
         })
     }
 }
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    add_service_exceptions(module)?;
     module.add_function(wrap_pyfunction!(serve_mcp, module)?)?;
     module.add_function(wrap_pyfunction!(_run_cli_command, module)?)?;
     module.add_class::<SessionSearch>()?;

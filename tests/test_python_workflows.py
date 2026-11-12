@@ -63,3 +63,31 @@ def test_message_dictionary_uses_cli_timestamp_name(corpus):
     message = corpus.read_session_messages("synthetic-0", limit=1)[0]
     assert message.to_dict()["ts"] == message.timestamp
     assert "timestamp" not in message.to_dict()
+
+
+def test_service_errors_are_named_and_keep_runtime_handlers(corpus):
+    from ai_session_search import native
+
+    with pytest.raises(native.NotFoundError) as missing:
+        corpus.read_session_messages("does-not-exist")
+    assert isinstance(missing.value, RuntimeError)
+    with pytest.raises(native.AmbiguousPrefixError) as ambiguous:
+        corpus.read_session_messages("synthetic-")
+    assert isinstance(ambiguous.value, RuntimeError)
+    with pytest.raises(native.NotFoundError):
+        corpus.reconstruct_file("missing.py")
+    destination = Path(corpus.db_path).parent / "versions"
+    corpus.publish_file_versions("app.py", destination, request=aise.FileQuery(scope=aise.QueryScope(session_id="synthetic-0")))
+    with pytest.raises(native.AlreadyExistsError) as exists:
+        corpus.publish_file_versions("app.py", destination, request=aise.FileQuery(scope=aise.QueryScope(session_id="synthetic-0")))
+    assert isinstance(exists.value, RuntimeError)
+
+
+def test_invalid_version_keeps_legacy_overflow_handler(corpus):
+    from ai_session_search import native
+
+    with pytest.raises(native.InvalidArgumentError) as invalid:
+        corpus.reconstruct_file("app.py", version=-1)
+    assert isinstance(invalid.value, (ValueError, RuntimeError))
+    assert isinstance(invalid.value, OverflowError)
+    assert "version" in str(invalid.value)

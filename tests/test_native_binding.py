@@ -332,6 +332,12 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.CapabilityReceipt is native.CapabilityReceipt
     assert package.MessageClassificationReport is native.MessageClassificationReport
     assert package.__all__ == [
+        "NotFoundError",
+        "AmbiguousPrefixError",
+        "AlreadyExistsError",
+        "InvalidArgumentError",
+        "IndexNotRefreshedError",
+
         "SessionSearch",
         "AnalysisPublicationPlan",
         "AnalysisRequest",

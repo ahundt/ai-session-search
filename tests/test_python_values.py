@@ -39,7 +39,7 @@ def test_every_value_type_has_value_protocol():
     resources = {"SessionSearch", "MessageSearchBatches", "ReconstructedFileVersions"}
     for name in native.__all__:
         cls = getattr(native, name)
-        if inspect.isclass(cls) and name not in resources:
+        if inspect.isclass(cls) and name not in resources and not issubclass(cls, Exception):
             assert callable(getattr(cls, "to_dict", None)), name
             assert cls.__repr__ is not object.__repr__, name
             assert cls.__eq__ is not object.__eq__, name

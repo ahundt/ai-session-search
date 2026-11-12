@@ -113,6 +113,11 @@ eligible session/transcript bytes before retaining its top page. Runtime, memory
 output-growth bounds are recorded under `REQ010-protect-complexity-bounds` in the
 [maintainer requirements](maintainer-requirements-and-design-decisions.md).
 
+Python exposes `NotFoundError`, `AmbiguousPrefixError`, `AlreadyExistsError`,
+`InvalidArgumentError`, and `IndexNotRefreshedError`. They preserve existing `RuntimeError`
+handlers. Validation also preserves `ValueError`; signed version validation preserves the
+legacy `OverflowError` handler. Error causes are classified from Rust types.
+
 ### Concurrency and resource ownership
 
 Long native operations release the GIL, so a refresh or a large search does not
