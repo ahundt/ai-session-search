@@ -779,7 +779,12 @@ refusal itself; `sql_query::run`, which took a path and skipped it, is deprecate
 caller's first read on an index that has never been refreshed fails with
 `ServiceError::IndexNotRefreshed` until `IndexService::prepare_for_read` applies the configured
 policy; the CLI, MCP server, and Python binding keep serving such an index as empty through
-`SessionSearch::serve_unrefreshed_index_as_empty`.
+`SessionSearch::serve_unrefreshed_index_as_empty`. Python preserves that historical behavior
+only when no `index_refresh` argument is supplied and configuration is not `existing-only`.
+An explicit Python policy uses the strict Rust read contract: the caller runs `refresh()` or
+`prepare_for_read()` first, and an absent existing-only index is never created. This compatibility
+exception keeps existing Python programs that create and populate a database working; the guide
+starts with refresh and recommends explicit policy for readers.
 
 Those two decisions are why the clap argument structs are shaped the way they are. The externally
 reachable ones carry `#[non_exhaustive]` so that adding a flag stays an additive change

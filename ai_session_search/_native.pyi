@@ -1742,6 +1742,8 @@ class CompactOutcome:
 
 @final
 class SessionSearch:
+    def prepare_for_read(self) -> RefreshOutcome | None:
+        """Apply the configured refresh policy before reading; existing-only never refreshes."""
     def classify_messages(self, *, skill: str = "corrections", request: MessageClassificationQuery | None = None, include_unattributed_input: bool | None = None, definition: MessageClassificationDefinition | None = None) -> list[MessageClassificationMatch]:
         """Return classification match rows directly; run_skill also returns policy receipts."""
     def vocabulary(self, *, prefix: str | None = None, trigram: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
@@ -1767,6 +1769,7 @@ class SessionSearch:
         config_path: str | Path | None = None,
         cache_dir: str | Path | None = None,
         threads: int | None = None,
+        index_refresh: Literal["auto", "before-query", "existing-only"] | None = None,
     ) -> Self: ...
     @property
     def db_path(self) -> Path: ...

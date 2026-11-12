@@ -179,3 +179,31 @@ def test_session_limits_follow_configuration(corpus, tmp_path: Path):
     assert [row.to_dict() for row in search.list_sessions()] == cli(search, "list", "--config", str(config), "--format", "json")
     assert len(search.list_sessions(aise.SessionQuery(limit=0))) == 3
     assert len(search.search_sessions("retry", aise.SessionQuery(limit=1))) == 1
+
+
+def test_existing_index_mode_never_creates_missing_database(tmp_path: Path):
+    database = tmp_path / "missing" / "index.db"
+    with pytest.raises(aise.NotFoundError):
+        aise.SessionSearch(database, index_refresh="existing-only")
+    assert not database.parent.exists()
+
+
+def test_strict_unprepared_index_has_actionable_error(tmp_path: Path):
+    database = tmp_path / "index.db"
+    aise.SessionSearch(database)
+    strict = aise.SessionSearch(database, index_refresh="existing-only")
+    with pytest.raises(aise.IndexNotRefreshedError):
+        strict.list_sessions()
+    assert strict.prepare_for_read() is None
+    with pytest.raises(aise.IndexNotRefreshedError):
+        strict.list_sessions()
+    aise.SessionSearch(database).reindex()
+    assert strict.list_sessions() == []
+
+
+def test_prepare_for_read_applies_auto_refresh(tmp_path: Path):
+    search = aise.SessionSearch(tmp_path / "index.db", index_refresh="auto")
+    with pytest.raises(aise.IndexNotRefreshedError):
+        search.list_sessions()
+    search.prepare_for_read()
+    assert search.list_sessions() == []

@@ -4461,12 +4461,13 @@ struct SessionSearch {
 #[pymethods]
 impl SessionSearch {
     #[new]
-    #[pyo3(signature = (db_path=None, *, config_path=None, cache_dir=None, threads=None))]
+    #[pyo3(signature = (db_path=None, *, config_path=None, cache_dir=None, threads=None, index_refresh=None))]
     fn new(
         db_path: Option<PathBuf>,
         config_path: Option<PathBuf>,
         cache_dir: Option<PathBuf>,
         threads: Option<usize>,
+        index_refresh: Option<&str>,
     ) -> PyResult<Self> {
         for (name, path) in [
             ("db_path", db_path.as_ref()),
@@ -4492,13 +4493,21 @@ impl SessionSearch {
             value.database_path = db_path;
             value.cache_dir = cache_dir;
             value.threads = threads;
+            value.index_refresh = index_refresh
+                .map(str::parse)
+                .transpose()
+                .map_err(value_error)?;
             value
         })
         .map_err(service_error)?
         .config;
+        let strict = index_refresh.is_some()
+            || config.index.refresh == ai_session_search::config::IndexRefresh::ExistingOnly;
         let mut inner = CoreSessionSearch::open(config).map_err(service_error)?;
-        // Keep the binding's existing behaviour: a never-refreshed index reads as empty.
-        inner.serve_unrefreshed_index_as_empty();
+        if !strict {
+            // Preserve pre-1.1 opening semantics when no read policy was requested.
+            inner.serve_unrefreshed_index_as_empty();
+        }
         Ok(Self {
             inner: Mutex::new(inner),
         })
@@ -4523,6 +4532,18 @@ impl SessionSearch {
                 .map_err(service_error)?
         };
         json_compatible(py, &specification)
+    }
+
+    /// Apply the configured refresh policy before a read, as the CLI does.
+    /// Returns a refresh outcome if work was attempted, otherwise None. existing-only never writes.
+    fn prepare_for_read(&self, py: Python<'_>) -> PyResult<Option<RefreshOutcome>> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.index()
+                .prepare_for_read()
+                .map(|outcome| outcome.map(RefreshOutcome::from))
+                .map_err(service_error)
+        })
     }
 
     /// Classify messages with a named skill and return its match rows directly.

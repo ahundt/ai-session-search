@@ -101,6 +101,14 @@ if sessions:
 status = search.index_status()
 ```
 
+Opening a service does not read transcript files. Call `refresh()` or `prepare_for_read()`
+before a first query. To require an existing index, pass
+`SessionSearch(db_path, index_refresh="existing-only")`: a missing path raises `NotFoundError`
+without creating its directory, and an unrefreshed empty index raises `IndexNotRefreshedError`.
+`index_refresh="auto"` and `"before-query"` use the corresponding CLI policy when you call
+`prepare_for_read()`. Omitting the argument preserves the older empty-index read behavior unless
+configuration explicitly selects existing-only.
+
 An omitted `SessionQuery.limit` (None) resolves `[search].default_limit` on list and ranked
 search calls, including when the request supplies other filters. An explicit 0 returns every
 session; a positive count overrides configuration.
