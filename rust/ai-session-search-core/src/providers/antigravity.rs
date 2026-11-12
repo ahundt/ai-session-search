@@ -216,9 +216,10 @@ impl AntigravityAdapter {
                         );
                     }
                     messages.push(raw_message);
-                    // Tool-step output stays out of the human transcript/title/preview, matching
-                    // how claude/codex/pi keep tool results separate from the conversation.
-                    if role != "tool" {
+                    // Tool-step output and context summaries stay out of the human
+                    // transcript/title/preview, matching how claude/codex/pi keep tool results
+                    // and compaction separate from the conversation.
+                    if role != "tool" && role != "compaction" {
                         transcript_lines.push(format_transcript_line(role, timestamp, &text));
                     }
                 }
@@ -397,6 +398,9 @@ fn classify_antigravity_record(
         "USER_INPUT" => Some(("user", None)),
         "PLANNER_RESPONSE" => Some(("assistant", None)),
         "CONVERSATION_HISTORY" => None,
+        // The harness's context summary: it copies earlier requests beside summary text found
+        // nowhere else, so it is kept once as generated text, not as a tool result.
+        "CHECKPOINT" => Some(("compaction", None)),
         // No `type`: fall back to the `source` field (older/partial records).
         "" => match source {
             "USER_EXPLICIT" | "USER" => Some(("user", None)),
@@ -915,6 +919,64 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.contains("earlier replayed turn")));
+    }
+
+    /// A `CHECKPOINT` record is Antigravity's context summary: a "# User Requests" section that
+    /// copies the person's earlier requests, then summary sections found nowhere else. It is
+    /// generated text, so it is indexed once as a compaction row, never as a tool result, a user
+    /// turn or session text.
+    #[test]
+    fn checkpoint_records_are_compaction_summaries() {
+        use crate::models::{MessageKind, Role};
+        let dir = tempdir().unwrap();
+        let session_dir = dir
+            .path()
+            .join("94fc19cc-ad62-42eb-aef9-c43deed34237/.system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        let checkpoint = "{{ CHECKPOINT 0 }}\n# User Requests\n1. rename the folder\n# Conversation Logs\nthe folder was renamed";
+        let log_content = format!(
+            "{}\n{}\n",
+            serde_json::json!({"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T23:13:00Z","content":"rename the folder"}),
+            serde_json::json!({"step_index":2,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-05-19T23:14:00Z","content":checkpoint}),
+        );
+        fs::write(session_dir.join("transcript_full.jsonl"), log_content).unwrap();
+
+        let adapter = AntigravityAdapter::new(vec![dir.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let rows: Vec<_> = parsed
+            .messages
+            .iter()
+            .map(|m| (m.role, m.kind, m.content.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Role::User, MessageKind::Conversation, "rename the folder"),
+                (Role::Compaction, MessageKind::Compaction, checkpoint),
+            ]
+        );
+        assert!(!parsed.transcript_text.contains("Conversation Logs"));
+
+        // An index the earlier parser wrote holds the checkpoint as a tool result; reindex
+        // updates that row in place by its step identity rather than adding a second copy.
+        let mut earlier = parsed.clone();
+        earlier.messages[1].role = Role::Tool;
+        earlier.messages[1].kind = MessageKind::ToolResult;
+        earlier.messages[1].tool_name = Some("checkpoint".into());
+        earlier.session.parse_version = "antigravity-v4".into();
+        let db_path = dir.path().join("index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.upsert_session(&earlier, 1, 1).unwrap();
+        db.upsert_session(&parsed, 2, 2).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let kinds: Vec<String> = stored
+            .prepare("select kind from messages order by seq")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kinds, ["conversation", "compaction"]);
     }
 
     #[test]

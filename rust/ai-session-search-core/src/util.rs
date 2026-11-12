@@ -2031,7 +2031,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v11",
         Provider::Codex => "codex-v8",
         Provider::Cursor => "cursor-v5",
-        Provider::Antigravity => "antigravity-v4",
+        Provider::Antigravity => "antigravity-v5",
         Provider::Pi => "pi-v5",
         Provider::PrimeAgent => "prime-agent-v3",
         Provider::AiStudio => "aistudio-v3",
