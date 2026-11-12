@@ -98,7 +98,7 @@ search.close()
 Use `run_skill(SkillRunQuery(...))` for the full classification report and policy receipts.
 `vocabulary(prefix="retry", limit=5)` reports term counts. `query_sql("SELECT COUNT(*) AS n FROM sessions")` returns read-only rows plus paging facts, with the configured SQL restrictions.
 `resume_command(id)` returns native argv without launching a provider. `index_status()` reports
-`parser_health.indexed_sessions` and `readiness.snapshot_availability`; `diagnostics()` adds
+`parser_health.indexed_sessions` and `readiness.snapshot_availability`; `doctor()` adds
 provider discovery and resume-tool health. `source_inventory()` lists configured transcript roots.
 
 ### Requests, results, and defaults

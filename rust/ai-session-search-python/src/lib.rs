@@ -5576,7 +5576,7 @@ impl SessionSearch {
         })
     }
 
-    #[doc = "Return snapshot readiness, parser/schema freshness, indexed/current/stale session counts and applicable repair commands. diagnostics() also reports provider discovery and resume-tool availability."]
+    #[doc = "Return snapshot readiness, parser/schema freshness, indexed/current/stale session counts and applicable repair commands. doctor() also reports provider discovery and resume-tool availability."]
     fn index_status(&self, py: Python<'_>) -> PyResult<NativeIndexStatus> {
         py.detach(|| {
             let app = self.app()?;
@@ -5608,7 +5608,7 @@ impl SessionSearch {
     }
 
     #[doc = "Return index health plus provider roots, discovery warnings, parser freshness and resume-tool availability, as aise doctor does."]
-    fn diagnostics(&self, py: Python<'_>) -> PyResult<NativeDiagnosticStatus> {
+    fn doctor(&self, py: Python<'_>) -> PyResult<NativeDiagnosticStatus> {
         py.detach(|| {
             let app = self.app()?;
             app.maintenance()
@@ -5625,6 +5625,18 @@ impl SessionSearch {
                 })
                 .map_err(service_error)
         })
+    }
+
+    /// Deprecated: use doctor() for full health and discovery details.
+    fn diagnostics(&self, py: Python<'_>) -> PyResult<NativeDiagnosticStatus> {
+        PyErr::warn(
+            py,
+            py.get_type::<pyo3::exceptions::PyDeprecationWarning>()
+                .as_any(),
+            c"diagnostics() is deprecated; use doctor() for index health and provider discovery",
+            1,
+        )?;
+        self.doctor(py)
     }
 
     #[doc = "Merge full-text segments, VACUUM the index and truncate its WAL. Return exact before_bytes, after_bytes and reclaimed_bytes. Requires a writable compatible index."]

@@ -2762,3 +2762,12 @@ def test_python_interfaces_read_every_row_of_a_shared_seq_in_one_order(tmp_path:
         assert [(hit.seq, hit.role) for hit in newest] == want, read["name"]
         selector = ["--limit", str(read["limit"]), "--order", "newest"]
         assert _parity_entry_point_read(database, spec, selector, tmp_path) == want, read["name"]
+
+
+def test_doctor_names_full_health_report_and_preserves_diagnostics(tmp_path: Path) -> None:
+    search = native.SessionSearch(tmp_path / "index.db")
+    current = search.doctor()
+    with pytest.deprecated_call(match="doctor"):
+        previous = search.diagnostics()
+    assert current.index_status.parser_health.indexed_sessions == previous.index_status.parser_health.indexed_sessions
+    assert current.db_path == previous.db_path

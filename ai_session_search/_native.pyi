@@ -2014,11 +2014,14 @@ class SessionSearch:
     def refresh(self) -> RefreshOutcome:
         """Attempt an opportunistic incremental index refresh and return status, counts and a skip reason. A recent refresh or a busy writer can skip work. Use reindex() for a synchronous pass that waits for the writer lock."""
     def index_status(self) -> IndexStatus:
-        """Return snapshot readiness, parser/schema freshness, indexed/current/stale session counts and applicable repair commands. diagnostics() also reports provider discovery and resume-tool availability."""
+        """Return snapshot readiness, parser/schema freshness, indexed/current/stale session counts and applicable repair commands. doctor() also reports provider discovery and resume-tool availability."""
     def reindex(self, *, full: bool = False) -> ReindexOutcome:
         """Reindex enabled sources synchronously and return file/session counts and discovery warnings. full=False reads new or changed transcripts; full=True reparses every discoverable transcript. This call waits for the writer lock."""
+    def doctor(self) -> DiagnosticStatus:
+        """Return full index health, provider discovery and resume-tool availability, as aise doctor and MCP get_index_status do."""
+        ...
     def diagnostics(self) -> DiagnosticStatus:
-        """Return index health plus provider roots, discovery warnings, parser freshness and resume-tool availability, as aise doctor does."""
+        """Deprecated: use doctor() for full index health and provider discovery."""
     def compact(self) -> CompactOutcome:
         """Merge full-text segments, VACUUM the index and truncate its WAL. Return exact before_bytes, after_bytes and reclaimed_bytes. Requires a writable compatible index."""
 
