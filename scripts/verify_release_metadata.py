@@ -46,14 +46,16 @@ _CHANGELOG_SECTION = re.compile(r"^## \[(?P<version>[^]]+)\](?: - (?P<date>\d{4}
 # A released section reads top to bottom for someone deciding whether and how to upgrade: a short
 # summary, then Keep a Changelog headings in this order. "Highlights" names the few changes most
 # readers came for; "For contributors" keeps build and test work out of the user-facing sections.
-# There is no upgrading heading: upgrading is one command, and the generated footer gives it.
+# Upgrade notes precede features because data formats and API contracts can need migration.
 NOTES_HEADINGS = (
+    "Upgrade notes",
     "Highlights",
     "Added",
     "Changed",
     "Deprecated",
     "Removed",
     "Fixed",
+    "Performance",
     "Security",
     "For contributors",
 )
@@ -187,8 +189,8 @@ def check_notes_shape(notes: str, version: str) -> None:
     unknown = [heading for heading in headings if heading not in NOTES_HEADINGS]
     if unknown:
         raise ReleaseMetadataError(
-            f"{where} uses {unknown}; release headings are {list(NOTES_HEADINGS)}. Upgrading is "
-            "one command, which the generated footer gives, so there is no upgrade section"
+            f"{where} uses {unknown}; release headings are {list(NOTES_HEADINGS)}; "
+            "use Upgrade notes for migration steps"
         )
     order = [NOTES_HEADINGS.index(heading) for heading in headings]
     if order != sorted(order) or len(set(order)) != len(order):

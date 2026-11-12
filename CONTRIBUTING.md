@@ -200,8 +200,8 @@ Add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) with the ch
 causes it. The released section becomes the GitHub Release body, followed by a generated footer
 with install and upgrade commands, so write for someone deciding whether and how to upgrade:
 
-1. Put each item under `Highlights`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
-   `Security`, or `For contributors`, in that order, and number the items.
+1. Put each item under `Upgrade notes`, `Highlights`, `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
+   `Performance`, `Security`, or `For contributors`, in that order, and number the items.
    `scripts/verify_release_metadata.py` checks the released section when a release is cut, so
    another heading or a bullet list blocks that release rather than your pull request.
 2. Start with what the user sees or does, then why, in one or two sentences. Name exact commands,
@@ -209,8 +209,8 @@ with install and upgrade commands, so write for someone deciding whether and how
 3. For a fix, say what went wrong for users of the previous release, then what happens now. A bug
    that was introduced and fixed between two releases never reached a user and gets no entry.
 4. A changed default or behavior goes under `Changed`, with a before-and-after snippet when a
-   user might want the old behavior back. Never write upgrade steps: upgrading is one command,
-   which the generated footer gives.
+   user might want the old behavior back. Put data-format, API, and script migration steps under
+   `Upgrade notes` before features; the generated footer supplies package-manager commands.
 5. Build, test, benchmark, and internal refactoring work goes under `For contributors`.
 6. Leave design reasoning to commit messages and the maintainer requirements document.
 
