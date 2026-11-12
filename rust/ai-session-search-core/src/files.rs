@@ -797,8 +797,8 @@ pub struct FilesCrossRefArgs {
     /// every edited file.
     #[arg(value_name = "PATTERN")]
     pub pattern_arg: Option<String>,
-    /// Glob over the basename, or the full path when it contains `/`. Omit to cross-reference
-    /// every edited file.
+    /// Deprecated: use the positional PATTERN (aise files cross-ref PATTERN).
+    /// Glob over the basename, or full path when it contains `/`. Omit for every edited file.
     #[arg(long)]
     pub pattern: Option<String>,
     #[command(flatten)]
@@ -863,6 +863,9 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
             emit(&db.file_search(&query)?, args.format)
         }
         FilesCmd::CrossRef(args) => {
+            if args.pattern.is_some() {
+                eprintln!("aise: files cross-ref --pattern is deprecated; use aise files cross-ref PATTERN");
+            }
             let (since, until) = args.dates.resolve_now()?;
             let pattern = match (&args.pattern_arg, &args.pattern) {
                 (Some(positional), Some(flag)) if positional != flag => {

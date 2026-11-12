@@ -3320,3 +3320,18 @@ fn cli_repeat_limit_notice_names_max_candidates() {
         "{stderr}"
     );
 }
+
+#[test]
+fn cli_cross_ref_pattern_notice_names_positional_argument() {
+    let output = deprecated_cli_output(&["files", "cross-ref", "--pattern", "*.rs"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("aise files cross-ref PATTERN"),
+        "{stderr}"
+    );
+}
