@@ -91,6 +91,7 @@ from ._native import (
     SkillRunReport,
     SkillSelector,
     ToolActivity,
+    UnrecognizedRecordType,
     serve_mcp,
 )
 
@@ -170,6 +171,7 @@ __all__ = [  # noqa: RUF022 - keep the canonical SessionSearch entry point first
     "SkillRunReport",
     "SkillSelector",
     "ToolActivity",
+    "UnrecognizedRecordType",
     "PhraseVocabulary",
     "QueryExclusions",
     "QueryScope",

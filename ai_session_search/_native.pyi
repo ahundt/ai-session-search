@@ -93,6 +93,7 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "ReindexOutcome",
     "ProviderParserHealth",
     "ParserHealth",
+    "UnrecognizedRecordType",
     "IndexStatus",
     "IndexReadinessStatus",
     "IndexRefreshStatus",
