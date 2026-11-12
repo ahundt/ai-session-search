@@ -4170,6 +4170,10 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
     // Python, and full receipts reported it as a configured default rather than the call. With
     // no keyword to materialize, a value is present exactly when the caller wrote it, and Codex
     // and VS Code, which delete the keyword before the model sees it, lose nothing.
+    if config.search.purposes.is_empty() {
+        properties.remove("purpose");
+        properties.remove("purpose_version");
+    }
     strip_default_keywords(properties);
 
     extract_shared_char_budget_variant(&mut schema);
@@ -8506,6 +8510,23 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("same fixed index"))
         );
+    }
+
+    #[test]
+    fn search_messages_omits_unconfigured_purposes() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tool = tool_input_schema(&config, "search_messages");
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("purpose"));
+        assert!(!properties.contains_key("purpose_version"));
+        let rejected = call_tool(
+            "search_messages",
+            json!({"purpose": "missing"}),
+            &config,
+            &db,
+        );
+        assert_eq!(rejected["result"]["isError"], true);
     }
 
     #[test]
@@ -15035,7 +15056,14 @@ mod tests {
     #[test]
     fn search_messages_schema_covers_every_canonical_parameter_and_mcp_property() {
         let (dir, _db) = fixture();
-        let config = config_for_fixture(&dir);
+        let mut config = config_for_fixture(&dir);
+        config.search.purposes.insert(
+            "review".to_owned(),
+            crate::config::PurposeDefinition::new(
+                std::num::NonZeroU32::new(1).unwrap(),
+                crate::config::SearchOperation::MessageSearch,
+            ),
+        );
         let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
         let properties = schema["properties"]
             .as_object()
@@ -15122,7 +15150,14 @@ mod tests {
     #[test]
     fn search_messages_advertises_exactly_the_fields_it_accepts() {
         let (dir, _db) = fixture();
-        let config = config_for_fixture(&dir);
+        let mut config = config_for_fixture(&dir);
+        config.search.purposes.insert(
+            "review".to_owned(),
+            crate::config::PurposeDefinition::new(
+                std::num::NonZeroU32::new(1).unwrap(),
+                crate::config::SearchOperation::MessageSearch,
+            ),
+        );
         let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
         assert_eq!(
             schema["additionalProperties"],

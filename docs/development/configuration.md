@@ -548,14 +548,12 @@ client's source at a pinned version, recorded with their provenance in
 operator running a client that has since moved sets the new number here rather than waiting for
 a release built against it.
 
-Your own settings change the schema size, because generated descriptions interpolate resolved
-values. With the shipped defaults, `search_messages` measures 4,732 bytes as Codex counts it, the
-figure pinned in `EMITTED_ARTIFACT_CEILINGS`, leaving 268 bytes under Codex's 5,000-byte limit. A
-first configured `[search.purposes.<name>]` bundle spends about 100 of those, and each later one roughly twice its
-name's length, because the name lands both in an enum Codex keeps and in the prose listing
-configured bundles. Past that limit Codex deletes every parameter description and emits no
-marker, so the server measures its own catalogue when it builds it and writes any breach to
-stderr.
+Your settings change schema size because descriptions contain resolved values. With shipped
+defaults, `search_messages` measures 4,586 bytes after Codex normalization, leaving 414 bytes under
+its 5,000-byte limit. The server advertises `purpose` and `purpose_version` only when
+`[search.purposes]` contains a bundle. Configured names add both enum and description bytes; run
+`aise mcp schema-budget` after changing them. The server also checks its catalogue at startup and
+reports a breach on stderr. Over the Codex limit, the client removes every parameter description.
 
 ## Atomic configuration initialization
 

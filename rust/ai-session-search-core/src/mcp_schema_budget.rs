@@ -590,7 +590,8 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     // Re-measured after removing the origin/delivery unknown output values: input bytes and
     // output depth remain unchanged, so these ceilings stay pinned to the same measurements.
     // Re-measured with hit timestamps: input bytes and output depth are unchanged.
-    ("search_messages", 4_732, 10),
+    // Unconfigured purpose controls are omitted; configured bundles remain advertised.
+    ("search_messages", 4_586, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
     // and `all_results` say "omit for" like every other property so the tool description's
     // omitted-values sentence can read them back. Codex deletes parameter descriptions beyond
