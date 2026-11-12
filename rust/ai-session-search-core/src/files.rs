@@ -139,7 +139,7 @@ pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
 }
 
 /// Recover one version or name the first blocking version since its latest full snapshot.
-/// Time O(E + L), memory O(L), for E edits and L bytes copied/replaced during replay.
+/// Time O(E + L), memory O(L), for E edits and L content bytes scanned/copied during replay.
 fn reconstruct_version(edits: &[FileEdit], version: usize) -> Result<String> {
     if version == 0 || version > edits.len() {
         bail!("version {version} is out of range (1..={})", edits.len());
@@ -166,7 +166,7 @@ fn reconstruct_version(edits: &[FileEdit], version: usize) -> Result<String> {
     Ok(content)
 }
 
-/// Apply replacements in order. Returns false when any requested replacement cannot be replayed.
+/// Apply replacements in order; an error names why a requested replacement cannot be replayed.
 fn apply_edits(content: &mut String, edits: &[EditOp]) -> std::result::Result<(), &'static str> {
     for op in edits {
         if op.old.is_empty() {
