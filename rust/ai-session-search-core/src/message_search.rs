@@ -1789,6 +1789,10 @@ pub struct ResolvedMessageSearchRequest {
     presentation: ResolvedRequestPresentation,
     include: Vec<MessageSearchInclude>,
     receipt_level: ReceiptLevel,
+    #[serde(skip)]
+    harness_notices_excluded: bool,
+    #[serde(skip)]
+    tool_arguments_excluded: bool,
 }
 
 impl ResolvedMessageSearchRequest {
@@ -1816,7 +1820,51 @@ impl ResolvedMessageSearchRequest {
             },
             include: plan.response.includes.clone(),
             receipt_level: plan.receipt,
+            harness_notices_excluded: plan.retrieval.predicates.kinds.is_none()
+                && plan.retrieval.target.field() == SearchField::Content
+                && !matches!(
+                    plan.retrieval.predicates.role,
+                    Some(Role::User | Role::Slash | Role::Compaction)
+                ),
+            tool_arguments_excluded: plan.retrieval.target.field() == SearchField::Content
+                && plan
+                    .retrieval
+                    .predicates
+                    .kinds
+                    .as_ref()
+                    .is_none_or(|kinds| kinds.contains(&MessageKind::ToolCall))
+                && matches!(
+                    plan.retrieval.predicates.role,
+                    None | Some(Role::Assistant | Role::Tool)
+                ),
         })
+    }
+
+    /// Presentation-only recovery advice. No probes, extra reads, or serialized request fields.
+    pub(crate) fn empty_result_hints(&self, surface: SearchSurface) -> Vec<&'static str> {
+        let offset = match self.extent {
+            ResolvedRequestExtent::Page { offset, .. }
+            | ResolvedRequestExtent::AllResults { offset } => offset,
+        };
+        if offset != 0 {
+            return Vec::new();
+        }
+        let mut hints = Vec::new();
+        if self.harness_notices_excluded {
+            hints.push(if surface == SearchSurface::Mcp {
+                "Harness notices are excluded by default; retry with kinds=[\"harness_notice\"], or add harness_notice to your existing kinds list."
+            } else {
+                "Harness notices are excluded by default; retry with --kinds harness-notice, or add harness-notice to your existing --kinds list."
+            });
+        }
+        if self.tool_arguments_excluded && self.query.is_some() {
+            hints.push(if surface == SearchSurface::Mcp {
+                "Decoded tool-call arguments can be searched with field=\"tool_argument\". For file recovery, use aise files search PATTERN."
+            } else {
+                "Decoded tool-call arguments can be searched with --field tool-argument. For file recovery, use aise files search PATTERN."
+            });
+        }
+        hints
     }
 
     pub fn query(&self) -> Option<&str> {

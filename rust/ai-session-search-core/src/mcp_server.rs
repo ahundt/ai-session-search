@@ -6660,6 +6660,11 @@ fn message_search_text_summary(
     let mut summary = format!(
         "{returned} {noun} at offset {offset}; {continuation}. structuredContent is the authoritative response.\n"
     );
+    if returned == 0 {
+        for hint in response.request().empty_result_hints(SearchSurface::Mcp) {
+            writeln!(summary, "{hint}").map_err(|error| error.to_string())?;
+        }
+    }
     for (index, result) in response
         .results()
         .iter()
@@ -7381,6 +7386,52 @@ mod tests {
             }),
         );
         args
+    }
+
+    #[test]
+    fn empty_message_search_names_only_relevant_recovery_options() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let missing =
+            tool_search_messages(&json!({"query":"absent-sentinel"}), &config, &db).unwrap();
+        assert!(
+            missing.text.contains("kinds=[\"harness_notice\"]"),
+            "{}",
+            missing.text
+        );
+        assert!(
+            missing.text.contains("field=\"tool_argument\""),
+            "{}",
+            missing.text
+        );
+        assert!(
+            missing.text.contains("aise files search"),
+            "{}",
+            missing.text
+        );
+        assert!(missing.structured_content.as_ref().unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for args in [
+            json!({"query":"hello"}),
+            json!({"query":"absent-sentinel", "offset":100}),
+            json!({"query":"absent-sentinel", "field":"tool_name", "kinds":message_kind_values()}),
+            json!({"query":"absent-sentinel", "role":"user"}),
+            json!({"query":"absent-sentinel", "role":"compaction"}),
+        ] {
+            let response = tool_search_messages(&args, &config, &db).unwrap();
+            assert!(
+                !response.text.contains("Harness notices are excluded"),
+                "{}",
+                response.text
+            );
+            assert!(
+                !response.text.contains("Decoded tool-call arguments"),
+                "{}",
+                response.text
+            );
+        }
     }
 
     #[test]

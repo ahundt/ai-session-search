@@ -2,6 +2,7 @@
   "description": "One fixture and one case table for every message-search interface: the Rust MessageService on each SearchSurface, the aise binary's CLI and MCP server, and the Python binding and entry point. Shared cases pass an explicit limit or all_results and compare result identity and order as [seq, role]; presentation (field views, match views, byte budgets) is deliberately not compared, per REQ004. deliberate_differences pins the documented surface-specific defaults of REQ003. twins adds that many tied pairs (same seq, user then assistant); expected \"twins\" means every pair in seq order, user first. tool_twins does the same for tool rows (an assistant tool call then its tool result, sharing one tool name), searched by field \"tool_name\"; a case without field searches content. reads name a seq whose rows every message-read interface must return in full and in the same order; newest_reads take the newest rows of the session, printed oldest-first.",
   "session_id": "claude:parity",
   "messages": [
+    {"seq":90,"role":"assistant","kind":"harness_notice","content":"harness-only sentinel"},
     {"seq": 0, "role": "user", "content": "ᏣᎳᎩ syllabary"},
     {"seq": 1, "role": "user", "content": "abİ end"},
     {"seq": 2, "role": "user", "content": "go to İstanbul now"},

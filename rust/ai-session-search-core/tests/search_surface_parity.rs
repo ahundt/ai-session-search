@@ -1039,3 +1039,50 @@ fn timeline_and_repeats_query_mode_regex_preserves_legacy_matches() {
         );
     }
 }
+
+#[test]
+fn cli_empty_search_hints_are_conditional_and_preserve_machine_output() {
+    let f = fixture();
+    let run = |format: &str, extra: &[&str]| {
+        let output = aise(&f)
+            .args([
+                "messages",
+                "search",
+                "harness-only sentinel",
+                "--format",
+                format,
+                "--index-refresh",
+                "existing-only",
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    for format in ["table", "plain"] {
+        let missing = run(format, &[]);
+        let stderr = String::from_utf8_lossy(&missing.stderr);
+        assert!(stderr.contains("--kinds harness-notice"), "{stderr}");
+        assert!(
+            stderr.contains("--field tool-argument") && stderr.contains("aise files search"),
+            "{stderr}"
+        );
+        let included = run(format, &["--kinds", "harness-notice"]);
+        assert!(String::from_utf8_lossy(&included.stdout).contains("harness-only sentinel"));
+        assert!(!String::from_utf8_lossy(&included.stderr).contains("Harness notices are excluded"));
+        let explicit = run(format, &["--kinds", "conversation"]);
+        assert!(!String::from_utf8_lossy(&explicit.stderr).contains("[hint]"));
+    }
+    let json = run("json", &[]);
+    assert!(!String::from_utf8_lossy(&json.stderr).contains("[hint]"));
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(value["results"].as_array().unwrap().is_empty());
+    assert!(value["effective_request"]
+        .get("harness_notices_excluded")
+        .is_none());
+}

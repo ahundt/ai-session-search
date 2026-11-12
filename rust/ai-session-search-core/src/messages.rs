@@ -1333,6 +1333,11 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         return emit_message_search_machine_response(&response, format);
     }
     let hits = response.hits();
+    if hits.is_empty() && matches!(format, OutputFormat::Table | OutputFormat::Plain) {
+        for hint in response.request().empty_result_hints(SearchSurface::Cli) {
+            eprintln!("[hint] {hint}");
+        }
+    }
     let include_refs = response.presentation().include_refs();
     let lines_per_message = response.presentation().message_lines().to_signed()?;
     if response.context_windows().is_empty() {
@@ -1597,6 +1602,13 @@ fn write_message_search_human_batches<W: Write>(
     }
 
     let completion = batches.completion()?;
+    if completion.page().returned() == 0
+        && matches!(format, OutputFormat::Table | OutputFormat::Plain)
+    {
+        for hint in batches.request().empty_result_hints(SearchSurface::Cli) {
+            eprintln!("[hint] {hint}");
+        }
+    }
     if let Some(explain) = completion.search_explanation() {
         eprintln!(
             "{}",
