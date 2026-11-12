@@ -195,7 +195,7 @@ pub fn exercise_public_api(
         .publish_versions("example.rs", &FileQuery::default(), recovery_destination);
     let _ = app.sources().inventory();
     let _ = app.index().refresh()?;
-    let _ = app.index().reindex(false)?;
+    let _ = app.index().reindex_report(false)?;
     let _ = app.maintenance().diagnostics()?;
     let _ = app.maintenance().compact()?;
     let format = "markdown".parse::<ExportFormat>()?;

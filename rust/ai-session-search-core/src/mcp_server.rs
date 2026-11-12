@@ -11271,7 +11271,8 @@ mod tests {
         }
         config.providers.claude.paths = vec![sources.display().to_string()];
         let app = SessionSearch::open(config.clone()).unwrap();
-        assert_eq!(app.index().reindex(false).unwrap(), (1, 1));
+        let outcome = app.index().reindex_report(false).unwrap();
+        assert_eq!((outcome.files_seen, outcome.sessions_updated), (1, 1));
         drop(app);
 
         let (refresh_finished, refresh_finished_rx) = mpsc::channel();

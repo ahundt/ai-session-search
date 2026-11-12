@@ -1949,12 +1949,6 @@ mod tests {
         db.mark_schema_current().unwrap();
         let adapter = GeminiCliAdapter::new(Vec::new());
         let path = Path::new("session-patched-answer.jsonl");
-        let config = crate::config::Config::default();
-        let service = crate::service::MessageService::new(
-            &config,
-            &db,
-            crate::message_search::SearchSurface::Rust,
-        );
         let filters = crate::models::MessageFilters {
             role: Some(crate::models::Role::User),
             ..Default::default()
@@ -1965,7 +1959,7 @@ mod tests {
                 .parse_reader(std::io::Cursor::new(&records), path)
                 .unwrap();
             db.upsert_session(&parsed, stamp, stamp).unwrap();
-            let first = service.search_legacy("first answer", &filters).unwrap();
+            let first = db.search_messages("first answer", &filters).unwrap();
             assert_eq!(
                 first.len(),
                 1,
@@ -1975,8 +1969,8 @@ mod tests {
                     .map(|hit| (hit.seq, hit.content.clone(), hit.provenance.clone()))
                     .collect::<Vec<_>>()
             );
-            assert!(service
-                .search_legacy("second answer", &filters)
+            assert!(db
+                .search_messages("second answer", &filters)
                 .unwrap()
                 .is_empty());
             let identity = (first[0].session_id.clone(), first[0].seq);

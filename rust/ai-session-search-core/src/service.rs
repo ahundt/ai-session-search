@@ -1647,8 +1647,8 @@ mod execution_runtime_tests {
             observed_calls.fetch_add(1, Ordering::Relaxed);
         });
         let hits = app
-            .messages()
-            .search_legacy(
+            .database()
+            .search_messages(
                 "ECONNRESET",
                 &MessageFilters {
                     match_mode: MessageSearchMode::Regex,
@@ -2204,6 +2204,8 @@ impl<'app> IndexService<'app> {
         indexer::refresh_index_opportunistically(self.config, self.db, None)
     }
 
+    /// Reindex and return `(files_seen, sessions_updated)`.
+    #[deprecated(since = "1.1.0", note = "use IndexService::reindex_report")]
     pub fn reindex(&self, full: bool) -> Result<(usize, usize)> {
         let outcome = self.reindex_report(full)?;
         Ok((outcome.files_seen, outcome.sessions_updated))
@@ -2417,6 +2419,7 @@ impl<'db> MessageService<'db> {
     /// batches; tool-argument fuzzy projection remains exhaustive but parallelizes JSON parsing
     /// and scoring. Peak Rust memory is `O(W + bytes(W) + batch_budget + largest_row + P*Q)`;
     /// validation rejects an unbounded fuzzy page.
+    #[deprecated(since = "1.1.0", note = "use MessageService::search")]
     pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
     }
@@ -3167,8 +3170,14 @@ impl<'db> MessageService<'db> {
         CatalogService::new(self.db)
     }
 
-    /// Run the same search as [`MessageService::search`] and optionally return its actual planner
+    /// Run a string-and-[`MessageFilters`] search and optionally return its actual planner
     /// receipt, including corpus size and any exact/regex prefilter decision.
+    ///
+    /// [`MessageService::search`] returns the same receipt from
+    /// [`MessageSearchResponse::search_explanation`] when the request sets
+    /// [`MessageSearchRequestBuilder::receipt_level`](crate::MessageSearchRequestBuilder::receipt_level)
+    /// to summary or full.
+    #[deprecated(since = "1.1.0", note = "use MessageService::search")]
     pub fn search_with_explain(
         &self,
         query: &str,
@@ -3499,8 +3508,8 @@ mod message_search_service_tests {
         config.index.refresh = IndexRefresh::ExistingOnly;
         let app = SessionSearch::open(config).unwrap();
         let unrestricted = app
-            .messages()
-            .search_legacy("legacy needle", &MessageFilters::default())
+            .database()
+            .search_messages("legacy needle", &MessageFilters::default())
             .unwrap();
         assert_eq!(unrestricted.len(), 1);
         let all_sessions = |limit| SearchFilters {
@@ -3553,8 +3562,8 @@ mod message_search_service_tests {
             1
         );
         let error = app
-            .messages()
-            .search_legacy(
+            .database()
+            .search_messages(
                 "legacy needle",
                 &MessageFilters {
                     role: Some(Role::User),
@@ -4510,6 +4519,8 @@ mod message_search_service_tests {
     }
 
     #[test]
+    // Deliberately covers the deprecated legacy search beside the typed one.
+    #[allow(deprecated)]
     fn typed_path_domains_are_separate_while_legacy_path_remains_broad() {
         let (_directory, db) = disposable_db();
         insert_session(
@@ -4610,8 +4621,17 @@ mod tests {
 
         let config = Config::default();
         let messages = MessageService::new(&config, &db, SearchSurface::Rust)
-            .search_legacy("missing", &MessageFilters::default())
-            .unwrap();
+            .search(
+                MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal("missing").unwrap(),
+                    MessageTarget::content(),
+                )
+                .build()
+                .unwrap(),
+            )
+            .unwrap()
+            .hits()
+            .len();
         let files = FileService::new(&db).search(&FileQuery::default()).unwrap();
         let mut config = Config::default();
         config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().to_string());
@@ -4619,7 +4639,7 @@ mod tests {
         app.database().mark_schema_current().unwrap();
         let status = app.index().status().unwrap();
 
-        assert!(messages.is_empty());
+        assert_eq!(messages, 0);
         assert!(files.is_empty());
         assert!(status.parser_health.schema_current);
         assert_eq!(status.parser_health.indexed_sessions, 0);
@@ -4689,6 +4709,11 @@ mod tests {
         );
     }
 
+    fn reindex_counts(app: &SessionSearch, full: bool) -> (usize, usize) {
+        let outcome = app.index().reindex_report(full).unwrap();
+        (outcome.files_seen, outcome.sessions_updated)
+    }
+
     #[test]
     fn explicit_reindex_owns_lock_on_current_schema() {
         let dir = tempfile::tempdir().unwrap();
@@ -4708,7 +4733,7 @@ mod tests {
         let app = SessionSearch::open(config).unwrap();
         assert!(!app.database().needs_backfill().unwrap());
 
-        assert_eq!(app.index().reindex(false).unwrap(), (0, 0));
+        assert_eq!(reindex_counts(&app, false), (0, 0));
 
         assert!(!app.database().needs_backfill().unwrap());
         assert!(app.index().status().unwrap().parser_health.schema_current);
@@ -4749,7 +4774,7 @@ mod tests {
 
         let app = SessionSearch::open(config).unwrap();
 
-        assert_eq!(app.index().reindex(true).unwrap(), (0, 0));
+        assert_eq!(reindex_counts(&app, true), (0, 0));
         assert_eq!(
             app.database().schema_version().unwrap(),
             crate::db::SCHEMA_VERSION
