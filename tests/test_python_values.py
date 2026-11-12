@@ -52,3 +52,11 @@ def test_results_are_inspectable_values(tmp_path: Path):
     assert "IndexStatus" in repr(left)
     assert left.to_dict()["parser_health"]["indexed_sessions"] == 0
     json.dumps(left.to_dict())
+
+
+def test_search_dictionary_omits_absent_optional_groups(tmp_path: Path):
+    search = native.SessionSearch(tmp_path / "index.db")
+    search.refresh()
+    value = search.search_messages().to_dict()
+    assert "included" not in value
+    assert "receipt" not in value

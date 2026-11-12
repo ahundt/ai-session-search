@@ -91,6 +91,23 @@ fn value_fields<'py>(value: &Bound<'py, PyAny>, fields: &[&str]) -> PyResult<Bou
     Ok(result.into_any())
 }
 
+fn optional_value_fields<'py>(
+    value: &Bound<'py, PyAny>,
+    fields: &[&str],
+) -> PyResult<Bound<'py, PyAny>> {
+    let result = value_fields(value, fields)?;
+    let mapping = result.cast::<PyDict>()?;
+    for field in ["included", "receipt"] {
+        if mapping
+            .get_item(field)?
+            .is_some_and(|value| value.is_none())
+        {
+            mapping.del_item(field)?;
+        }
+    }
+    Ok(result)
+}
+
 fn value_json<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     if value.hasattr("to_dict")? {
         return value.call_method0("to_dict");
@@ -5673,13 +5690,13 @@ python_value! { NativeRoleStatistic, slf => value_fields(slf.as_any(), &["role",
 
 python_value! { ResolvedDateRange, slf => value_fields(slf.as_any(), &["since","until"]); }
 
-python_value! { NativeMessageSearchResponse, slf => value_fields(slf.as_any(), &["response_schema_version","coordinate_unit","effective_request","results","page","included","receipt"]); }
+python_value! { NativeMessageSearchResponse, slf => optional_value_fields(slf.as_any(), &["response_schema_version","coordinate_unit","effective_request","results","page","included","receipt"]); }
 
 python_value! { NativeMessageSearchRuntimeDiagnostics, slf => value_fields(slf.as_any(), &["package_version","database_schema_version","response_schema_version","surface","config_digest"]); }
 
-python_value! { NativeMessageSearchBatch, slf => value_fields(slf.as_any(), &["results","included"]); }
+python_value! { NativeMessageSearchBatch, slf => optional_value_fields(slf.as_any(), &["results","included"]); }
 
-python_value! { NativeMessageSearchCompletion, slf => value_fields(slf.as_any(), &["page","receipt"]); }
+python_value! { NativeMessageSearchCompletion, slf => optional_value_fields(slf.as_any(), &["page","receipt"]); }
 
 python_value! { RefreshOutcome, slf => value_fields(slf.as_any(), &["status","files_seen","sessions_updated","reason"]); }
 
