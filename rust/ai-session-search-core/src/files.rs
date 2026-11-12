@@ -135,39 +135,55 @@ impl PendingFileMutations {
 /// range. A path-only edit or replay mismatch invalidates known content until a later full
 /// snapshot; recovery never invents a successful file state from an unapplied mutation.
 pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
+    reconstruct_version(edits, version).ok()
+}
+
+/// Recover one version or name the first blocking version since its latest full snapshot.
+/// Time O(E + L), memory O(L), for E edits and L bytes copied/replaced during replay.
+fn reconstruct_version(edits: &[FileEdit], version: usize) -> Result<String> {
     if version == 0 || version > edits.len() {
-        return None;
+        bail!("version {version} is out of range (1..={})", edits.len());
     }
     let target = version - 1;
-    // Latest full snapshot (a `Write`, which sets `new_content`) at or before target.
     let base = (0..=target)
         .rev()
-        .find(|&i| edits[i].new_content.is_some())?;
-    let mut content = edits[base].new_content.clone();
-    for edit in &edits[base + 1..=target] {
-        advance_reconstruction(&mut content, edit);
+        .find(|&i| edits[i].new_content.is_some())
+        .ok_or_else(|| anyhow!("version {version} has no preceding full-content snapshot"))?;
+    let mut content = edits[base]
+        .new_content
+        .clone()
+        .expect("selected full snapshot");
+    for (index, edit) in edits.iter().enumerate().take(version).skip(base + 1) {
+        if edit.edits.is_empty() {
+            bail!(
+                "version {} is path-only: no replacement content was recorded",
+                index + 1
+            );
+        }
+        apply_edits(&mut content, &edit.edits)
+            .map_err(|reason| anyhow!("version {} cannot be rebuilt: {reason}", index + 1))?;
     }
-    content
+    Ok(content)
 }
 
 /// Apply replacements in order. Returns false when any requested replacement cannot be replayed.
-fn apply_edits(content: &mut String, edits: &[EditOp]) -> bool {
+fn apply_edits(content: &mut String, edits: &[EditOp]) -> std::result::Result<(), &'static str> {
     for op in edits {
         if op.old.is_empty() {
-            return false;
+            return Err("replacement old text is empty");
         }
         if op.replace_all {
             if !content.contains(op.old.as_str()) {
-                return false;
+                return Err("replacement old text is absent from the preceding content");
             }
             *content = content.replace(op.old.as_str(), &op.new);
         } else if let Some(pos) = content.find(op.old.as_str()) {
             content.replace_range(pos..pos + op.old.len(), &op.new);
         } else {
-            return false;
+            return Err("replacement old text is absent from the preceding content");
         }
     }
-    true
+    Ok(())
 }
 
 /// Advance one reconstruction state without inventing bytes for an unreplayable event.
@@ -178,7 +194,7 @@ fn advance_reconstruction(content: &mut Option<String>, edit: &FileEdit) {
     } else if edit.edits.is_empty()
         || !content
             .as_mut()
-            .is_some_and(|current| apply_edits(current, &edit.edits))
+            .is_some_and(|current| apply_edits(current, &edit.edits).is_ok())
     {
         *content = None;
     }
@@ -520,11 +536,8 @@ pub fn reconstruct_query(
             crate::ServiceError::file_version_out_of_range(file, selected, edits.len()).into(),
         );
     }
-    let content = reconstruct(&edits, selected).ok_or_else(|| {
-        anyhow!(
-            "cannot reconstruct version {selected} of '{file}': no complete replay path exists; a full-content base may be missing or an intervening edit may be path-only"
-        )
-    })?;
+    let content = reconstruct_version(&edits, selected)
+        .with_context(|| format!("cannot reconstruct version {selected} of '{file}'"))?;
     Ok(ReconstructedFile {
         session_id,
         provider,
@@ -941,12 +954,8 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
             edits.len()
         );
     }
-    let content = reconstruct(&edits, version).ok_or_else(|| {
-        anyhow!(
-            "cannot reconstruct '{}' v{version}: no complete replay path exists (missing full snapshot or intervening path-only edit)",
-            args.file
-        )
-    })?;
+    let content = reconstruct_version(&edits, version)
+        .with_context(|| format!("cannot reconstruct '{}' v{version}", args.file))?;
     let original_path = edits[version - 1].file_path.clone();
     let original = PathBuf::from(&original_path);
     let lines = count_lines(&content);

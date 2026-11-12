@@ -580,3 +580,83 @@ fn cross_session_file_has_separate_version_chains() {
     assert_eq!(s2.len(), 1);
     assert_eq!(reconstruct(&s2, 1).as_deref(), Some("brand new"));
 }
+
+mod support;
+
+#[test]
+fn extract_names_the_broken_version_and_keeps_earlier_versions_extractable() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects/proj");
+    std::fs::create_dir_all(&projects).unwrap();
+    // The edit's recorded old text does not exist in the preceding successful Write.
+    std::fs::write(
+        projects.join("sess-fr-1.jsonl"),
+        SESS1.replace(
+            r#""old_string":"line2""#,
+            r#""old_string":"missing old text""#,
+        ),
+    )
+    .unwrap();
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    let service = FileService::new(&db);
+    assert_eq!(
+        service
+            .history("app.py", &FileQuery::default())
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        service
+            .reconstruct("app.py", &FileQuery::default(), Some(1))
+            .unwrap()
+            .content,
+        "line1\nline2\nline3"
+    );
+    let error = service
+        .reconstruct("app.py", &FileQuery::default(), Some(3))
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("version 2"), "{error}");
+    assert!(error.contains("old text is absent"), "{error}");
+    let paths = support::aise(dir.path())
+        .args(["config", "paths"])
+        .output()
+        .unwrap();
+    assert!(paths.status.success());
+    let run = |version: &str| {
+        support::aise(dir.path())
+            .arg("--database")
+            .arg(cfg.db_path())
+            .args([
+                "--index-refresh",
+                "existing-only",
+                "files",
+                "extract",
+                "app.py",
+                "--version",
+                version,
+            ])
+            .output()
+            .unwrap()
+    };
+    let failed = run("3");
+    assert!(!failed.status.success());
+    let error = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        error.contains("version 2") && error.contains("old text is absent"),
+        "{error}"
+    );
+    let available = run("1");
+    assert!(
+        available.status.success(),
+        "{}",
+        String::from_utf8_lossy(&available.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(available.stdout).unwrap(),
+        "line1\nline2\nline3\n"
+    );
+}
