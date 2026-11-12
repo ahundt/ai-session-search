@@ -93,7 +93,7 @@
     {"name": "a tool call and its result sharing a seq", "seq": 305, "expected": [[305, "assistant"], [305, "tool"]]}
   ],
   "context_reads": [
-    {"name":"forward context only","seq":0,"before":0,"after":2,"expected":[[0,"user"],[1,"user"],[2,"user"]]}
+    {"name":"forward context only","seq_parameters":["seq","message_seq"],"seq":0,"before":0,"after":2,"expected":[[0,"user"],[1,"user"],[2,"user"]]}
   ],
   "newest_reads": [
     {"name": "the newest three rows cut inside a tied pair", "limit": 3, "expected": [[304, "tool"], [305, "assistant"], [305, "tool"]]}

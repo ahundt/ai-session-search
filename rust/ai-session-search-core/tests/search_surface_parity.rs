@@ -854,13 +854,12 @@ fn asymmetric_context_reads_agree_across_surfaces() {
             ),
             want
         );
-        let results = mcp_calls(
-            &f,
-            &[(
-                "get_session",
-                json!({"session_id":session,"message_seq":seq,"context_before":before,"context_after":after}),
-            )],
-        );
-        assert_eq!(read_rows(results[0].as_ref().unwrap()), want);
+        for parameter in read["seq_parameters"].as_array().unwrap() {
+            let mut arguments =
+                json!({"session_id":session,"context_before":before,"context_after":after});
+            arguments[parameter.as_str().unwrap()] = json!(seq);
+            let results = mcp_calls(&f, &[("get_session", arguments)]);
+            assert_eq!(read_rows(results[0].as_ref().unwrap()), want);
+        }
     }
 }

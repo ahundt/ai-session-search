@@ -4321,10 +4321,15 @@ struct ReplacedToolParameter {
     value_change: &'static str,
 }
 
-/// Rejected-but-understood parameter names, kept beside the catalogue below so a rename there
-/// shows up here. They stay rejected: an alias would keep two vocabularies alive. The error names
-/// the replacement and still lists every accepted parameter.
+/// Replaced parameter names. Accepted compatibility aliases advertise deprecation in their
+/// schema; rejected sibling-tool names use this table to name the accepted replacement.
 const REPLACED_TOOL_PARAMETERS: &[ReplacedToolParameter] = &[
+    ReplacedToolParameter {
+        tool: "get_session",
+        name: "message_seq",
+        replacements: &["seq"],
+        value_change: "accepted deprecated alias; pass the same sequence as seq",
+    },
     ReplacedToolParameter {
         tool: "search_messages",
         name: "response_format",
@@ -4740,7 +4745,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; truncated_evidence names categories with additional indexed entries. Mutually exclusive with transcript_lines and message_seq. Default false, which returns transcript lines instead."
+                                "description": "Compact evidence: opening purpose, selected user intent, tool previews, refs, aggregate file changes, provenance and bounded follow-ups. summary_items caps message and aggregate evidence; truncated_evidence lists categories with more entries. Conflicts with transcript_lines and seq. Omit for false (transcript lines)."
                             },
                             "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items) },
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true." },
@@ -4748,10 +4753,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer",
                                 "description": format!("Transcript lines: positive=head/start, negative=tail/end, 0=all (may be large). Prefer message_seq from search_messages for one turn. Conflicts with summary, message_seq and ranges. Omit for {} when no selector is given.", config.mcp.get_session_transcript_lines)
                             },
-                            "message_seq": {
-                                "type": "integer", "minimum": 0,
-                                "description": "Message sequence number copied from search_messages `results[].message_ref.message_seq`. Returns a focused message-context result instead of transcript lines."
-                            },
+                            "seq": { "type": "integer", "minimum": 0, "description": "0-based message sequence from search_messages results[].message_ref.message_seq; selects focused context instead of transcript lines. Omit for transcript output." },
+                            "message_seq": { "type": "integer", "minimum": 0, "description": "Deprecated: use seq. Same focused-message selector; conflicting values fail." },
                             "seq_from": {
                                 "type": "integer", "minimum": 0,
                                 "description": "Lower inclusive session-local sequence bound. Pair with seq_to for chunks (0..499, then 500..999); advance last seq + 1 to avoid re-reading. Conflicts with summary, transcript_lines and message_seq. Omit to start at the first message."
@@ -4774,7 +4777,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)) },
                             "lines_per_message": {
                                 "type": "integer",
-                                "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message)
+                                "description": format!("With seq: display each message's first N lines (positive), last N (negative), or all (0); omit for {}. Bounds long tool output per message without changing membership or reference extraction. Use transcript_lines for a whole transcript window.", config.mcp.lines_per_message)
                             },
                             "detail": { "type": "string", "enum": ["compact", "full"], "description": "For focused context or ranges: compact caps content at preview_chars; full keeps all characters after lines_per_message. Omit for compact." },
                             "response_format": {
@@ -5110,7 +5113,12 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
     let summary = mcp_bool_arg(args, "summary", false);
-    let message_seq = args.get("message_seq").and_then(Value::as_i64);
+    let old_seq = args.get("message_seq").and_then(Value::as_i64);
+    let seq = args.get("seq").and_then(Value::as_i64);
+    if seq.is_some() && old_seq.is_some() && seq != old_seq {
+        return Err("seq conflicts with deprecated message_seq; pass seq only".to_string());
+    }
+    let message_seq = seq.or(old_seq);
     let transcript_lines = args.get("transcript_lines").and_then(Value::as_i64);
     // Absolute message-range read: an alternative to a bigger transcript_lines head/tail that lets
     // the caller advance seq_from = last seq + 1 for deterministic, non-overlapping chunks. seq
@@ -9468,6 +9476,43 @@ mod tests {
     }
 
     #[test]
+    fn focused_read_accepts_seq_and_deprecates_message_seq() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let new = parse(
+            &tool_get_session(&json!({"session_id":"test1", "seq":1}), &config, &db).unwrap(),
+        );
+        let old = parse(
+            &tool_get_session(
+                &json!({"session_id":"test1", "message_seq":1}),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(new, old);
+        assert!(tool_get_session(
+            &json!({"session_id":"test1", "seq":1, "message_seq":2}),
+            &config,
+            &db
+        )
+        .is_err());
+        let tools = handle_tools_list(None, &config);
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_session")
+            .unwrap();
+        assert!(
+            tool["inputSchema"]["properties"]["message_seq"]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Deprecated: use seq")
+        );
+    }
+
+    #[test]
     fn focused_read_accepts_asymmetric_context() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -11687,7 +11732,7 @@ mod tests {
     }
 
     /// Every row of `REPLACED_TOOL_PARAMETERS` points at the served catalogue: the tool exists,
-    /// it rejects the old name, and every replacement the error names is a parameter it accepts.
+    /// it rejects or deprecates the old name, and every replacement is a parameter it accepts.
     #[test]
     fn replaced_tool_parameters_name_only_parameters_their_tool_accepts() {
         let (dir, _db) = fixture();
@@ -11700,12 +11745,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} is served", row.tool))["inputSchema"]["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{} has properties", row.tool));
-            assert!(
-                !properties.contains_key(row.name),
-                "{} accepts {}, so the row is never reached",
-                row.tool,
-                row.name
-            );
+            if let Some(property) = properties.get(row.name) {
+                assert!(
+                    property["description"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("Deprecated: use ")),
+                    "{} must describe its accepted deprecated alias {}",
+                    row.tool,
+                    row.name
+                );
+            }
             for replacement in row.replacements {
                 assert!(
                     properties.contains_key(*replacement),
