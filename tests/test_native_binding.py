@@ -888,12 +888,14 @@ def test_run_skill_and_search_read_only_what_people_typed_in_claude_records(
     # A queued prompt whose attachment names a human origin is read; one with no recorded sender
     # is left out and counted unless asked for; a queued harness notification is never read.
     report = corrections(False)
+    assert search.classify_messages(include_unattributed_input=False) == report.matches
     assert [match.content for match in report.matches] == [
         "you missed the second directory",
         "you forgot to check the tests",
     ]
     assert (report.unattributed_input_count, report.unattributed_input_included) == (1, False)
     report = corrections(True)
+    assert search.classify_messages(include_unattributed_input=True) == report.matches
     assert [match.content for match in report.matches] == [
         "you missed the second directory",
         "you forgot to check the second directory",

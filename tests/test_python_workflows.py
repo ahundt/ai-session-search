@@ -158,3 +158,12 @@ def test_analysis_call_bounds_and_scopes(corpus):
 def test_sql_cell_truncation_retains_receipt(corpus):
     result = corpus.query_sql("select title from sessions", max_cell_chars=3)
     assert result["truncated_cell_char_limit"] == 3
+
+
+def test_direct_classification_returns_cli_rows(corpus):
+    matches = corpus.classify_messages(skill="corrections", include_unattributed_input=True)
+    expected = cli(corpus, "skills", "corrections", "--include-unattributed-input", "--format", "json")
+    assert matches
+    assert [row.to_dict() for row in matches] == expected["output"]["result"]["report"]["matches"]
+    scoped = corpus.classify_messages(request=aise.MessageClassificationQuery(scope=aise.QueryScope(session_id="synthetic-0")))
+    assert {row.session_id for row in scoped} == {"claude:synthetic-0"}

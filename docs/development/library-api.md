@@ -113,6 +113,10 @@ eligible session/transcript bytes before retaining its top page. Runtime, memory
 output-growth bounds are recorded under `REQ010-protect-complexity-bounds` in the
 [maintainer requirements](maintainer-requirements-and-design-decisions.md).
 
+`classify_messages(skill="corrections", include_unattributed_input=True)` returns match rows
+directly. Pass `request=MessageClassificationQuery(...)` for filters and bounds; `run_skill()`
+continues to return the full report with policy receipts and unattributed-input counts.
+
 `repeats()` returns the CLI report dictionary (`groups` with example message references,
 `unattributed_input_count`, and `unattributed_input_included`). Its bounds resolve from
 `[analytics]`, and `include_unattributed_input=True` includes queued input of unknown authorship.

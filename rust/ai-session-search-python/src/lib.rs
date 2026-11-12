@@ -4525,6 +4525,49 @@ impl SessionSearch {
         json_compatible(py, &specification)
     }
 
+    /// Classify messages with a named skill and return its match rows directly.
+    /// Defaults to corrections. Use run_skill for policy receipts and unattributed-input counts.
+    #[pyo3(signature = (*, skill="corrections", request=None, include_unattributed_input=None, definition=None))]
+    fn classify_messages(
+        &self,
+        py: Python<'_>,
+        skill: &str,
+        request: Option<NativeMessageClassificationQuery>,
+        include_unattributed_input: Option<bool>,
+        definition: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<NativeMessageClassificationMatch>> {
+        let selector = ai_session_search::SkillSelector::name(skill).map_err(value_error)?;
+        let definition = python_message_classification_definition(definition)?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let mut input = request.unwrap_or_default();
+            if let Some(include) = include_unattributed_input {
+                input.include_unattributed_input = include;
+            }
+            let mut query = ai_session_search::SkillRunQuery::new(
+                selector,
+                ai_session_search::SkillCapabilityInput::MessageClassification(
+                    input.into_core(&app)?,
+                ),
+            );
+            query.definition = definition;
+            let report = app.analysis().run_skill(&query).map_err(service_error)?;
+            match report.output {
+                ai_session_search::SkillCapabilityOutput::MessageClassification(output) => {
+                    Ok(output
+                        .report
+                        .matches
+                        .into_iter()
+                        .map(NativeMessageClassificationMatch::from)
+                        .collect())
+                }
+                _ => Err(runtime_error(
+                    "skill did not return message-classification output",
+                )),
+            }
+        })
+    }
+
     /// Report indexed term frequencies. None uses analytics.vocab_limit; 0 returns all terms.
     /// Refused under allowed-roots because these counts span the complete index.
     #[pyo3(signature = (*, prefix=None, trigram=false, limit=None))]
