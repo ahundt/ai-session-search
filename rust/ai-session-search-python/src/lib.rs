@@ -4373,7 +4373,9 @@ impl SessionSearch {
         })
         .map_err(runtime_error)?
         .config;
-        let inner = CoreSessionSearch::open(config).map_err(runtime_error)?;
+        let mut inner = CoreSessionSearch::open(config).map_err(runtime_error)?;
+        // Keep the binding's existing behaviour: a never-refreshed index reads as empty.
+        inner.serve_unrefreshed_index_as_empty();
         Ok(Self {
             inner: Mutex::new(inner),
         })

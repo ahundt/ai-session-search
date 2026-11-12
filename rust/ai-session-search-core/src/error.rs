@@ -208,6 +208,18 @@ impl ServiceError {
         }
     }
 
+    pub(crate) fn index_not_refreshed(path: &std::path::Path) -> Self {
+        Self::IndexNotRefreshed {
+            path: path.to_path_buf(),
+            message: format!(
+                "index {} holds no sessions and has never completed a refresh, so an empty \
+                 result would not mean no matches; call IndexService::prepare_for_read or \
+                 IndexService::refresh first (the command line runs `aise reindex`)",
+                path.display()
+            ),
+        }
+    }
+
     pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
         Self::InvalidArgument {
             message: message.into(),
@@ -231,6 +243,7 @@ mod tests {
                 "export bundle destination already exists: /d".into(),
             ),
             ServiceError::index_missing(std::path::Path::new("/i.db"), "missing".into()),
+            ServiceError::index_not_refreshed(std::path::Path::new("/i.db")),
             ServiceError::invalid_argument("bad"),
         ];
         let codes = errors
@@ -238,11 +251,7 @@ mod tests {
             .map(ServiceError::code)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(codes.len(), errors.len());
-        assert_eq!(
-            errors.len(),
-            7,
-            "one sample per kind except index-not-refreshed"
-        );
+        assert_eq!(errors.len(), 8, "one sample per kind");
         assert_eq!(
             errors[3].to_string(),
             "version 9 is out of range for 'a.py'; expected 1..=3"

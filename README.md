@@ -308,10 +308,12 @@ messages = search.search_messages(
 ```
 
 ```rust,no_run
-use ai_session_search::service::SessionSearch;
+use ai_session_search::SessionSearch;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ai_session_search::anyhow::Result<()> {
     let app = SessionSearch::load()?;
+    // Apply the configured refresh policy before the first read, as `aise` does.
+    app.index().prepare_for_read()?;
     let status = app.index().status()?;
     println!("{} repairs pending", status.repair_commands.len());
     Ok(())

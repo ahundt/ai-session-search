@@ -934,6 +934,9 @@ mod analysis_service_tests {
 
 impl SessionSearch {
     /// Load platform configuration and open the configured index.
+    ///
+    /// Opening never refreshes the index. Call [`IndexService::prepare_for_read`] before the
+    /// first query to apply the configured refresh policy, as the command line does.
     pub fn load() -> Result<Self> {
         Self::open(Config::load()?)
     }
@@ -946,17 +949,46 @@ impl SessionSearch {
     /// are absent; it does not modify the durable database contents. Other refresh modes
     /// may create a new current-schema database and later perform the configured incremental
     /// refresh. Newer, hybrid, and incomplete current schemas fail before an ordinary query.
+    ///
+    /// Opening never reads session sources. Until the index holds a session or has completed a
+    /// refresh, typed reads (listing, search, messages, files, export, analysis) return
+    /// [`ServiceError::IndexNotRefreshed`](crate::ServiceError::IndexNotRefreshed) rather than an
+    /// empty result that would look like "no matches". Call [`IndexService::prepare_for_read`]
+    /// once after opening to apply the configured refresh policy, as `aise` does before every
+    /// command.
+    ///
+    /// # Threads
+    ///
+    /// `SessionSearch` is `Send` but not `Sync`: it owns one SQLite connection. Move it into a
+    /// thread, open one instance per thread, or share one behind a `Mutex`.
     pub fn open(config: Config) -> Result<Self> {
         let inputs = TrustedAccessInputs::capture(&config.search.scope, Vec::new())?;
         Self::open_with_access_inputs(config, inputs)
     }
 
     /// Open an index with trusted runtime roots supplied by a harness integration.
+    ///
+    /// Like [`SessionSearch::open`], the returned application refuses typed reads on an index
+    /// that holds no sessions and has never completed a refresh; see
+    /// [`IndexService::prepare_for_read`].
     pub fn open_with_access_inputs(
         config: Config,
         access_inputs: TrustedAccessInputs,
     ) -> Result<Self> {
-        Self::open_with_access_inputs_and_runtime(config, access_inputs, None)
+        let mut app = Self::open_with_access_inputs_and_runtime(config, access_inputs, None)?;
+        app.db.set_reject_unrefreshed_reads(true);
+        Ok(app)
+    }
+
+    /// Serve an index that has never been refreshed as an empty one instead of returning
+    /// [`ServiceError::IndexNotRefreshed`](crate::ServiceError::IndexNotRefreshed).
+    ///
+    /// For frontends that apply the refresh policy themselves and print an empty result when
+    /// another process is still writing the first index: the command line, the MCP server, and
+    /// the Python binding. A Rust program should call [`IndexService::prepare_for_read`] instead.
+    #[doc(hidden)]
+    pub fn serve_unrefreshed_index_as_empty(&mut self) {
+        self.db.set_reject_unrefreshed_reads(false);
     }
 
     /// Open an independent prepared-index reader sharing one fixed data-parallel worker budget.
@@ -1117,6 +1149,7 @@ impl SessionSearch {
         request: MessageSearchRequest,
         batch_rows: NonZeroUsize,
     ) -> Result<MessageSearchBatches> {
+        self.db.ensure_refreshed_for_read()?;
         self.message_search_batches_for_surface(SearchSurface::Rust, request, batch_rows)
     }
 
@@ -1806,6 +1839,7 @@ impl<'app> AnalysisService<'app> {
         &self,
         query: &crate::skill_run::SkillRunQuery,
     ) -> Result<crate::skill_run::SkillRunReport> {
+        self.db.ensure_refreshed_for_read()?;
         let crate::skill_run::SkillCapabilityInput::MessageClassification(arguments) = &query.input;
         let embedded_primary = matches!(
             &query.skill,
@@ -1970,6 +2004,7 @@ impl<'app> AnalysisService<'app> {
         filters: &MessageFilters,
         command_patterns: &[String],
     ) -> Result<Vec<crate::models::PlanningCount>> {
+        self.db.ensure_refreshed_for_read()?;
         let command_filters =
             crate::analytics::compile_planning_filters(self.config, command_patterns)?;
         self.db.planning_usage(filters, &command_filters)
@@ -1984,6 +2019,7 @@ impl<'app> AnalysisService<'app> {
         &self,
         filters: &MessageFilters,
     ) -> Result<Vec<crate::analytics::RoleStat>> {
+        self.db.ensure_refreshed_for_read()?;
         let rows: Vec<_> = self
             .db
             .message_role_counts(filters)?
@@ -2021,6 +2057,7 @@ impl<'app> AnalysisService<'app> {
         &self,
         query: &crate::analytics::RepeatsQuery,
     ) -> Result<crate::analytics::RepeatsReport> {
+        self.db.ensure_refreshed_for_read()?;
         crate::analytics::mine_repeats(self.db, &self.config.analytics, query)
     }
 
@@ -2043,6 +2080,7 @@ impl<'app> AnalysisService<'app> {
         &self,
         query: &crate::analytics::VocabularyQuery,
     ) -> Result<Vec<crate::analytics::TermFrequency>> {
+        self.db.ensure_refreshed_for_read()?;
         if !matches!(
             self.db.access_scope(),
             crate::search_scope::EffectiveAccessScope::All
@@ -2081,6 +2119,7 @@ impl<'app> AnalysisService<'app> {
         filters: &SearchFilters,
         cursor: Option<&crate::models::AnalysisCursor>,
     ) -> Result<crate::models::AnalysisDocumentPage> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.analysis_documents(filters, cursor)
     }
 
@@ -2103,6 +2142,7 @@ impl<'app> AnalysisService<'app> {
         request: &crate::models::AnalysisRequest,
         policy: &crate::analysis_pipeline::AnalysisPolicy,
     ) -> Result<ReceiptedAnalysis> {
+        self.db.ensure_refreshed_for_read()?;
         self.run_with_session_batch_size(request, DEFAULT_ANALYSIS_SESSION_BATCH_SIZE, policy)
     }
 
@@ -2174,6 +2214,7 @@ impl<'db> ExportService<'db> {
         id_or_prefix: &str,
         format: crate::export::ExportFormat,
     ) -> Result<crate::export::ExportDocument> {
+        self.db.ensure_refreshed_for_read()?;
         let session = self.db.resolve_session(id_or_prefix)?;
         crate::export::render_full(&session, format)
     }
@@ -2189,6 +2230,7 @@ impl<'db> ExportService<'db> {
         filters: &SearchFilters,
         plan: &crate::export::ExportPublicationPlan,
     ) -> Result<crate::export::ExportPublicationReceipt> {
+        self.db.ensure_refreshed_for_read()?;
         let sessions = self.db.list_recent(filters)?;
         let format = plan.format();
         let documents = sessions.into_iter().map(|session| {
@@ -2347,6 +2389,34 @@ impl<'app> IndexService<'app> {
         Self { config, db }
     }
 
+    /// Apply the configured `index.refresh` policy before reads, as the command line does
+    /// before every query.
+    ///
+    /// - `auto` (the default): repair an unreadable schema, and index the sources synchronously
+    ///   when the index holds no sessions and is due; a populated index is returned unchanged
+    ///   (call [`IndexService::refresh`] to bring it up to date).
+    /// - `before-query`: run an incremental reindex under the update lock every call.
+    /// - `existing-only`: change nothing; fail when the schema is unreadable.
+    ///
+    /// Returns `None` when nothing ran, or what the refresh did. After `auto` meets another
+    /// writer (`SkippedBusy` or `SkippedLockUnavailable`) a never-indexed index stays empty and
+    /// typed reads keep returning [`ServiceError::IndexNotRefreshed`](crate::ServiceError::IndexNotRefreshed).
+    ///
+    /// ```no_run
+    /// let app = ai_session_search::SessionSearch::load()?;
+    /// app.index().prepare_for_read()?;
+    /// let sessions = app.catalog().list_sessions(&Default::default())?;
+    /// # Ok::<(), ai_session_search::anyhow::Error>(())
+    /// ```
+    pub fn prepare_for_read(&self) -> Result<Option<AutoReindexOutcome>> {
+        indexer::prepare_index_for_read_now(self.config, self.db)
+    }
+
+    /// Run an incremental refresh now unless one completed within
+    /// `index.auto_reindex_interval_ms` and the parser contract is unchanged.
+    ///
+    /// Does not wait for another writer: returns `SkippedBusy` or `SkippedLockUnavailable`
+    /// instead. Fails when the index needs a newer writer.
     pub fn refresh(&self) -> Result<AutoReindexOutcome> {
         self.db.require_write_compatibility()?;
         indexer::refresh_index_opportunistically(self.config, self.db, None)
@@ -2359,6 +2429,9 @@ impl<'app> IndexService<'app> {
         Ok((outcome.files_seen, outcome.sessions_updated))
     }
 
+    /// Reindex every enabled source and wait for the update lock. `full` re-reads every file
+    /// instead of only changed ones. Returns the files seen, sessions updated, discovery
+    /// warnings, and whether a full pass ran.
     pub fn reindex_report(&self, full: bool) -> Result<indexer::ExplicitReindexOutcome> {
         indexer::explicit_reindex_and_migrate(self.config, self.db, full, None)
     }
@@ -2442,6 +2515,7 @@ impl<'db> CatalogService<'db> {
     /// `O(K + D_K)` for selected row/text bytes. A zero limit intentionally returns the complete
     /// filtered corpus, so `K=N`; SQLite page-cache or temporary-sort memory is additional.
     pub fn list_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
+        self.db.ensure_refreshed_for_read()?;
         filters.validate()?;
         self.db.list_recent(filters)
     }
@@ -2454,6 +2528,7 @@ impl<'db> CatalogService<'db> {
         filters: &SearchFilters,
         offset: usize,
     ) -> Result<Vec<SessionRecord>> {
+        self.db.ensure_refreshed_for_read()?;
         filters.validate()?;
         self.db.list_recent_page(filters, offset)
     }
@@ -2480,6 +2555,7 @@ impl<'db> CatalogService<'db> {
         current_repo: Option<&str>,
         scoring: &ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
+        self.db.ensure_refreshed_for_read()?;
         filters.validate()?;
         self.db.search(query, filters, current_repo, scoring)
     }
@@ -2501,6 +2577,7 @@ impl<'db> CatalogService<'db> {
 
     /// Resolve one canonical session ID or unique prefix; ambiguous errors list candidates.
     pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.resolve_session_record(id_or_prefix)
     }
 
@@ -2521,6 +2598,7 @@ impl<'db> CatalogService<'db> {
     /// Reads the whole stored transcript once; retained memory is the transcript plus the
     /// selected window.
     pub fn transcript(&self, id_or_prefix: &str, lines: i64) -> Result<TranscriptWindow> {
+        self.db.ensure_refreshed_for_read()?;
         let full = self.db.resolve_session(id_or_prefix)?;
         let (text, lines_label) =
             crate::util::select_transcript_lines(&full.transcript_text, lines);
@@ -2556,6 +2634,7 @@ impl<'db> CatalogService<'db> {
     /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) or
     /// [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous).
     pub fn resume_command(&self, id_or_prefix: &str) -> Result<ResumeCommand> {
+        self.db.ensure_refreshed_for_read()?;
         let session = self.db.resolve_session_record(id_or_prefix)?;
         Ok(match crate::util::resume_plan(&session) {
             Ok((argv, cwd)) => ResumeCommand {
@@ -2579,6 +2658,7 @@ impl<'db> CatalogService<'db> {
         id_or_prefix: &str,
         options: crate::inspect::InspectionOptions,
     ) -> Result<crate::inspect::SessionInspection> {
+        self.db.ensure_refreshed_for_read()?;
         crate::inspect::inspect_session(self.db, id_or_prefix, options)
     }
 }
@@ -2689,10 +2769,12 @@ impl<'db> MessageService<'db> {
     /// validation rejects an unbounded fuzzy page.
     #[deprecated(since = "1.1.0", note = "use MessageService::search")]
     pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.search_messages(query, filters)
     }
 
     pub fn plan(&self, request: MessageSearchRequest) -> Result<MessageSearchPlan> {
+        self.db.ensure_refreshed_for_read()?;
         Self::plan_with_session_resolver(self.config, self.surface, request, |value| {
             self.catalog().resolve_session(value)
         })
@@ -3092,6 +3174,7 @@ impl<'db> MessageService<'db> {
     /// membership. Planning, membership, evidence, includes, and context share one SQLite read
     /// snapshot, so a concurrent WAL refresh becomes visible only to a later search.
     pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
+        self.db.ensure_refreshed_for_read()?;
         self.search_cancellable(request, None)
     }
 
@@ -3452,12 +3535,14 @@ impl<'db> MessageService<'db> {
         filters: &MessageFilters,
         include_explain: bool,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        self.db.ensure_refreshed_for_read()?;
         self.db
             .search_messages_with_explain(query, filters, include_explain)
     }
 
     /// Load compact metadata for the requested canonical IDs; absent IDs are omitted.
     pub fn session_metadata(&self, session_ids: &[String]) -> Result<HashMap<String, SessionMeta>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.session_metadata(session_ids)
     }
 
@@ -3488,6 +3573,7 @@ impl<'db> MessageService<'db> {
         before: i64,
         after: i64,
     ) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
         let session = self.db.resolve_session_record(session_id)?;
         self.db.message_context(&session.id, seq, before, after)
     }
@@ -3500,6 +3586,7 @@ impl<'db> MessageService<'db> {
         filters: &MessageFilters,
         order: crate::db::MessageOrder,
     ) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.read_session_messages(filters, order)
     }
 }
@@ -3522,11 +3609,13 @@ impl<'db> FileService<'db> {
     /// Work is proportional to filtered edit rows; returned memory is proportional to grouped
     /// files and is unbounded only when the query explicitly uses a zero limit.
     pub fn search(&self, query: &FileQuery) -> Result<Vec<FileEditSummary>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.file_search(query)
     }
 
     /// Return deterministic file/session edit-count pages using `query.limit` and `query.offset`.
     pub fn cross_reference(&self, query: &FileQuery) -> Result<Vec<FileCrossRef>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.file_cross_ref(query)
     }
 
@@ -3538,6 +3627,7 @@ impl<'db> FileService<'db> {
     /// returned memory is bounded by `query.limit` unless it is explicitly zero. `query.offset`
     /// skips versions after stable session/version ordering.
     pub fn history(&self, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
+        self.db.ensure_refreshed_for_read()?;
         crate::files::history(self.db, file, query)
     }
 
@@ -3553,6 +3643,7 @@ impl<'db> FileService<'db> {
         query: &FileQuery,
         version: Option<usize>,
     ) -> Result<crate::files::ReconstructedFile> {
+        self.db.ensure_refreshed_for_read()?;
         crate::files::reconstruct_query(self.db, file, query, version)
     }
 
@@ -3562,6 +3653,7 @@ impl<'db> FileService<'db> {
         file: &str,
         query: &FileQuery,
     ) -> Result<crate::files::ReconstructedFileVersions> {
+        self.db.ensure_refreshed_for_read()?;
         crate::files::reconstruct_versions_query(self.db, file, query)
     }
 
@@ -3572,6 +3664,7 @@ impl<'db> FileService<'db> {
         query: &FileQuery,
         destination: &std::path::Path,
     ) -> Result<crate::files::RecoveryPublicationReceipt> {
+        self.db.ensure_refreshed_for_read()?;
         let versions = self.reconstruct_versions(file, query)?;
         crate::files::publish_reconstructed_versions(versions, destination)
     }

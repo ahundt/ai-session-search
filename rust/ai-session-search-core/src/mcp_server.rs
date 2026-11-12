@@ -1887,10 +1887,13 @@ fn open_mcp_app<'a>(
     harness_roots: &[std::path::PathBuf],
 ) -> anyhow::Result<&'a SessionSearch> {
     if slot.is_none() {
-        *slot = Some(SessionSearch::open_with_access_inputs(
+        let mut app = SessionSearch::open_with_access_inputs(
             config.clone(),
             mcp_access_inputs(config, harness_roots.to_vec())?,
-        )?);
+        )?;
+        // The server reports index readiness through get_index_status instead.
+        app.serve_unrefreshed_index_as_empty();
+        *slot = Some(app);
     }
     Ok(slot.as_ref().expect("application slot initialized above"))
 }

@@ -589,6 +589,13 @@ pub struct Db {
     /// the CLI sets an `eprintln` sink, the MCP server leaves it unset (silent, so nothing can
     /// pollute its stdio JSON-RPC channel). Mirrors the indexer's `progress` callback.
     progress: Option<ProgressReporter>,
+    /// Refuse typed reads while the index holds no sessions and no refresh has ever completed,
+    /// so an empty result cannot be mistaken for "no matches". Set by the public
+    /// `SessionSearch` constructors; adapters that apply their own refresh policy clear it.
+    reject_unrefreshed_reads: bool,
+    /// Once the index is seen holding a session or a completed refresh it cannot go back, so
+    /// the check stops querying.
+    observed_refreshed: std::cell::Cell<bool>,
 }
 
 const MESSAGE_INPUT_INDEXES_SQL: &str =
@@ -960,6 +967,8 @@ impl Db {
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             implicit_index_maintenance: true,
             progress: None,
+            reject_unrefreshed_reads: false,
+            observed_refreshed: std::cell::Cell::new(false),
         };
         if !index_write_compatible(&db.conn)? {
             db.configure_query_connection()?;
@@ -1057,6 +1066,8 @@ impl Db {
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             implicit_index_maintenance: false,
             progress: None,
+            reject_unrefreshed_reads: false,
+            observed_refreshed: std::cell::Cell::new(false),
         })
     }
 
@@ -1360,6 +1371,25 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Control whether typed reads refuse an index that has never been refreshed.
+    pub(crate) fn set_reject_unrefreshed_reads(&mut self, reject: bool) {
+        self.reject_unrefreshed_reads = reject;
+    }
+
+    /// Fail with [`crate::ServiceError::IndexNotRefreshed`] when reads are guarded and the index
+    /// holds no sessions and has no completed refresh. One cached boolean after the first pass.
+    pub(crate) fn ensure_refreshed_for_read(&self) -> Result<()> {
+        if !self.reject_unrefreshed_reads || self.observed_refreshed.get() {
+            return Ok(());
+        }
+        if self.has_sessions()? || self.auto_reindex_completed_at()?.is_some() {
+            self.observed_refreshed.set(true);
+            return Ok(());
+        }
+        let path = self.conn.path().unwrap_or_default();
+        Err(crate::ServiceError::index_not_refreshed(Path::new(path)).into())
     }
 
     /// Control whether reads may build persistent derived indexes lazily.

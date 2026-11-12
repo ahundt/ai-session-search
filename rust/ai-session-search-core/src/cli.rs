@@ -1293,6 +1293,9 @@ fn execute(cli: Cli) -> Result<()> {
     };
     // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
     app.set_progress_reporter(|message| eprintln!("aise: {message}"));
+    // The command line applies the refresh policy below and prints an empty result when another
+    // process is still writing the first index.
+    app.serve_unrefreshed_index_as_empty();
     let db = app.database();
 
     // Repair an unusable schema before a read. A usable index is served immediately; `auto`

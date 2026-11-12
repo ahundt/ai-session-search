@@ -130,19 +130,22 @@ row, and PyO3 types stay out of its public contracts, so a library consumer
 works with the same typed requests and responses every other surface uses.
 
 ```rust,no_run
-use ai_session_search::models::SearchFilters;
-use ai_session_search::service::SessionSearch;
+use ai_session_search::{SearchFilters, SessionSearch};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ai_session_search::anyhow::Result<()> {
     let app = SessionSearch::load()?;
-    // Public types are #[non_exhaustive]: start from the default and set fields. Every field but
-    // the limit keeps its default, including session_kinds, which returns both user-started
-    // sessions and the subagent runs they spawned.
-    let mut filters = SearchFilters::default();
-    filters.limit = 20;
-    let sessions = app.catalog().list_sessions(&filters)?;
-    let status = app.index().status()?;
-    println!("{} sessions; {} repairs", sessions.len(), status.repair_commands.len());
+    // Opening never reads your session files. This applies the configured refresh policy, as
+    // `aise` does before every command; with the default `auto` policy it indexes the sources
+    // the first time. Without it, reads on a never-indexed database fail with
+    // ServiceError::IndexNotRefreshed instead of reporting zero sessions.
+    app.index().prepare_for_read()?;
+    // Public types are #[non_exhaustive]: start from the default and use the with_* setters.
+    // Every other field keeps its default, including session_kinds, which returns both
+    // user-started sessions and the subagent runs they spawned.
+    let sessions = app
+        .catalog()
+        .list_sessions(&SearchFilters::default().with_limit(20))?;
+    println!("{} sessions", sessions.len());
     Ok(())
 }
 ```

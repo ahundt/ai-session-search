@@ -666,6 +666,62 @@ mod tests {
             .is_ok());
     }
 
+    /// A never-refreshed index is not mistaken for an empty history: typed reads fail with
+    /// `IndexNotRefreshed` until `prepare_for_read` applies the configured policy, which for the
+    /// default `auto` indexes the sources synchronously.
+    #[test]
+    fn a_never_refreshed_index_is_distinguishable_from_no_matches() {
+        use ai_session_search::AutoReindexOutcome;
+        let fixture = Fixture::new();
+        let app = SessionSearch::open(fixture.config()).unwrap();
+        let error = app
+            .catalog()
+            .list_sessions(&SearchFilters::default())
+            .unwrap_err();
+        assert!(matches!(
+            service_error(&error),
+            ServiceError::IndexNotRefreshed { .. }
+        ));
+        assert_eq!(service_error(&error).code(), "index-not-refreshed");
+        let error = app
+            .messages()
+            .search(
+                MessageSearchRequest::builder(
+                    MessageQuery::literal("tests").unwrap(),
+                    MessageTarget::content(),
+                )
+                .build()
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(service_error(&error).code(), "index-not-refreshed");
+
+        let outcome = app.index().prepare_for_read().unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Some(AutoReindexOutcome::Updated {
+                    sessions_updated: 2,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            app.catalog()
+                .list_sessions(&SearchFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
+        // A refreshed index that matches nothing is an ordinary empty result.
+        let none = app
+            .catalog()
+            .list_sessions(&SearchFilters::default().with_path_prefix("/elsewhere"))
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
     /// Transcript windows use the CLI's signed convention: first N, last N, or all for 0.
     #[test]
     fn transcript_window_reads_first_last_or_all_lines() {
