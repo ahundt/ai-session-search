@@ -115,7 +115,6 @@ pub(crate) fn is_attachment_message(message: &crate::models::Message) -> bool {
 struct AttachmentRows {
     rows: Vec<RawMessage>,
     by_identity: HashMap<String, Vec<usize>>,
-    malformed: usize,
     binary: usize,
 }
 
@@ -141,7 +140,63 @@ impl AttachmentRows {
             .push(row.with_native_event_identity(MessageCorrelationAuthority::Anthropic, identity));
     }
 
-    fn read(&mut self, attachment: &Value, health: &mut UnrecognizedRecordTypes) {
+    // Only named text fields are read: paths, encodings and other metadata are not content.
+    fn text(&mut self, kind: &str, path: Option<&str>, value: &Value) -> bool {
+        if matches!(value["type"].as_str(), Some("image" | "binary" | "base64")) {
+            self.binary += 1;
+            return true;
+        }
+        match value {
+            Value::String(text) => {
+                self.push(kind, path, text);
+                true
+            }
+            Value::Array(values) => {
+                let mut found = values.is_empty();
+                for value in values {
+                    found |= self.text(kind, path, value);
+                }
+                found
+            }
+            Value::Object(fields) => {
+                let path = fields
+                    .get("filePath")
+                    .or_else(|| fields.get("path"))
+                    .and_then(Value::as_str)
+                    .or(path);
+                let mut found = false;
+                for key in ["file", "content", "text", "snippet"] {
+                    if let Some(value) = fields.get(key) {
+                        found |= self.text(kind, path, value);
+                    }
+                }
+                found
+            }
+            _ => false,
+        }
+    }
+
+    fn context(&mut self, path: Option<&str>, value: &Value) -> bool {
+        match value {
+            Value::String(text) => {
+                self.push("session_context", path, text);
+                true
+            }
+            Value::Object(fields) => {
+                let mut readable = true;
+                for (key, value) in fields {
+                    let key = key.replace('~', "~0").replace('/', "~1");
+                    let path = path.map_or(key.clone(), |parent| format!("{parent}/{key}"));
+                    readable &= self.context(Some(&path), value);
+                }
+                readable
+            }
+            _ => false,
+        }
+    }
+
+    fn read(&mut self, record: &Value, health: &mut UnrecognizedRecordTypes) {
+        let attachment = &record["attachment"];
         let kind = attachment
             .get("type")
             .and_then(Value::as_str)
@@ -149,51 +204,34 @@ impl AttachmentRows {
         let path = attachment.get("filename").and_then(Value::as_str);
         match kind {
             "file" => {
-                let content = &attachment["content"];
-                if matches!(
-                    content["type"].as_str(),
-                    Some("image" | "binary" | "base64")
-                ) {
-                    self.binary += 1;
-                } else if let Some(text) = content["file"]["content"].as_str() {
-                    let path = content["file"]["filePath"].as_str().or(path);
-                    self.push(kind, path, text);
-                } else {
-                    self.malformed += 1;
+                if !self.text(kind, path, &attachment["content"])
+                    && !self.text(kind, path, &record["rendered"])
+                {
+                    health.layout(kind, "text missing", &attachment["content"]);
                 }
             }
-            "edited_text_file" => match attachment["snippet"].as_str() {
-                Some(text) => self.push(kind, path, text),
-                None => self.malformed += 1,
-            },
+            "edited_text_file" => {
+                if !self.text(kind, path, attachment) && !self.text(kind, path, &record["rendered"])
+                {
+                    health.layout(kind, "text missing", attachment);
+                }
+            }
             "instructions" => {
-                let Some(files) = attachment["files"].as_array() else {
-                    self.malformed += 1;
-                    return;
-                };
-                for file in files {
-                    if matches!(file["type"].as_str(), Some("image" | "binary" | "base64")) {
-                        self.binary += 1;
-                    } else if let Some(text) = file["content"].as_str() {
-                        self.push(kind, file["path"].as_str(), text);
-                    } else {
-                        self.malformed += 1;
+                if let Some(files) = attachment["files"].as_array() {
+                    for file in files {
+                        if !self.text(kind, file["path"].as_str(), file) {
+                            health.layout(kind, "files text missing", file);
+                        }
                     }
+                } else if !self.text(kind, path, attachment)
+                    && !self.text(kind, path, &record["rendered"])
+                {
+                    health.layout(kind, "files not array", attachment);
                 }
             }
             "session_context" => {
-                if let Some(text) = attachment["context"].as_str() {
-                    self.push(kind, None, text);
-                } else if let Some(context) = attachment["context"].as_object() {
-                    for (name, value) in context {
-                        if let Some(text) = value.as_str() {
-                            self.push(kind, Some(name), text);
-                        } else {
-                            self.malformed += 1;
-                        }
-                    }
-                } else {
-                    self.malformed += 1;
+                if !self.context(None, &attachment["context"]) {
+                    health.layout(kind, "context not strings", &attachment["context"]);
                 }
             }
             _ => health.count(Some(&format!("attachment/{kind}"))),
@@ -226,6 +264,26 @@ impl UnrecognizedRecordTypes {
             Self::OVERFLOW.to_string()
         };
         *self.counts.entry(name).or_default() += 1;
+    }
+
+    fn layout(&mut self, kind: &str, difference: &str, value: &Value) {
+        let keys = value
+            .as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+            .unwrap_or_else(|| {
+                match value {
+                    Value::Null => "null",
+                    Value::Array(_) => "array",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::String(_) => "string",
+                    Value::Object(_) => unreachable!(),
+                }
+                .to_owned()
+            });
+        self.count(Some(&format!(
+            "attachment/{kind} ({difference}; keys: {keys})"
+        )));
     }
 
     fn warning(&self) -> Option<String> {
@@ -728,9 +786,13 @@ impl ClaudeAdapter {
                             queued_commands.push(queued);
                         }
                     } else if value["attachment"]["type"] != "queued_command" {
-                        attachments.read(&value["attachment"], &mut unrecognized);
+                        attachments.read(&value, &mut unrecognized);
                     } else {
-                        attachments.malformed += 1;
+                        unrecognized.layout(
+                            "queued_command",
+                            "prompt not string",
+                            &value["attachment"],
+                        );
                     }
                     continue;
                 }
@@ -1125,12 +1187,6 @@ impl ClaudeAdapter {
 
         let parse_warning = [
             super::malformed_jsonl_warning(malformed_line_count),
-            (attachments.malformed > 0).then(|| {
-                format!(
-                    "skipped {} malformed attachment payloads",
-                    attachments.malformed
-                )
-            }),
             (attachments.binary > 0)
                 .then(|| format!("skipped {} binary attachment payloads", attachments.binary)),
             unrecognized.warning(),
@@ -4518,12 +4574,7 @@ mod tests {
             .any(|(_, kind, content)| *kind == MessageKind::ToolCall
                 && content.contains("first draft")));
         assert!(!parsed.transcript_text.contains("first draft"));
-        for needle in [
-            "while you were working",
-            "coding agent",
-            "contributing guide",
-            "future record",
-        ] {
+        for needle in ["while you were working", "coding agent", "future record"] {
             assert!(
                 rows.iter().all(|(_, _, content)| !content.contains(needle)),
                 "{needle:?} is harness or unknown-record text: {rows:#?}"
@@ -4534,10 +4585,11 @@ mod tests {
             .filter(|(_, kind, _)| *kind == MessageKind::HarnessNotice)
             .map(|(_, _, content)| *content)
             .collect();
-        assert_eq!(notices.len(), 3, "{notices:#?}");
+        assert_eq!(notices.len(), 4, "{notices:#?}");
         assert!(notices[0].starts_with("<task-notification>"));
         assert!(notices[1].starts_with("Background job report"));
         assert!(notices[2].starts_with("Stop hook feedback"));
+        assert!(notices[3].contains("contributing guide"));
         assert_eq!(
             rows.iter()
                 .filter(|(role, _, _)| *role == Role::Compaction)
@@ -4638,7 +4690,7 @@ mod tests {
             assert_eq!(
                 count(
                     "select count(*) from messages where content like '%while you were working%'
-                       or content like '%future record%' or content like '%contributing guide%'"
+                       or content like '%future record%'"
                 ),
                 0,
                 "rows of declined records leave the index"
@@ -4730,7 +4782,38 @@ mod tests {
     }
 
     #[test]
-    fn malformed_attachments_are_parse_warnings_not_unknown_record_types() {
+    fn attachment_text_is_recovered_from_alternate_layouts() {
+        let records = [
+            json!({"type":"file","filename":"/tmp/a","content":"direct\r\n"}),
+            json!({"type":"file","content":{"file":{"filePath":"/tmp/b","text":"inner text"}}}),
+            json!({"type":"edited_text_file","filename":"/tmp/c","content":{"text":"alternate snippet"}}),
+            json!({"type":"instructions","content":"alternate instructions"}),
+            json!({"type":"session_context","context":{"nested":{"status":"nested context\r\n"},"empty":{}}}),
+            json!({"type":"session_context","context":{}}),
+            json!({"type":"session_context","context":"direct context"}),
+        ];
+        let mut rows = super::AttachmentRows::default();
+        let mut health = super::UnrecognizedRecordTypes::default();
+        for record in records {
+            rows.read(&json!({"attachment":record}), &mut health);
+        }
+        let texts = rows.rows.iter().map(|m| m.content()).collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "direct\r\n",
+                "inner text",
+                "alternate snippet",
+                "alternate instructions",
+                "nested context\r\n",
+                "direct context"
+            ]
+        );
+        assert!(health.counts.is_empty(), "{:?}", health.counts);
+    }
+
+    #[test]
+    fn unread_attachment_layouts_are_bounded_health_entries() {
         let temp = tempdir().unwrap();
         let records = [
             json!({"type":"attachment","attachment":{"type":"instructions","files":false}}),
@@ -4752,19 +4835,19 @@ mod tests {
             .unwrap();
         let warning = parsed.session.parse_warning.as_deref().unwrap();
         assert!(
-            warning.contains("skipped 3 malformed attachment payloads"),
+            warning.contains("attachment/instructions (files not array; keys: files,type)"),
             "{warning}"
         );
         assert!(
             warning.contains("skipped 1 binary attachment payload"),
             "{warning}"
         );
-        assert!(!warning.contains("unrecognized"), "{warning}");
+        assert!(!warning.contains("malformed"), "{warning}");
         let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
         db.upsert_session(&parsed, 1, 1).unwrap();
         let health = db.parser_health().unwrap();
         assert_eq!(health.parse_warnings, 1);
-        assert!(health.unrecognized_record_types.is_empty());
+        assert_eq!(health.unrecognized_record_types.len(), 3);
         assert!(parsed.messages.is_empty());
     }
 
@@ -4851,13 +4934,13 @@ mod tests {
         assert!(db.search_messages("sentinel", &human).unwrap().is_empty());
         let health = db.parser_health().unwrap();
         assert_eq!(health.parse_warnings, 1);
-        assert_eq!(health.unrecognized_record_types.len(), 1);
-        assert_eq!(
-            health.unrecognized_record_types[0].record_type,
-            "attachment/future-attachment"
-        );
+        assert_eq!(health.unrecognized_record_types.len(), 2);
+        assert!(health
+            .unrecognized_record_types
+            .iter()
+            .any(|t| t.record_type == "attachment/future-attachment"));
         let warning = parsed.session.parse_warning.as_deref().unwrap();
-        assert!(warning.contains("skipped 1 malformed attachment payload"));
+        assert!(warning.contains("attachment/file (text missing; keys: type)"));
         assert!(warning.contains("skipped 1 binary attachment payload"));
     }
 

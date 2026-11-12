@@ -250,7 +250,10 @@ fn cli_corrections_repeats_and_doctor_read_only_typed_text() {
     let doctor = indexed.aise().arg("doctor").output().unwrap();
     let stdout = String::from_utf8_lossy(&doctor.stdout);
     assert!(stdout.contains("Parse warnings indexed: 1"), "{stdout}");
-    assert!(!stdout.contains("attachment/instructions"), "{stdout}");
+    assert!(
+        stdout.contains("attachment/instructions (files not array; keys: files,type)"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains(
             r#"Unrecognized record type, not indexed: claude "future-record" (1 records in 1 sessions)"#
@@ -368,7 +371,8 @@ fn mcp_corrections_search_and_status_read_only_typed_text() {
     let unrecognized = &results[&6]["parser_health"]["unrecognized_record_types"];
     assert_eq!(
         unrecognized,
-        &json!([{"provider": "claude", "record_type": "future-record",
+        &json!([{"provider": "claude", "record_type": "attachment/instructions (files not array; keys: files,type)",
+                 "records": 1, "sessions": 1}, {"provider": "claude", "record_type": "future-record",
                  "records": 1, "sessions": 1}]),
         "{:#}",
         results[&6]

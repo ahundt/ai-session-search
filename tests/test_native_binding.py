@@ -913,7 +913,8 @@ def test_run_skill_and_search_read_only_what_people_typed_in_claude_records(
     assert health.parse_warnings == 1
     unrecognized = health.unrecognized_record_types
     assert [(item.provider, item.record_type, item.records, item.sessions) for item in unrecognized] == [
-        ("claude", "future-record", 1, 1)
+        ("claude", "attachment/instructions (files not array; keys: files,type)", 1, 1),
+        ("claude", "future-record", 1, 1),
     ]
 
 

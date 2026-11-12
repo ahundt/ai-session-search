@@ -25,3 +25,4 @@
 {"type":"api-request-blob","sessionId":"cafe0002-cafe-cafe-cafe-000000000001","hash":"h-summary","message":{"role":"user","content":[{"type":"text","text":"This session is being continued from a previous conversation. Summary: you didn't finish the migration."}]}}
 {"type":"api-request-blob","sessionId":"cafe0002-cafe-cafe-cafe-000000000001","hash":"h-reminder","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>you should have read the contributing guide</system-reminder>"}]}}
 {"type":"future-record","uuid":"f-1","timestamp":"2026-10-30T10:00:13Z","sessionId":"cafe0002-cafe-cafe-cafe-000000000001","message":{"role":"user","content":[{"type":"text","text":"future record text"},{"type":"tool_use","id":"toolu_future","name":"Bash","input":{"command":"echo future"}}]}}
+{"type":"attachment","uuid":"unread-layout","sessionId":"cafe0002-cafe-cafe-cafe-000000000001","attachment":{"type":"instructions","files":false}}
