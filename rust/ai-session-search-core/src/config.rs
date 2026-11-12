@@ -791,6 +791,7 @@ pub enum SearchOperation {
     MessageSearch,
 }
 
+/// Versioned defaults for one search operation, stored in `[search.purposes]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 // Strict: versioned purpose/policy bundles must not silently lose a future restriction.
 #[serde(deny_unknown_fields)]
@@ -800,6 +801,18 @@ pub struct PurposeDefinition {
     pub operation: SearchOperation,
     #[serde(default)]
     pub preferences: MessagePurposePreferences,
+}
+
+impl PurposeDefinition {
+    /// Define an operation's purpose with no preference overrides. Construction is O(1);
+    /// set the public `preferences` fields before adding it to `Config::search.purposes`.
+    pub fn new(version: NonZeroU32, operation: SearchOperation) -> Self {
+        Self {
+            version,
+            operation,
+            preferences: MessagePurposePreferences::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

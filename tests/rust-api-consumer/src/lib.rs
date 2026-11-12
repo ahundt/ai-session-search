@@ -1015,6 +1015,29 @@ mod tests {
     }
 
     #[test]
+    fn purpose_definitions_can_be_constructed_without_deserializing_private_fields() {
+        use ai_session_search::config::{PurposeDefinition, SearchOperation};
+        let mut purpose = PurposeDefinition::new(
+            std::num::NonZeroU32::new(2).unwrap(),
+            SearchOperation::MessageSearch,
+        );
+        assert_eq!(purpose.version.get(), 2);
+        assert_eq!(purpose.operation, SearchOperation::MessageSearch);
+        assert!(purpose.preferences.default_limit.is_none());
+        purpose.preferences.default_limit = std::num::NonZeroUsize::new(3);
+        let mut config = ai_session_search::Config::default();
+        config.search.purposes.insert("review".into(), purpose);
+        assert_eq!(
+            config.search.purposes["review"]
+                .preferences
+                .default_limit
+                .unwrap()
+                .get(),
+            3
+        );
+    }
+
+    #[test]
     fn root_reexports_reach_every_service_on_an_indexed_fixture() {
         let fixture = Fixture::new();
         let app = fixture.indexed();
