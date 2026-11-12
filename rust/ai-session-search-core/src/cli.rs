@@ -30,7 +30,7 @@ use crate::service::SessionSearch;
 use crate::tui;
 use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
-    resume_plan, select_transcript_lines, truncate_for_display,
+    select_transcript_lines, truncate_for_display,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -1406,8 +1406,11 @@ fn execute(cli: Cli) -> Result<()> {
             }
         }
         Commands::Resume(args) => {
-            let session = db.resolve_session_record(&args.id)?;
-            let (cmd, cwd) = resume_plan(&session)?;
+            let plan = app.catalog().resume_command(&args.id)?;
+            let (cmd, cwd) = match plan.argv {
+                Some(argv) => (argv, plan.cwd),
+                None => bail!("{}", plan.unavailable_reason.unwrap_or_default()),
+            };
             let rendered = render_posix_shell_command(&cmd)?;
             println!("POSIX shell resume command: {rendered}");
             println!("{}", crate::util::RESUME_COMMAND_POLICY_NOTE);

@@ -449,9 +449,13 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            // Tests run in parallel and the clock can repeat within one process, so a counter
+            // keeps each fixture's directory its own.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let root = std::env::temp_dir().join(format!(
-                "aise-api-consumer-{}-{}",
+                "aise-api-consumer-{}-{}-{}",
                 std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -660,6 +664,33 @@ mod tests {
         assert!(SqlService::new(&restricted)
             .schema(&SqlSchemaQuery::default())
             .is_ok());
+    }
+
+    /// The resume command is a named struct; a session the provider cannot reopen has no argv
+    /// and says why.
+    #[test]
+    fn resume_command_names_argv_cwd_or_why_not() {
+        use ai_session_search::ResumeCommand;
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        let plan: ResumeCommand = app.catalog().resume_command("claude:consumer-a").unwrap();
+        assert_eq!(plan.session_id, "claude:consumer-a");
+        match &plan.argv {
+            Some(argv) => {
+                assert_eq!(argv, &["claude", "--resume", "consumer-a"]);
+                assert!(plan.unavailable_reason.is_none());
+            }
+            // The test machine may not have the `claude` CLI on PATH; the reason says so.
+            None => {
+                let reason = plan.unavailable_reason.as_deref().unwrap();
+                assert!(reason.contains("`claude` is not on your PATH"), "{reason}");
+                assert!(plan.cwd.is_none());
+            }
+        }
+        // `/r` does not exist on the test machine, so no working directory is offered.
+        assert!(plan.cwd.is_none());
+        let error = app.catalog().resume_command("claude:nope").unwrap_err();
+        assert_eq!(service_error(&error).code(), "session-not-found");
     }
 
     /// Recurring phrases come back typed, with the count of queued messages left out because

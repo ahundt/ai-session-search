@@ -30,8 +30,8 @@ use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
-    current_repo, normalize_path_prefix, render_posix_shell_command, resume_plan,
-    select_transcript_lines, truncate_for_display,
+    current_repo, normalize_path_prefix, render_posix_shell_command, select_transcript_lines,
+    truncate_for_display,
 };
 
 /// Context radius in the generated one-call `get_session` continuation for a message hit.
@@ -5311,10 +5311,13 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
 
-    let session = db
-        .resolve_session_record(session_id)
+    let plan = crate::service::CatalogService::new(db)
+        .resume_command(session_id)
         .map_err(|e| format!("{e:#}"))?;
-    let (command, cwd) = resume_plan(&session).map_err(|e| format!("{e:#}"))?;
+    let Some(command) = plan.argv else {
+        return Err(plan.unavailable_reason.unwrap_or_default());
+    };
+    let cwd = plan.cwd;
 
     let cmd_str = render_posix_shell_command(&command).map_err(|error| format!("{error:#}"))?;
     // The text is the ready-to-run command; structured output names the resolved session
@@ -5328,7 +5331,7 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String
         None => (cmd_str, Value::Null),
     };
     let structured = json!({
-        "session_id": session.id,
+        "session_id": plan.session_id,
         "resume_command": resume_command.clone(),
         "cwd": cwd_value,
     });

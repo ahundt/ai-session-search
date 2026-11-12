@@ -2369,6 +2369,23 @@ impl<'app> IndexService<'app> {
     }
 }
 
+/// How to reopen one session in its provider's CLI, from [`CatalogService::resume_command`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct ResumeCommand {
+    /// Canonical id of the resolved session.
+    pub session_id: String,
+    /// Program and arguments, for example `["claude", "--resume", "<id>"]`. `None` means this
+    /// session cannot be resumed here; see `unavailable_reason`.
+    pub argv: Option<Vec<String>>,
+    /// Directory to run `argv` in: the session's recorded working directory when it still
+    /// exists, otherwise `None`.
+    pub cwd: Option<String>,
+    /// Why `argv` is `None`, naming `aise show` and `aise export` as ways to read the session.
+    /// `None` whenever `argv` is set.
+    pub unavailable_reason: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 /// Typed session listing, search, resolution, and compact inspection operations.
 pub struct CatalogService<'db> {
@@ -2451,6 +2468,38 @@ impl<'db> CatalogService<'db> {
     /// Resolve one canonical session ID or unique prefix; ambiguous errors list candidates.
     pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
         self.db.resolve_session_record(id_or_prefix)
+    }
+
+    /// The native command that reopens a session in the provider's own CLI, without running it.
+    ///
+    /// `id_or_prefix` resolves like [`CatalogService::resolve_session`]. When the provider can
+    /// reopen the session, [`ResumeCommand::argv`] holds the program and its arguments; when it
+    /// cannot (a provider with no resume command, a Claude subagent run, or a provider CLI that
+    /// is not on `PATH`), `argv` is `None` and [`ResumeCommand::unavailable_reason`] says why
+    /// and how to read the session instead. The command carries the provider's resume verb and
+    /// the session id only, never local permission or approval flags
+    /// ([`crate::util::RESUME_COMMAND_POLICY_NOTE`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) or
+    /// [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous).
+    pub fn resume_command(&self, id_or_prefix: &str) -> Result<ResumeCommand> {
+        let session = self.db.resolve_session_record(id_or_prefix)?;
+        Ok(match crate::util::resume_plan(&session) {
+            Ok((argv, cwd)) => ResumeCommand {
+                session_id: session.id,
+                argv: Some(argv),
+                cwd,
+                unavailable_reason: None,
+            },
+            Err(reason) => ResumeCommand {
+                session_id: session.id,
+                argv: None,
+                cwd: None,
+                unavailable_reason: Some(format!("{reason:#}")),
+            },
+        })
     }
 
     /// Build a bounded evidence summary for one resolved session without filesystem writes.
