@@ -121,6 +121,9 @@ Path arguments also accept `pathlib.Path` and other `os.PathLike` values. `DateR
 accepts `datetime.date` and `datetime.datetime` as well as text; it sends their ISO representation
 to the shared Rust date parser. Naive datetimes use the same local-zone rule as timestamp text.
 
+File queries default to all matching files and versions (`limit=0`), as on the CLI and in Rust.
+Set a positive limit and offset to page a large edit history.
+
 `SessionQuery` and `FileQuery` accept either flat `provider`, `path_prefix`, and `dates`
 filters or `scope=QueryScope(...)`. File queries also accept a flat `session_id`.
 `MessageSearchRequest` accepts the same flat filters or a `QueryScope`; its path filter means

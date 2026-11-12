@@ -350,3 +350,14 @@ def test_native_errors_and_fuzzy_help_name_python_actions(corpus):
     assert "aise list" not in str(missing.value)
     doc = aise.SessionSearch.search_messages.__doc__
     assert doc and "letters in order" in doc
+
+
+@pytest.mark.integration
+def test_file_query_default_matches_cli_without_hidden_fifty_row_limit(corpus):
+    with sqlite3.connect(corpus.db_path) as db:
+        for n in range(60):
+            db.execute("INSERT INTO file_edits (session_id, provider, seq, tool, file_path, file_name, new_content) VALUES ('claude:synthetic-0', 'claude', ?, 'Write', ?, ?, 'fixture')", (100 + n, f"/synthetic/generated-{n}.py", f"generated-{n}.py"))
+    files = corpus.search_files("generated-*.py")
+    assert len(files) == 60
+    assert [row.to_dict() for row in files] == cli(corpus, "files", "search", "generated-*.py", "--format", "json")
+    assert len(corpus.search_files("generated-*.py", aise.FileQuery(limit=1))) == 1

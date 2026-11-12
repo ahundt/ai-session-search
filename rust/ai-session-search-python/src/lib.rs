@@ -3758,7 +3758,7 @@ struct FileQuery {
 python_value! { FileQuery, slf => value_fields(slf.as_any(), &["scope","min_edits","max_edits","limit","offset"]);
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=50, offset=0, provider=None, session_id=None, path_prefix=None, exclusions=None, dates=None))]
+    #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=0, offset=0, provider=None, session_id=None, path_prefix=None, exclusions=None, dates=None))]
     fn new(
         scope: Option<QueryScope>,
         min_edits: Option<i64>,
@@ -3795,7 +3795,7 @@ impl Default for FileQuery {
             scope: QueryScope::default(),
             min_edits: None,
             max_edits: None,
-            limit: 50,
+            limit: 0,
             offset: 0,
         }
     }

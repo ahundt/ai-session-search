@@ -1365,7 +1365,7 @@ class FileQuery:
         scope: QueryScope | None = None,
         min_edits: int | None = None,
         max_edits: int | None = None,
-        limit: int = 50,
+        limit: int = 0,
         offset: int = 0,
         provider: _ProviderId | None = None,
         session_id: str | None = None,
