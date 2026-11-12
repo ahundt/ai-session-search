@@ -582,11 +582,15 @@ impl std::str::FromStr for CliMessageSearchInclude {
             "none" => return Ok(Self::None),
             "normalized_session_metadata" => MessageSearchInclude::NormalizedSessionMetadata,
             "parsed_references" => MessageSearchInclude::ParsedReferences,
-            "raw_provider_metadata" => MessageSearchInclude::RawProviderMetadata,
+            "raw-metadata" => MessageSearchInclude::RawProviderMetadata,
+            "raw_provider_metadata" => {
+                eprintln!("aise: --include raw_provider_metadata is deprecated; use --include raw-metadata");
+                MessageSearchInclude::RawProviderMetadata
+            },
             "runtime_diagnostics" => MessageSearchInclude::RuntimeDiagnostics,
             _ => {
                 return Err(
-                    "expected none, normalized_session_metadata, parsed_references, raw_provider_metadata, or runtime_diagnostics"
+                    "expected none, normalized_session_metadata, parsed_references, raw-metadata, or runtime_diagnostics"
                         .to_string(),
                 )
             }
@@ -771,7 +775,8 @@ pub struct MessageSearchArgs {
     /// deterministic relevance order on the complete eligible corpus.
     #[arg(help_heading = RESULTS_HEADING, long, default_value_t = 0)]
     pub offset: usize,
-    /// Optional payload groups. Repeat or comma-delimit names; --include none requests only the
+    /// Optional payload groups. --include raw-metadata adds verbatim provider metadata;
+    /// raw_provider_metadata is a deprecated alias. Repeat or comma-delimit names; --include none requests only the
     /// semantic core and cannot be combined with another name. Omit for no optional group on this
     /// surface, which is where the CLI differs from MCP: MCP adds normalized session metadata by
     /// default because it answers across arbitrary sessions, while a CLI caller can see the paths
@@ -2380,6 +2385,22 @@ mod tests {
             "--seq-to",
             "5",
         ]);
+    }
+
+    #[test]
+    fn message_search_accepts_canonical_raw_metadata_include() {
+        assert_parses(["sg", "search", "needle", "--include", "raw-metadata"]);
+        assert_parses([
+            "sg",
+            "search",
+            "needle",
+            "--include",
+            "raw_provider_metadata",
+        ]);
+        assert_eq!(
+            "raw-metadata".parse::<CliMessageSearchInclude>().unwrap(),
+            CliMessageSearchInclude::Value(MessageSearchInclude::RawProviderMetadata)
+        );
     }
 
     #[test]
