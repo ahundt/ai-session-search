@@ -11,6 +11,9 @@
 //! Capability parsing stays in its domain module; this module only adapts those shared results to
 //! the command surface and renders rows.
 
+// This module owns the deprecated CLI row compatibility paths.
+#![allow(deprecated)]
+
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -382,9 +385,13 @@ impl SkillCapabilityStatus {
     }
 }
 
-/// One skill as `aise skills list` reports it.
+/// One skill as `aise skills list` reports it; rendering copies O(row text bytes).
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill metadata or AnalysisService::run_skill for capability execution"
+)]
 pub struct SkillSummary {
     pub name: String,
     pub ownership: SkillOwnership,
@@ -429,9 +436,13 @@ impl Row for SkillSummary {
     }
 }
 
-/// One category, at the position it is evaluated.
+/// One category, at the position it is evaluated; cells copy O(category and displayed regex bytes).
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill metadata or AnalysisService::run_skill for capability execution"
+)]
 pub struct SkillCategoryRow {
     /// 1-based evaluation position. First match wins, so this is behavior, not presentation: a
     /// message matching two categories is reported as the lower-numbered one.
@@ -471,9 +482,13 @@ pub struct SkillDetail {
     pub problem: Option<String>,
 }
 
-/// One problem found by `aise skills validate`, with the fix.
+/// One problem found by `aise skills validate`, with the fix; cells scan O(diagnostic text bytes).
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill metadata or AnalysisService::run_skill for capability execution"
+)]
 pub struct SkillDiagnostic {
     /// Which file the problem is in, relative to the skill root.
     pub file: String,
@@ -1293,6 +1308,10 @@ impl Row for crate::integrations::SkillWriteOutcome {
 ///
 /// Returns an error when a configured search path cannot be read, when two directories claim one
 /// skill name, when `show` names a skill that does not exist, or when output cannot be written.
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill management or AnalysisService::run_skill for capability execution"
+)]
 pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
     run_with_harness_home(config, cmd, receipt_path, None)
 }

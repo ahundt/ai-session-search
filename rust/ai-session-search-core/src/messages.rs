@@ -1007,7 +1007,16 @@ pub enum EvidenceInclude {
     TimeProfile,
 }
 
+/// Render a parsed messages command to standard output; cost follows the selected service operation.
+#[deprecated(
+    since = "1.1.0",
+    note = "use MessageService::search or read_session, or CatalogService::inspect"
+)]
 pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
+    run_command(db, cmd, config)
+}
+
+pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
     let cli = &config.cli;
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args, config),

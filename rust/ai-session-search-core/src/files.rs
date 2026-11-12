@@ -859,7 +859,16 @@ pub struct FilesExtractArgs {
     pub dry_run: bool,
 }
 
+/// Render a parsed files command to standard output; cost follows the selected service operation.
+#[deprecated(
+    since = "1.1.0",
+    note = "use FileService::search, history, cross_reference, or reconstruct"
+)]
 pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
+    run_command(db, cmd)
+}
+
+pub(crate) fn run_command(db: &Db, cmd: &FilesCmd) -> Result<()> {
     match cmd {
         FilesCmd::Search(args) => {
             let (since, until) = args.dates.resolve_now()?;

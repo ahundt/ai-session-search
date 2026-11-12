@@ -1050,6 +1050,53 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // These callable compatibility paths must survive this release.
+    fn api_hygiene_cli_arguments_and_row_traits_are_externally_callable() {
+        use ai_session_search::{files, messages, skills, sql_query};
+        fn args<T: clap::Args>(tokens: &[&str]) -> T {
+            let matches = T::augment_args(clap::Command::new("consumer"))
+                .try_get_matches_from(tokens)
+                .unwrap();
+            T::from_arg_matches(&matches).unwrap()
+        }
+        let fixture = Fixture::new();
+        let config = fixture.config();
+        let db = ai_session_search::db::Db::open(&fixture.root.join("direct.db")).unwrap();
+        files::run(
+            &db,
+            &files::FilesCmd::Search(args::<files::FilesSearchArgs>(&[
+                "consumer", "*.py", "--format", "json",
+            ])),
+        )
+        .unwrap();
+        messages::run(
+            &db,
+            &messages::MessagesCmd::Search(Box::new(args::<messages::MessageSearchArgs>(&[
+                "consumer", "needle", "--format", "json",
+            ]))),
+            &config,
+        )
+        .unwrap();
+        let _skill_command = skills::SkillsCmd::List(args::<skills::SkillsListArgs>(&[
+            "consumer", "--format", "json",
+        ]));
+        let _skill_adapter: fn(
+            &ai_session_search::Config,
+            skills::SkillsCmd,
+            &std::path::Path,
+        ) -> ai_session_search::anyhow::Result<()> = skills::run;
+        let query = args::<sql_query::DbQueryArgs>(&["consumer", "select 1"]);
+        assert_eq!(query.resolve(&config.db).sql, "select 1");
+        let _sql_adapter = sql_query::run;
+        assert_eq!(
+            <skills::SkillCategoryRow as ai_session_search::render::Row>::headers(),
+            &["order", "category", "regex"]
+        );
+        let _cells: fn(&skills::SkillCategoryRow) -> Vec<String> =
+            <skills::SkillCategoryRow as ai_session_search::render::Row>::cells;
+    }
+
+    #[test]
     fn purpose_definitions_can_be_constructed_without_deserializing_private_fields() {
         use ai_session_search::config::{PurposeDefinition, SearchOperation};
         let mut purpose = PurposeDefinition::new(

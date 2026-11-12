@@ -337,7 +337,16 @@ impl ResolvedDbQueryArgs {
 }
 
 impl DbQueryArgs {
+    /// Clone SQL and resolve CLI defaults in O(SQL bytes) time and memory.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use SqlService::query with SqlQuery, which resolves configured defaults"
+    )]
     pub fn resolve(&self, defaults: &crate::config::DbConfig) -> ResolvedDbQueryArgs {
+        self.resolve_options(defaults)
+    }
+
+    fn resolve_options(&self, defaults: &crate::config::DbConfig) -> ResolvedDbQueryArgs {
         ResolvedDbQueryArgs {
             sql: self.sql.clone(),
             limit: self.limit.unwrap_or(defaults.query_limit),
@@ -402,7 +411,7 @@ pub fn run(
             out.flush()?;
         }
         DbCmd::Query(args) => {
-            let resolved = args.resolve(defaults);
+            let resolved = args.resolve_options(defaults);
             let result =
                 query_path(path, busy_timeout_ms, &resolved).map_err(format_cli_query_error)?;
             let stdout = io::stdout();
@@ -1420,7 +1429,7 @@ mod tests {
             timeout_ms: None,
             format: OutputFormat::Json,
         };
-        let resolved = args.resolve(&defaults);
+        let resolved = args.resolve_options(&defaults);
         assert_eq!(resolved.limit, 17);
         assert_eq!(resolved.timeout_ms, 2500);
         assert_eq!(resolved.offset, 2);
@@ -1432,7 +1441,7 @@ mod tests {
             timeout_ms: Some(0),
             format: OutputFormat::Json,
         };
-        let resolved = args.resolve(&defaults);
+        let resolved = args.resolve_options(&defaults);
         assert_eq!(resolved.limit, 0, "explicit 0 keeps unlimited rows");
         assert_eq!(resolved.timeout_ms, 0, "explicit 0 keeps no timeout");
     }

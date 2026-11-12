@@ -1557,7 +1557,7 @@ fn execute(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config)?,
+        Commands::Messages(cmd) => crate::messages::run_command(db, &cmd, &config)?,
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
         Commands::Analyze(args) => {
             let filters = build_filters(&args.filters, 0)?;
@@ -1603,7 +1603,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
         Commands::Vocab(args) => crate::analytics::run_vocab(db, &config, &args)?,
         Commands::Repeats(args) => crate::analytics::run_repeats(db, &config, &args)?,
-        Commands::Files(cmd) => crate::files::run(db, &cmd)?,
+        Commands::Files(cmd) => crate::files::run_command(db, &cmd)?,
         Commands::Compact => {
             let before = db.storage_allocation()?.total_bytes;
             eprintln!(
