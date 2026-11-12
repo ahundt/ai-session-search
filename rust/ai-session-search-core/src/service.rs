@@ -2549,6 +2549,34 @@ impl<'db> CatalogService<'db> {
         }
     }
 
+    /// List sessions with an omitted limit resolved from `[search].default_limit`.
+    /// An explicit 0 returns all matches. Clones O(F) filter bytes, then uses the exact
+    /// ordering, validation, and query/memory bounds of [`Self::list_sessions`].
+    pub fn list_query(&self, request: &crate::models::SessionQuery) -> Result<Vec<SessionRecord>> {
+        let limit = self
+            .config
+            .map_or_else(crate::config::default_limit, |config| {
+                config.search.default_limit
+            });
+        self.list_sessions(&request.resolved_filters(limit))
+    }
+
+    /// Search with an omitted limit resolved from `[search].default_limit` and configured
+    /// scoring/repository boosts. An explicit 0 returns all matches. Clones O(F) filter bytes;
+    /// retrieval, ranking, and retained-memory bounds are those of [`Self::search_sessions`].
+    pub fn search_query(
+        &self,
+        query: &str,
+        request: &crate::models::SessionQuery,
+    ) -> Result<Vec<SearchHit>> {
+        let limit = self
+            .config
+            .map_or_else(crate::config::default_limit, |config| {
+                config.search.default_limit
+            });
+        self.search(query, &request.resolved_filters(limit))
+    }
+
     /// List filtered sessions in database order.
     ///
     /// # Complexity

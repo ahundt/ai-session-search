@@ -121,7 +121,7 @@ pub use message_search_batches::{
 pub use models::{AnalysisRequest, AnalysisSessionSelection};
 pub use models::{
     FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,
-    SessionKind,
+    SessionKind, SessionQuery,
 };
 pub use search_scope::{
     AccessRoot, AccessRootOrigin, AccessRootSource, EffectiveAccessScope, TrustedAccessInputs,

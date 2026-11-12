@@ -1356,7 +1356,8 @@ pub struct SearchFilters {
     /// Maximum sessions returned, newest first. 0 (the default) returns every matching session.
     ///
     /// The command line uses `[search].default_limit` (50) when `--limit` is omitted; this
-    /// library default is 0, so set a limit when the index may be large.
+    /// legacy library default is 0. Use [`SessionQuery`] with `CatalogService::list_query` or
+    /// `CatalogService::search_query` to resolve an omitted limit from configuration.
     pub limit: usize,
     /// Keep only sessions whose transcript produced a parse warning. Default `false`.
     pub warnings_only: bool,
@@ -2260,6 +2261,47 @@ pub struct DiagnosticStatus {
     pub index_status: IndexStatus,
     pub discovery_warnings: Vec<crate::source::ProviderDiscoveryWarning>,
     pub providers: Vec<ProviderHealth>,
+}
+
+/// Session selection with a presence-aware limit for `CatalogService::list_query` and
+/// `CatalogService::search_query`. The default omits the limit and uses `[search].default_limit`;
+/// `with_limit(0)` explicitly returns every match. Existing `SearchFilters` calls keep their
+/// historical zero-means-all behavior.
+#[derive(Debug, Clone, Default)]
+pub struct SessionQuery {
+    filters: SearchFilters,
+    limit: Option<usize>,
+}
+
+impl SessionQuery {
+    /// Preserve an existing filter's limit literally, including 0 for all. Call
+    /// `with_configured_limit` afterwards to use its structural filters with the configured
+    /// default. Moves the filter without copying its strings: O(1).
+    pub fn from_filters(filters: SearchFilters) -> Self {
+        let limit = Some(filters.limit);
+        Self { filters, limit }
+    }
+
+    /// Return at most `limit` sessions; 0 returns every match. O(1) adapter work.
+    #[must_use]
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Omit the limit so it resolves from `[search].default_limit` (50 by default).
+    /// A standalone `CatalogService::new` uses that library default. O(1) adapter work.
+    #[must_use]
+    pub fn with_configured_limit(mut self) -> Self {
+        self.limit = None;
+        self
+    }
+
+    pub(crate) fn resolved_filters(&self, configured_limit: usize) -> SearchFilters {
+        let mut filters = self.filters.clone();
+        filters.limit = self.limit.unwrap_or(configured_limit);
+        filters
+    }
 }
 
 #[cfg(test)]

@@ -830,6 +830,16 @@ announces a 5.0, or when a library consumer asks for a lighter build; a gating c
 `cargo check --no-default-features` added to the gate first, because nothing currently builds the
 feature-off configuration.
 
+Rust session limits preserve both configuration defaults and compatibility. `SessionQuery::default()`
+omits the limit; `CatalogService::list_query` and `search_query` resolve it from
+`[search].default_limit` (50 by default). `with_limit(0)` explicitly returns every match.
+`SessionQuery::from_filters` preserves the supplied `SearchFilters.limit`, including 0; callers can
+then select `with_configured_limit()` to use its structural scope with the configured default.
+The existing `list_sessions`, `search`, and explicit-scoring methods still take `SearchFilters`
+and interpret a directly assigned 0 as all. Neither the field nor those calls are deprecated.
+The consumer test `session_requests_distinguish_configured_limits_from_explicit_all_and_legacy_fields`
+uses three indexed sessions and a configured default of 2, and covers listing and ranking.
+
 ### REQ033-commit-coherent-progress
 
 Commit coherent, recoverable progress points. Commit messages name exact files or components,

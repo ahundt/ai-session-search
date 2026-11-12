@@ -416,3 +416,12 @@ membership. The [generated caller contract](../README.md#generated-message-searc
 lists the shipped defaults, and
 `aise messages search --describe --describe-surface python|rust` resolves them
 against your active configuration.
+
+### Configured Rust session limits
+
+`SessionQuery::default()` uses `[search].default_limit` when passed to
+`app.catalog().list_query(&request)` or `search_query("text", &request)`.
+Use `SessionQuery::default().with_limit(0)` for every match, or a positive limit for a finite page.
+`SessionQuery::from_filters(filters)` preserves `filters.limit`; add `.with_configured_limit()`
+to use its structural filters with the configured default. The original `SearchFilters` methods
+retain their zero-means-all behavior, including direct assignments to `limit`.

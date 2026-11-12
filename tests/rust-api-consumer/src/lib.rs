@@ -1015,6 +1015,41 @@ mod tests {
     }
 
     #[test]
+    fn session_requests_distinguish_configured_limits_from_explicit_all_and_legacy_fields() {
+        use ai_session_search::SessionQuery;
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.root.join("projects/p/consumer-c.jsonl"),
+            transcripts()[0].1.replace("consumer-a", "consumer-c"),
+        )
+        .unwrap();
+        let mut config = fixture.config();
+        config.search.default_limit = 2;
+        let app = SessionSearch::open(config).unwrap();
+        app.index().reindex_report(true).unwrap();
+        let omitted = SessionQuery::default();
+        assert_eq!(app.catalog().list_query(&omitted).unwrap().len(), 2);
+        assert_eq!(
+            app.catalog().search_query("tests", &omitted).unwrap().len(),
+            2
+        );
+        let all = SessionQuery::default().with_limit(0);
+        assert_eq!(app.catalog().list_query(&all).unwrap().len(), 3);
+        assert_eq!(app.catalog().search_query("tests", &all).unwrap().len(), 3);
+        let mut legacy = SearchFilters::default();
+        assert_eq!(legacy.limit, 0);
+        legacy.limit = 1;
+        assert_eq!(app.catalog().list_sessions(&legacy).unwrap().len(), 1);
+        assert_eq!(app.catalog().search("tests", &legacy).unwrap().len(), 1);
+        legacy.limit = 0;
+        assert_eq!(app.catalog().list_sessions(&legacy).unwrap().len(), 3);
+        let legacy_request = SessionQuery::from_filters(legacy);
+        assert_eq!(app.catalog().list_query(&legacy_request).unwrap().len(), 3);
+        let configured = legacy_request.with_configured_limit();
+        assert_eq!(app.catalog().list_query(&configured).unwrap().len(), 2);
+    }
+
+    #[test]
     fn purpose_definitions_can_be_constructed_without_deserializing_private_fields() {
         use ai_session_search::config::{PurposeDefinition, SearchOperation};
         let mut purpose = PurposeDefinition::new(
