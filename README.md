@@ -66,8 +66,10 @@ harness, so ordinary results leave them out. They are usually why an agent stopp
 `--kinds harness-notice` searches them. Claude Code also keeps a stored copy of each API request
 message (`api-request-blob` records); aise does not index those copies, so the sentence Claude Code
 wraps around a prompt typed mid-turn, and repeated turns, never count as something you wrote. The
-prompt itself is indexed once, as a queued submission. `aise doctor` names any record type a parser
-did not recognize; its records are not indexed.
+prompt itself is indexed once, as a queued submission. Attached files and edited-file snippets
+are searchable as tool results; instructions and session context use `--kinds harness-notice`.
+Attachment text is retained from its own records, once per type, path, and exact content.
+`aise doctor` names any record type a parser did not recognize; its records are not indexed.
 
 `aise skills corrections` and `aise repeats` read messages with evidence that a person typed them,
 including messages typed while the agent was working when the transcript records a human sender

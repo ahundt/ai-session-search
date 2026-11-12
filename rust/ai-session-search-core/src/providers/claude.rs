@@ -56,7 +56,8 @@ const MESSAGE_RECORD_TYPES: [&str; 3] = ["user", "assistant", "system"];
 
 /// Record types Claude Code and Claude Desktop write that are deliberately not indexed: titles,
 /// modes, request bookkeeping, file-history snapshots, progress and status events, and the
-/// `api-request-blob` request copies whose content the conversation records already hold. A type
+/// `api-request-blob` request copies; conversation and attachment text are read from their own
+/// records instead. A type
 /// in neither list is counted and named in the session's parse warning, so a new record kind
 /// appears in `aise doctor` instead of silently changing what is indexed.
 const IGNORED_RECORD_TYPES: [&str; 27] = [
@@ -94,6 +95,112 @@ const IGNORED_RECORD_TYPES: [&str; 27] = [
 /// `raw_metadata_json` key holding `{record type: count}` for records of unrecognized types,
 /// which `Db::parser_health` aggregates across sessions.
 pub(crate) const UNRECOGNIZED_RECORD_TYPES_KEY: &str = "unrecognized_record_types";
+
+const ATTACHMENT_ID_PREFIX: &str = "claude_attachment:";
+
+pub(crate) fn is_attachment_message(message: &crate::models::Message) -> bool {
+    message
+        .provenance
+        .correlation_identity
+        .as_ref()
+        .is_some_and(|identity| {
+            identity.authority == MessageCorrelationAuthority::Anthropic
+                && identity.id.starts_with(ATTACHMENT_ID_PREFIX)
+        })
+}
+
+/// Attachment bodies stay byte-exact, outside conversation and file history. The identity
+/// keeps the type and path recoverable; a digest match is checked against the full text.
+/// O(total attachment bytes) time and O(distinct attachment bytes) retained memory.
+#[derive(Default)]
+struct AttachmentRows {
+    rows: Vec<RawMessage>,
+    by_identity: HashMap<String, Vec<usize>>,
+}
+
+impl AttachmentRows {
+    fn push(&mut self, kind: &str, path: Option<&str>, text: &str) {
+        let identity = format!(
+            "{ATTACHMENT_ID_PREFIX}{}",
+            json!([kind, path, sha256(text.as_bytes())])
+        );
+        let positions = self.by_identity.entry(identity.clone()).or_default();
+        if positions.iter().any(|&i| self.rows[i].content() == text) {
+            return;
+        }
+        let row = if matches!(kind, "instructions" | "session_context") {
+            RawMessage::harness_notice(text.to_owned(), None)
+        } else {
+            // Included file text came through the harness; it is searchable but was not typed.
+            RawMessage::tool_result_with_name(None, text.to_owned(), None, None)
+                .with_authorship(MessageAuthorship::Harness)
+        };
+        positions.push(self.rows.len());
+        self.rows
+            .push(row.with_native_event_identity(MessageCorrelationAuthority::Anthropic, identity));
+    }
+
+    fn read(&mut self, attachment: &Value, health: &mut UnrecognizedRecordTypes) {
+        let kind = attachment
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("(no type)");
+        let malformed = format!("attachment/{kind} (malformed)");
+        let binary = format!("attachment/{kind} (binary)");
+        let path = attachment.get("filename").and_then(Value::as_str);
+        match kind {
+            "file" => {
+                let content = &attachment["content"];
+                if matches!(
+                    content["type"].as_str(),
+                    Some("image" | "binary" | "base64")
+                ) {
+                    health.count(Some(&binary));
+                } else if let Some(text) = content["file"]["content"].as_str() {
+                    let path = content["file"]["filePath"].as_str().or(path);
+                    self.push(kind, path, text);
+                } else {
+                    health.count(Some(&malformed));
+                }
+            }
+            "edited_text_file" => match attachment["snippet"].as_str() {
+                Some(text) => self.push(kind, path, text),
+                None => health.count(Some(&malformed)),
+            },
+            "instructions" => {
+                let Some(files) = attachment["files"].as_array() else {
+                    health.count(Some(&malformed));
+                    return;
+                };
+                for file in files {
+                    if matches!(file["type"].as_str(), Some("image" | "binary" | "base64")) {
+                        health.count(Some(&binary));
+                    } else if let Some(text) = file["content"].as_str() {
+                        self.push(kind, file["path"].as_str(), text);
+                    } else {
+                        health.count(Some(&malformed));
+                    }
+                }
+            }
+            "session_context" => {
+                if let Some(text) = attachment["context"].as_str() {
+                    self.push(kind, None, text);
+                } else if let Some(context) = attachment["context"].as_object() {
+                    for (name, value) in context {
+                        if let Some(text) = value.as_str() {
+                            self.push(kind, Some(name), text);
+                        } else {
+                            health.count(Some(&malformed));
+                        }
+                    }
+                } else {
+                    health.count(Some(&malformed));
+                }
+            }
+            _ => health.count(Some(&format!("attachment/{kind}"))),
+        }
+    }
+}
 
 /// Records of types in neither `MESSAGE_RECORD_TYPES` nor `IGNORED_RECORD_TYPES`, by type name.
 /// Bounded: at most `MAX_TYPES` names of at most `MAX_NAME_CHARS` characters each are kept, and
@@ -506,6 +613,7 @@ impl ClaudeAdapter {
         let mut earlier_assistant_rows = Vec::new();
         // Retain fixed-size digests rather than another copy of the transcript's bodies.
         let mut seen_records = std::collections::HashSet::new();
+        let mut attachments = AttachmentRows::default();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -581,9 +689,12 @@ impl ClaudeAdapter {
                     continue;
                 }
                 Some("attachment") => {
-                    if event_id.is_some_and(|id| {
-                        !seen_records.insert((id.to_owned(), sha256(value.to_string().as_bytes())))
-                    }) {
+                    if value["attachment"]["type"] == "queued_command"
+                        && event_id.is_some_and(|id| {
+                            !seen_records
+                                .insert((id.to_owned(), sha256(value.to_string().as_bytes())))
+                        })
+                    {
                         continue;
                     }
                     if let Some(queued) = QueuedCommand::from_attachment(
@@ -597,6 +708,10 @@ impl ClaudeAdapter {
                         // the whole file, so a tail slice cannot decide it alone.
                         requires_full_parse_for_tail = true;
                         queued_commands.push(queued);
+                    } else if value["attachment"]["type"] != "queued_command" {
+                        attachments.read(&value["attachment"], &mut unrecognized);
+                    } else {
+                        unrecognized.count(Some("attachment/queued_command (malformed)"));
                     }
                     continue;
                 }
@@ -1052,6 +1167,7 @@ impl ClaudeAdapter {
         } else {
             UserRoleAuthorshipEvidence::HumanInputEvent
         };
+        messages.extend(attachments.rows);
         let mut messages = crate::util::normalize_raw_messages_with_evidence(
             messages,
             Some(&session.id),
@@ -4577,6 +4693,217 @@ mod tests {
     }
 
     #[test]
+    fn attachment_text_is_exact_distinct_and_has_existing_search_visibility() {
+        use crate::models::{MessageFilters, MessageKind, Role};
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("attachments.jsonl");
+        let instruction = json!({"type":"instructions","files":[{"path":"/tmp/CLAUDE.md","content":"instruction sentinel\r\n"}]});
+        let file = |name: &str, text: &str| json!({"type":"file","filename":name,"content":{"type":"text","file":{"filePath":name,"content":text}}});
+        let long = format!("  file sentinel\r\n{}\r\n", "x".repeat(200_000));
+        let mut attachments = vec![instruction; 20];
+        attachments.extend([
+            file("/tmp/a", &long), file("/tmp/a", &long), file("/tmp/b", &long),
+            file("/tmp/a", "changed sentinel"), file("/tmp/c", ""), file("/tmp/d", ""),
+            json!({"type":"edited_text_file","filename":"/tmp/e","snippet":" edited sentinel\r\n"}),
+            json!({"type":"session_context","context":{"gitStatus":"context sentinel\r\n","userEmail":"synthetic@example.invalid"}}),
+            json!({"type":"file","content":{"type":"image","source":{"type":"base64","data":"YWJj"}}}),
+            json!({"type":"file","content":{"type":"text"}}),
+            json!({"type":"future-attachment","content":"not stored"}),
+        ]);
+        let lines = attachments.into_iter().enumerate().map(|(i, a)| json!({"type":"attachment","uuid":format!("a{i}"),"sessionId":"attachments","attachment":a}).to_string()).collect::<Vec<_>>().join("\n");
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(std::io::Cursor::new(lines), &path)
+            .unwrap();
+        assert_eq!(parsed.messages.len(), 9);
+        assert_eq!(
+            parsed.messages.iter().filter(|m| m.content == long).count(),
+            2
+        );
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .filter(|m| m.content.is_empty())
+                .count(),
+            2
+        );
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|m| m.content == " edited sentinel\r\n"));
+        assert!(parsed.file_edits.is_empty());
+        assert!(parsed.retracted.messages.is_empty());
+        assert!(parsed.transcript_text.is_empty());
+        let db = crate::db::Db::open(&temp.path().join("attachments.db")).unwrap();
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        assert_eq!(
+            db.search_messages("file sentinel", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            db.search_messages("edited sentinel", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .search_messages("instruction sentinel", &MessageFilters::default())
+            .unwrap()
+            .is_empty());
+        let notices = MessageFilters {
+            kinds: Some(vec![MessageKind::HarnessNotice]),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_messages("instruction sentinel", &notices)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages("context sentinel", &notices)
+                .unwrap()
+                .len(),
+            1
+        );
+        let human = MessageFilters {
+            role: Some(Role::User),
+            ..Default::default()
+        };
+        assert!(db.search_messages("sentinel", &human).unwrap().is_empty());
+        let health = db.parser_health().unwrap();
+        for name in [
+            "attachment/file (binary)",
+            "attachment/file (malformed)",
+            "attachment/future-attachment",
+        ] {
+            assert!(
+                health
+                    .unrecognized_record_types
+                    .iter()
+                    .any(|r| r.record_type == name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_identity_survives_rewrites_archiving_and_incremental_appends() {
+        use std::io::Write;
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("attachment-tail.jsonl");
+        let adapter = ClaudeAdapter::new(vec![]);
+        let line = |uuid: &str, body: &str| {
+            format!(
+                "{}\n",
+                json!({"type":"attachment","uuid":uuid,"sessionId":"attachment-tail","attachment":{"type":"instructions","files":[{"path":"/tmp/CLAUDE.md","content":body}]}})
+            )
+        };
+        let first = line("first", "retained rule\r\n");
+        let repeats = [
+            line("second", "retained rule\r\n"),
+            line("third", "changed rule\r\n"),
+            line("fourth", "retained rule\r\n"),
+        ];
+        std::fs::write(&path, &first).unwrap();
+        let db_path = temp.path().join("tail.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        let parse = |text: &str| {
+            adapter
+                .parse_reader(std::io::Cursor::new(text), &path)
+                .unwrap()
+        };
+        db.upsert_session(&parse(&first), 1, first.len() as i64)
+            .unwrap();
+        let mut offset = first.len() as i64;
+        for text in &repeats {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            let tail =
+                crate::tail::tail_parse(&path, offset, |cursor, p| adapter.parse_reader(cursor, p))
+                    .unwrap()
+                    .unwrap();
+            offset += text.len() as i64;
+            db.append_tail(&tail, 2, offset).unwrap();
+        }
+        let full = parse(&format!("{first}{}", repeats.join("")));
+        assert_eq!(full.messages.len(), 2);
+        let fresh_path = temp.path().join("fresh.db");
+        crate::db::Db::open(&fresh_path)
+            .unwrap()
+            .upsert_session(&full, 1, offset)
+            .unwrap();
+        let rows = |p: &std::path::Path| {
+            let conn = rusqlite::Connection::open(p).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "select json_array(role,kind,content,correlation_id) from messages order by 1",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(rows(&db_path), rows(&fresh_path));
+        let surviving = parse(&repeats.join(""));
+        assert!(surviving.retracted.messages.is_empty());
+        for generation in [3, 4] {
+            db.upsert_session(&surviving, generation, offset).unwrap();
+        }
+        assert_eq!(rows(&db_path), rows(&fresh_path));
+        let empty = parse("{\"type\":\"user\",\"sessionId\":\"attachment-tail\",\"message\":{\"role\":\"user\",\"content\":\"\"}}\n");
+        db.upsert_session(&empty, 5, 0).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(rows(&db_path), rows(&fresh_path));
+    }
+
+    #[test]
+    fn attachment_digest_collision_compares_full_text_in_parser_and_storage() {
+        let mut attachments = super::AttachmentRows::default();
+        attachments.push("file", Some("/tmp/a"), "first body");
+        let mut collision = super::AttachmentRows::default();
+        collision.push("file", Some("/tmp/a"), "second body");
+        let identity = collision.by_identity.keys().next().unwrap().clone();
+        // Force two bodies into the same digest bucket and native identity.
+        attachments.by_identity.clear();
+        attachments.by_identity.insert(identity.clone(), vec![0]);
+        attachments.rows[0] = attachments.rows[0].clone().with_native_event_identity(
+            crate::models::MessageCorrelationAuthority::Anthropic,
+            &identity,
+        );
+        attachments.push("file", Some("/tmp/a"), "second body");
+        assert_eq!(attachments.rows.len(), 2);
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("collision.jsonl");
+        let mut parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(std::io::Cursor::new(""), &path)
+            .unwrap();
+        parsed.messages =
+            crate::util::to_messages_with_tools_in_scope(attachments.rows, &parsed.session.id);
+        let db = crate::db::Db::open(&temp.path().join("collision.db")).unwrap();
+        let mut first = parsed.clone();
+        first.messages.truncate(1);
+        db.upsert_session(&first, 1, 1).unwrap();
+        for generation in [2, 3] {
+            db.upsert_session(&parsed, generation, generation).unwrap();
+        }
+        assert_eq!(db.message_count().unwrap(), 2);
+        assert_eq!(
+            db.search_messages("body", &Default::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn legacy_request_copies_and_queue_notices_upgrade_to_fresh_content() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("upgrade.jsonl");
@@ -4590,7 +4917,7 @@ mod tests {
             "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"written"}]}});
         let blob = |record: &Value| json!({"type":"api-request-blob","sessionId":"upgrade","message":record["message"]});
         let notice = "<task-notification>complete</task-notification>";
-        let records = vec![
+        let mut records = vec![
             user.clone(),
             user,
             call.clone(),
@@ -4601,6 +4928,11 @@ mod tests {
             json!({"type":"attachment","uuid":"q1","sessionId":"upgrade",
                 "attachment":{"type":"queued_command","commandMode":"task-notification","prompt":notice}}),
         ];
+        records.extend([
+            json!({"type":"attachment","uuid":"file1","sessionId":"upgrade","attachment":{"type":"file","filename":"/tmp/attached","content":{"type":"text","file":{"content":"upgrade attached text"}}}}),
+            json!({"type":"attachment","uuid":"instruction1","sessionId":"upgrade","attachment":{"type":"instructions","files":[{"path":"/tmp/CLAUDE.md","content":"upgrade instruction text"}]}}),
+            json!({"type":"api-request-blob","sessionId":"upgrade","message":{"role":"user","content":"upgrade attached text\nupgrade instruction text"}}),
+        ]);
         let lines = records
             .iter()
             .map(Value::to_string)
@@ -4675,6 +5007,26 @@ mod tests {
                 assert_eq!(snapshot(&old_path, query), snapshot(&fresh_path, query), "{query}");
             }
         }
+        // When both original attachment and request copy are gone, legacy text is archive-only.
+        let archived = crate::db::Db::open(&temp.path().join("archived.db")).unwrap();
+        archived.upsert_session(&old, 1, 1).unwrap();
+        let pruned = records
+            .iter()
+            .filter(|v| !matches!(v["type"].as_str(), Some("attachment" | "api-request-blob")))
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pruned = adapter
+            .parse_reader(std::io::Cursor::new(pruned), &path)
+            .unwrap();
+        archived.upsert_session(&pruned, 2, 2).unwrap();
+        assert_eq!(
+            archived
+                .search_messages("upgrade attached text", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -2815,11 +2815,6 @@ impl Db {
         // gaps (rows deleted without renumbering), so the row count is not the next free seq:
         // numbering from it reused existing seqs and left one (session_id, seq) naming two
         // messages.
-        let existing_count: i64 = tx.query_row(
-            "select count(*) from messages where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
         let next_seq = next_message_seq(&tx, &session.id)?;
         insert_messages(
             &tx,
@@ -2841,7 +2836,11 @@ impl Db {
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward,
         // title/preview take the tail's newest view, cwd fills if it was NULL. created_at stays.
-        let new_count = existing_count + tail.new_messages.len() as i64;
+        let new_count: i64 = tx.query_row(
+            "select count(*) from messages where session_id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )?;
         let [_, updated_at, last_message_at] =
             widest_session_dates(stored_session_dates(&tx, &session.id)?.into_iter().chain([[
                 None,
@@ -6748,6 +6747,25 @@ fn insert_messages<'a>(
             );
         }
         let correlation = message.provenance.correlation_identity.as_ref();
+        if crate::providers::claude::is_attachment_message(message) {
+            let identity = correlation.expect("attachment identity was checked");
+            let exists: bool = tx.query_row(
+                "select exists(select 1 from messages where session_id=?1
+                 and correlation_authority=?2 and correlation_scope=?3 and correlation_id=?4
+                 and content=?5 collate binary)",
+                params![
+                    session.id,
+                    identity.authority.as_str(),
+                    identity.scope,
+                    identity.id,
+                    message.content
+                ],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+        }
         stmt.execute(params![
             session.id,
             session.provider.as_str(),
@@ -7037,6 +7055,7 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 ///   without deleting archive history.
 ///
 /// Key work is O(stored + parsed rows and bytes), with O(rows) memory for 32-byte keys.
+/// Attachment identity checks additionally retain O(stored attachment bytes) for exact comparison.
 /// Mixed-row equality additionally performs the indexed checks in [`message_parts_match`].
 fn store_parsed_messages(
     tx: &rusqlite::Transaction<'_>,
@@ -7047,6 +7066,10 @@ fn store_parsed_messages(
     preserve_family_history: bool,
 ) -> Result<bool> {
     let session = &parsed.session;
+    let has_attachments = parsed
+        .messages
+        .iter()
+        .any(crate::providers::claude::is_attachment_message);
     let existing_count: i64 = tx.query_row(
         "select count(*) from messages where session_id = ?1",
         params![session.id],
@@ -7057,6 +7080,7 @@ fn store_parsed_messages(
     // A stored prefix is dense only when the next free seq equals its count; a gap would make
     // the parse's tail seqs collide with stored ones.
     if allow_append_optimization
+        && !has_attachments
         && same_parser
         && existing_count > 0
         && next_seq == existing_count
@@ -7092,7 +7116,8 @@ fn store_parsed_messages(
         )?;
         return Ok(false);
     }
-    if same_parser && stored.iter().map(|(_, keys)| keys).eq(parsed_keys.iter()) {
+    if same_parser && !has_attachments && stored.iter().map(|(_, keys)| keys).eq(parsed_keys.iter())
+    {
         let mut same_parts = true;
         for ((id, _), message) in stored.iter().zip(&parsed.messages) {
             if !message_parts_match(tx, *id, message)? {
@@ -7105,6 +7130,7 @@ fn store_parsed_messages(
         }
     }
     if same_parser
+        && !has_attachments
         && !preserve_family_sequences
         && covers_every_stored_key(
             stored
@@ -7171,12 +7197,32 @@ fn store_parsed_messages(
             *count == 1 && position.is_some() && parsed_relations.get(key) == Some(&1)
         });
     }
+    // Native attachment digests are accelerators, never equality: compare complete stored text
+    // on a matching identity, including when two distinct texts collide on the digest.
+    let mut attachment_content = HashMap::new();
+    if has_attachments {
+        let mut statement = tx.prepare("select id, content from messages where session_id=?1 and correlation_id like 'claude_attachment:%'")?;
+        let rows = statement.query_map(params![session.id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, content) = row?;
+            attachment_content.insert(id, content);
+        }
+    }
     let mut unseen = Vec::new();
     for (message, keys) in parsed.messages.iter().zip(&parsed_keys) {
         let position = keys
             .correlation
             .and_then(|identity| stored_by_identity.get_mut(&identity))
             .and_then(|queue| {
+                if crate::providers::claude::is_attachment_message(message) {
+                    let index = queue.iter().position(|&position| {
+                        !matched[position]
+                            && attachment_content.get(&stored[position].0) == Some(&message.content)
+                    })?;
+                    return queue.remove(index);
+                }
                 while let Some(position) = queue.pop_front() {
                     if !matched[position] {
                         return Some(position);
