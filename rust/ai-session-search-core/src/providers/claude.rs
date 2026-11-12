@@ -500,6 +500,9 @@ impl ClaudeAdapter {
         let mut retracted_file_edits = Vec::new();
         let mut retracted_file_mutations = PendingFileMutations::default();
         let mut retracted_transcript_lines = Vec::new();
+        // Assistant rows earlier parsers stored with `tool_use` input as text; see
+        // `conversation_text`. Held apart because `retracted_messages` is borrowed per record.
+        let mut earlier_assistant_rows = Vec::new();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -706,7 +709,33 @@ impl ClaudeAdapter {
                         .map(str::to_string)
                         .or(role);
                 }
-                text = extract_text(message);
+                text = conversation_text(message);
+                if role.as_deref() == Some("assistant") && !retract {
+                    // Earlier parsers also read `tool_use` inputs as the turn's text, so a turn
+                    // holding a `Write` call was stored with the written file as assistant prose.
+                    // Render that row too, so reindex removes it; see `RetractedRows`.
+                    let earlier = extract_text(message);
+                    if earlier != text
+                        && !is_harness_notice(&value, &earlier)
+                        && !should_skip_message(&value, &earlier)
+                    {
+                        let earlier = strip_command_markup(&earlier);
+                        let mut row =
+                            RawMessage::message("assistant", earlier.clone(), timestamp, None);
+                        if let Some(event_id) = event_id {
+                            row = row.with_native_event_identity(
+                                MessageCorrelationAuthority::Anthropic,
+                                event_id,
+                            );
+                        }
+                        earlier_assistant_rows.push(row);
+                        retracted_transcript_lines.push(format_transcript_line(
+                            "assistant",
+                            timestamp,
+                            &earlier,
+                        ));
+                    }
+                }
                 if role.as_deref() == Some("user") {
                     mixed_user_content = claude_mixed_user_content(
                         message,
@@ -865,6 +894,7 @@ impl ClaudeAdapter {
             }
         }
 
+        retracted_messages.append(&mut earlier_assistant_rows);
         QueuedCommand::place(
             queued_commands,
             &enqueued,
@@ -1184,6 +1214,22 @@ fn claude_native_message_semantics(value: &Value) -> Option<ClaudeNativeMessageS
         input_origin: direct_input.then_some(MessageInputOrigin::DirectConversation),
         allow_interactive_answers: direct_input,
     })
+}
+
+/// The prose of a `message`: every block's text except `tool_use` blocks. A tool call is indexed
+/// as its own tool-call row, and a `Write` call's file text as a file edit; reading the call's
+/// `input` as prose made a turn holding only a `Write` call an assistant message of the file.
+fn conversation_text(message: &Value) -> String {
+    match message.get("content").and_then(Value::as_array) {
+        Some(blocks) => extract_text(&Value::Array(
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) != Some("tool_use"))
+                .cloned()
+                .collect(),
+        )),
+        None => extract_text(message),
+    }
 }
 
 /// Claude Code uses camelCase while the SDK's documented user/replay envelope uses snake_case.
@@ -4272,9 +4318,6 @@ mod tests {
             [
                 (Role::User, "please list the files in the project"),
                 (Role::Assistant, "Listing them now."),
-                // Unchanged behaviour outside this test's scope: text extraction reads the
-                // `content` input of a `Write` call as the assistant turn's text.
-                (Role::Assistant, "first draft"),
                 (Role::User, "you forgot to check the tests"),
                 (Role::User, "also rename the output folder"),
                 (Role::User, "you forgot to check the second directory"),
@@ -4288,6 +4331,13 @@ mod tests {
             .count();
         assert_eq!(tool_rows, 4, "two calls and two results: {rows:#?}");
         assert_eq!(parsed.file_edits.len(), 1, "{:#?}", parsed.file_edits);
+        // A turn holding only a `Write` call is a tool call, not prose: the written file's text
+        // is in the call row and in `file_edits`, never in an assistant conversation row.
+        assert!(rows
+            .iter()
+            .any(|(_, kind, content)| *kind == MessageKind::ToolCall
+                && content.contains("first draft")));
+        assert!(!parsed.transcript_text.contains("first draft"));
         for needle in [
             "while you were working",
             "coding agent",
@@ -4347,7 +4397,9 @@ mod tests {
             .retracted
             .messages
             .iter()
-            .all(|message| message.ts.is_none() || message.content.contains("future")));
+            .all(|message| message.ts.is_none()
+                || message.content.contains("future")
+                || message.content == "first draft"));
     }
 
     /// An index written by the parser that read request copies as turns is corrected on reindex:
@@ -4420,6 +4472,11 @@ mod tests {
                 4
             );
             assert_eq!(count("select count(*) from file_edits"), 1);
+            assert_eq!(
+                count("select count(*) from messages where role = 'assistant' and content = 'first draft'"),
+                0,
+                "the written file's text left the assistant rows"
+            );
             assert_eq!(
                 count(
                     "select count(*) from messages
