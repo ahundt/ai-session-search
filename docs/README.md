@@ -49,6 +49,8 @@ Search indexed AI-session messages while separating result selection, context, p
 | mcp | page of 15; offset 0 | 0 before / 0 after | 0 | `{"kind":"max_chars","max_chars":220}` | `{"kind":"max_chars","max_chars":220}` | `["normalized_session_metadata"]` / `none` |
 | python | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
 
+These are shipped defaults from an empty configuration. Positive `limit` counts result rows; signed `lines_per_message` keeps the first N lines, the last N for a negative value, or all lines for 0.
+
 ### Closed vocabularies
 
 | Canonical parameter | Accepted values | Omission semantics |

@@ -394,18 +394,7 @@ converted into a page. Session-level `aise list`/`aise search` limits and presen
 separate controls and do not redefine message-hit membership.
 
 <!-- aise-message-search-contract:start -->
-### Generated message-search policy resolution
-
-Resolution precedence, highest first: `explicit` → `detail_preset` → `purpose` → `operation_config` → `surface_config` → `typed_default` → `derived`.
-
-| Caller surface | Omitted non-fuzzy result extent | Context | Lines per message | Field view | Match view | Includes / receipt |
-| --- | --- | --- | ---: | --- | --- | --- |
-| rust | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
-| cli | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
-| mcp | page of 15; offset 0 | 0 before / 0 after | 0 | `{"kind":"max_chars","max_chars":220}` | `{"kind":"max_chars","max_chars":220}` | `["normalized_session_metadata"]` / `none` |
-| python | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
-
-The table uses an empty configuration and is a shipped-default reference, not a claim about a user's effective settings. Run `aise messages search --describe --describe-surface SURFACE` to inspect active values without opening or refreshing the index.
+See the [generated message-search reference](../README.md#generated-message-search-caller-contract) for shipped defaults and resolution precedence. Run `aise messages search --describe --describe-surface SURFACE` to inspect active values without opening or refreshing the index.
 <!-- aise-message-search-contract:end -->
 
 Ordinary indexed search has no elapsed-time deadline. Native CLI/Rust raw SQL uses

@@ -80,7 +80,10 @@ def test_renderer_is_deterministic_and_preserves_every_byte_outside_markers() ->
         assert "stale" not in rendered
         assert rendered.count(renderer.START) == 1
         assert rendered.count(renderer.END) == 1
-    assert "| mcp | page of 20; offset 0 |" in first[ROOT / "README.md"]
+    assert "| mcp | page of 20; offset 0 |" in first[ROOT / "docs/README.md"]
+    for path in (ROOT / "README.md", ROOT / "docs/development/configuration.md"):
+        assert "generated-message-search-caller-contract)" in first[path]
+        assert "| Caller surface |" not in first[path]
     assert "`sequence_requires_session` — sequence bounds require one session." in first[ROOT / "docs/README.md"]
 
 
@@ -103,3 +106,15 @@ def test_renderer_rejects_a_rule_without_its_executable_message() -> None:
 
     with pytest.raises(KeyError, match="message"):
         renderer.docs_block(specs, specs["cli"]["registry"])
+
+
+def test_reference_changes_when_planner_defaults_change() -> None:
+    renderer = load_renderer()
+    documents = {path: marked_document("before", "after") for path in renderer.TARGETS}
+    specs = fake_specs()
+    first = renderer.render_targets(specs, documents)
+    specs["mcp"]["configured_default"]["extent"]["limit"] = 7
+    second = renderer.render_targets(specs, first)
+    changed = [path for path in first if first[path] != second[path]]
+    assert changed == [ROOT / "docs/README.md"]
+    assert "page of 7; offset 0" in second[changed[0]]
