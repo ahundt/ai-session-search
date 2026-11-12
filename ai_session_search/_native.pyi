@@ -1852,6 +1852,7 @@ class SessionSearch:
         seq_from: int | None = None,
         seq_to: int | None = None,
         lines_per_message: int = 0,
+        kinds: list[_MessageKind] | None = None,
     ) -> list[MessageHit]:
         """Read one session's messages, selecting the oldest or newest ``limit`` by ``order``
         (``"oldest"``/``"newest"``), always returned chronologically. To page a long session,

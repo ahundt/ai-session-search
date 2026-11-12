@@ -856,6 +856,11 @@ pub struct MessageGetArgs {
     /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
+    /// Message classes for a range read. Omit for every class except harness-notice.
+    /// Pass conversation,harness-notice to include both. With --seq, context already includes
+    /// every class, so omit --kinds.
+    #[arg(long, value_enum, value_delimiter = ',', num_args = 1..)]
+    pub kinds: Option<Vec<MessageKind>>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Maximum messages to return; 0 (the default) returns all. Selection is oldest-first by
@@ -992,6 +997,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
             let session = db.resolve_session_record(&args.id)?;
             if let Some(seq) = args.seq {
                 if args.role.is_some()
+                    || args.kinds.is_some()
                     || args.limit > 0
                     || args.order != ReadOrder::Oldest
                     || args.offset > 0
@@ -1003,7 +1009,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                 {
                     bail!(
                         "--seq selects one sequence number, so it takes only --context; \
-                         drop --role, --limit, --order, --offset, --seq-from, --seq-to, --since, \
+                         drop --role, --kinds, --limit, --order, --offset, --seq-from, --seq-to, --since, \
                          --until, and --when, or omit --seq to read a range of messages"
                     );
                 }
@@ -1033,6 +1039,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
+                kinds: args.kinds.clone(),
                 session_id: Some(session.id),
                 since,
                 until,

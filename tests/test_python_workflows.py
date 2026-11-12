@@ -260,3 +260,16 @@ def test_structured_search_hits_include_timestamp(corpus):
     with sqlite3.connect(corpus.db_path) as db:
         db.execute("UPDATE messages SET ts = NULL")
     assert all(row["timestamp"] is None for row in corpus.search_messages("forgot").results)
+
+
+@pytest.mark.integration
+def test_message_ranges_can_include_harness_notices(corpus):
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute("INSERT INTO messages (session_id, provider, seq, role, kind, content) VALUES ('claude:synthetic-0', 'claude', 3, 'user', 'harness_notice', 'synthetic hook notice')")
+    assert [row.seq for row in corpus.read_session_messages("synthetic-0")] == [0, 1, 2]
+    kinds = ["conversation", "harness_notice"]
+    rows = corpus.read_session_messages("synthetic-0", kinds=kinds)
+    expected = cli(corpus, "messages", "get", "synthetic-0", "--kinds", "conversation,harness-notice", "--format", "json")
+    assert [row.seq for row in rows] == [0, 1, 2, 3]
+    assert [row.seq for row in rows] == [row["seq"] for row in expected]
+    assert corpus.message_context("synthetic-0", 3)[0].kind == "harness_notice"

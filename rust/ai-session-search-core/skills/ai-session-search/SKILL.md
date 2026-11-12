@@ -206,11 +206,16 @@ aise messages get SESSION_ID --seq 42 --context 3 --refs --lines-per-message 8
 aise messages get SESSION_ID --role user --limit 75 --order newest
 aise messages get SESSION_ID --seq-from 0 --seq-to 499
 aise messages get SESSION_ID --seq-from 500 --seq-to 999
+aise messages get SESSION_ID --kinds conversation,harness-notice
 aise messages evidence SESSION_ID --summary-items -12 --include time-profile
 aise show SESSION_ID --transcript-lines -40
 aise show SESSION_ID --transcript-lines 0
 aise resume SESSION_ID
 ```
+
+Range reads omit harness notices by default; an explicit `--kinds` list can include them.
+MCP `get_session` ranges accept `kinds=["conversation", "harness_notice"]`. Focused context
+already includes every class.
 
 Signed windows share one convention on every surface: positive keeps the first N records or
 lines, negative the last N, zero everything (which may be large). `--limit` on `messages get`

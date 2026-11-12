@@ -21,6 +21,11 @@ coordinates in that message. Tool-name and tool-argument queries use their own f
 Views and context may include generated text. Results include concise source
 provenance. The index retains full partition and correlation details for existing read-only SQL
 inspection; ordinary search hits do not emit those internal arrays.
+Range reads omit harness notices by default. Pass
+`read_session_messages(id, kinds=["conversation", "harness_notice"])` to include those classes,
+as `aise messages get ID --kinds conversation,harness-notice` does. Focused `message_context()`
+reads include all classes. MCP range reads accept the same `kinds` list.
+
 Structured message-search hits include `timestamp` (RFC 3339 UTC, or None when unknown),
 including queryless hits and batches.
 

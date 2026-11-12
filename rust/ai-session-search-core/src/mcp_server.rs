@@ -4766,6 +4766,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer", "minimum": 0,
                                 "description": "Upper inclusive message-sequence bound for an absolute range read. See seq_from for non-overlapping chunked reads. Must be >= seq_from when both are given."
                             },
+                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Message classes for seq_from/seq_to ranges. Omit for every class except harness_notice. Include harness_notice in an explicit class list to read notices too; focused message_seq context already includes every class." },
                             "context": {
                                 "type": "integer", "minimum": 0,
                                 "description": "When message_seq is provided, include this many turns before and after that message (default 0)."
@@ -5121,6 +5122,13 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
     let has_range = seq_from.is_some() || seq_to.is_some();
 
+    if !has_range {
+        reject_present(
+            args,
+            "kinds",
+            "kinds only applies with seq_from/seq_to; focused context already includes every class",
+        )?;
+    }
     let selector_count = summary as usize
         + message_seq.is_some() as usize
         + transcript_lines.is_some() as usize
@@ -5180,8 +5188,15 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .resolve_session_record(session_id)
             .map_err(|e| format!("{e:#}"))?;
         let presentation = MessagePresentation::from_args(args, config)?;
-        return message_range_value(&session, seq_from, seq_to, &presentation, db)
-            .and_then(ToolResponse::structured);
+        return message_range_value(
+            &session,
+            seq_from,
+            seq_to,
+            parse_enum_array(args, "kinds")?,
+            &presentation,
+            db,
+        )
+        .and_then(ToolResponse::structured);
     }
     reject_present(
         args,
@@ -6811,6 +6826,7 @@ fn message_range_value(
     session: &SessionRecord,
     seq_from: Option<i64>,
     seq_to: Option<i64>,
+    kinds: Option<Vec<crate::models::MessageKind>>,
     presentation: &MessagePresentation,
     db: &Db,
 ) -> Result<Value, String> {
@@ -6818,6 +6834,7 @@ fn message_range_value(
         session_id: Some(session.id.clone()),
         seq_from,
         seq_to,
+        kinds,
         ..MessageFilters::default()
     };
     let rows = db
@@ -9163,6 +9180,38 @@ mod tests {
         )
         .expect_err("a bare string must not pass as a one-element array");
         assert!(error.contains("session_kinds"), "{error}");
+    }
+
+    #[test]
+    fn get_session_range_can_select_harness_notices() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            Path::new("/synthetic/notices.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:notices".into();
+        parsed.session.provider_session_id = "notices".into();
+        let mut notice = Message::new(0, Role::User, "synthetic hook notice");
+        notice.kind = crate::models::MessageKind::HarnessNotice;
+        parsed.messages = vec![notice];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let read = |args| parse(&tool_get_session(&args, &config, &db).unwrap());
+        assert_eq!(
+            read(json!({"session_id":"notices", "seq_from":0}))["messages"],
+            json!([])
+        );
+        let selected =
+            read(json!({"session_id":"notices", "seq_from":0, "kinds":["harness_notice"]}));
+        assert_eq!(selected["messages"][0]["content"], "synthetic hook notice");
+        assert!(tool_get_session(
+            &json!({"session_id":"notices", "kinds":["harness_notice"]}),
+            &config,
+            &db
+        )
+        .unwrap_err()
+        .contains("kinds only applies"));
     }
 
     #[test]

@@ -4995,7 +4995,7 @@ impl SessionSearch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (session_id, *, order="oldest", role=None, limit=0, offset=0, seq_from=None, seq_to=None, lines_per_message=0))]
+    #[pyo3(signature = (session_id, *, order="oldest", role=None, limit=0, offset=0, seq_from=None, seq_to=None, lines_per_message=0, kinds=None))]
     /// Read one session's messages, selecting the oldest or newest `limit` by `order`, always
     /// returned in chronological (seq-ascending) order.
     ///
@@ -5004,6 +5004,8 @@ impl SessionSearch {
     /// returns all. To read a long session in chunks, advance `seq_from` (the next chunk starts
     /// at the last seq + 1) rather than growing `limit`, which re-sends what you already read.
     /// `lines_per_message` is the presentation-only per-message line window.
+    /// `kinds` defaults to every class except harness_notice; supply an explicit class list
+    /// to include notices. Focused message_context reads already include every class.
     fn read_session_messages(
         &self,
         py: Python<'_>,
@@ -5015,6 +5017,7 @@ impl SessionSearch {
         seq_from: Option<i64>,
         seq_to: Option<i64>,
         lines_per_message: i64,
+        kinds: Option<Vec<String>>,
     ) -> PyResult<Vec<NativeMessageHit>> {
         let order = match order {
             "oldest" => ai_session_search::db::MessageOrder::OldestFirst,
@@ -5029,6 +5032,14 @@ impl SessionSearch {
             .map(str::parse)
             .transpose()
             .map_err(PyValueError::new_err)?;
+        let kinds = kinds
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| value.parse::<MessageKind>().map_err(invalid_argument_error))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()?;
         let limit = paging_argument(PagingArgument::Limit, limit)?;
         let offset = paging_argument(PagingArgument::Offset, offset)?;
         // Reject an inverted range up front as a ValueError, so a caller mistake reads the same
@@ -5047,6 +5058,7 @@ impl SessionSearch {
             let filters = {
                 let mut value = MessageFilters::default();
                 value.role = role;
+                value.kinds = kinds;
                 value.session_id = Some(session.id);
                 value.seq_from = seq_from;
                 value.seq_to = seq_to;
