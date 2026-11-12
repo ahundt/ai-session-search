@@ -15,7 +15,7 @@ Google AI Studio, and Gemini CLI, on macOS, Linux, and Windows.
 
 <img width="1561" height="1098" alt="aise searching indexed AI coding sessions from the terminal" src="https://github.com/user-attachments/assets/757950b2-0523-4b59-b617-96d94ccf5ab1" />
 
-## Search nine harnesses from one index
+## Search nine providers from one index
 
 Useful AI coding history is already on disk. It is just hard to find, and in a range of totally
 different formats.
@@ -166,12 +166,12 @@ skips it.
 
 Scoped queries cost less ([filters and scopes](#filters-and-scopes)), and a smaller index is faster.
 
-## Session sources
+## Providers
 
 Everything is read from local files on your own machine. Cloud-only ChatGPT, Claude, and
 Antigravity conversations are never copied from a vendor account, and are not searchable here.
 
-| Session source | Provider ID | Native resume |
+| Provider | Provider ID | Native resume |
 | --- | --- | --- |
 | Claude Code CLI/Desktop | `claude` | yes |
 | Claude Desktop local agent | `claude-desktop` | no; use show/export |
@@ -192,7 +192,7 @@ browser state or sync cloud history, which OpenAI documents as
 [separate histories](https://help.openai.com/en/articles/20001276) in the merged desktop app.
 
 These IDs are the TOML keys in provider configuration, and `aise config paths` prints each
-source's enabled state and effective roots.
+provider's enabled state and effective roots.
 
 ## Filters and scopes
 
@@ -326,7 +326,7 @@ whatever you leave alone. `aise config example` previews it first.
 ```bash
 aise config show      # effective settings
 aise config origins   # where each setting came from
-aise config paths     # resolved paths and per-source roots
+aise config paths     # resolved paths and per-provider roots
 ```
 
 | Variable | Selects |

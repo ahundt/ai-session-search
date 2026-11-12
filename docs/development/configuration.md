@@ -98,7 +98,7 @@ Run `aise config check` to validate settings without opening the index or changi
 nonzero for invalid settings or unknown keys, even though ordinary commands can use a file containing
 unknown ordinary keys. Correct a typo using the suggestion, or upgrade aise to apply a future setting.
 
-Access-restricting tables stay strict: `[providers]` and `[providers.<name>]` select source disables
+Access-restricting tables stay strict: `[providers]` and `[providers.<name>]` select provider disables
 and paths; `[search.scope]` authorizes reads; `[search.budgets]` limits exposed page/context content.
 Versioned `[search.purposes.<name>]` bundles and their `.preferences` tables also stay strict to
 preserve future restrictions; their current settings remain overridable preferences.
@@ -177,7 +177,7 @@ unchanged; explicit package commands report failures.
 
 ## Search access scope
 
-`[search.scope] mode = "all"` is the default: every configured source is searchable. To confine
+`[search.scope] mode = "all"` is the default: every enabled provider is searchable. To confine
 every session, message, analysis, file-history, export, resume, and exact-ID read to authorized
 workspaces, use `mode = "allowed-roots"` with one or both trusted standalone sources:
 
