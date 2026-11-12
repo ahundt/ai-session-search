@@ -1998,6 +1998,32 @@ impl<'app> AnalysisService<'app> {
         Ok(rows.into_iter().skip(filters.offset).take(limit).collect())
     }
 
+    /// Find phrases a person keeps typing across messages, as `aise repeats` does.
+    ///
+    /// Each message is split into lowercase words. A run of `phrase_min_words` to
+    /// `phrase_max_words` words is a candidate when it contains no digit, neither starts nor
+    /// ends with a stop word, and holds a word of four or more letters that is not a stop word;
+    /// a candidate found in at least `min_matches` messages becomes a group. Unset limits come from
+    /// `[analytics]` in the configuration, exactly as the command line resolves them.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidArgument`](crate::ServiceError::InvalidArgument) for a zero
+    /// `min_matches` or `phrase_min_words`, or `phrase_max_words` below the minimum;
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) for an unknown
+    /// `filters.session_id`; an error for an invalid regex.
+    ///
+    /// # Complexity
+    ///
+    /// Time and memory are proportional to the candidate messages' text times the phrase-width
+    /// range, plus sorting the distinct candidate phrases.
+    pub fn repeats(
+        &self,
+        query: &crate::analytics::RepeatsQuery,
+    ) -> Result<crate::analytics::RepeatsReport> {
+        crate::analytics::mine_repeats(self.db, &self.config.analytics, query)
+    }
+
     /// Report indexed terms by frequency, as `aise vocab` does.
     ///
     /// Counts come from the full-text index and cover every indexed message, so they cannot be

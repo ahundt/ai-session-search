@@ -141,7 +141,10 @@ pub type SkillPathSelector = skill_catalog::SkillPathSelector;
 
 // Types a caller passes to or receives from the documented service calls, so a program never
 // imports from the storage, indexer, or configuration modules to name them.
-pub use analytics::{RoleStat, TermFrequency, VocabularyQuery};
+pub use analytics::{
+    RepeatExample, RepeatGroup, RepeatsQuery, RepeatsReport, RoleStat, TermFrequency,
+    VocabularyQuery,
+};
 /// The date and time crate used by every timestamp field (`since`, `until`, `ts`,
 /// `updated_at`), re-exported so a caller builds `chrono::DateTime<chrono::Utc>` values with the
 /// exact version this crate compiles against instead of adding its own `chrono` dependency.

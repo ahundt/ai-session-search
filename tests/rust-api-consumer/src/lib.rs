@@ -416,13 +416,16 @@ mod tests {
         format!("{value}\n")
     }
 
-    /// Two Claude sessions under `/r`. A's first user turn is what the custom category matches;
-    /// B writes and then edits `/r/app.py`, so it has two file versions, and ends with a harness
-    /// notice.
+    /// Two Claude sessions under `/r`. A's first user turn is what the custom category matches,
+    /// and A ends with a queued message whose sender is not recorded; B writes and then edits
+    /// `/r/app.py`, so it has two file versions, and ends with a harness notice. "please run the
+    /// tests before you commit" is typed in both sessions and queued once more.
     fn transcripts() -> [(&'static str, String); 2] {
         let a = [
             r#"{"type":"user","sessionId":"consumer-a","timestamp":"2026-06-01T10:00:00Z","cwd":"/r","uuid":"a0","message":{"role":"user","content":[{"type":"text","text":"you skipped the migration step. please run the tests before you commit"}]}}"#,
             r#"{"type":"assistant","sessionId":"consumer-a","timestamp":"2026-06-01T10:00:05Z","cwd":"/r","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"running the tests now"}]}}"#,
+            // Queued while the agent worked, with no record of who sent it.
+            r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-01T10:00:06Z","sessionId":"consumer-a","content":"please run the tests before you commit"}"#,
         ]
         .map(line)
         .concat();
@@ -659,6 +662,61 @@ mod tests {
             .is_ok());
     }
 
+    /// Recurring phrases come back typed, with the count of queued messages left out because
+    /// nobody is recorded as their sender.
+    #[test]
+    fn repeats_return_groups_and_the_unattributed_count() {
+        use ai_session_search::{RepeatsQuery, RepeatsReport};
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        let query = RepeatsQuery::default()
+            .with_phrase_min_words(4)
+            .with_max_examples_per_group(0);
+        let report: RepeatsReport = app.analysis().repeats(&query).unwrap();
+        let group = report
+            .groups
+            .iter()
+            .find(|group| group.repeat == "please run the tests before")
+            .unwrap_or_else(|| panic!("{report:#?}"));
+        assert_eq!((group.matches, group.sessions), (2, 2));
+        let first = &group.examples[0];
+        assert_eq!(
+            (first.session_id.as_str(), first.seq),
+            ("claude:consumer-a", 0)
+        );
+        assert!(first.timestamp.is_some());
+        assert!(first.preview.starts_with("you skipped the migration step"));
+        assert_eq!(report.unattributed_input_count, 1);
+        assert!(!report.unattributed_input_included);
+
+        let included = app
+            .analysis()
+            .repeats(&query.clone().with_include_unattributed_input(true))
+            .unwrap();
+        let group = included
+            .groups
+            .iter()
+            .find(|group| group.repeat == "please run the tests before")
+            .unwrap();
+        assert_eq!(group.matches, 3);
+        assert_eq!(included.unattributed_input_count, 1);
+        assert!(included.unattributed_input_included);
+
+        let error = app
+            .analysis()
+            .repeats(&RepeatsQuery::default().with_min_matches(0))
+            .unwrap_err();
+        assert_eq!(service_error(&error).code(), "invalid-argument");
+        let error = app
+            .analysis()
+            .repeats(
+                &RepeatsQuery::default()
+                    .with_filters(MessageFilters::default().with_session_id("claude:nope")),
+            )
+            .unwrap_err();
+        assert_eq!(service_error(&error).code(), "session-not-found");
+    }
+
     /// Term frequency is a typed call; it is refused under an allowed-roots access scope because
     /// index-wide counts cannot be limited to the allowed sessions.
     #[test]
@@ -671,7 +729,7 @@ mod tests {
             .vocabulary(&VocabularyQuery::default().with_prefix("TEST").with_limit(0))
             .unwrap();
         let tests = terms.iter().find(|row| row.term == "tests").unwrap();
-        assert_eq!((tests.docs, tests.count), (3, 3), "{terms:?}");
+        assert_eq!((tests.docs, tests.count), (4, 4), "{terms:?}");
         let one = app
             .analysis()
             .vocabulary(&VocabularyQuery::default().with_limit(1))

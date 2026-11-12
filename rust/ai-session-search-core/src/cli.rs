@@ -1536,7 +1536,7 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
         Commands::Vocab(args) => crate::analytics::run_vocab(db, &config, &args)?,
-        Commands::Repeats(args) => crate::analytics::run_repeats(db, &config.analytics, &args)?,
+        Commands::Repeats(args) => crate::analytics::run_repeats(db, &config, &args)?,
         Commands::Files(cmd) => crate::files::run(db, &cmd)?,
         Commands::Compact => {
             let before = db.storage_allocation()?.total_bytes;
@@ -4966,6 +4966,7 @@ mod tests {
             "--max-groups",
             "20",
         ]);
+        assert_parses(["aise", "repeats", "--format", "json", "--report"]);
         assert_rejects(["aise", "repeats", "you forgot", "--similarity"]);
         assert_rejects(["aise", "repeats", "you forgot", "--groups"]);
         assert_rejects(["aise", "repeats", "--context", "-1"]);

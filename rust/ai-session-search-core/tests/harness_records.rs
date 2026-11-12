@@ -192,6 +192,33 @@ fn cli_corrections_repeats_and_doctor_read_only_typed_text() {
     );
     assert!(!stderr.contains("left out"), "{stderr}");
 
+    // `--report` carries the same groups with the left-out count inside the JSON, while plain
+    // `--format json` keeps printing the bare array current readers parse.
+    let bare = indexed.json(&["repeats", "--format", "json"]);
+    let report = indexed.json(&["repeats", "--format", "json", "--report"]);
+    assert_eq!(report["groups"], bare, "{report:#}");
+    assert_eq!(report["unattributed_input_count"], json!(1), "{report:#}");
+    assert_eq!(report["unattributed_input_included"], json!(false));
+    let line = indexed
+        .aise()
+        .args(["repeats", "--format", "jsonl", "--report"])
+        .output()
+        .unwrap();
+    assert!(line.status.success(), "{line:?}");
+    let line: Value = serde_json::from_slice(&line.stdout).unwrap();
+    assert_eq!(line, report);
+    let table = indexed
+        .aise()
+        .args(["repeats", "--report"])
+        .output()
+        .unwrap();
+    assert!(!table.status.success());
+    assert!(
+        String::from_utf8_lossy(&table.stderr)
+            .contains("--report requires --format json or --format jsonl"),
+        "{table:?}"
+    );
+
     let queued = indexed.json(&[
         "messages",
         "search",

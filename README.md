@@ -74,7 +74,8 @@ including messages typed while the agent was working when the transcript records
 (recent Claude Code versions do). Older Claude Code versions recorded no sender for those queued
 messages, and a program can queue messages too, so they are left out by default; the output counts
 them (`unattributed_input_count` in JSON, a one-line note in table output and on stderr for
-`repeats`), and `--include-unattributed-input` reads them. A queued message that was also delivered
+`repeats`, and `unattributed_input_count` in `aise repeats --format json --report`), and
+`--include-unattributed-input` reads them. A queued message that was also delivered
 as its own prompt is read once, as the prompt.
 
 A subagent's work lives in its own session, so the parent transcript shows only that it ran.
