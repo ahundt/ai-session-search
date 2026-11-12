@@ -2039,14 +2039,14 @@ fn parser_versions_pin_claude_attachment_and_codex_fork_rules() {
         provider_parse_version(Provider::ClaudeDesktop),
         "claude-desktop-local-agent-v15"
     );
-    assert_eq!(provider_parse_version(Provider::Codex), "codex-v10");
+    assert_eq!(provider_parse_version(Provider::Codex), "codex-v11");
 }
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude-v15",
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v15",
-        Provider::Codex => "codex-v10",
+        Provider::Codex => "codex-v11",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v6",
         Provider::Pi => "pi-v5",

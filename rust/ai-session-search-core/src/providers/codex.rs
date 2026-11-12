@@ -63,6 +63,7 @@ pub struct CodexAdapter {
     metadata: Vec<CodexRootMetadata>,
     sidecar_warnings: Vec<CodexSidecarWarning>,
     id_re: Regex,
+    rollout_paths: std::sync::OnceLock<HashMap<String, PathBuf>>,
 }
 
 impl CodexAdapter {
@@ -85,6 +86,7 @@ impl CodexAdapter {
             roots,
             metadata,
             sidecar_warnings,
+            rollout_paths: std::sync::OnceLock::new(),
             id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl(?:\.zst)?$")
                 .expect("valid regex"),
         }
@@ -144,6 +146,15 @@ impl CodexAdapter {
                 size_bytes: entry.metadata.len() as i64,
             });
         }
+        let _ = self.rollout_paths.set(
+            files
+                .iter()
+                .filter_map(|source| {
+                    self.extract_id(&source.path)
+                        .map(|id| (id, source.path.clone()))
+                })
+                .collect(),
+        );
         let mut warnings = walked.warnings;
         warnings.extend(
             self.sidecar_warnings
@@ -222,6 +233,8 @@ impl CodexAdapter {
         // A fork replays its parent's history until its first `thread_settings_applied` event;
         // the parent's `session_meta` is optional. See `ForkReplay`.
         let mut fork_replay = ForkReplay::default();
+        let mut fork_parent = None;
+        let mut replayed_file_edits = None;
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -258,10 +271,12 @@ impl CodexAdapter {
                             );
                         }
                         if !session_id_bound {
-                            fork_replay.forked = payload
+                            fork_parent = payload
                                 .get("forked_from_id")
                                 .and_then(Value::as_str)
-                                .is_some_and(|id| !id.trim().is_empty());
+                                .filter(|id| !id.trim().is_empty())
+                                .map(str::to_owned);
+                            fork_replay.forked = fork_parent.is_some();
                             if fork_replay.forked {
                                 fork_replay.start(0, 0, &None, &None);
                             }
@@ -560,6 +575,9 @@ impl CodexAdapter {
                         .or_else(|| payload.get("event_type"))
                         .and_then(Value::as_str);
                     if event_type == Some("thread_settings_applied") {
+                        if fork_replay.open.is_some() {
+                            replayed_file_edits = Some(0..file_edits.len());
+                        }
                         fork_replay.end(
                             messages.len(),
                             transcript_lines.len(),
@@ -588,6 +606,22 @@ impl CodexAdapter {
             }
         }
 
+        let mut retracted = crate::models::RetractedRows::default();
+        if let (Some(parent), Some(range)) = (fork_parent, replayed_file_edits) {
+            // Discovery retains O(F) filename identities for F sources once per adapter. This
+            // check reads no other transcript; absent parents retain the fork's only copy.
+            if self.rollout_paths.get().is_none() {
+                self.discover_with_warnings();
+            }
+            if self
+                .rollout_paths
+                .get()
+                .and_then(|paths| paths.get(&parent))
+                .is_some_and(|parent_path| parent_path != path && parent_path.is_file())
+            {
+                retracted.file_edits = file_edits.drain(range).collect();
+            }
+        }
         let messages = fork_replay.mark(messages, &mut transcript_lines);
         let root_metadata = self.metadata_for_path(path);
         let meta = root_metadata
@@ -698,7 +732,7 @@ impl CodexAdapter {
             transcript_text: transcript_lines.join("\n\n"),
             messages,
             file_edits,
-            retracted: Default::default(),
+            retracted,
         })
     }
 
@@ -2797,6 +2831,80 @@ mod tests {
         assert!(!super::is_codex_subagent_notification(
             "please explain <subagent_notification> in this prompt"
         ));
+    }
+
+    #[test]
+    fn fork_replay_edits_are_counted_only_when_the_parent_file_is_absent() {
+        let parent = "019f4a0e-d714-7cc3-8003-543a04a1a822";
+        let own = "019f5ce8-afff-76a3-86f2-174307f3fa08";
+        for parent_present in [true, false] {
+            let dir = tempdir().unwrap();
+            let parent_path = dir.path().join(format!("rollout-{parent}.jsonl"));
+            let path = dir.path().join(format!("rollout-{own}.jsonl"));
+            let mutation = |id: &str, name: &str| {
+                [
+                    json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":id,"name":"apply_patch","input":format!("*** Begin Patch\n*** Add File: /p/{name}\n+content\n*** End Patch")}}),
+                    json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":id,"output":format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /p/{name}\n")}}),
+                ]
+            };
+            let parent_records = mutation("parent-call", "parent.rs");
+            if parent_present {
+                let mut rows = vec![json!({"type":"session_meta","payload":{"id":parent}})];
+                rows.extend(parent_records.clone());
+                fs::write(
+                    &parent_path,
+                    rows.into_iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .unwrap();
+            }
+            let mut rows =
+                vec![json!({"type":"session_meta","payload":{"id":own,"forked_from_id":parent}})];
+            rows.extend(parent_records);
+            rows.push(json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}));
+            rows.extend(mutation("fork-call", "fork.rs"));
+            fs::write(
+                &path,
+                rows.into_iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let adapter = CodexAdapter::new(vec![dir.path().to_path_buf()]);
+            let source = adapter
+                .discover()
+                .into_iter()
+                .find(|source| source.path == path)
+                .unwrap();
+            let parsed = adapter.parse(&source);
+            let names: Vec<_> = parsed
+                .file_edits
+                .iter()
+                .map(|edit| edit.file_name.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                if parent_present {
+                    vec!["fork.rs"]
+                } else {
+                    vec!["parent.rs", "fork.rs"]
+                }
+            );
+            let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+            let mut old = parsed.clone();
+            old.session.parse_version = "codex-v10".into();
+            old.file_edits.extend(parsed.retracted.file_edits.clone());
+            old.file_edits.sort_by_key(|edit| edit.seq);
+            db.upsert_session(&old, 1, 1).unwrap();
+            db.upsert_session(&parsed, 1, 1).unwrap();
+            assert_eq!(
+                db.file_edit_count().unwrap(),
+                parsed.file_edits.len() as i64
+            );
+        }
     }
 
     #[test]
