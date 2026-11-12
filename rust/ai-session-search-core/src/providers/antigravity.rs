@@ -122,6 +122,7 @@ impl AntigravityAdapter {
         let mut created_at: Option<DateTime<Utc>> = None;
         let mut updated_at: Option<DateTime<Utc>> = None;
         let mut messages = Vec::new();
+        let mut retracted_messages = Vec::new();
         let mut transcript_lines = Vec::new();
         let mut last_prompt = None;
         let mut file_edits: Vec<FileEdit> = Vec::new();
@@ -184,7 +185,9 @@ impl AntigravityAdapter {
                     if role == "user" && substantive_text(&text) {
                         last_prompt = Some(text.clone());
                     }
-                    let mut raw_message = if role == "tool" {
+                    let mut raw_message = if role == "harness_notice" {
+                        RawMessage::harness_notice(text.clone(), timestamp)
+                    } else if role == "tool" {
                         RawMessage::tool_result_with_name(tool_name, text.clone(), None, timestamp)
                     } else {
                         RawMessage::message(role, text.clone(), timestamp, None)
@@ -215,11 +218,26 @@ impl AntigravityAdapter {
                             step_index.to_string(),
                         );
                     }
+                    if role == "harness_notice" {
+                        let mut old = RawMessage::tool_result_with_name(
+                            Some(record_type.to_ascii_lowercase()),
+                            text.clone(),
+                            None,
+                            timestamp,
+                        );
+                        if let Some(index) = value.get("step_index").and_then(Value::as_i64) {
+                            old = old.with_native_event_identity(
+                                MessageCorrelationAuthority::Google,
+                                index.to_string(),
+                            );
+                        }
+                        retracted_messages.push(old);
+                    }
                     messages.push(raw_message);
                     // Tool-step output and context summaries stay out of the human
                     // transcript/title/preview, matching how claude/codex/pi keep tool results
                     // and compaction separate from the conversation.
-                    if role != "tool" && role != "compaction" {
+                    if !matches!(role, "tool" | "compaction" | "harness_notice") {
                         transcript_lines.push(format_transcript_line(role, timestamp, &text));
                     }
                 }
@@ -289,12 +307,20 @@ impl AntigravityAdapter {
             Some(&session.id),
             crate::util::UserRoleAuthorshipEvidence::Unverified,
         );
+        let retracted = crate::models::RetractedRows {
+            messages: crate::util::normalize_raw_messages_with_evidence(
+                retracted_messages,
+                Some(&session.id),
+                crate::util::UserRoleAuthorshipEvidence::Unverified,
+            ),
+            ..Default::default()
+        };
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
             messages,
             file_edits,
-            retracted: Default::default(),
+            retracted,
         })
     }
 }
@@ -398,6 +424,9 @@ fn classify_antigravity_record(
         "USER_INPUT" => Some(("user", None)),
         "PLANNER_RESPONSE" => Some(("assistant", None)),
         "CONVERSATION_HISTORY" => None,
+        // Like Gemini runtime errors, harness status and errors are searchable notices,
+        // excluded from ordinary conversation results rather than invented tool results.
+        "SYSTEM_MESSAGE" | "ERROR_MESSAGE" => Some(("harness_notice", None)),
         // The harness's context summary: it copies earlier requests beside summary text found
         // nowhere else, so it is kept once as generated text, not as a tool result.
         "CHECKPOINT" => Some(("compaction", None)),

@@ -245,3 +245,72 @@ fn unindexed_files_are_explained_by_naming_the_file_that_took_their_id() {
 // pinned directly by `models::tests::default_class_selection_excludes_rather_than_enumerates`.
 // Neither is duplicated here, and no test-only database accessor is added to the public API
 // to repeat them.
+
+#[test]
+fn antigravity_notices_upgrade_to_the_same_rows_as_a_fresh_parse() {
+    use ai_session_search::models::{Provider, Role};
+    use ai_session_search::providers::antigravity::AntigravityAdapter;
+    use ai_session_search::util::provider_parse_version;
+    use std::io::Cursor;
+
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("brain/example/.system_generated/logs/transcript.jsonl");
+    let source = concat!(
+        r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","content":"please check the database"}"#,
+        "\n",
+        r#"{"type":"SYSTEM_MESSAGE","content":"runtime sentinel system"}"#,
+        "\n",
+        r#"{"type":"ERROR_MESSAGE","content":"runtime sentinel error"}"#,
+        "\n",
+    );
+    let adapter = AntigravityAdapter::new(vec![]);
+    let parsed = adapter.parse_reader(Cursor::new(source), &path).unwrap();
+    assert_ne!(
+        provider_parse_version(Provider::Antigravity),
+        "antigravity-v5"
+    );
+    for message in &parsed.messages[1..] {
+        assert_eq!(message.role, Role::User);
+        assert_eq!(message.kind, MessageKind::HarnessNotice);
+        assert_eq!(message.tool_name, None);
+    }
+    assert!(!parsed.transcript_text.contains("runtime sentinel"));
+    let upgraded = Db::open(&dir.path().join("upgraded.db")).unwrap();
+    let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+    let mut old = parsed.clone();
+    old.session.parse_version = "antigravity-v5".into();
+    for (message, name) in old.messages[1..]
+        .iter_mut()
+        .zip(["system_message", "error_message"])
+    {
+        message.role = Role::Tool;
+        message.kind = MessageKind::ToolResult;
+        message.tool_name = Some(name.into());
+    }
+    upgraded
+        .upsert_session(&old, 1, source.len() as i64)
+        .unwrap();
+    upgraded
+        .upsert_session(&parsed, 1, source.len() as i64)
+        .unwrap();
+    fresh
+        .upsert_session(&parsed, 1, source.len() as i64)
+        .unwrap();
+    let mut filters = MessageFilters::default();
+    assert!(fresh
+        .search_messages("runtime sentinel", &filters)
+        .unwrap()
+        .is_empty());
+    filters.kinds = Some(vec![MessageKind::HarnessNotice]);
+    let rows = |db: &Db| {
+        db.search_messages("runtime sentinel", &filters)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.seq, m.role, m.kind, m.tool_name, m.content))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&upgraded), rows(&fresh));
+    assert_eq!(rows(&fresh).len(), 2);
+}
