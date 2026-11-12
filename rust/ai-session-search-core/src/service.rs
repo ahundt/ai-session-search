@@ -3372,8 +3372,10 @@ impl<'db> MessageService<'db> {
         });
         let origins =
             (exhausted && plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
-        let ordered_digest =
-            (exhausted && plan.receipt == ReceiptLevel::Full).then(|| digest.finish());
+        // The digest is computed for every batch anyway, so a completed traversal always reports
+        // it, matching MessageSearchResponse::ordered_digest. Receipt documents still include it
+        // only at ReceiptLevel::Full.
+        let ordered_digest = exhausted.then(|| digest.finish());
         Ok(MessageSearchBatchVisitOutcome {
             exhausted,
             page,

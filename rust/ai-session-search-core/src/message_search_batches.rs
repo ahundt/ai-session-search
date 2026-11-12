@@ -95,6 +95,11 @@ impl MessageSearchCompletion {
         self.origins.as_ref()
     }
 
+    /// SHA-256 over the ordered identities of every result the batches delivered, equal to
+    /// [`MessageSearchResponse::ordered_digest`](crate::MessageSearchResponse::ordered_digest)
+    /// for the same request. Always `Some` on a completion, whatever the request's receipt
+    /// level; it is `Option` because the receipt document carries it only at
+    /// [`ReceiptLevel::Full`](crate::ReceiptLevel::Full).
     pub fn ordered_digest(&self) -> Option<&str> {
         self.ordered_digest.as_deref()
     }

@@ -723,6 +723,38 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    /// A completed batch traversal reports the same ordered digest as the materialized response,
+    /// without the caller asking for a full receipt.
+    #[test]
+    fn batch_completion_reports_the_materialized_ordered_digest() {
+        use ai_session_search::RequestedExtent;
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        let request = || {
+            MessageSearchRequest::builder(
+                MessageQuery::literal("tests").unwrap(),
+                MessageTarget::content(),
+            )
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap()
+        };
+        let materialized = app.messages().search(request()).unwrap();
+        let mut batches = app
+            .message_search_batches(request(), std::num::NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        let mut rows = 0;
+        while let Some(batch) = batches.next_batch().unwrap() {
+            rows += batch.results().len();
+        }
+        assert_eq!(rows, materialized.results().len());
+        let completion = batches.completion().unwrap();
+        assert_eq!(
+            completion.ordered_digest(),
+            Some(materialized.ordered_digest().as_str())
+        );
+    }
+
     /// Transcript windows use the CLI's signed convention: first N, last N, or all for 0.
     #[test]
     fn transcript_window_reads_first_last_or_all_lines() {
