@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -729,10 +729,11 @@ struct ShowArgs {
 struct ResumeArgs {
     /// Session id or unambiguous id prefix to resume.
     id: String,
-    /// Skip the confirmation prompt and run the resume command immediately.
+    /// Skip confirmation and run the resume command when stdin and stdout are terminals.
     #[arg(long)]
     yes: bool,
     /// Print a POSIX-shell rendering of the resume arguments without running them.
+    /// This is also the default when stdin or stdout is not a terminal.
     #[arg(long)]
     dry_run: bool,
 }
@@ -1423,7 +1424,7 @@ fn execute(cli: Cli) -> Result<()> {
                 println!("cwd: {cwd}");
             }
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
-            if args.dry_run {
+            if args.dry_run || !io::stdout().is_terminal() || !io::stdin().is_terminal() {
                 return Ok(());
             }
             if !args.yes && !prompt_confirm("Execute resume command?")? {

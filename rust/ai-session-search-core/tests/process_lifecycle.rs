@@ -2216,7 +2216,7 @@ fn a_reader_answers_while_another_process_holds_the_index_writer_lock() {
 }
 
 #[test]
-fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
+fn cli_resume_without_terminal_prints_command_without_prompt_or_provider() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
 
@@ -2274,7 +2274,8 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("codex resume resume-test"), "{stdout}");
-    assert!(stdout.contains("resume cancelled"), "{stdout}");
+    assert!(!stdout.contains("Execute resume command?"), "{stdout}");
+    assert!(!stdout.contains("resume cancelled"), "{stdout}");
 }
 
 /// A ceiling set in the registration `env` block is the ceiling the served result is measured
