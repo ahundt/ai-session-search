@@ -831,8 +831,10 @@ pub struct SkillsConfig {
     /// skill directories. `~` is expanded. Empty = only capabilities embedded in the executable.
     ///
     /// These are DISCOVERY roots and are deliberately not the install destinations from
-    /// `aise integrations install`: install writes the same bundled skill to three client roots,
-    /// so scanning those would find three copies of one name. Discovery is also not activation --
+    /// `aise integrations install`: install writes one package under
+    /// `~/.ai-session-search/skills/` and links to it from each detected harness's skill
+    /// directory, so scanning those would find one name several times. Discovery is also not
+    /// activation --
     /// a file appearing here never changes results until it is selected by name.
     #[serde(default)]
     pub search_paths: Vec<String>,

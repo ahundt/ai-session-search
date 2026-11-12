@@ -271,8 +271,9 @@ threads = 0
 # holding SKILL.md) or a directory containing skill directories. `~` is expanded.
 #
 # These are DISCOVERY roots, not the install destinations `aise integrations install` writes to:
-# install writes the same bundled skill to three client roots, so scanning those would find three
-# copies of one name. Discovery is not activation: a skill found here changes nothing until it is
+# install writes one package under ~/.ai-session-search/skills/ and links to it from each detected
+# harness's skill directory, so scanning those directories would find one name several times.
+# Discovery is not activation: a skill found here changes nothing until it is
 # selected by `aise skills <name-or-path>` or a repeatable `--skill`.
 search_paths = []
 # Parent directory `aise skills create` writes into when --output-dir is omitted. Unset = require
