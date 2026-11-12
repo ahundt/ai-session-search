@@ -2889,7 +2889,6 @@ mod tests {
 
         /// Send the startup request for a harness that seeded nothing (the digest guard's
         /// real-executor path, whose fixture lives in the factory's own database).
-        #[allow(dead_code)]
         fn start(&mut self) {
             self.app.request_search();
         }
