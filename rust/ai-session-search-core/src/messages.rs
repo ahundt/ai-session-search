@@ -923,14 +923,17 @@ pub struct TimelineArgs {
     /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
-    /// Keep only messages containing this literal substring. Omit to keep every message the other
-    /// filters select. Mutually exclusive with `--regex` (which would otherwise silently win).
+    /// Text to match literally by default; --query-mode regex selects a Rust regex.
+    /// Omit for every message the other filters select. Conflicts with --regex.
     #[arg(long, conflicts_with = "regex")]
     pub grep: Option<String>,
-    /// Keep only messages matching this Rust regex. Omit to keep every message the other filters
-    /// select.
+    /// Deprecated: use --grep PATTERN --query-mode regex.
+    /// Keep messages matching this Rust regex. Omit for no regex filter.
     #[arg(long)]
     pub regex: Option<String>,
+    /// Matching model for --grep: literal (default) or regex. Requires a text filter.
+    #[arg(long, value_parser = ["literal", "regex"])]
+    pub query_mode: Option<String>,
     /// Include extracted URL references in output for timeline rows.
     #[arg(long)]
     pub refs: bool,
@@ -1074,6 +1077,17 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
             emit_message_hits(&hits, args.refs, args.format, lines_per_message)
         }
         MessagesCmd::Timeline(args) => {
+            if args.regex.is_some() {
+                eprintln!(
+                    "aise: timeline --regex is deprecated; use --grep PATTERN --query-mode regex"
+                );
+                if args.query_mode.as_deref() == Some("literal") {
+                    bail!("--regex conflicts with --query-mode literal; pass --grep PATTERN with one --query-mode");
+                }
+            }
+            if args.query_mode.is_some() && args.grep.is_none() && args.regex.is_none() {
+                bail!("--query-mode requires a text filter; pass --grep PATTERN");
+            }
             let session = db.resolve_session_record(&args.id)?;
             validate_seq_bounds(args.seq_from, args.seq_to)?;
             let (since, until) = args.dates.resolve_now()?;
@@ -1087,7 +1101,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                 seq_to: args.seq_to,
                 limit: args.limit,
                 offset: args.offset,
-                match_mode: if args.regex.is_some() {
+                match_mode: if args.regex.is_some() || args.query_mode.as_deref() == Some("regex") {
                     MessageSearchMode::Regex
                 } else {
                     MessageSearchMode::Literal

@@ -871,12 +871,15 @@ impl Row for RepeatGroupRow {
 #[derive(Debug, Args)]
 pub(crate) struct RepeatsArgs {
     /// Optional text to narrow candidate messages before repeat mining. Exact literal by default;
-    /// add --regex to interpret it as a Rust regex. A query starting with `-` is parsed as a flag
-    /// here; pass it after `--`, with every other flag before the `--`, e.g. `--regex -- ^/\S+`.
+    /// add --query-mode regex to interpret it as a Rust regex. A query starting with `-` is parsed as a flag
+    /// here; pass it after `--`, with every other flag before the `--`, e.g. `--query-mode regex -- ^/\S+`.
     pub query: Option<String>,
-    /// Interpret QUERY as a Rust regex before repeat mining.
+    /// Deprecated: use --query-mode regex. Interpret QUERY as a Rust regex.
     #[arg(long)]
     pub regex: bool,
+    /// QUERY matching model: literal (default) or regex. Requires QUERY.
+    #[arg(long, value_parser = ["literal", "regex"])]
+    pub query_mode: Option<String>,
     /// Filter by role: user (source-attributable human text only), assistant, tool
     /// (calls/results), slash (human-entered commands), or compaction. Omit to mine human text.
     #[arg(long = "role", value_enum)]
@@ -935,8 +938,14 @@ pub(crate) struct RepeatsArgs {
 }
 
 pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Result<()> {
-    if args.regex && args.query.is_none() {
-        bail!("--regex requires QUERY");
+    if args.regex {
+        eprintln!("aise: repeats --regex is deprecated; use --query-mode regex");
+        if args.query_mode.as_deref() == Some("literal") {
+            bail!("--regex conflicts with --query-mode literal; pass one --query-mode");
+        }
+    }
+    if (args.regex || args.query_mode.is_some()) && args.query.is_none() {
+        bail!("--query-mode and deprecated --regex require QUERY");
     }
     if args.report && !matches!(args.format, OutputFormat::Json | OutputFormat::Jsonl) {
         bail!("--report requires --format json or --format jsonl");
@@ -951,7 +960,7 @@ pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Resul
             path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
             since,
             until,
-            match_mode: if args.regex {
+            match_mode: if args.regex || args.query_mode.as_deref() == Some("regex") {
                 MessageSearchMode::Regex
             } else {
                 MessageSearchMode::Literal

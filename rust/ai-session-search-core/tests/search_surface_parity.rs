@@ -977,3 +977,65 @@ fn show_json_preserves_the_shared_transcript_window() {
     assert_eq!(got["complete"], false);
     assert!(got["session"].get("raw_metadata_json").is_none());
 }
+
+#[test]
+fn timeline_and_repeats_query_mode_regex_preserves_legacy_matches() {
+    let f = fixture();
+    let session = f.spec["session_id"].as_str().unwrap();
+    let pattern = f.spec["regex_alias"]["pattern"].as_str().unwrap();
+    for command in ["timeline", "repeats"] {
+        let run = |legacy: bool, mode: &str| {
+            let mut cli = aise(&f);
+            if command == "timeline" {
+                cli.args(["messages", "timeline", session]);
+                if legacy {
+                    cli.args(["--regex", pattern]);
+                } else {
+                    cli.args(["--grep", pattern, "--query-mode", mode]);
+                }
+            } else {
+                cli.args([
+                    "repeats",
+                    pattern,
+                    "--session-id",
+                    session,
+                    "--phrase-min-words",
+                    "1",
+                    "--phrase-max-words",
+                    "2",
+                    "--min-matches",
+                    "2",
+                ]);
+                if legacy {
+                    cli.arg("--regex");
+                } else {
+                    cli.args(["--query-mode", mode]);
+                }
+            }
+            let output = cli
+                .args(["--format", "json", "--index-refresh", "existing-only"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if legacy {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("deprecated") && stderr.contains("--query-mode regex"),
+                    "{stderr}"
+                );
+            }
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        };
+        let canonical = run(false, "regex");
+        assert!(!canonical.as_array().unwrap().is_empty(), "{command}");
+        assert_eq!(canonical, run(true, "regex"), "{command}");
+        assert!(
+            run(false, "literal").as_array().unwrap().is_empty(),
+            "{command}"
+        );
+    }
+}
