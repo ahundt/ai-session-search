@@ -543,9 +543,9 @@ operator running a client that has since moved sets the new number here rather t
 a release built against it.
 
 Your settings change schema size because descriptions contain resolved values. With shipped
-defaults, `search_messages` measures 4,586 bytes after Codex normalization, leaving 414 bytes under
-its 5,000-byte limit. The server advertises `purpose` and `purpose_version` only when
-`[search.purposes]` contains a bundle. Configured names add both enum and description bytes; run
+defaults, `search_messages` measures 4,732 bytes after Codex normalization, leaving 268 bytes under
+its 5,000-byte limit. The server keeps `purpose` and `purpose_version` advertised when no bundles
+are configured, with guidance to omit them. Configured names add enum and description bytes; run
 `aise mcp schema-budget` after changing them. The server also checks its catalogue at startup and
 reports a breach on stderr. Over the Codex limit, the client removes every parameter description.
 

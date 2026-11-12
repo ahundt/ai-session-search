@@ -51,9 +51,10 @@ not turn omitted values into explicit arguments that conflict with a caller's ch
 message-search defaults, accepted values, and conflict rules are generated from the planner;
 see the [caller reference](../README.md#generated-message-search-caller-contract).
 
-`purpose` and `purpose_version` are advertised only when presets are configured. Purpose names
-appear in both the enum and its description, so adding presets grows the schema. The server checks
-the configured catalogue once per connection and warns on stderr if it exceeds an enforced budget.
+`purpose` and `purpose_version` remain advertised when no presets are configured, with guidance
+to omit them. Configured purpose names appear in both the enum and its description, so adding
+presets grows the schema. The server checks the configured catalogue once per connection and
+warns on stderr if it exceeds an enforced budget.
 
 ## Tool results
 

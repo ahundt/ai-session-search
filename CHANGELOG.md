@@ -40,6 +40,9 @@ reads, and resume commands. See the [library guide](docs/development/library-api
 4. Python file queries return every matching file or version by default, instead of stopping at
    50. Supply a positive limit for a page. Omitted session-list and ranked-search limits now
    follow `[search].default_limit`; explicit zero still returns every session.
+   Omitted `query_mode` on Python `search_messages()` and `search_message_batches()` now follows
+   the request mode instead of overriding it with `literal`; pass `query_mode="literal"` to
+   preserve that override.
 5. Scripts can see fewer duplicate search results and file edits: Claude Code saved API request
    copies and repeated record identities no longer add extra turns or edits. Queued submissions
    delivered as prompts count as those prompts; independent same-text submissions stay distinct.
@@ -101,7 +104,8 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    policy tables remain strict. Upgrades preserve existing configuration without adding active
    keys. Migration receipts, skill manifests, and native ownership receipts preserve additive
    metadata; unsupported receipt versions fail before recovery writes.
-6. MCP advertises `purpose` and `purpose_version` only when search presets are configured.
+6. MCP keeps `purpose` and `purpose_version` in its schema when no search presets are configured;
+   configured presets supply the accepted purpose names.
    Server instructions name `aise files extract`, `aise export`, `aise analyze`, and `aise reindex`
    for operations performed through the CLI or libraries.
 
@@ -120,44 +124,45 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    Compatible aliases remain accepted; conflicting simultaneous values fail.
 8. Python `search_sessions("")` → `list_sessions(request)`; `diagnostics()` → `doctor()`.
    Both emit `DeprecationWarning`.
-9. Rust compatibility items remain callable with compiler warnings. Use these replacements:
+9. Rust compatibility items remain callable with compiler warnings. This table follows the
+   public deprecation attributes, grouping duplicate aliases and fields on deprecated types:
 
    | Rust items | Replacement |
    | --- | --- |
-   | `dates::parse_bound`, `dates::parse_span` | DateRange::resolve and pass the result to CatalogService or MessageService |
-   | `util::apply_user_role_authorship`, `util::UserRoleAuthorshipEvidence` | RawMessage::with_authorship before normalization |
-   | `Db::clear_all` | `IndexService::reindex_report` preserves archived history |
-   | `Db::is_file_current` | IndexService::prepare_for_read for coordinated freshness checks |
-   | `Db::replace_session` | IndexService::reindex_report for coordinated parser upgrades |
-   | `Db::purge_injected_messages` | `Db::classify_injected_messages` (reclassifies and preserves rows) |
-   | `Db::messages_fts_count` | MaintenanceService::diagnostics for index health |
-   | `Db::explain_message_search` | MessageService::plan or MessageService::search with a receipt level |
-   | `Db::file_edits_for` | FileService::history or FileService::reconstruct for typed recovery |
-   | `Db::file_edits_for_session_id` | FileService::history with a session-scoped FileQuery |
-   | `Db::file_edit_count` | FileService::search for typed file summaries |
-   | `Db::counts_by_provider` | CatalogService::list_sessions and group its typed provider rows |
-   | `files::run` | FileService::search, history, cross_reference, or reconstruct |
-   | `indexer::auto_reindex` | IndexService::prepare_for_read or IndexService::refresh |
-   | `SkillNameSelector` | SkillSelector::name |
-   | `SkillPathSelector` | SkillSelector::path |
-   | `mcp_schema_budget::ceiling_for`, `mcp_schema_budget::codex_strips_descriptions` | mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command |
-   | `mcp_schema_budget::LEDGER_STAGES` | run_cli_from for the schema-budget stage ledger; mcp_schema_budget::evaluate_all evaluates catalogue limits |
+   | `EffectiveAccessScope::allows_workspace_path` | CatalogService::list_sessions for authoritative scope-enforced reads |
+   | `EffectiveAccessScope::is_unrestricted` | match EffectiveAccessScope for policy inspection; use CatalogService::list_sessions for scope-enforced reads |
+   | `IndexService::reindex` | IndexService::reindex_report |
+   | `MessageSearchBatch::into_parts` | MessageService::search, or borrow batch results, context_windows, and included |
    | `MessageSearchResponse::into_hits` | MessageService::search and MessageSearchResponse::results |
    | `MessageSearchResponse::into_rows` | MessageService::search and borrow results and context_windows |
-   | `MessageSearchBatch::into_parts` | MessageService::search, or borrow batch results, context_windows, and included |
-   | `messages::run` | MessageService::search or read_session, or CatalogService::inspect |
-   | `EffectiveAccessScope::is_unrestricted` | match EffectiveAccessScope for policy inspection; use CatalogService::list_sessions for scope-enforced reads |
-   | `EffectiveAccessScope::allows_workspace_path` | CatalogService::list_sessions for authoritative scope-enforced reads |
-   | `IndexService::reindex` | IndexService::reindex_report |
    | `MessageService::search_legacy`, `MessageService::search_with_explain` | MessageService::search |
-   | `skills::SkillSummary`, `skills::SkillCategoryRow`, `skills::SkillDiagnostic` | run_cli_from for skill metadata or AnalysisService::run_skill for capability execution |
+   | `SkillNameSelector` | SkillSelector::name |
+   | `SkillPathSelector` | SkillSelector::path |
+   | `dates::parse_bound`, `dates::parse_span` | DateRange::resolve and pass the result to CatalogService or MessageService |
+   | `db::Db::clear_all` | no service deletes the archive; IndexService::reindex_report refreshes while preserving history |
+   | `db::Db::counts_by_provider` | CatalogService::list_sessions and group its typed provider rows |
+   | `db::Db::explain_message_search` | MessageService::plan or MessageService::search with a receipt level |
+   | `db::Db::file_edit_count` | FileService::search for typed file summaries |
+   | `db::Db::file_edits_for` | FileService::history or FileService::reconstruct for typed recovery |
+   | `db::Db::file_edits_for_session_id` | FileService::history with a session-scoped FileQuery |
+   | `db::Db::is_file_current` | IndexService::prepare_for_read for coordinated freshness checks |
+   | `db::Db::messages_fts_count` | MaintenanceService::diagnostics for index health |
+   | `db::Db::purge_injected_messages` | reclassifies instead of deleting; call `classify_injected_messages` |
+   | `db::Db::replace_session` | IndexService::reindex_report for coordinated parser upgrades |
+   | `files::run` | FileService::search, history, cross_reference, or reconstruct |
+   | `indexer::auto_reindex` | IndexService::prepare_for_read or IndexService::refresh |
+   | `mcp_schema_budget::LEDGER_STAGES` | run_cli_from for the schema-budget stage ledger; mcp_schema_budget::evaluate_all evaluates catalogue limits |
+   | `mcp_schema_budget::ceiling_for`, `mcp_schema_budget::codex_strips_descriptions` | mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command |
+   | `messages::run` | MessageService::search or read_session, or CatalogService::inspect |
+   | `skills::SkillCategoryRow`, `skills::SkillDiagnostic`, `skills::SkillSummary` | run_cli_from for skill metadata or AnalysisService::run_skill for capability execution |
    | `skills::run` | run_cli_from for skill management or AnalysisService::run_skill for capability execution |
-   | `DbQueryArgs::resolve` | SqlService::query with SqlQuery, which resolves configured defaults |
+   | `sql_query::DbQueryArgs::resolve` | SqlService::query with SqlQuery, which resolves configured defaults |
    | `sql_query::run` | SessionSearch::sql or SqlService::new(&config) and render the QueryResult |
    | `tail::tail_parse` | IndexService::reindex_report for guarded incremental parsing |
    | `trigram::trigram_prefilter_all` | MessageService::search with MessageQuery::regex for verified results |
-   | `trigram_index::ensure_schema`, `trigram_index::schema_is_compatible`, `trigram_index::base_max_id`, `trigram_index::build`, `trigram_index::build_in_current_transaction`, `trigram_index::candidates` | IndexService::reindex_report for index preparation and MessageService::search for verified queries |
-   | `util::to_messages`, `util::LegacyRawMessage`, `util::to_messages_with_tools` | RawMessage constructors; IndexService::reindex_report owns provider normalization |
+   | `trigram_index::base_max_id`, `trigram_index::build`, `trigram_index::build_in_current_transaction`, `trigram_index::candidates`, `trigram_index::ensure_schema`, `trigram_index::schema_is_compatible` | IndexService::reindex_report for index preparation and MessageService::search for verified queries |
+   | `util::LegacyRawMessage`, `util::to_messages`, `util::to_messages_with_tools` | RawMessage constructors; IndexService::reindex_report owns provider normalization |
+   | `util::UserRoleAuthorshipEvidence`, `util::apply_user_role_authorship` | RawMessage::with_authorship before normalization |
    | `util::to_messages_with_tools_in_scope` | RawMessage constructors; IndexService::reindex_report owns scoped provider normalization |
 
 ### Fixed
