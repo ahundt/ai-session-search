@@ -31,7 +31,8 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    constructor or `T::default()` followed by field assignment or `with_*` setters; add wildcard
    arms to enum matches. For example, use
    `SearchFilters::default().with_path_prefix(dir)` instead of a `SearchFilters { ... }` literal.
-   Use `RawMessage::with_authorship` before normalization; `UserRoleAuthorshipEvidence` is private.
+   Replace `apply_user_role_authorship` with `RawMessage::with_authorship` before normalization;
+   `UserRoleAuthorshipEvidence` is private.
 3. Rust typed reads on a never-refreshed empty index return `ServiceError::IndexNotRefreshed`.
    Call `app.index().prepare_for_read()` after opening to apply the configured refresh policy.
    `MessageService::context` resolves session prefixes and reports an unknown session as
