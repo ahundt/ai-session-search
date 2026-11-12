@@ -939,7 +939,34 @@ const MISTAKEN_ARGUMENTS: &[MistakenArgument] = &[
         replacement: "--receipt-level summary",
         note: "",
     },
+    MistakenArgument {
+        command: &["show"],
+        name: "--tail",
+        replacement: "--transcript-lines -N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
+    MistakenArgument {
+        command: &["show"],
+        name: "--last",
+        replacement: "--transcript-lines -N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
+    MistakenArgument {
+        command: &["show"],
+        name: "--head",
+        replacement: "--transcript-lines N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
+    MistakenArgument {
+        command: &["show"],
+        name: "--max-lines",
+        replacement: "--transcript-lines N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
 ];
+
+const SHOW_TRANSCRIPT_LINES_SIGN_RULE: &str = "--transcript-lines N prints the first N lines, \
+     --transcript-lines -N the last N, and --transcript-lines 0 the whole transcript";
 
 /// Replace Clap's edit-distance guess for a [`MISTAKEN_ARGUMENTS`] row. `command_tokens` are the
 /// arguments after the hoisted globals, so a leading `--index-refresh` does not hide the
@@ -4274,6 +4301,50 @@ mod tests {
         // The session-level commands keep their own `--path`.
         assert_parses(["aise", "search", "workflow", "--path", "/tmp/p"]);
         assert_parses(["aise", "list", "--path", "/tmp/p"]);
+    }
+
+    /// `aise show` windows its transcript with one signed `--transcript-lines`. Callers reach for
+    /// `--tail`, `--last`, `--head`, or `--max-lines`; clap answered those with its pass-as-value
+    /// tip, or nothing useful.
+    #[test]
+    fn show_line_window_spellings_name_transcript_lines_and_its_sign_rule() {
+        for (stale, replacement) in [
+            ("--tail", "--transcript-lines -N"),
+            ("--last", "--transcript-lines -N"),
+            ("--head", "--transcript-lines N"),
+            ("--max-lines", "--transcript-lines N"),
+        ] {
+            for invocation in [
+                vec!["aise", "show", "abc", stale, "40"],
+                vec!["aise", "show", stale, "40", "abc"],
+            ] {
+                let error = parse_cli_from(invocation.clone()).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{invocation:?}"
+                );
+                let text = error.to_string();
+                assert!(
+                    text.contains(&format!("a similar argument exists: '{replacement}'")),
+                    "{invocation:?}: {text}"
+                );
+                assert!(
+                    text.contains("the last N, and --transcript-lines 0 the whole transcript"),
+                    "{invocation:?}: {text}"
+                );
+                assert!(!text.contains("as a value"), "{invocation:?}: {text}");
+                assert!(text.contains("Usage: aise show"), "{invocation:?}: {text}");
+            }
+        }
+        let cli = parse_cli_from(["aise", "show", "abc", "--transcript-lines", "-40"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Show(ShowArgs {
+                transcript_lines: Some(-40),
+                ..
+            })
+        ));
     }
 
     /// The renames stay rejections, never working aliases: accepting `--regex` would keep two
