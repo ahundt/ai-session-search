@@ -746,6 +746,60 @@ mod tests {
         assert_eq!(resolved.origins.cache, "typed/platform default");
     }
 
+    /// Inspection follow-ups come as library calls beside the `aise` command strings, and each
+    /// one runs.
+    #[test]
+    fn inspection_follow_ups_are_runnable_library_calls() {
+        use ai_session_search::{InspectionFollowUp, MessageOrder};
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        let inspection = app
+            .catalog()
+            .inspect("claude:consumer-b", InspectionOptions::default())
+            .unwrap();
+        assert_eq!(inspection.follow_ups.len(), inspection.next_commands.len());
+        for follow_up in &inspection.follow_ups {
+            match follow_up {
+                InspectionFollowUp::TranscriptWindow {
+                    session_id, lines, ..
+                } => {
+                    assert_eq!(*lines, -40);
+                    app.catalog().transcript(session_id, *lines).unwrap();
+                }
+                InspectionFollowUp::MessageContext {
+                    session_id,
+                    seq,
+                    before,
+                    after,
+                    ..
+                } => {
+                    assert!(!app
+                        .messages()
+                        .context(session_id, *seq, *before, *after)
+                        .unwrap()
+                        .is_empty());
+                }
+                InspectionFollowUp::SessionMessages { session_id, .. } => {
+                    let filters = MessageFilters::default().with_session_id(session_id.clone());
+                    assert!(!app
+                        .messages()
+                        .read_session(&filters, MessageOrder::OldestFirst)
+                        .unwrap()
+                        .is_empty());
+                }
+                InspectionFollowUp::FileCrossReference { session_id, .. } => {
+                    let query = FileQuery::default().with_session_id(session_id.clone());
+                    assert!(!app.files().cross_reference(&query).unwrap().is_empty());
+                }
+                other => panic!("unexpected follow-up {other:?}"),
+            }
+        }
+        assert!(matches!(
+            inspection.follow_ups.first(),
+            Some(InspectionFollowUp::TranscriptWindow { .. })
+        ));
+    }
+
     /// A completed batch traversal reports the same ordered digest as the materialized response,
     /// without the caller asking for a full receipt.
     #[test]

@@ -154,7 +154,7 @@ pub use db::MessageOrder;
 pub use export::{ExportDocument, ExportPublicationReceipt};
 pub use files::{ReconstructedFile, ReconstructedFileVersions, RecoveryPublicationReceipt};
 pub use indexer::{AutoReindexOutcome, ExplicitReindexOutcome};
-pub use inspect::SessionInspection;
+pub use inspect::{InspectionFollowUp, SessionInspection};
 pub use message_search::MessageSearchPlan;
 pub use models::{
     AnalysisCursor, AnalysisDocumentPage, DiagnosticStatus, FileCrossRef, FileEditSummary,

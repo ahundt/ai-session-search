@@ -43,7 +43,42 @@ pub struct SessionInspection {
     pub truncated_evidence: Vec<EvidenceSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_profile: Option<crate::models::SessionTimeProfile>,
+    /// The same follow-ups as [`SessionInspection::follow_ups`], written as POSIX-shell `aise`
+    /// commands for a person or an agent with a shell.
     pub next_commands: Vec<String>,
+    /// Follow-up reads as library calls, in the order of `next_commands`. Each item's
+    /// `expand_command` likewise corresponds to
+    /// [`MessageService::context`](crate::service::MessageService::context)`(session.id, seq, 3, 3)`.
+    /// Not serialized: JSON output keeps carrying `next_commands`.
+    #[serde(skip)]
+    pub follow_ups: Vec<InspectionFollowUp>,
+}
+
+/// One follow-up read suggested by a session inspection, as a library call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InspectionFollowUp {
+    /// [`CatalogService::transcript`](crate::service::CatalogService::transcript)`(session_id,
+    /// lines)`; `lines` is -40, the last 40 lines.
+    #[non_exhaustive]
+    TranscriptWindow { session_id: String, lines: i64 },
+    /// [`MessageService::context`](crate::service::MessageService::context)`(session_id, seq,
+    /// before, after)` around the first intent or tool message.
+    #[non_exhaustive]
+    MessageContext {
+        session_id: String,
+        seq: i64,
+        before: i64,
+        after: i64,
+    },
+    /// [`MessageService::read_session`](crate::service::MessageService::read_session) with
+    /// `filters.session_id = session_id`: the whole message timeline.
+    #[non_exhaustive]
+    SessionMessages { session_id: String },
+    /// [`FileService::cross_reference`](crate::service::FileService::cross_reference) with
+    /// `query.session_id = session_id`: the files this session edited.
+    #[non_exhaustive]
+    FileCrossReference { session_id: String },
 }
 
 /// A compact-summary evidence category for which additional indexed entries are available.
@@ -377,6 +412,26 @@ pub fn inspect_session(
         .into_iter()
         .map(|parts| render_posix_shell_command(&parts))
         .collect::<Result<Vec<_>>>()?;
+    let mut follow_ups = vec![InspectionFollowUp::TranscriptWindow {
+        session_id: exact.clone(),
+        lines: -40,
+    }];
+    if let Some(seq) = selected_seq {
+        follow_ups.push(InspectionFollowUp::MessageContext {
+            session_id: exact.clone(),
+            seq,
+            before: 10,
+            after: 10,
+        });
+    }
+    follow_ups.extend([
+        InspectionFollowUp::SessionMessages {
+            session_id: exact.clone(),
+        },
+        InspectionFollowUp::FileCrossReference {
+            session_id: exact.clone(),
+        },
+    ]);
 
     let mut inspection = SessionInspection {
         session,
@@ -390,6 +445,7 @@ pub fn inspect_session(
             .then(|| db.session_time_profile(&exact))
             .transpose()?,
         next_commands,
+        follow_ups,
     };
     apply_evidence_budget(&mut inspection, options.evidence_window);
     Ok(inspection)
