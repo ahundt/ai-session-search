@@ -1410,9 +1410,7 @@ mod published_date_compatibility {
     #[test]
     #[allow(deprecated)]
     fn published_duration_shorthand_keeps_fixed_months_and_years() {
-        let now = DateTime::parse_from_rfc3339("2024-03-31T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = crate::util::parse_datetime("2024-03-31T12:00:00Z").unwrap();
         for (input, days) in [("1m", 30), ("1M", 30), ("1y", 365), ("1Y", 365)] {
             assert_eq!(
                 parse_span(input, now).unwrap(),
