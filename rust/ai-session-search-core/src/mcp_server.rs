@@ -3885,7 +3885,7 @@ fn message_search_tool_description(config: &Config, input_schema: &Value) -> Str
     let mut text = String::from(
         "Search local messages. structuredContent is authoritative; effective_request states choices; \
          results carry message_ref, views and literal coordinates. \
-         page.next_offset is the next offset; expand with get_session(session_id, message_seq).\n",
+         page.next_offset is the next offset; expand with get_session(session_id, seq).\n",
     );
     text.push_str(
         "Omitting a filter leaves it unapplied. harness_notice (harness output) is the one class omitted when kinds is omitted. \
@@ -4734,7 +4734,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "get_session",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), message_seq=N with context for one turn, or seq_from/seq_to for an absolute message range. To read more, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger transcript_lines, which re-sends what you already received. Default returns {} transcript lines.", transcript_lines_default_label(config.mcp.get_session_transcript_lines)),
+                    "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), seq=N with context for one turn, or seq_from/seq_to for an absolute message range. To read more, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger transcript_lines, which re-sends what you already received. Default returns {} transcript lines.", transcript_lines_default_label(config.mcp.get_session_transcript_lines)),
                     "outputSchema": get_session_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -4751,28 +4751,28 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true." },
                             "transcript_lines": {
                                 "type": "integer",
-                                "description": format!("Transcript lines: positive=head/start, negative=tail/end, 0=all (may be large). Prefer message_seq from search_messages for one turn. Conflicts with summary, message_seq and ranges. Omit for {} when no selector is given.", config.mcp.get_session_transcript_lines)
+                                "description": format!("Transcript lines: positive=head/start, negative=tail/end, 0=all (may be large). Prefer seq for one turn. Conflicts with summary, seq and ranges. Omit for {} when no selector is given.", config.mcp.get_session_transcript_lines)
                             },
                             "seq": { "type": "integer", "minimum": 0, "description": "0-based message sequence from search_messages results[].message_ref.message_seq; selects focused context instead of transcript lines. Omit for transcript output." },
                             "message_seq": { "type": "integer", "minimum": 0, "description": "Deprecated: use seq. Same focused-message selector; conflicting values fail." },
                             "seq_from": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Lower inclusive session-local sequence bound. Pair with seq_to for chunks (0..499, then 500..999); advance last seq + 1 to avoid re-reading. Conflicts with summary, transcript_lines and message_seq. Omit to start at the first message."
+                                "description": "Lower inclusive session-local sequence bound. Pair with seq_to for chunks (0..499, then 500..999); advance last seq + 1 to avoid re-reading. Conflicts with summary, transcript_lines and seq. Omit to start at the first message."
                             },
                             "seq_to": {
                                 "type": "integer", "minimum": 0,
                                 "description": "Upper inclusive message-sequence bound for an absolute range read. See seq_from for non-overlapping chunked reads. Must be >= seq_from when both are given."
                             },
-                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Message classes for seq_from/seq_to ranges. Omit for every class except harness_notice. Include harness_notice in an explicit class list to read notices too; focused message_seq context already includes every class." },
-                            "context_before": { "type": "integer", "minimum": 0, "description": "Messages before message_seq; omit for context. 0 selects none." },
-                            "context_after": { "type": "integer", "minimum": 0, "description": "Messages after message_seq; omit for context. 0 selects none." },
+                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Message classes for seq_from/seq_to ranges. Omit for every class except harness_notice. Include harness_notice in an explicit class list to read notices too; focused seq context already includes every class." },
+                            "context_before": { "type": "integer", "minimum": 0, "description": "Messages before seq; omit for context. 0 selects none." },
+                            "context_after": { "type": "integer", "minimum": 0, "description": "Messages after seq; omit for context. 0 selects none." },
                             "context": {
                                 "type": "integer", "minimum": 0,
-                                "description": "When message_seq is provided, include this many turns before and after that message (default 0)."
+                                "description": "When seq is provided, include this many turns before and after that message (default 0)."
                             },
                             "include_refs": {
                                 "type": "boolean",
-                                "description": "When message_seq is provided, include extracted URL-like references for each returned message (default false)."
+                                "description": "When seq is provided, include extracted URL-like references for each returned message (default false)."
                             },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)) },
                             "lines_per_message": {
@@ -5129,11 +5129,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
 
     if message_seq.is_none() {
         for name in ["context_before", "context_after"] {
-            reject_present(
-                args,
-                name,
-                "asymmetric context only applies with message_seq",
-            )?;
+            reject_present(args, name, "asymmetric context only applies with seq")?;
         }
     }
     if !has_range {
@@ -5156,7 +5152,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         + has_range as usize;
     if selector_count > 1 {
         return Err(
-            "Use only one get_session output selector: summary, transcript_lines, message_seq, or seq_from/seq_to."
+            "Use only one get_session output selector: summary, transcript_lines, seq (or deprecated message_seq), or seq_from/seq_to."
                 .to_string(),
         );
     }
@@ -5179,10 +5175,18 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
                 "unsupported get_session include value: {unsupported}"
             ));
         }
-        reject_present(args, "include_refs", "include_refs only applies with message_seq; summary already includes reference evidence")?;
-        reject_present(args, "context", "context only applies with message_seq; summary includes follow-up commands for larger windows")?;
-        reject_present(args, "response_format", "response_format only applies with message_seq; summary always returns structured evidence with bounded previews")?;
-        reject_present(args, "lines_per_message", "lines_per_message only applies with message_seq; summary uses preview_chars for its bounded previews")?;
+        reject_present(
+            args,
+            "include_refs",
+            "include_refs only applies with seq; summary already includes reference evidence",
+        )?;
+        reject_present(
+            args,
+            "context",
+            "context only applies with seq; summary includes follow-up commands for larger windows",
+        )?;
+        reject_present(args, "response_format", "response_format only applies with seq; summary always returns structured evidence with bounded previews")?;
+        reject_present(args, "lines_per_message", "lines_per_message only applies with seq; summary uses preview_chars for its bounded previews")?;
         let mut options = inspection_options_from_args(args, config)?;
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
         let inspection = CatalogService::new(db)
@@ -5206,7 +5210,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     }
 
     if has_range {
-        reject_present(args, "context", "context only applies with message_seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]")?;
+        reject_present(args, "context", "context only applies with seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]")?;
         let session = db
             .resolve_session_record(session_id)
             .map_err(|e| format!("{e:#}"))?;
@@ -5230,9 +5234,13 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     reject_present(
         args,
         "context",
-        "context only applies with message_seq; transcript output uses transcript_lines",
+        "context only applies with seq; transcript output uses transcript_lines",
     )?;
-    reject_present(args, "include_refs", "include_refs only applies with message_seq; transcript output returns raw transcript lines")?;
+    reject_present(
+        args,
+        "include_refs",
+        "include_refs only applies with seq; transcript output returns raw transcript lines",
+    )?;
     reject_present(
         args,
         "preview_chars",
@@ -5241,9 +5249,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     reject_present(
         args,
         "response_format",
-        "response_format only applies with message_seq; transcript output uses transcript_lines",
+        "response_format only applies with seq; transcript output uses transcript_lines",
     )?;
-    reject_present(args, "lines_per_message", "lines_per_message caps each message and only applies with message_seq; transcript output windows the whole session with transcript_lines")?;
+    reject_present(args, "lines_per_message", "lines_per_message caps each message and only applies with seq; transcript output windows the whole session with transcript_lines")?;
     let selected_lines = transcript_lines.unwrap_or(config.mcp.get_session_transcript_lines);
 
     let window = crate::service::CatalogService::new(db)
@@ -6722,7 +6730,7 @@ fn message_search_text_summary(
         );
         let _ = writeln!(
             summary,
-            "   full message: get_session(session_id={:?}, message_seq={}, context={})",
+            "   full message: get_session(session_id={:?}, seq={}, context={})",
             message_ref.session_id(),
             message_ref.message_seq(),
             GET_SESSION_FOLLOW_UP_CONTEXT,
@@ -9040,7 +9048,7 @@ mod tests {
             "search_messages description advertises offset continuation: {tool_doc}"
         );
         assert!(
-            tool_doc.contains("get_session(session_id, message_seq)"),
+            tool_doc.contains("get_session(session_id, seq)"),
             "search_messages description names the exact expansion call: {tool_doc}"
         );
 
@@ -9380,15 +9388,15 @@ mod tests {
             properties["seq_from"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("non-overlapping"),
+                .contains("last seq + 1 to avoid re-reading"),
             "seq_from doc explains non-overlapping chunk reads"
         );
 
-        let message_seq_doc = properties["message_seq"]["description"].as_str().unwrap();
+        let seq_doc = properties["seq"]["description"].as_str().unwrap();
         assert!(
-            message_seq_doc.contains("results[].message_ref.message_seq")
-                && !message_seq_doc.contains("`seq` field"),
-            "message_seq doc names the exact search_messages result path: {message_seq_doc}"
+            seq_doc.contains("results[].message_ref.message_seq")
+                && !seq_doc.contains("`seq` field"),
+            "seq doc names the exact search_messages result path: {seq_doc}"
         );
 
         // task 35 guidance on the get_session description too.
@@ -9758,8 +9766,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            summary_error.contains("message_seq"),
-            "summary output must direct callers to message_seq: {summary_error}"
+            summary_error.contains("with seq"),
+            "summary output must direct callers to seq: {summary_error}"
         );
     }
 
@@ -9907,7 +9915,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(err.contains("include_refs only applies with message_seq"));
+        assert!(err.contains("include_refs only applies with seq"));
 
         // A present value is the caller's own even when it equals the omission value: it is
         // rejected on the path that cannot use it, exactly as on search_messages, so a client
@@ -9924,10 +9932,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(
-            err.contains("context only applies with message_seq"),
-            "{err}"
-        );
+        assert!(err.contains("context only applies with seq"), "{err}");
         assert!(tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).is_ok());
     }
 
@@ -14122,7 +14127,7 @@ mod tests {
             .as_str()
             .is_some_and(|description| {
                 description.contains("structuredContent is authoritative")
-                    && description.contains("get_session(session_id, message_seq)")
+                    && description.contains("get_session(session_id, seq)")
             }));
         // This filter applies to the canonical tool name whatever `field` is searching, so its
         // description has to name that field. The registry writes it surface-neutrally as "tool
@@ -14328,7 +14333,7 @@ mod tests {
             .as_str()
             .is_some_and(|d| d.contains("summary=true")
                 && d.contains("transcript_lines=N")
-                && d.contains("message_seq=N")
+                && d.contains("seq=N")
                 && d.contains("last 40 transcript lines")));
         assert!(query_session_index["description"]
             .as_str()
@@ -14367,12 +14372,12 @@ mod tests {
             schema["description"].as_str().unwrap().to_owned()
         };
         assert!(
-            get_session_prose("summary").contains("Default false"),
+            get_session_prose("summary").contains("Omit for false"),
             "summary is opt-in"
         );
         assert!(get_session["inputSchema"]["properties"]["transcript_lines"].is_object());
         assert!(get_session["inputSchema"]["properties"]["message_seq"].is_object());
-        assert!(get_session["inputSchema"]["properties"]["seq"].is_null());
+        assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
         assert!(get_session["inputSchema"]["properties"]["max_lines"].is_null());
         assert!(get_session["inputSchema"]["properties"]["view"].is_null());
         assert!(
@@ -14381,7 +14386,7 @@ mod tests {
         );
         assert!(
             get_session_prose("transcript_lines")
-                .contains("Default when no output selector is provided: -40"),
+                .contains("Omit for -40 when no selector is given"),
             "bare get_session is bounded by default"
         );
         assert!(
@@ -14425,7 +14430,8 @@ mod tests {
         }
         assert!(search_messages["description"]
             .as_str()
-            .is_some_and(|d| d.contains("message_seq") && !d.contains("session_id, seq")));
+            .is_some_and(|d| d.contains("get_session(session_id, seq)")
+                && !d.contains("get_session(session_id, message_seq)")));
         let match_mode = &search_messages["inputSchema"]["properties"]["query_mode"];
         assert_eq!(match_mode["enum"], json!(["literal", "regex", "fuzzy"]));
         assert!(match_mode["default"].is_null());
@@ -14679,7 +14685,7 @@ mod tests {
             );
         }
 
-        for removed_alias in ["view", "seq", "max_lines"] {
+        for removed_alias in ["view", "sequence", "max_lines"] {
             let mut arguments = json!({ "session_id": "x" });
             arguments[removed_alias] = json!(1);
             let error = validate_tool_call(
@@ -14849,7 +14855,7 @@ mod tests {
         assert!(prose(search_sessions, "limit").contains("(default 7)"));
         assert!(prose(list_sessions, "limit").contains("(default 8)"));
         assert!(prose(get_session, "transcript_lines")
-            .contains("Default when no output selector is provided: -3"));
+            .contains("Omit for -3 when no selector is given"));
         assert!(prose(get_session, "preview_chars").contains("(default 10)"));
         // The message-search family renders its prose from the same configured request.
         let limit_prose = search_messages["inputSchema"]["properties"]["limit"]["description"]

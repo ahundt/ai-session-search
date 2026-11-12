@@ -304,6 +304,11 @@ MCP `get_session` and message search use `detail=compact|full` for character pre
 values; conflicting simultaneous settings fail. MCP describes deprecation in the schema and
 keeps stderr silent. Neither spelling changes message membership or the signed line window.
 
+MCP focused reads use `seq`; `message_seq` remains accepted with a schema deprecation notice,
+and conflicting simultaneous values fail. Search result references keep `message_ref.message_seq`.
+CLI `messages get`, MCP focused reads, Python and Rust accept independent before/after context
+counts; each explicit side overrides the symmetric `context` radius without changing the anchor.
+
 ### REQ004-separate-retrieval-presentation
 
 Line windows, field-view limits, match-view budgets, response formats, and whitespace

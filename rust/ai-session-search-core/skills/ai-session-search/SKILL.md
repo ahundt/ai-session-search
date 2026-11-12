@@ -50,8 +50,8 @@ The same operations exist on the CLI, so choose by what is known, then narrow:
 | Metadata only (a directory, provider, or period) and want the newest sessions | `aise list --path DIR --when 7d --limit 10` | `list_sessions(path_prefix, when, limit)` | ms, indexed; newest first |
 | A topic, title, repository, or remembered phrase | `aise search "topic"` | `search_sessions(query, path_prefix, when, limit)` | reads every eligible session's text; seconds on a large index |
 | An exact string, identifier, correction, or tool activity | `aise messages search "text"` | `search_messages(query, workspace_path_prefix, role/kinds/tool_name_contains, context, limit)` | sub-second with a selective prefilter; fuzzy is seconds |
-| A session id (from any of the above) | `aise messages evidence ID`, `aise show ID`, `aise messages get ID` | `get_session(session_id, summary=true \| transcript_lines=N \| message_seq=N \| seq_from/seq_to)` | ms |
-| A `(session_id, seq)` hit | `aise messages get ID --seq N --context 2` | `get_session(session_id, message_seq, context)` | ms |
+| A session id (from any of the above) | `aise messages evidence ID`, `aise show ID`, `aise messages get ID` | `get_session(session_id, summary=true \| transcript_lines=N \| seq=N \| seq_from/seq_to)` | ms |
+| A `(session_id, seq)` hit | `aise messages get ID --seq N --context 2` | `get_session(session_id, seq, context)` | ms |
 | A structural question: counts, grouping, time series, cross-provider | `aise db query "SQL"` | `query_session_index(sql \| schema_table)` | ~0.01 s indexed aggregate; >1 s full scan |
 | You want to reopen a session | `aise resume ID` | `get_resume_command(session_id)` | ms |
 | Index health | `aise doctor` | `get_index_status()` | ~0.2 s warm |

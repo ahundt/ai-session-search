@@ -596,11 +596,12 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     // omitted-values sentence can read them back. Codex deletes parameter descriptions beyond
     // its 5,000-byte limit without marking the removal for the model.
     // 4_721 -> 4_883: `include_unattributed_input` opts in to queued messages with no recorded
-    // sender, which the run otherwise leaves out and counts. 117 bytes remain before the cliff.
+    // sender, which the run otherwise leaves out and counts. Tighter wording later retained the
+    // same contract at 4,723 bytes, below the 4,750-byte tripwire.
     ("run_skill_capability", 4_723, 9),
     // Explicit range kinds include harness notices without changing the default class set.
     // Canonical detail compact/full retains the deprecated response_format spelling.
-    ("get_session", 4_272, 10),
+    ("get_session", 4_187, 10),
     // 4_250 -> 4_306: `query` now states its matching model (case-insensitive substring of the
     // whole query and of each word, fuzzy on title and paths, every-word bonus, no quote or
     // boolean operators) instead of "keywords, a phrase, or a code snippet". 694 bytes remain
