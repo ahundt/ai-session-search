@@ -332,22 +332,25 @@ pub fn root_reexports_name_service_types(
     let _ = |m: MaintenanceService<'_>| -> R<CompactOutcome> { m.compact() };
     let _ = |i: IndexService<'_>| -> R<AutoReindexOutcome> { i.refresh() };
     let _ = |i: IndexService<'_>| -> R<ExplicitReindexOutcome> { i.reindex_report(false) };
-    let mut filters = SearchFilters::default();
-    filters.provider = Some(Provider::Claude);
-    filters.since = Some(since);
-    filters.limit = 5;
+    let filters = SearchFilters::default()
+        .with_provider(Provider::Claude)
+        .with_since(since)
+        .with_limit(5);
     let sessions = catalog.list_sessions(&filters)?;
     let hits = catalog.search_sessions("tests", &filters, None, &app.config().search.scoring)?;
-    let mut message_filters = MessageFilters::default();
-    message_filters.role = Some(Role::User);
-    message_filters.kinds = Some(vec![MessageKind::Conversation]);
+    let message_filters = MessageFilters::default()
+        .with_role(Role::User)
+        .with_kinds(vec![MessageKind::Conversation]);
     let mut newest = Vec::new();
     let mut inspection = None;
     if let Some(session) = sessions.first() {
-        let mut one_session = message_filters.clone();
-        one_session.session_id = Some(session.id.clone());
-        one_session.limit = 10;
-        newest = messages.read_session(&one_session, MessageOrder::NewestFirst)?;
+        newest = messages.read_session(
+            &message_filters
+                .clone()
+                .with_session_id(session.id.clone())
+                .with_limit(10),
+            MessageOrder::NewestFirst,
+        )?;
         inspection = Some(catalog.inspect(&session.id, InspectionOptions::default())?);
         let _: std::collections::HashMap<String, SessionMeta> =
             messages.session_metadata(std::slice::from_ref(&session.id))?;
@@ -366,6 +369,42 @@ pub fn root_reexports_name_service_types(
     let _: Vec<PlanningCount> = analysis.planning(&message_filters, &[])?;
     let _: Vec<RoleStat> = analysis.role_statistics(&message_filters)?;
     Ok((sessions, hits, newest, inspection))
+}
+
+/// Build every documented request type with chainable setters instead of `let mut` plus field
+/// assignment, which `#[non_exhaustive]` forces on struct literals.
+pub fn requests_built_with_setters() -> (
+    SearchFilters,
+    MessageFilters,
+    FileQuery,
+    InspectionOptions,
+    MessageClassificationQuery,
+    ai_session_search::ConfigOverrides,
+) {
+    (
+        SearchFilters::default()
+            .with_path_prefix("/r")
+            .with_session_kinds(vec![SessionKind::User])
+            .with_limit(5),
+        MessageFilters::default()
+            .with_session_id("claude:consumer-a")
+            .with_seq_from(1)
+            .with_limit(10)
+            .with_offset(2),
+        FileQuery::default()
+            .with_pattern("*.py")
+            .with_min_edits(2)
+            .with_limit(3),
+        InspectionOptions::default()
+            .with_preview_chars(80)
+            .with_include_time_profile(true),
+        MessageClassificationQuery::default()
+            .with_filters(MessageFilters::default().with_limit(50))
+            .with_include_unattributed_input(true),
+        ai_session_search::ConfigOverrides::default()
+            .with_database_path("/tmp/index.db")
+            .with_threads(2),
+    )
 }
 
 #[cfg(test)]
@@ -564,6 +603,34 @@ mod tests {
         missing.index.refresh = ai_session_search::config::IndexRefresh::ExistingOnly;
         let error = SessionSearch::open(missing).err().unwrap();
         assert_eq!(service_error(&error).code(), "index-missing");
+    }
+
+    #[test]
+    fn setters_set_the_named_fields_and_keep_the_other_defaults() {
+        let (sessions, messages, files, inspection, classification, overrides) =
+            requests_built_with_setters();
+        assert_eq!(sessions.path_prefix.as_deref(), Some("/r"));
+        assert_eq!(sessions.session_kinds, Some(vec![SessionKind::User]));
+        assert_eq!((sessions.limit, sessions.provider), (5, None));
+        assert_eq!(messages.session_id.as_deref(), Some("claude:consumer-a"));
+        assert_eq!(
+            (messages.seq_from, messages.limit, messages.offset),
+            (Some(1), 10, 2)
+        );
+        assert_eq!(files.pattern.as_deref(), Some("*.py"));
+        assert_eq!(
+            (files.min_edits, files.limit, files.offset),
+            (Some(2), 3, 0)
+        );
+        assert_eq!(inspection.preview_chars, 80);
+        assert!(inspection.include_time_profile);
+        assert_eq!(classification.filters.limit, 50);
+        assert!(classification.include_unattributed_input);
+        assert_eq!(
+            overrides.database_path.as_deref(),
+            Some(std::path::Path::new("/tmp/index.db"))
+        );
+        assert_eq!((overrides.threads, overrides.config_path), (Some(2), None));
     }
 
     #[test]

@@ -75,13 +75,24 @@ pub enum SkillCapabilityInput {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct MessageClassificationQuery {
+    /// Which messages are classified. The default selects every message and returns every
+    /// match (`limit` 0); the command line applies `[analytics].corrections_limit` (50) when
+    /// `--limit` is omitted.
     pub filters: MessageFilters,
+    /// More installed skill packages whose categories run beside the selected one. Empty (the
+    /// default) runs only the selected skill.
     pub additional_skills: Vec<SkillSelector>,
     /// Also classify messages typed while the agent was working whose transcript does not
     /// record who sent them. Default false: such a message may have been sent by a program, so
     /// it is left out and counted in `MessageClassificationReport::unattributed_input_count`.
     pub include_unattributed_input: bool,
 }
+
+chainable_setters!(MessageClassificationQuery {
+    with_filters(filters: MessageFilters) value;
+    with_additional_skills(additional_skills: Vec<SkillSelector>) value;
+    with_include_unattributed_input(include_unattributed_input: bool) value;
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

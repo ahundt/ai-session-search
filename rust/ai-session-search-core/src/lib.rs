@@ -2,6 +2,29 @@
 // SPDX-FileCopyrightText: 2026 Andrew Hundt
 // SPDX-License-Identifier: Apache-2.0
 
+/// Generate chainable `with_<field>` setters for a `#[non_exhaustive]` request struct, which a
+/// downstream crate cannot build with a struct literal. `some` wraps the argument in `Some`;
+/// `value` assigns it as is. Field assignment keeps working beside the setters.
+macro_rules! chainable_setters {
+    ($ty:ident { $($setter:ident($field:ident: $arg:ty) $mode:ident;)* }) => {
+        impl $ty {
+            $(
+                #[doc = concat!(
+                    "Return `self` with [`", stringify!($ty), "::", stringify!($field),
+                    "`] set. The field's documentation states its meaning and default."
+                )]
+                #[must_use]
+                pub fn $setter(mut self, value: $arg) -> Self {
+                    chainable_setters!(@set self.$field, value, $mode);
+                    self
+                }
+            )*
+        }
+    };
+    (@set $place:expr, $value:ident, some) => { $place = Some($value.into()) };
+    (@set $place:expr, $value:ident, value) => { $place = $value.into() };
+}
+
 pub mod analysis_pipeline;
 pub mod analysis_publication;
 pub mod analytics;

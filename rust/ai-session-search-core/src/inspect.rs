@@ -75,13 +75,26 @@ impl EvidenceSection {
     }
 }
 
+/// How much [`CatalogService::inspect`](crate::service::CatalogService::inspect) returns.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct InspectionOptions {
+    /// Maximum Unicode scalar values (Rust `char`s) kept in each preview; longer text is cut
+    /// and marked. Default [`DEFAULT_PREVIEW_CHARS`] (220). 0 keeps no preview text.
     pub preview_chars: usize,
+    /// Which evidence records to keep from the session. Default: the last 12
+    /// ([`DEFAULT_EVIDENCE_LIMIT`]).
     pub evidence_window: EvidenceWindow,
+    /// Also compute message counts, first and last timestamps, and the longest gap. Default
+    /// `false`.
     pub include_time_profile: bool,
 }
+
+chainable_setters!(InspectionOptions {
+    with_preview_chars(preview_chars: usize) value;
+    with_evidence_window(evidence_window: EvidenceWindow) value;
+    with_include_time_profile(include_time_profile: bool) value;
+});
 
 impl Default for InspectionOptions {
     fn default() -> Self {

@@ -1300,9 +1300,23 @@ impl std::str::FromStr for SessionKind {
     }
 }
 
+/// Structural filters for session listing, session search, export, and analysis.
+///
+/// Start from [`SearchFilters::default`], which selects every session, and narrow it with the
+/// `with_*` setters or by assigning fields:
+///
+/// ```
+/// use ai_session_search::{Provider, SearchFilters};
+/// let recent = SearchFilters::default()
+///     .with_provider(Provider::Claude)
+///     .with_path_prefix("/work/project")
+///     .with_limit(5);
+/// assert_eq!(recent.limit, 5);
+/// ```
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct SearchFilters {
+    /// Restrict to one indexed session source. `None` (the default) selects every provider.
     pub provider: Option<Provider>,
     /// Which classes of session to return. `None` selects the default set
     /// ([`SessionKind::default_search_set`]), which is every class.
@@ -1311,8 +1325,13 @@ pub struct SearchFilters {
     /// [`MessageFilters::kinds`] one level up. Adding a class means adding a [`SessionKind`]
     /// variant, never an `include_<class>` boolean or a `<class>_only` flag beside it.
     pub session_kinds: Option<Vec<SessionKind>>,
+    /// Keep sessions whose cwd, repository root, or transcript path is this directory or below
+    /// it, matched on whole path components. `None` (the default) applies no path restriction.
     pub path_prefix: Option<String>,
+    /// Drop sessions whose cwd, repository root, or transcript path is under any of these
+    /// directories. Empty (the default) drops nothing.
     pub exclude_path_prefixes: Vec<String>,
+    /// Drop these exact canonical session ids. Empty (the default) drops nothing.
     pub exclude_session_ids: Vec<String>,
     /// Return only sessions spawned by this exact session id. The link
     /// [`SessionRecord::parent_session_id`] stores is typed precisely so "every subagent of
@@ -1324,9 +1343,27 @@ pub struct SearchFilters {
     /// Inclusive query end. Session retrieval keeps rows whose known indexed start
     /// (`created_at`, falling back to `updated_at`) is on or before this instant.
     pub until: Option<DateTime<Utc>>,
+    /// Maximum sessions returned, newest first. 0 (the default) returns every matching session.
+    ///
+    /// The command line uses `[search].default_limit` (50) when `--limit` is omitted; this
+    /// library default is 0, so set a limit when the index may be large.
     pub limit: usize,
+    /// Keep only sessions whose transcript produced a parse warning. Default `false`.
     pub warnings_only: bool,
 }
+
+chainable_setters!(SearchFilters {
+    with_provider(provider: Provider) some;
+    with_session_kinds(session_kinds: Vec<SessionKind>) some;
+    with_path_prefix(path_prefix: impl Into<String>) some;
+    with_exclude_path_prefixes(exclude_path_prefixes: Vec<String>) value;
+    with_exclude_session_ids(exclude_session_ids: Vec<String>) value;
+    with_parent_session_id(parent_session_id: impl Into<String>) some;
+    with_since(since: DateTime<Utc>) some;
+    with_until(until: DateTime<Utc>) some;
+    with_limit(limit: usize) value;
+    with_warnings_only(warnings_only: bool) value;
+});
 
 impl SearchFilters {
     /// The session classes this request returns, with the default applied. Every reader goes
@@ -1545,9 +1582,34 @@ pub struct MessageFilters {
     /// `crate::db::Db::find_corrections`, which forces `User` for the same reason it forces
     /// `Role::User`.
     pub session_kinds: Option<Vec<SessionKind>>,
+    /// Maximum messages returned. 0 (the default) returns every match; fuzzy matching requires
+    /// a positive limit.
     pub limit: usize,
+    /// Matches skipped before `limit` counts. Default 0.
     pub offset: usize,
 }
+
+chainable_setters!(MessageFilters {
+    with_role(role: Role) some;
+    with_kinds(kinds: Vec<MessageKind>) some;
+    with_field(field: SearchField) some;
+    with_argument_path(argument_path: impl Into<String>) some;
+    with_providers(providers: Vec<Provider>) some;
+    with_session_id(session_id: impl Into<String>) some;
+    with_path_prefix(path_prefix: impl Into<String>) some;
+    with_exclude_path_prefixes(exclude_path_prefixes: Vec<String>) value;
+    with_exclude_session_ids(exclude_session_ids: Vec<String>) value;
+    with_since(since: DateTime<Utc>) some;
+    with_until(until: DateTime<Utc>) some;
+    with_seq_from(seq_from: i64) some;
+    with_seq_to(seq_to: i64) some;
+    with_match_mode(match_mode: MessageSearchMode) value;
+    with_tool(tool: impl Into<String>) some;
+    with_no_compaction(no_compaction: bool) value;
+    with_session_kinds(session_kinds: Vec<SessionKind>) some;
+    with_limit(limit: usize) value;
+    with_offset(offset: usize) value;
+});
 
 impl MessageFilters {
     pub(crate) fn input_scope(&self) -> MessageInputScope {
@@ -2076,6 +2138,9 @@ pub struct PlanningCount {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct FileQuery {
+    /// Glob over edited files: `*` matches any run of characters and `?` one character. Without a
+    /// `/` it matches the file name exactly (`retry.py`, `*.rs`); with a `/` it matches the end of
+    /// the full path (`src/*.rs`). `None` (the default) selects every file.
     pub pattern: Option<String>,
     /// Restrict to one indexed session source.
     pub provider: Option<Provider>,
@@ -2088,9 +2153,15 @@ pub struct FileQuery {
     pub exclude_path_prefixes: Vec<String>,
     /// Exclude exact canonical session IDs before grouping, reconstruction selection, and limits.
     pub exclude_session_ids: Vec<String>,
+    /// Keep edits at or after this instant. `None` (the default) sets no lower bound.
     pub since: Option<DateTime<Utc>>,
+    /// Keep edits at or before this instant. `None` (the default) sets no upper bound.
     pub until: Option<DateTime<Utc>>,
+    /// File search keeps files edited at least this many times. `None` (the default) sets no
+    /// minimum.
     pub min_edits: Option<i64>,
+    /// File search keeps files edited at most this many times. `None` (the default) sets no
+    /// maximum.
     pub max_edits: Option<i64>,
     /// Maximum rows returned by file search, cross-reference, and history. Zero explicitly means
     /// unlimited and may materialize the complete filtered result.
@@ -2098,6 +2169,21 @@ pub struct FileQuery {
     /// Rows skipped after the surface's documented deterministic ordering.
     pub offset: usize,
 }
+
+chainable_setters!(FileQuery {
+    with_pattern(pattern: impl Into<String>) some;
+    with_provider(provider: Provider) some;
+    with_session_id(session_id: impl Into<String>) some;
+    with_path_prefix(path_prefix: impl Into<String>) some;
+    with_exclude_path_prefixes(exclude_path_prefixes: Vec<String>) value;
+    with_exclude_session_ids(exclude_session_ids: Vec<String>) value;
+    with_since(since: DateTime<Utc>) some;
+    with_until(until: DateTime<Utc>) some;
+    with_min_edits(min_edits: i64) some;
+    with_max_edits(max_edits: i64) some;
+    with_limit(limit: usize) value;
+    with_offset(offset: usize) value;
+});
 
 /// One aggregate row per file across the filtered edit set (`files search`).
 #[derive(Debug, Clone, Serialize)]

@@ -123,16 +123,46 @@ pub struct Config {
     pub unknown_config_keys: Vec<UnknownConfigKey>,
 }
 
-/// Per-invocation configuration overrides. `None` preserves lower-precedence sources.
+/// Per-invocation configuration overrides passed to [`Config::resolve`].
+///
+/// Each field is the highest-precedence source for its setting: it wins over the matching
+/// `AI_SESSION_SEARCH_*` environment variable, which wins over the config file, which wins over
+/// the built-in default. `None` (every field's default) leaves the setting to those lower sources.
+///
+/// ```no_run
+/// use ai_session_search::{Config, ConfigOverrides, SessionSearch};
+/// let resolved = Config::resolve(
+///     ConfigOverrides::default()
+///         .with_config_path("/tmp/aise/config.toml")
+///         .with_database_path("/tmp/aise/index.db"),
+/// )?;
+/// let app = SessionSearch::open(resolved.config)?;
+/// # Ok::<(), ai_session_search::anyhow::Error>(())
+/// ```
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ConfigOverrides {
+    /// Config file to read instead of `AI_SESSION_SEARCH_CONFIG` or the platform default. The
+    /// file must exist when set.
     pub config_path: Option<PathBuf>,
+    /// Index database path, over `AI_SESSION_SEARCH_DATABASE` and `[index].db_path`.
     pub database_path: Option<PathBuf>,
+    /// Cache directory, over `AI_SESSION_SEARCH_CACHE_DIR` and `[index].cache_dir`.
     pub cache_dir: Option<PathBuf>,
+    /// Worker threads for parallel scoring and indexing, over `AI_SESSION_SEARCH_THREADS` and
+    /// `[index].threads`. Must be at least 1.
     pub threads: Option<usize>,
+    /// Refresh policy, over `AI_SESSION_SEARCH_INDEX_REFRESH` and `[index].refresh`.
     pub index_refresh: Option<IndexRefresh>,
 }
+
+chainable_setters!(ConfigOverrides {
+    with_config_path(config_path: impl Into<PathBuf>) some;
+    with_database_path(database_path: impl Into<PathBuf>) some;
+    with_cache_dir(cache_dir: impl Into<PathBuf>) some;
+    with_threads(threads: usize) some;
+    with_index_refresh(index_refresh: IndexRefresh) some;
+});
 
 /// Process environment captured once so precedence can be tested without mutating global state.
 #[derive(Debug, Clone, Default)]
