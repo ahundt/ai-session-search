@@ -379,17 +379,7 @@ fn parse_message_search_includes(
         .map(|includes| {
             includes
                 .into_iter()
-                .map(|include| match include.as_str() {
-                    "normalized_session_metadata" => {
-                        Ok(CoreMessageSearchInclude::NormalizedSessionMetadata)
-                    }
-                    "parsed_references" => Ok(CoreMessageSearchInclude::ParsedReferences),
-                    "raw_provider_metadata" => Ok(CoreMessageSearchInclude::RawProviderMetadata),
-                    "runtime_diagnostics" => Ok(CoreMessageSearchInclude::RuntimeDiagnostics),
-                    _ => Err(invalid_argument_error(format!(
-                        "unknown include {include:?}; accepted values are normalized_session_metadata, parsed_references, raw_provider_metadata, and runtime_diagnostics"
-                    ))),
-                })
+                .map(|include| include.parse().map_err(invalid_argument_error))
                 .collect()
         })
         .transpose()
@@ -3184,11 +3174,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
             includes: parse_message_search_includes(include)?,
             lines_per_message,
             detail: detail
-                .map(|value| match value {
-                    "compact" => Ok(CoreDetailLevel::Compact),
-                    "full" => Ok(CoreDetailLevel::Full),
-                    _ => Err(invalid_argument_error("detail must be 'compact' or 'full'")),
-                })
+                .map(|value| value.parse().map_err(|_: String| invalid_argument_error("detail must be 'compact' or 'full'")))
                 .transpose()?,
             field_view,
             match_view,
@@ -3201,14 +3187,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
                 })
                 .transpose()?,
             receipt_level: receipt_level
-                .map(|value| match value {
-                    "none" => Ok(CoreReceiptLevel::None),
-                    "summary" => Ok(CoreReceiptLevel::Summary),
-                    "full" => Ok(CoreReceiptLevel::Full),
-                    _ => Err(invalid_argument_error(
-                        "receipt_level must be 'none', 'summary', or 'full'",
-                    )),
-                })
+                .map(|value| value.parse().map_err(|_: String| invalid_argument_error("receipt_level must be 'none', 'summary', or 'full'")))
                 .transpose()?,
         })
     }

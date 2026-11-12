@@ -356,6 +356,50 @@ pub enum MessageSearchInclude {
     RuntimeDiagnostics,
 }
 
+/// Parse a canonical, case-sensitive name in O(input bytes) time with constant auxiliary space.
+impl std::str::FromStr for DetailLevel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "compact" => Ok(Self::Compact),
+            "full" => Ok(Self::Full),
+            _ => Err(format!("detail must be compact or full; got {value:?}")),
+        }
+    }
+}
+
+/// Parse a canonical, case-sensitive name in O(input bytes) time with constant auxiliary space.
+impl std::str::FromStr for ReceiptLevel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "summary" => Ok(Self::Summary),
+            "full" => Ok(Self::Full),
+            _ => Err(format!(
+                "receipt_level must be none, summary, or full; got {value:?}"
+            )),
+        }
+    }
+}
+
+/// Parse a canonical, case-sensitive name in O(input bytes) time with constant auxiliary space.
+impl std::str::FromStr for MessageSearchInclude {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "normalized_session_metadata" => Ok(Self::NormalizedSessionMetadata),
+            "parsed_references" => Ok(Self::ParsedReferences),
+            "raw_provider_metadata" => Ok(Self::RawProviderMetadata),
+            "runtime_diagnostics" => Ok(Self::RuntimeDiagnostics),
+            _ => Err(format!("unknown include {value:?}; accepted values are normalized_session_metadata, parsed_references, raw_provider_metadata, and runtime_diagnostics")),
+        }
+    }
+}
+
 impl MatchViewBudget {
     pub fn max_chars(max_chars: usize) -> Result<Self, MessageSearchError> {
         NonZeroUsize::new(max_chars)

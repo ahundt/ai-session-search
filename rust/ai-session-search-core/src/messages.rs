@@ -31,7 +31,9 @@ use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
 };
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
-use crate::render::{emit, render, OutputFormat, Row, RowBatchRenderer};
+#[cfg(test)]
+use crate::render::render;
+use crate::render::{emit, OutputFormat, Row, RowBatchRenderer};
 use crate::service::{CatalogService, MessageService};
 use crate::util::{select_message_lines, truncate_for_display};
 
@@ -580,20 +582,14 @@ impl std::str::FromStr for CliMessageSearchInclude {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         let include = match value {
             "none" => return Ok(Self::None),
-            "normalized_session_metadata" => MessageSearchInclude::NormalizedSessionMetadata,
-            "parsed_references" => MessageSearchInclude::ParsedReferences,
             "raw-metadata" => MessageSearchInclude::RawProviderMetadata,
             "raw_provider_metadata" => {
                 eprintln!("aise: --include raw_provider_metadata is deprecated; use --include raw-metadata");
                 MessageSearchInclude::RawProviderMetadata
             },
-            "runtime_diagnostics" => MessageSearchInclude::RuntimeDiagnostics,
-            _ => {
-                return Err(
-                    "expected none, normalized_session_metadata, parsed_references, raw-metadata, or runtime_diagnostics"
-                        .to_string(),
-                )
-            }
+            _ => value.parse().map_err(|_| {
+                "expected none, normalized_session_metadata, parsed_references, raw-metadata, or runtime_diagnostics".to_string()
+            })?,
         };
         Ok(Self::Value(include))
     }

@@ -19,8 +19,8 @@ use crate::inspect::InspectionOptions;
 use crate::message_search::{
     selected_field_view, ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget,
     MatchWindow, MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchParameter,
-    MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel,
-    RequestedExtent, RequestedTimeRange, ResolvedRequestExtent, SearchSurface, SequenceRange,
+    MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, RequestedExtent,
+    RequestedTimeRange, ResolvedRequestExtent, SearchSurface, SequenceRange,
     DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionRecord};
@@ -6389,9 +6389,7 @@ fn parse_message_search_detail(args: &Value) -> Result<Option<DetailLevel>, Stri
         return Ok(None);
     };
     match value.as_str() {
-        Some("compact") => Ok(Some(DetailLevel::Compact)),
-        Some("full") => Ok(Some(DetailLevel::Full)),
-        Some(other) => Err(format!("detail must be compact or full; got {other:?}")),
+        Some(name) => name.parse().map(Some),
         None => Err("detail must be a string: compact or full".to_string()),
     }
 }
@@ -6428,17 +6426,7 @@ fn parse_message_search_includes(
         let name = entry
             .as_str()
             .ok_or_else(|| "include entries must be strings".to_string())?;
-        includes.push(match name {
-            "normalized_session_metadata" => MessageSearchInclude::NormalizedSessionMetadata,
-            "parsed_references" => MessageSearchInclude::ParsedReferences,
-            "raw_provider_metadata" => MessageSearchInclude::RawProviderMetadata,
-            "runtime_diagnostics" => MessageSearchInclude::RuntimeDiagnostics,
-            other => {
-                return Err(format!(
-                    "unknown include {other:?}; accepted values are normalized_session_metadata, parsed_references, raw_provider_metadata, and runtime_diagnostics"
-                ))
-            }
-        });
+        includes.push(name.parse()?);
     }
     Ok(Some(includes))
 }
@@ -6637,16 +6625,7 @@ fn tool_search_messages_cancellable(
             .purpose(PurposeSelection::new(purpose, version).map_err(|error| error.to_string())?);
     }
     if let Some(receipt) = args.get("receipt_level").and_then(Value::as_str) {
-        builder = builder.receipt_level(match receipt {
-            "none" => ReceiptLevel::None,
-            "summary" => ReceiptLevel::Summary,
-            "full" => ReceiptLevel::Full,
-            other => {
-                return Err(format!(
-                    "receipt_level must be none, summary, or full; got {other:?}"
-                ))
-            }
-        });
+        builder = builder.receipt_level(receipt.parse()?);
     }
     let messages = MessageService::new(config, db, crate::message_search::SearchSurface::Mcp);
     let response = messages

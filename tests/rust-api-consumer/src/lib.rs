@@ -1129,6 +1129,52 @@ mod tests {
         assert!(!newest.is_empty() && newest.len() <= 10);
         assert!(inspection.is_some());
     }
+    #[test]
+    fn message_search_names_parse_in_the_core_api() {
+        use ai_session_search::{DetailLevel, MessageSearchInclude, ReceiptLevel};
+        for (name, expected) in [
+            ("compact", DetailLevel::Compact),
+            ("full", DetailLevel::Full),
+        ] {
+            assert_eq!(name.parse::<DetailLevel>().unwrap(), expected);
+        }
+        for (name, expected) in [
+            ("none", ReceiptLevel::None),
+            ("summary", ReceiptLevel::Summary),
+            ("full", ReceiptLevel::Full),
+        ] {
+            assert_eq!(name.parse::<ReceiptLevel>().unwrap(), expected);
+        }
+        for (name, expected) in [
+            (
+                "normalized_session_metadata",
+                MessageSearchInclude::NormalizedSessionMetadata,
+            ),
+            ("parsed_references", MessageSearchInclude::ParsedReferences),
+            (
+                "raw_provider_metadata",
+                MessageSearchInclude::RawProviderMetadata,
+            ),
+            (
+                "runtime_diagnostics",
+                MessageSearchInclude::RuntimeDiagnostics,
+            ),
+        ] {
+            assert_eq!(name.parse::<MessageSearchInclude>().unwrap(), expected);
+        }
+        assert_eq!(
+            "FULL".parse::<DetailLevel>().unwrap_err(),
+            "detail must be compact or full; got \"FULL\""
+        );
+        assert!("bad"
+            .parse::<ReceiptLevel>()
+            .unwrap_err()
+            .contains("receipt_level"));
+        assert!("raw-metadata"
+            .parse::<MessageSearchInclude>()
+            .unwrap_err()
+            .contains("accepted values"));
+    }
 }
 
 // Compile the Rust examples in the repository README and the library guide. They live outside the
