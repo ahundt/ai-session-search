@@ -4931,6 +4931,25 @@ mod tests {
     }
 
     #[test]
+    fn classification_all_results_selects_zero_limit() {
+        let parsed =
+            Cli::try_parse_from(["aise", "skills", "corrections", "--all-results"]).unwrap();
+        let Commands::Skills(command) = parsed.command else {
+            panic!("expected skills");
+        };
+        let args = command.into_execution().unwrap().args;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let config = Config::default();
+        assert_eq!(
+            crate::analytics::message_classification_filters(&db, &config, &args)
+                .unwrap()
+                .limit,
+            0
+        );
+    }
+
+    #[test]
     fn classification_accepts_comma_separated_session_kinds() {
         let parsed = Cli::try_parse_from([
             "aise",

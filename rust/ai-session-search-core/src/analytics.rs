@@ -246,9 +246,13 @@ pub struct CorrectionsArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Max matches. Omit to use `[capabilities.message_classification].limit`. 0 = every match.
-    #[arg(long)]
+    /// Max matches. Omit for `[capabilities.message_classification].limit`.
+    /// Deprecated: 0 means every match; use --all-results instead.
+    #[arg(long, conflicts_with = "all_results")]
     pub limit: Option<usize>,
+    /// Return every matching message instead of a page; conflicts with --limit.
+    #[arg(long)]
+    pub all_results: bool,
     /// Matches to skip before `--limit` applies, newest first. 0 starts at the newest match.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
@@ -372,14 +376,21 @@ pub(crate) fn message_classification_filters(
     config: &Config,
     args: &CorrectionsArgs,
 ) -> Result<MessageFilters> {
+    if args.limit == Some(0) {
+        eprintln!("aise: --limit 0 is deprecated for classification; use --all-results");
+    }
     let mut filters = filters_from(
         db,
         &args.session_id,
         args.provider,
         &args.path,
         &args.dates,
-        args.limit
-            .unwrap_or(config.capabilities.message_classification.limit),
+        if args.all_results {
+            0
+        } else {
+            args.limit
+                .unwrap_or(config.capabilities.message_classification.limit)
+        },
         args.offset,
     )?;
     // Left as `None` when the caller named no class, so `find_corrections` applies its own
