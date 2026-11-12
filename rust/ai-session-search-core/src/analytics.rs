@@ -43,6 +43,7 @@ const USER_REQUEST_END: &str = "</USER_REQUEST>";
 /// The executable source is the selected message-classification skill's `aise-capability.toml`.
 /// These patterns remain narrowed to second-person / imperative / demonstrative forms so tests
 /// can compare the current compiled capability with the pre-skills behavior.
+#[cfg(test)]
 pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (

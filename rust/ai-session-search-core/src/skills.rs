@@ -1222,21 +1222,14 @@ fn scaffold_files(name: &str, capability: Option<ScaffoldCapability>) -> Vec<(Pa
          # Categories are evaluated top to bottom and the FIRST match wins, so a catch-all\n\
          # belongs last. Patterns within one category are ORed, and each category compiles to a\n\
          # single case-insensitive regex. Check this file with `aise skills validate`, then use\n\
-         # it with `aise skills {name}`.\n\
-         schema_version = {}\n\
-         kind = \"message-classification\"\n",
-        crate::message_classification::MESSAGE_CLASSIFICATION_SCHEMA_VERSION
+         # it with `aise skills {name}`.\n"
     );
-    for (category, patterns) in crate::analytics::default_correction_patterns() {
-        policy.push_str(&format!(
-            "\n[[categories]]\nname = \"{category}\"\npatterns = [\n"
-        ));
-        for pattern in patterns {
-            // TOML multiline literal strings: no backslash doubling, so a regex stays readable.
-            policy.push_str(&format!("  \'\'\'{pattern}\'\'\',\n"));
-        }
-        policy.push_str("]\n");
-    }
+    // Keep the canonical policy body, without comments describing the immutable product default.
+    policy.extend(
+        crate::corrections::EMBEDDED_POLICY_TOML
+            .split_inclusive('\n')
+            .skip_while(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
+    );
     files.push((PathBuf::from(crate::skill_catalog::CAPABILITY_FILE), policy));
     files
 }
@@ -1500,6 +1493,19 @@ fn report_write_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_hygiene_scaffold_uses_the_embedded_capability_bytes() {
+        let files = scaffold_files("review", Some(ScaffoldCapability::MessageClassification));
+        let policy = files
+            .iter()
+            .find(|(path, _)| path == Path::new(crate::skill_catalog::CAPABILITY_FILE))
+            .unwrap();
+        let embedded = crate::corrections::EMBEDDED_POLICY_TOML;
+        let body = &embedded[embedded.find("schema_version =").unwrap()..];
+        assert!(policy.1.ends_with(body));
+        assert!(!policy.1.contains("THIS FILE IS THE PRODUCT DEFAULT"));
+    }
 
     /// `aise skills corrections -- --help` once printed `Usage: aise-skill-capability [OPTIONS]`,
     /// the internal argv[0] placeholder, which names no executable; a Pi session hit exactly that
