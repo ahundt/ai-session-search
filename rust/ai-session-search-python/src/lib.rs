@@ -167,7 +167,17 @@ fn service_error(error: anyhow::Error) -> PyErr {
         Some(ServiceError::IndexNotRefreshed { .. }) => "IndexNotRefreshedError",
         _ => return runtime_error(error),
     };
-    named_error(name, format!("{error:#}"))
+    let translated = match error.downcast_ref::<ServiceError>() {
+        Some(ServiceError::SessionNotFound { id_or_prefix, .. }) => Some(format!("no session matches '{id_or_prefix}'; call list_sessions() or search_sessions(query) to find a session")),
+        Some(ServiceError::IndexMissing { path, .. }) => Some(format!("existing-only index {} does not exist; open SessionSearch with index_refresh='auto' and call reindex(full=True) to create it", path.display())),
+        Some(ServiceError::IndexNotRefreshed { path, .. }) => Some(format!("index {} has never completed a refresh; call refresh() or prepare_for_read() before reading", path.display())),
+        _ => None,
+    };
+    let mut message = format!("{error:#}");
+    if let (Some(translated), Some(cause)) = (translated, error.downcast_ref::<ServiceError>()) {
+        message = message.replace(&cause.to_string(), &translated);
+    }
+    named_error(name, message)
 }
 
 fn add_service_exceptions(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -458,7 +468,7 @@ fn parse_session_kinds(values: Option<Vec<String>>) -> PyResult<Option<Vec<Sessi
         .map(|values| {
             values
                 .into_iter()
-                .map(|value| value.parse::<SessionKind>().map_err(PyValueError::new_err))
+                .map(|value| value.parse::<SessionKind>().map_err(invalid_argument_error))
                 .collect::<PyResult<Vec<_>>>()
         })
         .transpose()
@@ -470,7 +480,7 @@ fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
             // Surface the parser's message unwrapped: it already opens with "unsupported
             // provider: <value>" and names every accepted provider, so an "invalid provider: "
             // prefix here only produced "invalid provider: unsupported provider: chatgpt — ...".
-            value.parse().map_err(PyValueError::new_err)
+            value.parse().map_err(invalid_argument_error)
         })
         .transpose()
 }
@@ -485,7 +495,7 @@ fn parse_provider_set(values: Option<Vec<String>>) -> PyResult<Option<Vec<Provid
             }
             let mut providers = values
                 .into_iter()
-                .map(|value| value.parse().map_err(PyValueError::new_err))
+                .map(|value| value.parse().map_err(invalid_argument_error))
                 .collect::<PyResult<Vec<Provider>>>()?;
             providers.sort_unstable_by_key(|provider| provider.as_str());
             providers.dedup();
@@ -3111,7 +3121,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
         if purpose.is_none() && purpose_version.is_some() {
             return Err(invalid_argument_error("purpose_version requires purpose"));
         }
-        let field = field.parse().map_err(PyValueError::new_err)?;
+        let field = field.parse().map_err(invalid_argument_error)?;
         if argument_path.is_some() && field != SearchField::ToolArgument {
             return Err(invalid_argument_error(
                 "argument_path requires field='tool_argument'",
@@ -3149,11 +3159,11 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
             role: role
                 .map(str::parse)
                 .transpose()
-                .map_err(PyValueError::new_err)?,
+                .map_err(invalid_argument_error)?,
             kind: kind
                 .map(str::parse)
                 .transpose()
-                .map_err(PyValueError::new_err)?,
+                .map_err(invalid_argument_error)?,
             kinds: kinds
                 .map(|kinds| {
                     kinds
@@ -3162,7 +3172,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()
-                .map_err(PyValueError::new_err)?,
+                .map_err(invalid_argument_error)?,
             field,
             argument_path,
             seq_from,
@@ -4961,8 +4971,9 @@ impl SessionSearch {
     /// Search messages through the shared typed planner and return results with aligned context,
     /// paging, resolved presentation, and optional planner receipts.
     ///
-    /// Fuzzy mode scores every structurally eligible message with Nucleo sequence matching,
-    /// orders results deterministically, and then applies the finite request offset and limit.
+    /// Fuzzy mode matches query letters in order within every eligible message, allowing gaps.
+    /// Extra query letters can prevent a match. It scores and orders results deterministically,
+    /// then applies the finite request offset and limit.
     /// It requires at least three characters and does not support all-results output. With no
     /// explicit, purpose, or operation limit, Python returns every literal, regex, or no-text
     /// match; `all_results=True` states that complete-corpus choice explicitly.
@@ -5142,7 +5153,7 @@ impl SessionSearch {
         let role = role
             .map(str::parse)
             .transpose()
-            .map_err(PyValueError::new_err)?;
+            .map_err(invalid_argument_error)?;
         let kinds = kinds
             .map(|values| {
                 values

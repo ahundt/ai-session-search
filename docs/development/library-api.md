@@ -166,6 +166,11 @@ SQL and index-wide vocabulary refuse `allowed-roots` access. `resume_command(id)
 `transcript(id, lines=N)` returns the Rust transcript window including completeness metadata;
 positive N keeps the head, negative N the tail, and 0 every line.
 
+Fuzzy message search matches query letters in order, allowing gaps. It can match a missing
+letter, while an extra query letter can prevent a match; it is not an edit-distance search.
+It requires a positive finite limit. Typed error messages name Python methods for lookup and
+index preparation, while preserving error causes.
+
 Python exposes `NotFoundError`, `AmbiguousPrefixError`, `AlreadyExistsError`,
 `InvalidArgumentError`, and `IndexNotRefreshedError`. They preserve existing `RuntimeError`
 handlers. Validation also preserves `ValueError`; signed version validation preserves the

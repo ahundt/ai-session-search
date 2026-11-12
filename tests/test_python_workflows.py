@@ -341,3 +341,12 @@ def test_empty_ranked_query_is_deprecated_with_working_replacement(corpus):
     with pytest.warns(DeprecationWarning, match="list_sessions"):
         hits = corpus.search_sessions("")
     assert [hit.session for hit in hits] == corpus.list_sessions()
+
+
+def test_native_errors_and_fuzzy_help_name_python_actions(corpus):
+    with pytest.raises(aise.NotFoundError) as missing:
+        corpus.read_session_messages("absent")
+    assert "list_sessions()" in str(missing.value)
+    assert "aise list" not in str(missing.value)
+    doc = aise.SessionSearch.search_messages.__doc__
+    assert doc and "letters in order" in doc

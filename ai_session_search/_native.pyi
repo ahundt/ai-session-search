@@ -1817,8 +1817,11 @@ class SessionSearch:
     ) -> MessageSearchResponse:
         """Search through the shared planner and return results, context, paging, and receipts.
 
+        Fuzzy mode matches query letters in order, allowing gaps; extra query letters can prevent
+        a match. It scores the eligible corpus before retaining the requested finite page.
+
         ``literal`` is the default case-insensitive substring match. ``regex`` uses Rust regex
-        syntax. ``fuzzy`` scores every structurally eligible row with Nucleo sequence matching,
+        syntax. ``fuzzy`` scores every structurally eligible row by matching letters in order,
         then applies a deterministic finite offset and limit. It requires at least three query
         characters and does not support all-results output. With no explicit, purpose, or
         operation limit, Python returns every literal, regex, or no-text match;
