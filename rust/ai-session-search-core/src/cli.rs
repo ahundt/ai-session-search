@@ -871,7 +871,8 @@ where
     let Some(program) = args.next() else {
         return Cli::try_parse_from(std::iter::empty::<OsString>());
     };
-    let globals = Cli::command()
+    let grammar = Cli::command();
+    let globals = grammar
         .get_arguments()
         .filter(|argument| argument.is_global_set())
         .filter_map(|argument| {
@@ -884,13 +885,27 @@ where
     let mut global_tokens = Vec::new();
     let mut command_tokens = Vec::with_capacity(remaining.len());
     let mut index = 0;
+    let mut command = &grammar;
     while index < remaining.len() {
         let token = &remaining[index];
+        if let Some(child) = token
+            .to_str()
+            .and_then(|name| command.find_subcommand(name))
+        {
+            command = child;
+        }
         let global = token.to_str().and_then(|token| {
             token
                 .strip_prefix("--")
                 .map(|long| long.split_once('=').map_or(long, |(name, _)| name))
                 .and_then(|name| globals.get(name).map(|takes_value| (name, *takes_value)))
+                .filter(|(name, _)| {
+                    // A command-local spelling owns its value. Hoisting it would leave the
+                    // local required argument empty.
+                    !command.get_arguments().any(|argument| {
+                        argument.get_long() == Some(*name) && !argument.is_global_set()
+                    })
+                })
         });
         match global {
             Some((_name, takes_value)) => {
@@ -1738,6 +1753,8 @@ fn root_options_for(path: &[&str]) -> &'static [RootOption] {
         ["config", "init" | "paths"] => CONFIG_DATABASE_AND_CACHE,
         ["config", "show" | "check" | "origins"] => CONFIG_INPUTS,
         ["db", ..] => DATABASE_COMMAND_INPUTS,
+        // This spelling is local to migration, but clap also copies it to the root field.
+        ["migrate", "config"] => &[CacheDirectory],
         ["migrate", ..] | ["dates"] | ["__refresh-index"] => NO_ROOT_OPTIONS,
         ["skills", "list" | "show" | "validate" | "create" | "restore"] => SKILL_MANAGEMENT_INPUTS,
         _ => ORDINARY_COMMAND_INPUTS,

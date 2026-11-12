@@ -3353,3 +3353,41 @@ fn cli_show_summary_notice_names_messages_evidence() {
         "{stderr}"
     );
 }
+
+#[test]
+fn migrate_config_keeps_its_required_cache_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let paths = aise(root).args(["config", "paths"]).output().unwrap();
+    assert!(
+        paths.status.success(),
+        "{}",
+        String::from_utf8_lossy(&paths.stderr)
+    );
+    let source = root.join("legacy.json");
+    let destination = root.join("converted.toml");
+    let database = root.join("archive.db");
+    let cache = root.join("converted-cache");
+    std::fs::write(&source, "{}").unwrap();
+    let output = aise(root)
+        .args(["migrate", "config", "--source-json"])
+        .arg(&source)
+        .arg("--destination")
+        .arg(&destination)
+        .arg("--database-path")
+        .arg(&database)
+        .arg("--cache-dir")
+        .arg(&cache)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(destination).unwrap();
+    let config: ai_session_search::config::Config = toml::from_str(&text).unwrap();
+    assert_eq!(config.cache_dir(), cache);
+    assert_eq!(config.db_path(), database);
+}
