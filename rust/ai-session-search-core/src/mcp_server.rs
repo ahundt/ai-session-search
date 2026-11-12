@@ -13072,8 +13072,16 @@ mod tests {
             None,
             &[
                 (0, "2026-06-01T00:00:00Z", "you forgot the migration"),
-                (1, "2026-06-02T00:00:00Z", "no, that's wrong"),
-                (2, "2026-06-03T00:00:00Z", "also need the changelog"),
+                (
+                    1,
+                    "2026-06-02T00:00:00Z",
+                    "what are you talking about? The chart uses centimeters, so that scale is wrong.",
+                ),
+                (
+                    2,
+                    "2026-06-03T00:00:00Z",
+                    "you are not finished with the outline",
+                ),
             ],
         );
         // A spawned run: these `user` rows are the CALLING AGENT's delegation prompt.
@@ -13174,8 +13182,12 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("corrections", "incomplete", "also need"),
-                ("corrections", "misunderstanding", "no, that's"),
+                ("corrections", "incomplete", "not finished"),
+                (
+                    "corrections",
+                    "misunderstanding",
+                    "what are you talking about"
+                ),
                 ("corrections", "skip_step", "you forgot"),
             ],
             "newest first, each naming the policy that classified it: {result:#}"

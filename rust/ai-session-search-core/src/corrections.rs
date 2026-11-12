@@ -525,6 +525,54 @@ fn describe_source(source: &CorrectionPolicySource) -> String {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn embedded_rules_find_leading_complaints_without_claiming_additional_requests() {
+        let policy = super::embedded_policy().unwrap();
+        for text in [
+            "What are you talking about? The parcel weighs three kilograms.",
+            "Uh, what are you talking about? The appointment is on Friday.",
+            "OK! Well, what are you talking about? The diagram has four nodes.",
+        ] {
+            assert_eq!(
+                policy.classify(text).map(|hit| hit.category),
+                Some("misunderstanding"),
+                "{text:?}"
+            );
+        }
+        for text in [
+            "We also need a spare lamp.",
+            "You also need to draw a triangle.",
+            "I also need to correct my own calculation.",
+            "\"What are you talking about?\" is a line in the screenplay.",
+            "Example: what are you talking about?",
+            "Log: what are you talking about?",
+            "What are we talking about at the meeting?",
+        ] {
+            assert!(policy.classify(text).is_none(), "{text:?}");
+        }
+        for (text, expected) in [
+            ("You are not finished with the sculpture.", "incomplete"),
+            (
+                "What are you talking about? You deleted the timer.",
+                "regression",
+            ),
+            (
+                "What are you talking about? You forgot the receipt.",
+                "skip_step",
+            ),
+            (
+                "What are you talking about? You are not finished.",
+                "misunderstanding",
+            ),
+        ] {
+            assert_eq!(
+                policy.classify(text).map(|hit| hit.category),
+                Some(expected),
+                "{text:?}"
+            );
+        }
+    }
+
     /// Boundary category counts. One and many must both work; zero must be refused.
     #[test]
     fn a_policy_may_have_one_category_or_many_but_never_zero() {

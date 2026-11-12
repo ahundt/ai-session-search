@@ -38,11 +38,11 @@ const TABLE_CONTENT_CHARS: usize = 100;
 const USER_REQUEST_START: &str = "<USER_REQUEST>";
 const USER_REQUEST_END: &str = "</USER_REQUEST>";
 
-/// Historical built-in correction categories retained as a compatibility test oracle.
+/// Expected default correction categories retained as a test oracle.
 ///
 /// The executable source is the selected message-classification skill's `aise-capability.toml`.
 /// These patterns remain narrowed to second-person / imperative / demonstrative forms so tests
-/// can compare the current compiled capability with the pre-skills behavior.
+/// can compare the current compiled capability with the expected default rules.
 #[cfg(test)]
 pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
@@ -69,6 +69,7 @@ pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static s
         (
             "misunderstanding",
             vec![
+                r"^\s*(?:(?:ok|well|uh|oh|no)[,!?]?\s+){0,2}what are you talking about\b",
                 r"\b(that is|that'?s|it is|it'?s) (actually )?(wrong|incorrect|not correct|not right|not what|a mistake)\b",
                 r"\byou'?re wrong\b",
                 r"\byou (misunderstood|got it wrong|misread)\b",
@@ -82,7 +83,6 @@ pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static s
         (
             "incomplete",
             vec![
-                r"\balso need\b",
                 r"\bmust also\b",
                 r"\bnot done\b",
                 r"\bnot finished\b",
@@ -1762,7 +1762,7 @@ mod tests {
             ("that's wrong, the API returns a list", "misunderstanding"),
             ("no, that's not what I asked", "misunderstanding"),
             ("you're wrong about the types", "misunderstanding"),
-            ("you also need to handle the error case", "incomplete"),
+            ("you are not done with the error case", "incomplete"),
             ("that's not finished, the tests still fail", "incomplete"),
             ("stop changing the config", "other"),
             ("please stop", "other"),
@@ -1787,6 +1787,7 @@ mod tests {
             "we should have access to the API",
             "run the command once and stop",
             "the incorrect assumption was already fixed",
+            "you also need to draw a triangle",
         ];
         for text in negatives {
             assert_eq!(

@@ -43,6 +43,7 @@ patterns = [
 [[categories]]
 name = "misunderstanding"
 patterns = [
+  '''^\s*(?:(?:ok|well|uh|oh|no)[,!?]?\s+){0,2}what are you talking about\b''',
   '''\b(that is|that'?s|it is|it'?s) (actually )?(wrong|incorrect|not correct|not right|not what|a mistake)\b''',
   '''\byou'?re wrong\b''',
   '''\byou (misunderstood|got it wrong|misread)\b''',
@@ -56,7 +57,6 @@ patterns = [
 [[categories]]
 name = "incomplete"
 patterns = [
-  '''\balso need\b''',
   '''\bmust also\b''',
   '''\bnot done\b''',
   '''\bnot finished\b''',
