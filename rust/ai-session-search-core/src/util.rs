@@ -1580,7 +1580,7 @@ fn infer_message_authorship(role: Role, kind: MessageKind) -> MessageAuthorship 
 
 /// Provider evidence that can resolve an otherwise-unknown user-role conversation row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[doc(hidden)]
+#[non_exhaustive]
 pub enum UserRoleEvidence {
     HumanInputEvent,
     AgentDelegationEvent,
