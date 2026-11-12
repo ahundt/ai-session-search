@@ -1144,6 +1144,24 @@ pub struct ParsedSession {
     pub messages: Vec<Message>,
     /// File-mutating tool calls persisted to the `file_edits` table (file-version recovery).
     pub file_edits: Vec<FileEdit>,
+    /// Rows an earlier parser derived from records that are still in this source but that this
+    /// parser no longer indexes; see `RetractedRows`.
+    #[serde(skip)]
+    pub(crate) retracted: RetractedRows,
+}
+
+/// What an earlier parser made of records this parser declines, rendered the way it did then.
+///
+/// The index is an archive: a stored row the current parse lacks is kept, because its source
+/// record may have been compacted or pruned away. That rule cannot tell a record that is gone
+/// from a record that is present but no longer a message, such as Claude Code's
+/// `api-request-blob` request copies. These rows name the second case. A stored row the parse
+/// does not hold and that equals one of these is removed on reindex; every other stored row the
+/// parse lacks is kept, so content whose record is gone from the source is never deleted.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RetractedRows {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) file_edits: Vec<FileEdit>,
 }
 
 impl ParsedSession {
@@ -1154,6 +1172,7 @@ impl ParsedSession {
             transcript_text: String::new(),
             messages,
             file_edits: Vec::new(),
+            retracted: RetractedRows::default(),
         }
     }
 }

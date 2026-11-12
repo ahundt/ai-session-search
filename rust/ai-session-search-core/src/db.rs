@@ -7020,6 +7020,10 @@ fn store_parsed_messages(
             unseen.push(message);
         }
     }
+    let mut delete = tx.prepare("delete from messages where id = ?1")?;
+    for id in take_retracted_rows(&stored, &mut matched, &parsed.retracted.messages) {
+        delete.execute(params![id])?;
+    }
     insert_messages(
         tx,
         session,
@@ -7029,6 +7033,73 @@ fn store_parsed_messages(
             .map(|(offset, message)| (next_seq + offset as i64, message)),
     )?;
     Ok(matched.iter().any(|matched| !matched))
+}
+
+/// Row ids of stored messages derived from records the parse declines (`RetractedRows`), each
+/// marked matched so it is not kept as archive.
+///
+/// The invariant: a stored row the parse does not hold stays (the archive rule) unless it equals
+/// what an earlier parser made of a record that is still in the source and that this parser
+/// declines. The parser's verdict is authoritative for records still present; content whose
+/// record is gone from the source is never deleted. Only rows the parse left unclaimed are
+/// candidates, and each declined rendering takes at most one row. Equal columns are tried first,
+/// for every declined row, so a pruned record's row is not taken for a declined copy of the same
+/// text; role and content second, for rows an older renderer stored with other metadata. The
+/// second rule never takes a row with a native identity, which no declined copy carries.
+/// O(stored + declined) time and key memory.
+fn take_retracted_rows(
+    stored: &[(i64, MessageKeys)],
+    matched: &mut [bool],
+    retracted: &[Message],
+) -> Vec<i64> {
+    if retracted.is_empty() {
+        return Vec::new();
+    }
+    let mut by_columns: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
+    let mut by_role_and_content: HashMap<RowDigest, std::collections::VecDeque<usize>> =
+        HashMap::new();
+    for (position, (_, keys)) in stored.iter().enumerate() {
+        if matched[position] {
+            continue;
+        }
+        by_columns
+            .entry(keys.columns_without_seq)
+            .or_default()
+            .push_back(position);
+        if keys.correlation.is_none() {
+            by_role_and_content
+                .entry(keys.role_and_content)
+                .or_default()
+                .push_back(position);
+        }
+    }
+    let take = |queue: Option<&mut std::collections::VecDeque<usize>>,
+                matched: &mut [bool]|
+     -> Option<usize> {
+        let queue = queue?;
+        while let Some(position) = queue.pop_front() {
+            if !matched[position] {
+                matched[position] = true;
+                return Some(position);
+            }
+        }
+        None
+    };
+    let keys: Vec<MessageKeys> = retracted.iter().map(parsed_message_keys).collect();
+    let mut taken = Vec::new();
+    let mut loose = Vec::new();
+    for keys in &keys {
+        match take(by_columns.get_mut(&keys.columns_without_seq), matched) {
+            Some(position) => taken.push(stored[position].0),
+            None => loose.push(keys.role_and_content),
+        }
+    }
+    for key in loose {
+        if let Some(position) = take(by_role_and_content.get_mut(&key), matched) {
+            taken.push(stored[position].0);
+        }
+    }
+    taken
 }
 
 /// Union structurally attributed fragments only within the same proven native family event.
@@ -7256,8 +7327,28 @@ fn store_parsed_file_edits(
             }
         }
     }
+    // A stored edit the parse left unclaimed that equals an edit an earlier parser derived from a
+    // record still in the source, which this parser declines, leaves; see `take_retracted_rows`
+    // for the invariant. Claude's request copies repeated each edit; an `Edit` replayed a second
+    // time no longer finds its old text, which invalidates the reconstructed file version.
+    let mut retracted = vec![false; stored.len()];
+    for edit in &parsed.retracted.file_edits {
+        let key = parsed_file_edit_keys(edit)?.edit;
+        if let Some(position) = positions.get_mut(&key).and_then(|queue| queue.pop_front()) {
+            retracted[position] = true;
+        }
+    }
+    let mut delete = tx.prepare("delete from file_edits where id = ?1")?;
+    for (position, (id, _, _)) in stored.iter().enumerate() {
+        if retracted[position] {
+            delete.execute(params![id])?;
+        }
+    }
     // (stored position to precede or follow, 0 = parse-only before 1 = stored, tiebreak index).
-    let mut order: Vec<(usize, u8, usize)> = (0..stored.len()).map(|j| (j, 1, j)).collect();
+    let mut order: Vec<(usize, u8, usize)> = (0..stored.len())
+        .filter(|j| !retracted[*j])
+        .map(|j| (j, 1, j))
+        .collect();
     let mut next_retained = stored.len();
     for (index, position) in matched.iter().enumerate().rev() {
         match position {
@@ -18581,6 +18672,7 @@ mod tests {
             transcript_text: contents.join("\n\n"),
             messages,
             file_edits: Vec::new(),
+            retracted: Default::default(),
         }
     }
 
@@ -18700,6 +18792,52 @@ mod tests {
         assert_eq!(
             updates, 0,
             "a repeated repair must not rewrite retained message rows"
+        );
+    }
+
+    /// Rows a parser declines are removed only when the parse left them unclaimed, one stored
+    /// row per declined rendering, and never by text alone from a row with a native identity.
+    /// Text an older renderer stored with other metadata is still recognised by role and content.
+    #[test]
+    fn reindex_removes_only_unclaimed_rows_equal_to_declined_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut stored = parsed_with_messages(
+            "claude:retract",
+            &["kept turn", "copy", "copy", "identified copy", "pruned"],
+        );
+        stored.messages[1].provenance.authorship = MessageAuthorship::Unknown;
+        stored.messages[3].provenance.correlation_identity =
+            Some(crate::models::MessageCorrelationIdentity {
+                authority: crate::models::MessageCorrelationAuthority::Anthropic,
+                scope: "claude:retract".into(),
+                id: "u-3".into(),
+            });
+        db.upsert_session(&stored, 1, 1).unwrap();
+
+        let mut current = parsed_with_messages("claude:retract", &["kept turn", "copy"]);
+        current.session.parse_version = "v2".into();
+        let declined = parsed_with_messages("claude:retract", &["copy", "identified copy"]);
+        current.retracted.messages = declined.messages;
+        for message in &mut current.retracted.messages {
+            message.provenance.authorship = MessageAuthorship::Human;
+        }
+        db.upsert_session(&current, 2, 2).unwrap();
+
+        let contents: Vec<String> = db
+            .conn
+            .prepare(
+                "select content from messages where session_id = 'claude:retract' order by seq",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            contents,
+            ["kept turn", "copy", "identified copy", "pruned"],
+            "one copy is the parse's, one was declined; the identified and pruned rows stay"
         );
     }
 
@@ -19224,6 +19362,7 @@ mod tests {
             transcript_text: String::new(),
             messages,
             file_edits,
+            retracted: Default::default(),
         }
     }
 
@@ -20371,6 +20510,7 @@ mod tests {
             transcript_text: String::new(),
             messages,
             file_edits: Vec::new(),
+            retracted: Default::default(),
         };
         db.upsert_session(
             &session(vec![message(0, "a"), message(1, "b"), message(2, "c")]),

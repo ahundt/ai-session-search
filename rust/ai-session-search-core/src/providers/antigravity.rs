@@ -293,6 +293,7 @@ impl AntigravityAdapter {
             transcript_text: transcript_lines.join("\n\n"),
             messages,
             file_edits,
+            retracted: Default::default(),
         })
     }
 }

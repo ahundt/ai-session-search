@@ -123,5 +123,6 @@ pub(super) fn parsed_session_from_raw_with_evidence(
         transcript_text,
         messages,
         file_edits: Vec::new(),
+        retracted: Default::default(),
     }
 }

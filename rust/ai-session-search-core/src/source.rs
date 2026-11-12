@@ -680,7 +680,8 @@ mod tests {
     fn valid_metadata_record_is_not_a_total_failure_when_another_line_is_malformed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata-only.jsonl");
-        std::fs::write(&path, "{\"type\":\"metadata\"}\n{partial\n").unwrap();
+        // A known metadata record; an unrecognized type would add its own warning.
+        std::fs::write(&path, "{\"type\":\"custom-title\"}\n{partial\n").unwrap();
         let source = SourceFile {
             provider: Provider::Claude,
             path: path.clone(),

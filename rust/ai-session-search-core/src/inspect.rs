@@ -738,6 +738,7 @@ mod tests {
                 new_content: None,
                 edits: Vec::new(),
             }],
+            retracted: Default::default(),
         };
         db.upsert_session(&parsed, 0, 0).unwrap();
 
@@ -842,6 +843,7 @@ mod tests {
             transcript_text: String::new(),
             messages,
             file_edits: Vec::new(),
+            retracted: Default::default(),
         };
         db.upsert_session(&parsed, 0, 0).unwrap();
 

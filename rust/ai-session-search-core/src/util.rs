@@ -2001,13 +2001,14 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
         transcript_text: String::new(),
         messages: Vec::new(),
         file_edits: Vec::new(),
+        retracted: Default::default(),
     }
 }
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v9",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v9",
+        Provider::Claude => "claude-v10",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v10",
         Provider::Codex => "codex-v8",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v4",

@@ -41,6 +41,250 @@ pub(crate) fn claude_queue_scope(canonical_path: &str) -> String {
     format!("claude_queue:{canonical_path}")
 }
 
+/// Record types that are conversation, and the only ones whose records may become messages,
+/// tool calls, tool results or file edits. `system` records reach only the harness-notice rule
+/// (`is_harness_notice`); `queue-operation`, `attachment` and `last-prompt` have their own arms
+/// in `parse_reader`'s dispatch.
+///
+/// Eligibility is decided by the record's `type`, never by whether it carries a `message` object:
+/// a record may carry one without being a message. Since 2026-10-21 Claude Code writes
+/// `api-request-blob` records, `{type, sessionId, hash, message: {role, content}}`, a stored copy
+/// of each message of each API request. Taking the role from `message.role` indexed every copy
+/// as another user or assistant turn and repeated its tool calls, tool results and file edits,
+/// so harness wrappers and repeated prompts reached corrections, repeats and user search.
+const MESSAGE_RECORD_TYPES: [&str; 3] = ["user", "assistant", "system"];
+
+/// Record types Claude Code and Claude Desktop write that are deliberately not indexed: titles,
+/// modes, request bookkeeping, file-history snapshots, progress and status events, and the
+/// `api-request-blob` request copies whose content the conversation records already hold. A type
+/// in neither list is counted and named in the session's parse warning, so a new record kind
+/// appears in `aise doctor` instead of silently changing what is indexed.
+const IGNORED_RECORD_TYPES: [&str; 27] = [
+    "agent-name",
+    "ai-title",
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
+    "atis-latch",
+    "command_lifecycle",
+    "cost-state",
+    "custom-title",
+    "file-history-delta",
+    "file-history-snapshot",
+    "fork-context-ref",
+    "frame-link",
+    "mode",
+    "permission-mode",
+    "pr-link",
+    "progress",
+    "rate_limit_event",
+    "relocated",
+    "result",
+    "session-owner",
+    "started",
+    // Conversation-summary records of Claude Code releases before this machine's earliest
+    // transcript; no message content.
+    "summary",
+    "tool_progress",
+    "tool_use_summary",
+    "tools-used",
+    "worktree-state",
+];
+
+/// `raw_metadata_json` key holding `{record type: count}` for records of unrecognized types,
+/// which `Db::parser_health` aggregates across sessions.
+pub(crate) const UNRECOGNIZED_RECORD_TYPES_KEY: &str = "unrecognized_record_types";
+
+/// Records of types in neither `MESSAGE_RECORD_TYPES` nor `IGNORED_RECORD_TYPES`, by type name.
+/// Bounded: at most `MAX_TYPES` names of at most `MAX_NAME_CHARS` characters each are kept, and
+/// records of any further type are counted under one overflow name.
+#[derive(Default)]
+struct UnrecognizedRecordTypes {
+    counts: std::collections::BTreeMap<String, usize>,
+}
+
+impl UnrecognizedRecordTypes {
+    const MAX_TYPES: usize = 16;
+    const MAX_NAME_CHARS: usize = 64;
+    const OVERFLOW: &'static str = "(other types)";
+
+    fn count(&mut self, record_type: Option<&str>) {
+        let name: String = record_type
+            .unwrap_or("(no type)")
+            .chars()
+            .take(Self::MAX_NAME_CHARS)
+            .collect();
+        let name = if self.counts.contains_key(&name) || self.counts.len() < Self::MAX_TYPES {
+            name
+        } else {
+            Self::OVERFLOW.to_string()
+        };
+        *self.counts.entry(name).or_default() += 1;
+    }
+
+    fn warning(&self) -> Option<String> {
+        if self.counts.is_empty() {
+            return None;
+        }
+        Some(
+            self.counts
+                .iter()
+                .map(|(name, count)| match count {
+                    1 => format!("1 record of unrecognized type {name:?} was not indexed"),
+                    count => {
+                        format!("{count} records of unrecognized type {name:?} were not indexed")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+}
+
+/// A queued prompt or notice found in an `attachment` record with
+/// `attachment.type == "queued_command"`, held until the whole file is read.
+///
+/// Claude Code records a prompt typed while the agent was working as a `queue-operation`
+/// enqueue, and when it is delivered as this attachment. Recent enqueues often omit `content`,
+/// so the attachment can be the only copy of what the person typed. The structured
+/// `attachment.prompt` is used, never the wrapped `rendered` text. A prompt already indexed from a
+/// `queue-operation` enqueue or a `user` record of the same file is not added again: each indexed
+/// copy of a text absorbs one attachment of that text, in file order, by the same
+/// `strip_command_markup`-then-trim content digest the queue identity uses.
+struct QueuedCommand {
+    /// `messages.len()` and `transcript_lines.len()` when the attachment was read, so the row
+    /// keeps its place in file order.
+    position: usize,
+    transcript_position: usize,
+    digest: String,
+    /// `commandMode == "prompt"`: input a person or agent submitted. Any other mode is not a
+    /// typed prompt (task notifications, and peer or coordinator messages without a mode) and
+    /// becomes a harness notice.
+    prompt: bool,
+    timestamp: Option<DateTime<Utc>>,
+    message: RawMessage,
+}
+
+impl QueuedCommand {
+    fn from_attachment(
+        value: &Value,
+        timestamp: Option<DateTime<Utc>>,
+        event_id: Option<&str>,
+        position: usize,
+        transcript_position: usize,
+    ) -> Option<Self> {
+        let attachment = value.get("attachment")?;
+        if attachment.get("type").and_then(Value::as_str) != Some("queued_command") {
+            return None;
+        }
+        let prompt = attachment.get("prompt").and_then(Value::as_str)?;
+        let is_prompt = attachment.get("commandMode").and_then(Value::as_str) == Some("prompt");
+        let content = if is_prompt {
+            strip_command_markup(prompt).trim().to_string()
+        } else {
+            prompt.trim().to_string()
+        };
+        if !substantive_text(&content) {
+            return None;
+        }
+        let digest = sha256(content.as_bytes());
+        let mut message = if is_prompt {
+            // The sender is `attachment.origin`, the same field the SDK sets on a user record.
+            queued_input_message(
+                content,
+                timestamp,
+                claude_native_message_semantics(attachment),
+            )
+        } else {
+            RawMessage::harness_notice(content, timestamp)
+        };
+        if let Some(event_id) = event_id {
+            message = message
+                .with_native_event_identity(MessageCorrelationAuthority::Anthropic, event_id);
+        }
+        Some(Self {
+            position,
+            transcript_position,
+            digest,
+            prompt: is_prompt,
+            timestamp,
+            message,
+        })
+    }
+
+    /// Insert every queued command no other record of the file already indexed, in file order.
+    fn place(
+        queued: Vec<Self>,
+        messages: &mut Vec<RawMessage>,
+        transcript_lines: &mut Vec<String>,
+        created_at: &mut Option<DateTime<Utc>>,
+        updated_at: &mut Option<DateTime<Utc>>,
+    ) {
+        if queued.is_empty() {
+            return;
+        }
+        // Harness notices are stored with role `user`, so a notice already indexed from a
+        // `user` record also absorbs its attachment copy.
+        let mut indexed: HashMap<String, usize> = HashMap::new();
+        for message in messages.iter().filter(|message| message.role() == "user") {
+            *indexed
+                .entry(sha256(message.content().trim().as_bytes()))
+                .or_default() += 1;
+        }
+        let kept: Vec<Self> = queued
+            .into_iter()
+            .filter(|queued| match indexed.get_mut(&queued.digest) {
+                Some(copies) if *copies > 0 => {
+                    *copies -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .collect();
+        // Back to front, so each recorded position still names the place it was read at.
+        for queued in kept.into_iter().rev() {
+            if queued.prompt {
+                observe_session_start(created_at, queued.timestamp);
+                observe_session_end(updated_at, queued.timestamp);
+                transcript_lines.insert(
+                    queued.transcript_position,
+                    format_transcript_line("user", queued.timestamp, queued.message.content()),
+                );
+            }
+            messages.insert(queued.position, queued.message);
+        }
+    }
+}
+
+/// A prompt submitted through Claude Code's queue, from a `queue-operation` enqueue or a
+/// `queued_command` attachment.
+///
+/// Legacy queue rows carry no sender or per-item origin. If the producer includes the SDK's
+/// native origin, preserve it: a known generated/unclassified row must not become UserInput
+/// merely because queue delivery is known, while direct/channel/scheduled input keeps the queue
+/// origin and its submitted lifecycle evidence.
+fn queued_input_message(
+    content: String,
+    timestamp: Option<DateTime<Utc>>,
+    semantics: Option<ClaudeNativeMessageSemantics>,
+) -> RawMessage {
+    let raw_message = RawMessage::message("user", content, timestamp, None)
+        .with_input_delivery_state(InputDeliveryState::Submitted);
+    match semantics {
+        Some(semantics) => {
+            let raw_message = raw_message.with_authorship(semantics.content_authorship.into());
+            if semantics.input_origin.is_some() {
+                raw_message.with_input_origin(MessageInputOrigin::Queued)
+            } else {
+                raw_message
+            }
+        }
+        None => raw_message
+            .with_authorship(MessageAuthorship::Unknown)
+            .with_input_origin(MessageInputOrigin::Queued),
+    }
+}
+
 pub struct ClaudeAdapter {
     roots: Vec<PathBuf>,
 }
@@ -211,6 +455,14 @@ impl ClaudeAdapter {
         let mut queue_occurrences: HashMap<String, usize> = HashMap::new();
         let queue_scope = std::cell::OnceCell::new();
         let mut requires_full_parse_for_tail = false;
+        // Queued prompts recorded only as attachments, placed after the loop once every
+        // conversation and queue record of the file is known; see `QueuedCommand`.
+        let mut queued_commands: Vec<QueuedCommand> = Vec::new();
+        let mut unrecognized = UnrecognizedRecordTypes::default();
+        // What earlier parsers made of the records this one declines; see `RetractedRows`.
+        let mut retracted_messages = Vec::new();
+        let mut retracted_file_edits = Vec::new();
+        let mut retracted_file_mutations = PendingFileMutations::default();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -255,14 +507,6 @@ impl ClaudeAdapter {
                         .map(ToOwned::to_owned);
                 }
             }
-            if value.get("type").and_then(Value::as_str) == Some("last-prompt") {
-                if let Some(prompt) = value.get("lastPrompt").and_then(Value::as_str) {
-                    let prompt = prompt.trim();
-                    if substantive_text(prompt) {
-                        last_prompt = Some(prompt.to_string());
-                    }
-                }
-            }
             if cwd.is_none() {
                 cwd = value
                     .get("cwd")
@@ -276,89 +520,107 @@ impl ClaudeAdapter {
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty());
 
-            // Only enqueue records a submission; other queue operations establish neither a
-            // new input nor a link proving delivery. Keep repeated submissions independently.
-            if value.get("type").and_then(Value::as_str) == Some("queue-operation") {
-                let operation = value
-                    .get("operation")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                *queue_operation_counts
-                    .entry(operation.to_string())
-                    .or_default() += 1;
-                if operation == "enqueue" {
-                    requires_full_parse_for_tail = true;
-                    if let Some(content) = value.get("content").and_then(Value::as_str) {
-                        let content = strip_command_markup(content).trim().to_string();
-                        if substantive_text(&content) {
-                            let timestamp_key = value
-                                .get("timestamp")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .or_else(|| timestamp.map(crate::util::stored_timestamp))
-                                .unwrap_or_else(|| "unknown-time".to_string());
-                            // Timestamp alone is not stable when an earlier, different enqueue
-                            // sharing that timestamp disappears from a shortened source. Include
-                            // the content digest in the source-local bucket; identical repeated
-                            // submissions still receive distinct occurrence suffixes.
-                            let identity_key =
-                                format!("{timestamp_key}:{}", sha256(content.as_bytes()));
-                            let occurrence =
-                                queue_occurrences.entry(identity_key.clone()).or_default();
-                            let occurrence_id = *occurrence;
-                            *occurrence += 1;
-                            observe_session_start(&mut created_at, timestamp);
-                            observe_session_end(&mut updated_at, timestamp);
-                            let mut raw_message =
-                                RawMessage::message("user", content.clone(), timestamp, None)
-                                    .with_input_delivery_state(InputDeliveryState::Submitted);
-                            // Legacy queue rows carry no sender or per-item origin. If a future
-                            // producer includes the SDK's native origin, preserve it: a known
-                            // generated/unclassified row must not become UserInput merely because
-                            // queue delivery is known, while direct/channel/scheduled input keeps
-                            // the queue origin and its submitted lifecycle evidence.
-                            match claude_native_message_semantics(&value) {
-                                Some(semantics) => {
-                                    raw_message = raw_message
-                                        .with_authorship(semantics.content_authorship.into());
-                                    if semantics.input_origin.is_some() {
-                                        raw_message = raw_message
-                                            .with_input_origin(MessageInputOrigin::Queued);
-                                    }
-                                }
-                                None => {
-                                    raw_message = raw_message
-                                        .with_authorship(MessageAuthorship::Unknown)
-                                        .with_input_origin(MessageInputOrigin::Queued);
-                                }
-                            }
-                            if let Some(event_id) = event_id {
-                                raw_message = raw_message.with_native_event_identity(
-                                    MessageCorrelationAuthority::Anthropic,
-                                    event_id,
-                                );
-                            } else {
-                                raw_message = raw_message.with_correlation_identity(
-                                    MessageCorrelationIdentity {
-                                        authority: MessageCorrelationAuthority::SourceLocal,
-                                        // Verified aliases must name the same physical source.
-                                        scope: queue_scope
-                                            .get_or_init(|| {
-                                                claude_queue_scope(&canonical_source_path(path))
-                                            })
-                                            .clone(),
-                                        id: format!("{identity_key}#{occurrence_id}"),
-                                    },
-                                );
-                            }
-                            messages.push(raw_message);
-                            transcript_lines
-                                .push(format_transcript_line("user", timestamp, &content));
+            let record_type = value.get("type").and_then(Value::as_str);
+            // The one place that decides what a record may produce, by its type. A record of any
+            // type outside `MESSAGE_RECORD_TYPES` yields no message, tool call, tool result or
+            // file edit, whatever fields it carries; see that constant for why.
+            let retract = match record_type {
+                Some(kind) if MESSAGE_RECORD_TYPES.contains(&kind) => false,
+                Some("last-prompt") => {
+                    if let Some(prompt) = value.get("lastPrompt").and_then(Value::as_str) {
+                        let prompt = prompt.trim();
+                        if substantive_text(prompt) {
+                            last_prompt = Some(prompt.to_string());
                         }
                     }
+                    continue;
                 }
-                continue;
-            }
+                Some("attachment") => {
+                    if let Some(queued) = QueuedCommand::from_attachment(
+                        &value,
+                        timestamp,
+                        event_id,
+                        messages.len(),
+                        transcript_lines.len(),
+                    ) {
+                        // Whether it duplicates another record is decided after the loop, over
+                        // the whole file, so a tail slice cannot decide it alone.
+                        requires_full_parse_for_tail = true;
+                        queued_commands.push(queued);
+                    }
+                    continue;
+                }
+                // Only enqueue records a submission; other queue operations establish neither a
+                // new input nor a link proving delivery. Keep repeated submissions independently.
+                Some("queue-operation") => {
+                    let operation = value
+                        .get("operation")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    *queue_operation_counts
+                        .entry(operation.to_string())
+                        .or_default() += 1;
+                    if operation == "enqueue" {
+                        requires_full_parse_for_tail = true;
+                        if let Some(content) = value.get("content").and_then(Value::as_str) {
+                            let content = strip_command_markup(content).trim().to_string();
+                            if substantive_text(&content) {
+                                let timestamp_key = value
+                                    .get("timestamp")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .or_else(|| timestamp.map(crate::util::stored_timestamp))
+                                    .unwrap_or_else(|| "unknown-time".to_string());
+                                // Timestamp alone is not stable when an earlier, different enqueue
+                                // sharing that timestamp disappears from a shortened source. Include
+                                // the content digest in the source-local bucket; identical repeated
+                                // submissions still receive distinct occurrence suffixes.
+                                let identity_key =
+                                    format!("{timestamp_key}:{}", sha256(content.as_bytes()));
+                                let occurrence =
+                                    queue_occurrences.entry(identity_key.clone()).or_default();
+                                let occurrence_id = *occurrence;
+                                *occurrence += 1;
+                                observe_session_start(&mut created_at, timestamp);
+                                observe_session_end(&mut updated_at, timestamp);
+                                let mut raw_message = queued_input_message(
+                                    content.clone(),
+                                    timestamp,
+                                    claude_native_message_semantics(&value),
+                                );
+                                if let Some(event_id) = event_id {
+                                    raw_message = raw_message.with_native_event_identity(
+                                        MessageCorrelationAuthority::Anthropic,
+                                        event_id,
+                                    );
+                                } else {
+                                    raw_message = raw_message.with_correlation_identity(
+                                        MessageCorrelationIdentity {
+                                            authority: MessageCorrelationAuthority::SourceLocal,
+                                            // Verified aliases must name the same physical source.
+                                            scope: queue_scope
+                                                .get_or_init(|| {
+                                                    claude_queue_scope(&canonical_source_path(path))
+                                                })
+                                                .clone(),
+                                            id: format!("{identity_key}#{occurrence_id}"),
+                                        },
+                                    );
+                                }
+                                messages.push(raw_message);
+                                transcript_lines
+                                    .push(format_transcript_line("user", timestamp, &content));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Some(kind) if IGNORED_RECORD_TYPES.contains(&kind) => true,
+                other => {
+                    unrecognized.count(other);
+                    true
+                }
+            };
 
             if claude_tool_use_result(&value).is_some_and(|result| {
                 result.get("answers").is_some_and(Value::is_object)
@@ -372,10 +634,18 @@ impl ClaudeAdapter {
             // the legacy session-level evidence below remains unchanged.
             let native_semantics = claude_native_message_semantics(&value);
 
-            let mut role = value
-                .get("type")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            // A declined record runs through the same rendering into separate sinks, so what an
+            // earlier parser stored from it can be recognised and removed; see `RetractedRows`.
+            let (out, edits, pending) = if retract {
+                (
+                    &mut retracted_messages,
+                    &mut retracted_file_edits,
+                    &mut retracted_file_mutations,
+                )
+            } else {
+                (&mut messages, &mut file_edits, &mut pending_file_mutations)
+            };
+            let mut role = record_type.map(str::to_string);
             let mut text = String::new();
             let mut tool_result = false;
             let mut tool_name: Option<String> = None;
@@ -383,11 +653,15 @@ impl ClaudeAdapter {
             let mut mixed_user_content = None;
 
             if let Some(message) = value.get("message") {
-                role = message
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or(role);
+                // `message.role` refines a user or assistant record. It never makes a record of
+                // another type a turn; only the earlier rendering of a declined record used it.
+                if retract || matches!(record_type, Some("user" | "assistant")) {
+                    role = message
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or(role);
+                }
                 text = extract_text(message);
                 if role.as_deref() == Some("user") {
                     mixed_user_content = claude_mixed_user_content(
@@ -401,10 +675,10 @@ impl ClaudeAdapter {
                 }
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
-                stage_file_edits(message, timestamp, &mut pending_file_mutations);
-                collect_file_edit_results(message, &mut pending_file_mutations, &mut file_edits);
+                stage_file_edits(message, timestamp, pending);
+                collect_file_edit_results(message, pending, edits);
                 collect_tool_use_names(message, &mut tool_use_names);
-                append_tool_use_messages(message, timestamp, &mut messages);
+                append_tool_use_messages(message, timestamp, out);
                 // One scan for the first tool_result block: `tool_result` is true when a block
                 // EXISTS (even without a `tool_use_id`), and the name is tagged from that same
                 // block's id when present. Was two scans (`is_tool_result` + `tool_result_id`).
@@ -433,7 +707,7 @@ impl ClaudeAdapter {
                             event_id,
                         );
                     }
-                    messages.push(raw_message);
+                    out.push(raw_message);
                 }
                 continue;
             }
@@ -451,8 +725,10 @@ impl ClaudeAdapter {
             match role.as_deref() {
                 Some("user") | Some("assistant") => {
                     if let Some(mixed) = mixed_user_content {
-                        observe_session_start(&mut created_at, timestamp);
-                        observe_session_end(&mut updated_at, timestamp);
+                        if !retract {
+                            observe_session_start(&mut created_at, timestamp);
+                            observe_session_end(&mut updated_at, timestamp);
+                        }
                         let (mut raw_message, transcript_text) = mixed.into_raw_message(timestamp);
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
@@ -460,8 +736,8 @@ impl ClaudeAdapter {
                                 event_id,
                             );
                         }
-                        messages.push(raw_message);
-                        if !transcript_text.is_empty() {
+                        out.push(raw_message);
+                        if !retract && !transcript_text.is_empty() {
                             transcript_lines.push(format_transcript_line(
                                 "user",
                                 timestamp,
@@ -487,7 +763,7 @@ impl ClaudeAdapter {
                                 event_id,
                             );
                         }
-                        messages.push(raw_message);
+                        out.push(raw_message);
                         continue;
                     }
                     if tool_result {
@@ -503,11 +779,13 @@ impl ClaudeAdapter {
                                 event_id,
                             );
                         }
-                        messages.push(raw_message);
+                        out.push(raw_message);
                         continue;
                     }
-                    observe_session_start(&mut created_at, timestamp);
-                    observe_session_end(&mut updated_at, timestamp);
+                    if !retract {
+                        observe_session_start(&mut created_at, timestamp);
+                        observe_session_end(&mut updated_at, timestamp);
+                    }
                     let is_user_role = role.as_deref() == Some("user");
                     let mut raw_message = RawMessage::message(
                         role.unwrap_or_default(),
@@ -530,16 +808,26 @@ impl ClaudeAdapter {
                             event_id,
                         );
                     }
-                    messages.push(raw_message);
-                    transcript_lines.push(format_transcript_line(
-                        messages.last().map(RawMessage::role).unwrap_or("message"),
-                        timestamp,
-                        &text,
-                    ));
+                    if !retract {
+                        transcript_lines.push(format_transcript_line(
+                            raw_message.role(),
+                            timestamp,
+                            &text,
+                        ));
+                    }
+                    out.push(raw_message);
                 }
                 _ => {}
             }
         }
+
+        QueuedCommand::place(
+            queued_commands,
+            &mut messages,
+            &mut transcript_lines,
+            &mut created_at,
+            &mut updated_at,
+        );
 
         let first_user = messages
             .iter()
@@ -608,9 +896,18 @@ impl ClaudeAdapter {
         if requires_full_parse_for_tail {
             raw_metadata["requires_full_parse_for_tail"] = json!(true);
         }
+        if !unrecognized.counts.is_empty() {
+            raw_metadata[UNRECOGNIZED_RECORD_TYPES_KEY] = json!(unrecognized.counts);
+        }
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
-        let parse_warning = super::malformed_jsonl_warning(malformed_line_count);
+        let parse_warning = [
+            super::malformed_jsonl_warning(malformed_line_count),
+            unrecognized.warning(),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|first, second| format!("{first}; {second}"));
 
         // A subagent's identity is its parent's id plus what distinguishes the run under that
         // parent. Neither half alone works: the records name only the parent, and the agent id
@@ -664,20 +961,30 @@ impl ClaudeAdapter {
                 .or(agent_id),
         };
 
+        let evidence = if subagent {
+            UserRoleAuthorshipEvidence::AgentDelegationEvent
+        } else {
+            UserRoleAuthorshipEvidence::HumanInputEvent
+        };
         let messages = crate::util::normalize_raw_messages_with_evidence(
             messages,
             Some(&session.id),
-            if subagent {
-                UserRoleAuthorshipEvidence::AgentDelegationEvent
-            } else {
-                UserRoleAuthorshipEvidence::HumanInputEvent
-            },
+            evidence,
         );
+        let retracted = crate::models::RetractedRows {
+            messages: crate::util::normalize_raw_messages_with_evidence(
+                retracted_messages,
+                Some(&session.id),
+                evidence,
+            ),
+            file_edits: retracted_file_edits,
+        };
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
             messages,
             file_edits,
+            retracted,
         })
     }
 }
@@ -3875,5 +4182,281 @@ mod tests {
         );
         assert_eq!(parsed.session.message_count, Some(1));
         assert_eq!(parsed.messages[0].content, "sidecar missing but parse me");
+    }
+
+    /// One transcript holding every record kind that carries text the person did not type
+    /// beside the turns they did: stored request copies, a mid-turn wrapper, a compaction summary,
+    /// a Stop-hook notice, an instructions attachment, queued prompts, and a record type the
+    /// parser has never seen.
+    const HARNESS_RECORDS: &str = include_str!("../../tests/fixtures/claude_harness_records.jsonl");
+
+    fn parse_harness_records() -> crate::models::ParsedSession {
+        let temp = tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("cafe0002-cafe-cafe-cafe-000000000001.jsonl");
+        std::fs::write(&path, HARNESS_RECORDS).unwrap();
+        ClaudeAdapter::new(vec![temp.path().to_path_buf()])
+            .parse_reader(std::io::Cursor::new(HARNESS_RECORDS), &path)
+            .unwrap()
+    }
+
+    /// Only records that are conversation become messages. Since 2026-10-21 Claude Code also
+    /// writes `api-request-blob` records, stored copies of each API request message with a
+    /// `message.role`, and reading the role from `message` indexed every copy as another user or
+    /// assistant turn and another tool call. Their text reached corrections, repeats and user
+    /// search as if the person had typed it again.
+    #[test]
+    fn only_conversation_records_become_messages() {
+        use crate::models::{MessageAuthorship, MessageInputOrigin, MessageKind, Role};
+
+        let parsed = parse_harness_records();
+        let rows: Vec<(Role, MessageKind, &str)> = parsed
+            .messages
+            .iter()
+            .map(|message| (message.role, message.kind, message.content.as_str()))
+            .collect();
+        let conversation: Vec<_> = rows
+            .iter()
+            .filter(|(_, kind, _)| *kind == MessageKind::Conversation)
+            .map(|(role, _, content)| (*role, *content))
+            .collect();
+        assert_eq!(
+            conversation,
+            [
+                (Role::User, "please list the files in the project"),
+                (Role::Assistant, "Listing them now."),
+                // Unchanged behaviour outside this test's scope: text extraction reads the
+                // `content` input of a `Write` call as the assistant turn's text.
+                (Role::Assistant, "first draft"),
+                (Role::User, "you forgot to check the tests"),
+                (Role::User, "also rename the output folder"),
+                (Role::User, "you missed the second directory"),
+            ],
+            "every conversation row is a turn a person or the model wrote, once: {rows:#?}"
+        );
+        let tool_rows = rows
+            .iter()
+            .filter(|(_, kind, _)| matches!(kind, MessageKind::ToolCall | MessageKind::ToolResult))
+            .count();
+        assert_eq!(tool_rows, 4, "two calls and two results: {rows:#?}");
+        assert_eq!(parsed.file_edits.len(), 1, "{:#?}", parsed.file_edits);
+        for needle in [
+            "while you were working",
+            "coding agent",
+            "contributing guide",
+            "future record",
+        ] {
+            assert!(
+                rows.iter().all(|(_, _, content)| !content.contains(needle)),
+                "{needle:?} is harness or unknown-record text: {rows:#?}"
+            );
+        }
+        let notices: Vec<_> = rows
+            .iter()
+            .filter(|(_, kind, _)| *kind == MessageKind::HarnessNotice)
+            .map(|(_, _, content)| *content)
+            .collect();
+        assert_eq!(notices.len(), 2, "{notices:#?}");
+        assert!(notices[0].starts_with("<task-notification>"));
+        assert!(notices[1].starts_with("Stop hook feedback"));
+        assert_eq!(
+            rows.iter()
+                .filter(|(role, _, _)| *role == Role::Compaction)
+                .count(),
+            1
+        );
+
+        // The prompt that exists only in a queued-command attachment is the person's input,
+        // delivered through the queue, at the attachment's own time.
+        let queued = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "also rename the output folder")
+            .unwrap();
+        assert_eq!(queued.provenance.authorship, MessageAuthorship::Human);
+        assert_eq!(
+            queued.provenance.input_origin,
+            Some(MessageInputOrigin::Queued)
+        );
+        assert_eq!(
+            queued.ts.map(crate::util::stored_timestamp).as_deref(),
+            Some("2026-10-30T10:00:07+00:00")
+        );
+        assert!(parsed
+            .transcript_text
+            .contains("also rename the output folder"));
+        assert!(!parsed.transcript_text.contains("while you were working"));
+
+        // What the earlier parser made of the declined records, for reindex to remove.
+        assert_eq!(parsed.retracted.file_edits.len(), 1);
+        assert!(parsed
+            .retracted
+            .messages
+            .iter()
+            .any(|message| message.content.contains("while you were working")));
+        assert!(parsed
+            .retracted
+            .messages
+            .iter()
+            .all(|message| message.ts.is_none() || message.content.contains("future")));
+    }
+
+    /// An index written by the parser that read request copies as turns is corrected on reindex:
+    /// rows derived from records still in the source, which this parser declines, leave the
+    /// index, while a row whose record was pruned from the source stays, because the index is
+    /// the archive of what the source once held.
+    #[test]
+    fn reindex_removes_rows_of_declined_records_and_keeps_archived_rows() {
+        let temp = tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("cafe0002-cafe-cafe-cafe-000000000001.jsonl");
+        let pruned = r#"{"type":"user","uuid":"u-0","timestamp":"2026-10-30T09:59:00Z","sessionId":"cafe0002-cafe-cafe-cafe-000000000001","message":{"role":"user","content":"an early prompt the harness later pruned"}}"#;
+        std::fs::write(&path, format!("{pruned}\n{HARNESS_RECORDS}")).unwrap();
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let source = adapter.discover().remove(0);
+
+        // The index the earlier parser wrote: every declined record's rows stored as well.
+        let mut earlier = adapter.parse(&source);
+        let declined = std::mem::take(&mut earlier.retracted);
+        earlier.messages.extend(declined.messages);
+        for (seq, message) in earlier.messages.iter_mut().enumerate() {
+            message.seq = seq as i64;
+        }
+        earlier.file_edits.extend(declined.file_edits);
+        for (seq, edit) in earlier.file_edits.iter_mut().enumerate() {
+            edit.seq = seq as i64;
+        }
+        earlier.session.parse_version = "claude-v9".into();
+        let db_path = temp.path().join("index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.upsert_session(&earlier, 1, 1).unwrap();
+
+        // The harness prunes the early prompt; the upgraded parser reindexes, twice.
+        std::fs::write(&path, HARNESS_RECORDS).unwrap();
+        let current = adapter.parse(&adapter.discover().remove(0));
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let count = |sql: &str| -> i64 { stored.query_row(sql, [], |row| row.get(0)).unwrap() };
+        for generation in [2, 3] {
+            db.upsert_session(&current, generation, generation).unwrap();
+            assert_eq!(
+                count(
+                    "select count(*) from messages where content like '%while you were working%'
+                       or content like '%future record%' or content like '%contributing guide%'"
+                ),
+                0,
+                "rows of declined records leave the index"
+            );
+            assert_eq!(
+                count("select count(*) from messages where content = 'Listing them now.'"),
+                1
+            );
+            assert_eq!(
+                count("select count(*) from messages where kind in ('tool_call', 'tool_result')"),
+                4
+            );
+            assert_eq!(count("select count(*) from file_edits"), 1);
+            assert_eq!(
+                count(
+                    "select count(*) from messages
+                       where content = 'an early prompt the harness later pruned'"
+                ),
+                1,
+                "a row whose record left the source stays in the archive"
+            );
+            assert_eq!(
+                count(
+                    "select count(*) from messages where content = 'also rename the output folder'"
+                ),
+                1
+            );
+            assert_eq!(
+                count("select count(*) from messages"),
+                current.messages.len() as i64 + 1
+            );
+        }
+    }
+
+    /// A record type the parser does not know yields nothing, even shaped like a user turn with
+    /// a tool call, and is named in the session's parse warning so `doctor` can report it.
+    #[test]
+    fn an_unknown_record_type_yields_nothing_and_is_reported() {
+        let record = r#"{"type":"brand-new-kind","uuid":"n-1","timestamp":"2026-11-01T00:00:00Z","sessionId":"unknown-kind","message":{"role":"user","content":[{"type":"text","text":"typed by nobody"},{"type":"tool_use","id":"toolu_new","name":"Write","input":{"file_path":"/tmp/x","content":"y"}}]}}
+{"type":"brand-new-kind","sessionId":"unknown-kind"}
+{"type":"api-request-blob","sessionId":"unknown-kind","message":{"role":"user","content":"known and ignored"}}
+{"type":"user","uuid":"n-2","timestamp":"2026-11-01T00:00:01Z","sessionId":"unknown-kind","message":{"role":"user","content":"a real turn"}}
+"#;
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(record),
+                std::path::Path::new("/tmp/unknown-kind.jsonl"),
+            )
+            .unwrap();
+        let contents: Vec<_> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["a real turn"]);
+        assert!(parsed.file_edits.is_empty());
+        assert_eq!(
+            parsed.session.parse_warning.as_deref(),
+            Some(r#"2 records of unrecognized type "brand-new-kind" were not indexed"#)
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            metadata[super::UNRECOGNIZED_RECORD_TYPES_KEY],
+            json!({"brand-new-kind": 2})
+        );
+    }
+
+    /// A queued prompt is indexed once whichever record holds it and in whatever order the
+    /// records appear; an attachment adds a row only for a text no other record indexed, and
+    /// repeated submissions of one text each keep their own row.
+    #[test]
+    fn queued_command_attachments_add_only_prompts_no_other_record_holds() {
+        let attachment = |uuid: &str, prompt: &str| {
+            json!({"type":"attachment","uuid":uuid,"timestamp":"2026-11-01T00:00:00Z",
+                "sessionId":"queued","attachment":{"type":"queued_command","prompt":prompt,
+                "commandMode":"prompt"}})
+            .to_string()
+        };
+        let lines = [
+            // Delivered before the user record that also holds it.
+            attachment("q-1", "held by a later user record"),
+            json!({"type":"user","uuid":"u-1","sessionId":"queued",
+                "message":{"role":"user","content":"held by a later user record"}})
+            .to_string(),
+            // An enqueue without `content`, as recent Claude Code writes it.
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":"queued",
+                "timestamp":"2026-11-01T00:00:01Z"})
+            .to_string(),
+            attachment("q-2", "only in the attachment"),
+            // The same text submitted twice, enqueued once with content.
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":"queued",
+                "timestamp":"2026-11-01T00:00:02Z","content":"submitted twice"})
+            .to_string(),
+            attachment("q-3", "submitted twice"),
+            attachment("q-4", "submitted twice"),
+        ]
+        .join("\n");
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(lines),
+                std::path::Path::new("/tmp/queued.jsonl"),
+            )
+            .unwrap();
+        let contents: Vec<_> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            [
+                "held by a later user record",
+                "only in the attachment",
+                "submitted twice",
+                "submitted twice",
+            ]
+        );
+        assert!(parsed.session.parse_warning.is_none());
+        let metadata: serde_json::Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["requires_full_parse_for_tail"], json!(true));
     }
 }
