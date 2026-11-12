@@ -4853,6 +4853,9 @@ impl SessionSearch {
         phrase_max_words: Option<i64>,
         context: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if context < 0 {
+            return Err(invalid_argument_error(format!("context must be 0 or greater; got {context}; pass the number of neighboring messages per example")));
+        }
         let count = |name: &str, value: Option<i64>| {
             value
                 .map(|v| {
