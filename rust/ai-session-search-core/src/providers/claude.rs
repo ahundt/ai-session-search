@@ -692,7 +692,7 @@ impl ClaudeAdapter {
                     continue;
                 }
                 Some("attachment") => {
-                    if value["attachment"]["type"] == "queued_command"
+                    let repeated = value["attachment"]["type"] == "queued_command"
                         && event_id.is_some_and(|id| {
                             // Branch metadata can change when the same attachment is replayed.
                             !seen_records.insert((
@@ -703,10 +703,7 @@ impl ClaudeAdapter {
                                         .as_bytes(),
                                 ),
                             ))
-                        })
-                    {
-                        continue;
-                    }
+                        });
                     if let Some(queued) = QueuedCommand::from_attachment(
                         &value,
                         timestamp,
@@ -717,7 +714,19 @@ impl ClaudeAdapter {
                         // Whether it duplicates another record is decided after the loop, over
                         // the whole file, so a tail slice cannot decide it alone.
                         requires_full_parse_for_tail = true;
-                        queued_commands.push(queued);
+                        if repeated {
+                            // A previous parser may already have stored this replay.
+                            if queued.prompt {
+                                retracted_transcript_lines.push(format_transcript_line(
+                                    "user",
+                                    queued.timestamp,
+                                    queued.message.content(),
+                                ));
+                            }
+                            retracted_messages.push(queued.message);
+                        } else {
+                            queued_commands.push(queued);
+                        }
                     } else if value["attachment"]["type"] != "queued_command" {
                         attachments.read(&value["attachment"], &mut unrecognized);
                     } else {
@@ -5286,6 +5295,66 @@ mod tests {
             parsed.messages[0].provenance.authorship,
             crate::models::MessageAuthorship::Human
         );
+        // A previous parser retained the replay as a second native attachment row.
+        let extra = super::QueuedCommand::from_attachment(
+            &records[2],
+            parsed.messages[0].ts,
+            Some("q1"),
+            0,
+            0,
+        )
+        .unwrap();
+        let mut old = parsed.clone();
+        old.session.parse_version = "claude-v12".into();
+        old.messages
+            .extend(crate::util::to_messages_with_tools_in_scope(
+                vec![extra.message],
+                &parsed.session.id,
+            ));
+        old.messages[1].seq = 1;
+        old.transcript_text = format!(
+            "{}\n\n{}",
+            parsed.transcript_text,
+            crate::util::format_transcript_line(
+                "user",
+                parsed.messages[0].ts,
+                &parsed.messages[0].content
+            )
+        );
+        let pruned = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(
+                    records[..2]
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                &temp.path().join("replay.jsonl"),
+            )
+            .unwrap();
+        let archive = crate::db::Db::open(&temp.path().join("archive.db")).unwrap();
+        archive.upsert_session(&old, 1, 1).unwrap();
+        archive.upsert_session(&pruned, 2, 2).unwrap();
+        assert_eq!(
+            archive.message_count().unwrap(),
+            2,
+            "a pruned replay stays archived"
+        );
+        let db_path = temp.path().join("replay.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.upsert_session(&old, 1, 1).unwrap();
+        for generation in [2, 3] {
+            db.upsert_session(&parsed, generation, generation).unwrap();
+            assert_eq!(db.message_count().unwrap(), 1);
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let transcript: String = conn
+                .query_row("select transcript_text from transcripts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(transcript, parsed.transcript_text);
+        }
     }
 
     /// A queued prompt is indexed once whichever record holds it and in whatever order the
