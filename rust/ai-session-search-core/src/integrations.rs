@@ -21,7 +21,7 @@ use crate::text_file_transaction::{
 };
 #[cfg(test)]
 use crate::text_file_transaction::{execute_text_file_transaction, publish_text_change};
-use crate::util::which;
+use crate::util::{expand_tilde_required as expand_tilde, which};
 // Only the `#[cfg(unix)]` executable-bit branch renders a shell command, so an unconditional
 // import is dead on Windows and warns there while Clippy's `-D warnings` job runs on Linux.
 #[cfg(unix)]
@@ -2751,15 +2751,7 @@ fn instruction_targets_for_layout(
 }
 
 fn instruction_detected(target: &InstructionTarget) -> bool {
-    target.path.exists()
-        || target
-            .detect_paths
-            .iter()
-            .any(|path| path.exists() && path.is_dir())
-        || target
-            .detect_binaries
-            .iter()
-            .any(|binary| which(binary).is_some())
+    client_detected(&target.path, &target.detect_paths, &target.detect_binaries)
 }
 
 fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<SkillTarget> {
@@ -2883,16 +2875,14 @@ fn custom_skill_targets(paths: &[PathBuf]) -> Result<Vec<SkillTarget>> {
         .collect()
 }
 
+fn client_detected(path: &Path, detect_paths: &[PathBuf], detect_binaries: &[&str]) -> bool {
+    path.exists()
+        || detect_paths.iter().any(|path| path.exists() && path.is_dir())
+        || detect_binaries.iter().any(|binary| which(binary).is_some())
+}
+
 fn target_detected(target: &Target) -> bool {
-    target.path.exists()
-        || target
-            .detect_paths
-            .iter()
-            .any(|path| path.exists() && path.is_dir())
-        || target
-            .detect_binaries
-            .iter()
-            .any(|binary| which(binary).is_some())
+    client_detected(&target.path, &target.detect_paths, &target.detect_binaries)
 }
 
 fn custom_instruction_targets(
@@ -6384,14 +6374,6 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(env::current_dir()?.join(path))
     }
-}
-
-/// Expand `~` for an install destination, refusing when no home directory exists.
-///
-/// One definition, shared with skill discovery and scaffolding, so the three places that decide
-/// where a file lands cannot disagree about what `~/skills` means.
-fn expand_tilde(path: &Path) -> Result<PathBuf> {
-    crate::util::expand_tilde_required(path)
 }
 
 fn missing_home_error() -> anyhow::Error {
