@@ -1162,6 +1162,10 @@ pub struct ParsedSession {
 pub(crate) struct RetractedRows {
     pub(crate) messages: Vec<Message>,
     pub(crate) file_edits: Vec<FileEdit>,
+    /// The session-text entries the earlier parser wrote for those records. When an archive keep
+    /// merges stored session text with the parse's, one stored paragraph equal to each of these
+    /// is left out, as `messages` are.
+    pub(crate) transcript: Vec<String>,
 }
 
 impl ParsedSession {

@@ -2630,8 +2630,9 @@ impl Db {
                 stored_transcript
                     .iter()
                     .chain(&prior_transcripts)
-                    .map(String::as_str)
-                    .chain(std::iter::once(parsed.transcript_text.as_str())),
+                    .map(String::as_str),
+                &parsed.transcript_text,
+                &parsed.retracted.transcript,
             );
             if stored_transcript.as_deref() != Some(transcript.as_str()) {
                 upsert_transcript(&tx, &session.id, &transcript)?;
@@ -6914,12 +6915,43 @@ fn widest_session_dates(dates: impl IntoIterator<Item = SessionDates>) -> [Optio
 /// rows themselves are unaffected. The text cannot be rebuilt from the rows instead: providers
 /// write transcript entries only for conversation messages, and Claude's hold only the
 /// human-authored part. O(total bytes) time, O(paragraphs) memory.
-fn merge_transcripts<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
+///
+/// `retracted` holds the entries an earlier parser wrote for records still in the source that
+/// this parser declines (`RetractedRows::transcript`). Each of their paragraphs removes one equal
+/// paragraph from each stored text, as `take_retracted_rows` removes their rows; the stored texts
+/// describe the same source, so each holds its own copy. A paragraph the parse itself holds is
+/// still added from the parse.
+fn merge_transcripts<'a>(
+    stored: impl IntoIterator<Item = &'a str>,
+    parsed: &'a str,
+    retracted: &'a [String],
+) -> String {
+    let paragraphs = |text: &'a str| text.split("\n\n").filter(|paragraph| !paragraph.is_empty());
+    let mut declined: HashMap<&'a str, usize> = HashMap::new();
+    for paragraph in retracted.iter().flat_map(|entry| paragraphs(entry)) {
+        *declined.entry(paragraph).or_default() += 1;
+    }
     let mut held: HashMap<&'a str, usize> = HashMap::new();
     let mut merged = String::new();
-    for text in texts {
+    let texts = stored
+        .into_iter()
+        .map(|text| (text, true))
+        .chain(std::iter::once((parsed, false)));
+    for (text, is_stored) in texts {
         let mut text_counts: HashMap<&'a str, usize> = HashMap::new();
-        for paragraph in text.split("\n\n").filter(|paragraph| !paragraph.is_empty()) {
+        let mut declined_here = if is_stored {
+            declined.clone()
+        } else {
+            HashMap::new()
+        };
+        for paragraph in paragraphs(text) {
+            if let Some(copies) = declined_here
+                .get_mut(paragraph)
+                .filter(|copies| **copies > 0)
+            {
+                *copies -= 1;
+                continue;
+            }
             let seen = text_counts.entry(paragraph).or_default();
             *seen += 1;
             let have = held.entry(paragraph).or_default();
@@ -13228,7 +13260,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(seqs(false), [0, 3]);
-        assert_eq!(seqs(true), [0, 2, 3], "the delivered copy at seq 1 is never read");
+        assert_eq!(
+            seqs(true),
+            [0, 2, 3],
+            "the delivered copy at seq 1 is never read"
+        );
         assert_eq!(db.unattributed_input_count(&filters).unwrap(), 1);
     }
 

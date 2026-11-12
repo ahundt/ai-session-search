@@ -499,6 +499,7 @@ impl ClaudeAdapter {
         let mut retracted_messages = Vec::new();
         let mut retracted_file_edits = Vec::new();
         let mut retracted_file_mutations = PendingFileMutations::default();
+        let mut retracted_transcript_lines = Vec::new();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -780,12 +781,13 @@ impl ClaudeAdapter {
                             );
                         }
                         out.push(raw_message);
-                        if !retract && !transcript_text.is_empty() {
-                            transcript_lines.push(format_transcript_line(
-                                "user",
-                                timestamp,
-                                &transcript_text,
-                            ));
+                        if !transcript_text.is_empty() {
+                            let line = format_transcript_line("user", timestamp, &transcript_text);
+                            if retract {
+                                retracted_transcript_lines.push(line);
+                            } else {
+                                transcript_lines.push(line);
+                            }
                         }
                         continue;
                     }
@@ -851,12 +853,11 @@ impl ClaudeAdapter {
                             event_id,
                         );
                     }
-                    if !retract {
-                        transcript_lines.push(format_transcript_line(
-                            raw_message.role(),
-                            timestamp,
-                            &text,
-                        ));
+                    let line = format_transcript_line(raw_message.role(), timestamp, &text);
+                    if retract {
+                        retracted_transcript_lines.push(line);
+                    } else {
+                        transcript_lines.push(line);
                     }
                     out.push(raw_message);
                 }
@@ -1022,6 +1023,7 @@ impl ClaudeAdapter {
                 evidence,
             ),
             file_edits: retracted_file_edits,
+            transcript: retracted_transcript_lines,
         };
         Ok(ParsedSession {
             session,
@@ -4366,6 +4368,21 @@ mod tests {
         // The index the earlier parser wrote: every declined record's rows stored as well.
         let mut earlier = adapter.parse(&source);
         let declined = std::mem::take(&mut earlier.retracted);
+        // The earlier parser also wrote each declined conversation record into the session text.
+        for message in declined
+            .messages
+            .iter()
+            .filter(|message| message.kind == crate::models::MessageKind::Conversation)
+        {
+            earlier.transcript_text.push_str("\n\n");
+            earlier
+                .transcript_text
+                .push_str(&crate::util::format_transcript_line(
+                    message.role.as_str(),
+                    message.ts,
+                    &message.content,
+                ));
+        }
         earlier.messages.extend(declined.messages);
         for (seq, message) in earlier.messages.iter_mut().enumerate() {
             message.seq = seq as i64;
@@ -4420,6 +4437,27 @@ mod tests {
             assert_eq!(
                 count("select count(*) from messages"),
                 current.messages.len() as i64 + 1
+            );
+            // The session text follows the same rule: the declined records' text leaves, the
+            // archived prompt's text stays.
+            let transcript: String = stored
+                .query_row("select transcript_text from transcripts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(
+                !transcript.contains("while you were working"),
+                "{transcript}"
+            );
+            assert!(!transcript.contains("future record"), "{transcript}");
+            assert!(
+                transcript.contains("an early prompt the harness later pruned"),
+                "{transcript}"
+            );
+            assert_eq!(
+                transcript.matches("Listing them now.").count(),
+                1,
+                "{transcript}"
             );
         }
     }
