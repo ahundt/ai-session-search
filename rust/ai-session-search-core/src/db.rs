@@ -12731,8 +12731,10 @@ mod tests {
             parsed.transcript_text = format!("{} needle-{n} final", "background ".repeat(300));
             db.upsert_session(&parsed, 0, 0).unwrap();
         }
-        let mut scoring = crate::config::ScoringConfig::default();
-        scoring.recency_weight = 0;
+        let scoring = crate::config::ScoringConfig {
+            recency_weight: 0,
+            ..Default::default()
+        };
         let mut filters = SearchFilters::default();
         let all = db.search("needle", &filters, None, &scoring).unwrap();
         assert_eq!(all.len(), 140);

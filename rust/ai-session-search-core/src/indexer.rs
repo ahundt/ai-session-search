@@ -2133,8 +2133,10 @@ mod tests {
         fresh
             .upsert_session(&parsed, source.mtime_ns, source.size_bytes)
             .unwrap();
-        let mut filters = crate::models::MessageFilters::default();
-        filters.session_id = Some(parsed.session.id.clone());
+        let filters = crate::models::MessageFilters {
+            session_id: Some(parsed.session.id.clone()),
+            ..Default::default()
+        };
         let rows = |db: &Db| {
             serde_json::to_value(
                 db.read_session_messages(&filters, crate::db::MessageOrder::OldestFirst)
