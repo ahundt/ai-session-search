@@ -4194,10 +4194,6 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
     // Python, and full receipts reported it as a configured default rather than the call. With
     // no keyword to materialize, a value is present exactly when the caller wrote it, and Codex
     // and VS Code, which delete the keyword before the model sees it, lose nothing.
-    if config.search.purposes.is_empty() {
-        properties.remove("purpose");
-        properties.remove("purpose_version");
-    }
     strip_default_keywords(properties);
 
     extract_shared_char_budget_variant(&mut schema);
@@ -8546,13 +8542,13 @@ mod tests {
     }
 
     #[test]
-    fn search_messages_omits_unconfigured_purposes() {
+    fn search_messages_keeps_published_purpose_parameters_when_unconfigured() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
         let tool = tool_input_schema(&config, "search_messages");
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();
-        assert!(!properties.contains_key("purpose"));
-        assert!(!properties.contains_key("purpose_version"));
+        assert!(properties.contains_key("purpose"));
+        assert!(properties.contains_key("purpose_version"));
         let rejected = call_tool(
             "search_messages",
             json!({"purpose": "missing"}),
