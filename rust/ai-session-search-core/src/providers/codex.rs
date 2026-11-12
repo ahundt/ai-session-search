@@ -219,8 +219,8 @@ impl CodexAdapter {
         let mut first_user = None;
         let mut last_user = None;
         let mut latest_goal: Option<Value> = None;
-        // A fork replays its parent's history between its second `session_meta` and its first
-        // `thread_settings_applied` event; see `ForkReplay`.
+        // A fork replays its parent's history until its first `thread_settings_applied` event;
+        // the parent's `session_meta` is optional. See `ForkReplay`.
         let mut fork_replay = ForkReplay::default();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
@@ -262,6 +262,9 @@ impl CodexAdapter {
                                 .get("forked_from_id")
                                 .and_then(Value::as_str)
                                 .is_some_and(|id| !id.trim().is_empty());
+                            if fork_replay.forked {
+                                fork_replay.start(0, 0, &None, &None);
+                            }
                             let (parent, label) = codex_spawn_origin(payload);
                             session_is_agent |= parent.is_some() || label.is_some();
                             header_spawn_origin = (parent, label);
@@ -1427,12 +1430,9 @@ fn codex_apply_patch_succeeded(output: Option<&Value>) -> bool {
         && text.contains("\nOutput:\nSuccess. Updated the following files:")
 }
 
-/// Read Codex's spawn record out of session metadata as (parent session id, agent label).
-/// `source` is an object in native rollout records and an encoded JSON string in state_5.sqlite;
-/// both carry `{"subagent":{"thread_spawn":...}}` (or a label-only `other` record).
 /// The parent history a forked rollout replays before its own records.
 ///
-/// Codex writes a fork's file as its own `session_meta`, the parent's `session_meta`, a copy of
+/// Codex writes a fork's own `session_meta`, optionally the parent's `session_meta`, a copy of
 /// the parent's records, then the fork's first `event_msg` of type `thread_settings_applied`
 /// and what happened in the fork. The copied rows are kept, so nothing is lost when the parent
 /// file is gone, but marked as mirrors of the parent: they are not the fork's input, analytics
@@ -1443,8 +1443,7 @@ fn codex_apply_patch_succeeded(output: Option<&Value>) -> bool {
 struct ForkReplay {
     /// The file's own `session_meta` names the session it was forked from.
     forked: bool,
-    /// `messages.len()`, `transcript_lines.len()`, and whether a first user prompt was known,
-    /// with the last one, when the parent's `session_meta` was read.
+    /// Start coordinates and first/last-user state to restore when the parent replay closes.
     open: Option<(usize, usize, bool, Option<String>)>,
     /// Replayed `messages` and `transcript_lines` ranges once the fork's own records begin.
     closed: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
@@ -1507,6 +1506,9 @@ impl ForkReplay {
     }
 }
 
+/// Read Codex's spawn record out of session metadata as (parent session id, agent label).
+/// `source` is an object in native rollout records and an encoded JSON string in state_5.sqlite;
+/// both carry `{"subagent":{"thread_spawn":...}}` (or a label-only `other` record).
 fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) {
     let Some(source) = raw_metadata.get("source") else {
         return (None, None);
@@ -2021,6 +2023,59 @@ mod tests {
     /// (on this machine 233 of 233 forks; every user message in that window is in the parent's
     /// file). The replayed rows are kept, so nothing is lost when the parent file is gone, but
     /// as known mirrors: not the fork's input, not its session text, title or preview.
+    #[test]
+    fn fork_without_parent_metadata_marks_replay_only_after_settings_arrive() {
+        use crate::models::MessageRecordRelation;
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("rollout-fork.jsonl");
+        let prefix = [
+            json!({"type":"compacted","payload":{"message":"parent summary"}}),
+            json!({"type":"session_meta","payload":{"id":"fork","forked_from_id":"parent"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"parent prompt"}]}}),
+        ];
+        let adapter = CodexAdapter::new(vec![temp.path().to_path_buf()]);
+        for closed in [false, true] {
+            let mut records = prefix.to_vec();
+            if closed {
+                records
+                    .push(json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}));
+            }
+            records.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fork task"}]}}));
+            fs::write(
+                &file,
+                records
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let parsed = adapter.parse(&adapter.discover()[0]);
+            assert_eq!(parsed.session.provider_session_id, "fork");
+            assert!(
+                parsed.session.parent_session_id.is_none(),
+                "a fork is not a spawned agent"
+            );
+            for message in &parsed.messages {
+                let replay = closed && message.content != "fork task";
+                assert_eq!(
+                    message.provenance.record_relation,
+                    if replay {
+                        MessageRecordRelation::Mirror
+                    } else {
+                        MessageRecordRelation::Original
+                    },
+                    "{closed}: {}",
+                    message.content
+                );
+            }
+            assert_eq!(parsed.transcript_text.contains("parent prompt"), !closed);
+            if closed {
+                assert_eq!(parsed.session.preview_text, "fork task");
+            }
+        }
+    }
+
     #[test]
     fn forked_session_keeps_replayed_parent_history_only_as_mirror_rows() {
         use crate::models::MessageRecordRelation;
