@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {
-  description = "Local-first search, inspection, export, and resume for Claude Code, Codex CLI, and Cursor sessions, with an MCP server for agent-driven recall.";
+  description = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.description;
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

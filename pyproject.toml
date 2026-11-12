@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ai-session-search"
 version = "1.1.0"
-description = "Search, inspect, analyze, export, and recover local AI coding-agent sessions from the CLI, an MCP server, Python, or Rust"
+description = "Search and recover local AI coding-agent session history from Claude Code, Codex, Gemini CLI, Cursor, and five more tools via CLI, MCP server, Python, or Rust"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -13,8 +13,19 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [
     {name = "Andrew Hundt", email = "ATHundt@gmail.com"}
 ]
-keywords = ["claude", "ai-studio", "gemini", "sessions", "analysis", "jsonl", "recovery", "cli", "mcp"]
+keywords = ["claude-code", "codex", "gemini-cli", "cursor", "antigravity", "session-history", "conversation-history", "coding-agent", "search", "mcp", "mcp-server", "transcripts", "recovery", "cli", "sqlite"]
 classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: System :: Recovery Tools",
+    "Typing :: Typed",
+
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
@@ -43,7 +54,7 @@ aise = "ai_session_search.entrypoint:cli_main"
 
 [project.urls]
 Homepage = "https://github.com/ahundt/ai-session-search"
-Documentation = "https://github.com/ahundt/ai-session-search/blob/main/README.md"
+Documentation = "https://github.com/ahundt/ai-session-search/blob/main/docs/README.md"
 Repository = "https://github.com/ahundt/ai-session-search"
 Issues = "https://github.com/ahundt/ai-session-search/issues"
 Changelog = "https://github.com/ahundt/ai-session-search/blob/main/CHANGELOG.md"

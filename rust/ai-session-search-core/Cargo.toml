@@ -3,7 +3,7 @@ name = "ai-session-search"
 version = "1.1.0"
 edition = "2021"
 rust-version.workspace = true
-description = "Search, inspect, analyze, export, and recover local AI coding-agent sessions from the CLI, an MCP server, Python, or Rust"
+description = "Search and recover local AI coding-agent session history from Claude Code, Codex, Gemini CLI, Cursor, and five more tools via CLI, MCP server, Python, or Rust"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -22,8 +22,8 @@ include = [
     "src/**",
     "tests/**",
 ]
-keywords = ["cli", "search", "claude", "codex", "cursor"]
-categories = ["command-line-utilities", "development-tools"]
+keywords = ["claude-code", "codex", "mcp", "history", "coding-agent"]
+categories = ["command-line-utilities", "development-tools", "artificial-intelligence"]
 
 [dependencies]
 anyhow = "1.0"
