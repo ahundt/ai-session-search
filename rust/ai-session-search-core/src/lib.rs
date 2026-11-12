@@ -105,12 +105,46 @@ pub use search_scope::{
 };
 pub use service::SessionSearch;
 pub use service::{AnalysisReceipt, ReceiptedAnalysis};
-pub use skill_catalog::{SkillName, SkillNameSelector, SkillPathSelector, SkillSelector};
+pub use skill_catalog::{SkillName, SkillSelector};
+
+/// Deprecated root name for [`skill_catalog::SkillNameSelector`]. Build selectors with
+/// [`SkillSelector::name`]; the struct itself has no public constructor.
+#[deprecated(since = "1.1.0", note = "use SkillSelector::name")]
+pub type SkillNameSelector = skill_catalog::SkillNameSelector;
+/// Deprecated root name for [`skill_catalog::SkillPathSelector`]. Build selectors with
+/// [`SkillSelector::path`]; the struct itself has no public constructor.
+#[deprecated(since = "1.1.0", note = "use SkillSelector::path")]
+pub type SkillPathSelector = skill_catalog::SkillPathSelector;
+
+// Types a caller passes to or receives from the documented service calls, so a program never
+// imports from the storage, indexer, or configuration modules to name them.
+pub use analytics::RoleStat;
+/// The date and time crate used by every timestamp field (`since`, `until`, `ts`,
+/// `updated_at`), re-exported so a caller builds `chrono::DateTime<chrono::Utc>` values with the
+/// exact version this crate compiles against instead of adding its own `chrono` dependency.
+pub use chrono;
+pub use config::{Config, ConfigOverrides, IndexRefresh, ResolvedConfig, ScoringConfig};
+pub use db::MessageOrder;
+pub use export::{ExportDocument, ExportPublicationReceipt};
+pub use files::{ReconstructedFile, ReconstructedFileVersions, RecoveryPublicationReceipt};
+pub use indexer::{AutoReindexOutcome, ExplicitReindexOutcome};
+pub use inspect::SessionInspection;
+pub use message_search::MessageSearchPlan;
+pub use models::{
+    AnalysisCursor, AnalysisDocumentPage, DiagnosticStatus, FileCrossRef, FileEditSummary,
+    FileVersion, IndexStatus, MessageHit, MessageKind, PlanningCount, Provider, Role,
+    SearchExplain, SearchHit, SessionMeta, SessionRecord,
+};
+pub use service::{
+    AnalysisService, CatalogService, CompactOutcome, ExportService, FileService, IndexService,
+    MaintenanceService, MessageService, SourceService,
+};
 pub use skill_run::{
     CapabilityExecutionSource, MessageClassificationDefinition, MessageClassificationQuery,
     MessageClassificationResult, ResolvedSkillReceipt, SelectedSkillLocation, SkillCapabilityInput,
     SkillCapabilityOutput, SkillRunQuery, SkillRunReport,
 };
+pub use source::ProviderSourceStatus;
 
 /// Execute the canonical CLI after recording that this process entered through the Python binding.
 ///

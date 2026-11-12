@@ -290,6 +290,84 @@ pub fn caller_built_queries(
     Ok((rows, categories))
 }
 
+/// Name every documented service input and result from the crate root alone.
+///
+/// This compiles only while each type is re-exported at the root; no path here reaches into
+/// `config`, `db`, `models`, `files`, `inspect`, `indexer`, `export`, or `source`.
+#[allow(clippy::type_complexity)]
+pub fn root_reexports_name_service_types(
+    app: &SessionSearch,
+) -> ai_session_search::anyhow::Result<(
+    Vec<ai_session_search::SessionRecord>,
+    Vec<ai_session_search::SearchHit>,
+    Vec<ai_session_search::MessageHit>,
+    Option<ai_session_search::SessionInspection>,
+)> {
+    use ai_session_search::chrono::{TimeZone, Utc};
+    use ai_session_search::{
+        AnalysisService, AutoReindexOutcome, CatalogService, CompactOutcome, Config,
+        ConfigOverrides, DiagnosticStatus, ExplicitReindexOutcome, ExportDocument, ExportService,
+        FileCrossRef, FileEditSummary, FileService, FileVersion, IndexRefresh, IndexService,
+        IndexStatus, MaintenanceService, MessageKind, MessageOrder, MessageService, PlanningCount,
+        Provider, ProviderSourceStatus, ReconstructedFile, RecoveryPublicationReceipt,
+        ResolvedConfig, Role, RoleStat, ScoringConfig, SessionMeta, SourceService,
+    };
+    let since = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let _: Option<fn(ConfigOverrides) -> ai_session_search::anyhow::Result<ResolvedConfig>> =
+        Some(Config::resolve);
+    let _: Option<IndexRefresh> = Some(IndexRefresh::BeforeQuery);
+    let _: &ScoringConfig = &app.config().search.scoring;
+    let catalog: CatalogService<'_> = app.catalog();
+    let messages: MessageService<'_> = app.messages();
+    let files: FileService<'_> = app.files();
+    let index: IndexService<'_> = app.index();
+    let _: MaintenanceService<'_> = app.maintenance();
+    let analysis: AnalysisService<'_> = app.analysis();
+    let _: ExportService<'_> = app.exports();
+    let sources: SourceService<'_> = app.sources();
+    let _: Vec<ProviderSourceStatus> = sources.inventory();
+    let _: IndexStatus = index.status()?;
+    type R<T> = ai_session_search::anyhow::Result<T>;
+    let _ = |m: MaintenanceService<'_>| -> R<DiagnosticStatus> { m.diagnostics() };
+    let _ = |m: MaintenanceService<'_>| -> R<CompactOutcome> { m.compact() };
+    let _ = |i: IndexService<'_>| -> R<AutoReindexOutcome> { i.refresh() };
+    let _ = |i: IndexService<'_>| -> R<ExplicitReindexOutcome> { i.reindex_report(false) };
+    let mut filters = SearchFilters::default();
+    filters.provider = Some(Provider::Claude);
+    filters.since = Some(since);
+    filters.limit = 5;
+    let sessions = catalog.list_sessions(&filters)?;
+    let hits = catalog.search_sessions("tests", &filters, None, &app.config().search.scoring)?;
+    let mut message_filters = MessageFilters::default();
+    message_filters.role = Some(Role::User);
+    message_filters.kinds = Some(vec![MessageKind::Conversation]);
+    let mut newest = Vec::new();
+    let mut inspection = None;
+    if let Some(session) = sessions.first() {
+        let mut one_session = message_filters.clone();
+        one_session.session_id = Some(session.id.clone());
+        one_session.limit = 10;
+        newest = messages.read_session(&one_session, MessageOrder::NewestFirst)?;
+        inspection = Some(catalog.inspect(&session.id, InspectionOptions::default())?);
+        let _: std::collections::HashMap<String, SessionMeta> =
+            messages.session_metadata(std::slice::from_ref(&session.id))?;
+        let _: ExportDocument = app
+            .exports()
+            .render_full(&session.id, ExportFormat::Markdown)?;
+    }
+    let _: Vec<FileEditSummary> = files.search(&FileQuery::default())?;
+    let _: Vec<FileCrossRef> = files.cross_reference(&FileQuery::default())?;
+    let q = FileQuery::default();
+    let _ = |f: FileService<'_>| -> R<Vec<FileVersion>> { f.history("a.py", &q) };
+    let _ = |f: FileService<'_>| -> R<ReconstructedFile> { f.reconstruct("a.py", &q, None) };
+    let _ = |f: FileService<'_>, to: &std::path::Path| -> R<RecoveryPublicationReceipt> {
+        f.publish_versions("a.py", &q, to)
+    };
+    let _: Vec<PlanningCount> = analysis.planning(&message_filters, &[])?;
+    let _: Vec<RoleStat> = analysis.role_statistics(&message_filters)?;
+    Ok((sessions, hits, newest, inspection))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +564,17 @@ mod tests {
         missing.index.refresh = ai_session_search::config::IndexRefresh::ExistingOnly;
         let error = SessionSearch::open(missing).err().unwrap();
         assert_eq!(service_error(&error).code(), "index-missing");
+    }
+
+    #[test]
+    fn root_reexports_reach_every_service_on_an_indexed_fixture() {
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+        let (sessions, hits, newest, inspection) = root_reexports_name_service_types(&app).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(hits.len(), 2);
+        assert!(!newest.is_empty() && newest.len() <= 10);
+        assert!(inspection.is_some());
     }
 }
 
