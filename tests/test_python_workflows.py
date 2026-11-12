@@ -258,9 +258,15 @@ def test_structured_search_hits_include_timestamp(corpus):
     response = corpus.search_messages("forgot")
     assert response.results[0]["timestamp"] == "2026-01-15T12:00:00Z"
     assert response.to_dict() == cli(corpus, "messages", "search", "forgot", "--format", "json")
-    with sqlite3.connect(corpus.db_path) as db:
+    database = corpus.db_path
+    corpus.close()
+    with sqlite3.connect(database) as db:
         db.execute("UPDATE messages SET ts = NULL")
-    assert all(row["timestamp"] is None for row in corpus.search_messages("forgot").results)
+    db.close()
+    with aise.SessionSearch(database, index_refresh="existing-only") as reopened:
+        updated = reopened.search_messages("forgot")
+        assert all(row["timestamp"] is None for row in updated.results)
+        assert updated.to_dict() == cli(reopened, "messages", "search", "forgot", "--format", "json")
 
 
 @pytest.mark.integration
