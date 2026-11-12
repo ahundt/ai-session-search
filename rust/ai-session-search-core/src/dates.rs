@@ -149,6 +149,12 @@ impl DateRange {
 
 /// Parse one token to a single bound (start or end of its period), reading input without an
 /// offset or zone in UTC.
+/// Compatibility UTC bound parser; work and allocation follow the date expression length.
+#[deprecated(
+    since = "1.1.0",
+    note = "use DateRange::resolve and pass the result to CatalogService or MessageService"
+)]
+#[allow(deprecated)] // The bound compatibility adapter delegates to the retained span parser.
 pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     let (start, end) = parse_span(input, now)?;
     Ok(if bound == Bound::Start { start } else { end })
@@ -157,6 +163,11 @@ pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<Date
 /// Parse one token to its full `(start, end)` instant span, reading input without an offset or
 /// zone in UTC. An EDTF open interval such as `2026-01/..` has no span and is an error here;
 /// [`DateRange`] accepts it as an unbounded side.
+/// Compatibility UTC span parser; work and allocation follow the date expression length.
+#[deprecated(
+    since = "1.1.0",
+    note = "use DateRange::resolve and pass the result to CatalogService or MessageService"
+)]
 pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     match period(input, &zoned(now, &TimeZone::UTC)?)? {
         (Some(start), Some(end)) => Ok((start, end)),

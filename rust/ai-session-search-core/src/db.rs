@@ -1444,6 +1444,7 @@ impl Db {
         self.promote_compatibility()
     }
 
+    #[allow(deprecated)] // Keep pre-FTS index compatibility behind the service path.
     fn init_layout(&self) -> Result<()> {
         self.conn.execute_batch(
             "
@@ -1825,6 +1826,7 @@ impl Db {
     /// direct-scan (`id > base_max`). This makes the one-time parallel build lazy — paid on first
     /// regex use, never by `list`/`show`/`paths`/`resume` — and keeps incremental reindex free of
     /// trigram work (no triggers): new messages just accumulate in the delta until a rebuild.
+    #[allow(deprecated)] // Keep pre-FTS index compatibility behind the service path.
     pub(crate) fn ensure_trigram_base(&self) -> Result<i64> {
         anyhow::ensure!(
             self.schema_version()? < 4,
@@ -1868,6 +1870,7 @@ impl Db {
         Ok(base_max)
     }
 
+    #[allow(deprecated)] // Keep pre-FTS index compatibility behind the service path.
     fn rebuild_trigram_base_with_writer_lock(&self) -> Result<TrigramRebuild> {
         self.with_immediate_transaction(|| {
             let schema_compatible = crate::trigram_index::schema_is_compatible(&self.conn)?;
@@ -2129,6 +2132,11 @@ impl Db {
     /// which is a durable archive (it never deletes sessions whose source files were
     /// removed). This is the deliberate "start over" reset for embedders / corruption
     /// recovery; the user-facing equivalent is deleting the index file.
+    /// Delete the entire archive in one transaction; work scales with all indexed rows and derived indexes.
+    #[deprecated(
+        since = "1.1.0",
+        note = "no service deletes the archive; IndexService::reindex_report refreshes while preserving history"
+    )]
     pub fn clear_all(&self) -> Result<()> {
         // One transaction so an interruption (or a failing statement) leaves the index either fully
         // cleared or fully intact — never a logically inconsistent mix such as sessions carrying a
@@ -2162,6 +2170,11 @@ impl Db {
         })
     }
 
+    /// Check stored source freshness with one O(log files) indexed lookup and constant retained state.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use IndexService::prepare_for_read for coordinated freshness checks"
+    )]
     pub fn is_file_current(
         &self,
         provider: Provider,
@@ -2348,6 +2361,12 @@ impl Db {
     ///   and the index is the archive. Rows only the parse holds are added, and the session's
     ///   text, date span and message count then describe both. A message counts as held when
     ///   the parse has one with the same role and text.
+    ///
+    /// Compatibility full-parse persistence; reconciliation scans stored and parsed session rows and text.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use IndexService::reindex_report for coordinated parser upgrades"
+    )]
     pub fn replace_session(
         &self,
         parsed: &ParsedSession,
@@ -2937,6 +2956,11 @@ impl Db {
     /// `count(*) from messages_fts` reflects the `messages` content table even when
     /// the token index is empty; `_docsize` holds one row per indexed document and is
     /// the value that can actually assert trigger/rebuild sync (== `message_count`).
+    /// Count indexed FTS rows; SQLite scans O(indexed messages) rows with constant Rust state.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use MaintenanceService::diagnostics for index health"
+    )]
     pub fn messages_fts_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -4469,6 +4493,7 @@ impl Db {
     /// caller's literal/regex verifier remains authoritative. Returning `(false, explain)` is
     /// still correct: it means either no usable anchor exists or the structured filters already
     /// made a direct scan cheaper than intersecting the whole-corpus trigram index.
+    #[allow(deprecated)] // Keep pre-FTS index compatibility behind the service path.
     fn prepare_content_prefilter(
         &self,
         pattern: Option<&str>,
@@ -4583,6 +4608,11 @@ impl Db {
     /// Prefer [`Db::search_messages_with_explain`] when the caller also needs results so the query
     /// runs only once. This method deliberately shares every field/mode/schema branch with search;
     /// it never invokes a second legacy-only planner.
+    /// Build the legacy message-search planner receipt; cost follows filtered corpus statistics.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use MessageService::plan or MessageService::search with a receipt level"
+    )]
     pub fn explain_message_search(
         &self,
         query: &str,
@@ -5360,6 +5390,11 @@ impl Db {
     /// Results are ordered by `(session_id, seq, id)`, the id keeping several edits made by one
     /// message in source order, so callers can number versions per session and replay deltas
     /// deterministically.
+    /// Compatibility raw edit lookup; retains all matching edit payloads in stable session and source order.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use FileService::history or FileService::reconstruct for typed recovery"
+    )]
     pub fn file_edits_for(
         &self,
         file: &str,
@@ -5385,6 +5420,11 @@ impl Db {
         self.file_edits_for_scoped(file, query)
     }
 
+    /// Load all matching edit payloads for an exact canonical session ID in source order.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use FileService::history with a session-scoped FileQuery"
+    )]
     pub fn file_edits_for_session_id(
         &self,
         file: &str,
@@ -5475,6 +5515,11 @@ impl Db {
     }
 
     /// Total persisted file-edit rows. Basis for migration detection and tests.
+    /// Count raw file edits with O(edits) SQLite work and constant Rust state.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use FileService::search for typed file summaries"
+    )]
     pub fn file_edit_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -6081,6 +6126,11 @@ impl Db {
         })
     }
 
+    /// Count sessions grouped by provider, scanning O(sessions) rows and retaining O(providers) counts.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use CatalogService::list_sessions and group its typed provider rows"
+    )]
     pub fn counts_by_provider(&self) -> Result<HashMap<String, i64>> {
         let mut stmt = self
             .conn

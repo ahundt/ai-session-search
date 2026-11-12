@@ -1306,6 +1306,12 @@ fn is_slash_command(text: &str) -> bool {
 /// rows, assigning sequence numbers and normalizing roles via [`classify_role`].
 /// Use [`to_messages_with_tools`] when a provider can name the tool behind a
 /// [`Role::Tool`] message.
+/// Compatibility tuple normalization; scans and retains O(message bytes).
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns provider normalization"
+)]
+#[allow(deprecated)] // The tuple compatibility adapter delegates to the retained normalizer.
 pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Message> {
     let raw: Vec<LegacyRawMessage> = raw
         .into_iter()
@@ -1317,6 +1323,10 @@ pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Mes
 /// Compact adapter input for provider formats that expose only role, text, timestamp, and an
 /// optional tool name. [`to_messages_with_tools`] converts this shape immediately to
 /// [`RawMessage`], so role/kind normalization remains provider-neutral and has one implementation.
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns provider normalization"
+)]
 pub type LegacyRawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
 
 /// Provider evidence before role normalization and sequence assignment.
@@ -1517,6 +1527,7 @@ impl RawMessage {
     }
 }
 
+#[allow(deprecated)] // Preserve conversion from the deprecated tuple alias.
 impl From<LegacyRawMessage> for RawMessage {
     fn from((role, content, ts, tool_name): LegacyRawMessage) -> Self {
         Self {
@@ -1608,6 +1619,11 @@ pub fn tool_call_message_content(tool_name: &str, args: Value) -> String {
 /// [`Role::Tool`] message came from (e.g. `"Bash"`, `"ls"`, `"apply_patch"`). The name is
 /// stored only as supplied; role classification still derives from the role/text so a
 /// non-tool message with an incidental name is unaffected.
+/// Compatibility provider normalization; scans and retains O(message bytes).
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns provider normalization"
+)]
 pub fn to_messages_with_tools<T>(raw: Vec<T>) -> Vec<Message>
 where
     T: Into<RawMessage>,
@@ -1620,6 +1636,11 @@ where
 /// This stays `O(M)` time and `O(M)` output for `M` messages, with `O(1)` extra state beyond the
 /// returned rows. Binding at finalization handles providers whose true session ID is discovered
 /// after earlier records without synthesizing message identity from sequence, timestamps, or text.
+/// Compatibility provider normalization with session identity; retains O(message bytes).
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns scoped provider normalization"
+)]
 pub fn to_messages_with_tools_in_scope<T>(raw: Vec<T>, scope: &str) -> Vec<Message>
 where
     T: Into<RawMessage>,

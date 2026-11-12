@@ -4,6 +4,9 @@
 //! Phase 1 keystone integration tests: the `messages` table is populated during
 //! reindex, is idempotent, and a malformed session never panics the reindex.
 
+// Exercise retained low-level storage and tail-parser compatibility guarantees.
+#![allow(deprecated)]
+
 use std::path::Path;
 
 use ai_session_search::config::Config;

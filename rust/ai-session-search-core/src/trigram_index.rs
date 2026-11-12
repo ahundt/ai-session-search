@@ -27,6 +27,9 @@
 //! delta-encoded varints (the same compact form FTS5 uses internally); `trigram_meta(key, value)`
 //! holds `base_max_id`.
 
+// Compatibility implementation for pre-FTS indexes and the deprecated public functions.
+#![allow(deprecated)]
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -37,6 +40,11 @@ use crate::runtime::ExecutionRuntime;
 type Posting = (String, Vec<i64>);
 
 /// Create the index tables if absent. Safe to call repeatedly (used by `Db::init` and [`build`]).
+/// Performs fixed schema DDL; SQLite may allocate storage when creating the tables.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for index preparation and MessageService::search for verified queries"
+)]
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "create table if not exists trigram_postings (
@@ -55,6 +63,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 /// SQLite failures. Callers may safely rebuild the former, while lock, I/O, and database-level
 /// corruption errors must continue to propagate instead of being misclassified as disposable
 /// index metadata.
+/// Reads a fixed set of table-column metadata and retains those column descriptions.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for index preparation and MessageService::search for verified queries"
+)]
 pub fn schema_is_compatible(conn: &Connection) -> Result<bool> {
     fn has_required_columns(
         conn: &Connection,
@@ -98,6 +111,11 @@ pub fn schema_is_compatible(conn: &Connection) -> Result<bool> {
 }
 
 /// Highest message id covered by the base index (`0` if never built).
+/// Reads one metadata row after the fixed schema check, retaining constant Rust state.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for index preparation and MessageService::search for verified queries"
+)]
 pub fn base_max_id(conn: &Connection) -> Result<i64> {
     ensure_schema(conn)?;
     // `.optional()` maps only "no row yet" (legitimate empty state) to `None`; any other
@@ -126,6 +144,11 @@ pub fn base_max_id(conn: &Connection) -> Result<i64> {
 /// Memory: holds message content + the in-RAM postings map transiently (~content size + ~postings
 /// size). For very large corpora this trades memory for build speed; a future refinement could
 /// shard the trigram space across passes to bound peak memory.
+/// Materializes all message bytes and postings; posting aggregation and sorting dominate the work.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for index preparation and MessageService::search for verified queries"
+)]
 pub fn build(conn: &Connection, runtime: &ExecutionRuntime) -> Result<i64> {
     ensure_schema(conn)?;
     let (base_max, postings) = build_postings_from_messages(conn, runtime)?;
@@ -137,6 +160,11 @@ pub fn build(conn: &Connection, runtime: &ExecutionRuntime) -> Result<i64> {
 
 /// Build inside a transaction already opened by the caller. Used when the caller must hold an
 /// immediate SQLite writer lock before the expensive parallel tokenization starts.
+/// Materializes all message bytes and postings; the caller retains its writer transaction.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for index preparation and MessageService::search for verified queries"
+)]
 pub fn build_in_current_transaction(conn: &Connection, runtime: &ExecutionRuntime) -> Result<i64> {
     ensure_schema(conn)?;
     let (base_max, postings) = build_postings_from_messages(conn, runtime)?;
@@ -180,6 +208,11 @@ fn write_postings(conn: &Connection, base_max: i64, postings: &[Posting]) -> Res
 /// [`crate::trigram::trigram_prefilter_groups`]): within a group every trigram's postings are
 /// intersected (AND); across groups the results are unioned (OR). Only ids ≤ `base_max_id` are
 /// returned (that is all the base covers); the caller adds the delta (`ids > base_max_id`).
+/// Reads the requested postings and retains their candidate ID sets; worst case covers every indexed ID.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for index preparation and MessageService::search for verified queries"
+)]
 pub fn candidates(conn: &Connection, groups: &[Vec<String>]) -> Result<HashSet<i64>> {
     let mut stmt = conn.prepare("select ids from trigram_postings where tg = ?1")?;
     let mut result: HashSet<i64> = HashSet::new();

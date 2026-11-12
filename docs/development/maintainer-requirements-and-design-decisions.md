@@ -809,6 +809,14 @@ after printing, so they were never usable as a library and had no caller outside
 `DateRange` and `DbSchemaArgs` stay public because `DbCmd::Schema` and the Python bindings hold
 them; narrowing those would cascade through the public command enums for no gain.
 
+The remaining public CLI adapters (`files::run`, `messages::run`, `skills::run`, and
+`DbQueryArgs::resolve`) are externally callable: clap's `FromArgMatches` constructs their
+non-exhaustive argument types. They remain deprecated compatibility paths in 1.1.0, with typed
+service alternatives named in their notes. Internal dispatch uses crate-private adapters.
+Skill row `cells` methods implement the public `render::Row` trait; Rust cannot narrow their
+visibility independently. Their row types remain available with deprecation notes instead.
+The consumer crate exercises these paths and compile-checks the internal dispatch boundary.
+
 Recorded 2026-11-01, the same coupling as `anyhow` above and wider: `clap` itself. Every provider,
 role, kind, mode, format and selector enum the CLI takes as a value derives `ValueEnum`, and the
 subcommand and argument structs derive `Subcommand` and `Args`, so a `clap` 5.0 breaks this

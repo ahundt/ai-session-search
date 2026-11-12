@@ -2497,11 +2497,21 @@ impl MessageSearchResponse {
         &self.hits
     }
 
+    /// Consume legacy hit storage without cloning; dropping unused context costs O(context bytes).
+    #[deprecated(
+        since = "1.1.0",
+        note = "use MessageService::search and MessageSearchResponse::results"
+    )]
     pub fn into_hits(self) -> Vec<MessageSearchHit> {
         self.hits
     }
 
     /// Consume returned rows without cloning their potentially large content strings.
+    /// Consume hit and context allocations without cloning; remaining response metadata is dropped.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use MessageService::search and borrow results and context_windows"
+    )]
     pub fn into_rows(self) -> (Vec<MessageSearchHit>, Vec<Vec<crate::models::MessageHit>>) {
         (self.hits, self.context_windows)
     }

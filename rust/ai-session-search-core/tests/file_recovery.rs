@@ -5,6 +5,9 @@
 //! extracted during reindex, persisted to `file_edits`, queryable (search/history/
 //! cross-ref), idempotent, and replayable into reconstructed historical content.
 
+// Raw edit assertions preserve low-level recovery compatibility alongside the service tests.
+#![allow(deprecated)]
+
 use std::path::Path;
 
 use ai_session_search::config::Config;

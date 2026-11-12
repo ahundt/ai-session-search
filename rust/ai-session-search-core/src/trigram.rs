@@ -145,6 +145,11 @@ fn consider_more_selective(
 /// a candidate set built from the others would miss that pattern's matches. (Note: `corrections`
 /// no longer uses this — it scans the small `role='user'` slice directly; see `Db::find_corrections`
 /// — but this stays as a general public utility for multi-pattern prefiltering over a wide corpus.)
+/// Compile and retain safe prefilters for every supplied regex; output grows with all required terms.
+#[deprecated(
+    since = "1.1.0",
+    note = "use MessageService::search with MessageQuery::regex for verified results"
+)]
 pub fn trigram_prefilter_all<I, S>(patterns: I) -> Option<String>
 where
     I: IntoIterator<Item = S>,

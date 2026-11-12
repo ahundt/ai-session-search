@@ -614,6 +614,11 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
 ];
 
 /// The recorded `(bytes, depth)` ceiling for one tool, or `None` when nothing is watching it.
+/// Look up a tool ceiling by scanning the fixed emitted-artifact ledger with constant auxiliary space.
+#[deprecated(
+    since = "1.1.0",
+    note = "use mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command"
+)]
 pub fn ceiling_for(tool: &str) -> Option<(usize, usize)> {
     EMITTED_ARTIFACT_CEILINGS
         .iter()
@@ -850,6 +855,11 @@ pub fn codex_measured_bytes(value: &Value) -> usize {
 /// survives, which nothing here asks about.
 // ponytail: models pass 1 only; extend to the later passes if a caller needs to know which
 // structure survives a breach rather than whether the prose does.
+/// Model description stripping by serializing the schema, using O(schema bytes) time and memory.
+#[deprecated(
+    since = "1.1.0",
+    note = "use mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command"
+)]
 pub fn codex_strips_descriptions(value: &Value) -> bool {
     codex_measured_bytes(value) > CODEX_COMPACT_TOOL_SCHEMA_BYTES
 }
@@ -1596,6 +1606,10 @@ pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> 
 /// Collapsing any two of them reports a validator cost as a model-context cost, or a wire byte as
 /// a token. The last three need a `tools/call` fixture, so a catalogue reports them with a status
 /// rather than with a zero that would read as a saving.
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for the schema-budget stage ledger; mcp_schema_budget::evaluate_all evaluates catalogue limits"
+)]
 pub const LEDGER_STAGES: [&str; 9] = [
     "raw_catalogue",
     "jsonrpc_catalogue_envelope",

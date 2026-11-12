@@ -1,4 +1,6 @@
 #![recursion_limit = "256"]
+// Unit tests retain coverage of deprecated storage/provider compatibility paths.
+#![cfg_attr(test, allow(deprecated))]
 // SPDX-FileCopyrightText: 2026 Andrew Hundt
 // SPDX-License-Identifier: Apache-2.0
 

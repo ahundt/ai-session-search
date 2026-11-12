@@ -26,6 +26,38 @@
 //! }
 //! ```
 
+//! CLI dispatch adapters are crate-private; public compatibility wrappers remain callable.
+//! ```compile_fail
+//! let _ = ai_session_search::files::run_command;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::messages::run_command;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::skills::run_with_harness_home;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::sql_query::run_command;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::analytics::run_vocab;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::analytics::run_repeats;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::analytics::run_stats;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::analytics::run_planning;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::mcp_schema_budget::run;
+//! ```
+//! ```compile_fail
+//! let _ = ai_session_search::sql_query::schema_path;
+//! ```
+
 use ai_session_search::sql_query::{QueryResult, ResolvedDbQueryArgs};
 use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
@@ -1174,6 +1206,44 @@ mod tests {
             .parse::<MessageSearchInclude>()
             .unwrap_err()
             .contains("accepted values"));
+    }
+    #[test]
+    #[allow(deprecated)] // Preserve callable compatibility paths while steering new consumers to services.
+    fn compatibility_storage_and_provider_helpers_remain_callable() {
+        use ai_session_search::{db::Db, message_search::MessageSearchResponse, util};
+        let _ = Db::counts_by_provider;
+        let _ = Db::clear_all;
+        let _ = Db::is_file_current;
+        let _ = Db::replace_session;
+        let _ = Db::messages_fts_count;
+        let _ = Db::explain_message_search;
+        let _ = Db::file_edits_for;
+        let _ = Db::file_edits_for_session_id;
+        let _ = Db::file_edit_count;
+        let _ = ai_session_search::MessageSearchBatch::into_parts;
+        let _ = MessageSearchResponse::into_hits;
+        let _ = MessageSearchResponse::into_rows;
+        let _ = util::to_messages;
+        let _ = util::to_messages_with_tools::<util::RawMessage>;
+        let _ = util::to_messages_with_tools_in_scope::<util::RawMessage>;
+        let _ = ai_session_search::indexer::auto_reindex;
+        let _ = ai_session_search::dates::parse_bound;
+        let _ = ai_session_search::dates::parse_span;
+        let _ = ai_session_search::search_scope::EffectiveAccessScope::is_unrestricted;
+        let _ = ai_session_search::search_scope::EffectiveAccessScope::allows_workspace_path;
+        let _ = ai_session_search::mcp_schema_budget::LEDGER_STAGES;
+        let _ = ai_session_search::mcp_schema_budget::ceiling_for;
+        let _ = ai_session_search::mcp_schema_budget::codex_strips_descriptions;
+        let _ = ai_session_search::trigram_index::ensure_schema;
+        let _ = ai_session_search::trigram_index::schema_is_compatible;
+        let _ = ai_session_search::trigram_index::base_max_id;
+        let _ = ai_session_search::trigram_index::build;
+        let _ = ai_session_search::trigram_index::build_in_current_transaction;
+        let _ = ai_session_search::trigram_index::candidates;
+        assert_eq!(
+            ai_session_search::trigram::trigram_prefilter_all(["needle"]),
+            Some("(\"dle\" AND \"edl\" AND \"eed\" AND \"nee\")".into())
+        );
     }
 }
 

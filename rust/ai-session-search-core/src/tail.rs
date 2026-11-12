@@ -170,6 +170,11 @@ pub(crate) enum TailParseRun {
 /// Returns `Ok(None)` when no new COMPLETE line has been appended yet (only a partial, still-
 /// being-written line) — the caller should skip the file, there is nothing new to index. The
 /// caller is responsible for the truncation / fingerprint preconditions BEFORE calling this.
+/// Compatibility tail parser; reads O(appended bytes) plus fixed overlap, retaining the parsed tail.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for guarded incremental parsing"
+)]
 pub fn tail_parse<F>(
     path: &Path,
     checkpoint_offset: i64,

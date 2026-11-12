@@ -62,6 +62,11 @@ impl MessageSearchBatch {
         })
     }
 
+    /// Consume a batch without cloning its payload; constant-time moves retain all three owned allocations.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use MessageService::search, or borrow batch results, context_windows, and included"
+    )]
     pub fn into_parts(
         self,
     ) -> (

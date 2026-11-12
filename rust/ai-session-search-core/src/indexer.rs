@@ -408,6 +408,11 @@ pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>)
     IndexCoordinator::new(config).with_elected_writer(|_permit| f())
 }
 
+/// Run a coordinated legacy auto-refresh; cost follows the discovered files and changed transcript bytes.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::prepare_for_read or IndexService::refresh"
+)]
 pub fn auto_reindex(
     config: &Config,
     db: &Db,

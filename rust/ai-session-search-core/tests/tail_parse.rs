@@ -8,6 +8,9 @@
 //! in the SAME state as a full reindex of the final file. The fast path is a pure optimization;
 //! on truncation or a rewritten head it must fall back to a full parse.
 
+// Exercise retained low-level storage and tail-parser compatibility guarantees.
+#![allow(deprecated)]
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
