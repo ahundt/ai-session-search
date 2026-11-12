@@ -151,6 +151,12 @@ impl UnrecognizedRecordTypes {
 /// `queue-operation` enqueue or a `user` record of the same file is not added again: each indexed
 /// copy of a text absorbs one attachment of that text, in file order, by the same
 /// `strip_command_markup`-then-trim content digest the queue identity uses.
+///
+/// An enqueue records only that something was queued, not who sent it. When an enqueue's row
+/// absorbs an attachment, the row takes the attachment's evidence: `commandMode == "prompt"`
+/// with an `origin` gives the row that origin's authorship (`human` for a person), a prompt
+/// without `origin` leaves the sender unknown, and any other mode makes the row a harness notice.
+/// A `user` record that absorbs an attachment keeps its own record's evidence.
 struct QueuedCommand {
     /// `messages.len()` and `transcript_lines.len()` when the attachment was read, so the row
     /// keeps its place in file order.
@@ -161,6 +167,8 @@ struct QueuedCommand {
     /// typed prompt (task notifications, and peer or coordinator messages without a mode) and
     /// becomes a harness notice.
     prompt: bool,
+    /// The sender named by `attachment.origin`, absent when the attachment names none.
+    semantics: Option<ClaudeNativeMessageSemantics>,
     timestamp: Option<DateTime<Utc>>,
     message: RawMessage,
 }
@@ -188,13 +196,10 @@ impl QueuedCommand {
             return None;
         }
         let digest = sha256(content.as_bytes());
+        // The sender is `attachment.origin`, the same field the SDK sets on a user record.
+        let semantics = claude_native_message_semantics(attachment);
         let mut message = if is_prompt {
-            // The sender is `attachment.origin`, the same field the SDK sets on a user record.
-            queued_input_message(
-                content,
-                timestamp,
-                claude_native_message_semantics(attachment),
-            )
+            queued_input_message(content, timestamp, semantics)
         } else {
             RawMessage::harness_notice(content, timestamp)
         };
@@ -207,14 +212,20 @@ impl QueuedCommand {
             transcript_position,
             digest,
             prompt: is_prompt,
+            semantics,
             timestamp,
             message,
         })
     }
 
-    /// Insert every queued command no other record of the file already indexed, in file order.
+    /// Give each indexed copy of a queued text its attachment's evidence, and insert every
+    /// queued command no other record of the file already indexed, in file order.
+    ///
+    /// `enqueued` maps the position in `messages` of each row built from a `queue-operation`
+    /// enqueue to its line in `transcript_lines`.
     fn place(
         queued: Vec<Self>,
+        enqueued: &HashMap<usize, usize>,
         messages: &mut Vec<RawMessage>,
         transcript_lines: &mut Vec<String>,
         created_at: &mut Option<DateTime<Utc>>,
@@ -225,22 +236,40 @@ impl QueuedCommand {
         }
         // Harness notices are stored with role `user`, so a notice already indexed from a
         // `user` record also absorbs its attachment copy.
-        let mut indexed: HashMap<String, usize> = HashMap::new();
-        for message in messages.iter().filter(|message| message.role() == "user") {
-            *indexed
-                .entry(sha256(message.content().trim().as_bytes()))
-                .or_default() += 1;
+        let mut indexed: HashMap<String, std::collections::VecDeque<usize>> = HashMap::new();
+        for (position, message) in messages.iter().enumerate() {
+            if message.role() == "user" {
+                indexed
+                    .entry(sha256(message.content().trim().as_bytes()))
+                    .or_default()
+                    .push_back(position);
+            }
         }
-        let kept: Vec<Self> = queued
-            .into_iter()
-            .filter(|queued| match indexed.get_mut(&queued.digest) {
-                Some(copies) if *copies > 0 => {
-                    *copies -= 1;
-                    false
-                }
-                _ => true,
-            })
-            .collect();
+        let mut retired_lines = false;
+        let mut kept: Vec<Self> = Vec::new();
+        for queued in queued {
+            let Some(position) = indexed
+                .get_mut(&queued.digest)
+                .and_then(std::collections::VecDeque::pop_front)
+            else {
+                kept.push(queued);
+                continue;
+            };
+            let Some(&line) = enqueued.get(&position) else {
+                continue;
+            };
+            let row = &mut messages[position];
+            row.fill_missing_ts(queued.timestamp);
+            if !queued.prompt {
+                row.retag_harness_notice();
+                // Harness notices are not conversation, so they leave the session transcript.
+                transcript_lines[line].clear();
+                retired_lines = true;
+            } else if let Some(semantics) = queued.semantics {
+                row.set_authorship(semantics.content_authorship.into());
+            }
+        }
+
         // Back to front, so each recorded position still names the place it was read at.
         for queued in kept.into_iter().rev() {
             if queued.prompt {
@@ -252,6 +281,11 @@ impl QueuedCommand {
                 );
             }
             messages.insert(queued.position, queued.message);
+        }
+        if retired_lines {
+            // Formatted transcript lines are never empty, so only the retired ones go. Removed
+            // after the insertions above, whose recorded positions count every line.
+            transcript_lines.retain(|line| !line.is_empty());
         }
     }
 }
@@ -458,6 +492,8 @@ impl ClaudeAdapter {
         // Queued prompts recorded only as attachments, placed after the loop once every
         // conversation and queue record of the file is known; see `QueuedCommand`.
         let mut queued_commands: Vec<QueuedCommand> = Vec::new();
+        // Position in `messages` of each enqueue's row -> its line in `transcript_lines`.
+        let mut enqueued: HashMap<usize, usize> = HashMap::new();
         let mut unrecognized = UnrecognizedRecordTypes::default();
         // What earlier parsers made of the records this one declines; see `RetractedRows`.
         let mut retracted_messages = Vec::new();
@@ -607,9 +643,16 @@ impl ClaudeAdapter {
                                         },
                                     );
                                 }
+                                // A notification the harness queued is not input, the same rule a
+                                // `user` record of that text follows.
+                                if is_harness_notice(&value, &content) {
+                                    raw_message.retag_harness_notice();
+                                } else {
+                                    enqueued.insert(messages.len(), transcript_lines.len());
+                                    transcript_lines
+                                        .push(format_transcript_line("user", timestamp, &content));
+                                }
                                 messages.push(raw_message);
-                                transcript_lines
-                                    .push(format_transcript_line("user", timestamp, &content));
                             }
                         }
                     }
@@ -823,6 +866,7 @@ impl ClaudeAdapter {
 
         QueuedCommand::place(
             queued_commands,
+            &enqueued,
             &mut messages,
             &mut transcript_lines,
             &mut created_at,
@@ -2154,7 +2198,7 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
 mod tests {
     use super::{is_harness_notice, should_skip_message, ClaudeAdapter};
     use crate::models::Provider;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tempfile::tempdir;
 
     // These four cases were previously asserted against `should_skip_message`, i.e. that the
@@ -4458,5 +4502,190 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
         assert_eq!(metadata["requires_full_parse_for_tail"], json!(true));
+    }
+
+    /// A `queue-operation` enqueue says only that something was queued. The `queued_command`
+    /// attachment Claude Code writes when it delivers that text says who sent it
+    /// (`origin.kind`) and whether it is a typed prompt or a harness notification
+    /// (`commandMode`). The one row for each queued text carries that evidence; a text with no
+    /// attachment keeps an unknown sender, and the message text is never used to guess one.
+    #[test]
+    fn queued_command_evidence_decides_the_authorship_of_the_queued_row() {
+        use crate::models::{MessageAuthorship, MessageInputOrigin, MessageKind};
+
+        let enqueue = |time: &str, content: &str| {
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":"q",
+                "timestamp":time,"content":content})
+            .to_string()
+        };
+        let attachment = |uuid: &str, time: &str, prompt: &str, mode: &str, origin: Value| {
+            let mut attachment =
+                json!({"type":"queued_command","prompt":prompt,"commandMode":mode});
+            if !origin.is_null() {
+                attachment["origin"] = origin;
+            }
+            json!({"type":"attachment","uuid":uuid,"timestamp":time,"sessionId":"q",
+                "attachment":attachment})
+            .to_string()
+        };
+        let lines = [
+            enqueue("2026-11-01T00:00:01Z", "typed by the person"),
+            enqueue("2026-11-01T00:00:02Z", "sender not recorded"),
+            enqueue("2026-11-01T00:00:03Z", "Background task finished"),
+            enqueue("2026-11-01T00:00:04Z", "attachment without origin"),
+            // Older Claude Code wrote no attachment; a notification is still recognised by the
+            // envelope the harness wraps it in, as for a `user` record.
+            enqueue(
+                "2026-11-01T00:00:05Z",
+                "<task-notification><task-id>t</task-id></task-notification>",
+            ),
+            attachment(
+                "q-1",
+                "2026-11-01T00:00:11Z",
+                "typed by the person",
+                "prompt",
+                json!({"kind":"human"}),
+            ),
+            attachment(
+                "q-3",
+                "2026-11-01T00:00:13Z",
+                "Background task finished",
+                "task-notification",
+                Value::Null,
+            ),
+            attachment(
+                "q-4",
+                "2026-11-01T00:00:14Z",
+                "attachment without origin",
+                "prompt",
+                Value::Null,
+            ),
+        ]
+        .join("\n");
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(lines),
+                std::path::Path::new("/tmp/q.jsonl"),
+            )
+            .unwrap();
+        let rows: Vec<_> = parsed
+            .messages
+            .iter()
+            .map(|m| {
+                (
+                    m.content.as_str(),
+                    m.kind,
+                    m.provenance.authorship,
+                    m.provenance.input_origin,
+                    m.ts.map(crate::util::stored_timestamp),
+                )
+            })
+            .collect();
+        let at = |second: u32| Some(format!("2026-11-01T00:00:{second:02}+00:00"));
+        assert_eq!(
+            rows,
+            [
+                (
+                    "typed by the person",
+                    MessageKind::Conversation,
+                    MessageAuthorship::Human,
+                    Some(MessageInputOrigin::Queued),
+                    at(1),
+                ),
+                (
+                    "sender not recorded",
+                    MessageKind::Conversation,
+                    MessageAuthorship::Unknown,
+                    Some(MessageInputOrigin::Queued),
+                    at(2),
+                ),
+                (
+                    "Background task finished",
+                    MessageKind::HarnessNotice,
+                    MessageAuthorship::Harness,
+                    None,
+                    at(3),
+                ),
+                (
+                    "attachment without origin",
+                    MessageKind::Conversation,
+                    MessageAuthorship::Unknown,
+                    Some(MessageInputOrigin::Queued),
+                    at(4),
+                ),
+                (
+                    "<task-notification><task-id>t</task-id></task-notification>",
+                    MessageKind::HarnessNotice,
+                    MessageAuthorship::Harness,
+                    None,
+                    at(5),
+                ),
+            ]
+        );
+        assert!(!parsed.transcript_text.contains("Background task finished"));
+        assert!(parsed.transcript_text.contains("typed by the person"));
+    }
+
+    /// An index written before the attachment evidence was read holds each queued row with an
+    /// unknown sender. Reindexing updates those rows in place: no second copy, no lost row.
+    #[test]
+    fn reindex_gives_stored_queued_rows_their_attachment_evidence_in_place() {
+        let temp = tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("cafe0003-cafe-cafe-cafe-000000000001.jsonl");
+        let session = "cafe0003-cafe-cafe-cafe-000000000001";
+        let enqueues = [
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":session,
+                "timestamp":"2026-11-01T00:00:01Z","content":"typed by the person"}),
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":session,
+                "timestamp":"2026-11-01T00:00:02Z","content":"Background task finished"}),
+        ]
+        .map(|value| value.to_string())
+        .join("\n");
+        let attachments = [
+            json!({"type":"attachment","uuid":"q-1","timestamp":"2026-11-01T00:00:03Z",
+                "sessionId":session,"attachment":{"type":"queued_command",
+                "prompt":"typed by the person","commandMode":"prompt","origin":{"kind":"human"}}}),
+            json!({"type":"attachment","uuid":"q-2","timestamp":"2026-11-01T00:00:04Z",
+                "sessionId":session,"attachment":{"type":"queued_command",
+                "prompt":"Background task finished","commandMode":"task-notification"}}),
+        ]
+        .map(|value| value.to_string())
+        .join("\n");
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        std::fs::write(&path, &enqueues).unwrap();
+        let mut earlier = adapter.parse(&adapter.discover().remove(0));
+        earlier.session.parse_version = "claude-v10".into();
+        let db_path = temp.path().join("index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.upsert_session(&earlier, 1, 1).unwrap();
+
+        std::fs::write(&path, format!("{enqueues}\n{attachments}")).unwrap();
+        let current = adapter.parse(&adapter.discover().remove(0));
+        db.upsert_session(&current, 2, 2).unwrap();
+        let stored = rusqlite::Connection::open(&db_path).unwrap();
+        let rows: Vec<(String, String, String)> = stored
+            .prepare("select content, kind, authorship from messages order by seq")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "typed by the person".into(),
+                    "conversation".into(),
+                    "human".into()
+                ),
+                (
+                    "Background task finished".into(),
+                    "harness_notice".into(),
+                    "harness".into()
+                ),
+            ]
+        );
     }
 }

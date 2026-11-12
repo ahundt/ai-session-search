@@ -1488,6 +1488,26 @@ impl RawMessage {
         self
     }
 
+    /// Re-tag a row as a harness notice once later provider evidence shows the harness wrote it.
+    /// Content, time and identity stay; authorship becomes `Harness` and input provenance clears,
+    /// as for a row built by [`RawMessage::harness_notice`].
+    pub(crate) fn retag_harness_notice(&mut self) {
+        self.kind = Some(MessageKind::HarnessNotice);
+        self.authorship_override = None;
+        self.provenance.input_origin = None;
+        self.provenance.input_delivery_state = None;
+    }
+
+    /// Replace the authorship with provider evidence found after the row was built.
+    pub(crate) fn set_authorship(&mut self, authorship: MessageAuthorship) {
+        self.authorship_override = Some(authorship);
+    }
+
+    /// Use `ts` only when the row has no time of its own.
+    pub(crate) fn fill_missing_ts(&mut self, ts: Option<DateTime<Utc>>) {
+        self.ts = self.ts.or(ts);
+    }
+
     pub fn role(&self) -> &str {
         &self.role
     }
@@ -2007,8 +2027,8 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v10",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v10",
+        Provider::Claude => "claude-v11",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v11",
         Provider::Codex => "codex-v8",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v4",
