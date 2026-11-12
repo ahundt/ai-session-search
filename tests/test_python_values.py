@@ -70,3 +70,16 @@ def test_package_root_exports_all_native_result_types():
         if inspect.isclass(value):
             assert getattr(package, name, None) is value, name
             assert name in package.__all__
+
+
+def test_public_native_functions_and_types_have_runtime_help():
+    missing = []
+    for name in native.__all__:
+        value = getattr(native, name)
+        if callable(value) and not value.__doc__:
+            missing.append(name)
+        if inspect.isclass(value):
+            for method, member in vars(value).items():
+                if not method.startswith("_") and callable(member) and not member.__doc__:
+                    missing.append(f"{name}.{method}")
+    assert not missing, missing

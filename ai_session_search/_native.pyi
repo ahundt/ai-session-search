@@ -434,8 +434,10 @@ class AnalysisPublicationPlan:
     def destination(self) -> Path: ...
     @property
     def formats(self) -> list[Literal["json", "markdown"]]: ...
-    def render(self, analysis: ReceiptedAnalysis) -> list[AnalysisArtifact]: ...
-    def publish(self, analysis: ReceiptedAnalysis) -> AnalysisPublicationReceipt: ...
+    def render(self, analysis: ReceiptedAnalysis) -> list[AnalysisArtifact]:
+        """Render the requested analysis artifacts in memory without writing files. Use publish to create the immutable bundle."""
+    def publish(self, analysis: ReceiptedAnalysis) -> AnalysisPublicationReceipt:
+        """Publish one immutable analysis bundle and return its receipt. The destination must not exist; an existing bundle is preserved and raises AlreadyExistsError."""
 
 @final
 class SessionGraphNode:
@@ -1240,7 +1242,7 @@ class MessageSearchRequest:
 
 @final
 class AnalysisQuery:
-    """Session scope and maximum document count for aggregate analysis operations."""
+    """Scope and maximum returned aggregate rows for planning and role_statistics; 50 by default, 0 for all."""
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-ready dictionary using structured-output field names."""
@@ -1766,6 +1768,13 @@ class CompactOutcome:
 
 @final
 class SessionSearch:
+    """Rust-backed search, recovery, export, and analysis service.
+
+    Opening loads configuration and the database, not transcripts. Call refresh() or
+    prepare_for_read() before a first read; index_refresh="existing-only" requires an existing
+    index. Session IDs accept canonical IDs or unique prefixes. Use close() or a with block
+    to release the connection; independent iterators own their own resources.
+    """
     def close(self) -> None:
         """Release the connection and owned workers; repeated calls are safe."""
     def __enter__(self) -> Self: ...
@@ -1785,11 +1794,6 @@ class SessionSearch:
     def transcript(self, session_id: str, *, lines: int = 0) -> dict[str, Any]:
         """Read first N (positive), last N (negative), or all (0) transcript lines."""
 
-    """Rust-backed search, recovery, export, and analysis service.
-
-    Methods accepting ``session_id`` accept a canonical provider-qualified ID or a unique ID
-    prefix. Ambiguous prefixes fail with the matching canonical IDs instead of selecting one.
-    """
     def __new__(
         cls,
         db_path: _PathInput | None = None,
@@ -1911,50 +1915,59 @@ class SessionSearch:
         self,
         pattern: _PathInput | None = None,
         request: FileQuery | None = None,
-    ) -> list[FileEditSummary]: ...
+    ) -> list[FileEditSummary]:
+        """List edited files matching a filename or glob pattern, with edit/session counts and last edit time. Omit the pattern for every file. FileQuery supplies scope and paging; its default limit=0 returns all matches."""
     def file_history(
         self,
         file: _PathInput,
         request: FileQuery | None = None,
-    ) -> list[FileVersion]: ...
+    ) -> list[FileVersion]:
+        """Return recorded versions of a file in stable session/version order. FileQuery narrows the source sessions and dates; limit=0 returns all versions, and offset skips versions."""
     def cross_reference_files(
         self,
         pattern: _PathInput | None = None,
         request: FileQuery | None = None,
-    ) -> list[FileCrossRef]: ...
+    ) -> list[FileCrossRef]:
+        """Count edits per file and session for a filename or glob pattern. FileQuery applies scope and paging; an omitted pattern selects every file."""
     def reconstruct_file(
         self,
         file: _PathInput,
         *,
         version: int | None = None,
         request: FileQuery | None = None,
-    ) -> ReconstructedFile: ...
+    ) -> ReconstructedFile:
+        """Replay recorded writes and edits and return complete file content in memory. version is 1-based; None selects the latest version. If the file matches several sessions, pass FileQuery(session_id=...) to select one. This call writes no file; use the result restore(output_dir=...) to publish a copy."""
     def reconstruct_file_versions(
         self,
         file: _PathInput,
         *,
         request: FileQuery | None = None,
-    ) -> ReconstructedFileVersions: ...
+    ) -> ReconstructedFileVersions:
+        """Iterate reconstructable historical versions of one file without writing them. If several sessions match, select one with FileQuery(session_id=...). The iterator owns its selected rows and does not hold the parent service lock while consumed."""
     def publish_file_versions(
         self,
         file: _PathInput,
         destination: _PathInput,
         *,
         request: FileQuery | None = None,
-    ) -> RecoveryPublicationReceipt: ...
+    ) -> RecoveryPublicationReceipt:
+        """Write reconstructable file versions to a new immutable destination directory and return paths and hashes. The destination must not exist; an existing directory is preserved and raises AlreadyExistsError. FileQuery selects the source session and history."""
     def export_session(
         self,
         session_id: str,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
-    ) -> ExportDocument: ...
+    ) -> ExportDocument:
+        """Render one complete session as markdown, json, or text and return an ExportDocument in memory. session_id accepts a canonical ID or unique prefix. This call writes no file."""
     def export_sessions(
         self,
         destination: _PathInput,
         request: SessionQuery | None = None,
         *,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
-    ) -> ExportPublicationReceipt: ...
-    def source_inventory(self) -> list[ProviderSourceStatus]: ...
+    ) -> ExportPublicationReceipt:
+        """Publish selected sessions to a new destination as json or text and return a receipt. The destination must not exist. SessionQuery supplies filters; its historical export default is 50 sessions, and an explicit limit=0 selects all."""
+    def source_inventory(self) -> list[ProviderSourceStatus]:
+        """Return configured provider roots, discovered file counts and non-fatal traversal warnings. Disabled providers are reported without scanning their transcript roots."""
     def analysis_documents(
         self,
         request: SessionQuery | None = None,
@@ -1991,16 +2004,23 @@ class SessionSearch:
         self,
         request: AnalysisQuery | None = None,
         command_patterns: list[str] | None = None,
-    ) -> list[PlanningCount]: ...
+    ) -> list[PlanningCount]:
+        """Count recorded slash commands with occurrence, distinct-session and distinct-project totals. AnalysisQuery supplies scope and a returned-row limit (50 by default, 0 for all). command_patterns adds Rust regex filters to the configured planning_commands patterns."""
     def role_statistics(
         self,
         request: AnalysisQuery | None = None,
-    ) -> list[RoleStat]: ...
-    def refresh(self) -> RefreshOutcome: ...
-    def index_status(self) -> IndexStatus: ...
-    def reindex(self, *, full: bool = False) -> ReindexOutcome: ...
-    def diagnostics(self) -> DiagnosticStatus: ...
-    def compact(self) -> CompactOutcome: ...
+    ) -> list[RoleStat]:
+        """Count indexed messages by their normalized storage role, in role order. AnalysisQuery supplies scope and a returned-row limit (50 by default, 0 for all)."""
+    def refresh(self) -> RefreshOutcome:
+        """Attempt an opportunistic incremental index refresh and return status, counts and a skip reason. A recent refresh or a busy writer can skip work. Use reindex() for a synchronous pass that waits for the writer lock."""
+    def index_status(self) -> IndexStatus:
+        """Return snapshot readiness, parser/schema freshness, indexed/current/stale session counts and applicable repair commands. diagnostics() also reports provider discovery and resume-tool availability."""
+    def reindex(self, *, full: bool = False) -> ReindexOutcome:
+        """Reindex enabled sources synchronously and return file/session counts and discovery warnings. full=False reads new or changed transcripts; full=True reparses every discoverable transcript. This call waits for the writer lock."""
+    def diagnostics(self) -> DiagnosticStatus:
+        """Return index health plus provider roots, discovery warnings, parser freshness and resume-tool availability, as aise doctor does."""
+    def compact(self) -> CompactOutcome:
+        """Merge full-text segments, VACUUM the index and truncate its WAL. Return exact before_bytes, after_bytes and reclaimed_bytes. Requires a writable compatible index."""
 
 class NotFoundError(RuntimeError):
     """The requested session, file, or existing index was not found."""

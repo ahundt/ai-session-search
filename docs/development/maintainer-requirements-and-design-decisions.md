@@ -762,7 +762,7 @@ whether to retire them is the maintainer's call because it removes a public tool
 Partly answered in 1.1.0: `CatalogService::resume_command` computes the command once at the
 shared typed layer as `ResumeCommand {session_id, argv, cwd, unavailable_reason}`, and `aise
 resume` and `get_resume_command` render it. Whether `get_session`, `aise show`, and the Python
-`SessionRecord` carry it is still open, as is the Python method.
+`SessionRecord` carry it is still open. Python exposes the service through `resume_command(id)`.
 
 Recorded 2026-10-31 before 1.0.0 froze the surface: **what the public Rust API exposes.**
 
@@ -781,8 +781,7 @@ directly from `cli.rs` through 1.0.0. In 1.1.0 both run through `AnalysisService
 json` keeps its bare array of groups; `--report` prints the report object, which carries the
 unattributed-input count. The Rust vocabulary call refuses under an `allowed-roots` access scope
 because full-text term counts span every session; `aise vocab` still reads them under every scope,
-which is the remaining gap to decide. Neither has an MCP tool or a Python method yet; adding them
-stays additive.
+which is the remaining gap to decide. Python `vocabulary()` and `repeats()` call those services. Neither has an MCP analytics tool.
 
 Read-only SQL goes through `SqlService` (`SessionSearch::sql`), which applies the `allowed-roots`
 refusal itself; `sql_query::run`, which took a path and skipped it, is deprecated. A library

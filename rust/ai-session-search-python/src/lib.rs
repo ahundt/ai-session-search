@@ -1323,6 +1323,7 @@ python_value! { NativeAnalysisPublicationPlan, slf => value_fields(slf.as_any(),
             .collect()
     }
 
+    #[doc = "Render the requested analysis artifacts in memory without writing files. Use publish to create the immutable bundle."]
     fn render(
         &self,
         py: Python<'_>,
@@ -1337,6 +1338,7 @@ python_value! { NativeAnalysisPublicationPlan, slf => value_fields(slf.as_any(),
             .collect()
     }
 
+    #[doc = "Publish one immutable analysis bundle and return its receipt. The destination must not exist; an existing bundle is preserved and raises AlreadyExistsError."]
     fn publish(
         &self,
         py: Python<'_>,
@@ -2525,7 +2527,8 @@ impl QueryExclusions {
 }
 
 #[derive(Clone)]
-/// Session list/search filters; limit=0 explicitly selects every matching session.
+/// Session list/search filters; an omitted limit follows search.default_limit, and 0 selects all.
+/// offset skips sessions in the existing list or ranked order. Accept flat filters or QueryScope.
 /// `current_repo` overrides repository-aware ranking; omission honors `prefer_current_repo` and
 /// derives the repository from the process working directory when search runs.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
@@ -3454,7 +3457,7 @@ impl MessageSearchRequest {
 }
 
 #[derive(Clone)]
-/// Session scope and maximum document count for aggregate analysis operations.
+/// Scope and maximum returned aggregate rows for planning and role_statistics; 50 by default, 0 for all.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct AnalysisQuery {
     scope: QueryScope,
@@ -4615,15 +4618,17 @@ impl From<CompactOutcome> for NativeCompactOutcome {
 
 /// Rust-backed search, recovery, export, and analysis service.
 ///
-/// Methods accepting `session_id` accept a canonical provider-qualified ID or a unique ID prefix.
-/// Ambiguous prefixes fail with the matching canonical IDs instead of selecting one.
-///
-/// `frozen` because every method takes `&self` and the state is already behind a `Mutex`.
-/// Without it PyO3 wraps the object in a `RefCell`, and concurrent Python threads are safe only
-/// for as long as nobody adds a `&mut self` method — at which point overlapping calls start
-/// raising `RuntimeError: Already borrowed` at run time, on whichever thread loses. Frozen turns
-/// that into a compile error and removes the interior mutability there was nothing to contend
-/// for.
+/// Opening loads configuration and the database, not transcripts. Call refresh() or
+/// prepare_for_read() before a first read; index_refresh="existing-only" requires an existing
+/// index. Session IDs accept canonical IDs or unique prefixes. Use close() or a with block
+/// to release the connection; independent iterators own their own resources.
+
+// `frozen` because every method takes `&self` and the state is already behind a `Mutex`.
+// Without it PyO3 wraps the object in a `RefCell`, and concurrent Python threads are safe only
+// for as long as nobody adds a `&mut self` method — at which point overlapping calls start
+// raising `RuntimeError: Already borrowed` at run time, on whichever thread loses. Frozen turns
+// that into a compile error and removes the interior mutability there was nothing to contend
+// for.
 #[pyclass(module = "ai_session_search._native", frozen)]
 struct SessionSearch {
     inner: Mutex<Option<CoreSessionSearch>>,
@@ -5199,6 +5204,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (session_id, *, preview_chars=None, summary_items=None, include_time_profile=false))]
+    #[doc = "Return compact evidence; positive items select first, negative last, and zero all. preview_chars defaults to 220; summary_items defaults to the last 12 evidence records. include_time_profile adds message counts and timestamp/gap facts."]
     fn inspect_session(
         &self,
         py: Python<'_>,
@@ -5306,6 +5312,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (pattern=None, request=None))]
+    #[doc = "List edited files matching a filename or glob pattern, with edit/session counts and last edit time. Omit the pattern for every file. FileQuery supplies scope and paging; its default limit=0 returns all matches."]
     fn search_files(
         &self,
         py: Python<'_>,
@@ -5323,6 +5330,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (file, request=None))]
+    #[doc = "Return recorded versions of a file in stable session/version order. FileQuery narrows the source sessions and dates; limit=0 returns all versions, and offset skips versions."]
     fn file_history(
         &self,
         py: Python<'_>,
@@ -5340,6 +5348,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (pattern=None, request=None))]
+    #[doc = "Count edits per file and session for a filename or glob pattern. FileQuery applies scope and paging; an omitted pattern selects every file."]
     fn cross_reference_files(
         &self,
         py: Python<'_>,
@@ -5362,6 +5371,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (file, *, version=None, request=None))]
+    #[doc = "Replay recorded writes and edits and return complete file content in memory. version is 1-based; None selects the latest version. If the file matches several sessions, pass FileQuery(session_id=...) to select one. This call writes no file; use the result restore(output_dir=...) to publish a copy."]
     fn reconstruct_file(
         &self,
         py: Python<'_>,
@@ -5387,6 +5397,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (file, *, request=None))]
+    #[doc = "Iterate reconstructable historical versions of one file without writing them. If several sessions match, select one with FileQuery(session_id=...). The iterator owns its selected rows and does not hold the parent service lock while consumed."]
     fn reconstruct_file_versions(
         &self,
         py: Python<'_>,
@@ -5404,6 +5415,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (file, destination, *, request=None))]
+    #[doc = "Write reconstructable file versions to a new immutable destination directory and return paths and hashes. The destination must not exist; an existing directory is preserved and raises AlreadyExistsError. FileQuery selects the source session and history."]
     fn publish_file_versions(
         &self,
         py: Python<'_>,
@@ -5426,6 +5438,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (session_id, format="markdown"))]
+    #[doc = "Render one complete session as markdown, json, or text and return an ExportDocument in memory. session_id accepts a canonical ID or unique prefix. This call writes no file."]
     fn export_session(
         &self,
         py: Python<'_>,
@@ -5445,6 +5458,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (destination, request=None, *, format="markdown"))]
+    #[doc = "Publish selected sessions to a new destination as json or text and return a receipt. The destination must not exist. SessionQuery supplies filters; its historical export default is 50 sessions, and an explicit limit=0 selects all."]
     fn export_sessions(
         &self,
         py: Python<'_>,
@@ -5467,6 +5481,7 @@ impl SessionSearch {
         })
     }
 
+    #[doc = "Return configured provider roots, discovered file counts and non-fatal traversal warnings. Disabled providers are reported without scanning their transcript roots."]
     fn source_inventory(&self, py: Python<'_>) -> PyResult<Vec<NativeProviderSourceStatus>> {
         py.detach(|| {
             let app = self.app()?;
@@ -5531,6 +5546,7 @@ impl SessionSearch {
         })
     }
 
+    #[doc = "Execute one deterministic skill capability.\n\nSelected ``aise-capability.toml`` documents share a 1 MiB aggregate parsing\nsafety ceiling. Exceeding it raises an actionable error with byte counts;\nrules and results are never truncated to fit."]
     fn run_skill(
         &self,
         py: Python<'_>,
@@ -5545,6 +5561,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (request=None, command_patterns=None))]
+    #[doc = "Count recorded slash commands with occurrence, distinct-session and distinct-project totals. AnalysisQuery supplies scope and a returned-row limit (50 by default, 0 for all). command_patterns adds Rust regex filters to the configured planning_commands patterns."]
     fn planning(
         &self,
         py: Python<'_>,
@@ -5562,6 +5579,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (request=None))]
+    #[doc = "Count indexed messages by their normalized storage role, in role order. AnalysisQuery supplies scope and a returned-row limit (50 by default, 0 for all)."]
     fn role_statistics(
         &self,
         py: Python<'_>,
@@ -5577,6 +5595,7 @@ impl SessionSearch {
         })
     }
 
+    #[doc = "Attempt an opportunistic incremental index refresh and return status, counts and a skip reason. A recent refresh or a busy writer can skip work. Use reindex() for a synchronous pass that waits for the writer lock."]
     fn refresh(&self, py: Python<'_>) -> PyResult<RefreshOutcome> {
         py.detach(|| {
             let app = self.app()?;
@@ -5587,6 +5606,7 @@ impl SessionSearch {
         })
     }
 
+    #[doc = "Return snapshot readiness, parser/schema freshness, indexed/current/stale session counts and applicable repair commands. diagnostics() also reports provider discovery and resume-tool availability."]
     fn index_status(&self, py: Python<'_>) -> PyResult<NativeIndexStatus> {
         py.detach(|| {
             let app = self.app()?;
@@ -5598,6 +5618,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (*, full=false))]
+    #[doc = "Reindex enabled sources synchronously and return file/session counts and discovery warnings. full=False reads new or changed transcripts; full=True reparses every discoverable transcript. This call waits for the writer lock."]
     fn reindex(&self, py: Python<'_>, full: bool) -> PyResult<NativeReindexOutcome> {
         py.detach(|| {
             let app = self.app()?;
@@ -5616,6 +5637,7 @@ impl SessionSearch {
         })
     }
 
+    #[doc = "Return index health plus provider roots, discovery warnings, parser freshness and resume-tool availability, as aise doctor does."]
     fn diagnostics(&self, py: Python<'_>) -> PyResult<NativeDiagnosticStatus> {
         py.detach(|| {
             let app = self.app()?;
@@ -5635,6 +5657,7 @@ impl SessionSearch {
         })
     }
 
+    #[doc = "Merge full-text segments, VACUUM the index and truncate its WAL. Return exact before_bytes, after_bytes and reclaimed_bytes. Requires a writable compatible index."]
     fn compact(&self, py: Python<'_>) -> PyResult<NativeCompactOutcome> {
         py.detach(|| {
             let app = self.app()?;

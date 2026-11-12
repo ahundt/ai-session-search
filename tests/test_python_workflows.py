@@ -4,10 +4,12 @@
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from datetime import UTC
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -395,3 +397,35 @@ def test_detail_vocabulary_is_shared_and_legacy_spelling_is_deprecated(corpus):
     catalogue = cli(corpus, "mcp", "schema-budget", "--catalogue")
     tool = next(tool for tool in catalogue if tool["name"] == "get_session")
     assert tool["inputSchema"]["properties"]["response_format"]["description"].startswith("Deprecated: use detail")
+
+
+def test_library_guide_runs_each_of_the_five_purposes(corpus, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    guide = (Path(__file__).resolve().parents[1] / "docs/development/library-api.md").read_text()
+    section = guide.split("## Python", 1)[1].split("## Rust", 1)[0]
+    examples = re.findall(r"```python\n(.*?)```", section, re.DOTALL)
+    assert len(examples) == 5
+    monkeypatch.setenv("AI_SESSION_SEARCH_DATABASE", str(corpus.db_path))
+    monkeypatch.chdir(tmp_path)
+    namespace: dict[str, Any] = {}
+    for number, example in enumerate(examples):
+        exec(compile(example, f"library-api.md:python-example-{number + 1}", "exec"), namespace)
+    assert namespace["sessions"]
+    assert namespace["message_page"].results
+    assert namespace["recent_messages"]
+    assert namespace["restored_path"].read_text() == "print(42)"
+    assert namespace["corrections"]
+    assert namespace["repeat_report"]["groups"]
+
+
+def test_signed_windows_keep_head_tail_or_all(corpus):
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute("INSERT INTO transcripts (session_id, transcript_text) VALUES ('claude:synthetic-0', 'head\nmiddle\ntail')")
+        db.execute("UPDATE messages SET content = 'head\nmiddle\ntail' WHERE session_id = 'claude:synthetic-0' AND seq = 0")
+    for count, expected in [(1, "head"), (-1, "tail"), (0, "head\nmiddle\ntail")]:
+        assert corpus.transcript("synthetic-0", lines=count)["text"] == expected
+        assert corpus.read_session_messages("synthetic-0", seq_from=0, seq_to=0, lines_per_message=count)[0].content == expected
+    first = corpus.inspect_session("synthetic-0", summary_items=1).user_intent
+    last = corpus.inspect_session("synthetic-0", summary_items=-1).user_intent
+    assert len(first) == len(last) == 1
+    assert first[0].seq == 0 and last[0].seq == 2
+    assert len(corpus.inspect_session("synthetic-0", summary_items=0).user_intent) == 3

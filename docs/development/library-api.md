@@ -12,6 +12,97 @@ the [configuration guide](configuration.md).
 
 ## Python
 
+Call `refresh()` before the first read: opening an index does not read transcripts. These five
+examples run in order, sharing one service. Replace the search text and file pattern for your
+history. If no sessions match, the later session-specific blocks skip their reads.
+
+### Find a session
+
+```python
+import ai_session_search as aise
+
+search = aise.SessionSearch(index_refresh="auto")
+search.refresh()
+sessions = search.search_sessions("retry", aise.SessionQuery(limit=5))
+for hit in sessions:
+    print(hit.session.id, hit.session.title)
+```
+
+To browse by directory instead, use `list_sessions(SessionQuery(path_prefix=..., limit=5))`.
+An omitted session limit follows `[search].default_limit`; an explicit 0 returns every session.
+
+### Find a message
+
+```python
+scope = aise.QueryScope(session_id=sessions[0].session.id if sessions else None)
+message_page = search.search_messages(
+    r"(?i)you forgot|you missed",
+    aise.MessageSearchRequest(scope=scope, role="user", query_mode="regex", limit=5, context=1),
+)
+for hit in message_page.results:
+    print(hit["message_ref"], hit["timestamp"], hit["presentation"]["field_view"]["text"])
+print(message_page.page["next_offset"])
+```
+
+The response is not itself iterable: iterate `results`. Context is under each hit's
+`context.messages_before` and `context.messages_after`. Continue a finite page by passing its
+`page.next_offset` as the next request's `offset` while `page.has_more` is true. Literal mode is
+the default; fuzzy mode requires a positive finite limit.
+
+### Read a session
+
+```python
+recent_messages = []
+if sessions:
+    recent_messages = search.read_session_messages(sessions[0].session.id, order="newest", limit=10)
+    for message in recent_messages:
+        print(message.seq, message.timestamp, message.content)
+```
+
+`newest` selects the last N records and returns them chronologically. Use `seq_from`/`seq_to`
+for inclusive ranges, or `message_context(id, seq, context_before=1, context_after=3)` around one
+turn. `transcript(id, lines=-20)` reads the text tail; positive lines keeps the head and 0 all.
+
+### Recover a file
+
+```python
+from pathlib import Path
+
+edited_files = search.search_files("*.py")
+if edited_files:
+    file_path = edited_files[0].file_path
+    history = search.file_history(file_path)
+    source = aise.FileQuery(session_id=history[0].session_id)
+    recovered = search.reconstruct_file(file_path, version=history[0].version, request=source)
+    restored_path = recovered.restore(output_dir=Path("recovered"))
+    print(restored_path)
+```
+
+Choose the version you need from `history`. Reconstruction returns content in memory;
+`restore()` explicitly writes a collision-safe copy. Selecting a source session disambiguates a
+file edited in several sessions. `publish_file_versions(file, destination, request=source)`
+writes an immutable bundle of reconstructable versions to a new directory.
+
+### Analyse corrections and repeated phrases
+
+```python
+corrections = search.classify_messages(skill="corrections", include_unattributed_input=True)
+repeat_report = search.repeats(max_groups=10, include_unattributed_input=True)
+for correction in corrections:
+    print(correction.session_id, correction.message_seq, correction.category)
+for group in repeat_report["groups"]:
+    print(group["repeat"], group["matches"], group["examples"])
+search.close()
+```
+
+Use `run_skill(SkillRunQuery(...))` for the full classification report and policy receipts.
+`vocabulary(prefix="retry", limit=5)` reports term counts. `query_sql("SELECT COUNT(*) AS n FROM sessions")` returns read-only rows plus paging facts, with the configured SQL restrictions.
+`resume_command(id)` returns native argv without launching a provider. `index_status()` reports
+`parser_health.indexed_sessions` and `readiness.snapshot_availability`; `diagnostics()` adds
+provider discovery and resume-tool health. `source_inventory()` lists configured transcript roots.
+
+### Requests, results, and defaults
+
 For historical user input across storage roles, pass `role="user"` to
 `MessageSearchRequest`. This selects recorded prompts, queued submissions and linked answer
 regions; omit the role to search complete content. Known parent-agent prompts sent to spawned
@@ -55,59 +146,6 @@ generated gaps.
 pool. Query objects are immutable mirrors of the Rust request types, so one you
 build is safe to reuse.
 
-```python
-import ai_session_search as aise
-
-search = aise.SessionSearch()
-search.refresh()
-
-# Session and file queries share QueryScope; message search takes MessageScope, whose
-# workspace and provider fields are plural and message-specific.
-scope = aise.QueryScope(
-    provider="codex",
-    path_prefix="/path/to/project",
-    dates=aise.DateRange(when="7d"),
-)
-message_scope = aise.MessageScope(
-    providers=["codex"],
-    workspace_path_prefix="/path/to/project",
-    dates=aise.DateRange(when="7d"),
-)
-
-sessions = search.list_sessions(
-    aise.SessionQuery(
-        provider="codex",
-        dates=aise.DateRange(when="2026-01"),
-        limit=20,
-    ),
-)
-messages = search.search_messages(
-    "authentication",
-    aise.MessageSearchRequest(
-        scope=message_scope,
-        role="user",
-        include_compaction=False,
-        limit=50,
-    ),
-)
-files = search.search_files(
-    "*.py",
-    aise.FileQuery(scope=scope, min_edits=3, limit=50),
-)
-history_page = search.file_history(
-    "src/app.py",
-    aise.FileQuery(scope=scope, limit=50, offset=0),
-)
-
-if sessions:
-    evidence = search.inspect_session(
-        sessions[0].id,
-        include_time_profile=True,
-    )
-    markdown = search.export_session(sessions[0].id, "markdown")
-
-status = search.index_status()
-```
 
 Opening a service does not read transcript files. Call `refresh()` or `prepare_for_read()`
 before a first query. To require an existing index, pass
