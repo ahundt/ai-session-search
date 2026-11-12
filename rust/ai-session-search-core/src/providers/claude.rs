@@ -669,6 +669,7 @@ impl ClaudeAdapter {
                 claude_subagent_sidecar_path(path)
             };
             files.push(SourceFile {
+                sidecar: None,
                 provider: source_kind.provider(),
                 path: entry.path,
                 mtime_ns: mtime_ns(&entry.metadata),
@@ -2571,6 +2572,11 @@ fn mtime_ns(metadata: &fs::Metadata) -> i64 {
 fn fold_sidecar(source: &mut SourceFile, sidecar: &Path) -> Option<ProviderPathWarning> {
     match sidecar.metadata() {
         Ok(metadata) => {
+            source.sidecar = Some(crate::models::SourceSidecar {
+                path: sidecar.to_path_buf(),
+                mtime_ns: mtime_ns(&metadata),
+                size_bytes: metadata.len() as i64,
+            });
             source.mtime_ns = source.mtime_ns.max(mtime_ns(&metadata));
             source.size_bytes = source.size_bytes.saturating_add(metadata.len() as i64);
             None
@@ -2581,6 +2587,21 @@ fn fold_sidecar(source: &mut SourceFile, sidecar: &Path) -> Option<ProviderPathW
             operation: "read_sidecar",
             message: error.to_string(),
         }),
+    }
+}
+
+/// Compare one discovery sidecar stamp without reading its contents. O(1) time and memory.
+pub(crate) fn sidecar_is_current(source: &SourceFile) -> Result<bool> {
+    let Some(sidecar) = &source.sidecar else {
+        return Ok(true);
+    };
+    match sidecar.path.metadata() {
+        Ok(metadata) => {
+            Ok(sidecar.size_bytes == metadata.len() as i64
+                && sidecar.mtime_ns == mtime_ns(&metadata))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 

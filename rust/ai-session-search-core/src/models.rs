@@ -1188,6 +1188,15 @@ pub struct SourceFile {
     pub path: std::path::PathBuf,
     pub mtime_ns: i64,
     pub size_bytes: i64,
+    pub(crate) sidecar: Option<SourceSidecar>,
+}
+
+/// Discovery-only metadata; no public request or result carries this bookkeeping.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceSidecar {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) mtime_ns: i64,
+    pub(crate) size_bytes: i64,
 }
 
 impl SourceFile {
@@ -1203,6 +1212,7 @@ impl SourceFile {
             path: path.into(),
             mtime_ns,
             size_bytes,
+            sidecar: None,
         }
     }
 }

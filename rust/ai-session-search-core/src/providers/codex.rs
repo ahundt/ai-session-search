@@ -140,6 +140,7 @@ impl CodexAdapter {
                 .map(|value| value.as_nanos() as i64)
                 .unwrap_or_default();
             files.push(SourceFile {
+                sidecar: None,
                 provider: Provider::Codex,
                 path: entry.path,
                 mtime_ns,

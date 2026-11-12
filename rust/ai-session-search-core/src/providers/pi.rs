@@ -168,6 +168,7 @@ impl PiAdapter {
             .map(|value| value.as_nanos() as i64)
             .unwrap_or_default();
         SourceFile {
+            sidecar: None,
             provider: self.provider,
             path: entry.path,
             mtime_ns,

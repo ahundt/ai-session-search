@@ -1211,13 +1211,19 @@ pub(crate) fn reindex_until(
 /// Capture a tail checkpoint only when the path still has the exact size discovery supplied to
 /// the parser. A later reopen may observe a concurrent append, but those bytes were not proven to
 /// have crossed the parser's EOF and therefore must force one conservative full parse.
+/// Time O(D + 1) for D trailing bytes through the last newline; O(1) retained memory.
+/// The head fingerprint and sidecar stat add constant work.
 fn full_parse_checkpoint(source: &SourceFile) -> Result<(i64, String)> {
     let current_size = std::fs::metadata(&source.path)?.len() as i64;
     if crate::source::is_compressed_jsonl(&source.path) {
         // No tail checkpoint into compressed bytes; any later change takes the full parse.
         return Ok((0, crate::tail::prefix_fingerprint(&source.path)?));
     }
-    let complete_offset = if current_size == source.size_bytes {
+    let transcript_size =
+        source.size_bytes - source.sidecar.as_ref().map_or(0, |meta| meta.size_bytes);
+    let unchanged =
+        current_size == transcript_size && crate::providers::claude::sidecar_is_current(source)?;
+    let complete_offset = if unchanged {
         crate::tail::complete_prefix_offset(&source.path)?
     } else {
         0
@@ -1225,12 +1231,23 @@ fn full_parse_checkpoint(source: &SourceFile) -> Result<(i64, String)> {
     // Provider parsers accept a valid final JSONL record without a trailing newline. Such a
     // record is already present in the parsed session, but complete_prefix_offset points to its
     // beginning. Store zero so the next change takes a full-parse fallback and cannot duplicate it.
-    let offset = if current_size == source.size_bytes && complete_offset == source.size_bytes {
+    let offset = if unchanged && complete_offset == transcript_size {
         complete_offset
     } else {
         0
     };
-    Ok((offset, crate::tail::prefix_fingerprint(&source.path)?))
+    Ok((
+        offset,
+        source_fingerprint(source, &crate::tail::prefix_fingerprint(&source.path)?),
+    ))
+}
+
+/// Stamp only the fixed-size prefix and auxiliary metadata, not transcript contents. O(1).
+fn source_fingerprint(source: &SourceFile, prefix: &str) -> String {
+    match &source.sidecar {
+        Some(meta) => format!("{prefix};{}:{}", meta.mtime_ns, meta.size_bytes),
+        None => prefix.to_owned(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1706,6 +1723,10 @@ fn tail_requires_full_parse(session: &crate::models::SessionRecord) -> bool {
 /// ([`crate::tail`]). The preconditions (a stored checkpoint, no truncation, an unchanged file
 /// head) make this a pure optimization: on any doubt it returns [`TailOutcome::FullParse`] and
 /// the caller re-reads the whole file, so correctness never depends on the fast path.
+/// Parsing A appended bytes plus the fixed overlap costs O(A + overlap) time/memory.
+/// Stamp checks are O(1). Persistence still counts O(M) stored session messages and copies
+/// O(B + A) transcript bytes in SQLite, including transient memory, for B stored bytes.
+/// New returned messages retain O(A) bytes, plus the existing table/FTS maintenance costs.
 fn try_tail<F>(
     source: &SourceFile,
     source_path: &str,
@@ -1731,11 +1752,17 @@ where
         return Ok(TailOutcome::FullParse);
     };
     // Truncation / copytruncate: the file is now shorter than where we parsed to → re-read whole.
-    if offset <= 0 || source.size_bytes <= offset {
+    let transcript_size =
+        source.size_bytes - source.sidecar.as_ref().map_or(0, |meta| meta.size_bytes);
+    if offset <= 0 || transcript_size <= offset {
         return Ok(TailOutcome::FullParse);
     }
     // Rewrite / rotation: the head bytes changed → the stored offset is meaningless → re-read.
-    if !crate::tail::fingerprint_matches(&source.path, &stored_fingerprint)? {
+    let prefix = stored_fingerprint.split(';').next().unwrap_or_default();
+    if source_fingerprint(source, prefix) != stored_fingerprint
+        || !crate::providers::claude::sidecar_is_current(source)?
+        || !crate::tail::fingerprint_matches(&source.path, prefix)?
+    {
         return Ok(TailOutcome::FullParse);
     }
     match crate::tail::tail_parse_until(&source.path, offset, should_cancel, parse_slice) {
@@ -1776,6 +1803,10 @@ where
                 &mut tail.new_file_edits,
                 source.mtime_ns,
             );
+            if !crate::providers::claude::sidecar_is_current(source)? {
+                return Ok(TailOutcome::FullParse);
+            }
+            tail.new_fingerprint = source_fingerprint(source, &tail.new_fingerprint);
             db.append_tail(&tail, source.mtime_ns, source.size_bytes)?;
             Ok(TailOutcome::Appended)
         }
@@ -1979,6 +2010,7 @@ mod tests {
         let path = dir.path().join("session.jsonl");
         std::fs::write(&path, b"first\n").unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: path.clone(),
             mtime_ns: 0,
@@ -2038,6 +2070,105 @@ mod tests {
             initial.push_str(&progress);
         }
         initial
+    }
+
+    #[test]
+    fn claude_sidecar_checkpoint_uses_transcript_bytes_and_guards_metadata_changes() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project/parent/subagents");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("agent-demo.jsonl");
+        let sidecar = path.with_extension("meta.json");
+        let initial = claude_overlap_padding("parent").replace(
+            "\"type\":",
+            "\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":",
+        );
+        std::fs::write(&path, initial).unwrap();
+        std::fs::write(
+            &sidecar,
+            r#"{"agentType":"Explore","description":"original title"}"#,
+        )
+        .unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let discover = || {
+            ProviderSet::new(&config)
+                .discover_enabled(&config)
+                .sources
+                .remove(0)
+        };
+        let source = discover();
+        let source_path = normalize_path(&source.path);
+        let (offset, _) = db
+            .file_checkpoint(
+                Provider::Claude,
+                &source_path,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len() as i64);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(
+            b"{\"sessionId\":\"parent\",\"type\":\"assistant\",\"timestamp\":\"2026-01-01T00:01:00Z\",\"message\":{\"role\":\"assistant\",\"content\":\"sidecar reply\"}}\n",
+        ).unwrap();
+        let adapters = ProviderSet::new(&config);
+        let source = discover();
+        let parsed = adapters.claude.parse(&source);
+        assert!(matches!(
+            try_tail(
+                &source,
+                &source_path,
+                Some(&parsed.session.id),
+                &db,
+                &|| false,
+                |reader, path| adapters.claude.parse_reader(reader, path)
+            )
+            .unwrap(),
+            TailOutcome::Appended
+        ));
+        let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+        fresh
+            .upsert_session(&parsed, source.mtime_ns, source.size_bytes)
+            .unwrap();
+        let mut filters = crate::models::MessageFilters::default();
+        filters.session_id = Some(parsed.session.id.clone());
+        let rows = |db: &Db| {
+            serde_json::to_value(
+                db.read_session_messages(&filters, crate::db::MessageOrder::OldestFirst)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(rows(&db), rows(&fresh));
+        std::fs::write(
+            &sidecar,
+            r#"{"agentType":"Explore","description":"changed metadata title"}"#,
+        )
+        .unwrap();
+        let changed = discover();
+        assert!(matches!(
+            try_tail(
+                &changed,
+                &source_path,
+                Some(&parsed.session.id),
+                &db,
+                &|| false,
+                |reader, path| adapters.claude.parse_reader(reader, path)
+            )
+            .unwrap(),
+            TailOutcome::FullParse
+        ));
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            db.resolve_session_record(&parsed.session.id)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("changed metadata title")
+        );
     }
 
     #[test]
@@ -3267,6 +3398,7 @@ mod tests {
         let successor_path = PathBuf::from("/fixture/session.jsonl");
         let unrelated_path = PathBuf::from("/fixture/other-session.jsonl");
         let source = |path: &Path| SourceFile {
+            sidecar: None,
             provider: Provider::GeminiCli,
             path: path.to_path_buf(),
             mtime_ns: 1,
@@ -3389,6 +3521,7 @@ mod tests {
         let source = |path: &Path| {
             let metadata = std::fs::metadata(path).unwrap();
             SourceFile {
+                sidecar: None,
                 provider: Provider::GeminiCli,
                 path: path.to_path_buf(),
                 mtime_ns: 1,
@@ -4173,6 +4306,7 @@ mod tests {
         let source = |provider, path: &std::path::Path| {
             let metadata = std::fs::metadata(path).unwrap();
             SourceFile {
+                sidecar: None,
                 provider,
                 path: path.to_path_buf(),
                 mtime_ns: 1,

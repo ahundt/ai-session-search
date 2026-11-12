@@ -51,6 +51,7 @@ impl AntigravityAdapter {
                 .map(|value| value.as_nanos() as i64)
                 .unwrap_or_default();
             let source = SourceFile {
+                sidecar: None,
                 provider: Provider::Antigravity,
                 path: entry.path.clone(),
                 mtime_ns,

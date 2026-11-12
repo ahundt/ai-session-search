@@ -19643,6 +19643,7 @@ mod tests {
         std::fs::write(&file, line("2026-06-01T09:00:00Z", "user", "first prompt")).unwrap();
         let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
         let source = crate::models::SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: file.clone(),
             mtime_ns: 1,
@@ -19733,6 +19734,7 @@ mod tests {
         .unwrap();
         let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
         let source = crate::models::SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: file.clone(),
             mtime_ns: 1,
@@ -21086,6 +21088,7 @@ mod tests {
 
         let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
         let source = crate::models::SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: file.clone(),
             mtime_ns: 1,

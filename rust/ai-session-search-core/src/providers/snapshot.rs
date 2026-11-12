@@ -35,6 +35,7 @@ pub(super) fn source_file(
         .map(|value| value.as_nanos().min(i64::MAX as u128) as i64)
         .unwrap_or_default();
     SourceFile {
+        sidecar: None,
         provider,
         path,
         mtime_ns,

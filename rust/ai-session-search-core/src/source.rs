@@ -596,6 +596,7 @@ mod tests {
         );
         std::fs::write(&path, content).unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: path.clone(),
             mtime_ns: 0,
@@ -626,6 +627,7 @@ mod tests {
         let path = dir.path().join("large.md");
         std::fs::write(&path, "x".repeat(128 * 1024)).unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::AiStudio,
             path: path.clone(),
             mtime_ns: 0,
@@ -656,6 +658,7 @@ mod tests {
         )
         .unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::GeminiCli,
             path: path.clone(),
             mtime_ns: 0,
@@ -683,6 +686,7 @@ mod tests {
         // A known metadata record; an unrecognized type would add its own warning.
         std::fs::write(&path, "{\"type\":\"custom-title\"}\n{partial\n").unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: path.clone(),
             mtime_ns: 0,
