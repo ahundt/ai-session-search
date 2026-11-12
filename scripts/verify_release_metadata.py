@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
 import sys
@@ -290,6 +291,12 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
                 f"{relative} declares {skill_version!r} "
                 f"instead of the release version {cargo_version!r}"
             )
+    registry = json.loads((root / "server.json").read_text(encoding="utf-8"))
+    if registry["version"] != cargo_version:
+        raise ReleaseMetadataError(f"server.json version must equal {cargo_version!r}")
+    for package in registry["packages"]:
+        if package["version"] != cargo_version:
+            raise ReleaseMetadataError(f"server.json package version must equal {cargo_version!r}")
     _verify_documented_requirements(root, cargo_version)
     release_body(root, version)
     return version
@@ -340,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.notes_out is not None:
             args.notes_out.write_text(body, encoding="utf-8")
         print(version)
-    except (KeyError, OSError, ReleaseMetadataError, tomllib.TOMLDecodeError) as error:
+    except (KeyError, OSError, ReleaseMetadataError, tomllib.TOMLDecodeError, json.JSONDecodeError) as error:
         print(f"release metadata verification failed: {error}", file=sys.stderr)
         return 1
     return 0

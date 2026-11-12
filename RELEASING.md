@@ -27,7 +27,7 @@ One release has one identity, spelled the way each ecosystem requires:
 | Final X.Y.Z (including patch releases) | `X.Y.Z`, tag `vX.Y.Z` | `X.Y.Z` |
 
 `scripts/release_versions.py` is the sole mapping between the two spellings. Preparing a
-release means setting all eight declarations to the new version, then running
+release means setting all nine declarations to the new version, then running
 `cargo update --workspace` and `uv lock` so both lockfiles record it (the gate's lockfile checks
 fail otherwise), in one commit, and tagging that commit. The consumer crate stays unpublished at `0.0.0`; only its requirement on the released
 core crate carries the release version:
@@ -35,6 +35,7 @@ core crate carries the release version:
 | Location | Field |
 | --- | --- |
 | `pyproject.toml` | `project.version` |
+| `server.json` | server and package versions (Cargo/SemVer spelling) |
 | `rust/ai-session-search-core/Cargo.toml` | `package.version` |
 | `rust/ai-session-search-python/Cargo.toml` | `package.version` |
 | `rust/ai-session-search-python/Cargo.toml` | `dependencies.ai-session-search.version` |
@@ -54,7 +55,7 @@ uv run python -m scripts.verify_release_metadata --tag vX.Y.ZrcN
 What is published is recorded by the registries and by `git tag`, never by this file: `git tag
 --list 'v*'`, `https://crates.io/crates/ai-session-search`, and
 `https://pypi.org/project/ai-session-search/`. The working tree declares the next candidate in
-the eight locations above.
+the nine locations above.
 
 ## Toolchain and compatibility
 
@@ -63,8 +64,7 @@ Releases require Rust at or above the workspace `rust-version` (1.89 at the time
 Free-threaded CPython is not supported. The distribution exposes one executable, `aise`, and
 MCP clients run `aise mcp serve`.
 
-1.0.0 is the first stable release; the interfaces of the former private single-user package do
-not constrain it. Release tools (uv, cargo-cyclonedx, cargo-deny)
+1.0.0 is the published stable compatibility baseline. Release tools (uv, cargo-cyclonedx, cargo-deny)
 are pinned by version in `.github/workflows/ci.yml`, `prepare-packages.yml`, and `publish.yml`;
 change them only in a separate reviewed toolchain change.
 
@@ -97,17 +97,8 @@ Do not create a tag until these are also true of the specific release:
 - The exact release commit passes the local gate and package preparation below.
 - Every declaration in the identity table is the new version, and the metadata gate passes
   against the tag you are about to create.
-- The install documentation does not claim that the registries hold only release candidates. The
-  two sentences that did, "No stable version is published yet" in `README.md` and crates.io
-  "carries only release candidates" in `docs/development/installation.md`, were rewritten for
-  1.0.0 and must not return: a published stable release is not undone by the version a working
-  tree declares next, so declaring the following candidate does not make either true again. The
-  documented Cargo command drops `--version '^1.0.0-rc'` in the same release, because a bare
-  `cargo install` reaches a stable version and nothing but a candidate needed the range; see
-  [Pre-release semantics](#pre-release-semantics). `verify_release_metadata` cannot see this --
-  a claim about the registries is not a version declaration -- so
-  `test_the_documentation_does_not_claim_that_no_stable_release_exists` holds the line in the
-  local gate.
+- The install documentation gives stable-release commands and does not claim that the registries
+  hold only release candidates. The repository contract tests guard that guidance.
 - The message-search response shape is the one you intend to publish. Once any version is on a
   registry, removing a field, renaming one, changing a type, or changing what a value means
   requires incrementing `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION` across the serializer, the
@@ -254,29 +245,10 @@ command that could not install once shipped on the README, and it is why
 `test_the_release_check_runs_the_cargo_command_the_readme_gives` ties this table to the README's
 install block.
 
-#### Why a candidate needed an explicit version range and 1.0.0 does not
+#### Pre-release selection
 
-Measured while `1.0.0rc1` and `1.0.0rc2` were the only published versions:
-
-```
-uv tool install ai-session-search             -> ai-session-search==1.0.0rc2
-uv pip install ai-session-search              -> ai-session-search==1.0.0rc2
-uv add ai-session-search                      -> ai-session-search==1.0.0rc2
-python -m pip install ai-session-search       -> ai-session-search-1.0.0rc2
-cargo add ai-session-search                   -> Adding ai-session-search v1.0.0-rc.2
-cargo install ai-session-search --locked      -> error: could not find `ai-session-search`
-                                                 in registry `crates-io` with version `*`
-cargo install ai-session-search --locked --version '^1.0.0-rc'
-                                              -> Installing ai-session-search v1.0.0-rc.2
-```
-
-Cargo splits on the verb. `cargo add` resolves a candidate the way the Python resolvers do,
-while `cargo install` takes one only when a requirement asks for it, so while every published
-version was a candidate the README had to carry `--version '^1.0.0-rc'` to install at all.
-Publishing a stable version ends that: `cargo install` reaches a non-prerelease version without
-being asked, so from 1.0.0 the README gives the bare command and the table above is where each
-release proves it still installs. A reader has no way to tell an explicit candidate range from
-an instruction to install a candidate, which is the other reason it does not survive 1.0.0.
+`cargo install` selects a candidate only when its version requirement asks for one. Stable
+installation uses the unqualified command in the table above. Test the documented invocation.
 
 The Python result surprises people, so do not "fix" it.
 [PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases) excludes pre-releases
@@ -403,8 +375,7 @@ Before tagging, confirm:
 crates.io has no test registry, so only the Python half can be rehearsed. The tag push rehearses
 it automatically: `publish-testpypi` runs on both triggers and `publish-crate` waits for it, so a
 rejected wheel tag or unrenderable metadata stops the release while every registry version is
-still repairable. The 1.0.0rc2 tag push is why it works that way, because the job was
-dispatch-only then and reported `skipped` while the crate went to crates.io.
+still repairable.
 
 The job uploads the verified wheels and sdist, then installs the release from TestPyPI alone and
 runs `aise --version`, because an accepted upload is a weaker property than an installable wheel.
