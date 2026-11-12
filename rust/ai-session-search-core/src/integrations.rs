@@ -1199,7 +1199,11 @@ impl RegistrationState {
             let path = absolutize(&expand_tilde(&path)?)?;
             let value = path.to_str().ok_or_else(|| anyhow!("MCP {flag} path {} is not valid UTF-8; pass a UTF-8 path before installing", path.display()))?.to_string();
             state.intended.insert(flag.to_string(), value.clone());
-            if origin.starts_with("cli ") || origin.starts_with("environment ") {
+            // An explicit choice from a flag, a library override, or the environment is pinned.
+            if origin.starts_with("cli ")
+                || origin.starts_with("ConfigOverrides.")
+                || origin.starts_with("environment ")
+            {
                 state.arguments.extend([flag.to_string(), value]);
             }
         }

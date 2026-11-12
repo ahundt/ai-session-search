@@ -1112,7 +1112,9 @@ fn execute(cli: Cli) -> Result<()> {
         cache_dir: cli.cache_dir,
         threads: cli.threads,
         index_refresh: cli.index_refresh,
-    };
+        ..ConfigOverrides::default()
+    }
+    .set_by_command_line();
     // Whatever the user runs first after an upgrade, including `aise integrations status` and
     // `aise mcp serve`, finds the installed skill already current. Commands that write
     // integrations or move state themselves are left to do exactly what was asked. A config

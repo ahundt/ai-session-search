@@ -150,10 +150,45 @@ pub struct ConfigOverrides {
     /// Cache directory, over `AI_SESSION_SEARCH_CACHE_DIR` and `[index].cache_dir`.
     pub cache_dir: Option<PathBuf>,
     /// Worker threads for parallel scoring and indexing, over `AI_SESSION_SEARCH_THREADS` and
-    /// `[index].threads`. Must be at least 1.
+    /// `[performance].threads`. Must be at least 1.
     pub threads: Option<usize>,
     /// Refresh policy, over `AI_SESSION_SEARCH_INDEX_REFRESH` and `[index].refresh`.
     pub index_refresh: Option<IndexRefresh>,
+    /// Who set these overrides, which names them in [`ConfigOrigins`]: a library caller
+    /// (`ConfigOverrides.database_path`) or the command line (`cli --database`).
+    pub(crate) source: OverrideSource,
+}
+
+/// Where a [`ConfigOverrides`] value came from, for [`ConfigOrigins`] labels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum OverrideSource {
+    #[default]
+    Caller,
+    CommandLine,
+}
+
+impl ConfigOverrides {
+    /// Mark these overrides as command-line flags, so origins read `cli --database` and so on.
+    pub(crate) fn set_by_command_line(mut self) -> Self {
+        self.source = OverrideSource::CommandLine;
+        self
+    }
+
+    /// Relabel a `cli --flag` origin for overrides a library caller set.
+    fn origin(&self, cli_origin: String) -> String {
+        if self.source == OverrideSource::CommandLine {
+            return cli_origin;
+        }
+        let field = match cli_origin.as_str() {
+            "cli --config" => "config_path",
+            "cli --database" => "database_path",
+            "cli --cache-dir" => "cache_dir",
+            "cli --threads" => "threads",
+            "cli --index-refresh" => "index_refresh",
+            _ => return cli_origin,
+        };
+        format!("ConfigOverrides.{field}")
+    }
 }
 
 chainable_setters!(ConfigOverrides {
@@ -1845,6 +1880,13 @@ impl Config {
         environment: ConfigEnvironment,
         initializing: bool,
     ) -> Result<ResolvedConfig> {
+        let relabel = {
+            let labels = ConfigOverrides {
+                source: overrides.source,
+                ..ConfigOverrides::default()
+            };
+            move |origin: String| labels.origin(origin)
+        };
         let (config_path, config_origin, explicit_config_path) =
             if let Some(path) = overrides.config_path {
                 (expand_override_path(path), "cli --config".to_string(), true)
@@ -2011,11 +2053,11 @@ impl Config {
             config,
             config_path,
             origins: ConfigOrigins {
-                config: config_origin,
-                database: database_origin,
-                cache: cache_origin,
-                threads: threads_origin,
-                index_refresh: index_refresh_origin,
+                config: relabel(config_origin),
+                database: relabel(database_origin),
+                cache: relabel(cache_origin),
+                threads: relabel(threads_origin),
+                index_refresh: relabel(index_refresh_origin),
                 search_scope: if has_search_scope_config {
                     "config file"
                 } else {
@@ -3974,7 +4016,8 @@ mcp_config = "kilo.jsonc"
                 config_path: Some(config_path),
                 cache_dir: Some(PathBuf::from("/portable/cache")),
                 ..Default::default()
-            },
+            }
+            .set_by_command_line(),
             ConfigEnvironment {
                 cache_dir: Some(PathBuf::from("/environment/cache")),
                 ..Default::default()
@@ -4476,7 +4519,8 @@ mcp_config = "kilo.jsonc"
                 database_path: Some(PathBuf::from("/cli/index.db")),
                 threads: Some(11),
                 ..Default::default()
-            },
+            }
+            .set_by_command_line(),
             ConfigEnvironment {
                 database_path: Some(PathBuf::from("/env/index.db")),
                 cache_dir: Some(PathBuf::from("/env/cache")),

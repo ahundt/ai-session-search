@@ -723,6 +723,29 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    /// Origins name a library override as the `ConfigOverrides` field that set it, not as a
+    /// command-line flag the program never received.
+    #[test]
+    fn config_origins_name_library_overrides_by_field() {
+        use ai_session_search::config::ConfigEnvironment;
+        use ai_session_search::{Config, ConfigOverrides};
+        let fixture = Fixture::new();
+        let config_file = fixture.root.join("config.toml");
+        std::fs::write(&config_file, "").unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides::default()
+                .with_config_path(&config_file)
+                .with_database_path(fixture.root.join("index.db"))
+                .with_threads(2),
+            ConfigEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.origins.config, "ConfigOverrides.config_path");
+        assert_eq!(resolved.origins.database, "ConfigOverrides.database_path");
+        assert_eq!(resolved.origins.threads, "ConfigOverrides.threads");
+        assert_eq!(resolved.origins.cache, "typed/platform default");
+    }
+
     /// A completed batch traversal reports the same ordered digest as the materialized response,
     /// without the caller asking for a full receipt.
     #[test]
