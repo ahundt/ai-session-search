@@ -195,12 +195,105 @@ pub struct DbQueryArgs {
     pub format: OutputFormat,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Rows from one read-only SQL statement or schema listing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[non_exhaustive]
 pub struct QueryResult {
+    /// Column names in statement order. A repeated name gets a numeric suffix so each row key
+    /// is unique.
     pub columns: Vec<String>,
+    /// One map per row from column name to its JSON value. Integers and reals stay numbers;
+    /// a blob is the string `<blob N bytes>`.
     pub rows: Vec<BTreeMap<String, Value>>,
+    /// `true` when rows remained after the row limit; the next page starts at
+    /// `offset + rows.len()`.
     pub truncated: bool,
+    /// `Some(n)` when at least one string cell was cut to `n` characters by
+    /// [`SqlQuery::max_cell_chars`]; `None` when every cell is complete.
+    pub truncated_cell_char_limit: Option<usize>,
+}
+
+/// One read-only SQL statement for [`SqlService::query`](crate::service::SqlService::query).
+///
+/// ```
+/// use ai_session_search::SqlQuery;
+/// let query = SqlQuery::new("select id from sessions order by updated_at desc")
+///     .with_limit(10)
+///     .with_max_cell_chars(200);
+/// assert_eq!((query.limit, query.offset, query.timeout_ms), (Some(10), 0, None));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SqlQuery {
+    /// One SELECT or WITH statement. It must return rows; writes, attachments, and pragmas that
+    /// change state are refused by a SQLite authorizer before they run.
+    pub sql: String,
+    /// Maximum rows returned. `None` uses `[db].query_limit` from the configuration (100 by
+    /// default), as `aise db query` does; `Some(0)` returns every row.
+    pub limit: Option<usize>,
+    /// Rows skipped after the statement runs and before `limit` counts. Default 0.
+    pub offset: usize,
+    /// Interrupt the statement after this many milliseconds. `None` uses
+    /// `[db].query_timeout_ms` (0 by default, meaning no timeout); `Some(0)` sets no timeout.
+    pub timeout_ms: Option<u64>,
+    /// Cut each string cell longer than this many characters and mark it `... [truncated]`.
+    /// 0 (the default) keeps every cell whole, as `aise db query` does.
+    pub max_cell_chars: usize,
+}
+
+impl SqlQuery {
+    /// Query `sql` with the configured row limit and timeout, no offset, and whole cells.
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            limit: None,
+            offset: 0,
+            timeout_ms: None,
+            max_cell_chars: 0,
+        }
+    }
+
+    pub(crate) fn resolve(&self, defaults: &crate::config::DbConfig) -> ResolvedDbQueryArgs {
+        let mut args =
+            ResolvedDbQueryArgs::new(self.sql.clone(), self.limit.unwrap_or(defaults.query_limit));
+        args.offset = self.offset;
+        args.timeout_ms = self.timeout_ms.unwrap_or(defaults.query_timeout_ms);
+        args
+    }
+}
+
+chainable_setters!(SqlQuery {
+    with_limit(limit: usize) some;
+    with_offset(offset: usize) value;
+    with_timeout_ms(timeout_ms: u64) some;
+    with_max_cell_chars(max_cell_chars: usize) value;
+});
+
+/// What [`SqlService::schema`](crate::service::SqlService::schema) lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SqlSchemaQuery {
+    /// List this table's columns, each with a `note` naming values a plausible predicate
+    /// misreads. `None` (the default) lists every table and view without columns.
+    pub table: Option<String>,
+    /// Include SQLite and FTS shadow tables and internal indexes. Default `false`.
+    pub include_internal: bool,
+}
+
+chainable_setters!(SqlSchemaQuery {
+    with_table(table: impl Into<String>) some;
+    with_include_internal(include_internal: bool) value;
+});
+
+/// Cut string cells longer than `max_chars` characters in place; 0 leaves every cell whole.
+pub(crate) fn truncate_cells(result: &mut QueryResult, max_chars: usize) {
+    let mut truncated = false;
+    for row in &mut result.rows {
+        for value in row.values_mut() {
+            *value = truncate_json_value(std::mem::take(value), max_chars, &mut truncated);
+        }
+    }
+    result.truncated_cell_char_limit = truncated.then_some(max_chars);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -255,6 +348,45 @@ impl DbQueryArgs {
     }
 }
 
+/// Run `aise db schema` or `aise db query` through [`SqlService`](crate::service::SqlService)
+/// and print the result. The command line's scope check runs before this, under its own label.
+pub(crate) fn run_command(service: &crate::service::SqlService<'_>, cmd: DbCmd) -> Result<()> {
+    let (result, format) = match cmd {
+        DbCmd::Schema(args) => {
+            let query = SqlSchemaQuery {
+                table: args.table,
+                include_internal: args.include_internal,
+            };
+            (service.schema(&query)?, args.format)
+        }
+        DbCmd::Query(args) => {
+            let query = SqlQuery {
+                limit: args.limit,
+                offset: args.offset,
+                timeout_ms: args.timeout_ms,
+                ..SqlQuery::new(args.sql)
+            };
+            (
+                service.query(&query).map_err(format_cli_query_error)?,
+                args.format,
+            )
+        }
+    };
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    render_query_result(&result, format, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Run a parsed `aise db` command against `path`.
+///
+/// This entry point skips the configured search-scope check that refuses raw SQL under
+/// `allowed-roots`.
+#[deprecated(
+    since = "1.1.0",
+    note = "use SessionSearch::sql or SqlService::new(&config) and render the QueryResult"
+)]
 pub fn run(
     path: &Path,
     busy_timeout_ms: u64,
@@ -537,6 +669,7 @@ fn schema_objects(conn: &Connection, include_internal: bool) -> Result<QueryResu
         ],
         rows,
         truncated: false,
+        truncated_cell_char_limit: None,
     })
 }
 
@@ -669,6 +802,7 @@ fn table_columns(conn: &Connection, table: &str) -> Result<QueryResult> {
         ],
         rows,
         truncated: false,
+        truncated_cell_char_limit: None,
     })
 }
 
@@ -711,6 +845,7 @@ fn collect_query_rows(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<Q
         columns,
         rows,
         truncated,
+        truncated_cell_char_limit: None,
     })
 }
 

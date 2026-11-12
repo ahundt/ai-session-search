@@ -1254,12 +1254,7 @@ fn execute(cli: Cli) -> Result<()> {
         if matches!(&cmd, crate::sql_query::DbCmd::Query(_)) {
             crate::search_scope::ensure_raw_sql_allowed(&config.search.scope, "aise db query")?;
         }
-        return crate::sql_query::run(
-            &config.db_path(),
-            config.index.busy_timeout_ms,
-            &config.db,
-            cmd,
-        );
+        return crate::sql_query::run_command(&crate::service::SqlService::new(&config), cmd);
     }
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&resolved, cmd);

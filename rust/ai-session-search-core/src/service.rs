@@ -1167,6 +1167,11 @@ impl SessionSearch {
         AnalysisService::new(&self.config, &self.db)
     }
 
+    /// Read-only SQL over the index, as `aise db query` and `aise db schema` run it.
+    pub const fn sql(&self) -> SqlService<'_> {
+        SqlService::new(&self.config)
+    }
+
     /// Crate-internal storage access for operations not yet represented by a service.
     ///
     /// External consumers (Python bindings, integration tests, downstream crates) must use
@@ -2138,6 +2143,78 @@ impl<'config> SourceService<'config> {
     /// Discover enabled sources and return status for every supported provider.
     pub fn inventory(&self) -> Vec<crate::source::ProviderSourceStatus> {
         crate::source::inventory(self.config)
+    }
+}
+
+/// Read-only SQL over the index database, shared by `aise db query`, `aise db schema`, and Rust
+/// callers.
+///
+/// Each call opens its own SQLite read-only connection with `pragma query_only` and an
+/// authorizer that refuses writes, attachments, and state-changing pragmas, so the statement
+/// cannot change the index. Raw SQL cannot enforce workspace authority, so
+/// [`query`](Self::query) is refused while `search.scope.mode` is `allowed-roots`, exactly as the
+/// command line refuses it. [`SqlService::new`] needs only a configuration; it does not open or
+/// refresh the index, so it works on an index another process is writing.
+#[derive(Clone, Copy)]
+pub struct SqlService<'config> {
+    config: &'config Config,
+}
+
+impl<'config> SqlService<'config> {
+    /// Create a SQL service reading `config.db_path()` with `config.index.busy_timeout_ms`.
+    pub const fn new(config: &'config Config) -> Self {
+        Self { config }
+    }
+
+    /// Run one read-only statement and return its rows.
+    ///
+    /// Defaults left as `None` in `query` come from `[db]` in the configuration, so a caller
+    /// and `aise db query` given the same statement return the same rows.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the scope is `allowed-roots`, the statement is not exactly one row-returning
+    /// read, the authorizer refuses it, the timeout interrupts it, or the database cannot be
+    /// opened read-only.
+    ///
+    /// # Complexity
+    ///
+    /// SQLite's own cost for the statement, plus `O(offset + limit)` rows read and
+    /// `O(limit * columns)` values retained; `limit` 0 retains every row.
+    pub fn query(
+        &self,
+        query: &crate::sql_query::SqlQuery,
+    ) -> Result<crate::sql_query::QueryResult> {
+        crate::search_scope::ensure_raw_sql_allowed(
+            &self.config.search.scope,
+            "SessionSearch::sql().query",
+        )?;
+        let args = query.resolve(&self.config.db);
+        let mut result = crate::sql_query::query_path(
+            &self.config.db_path(),
+            self.config.index.busy_timeout_ms,
+            &args,
+        )?;
+        crate::sql_query::truncate_cells(&mut result, query.max_cell_chars);
+        Ok(result)
+    }
+
+    /// List tables and views, or one table's columns with reading notes.
+    ///
+    /// Schema listing is allowed under every search scope because it reveals no session data.
+    pub fn schema(
+        &self,
+        query: &crate::sql_query::SqlSchemaQuery,
+    ) -> Result<crate::sql_query::QueryResult> {
+        crate::sql_query::schema_path(
+            &self.config.db_path(),
+            self.config.index.busy_timeout_ms,
+            &crate::sql_query::DbSchemaArgs {
+                table: query.table.clone(),
+                include_internal: query.include_internal,
+                format: crate::render::OutputFormat::Table,
+            },
+        )
     }
 }
 

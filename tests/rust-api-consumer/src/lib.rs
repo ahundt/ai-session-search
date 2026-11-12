@@ -605,6 +605,60 @@ mod tests {
         assert_eq!(service_error(&error).code(), "index-missing");
     }
 
+    /// The typed SQL call returns the rows `aise db query` returns, applies the configured row
+    /// limit, cuts long cells on request, and is refused under `allowed-roots` like the CLI.
+    #[test]
+    fn sql_service_runs_read_only_queries_under_the_configured_scope() {
+        use ai_session_search::{SqlQuery, SqlSchemaQuery, SqlService};
+        let fixture = Fixture::new();
+        let app = fixture.indexed();
+
+        let rows = app
+            .sql()
+            .query(&SqlQuery::new("select id from sessions order by id").with_limit(1))
+            .unwrap();
+        assert_eq!(rows.columns, ["id"]);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0]["id"], "claude:consumer-a");
+        assert!(rows.truncated, "a second session remains past the limit");
+
+        let page = app
+            .sql()
+            .query(
+                &SqlQuery::new("select id from sessions order by id")
+                    .with_offset(1)
+                    .with_max_cell_chars(8),
+            )
+            .unwrap();
+        assert_eq!(page.rows[0]["id"], "claude:c... [truncated]");
+        assert_eq!(page.truncated_cell_char_limit, Some(8));
+        assert!(!page.truncated);
+
+        let error = app
+            .sql()
+            .query(&SqlQuery::new("delete from sessions"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not authorized"), "{error:#}");
+
+        let tables = app.sql().schema(&SqlSchemaQuery::default()).unwrap();
+        assert!(tables.rows.iter().any(|row| row["name"] == "sessions"));
+        let columns = app
+            .sql()
+            .schema(&SqlSchemaQuery::default().with_table("sessions"))
+            .unwrap();
+        assert!(columns.rows.iter().any(|row| row["name"] == "provider"));
+
+        let mut restricted = fixture.config();
+        restricted.search.scope.mode = ai_session_search::config::SearchScopeMode::AllowedRoots;
+        let error = SqlService::new(&restricted)
+            .query(&SqlQuery::new("select 1"))
+            .unwrap_err();
+        assert!(error.to_string().contains("allowed-roots"), "{error:#}");
+        assert!(SqlService::new(&restricted)
+            .schema(&SqlSchemaQuery::default())
+            .is_ok());
+    }
+
     #[test]
     fn setters_set_the_named_fields_and_keep_the_other_defaults() {
         let (sessions, messages, files, inspection, classification, overrides) =

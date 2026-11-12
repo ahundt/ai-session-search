@@ -160,7 +160,7 @@ pub use models::{
 };
 pub use service::{
     AnalysisService, CatalogService, CompactOutcome, ExportService, FileService, IndexService,
-    MaintenanceService, MessageService, SourceService,
+    MaintenanceService, MessageService, SourceService, SqlService,
 };
 pub use skill_run::{
     CapabilityExecutionSource, MessageClassificationDefinition, MessageClassificationQuery,
@@ -168,6 +168,7 @@ pub use skill_run::{
     SkillCapabilityOutput, SkillRunQuery, SkillRunReport,
 };
 pub use source::ProviderSourceStatus;
+pub use sql_query::{QueryResult, SqlQuery, SqlSchemaQuery};
 
 /// Execute the canonical CLI after recording that this process entered through the Python binding.
 ///
