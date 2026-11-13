@@ -167,6 +167,8 @@ def renderer_command(
     candidate_scale_paths: dict[str, Path],
     relevance_path: Path | None,
 ) -> str:
+    # Deprecated: illustrative template retained for callers; reports omit it because sample
+    # metadata does not record the renderer invocation or output destination.
     command = (
         "uv run python scripts/render_benchmark_report.py --baseline BASELINE_JSONL "
         "--candidate CANDIDATE_JSONL"
@@ -321,16 +323,6 @@ def render(
         "GO" if publishable and not semantic_mismatches and candidate_durable_mutations == 0
         and candidate_failures == 0 and relevance_passed else "NO-GO"
     )
-    exact_renderer_command = renderer_command(
-        baseline_path,
-        candidate_path,
-        overlay_paths,
-        baseline_overlay_paths,
-        candidate_overlay_paths,
-        scale_paths,
-        candidate_scale_paths,
-        relevance_path,
-    )
     lines = [
         "# AI Session Search before/after benchmark report",
         "",
@@ -428,12 +420,6 @@ def render(
         "uv run python scripts/benchmark_release.py --tier release --fixture generated --artifact-dir /private/tmp/aise-benchmark-release --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY",
         "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output notes/aise-report.md",
         "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output notes/aise-report.md --check",
-        "```",
-        "",
-        "This report's exact renderer command is:",
-        "",
-        "```sh",
-        exact_renderer_command,
         "```",
         "",
         "- [SQLite WAL concurrency](https://www.sqlite.org/wal.html)",

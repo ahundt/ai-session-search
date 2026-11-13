@@ -1449,6 +1449,7 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
         None,
     )
 
+    assert "This report's exact renderer command is:" not in report
     assert "**NO-GO" in report
     assert "publishable generated fixture: no" in report
     assert "held-out relevance gate: not supplied" in report
