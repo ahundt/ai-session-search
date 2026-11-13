@@ -5,6 +5,7 @@
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -15,7 +16,9 @@ import pytest
 
 import ai_session_search as aise
 
-CLI = Path(__file__).resolve().parents[1] / "target/debug/aise"
+# The console script of the package under test, so the tests need no separate Cargo build.
+CLI = shutil.which("aise")
+assert CLI is not None, "run `uv run maturin develop --uv` to install the aise console script"
 
 
 @pytest.fixture
