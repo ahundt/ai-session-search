@@ -1462,6 +1462,51 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
     assert "private_local_fixture" in report
 
 
+def test_renderer_separates_reviewed_result_differences_from_regressions(tmp_path: Path) -> None:
+    # A digest pair the manifest declares as reviewed is not a regression; an undeclared one is.
+    renderer = load_script("render_benchmark_report.py")
+    evidence = tmp_path / "samples.jsonl"
+    metadata = {
+        "commit": "b" * 40, "dirty": False, "source_state_sha256": "c" * 64,
+        "binary_sha256": "d" * 64, "manifest_sha256": "e" * 64, "os": "TestOS 1",
+        "machine": "test-machine", "python": "3.12", "sqlite": "3.47",
+    }
+    fixture = {"sha256": "a" * 64, "bytes": 4096, "schema_version": 5,
+               "counts": {"sessions": 1, "messages": 2, "file_edits": 0}}
+    digests = {"baseline": "1" * 64, "candidate": "2" * 64}
+    contracts = {
+        "timestamp-case": {"accepted_results": [{
+            "baseline_sha256": digests["baseline"], "candidate_sha256": digests["candidate"],
+            "category": "field_added", "difference": "hits add timestamp",
+            "changelog": "Added: structured message hits include timestamps",
+        }]},
+        "drifted-case": {},
+    }
+    rows = []
+    for build in ("baseline", "candidate"):
+        rows.append({"kind": "run", "build": build, "metadata": metadata, "fixture": fixture,
+                     "contracts": contracts, "selected_cases": sorted(contracts), "repetitions": 1,
+                     "artifact_privacy": {"classification": "portable_generated",
+                                          "publishable": True}})
+        rows.extend({"kind": "sample", "build": build, "case": case, "surface": "cli",
+                     "exit_code": 0, "result_sha256": digests[build], "wall_ms": 1,
+                     "cpu_seconds": 0, "peak_rss_kib": 1, "peak_threads": 1,
+                     "peak_processes": 1, "repetition": 0} for case in sorted(contracts))
+    evidence.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    report = renderer.render(evidence, evidence, "baseline", "candidate", [], {}, [], [], [], None)
+
+    reviewed, regressions = report.split("## Regressions and limitations")
+    regressions = regressions.split("\n## ")[0]
+    assert "- `drifted-case` returned a result digest no manifest declaration covers." in regressions
+    assert "timestamp-case" not in regressions
+    reviewed = reviewed.split("## Reviewed result differences")[1]
+    assert ("- `timestamp-case` (field_added): hits add timestamp. Changelog: Added: structured "
+            "message hits include timestamps.") in reviewed
+    assert "drifted-case" not in reviewed
+    assert "Required-equal result-digest mismatches: 1." in report
+
+
 def test_tracked_docs_contain_no_personal_install_paths() -> None:
     personal_home = str(Path.home())
     for path in (
