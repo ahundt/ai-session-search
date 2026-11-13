@@ -54,8 +54,11 @@ impl AiStudioAdapter {
     }
 
     fn parse_path(&self, path: &Path) -> Result<ParsedSession> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read AI Studio session {}", path.display()))?;
+        let read_error = || format!("failed to read AI Studio session {}", path.display());
+        let file = fs::File::open(path).with_context(read_error)?;
+        let raw =
+            String::from_utf8(crate::util::read_provider_snapshot(file).with_context(read_error)?)
+                .with_context(read_error)?;
         self.parse_raw(path, raw)
     }
 

@@ -89,8 +89,11 @@ impl GeminiCliAdapter {
                 .with_context(|| format!("failed to read Gemini CLI session {}", path.display()))?;
             return self.parse_reader(std::io::BufReader::new(file), path);
         }
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read Gemini CLI session {}", path.display()))?;
+        let read_error = || format!("failed to read Gemini CLI session {}", path.display());
+        let file = fs::File::open(path).with_context(read_error)?;
+        let raw =
+            String::from_utf8(crate::util::read_provider_snapshot(file).with_context(read_error)?)
+                .with_context(read_error)?;
         self.parse_raw(path, raw)
     }
 

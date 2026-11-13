@@ -202,6 +202,10 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    information; earlier recoverable versions remain extractable. Codex forks omit copied parent
    file edits when the parent transcript is available, and retain them when it is absent.
 
+9. Legacy Google AI Studio and Gemini JSON snapshots, Markdown exports, and Codex title sidecars
+   reject inputs above 64 MiB before decoding. A failed source refresh preserves indexed history;
+   an oversized optional sidecar falls back to transcript-derived titles and reports a warning.
+
 ### Performance
 
 These subsystem measurements use generated benchmark fixtures and unoptimized debug builds;

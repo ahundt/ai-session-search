@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
@@ -1784,7 +1784,8 @@ fn thread_columns(conn: &Connection) -> Result<Vec<String>> {
 
 fn load_index_titles(path: &Path) -> Result<SidecarLoad<HashMap<String, String>>> {
     // Lossy decode so a stray non-UTF-8 byte in the index sidecar never aborts codex indexing.
-    let bytes = fs::read(path)?;
+    let bytes = crate::util::read_provider_snapshot(fs::File::open(path)?)
+        .with_context(|| format!("failed to read Codex title sidecar {}", path.display()))?;
     let raw = String::from_utf8_lossy(&bytes).into_owned();
     let mut map = HashMap::new();
     let mut malformed_lines = usize::from(raw.contains(char::REPLACEMENT_CHARACTER));
@@ -3311,4 +3312,21 @@ mod tests {
         );
         assert_eq!(parsed.session.message_count, Some(0));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn oversized_title_sidecar_is_rejected_before_decoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session_index.jsonl");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    let error = match load_index_titles(&path) {
+        Ok(_) => panic!("an oversized sidecar must not be loaded"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("exceeds"), "{error}");
+    assert!(error.contains(&path.display().to_string()), "{error}");
 }

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::sync::OnceLock;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::config::Config;
@@ -315,13 +315,13 @@ fn read_snapshot_until(
     parse: impl FnOnce(String) -> Result<crate::models::ParsedSession>,
 ) -> Result<crate::models::ParsedSession> {
     let file = std::fs::File::open(&source.path)?;
-    let mut reader = CancellationReader {
+    let reader = CancellationReader {
         inner: file,
         should_cancel,
     };
-    let mut raw = String::new();
-    reader.read_to_string(&mut raw)?;
-    parse(raw)
+    let raw = crate::util::read_provider_snapshot(reader)
+        .with_context(|| format!("failed to read snapshot {}", source.path.display()))?;
+    parse(String::from_utf8(raw)?)
 }
 
 fn total_parse_failure_reason(parsed: &crate::models::ParsedSession) -> Option<String> {
@@ -978,5 +978,31 @@ mod tests {
                 "{provider} must preserve configured-root encounter order and dedupe aliases"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn oversized_legacy_snapshots_fail_before_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.json");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    for provider in [Provider::AiStudio, Provider::GeminiCli] {
+        let source = SourceFile::new(
+            provider,
+            path.clone(),
+            0,
+            path.metadata().unwrap().len() as i64,
+        );
+        let error = read_snapshot_until(&source, &|| false, |_| {
+            panic!("oversized snapshot reached parser")
+        })
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
     }
 }
