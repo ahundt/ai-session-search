@@ -2102,11 +2102,17 @@ impl Config {
     }
 
     /// Config files that exist at a discovery location and are not `active`, in discovery order.
-    /// Exactly one config file is read, so a setting in any of these has no effect.
+    /// At most one config file is read, so a setting in any of these has no effect. Files are
+    /// compared after resolving symbolic links and relative paths, so another spelling of the
+    /// active file is not listed and one file reachable at two locations is listed once.
     pub fn config_files_not_read(active: &std::path::Path) -> Vec<PathBuf> {
-        let mut unread = Vec::<PathBuf>::new();
+        let resolved = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.into());
+        let mut seen = vec![resolved(active)];
+        let mut unread = Vec::new();
         for path in config_discovery_paths() {
-            if path != active && path.is_file() && !unread.contains(&path) {
+            let identity = resolved(&path);
+            if path.is_file() && !seen.contains(&identity) {
+                seen.push(identity);
                 unread.push(path);
             }
         }

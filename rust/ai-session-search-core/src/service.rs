@@ -2374,9 +2374,10 @@ impl<'app> MaintenanceService<'app> {
         Self { config, db }
     }
 
-    /// What `aise doctor --format json` reports: the database path, unknown config keys,
-    /// [`IndexStatus`] (parser health, stale sessions, readiness, repair commands), discovery
-    /// warnings, and per-provider health. Reads only; never refreshes.
+    /// What `aise doctor --format json` reports, apart from the config-file fields that command
+    /// adds: the database path, unknown config keys, [`IndexStatus`] (parser health, stale
+    /// sessions, readiness, repair commands), discovery warnings, and per-provider health. Reads
+    /// only; never refreshes.
     pub fn diagnostics(&self) -> Result<DiagnosticStatus> {
         crate::diagnostics::collect(self.config, self.db)
     }

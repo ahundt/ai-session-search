@@ -858,61 +858,137 @@ fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     );
 }
 
+/// Runs `aise doctor` in `root` with `HOME` there and returns its standard output.
+fn doctor_output(root: &std::path::Path, config: Option<&std::path::Path>, format: &str) -> String {
+    let mut command = aise(root);
+    command.env("HOME", root).env("USERPROFILE", root);
+    match config {
+        Some(config) => command.arg("--config").arg(config),
+        None => command.env_remove("AI_SESSION_SEARCH_CONFIG"),
+    };
+    let output = command
+        .args([
+            "--index-refresh",
+            "existing-only",
+            "doctor",
+            "--format",
+            format,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Writes a config file whose one unrecognized key `marker` shows up in `doctor` only when this
+/// is the file that was read.
+fn write_marked_config(path: &std::path::Path, marker: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, format!("[search]\n{marker} = 1\n")).unwrap();
+}
+
 /// A setting that has no effect is usually in a file aise is not reading. `doctor` names the file
-/// in use with how it was selected, and every other file at a discovery location, in both formats.
+/// in use with how it was selected, in both formats, and that file is the one whose settings apply.
 #[test]
-fn doctor_names_the_config_file_in_use_and_the_ones_it_does_not_read() {
+fn doctor_names_the_config_file_in_use() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
+    let mut selected = fs::read_to_string(&config).unwrap();
+    selected.push_str("[search]\nmarker_selected = 1\n");
+    fs::write(&config, selected).unwrap();
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
-    let unread = [
-        root.path().join(".ai-session-search/config.toml"),
-        root.path().join(".config/ai-session-search/config.toml"),
-    ];
-    for path in &unread {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "[search]\ndefault_limit = 7\n").unwrap();
-    }
-    let run = |format: &str| {
-        let output = aise(root.path())
-            .env("HOME", root.path())
-            .env("USERPROFILE", root.path())
-            .args(["--config", config.to_str().unwrap()])
-            .args([
-                "--index-refresh",
-                "existing-only",
-                "doctor",
-                "--format",
-                format,
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
-    };
+    write_marked_config(
+        &root.path().join(".ai-session-search/config.toml"),
+        "marker_unread",
+    );
 
-    let text = run("table");
+    let text = doctor_output(root.path(), Some(&config), "table");
     assert!(
         text.contains(&format!("Config: {} (cli --config)\n", config.display())),
         "{text}"
     );
-    for path in &unread {
-        assert!(
-            text.contains(&format!("Config file not read: {}\n", path.display())),
-            "{text}"
-        );
-    }
+    assert!(text.contains("marker_selected"), "{text}");
+    assert!(!text.contains("marker_unread"), "{text}");
 
-    let document: serde_json::Value = serde_json::from_str(&run("json")).unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&doctor_output(root.path(), Some(&config), "json")).unwrap();
     assert_eq!(
         document["config_file"],
         serde_json::json!({"path": config, "origin": "cli --config", "exists": true})
     );
-    assert_eq!(document["config_files_not_read"], serde_json::json!(unread));
+    assert!(document["config_files_not_read"].is_array());
+}
+
+/// `doctor` lists every other config file at a discovery location, never the active file under
+/// another spelling, and says when no file exists. Unix only: there the home directory follows
+/// `HOME`, while Windows asks the system for the profile directory and ignores the environment.
+#[cfg(unix)]
+#[test]
+fn doctor_lists_the_discovered_config_files_it_does_not_read() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().canonicalize().unwrap();
+    ai_session_search::db::Db::open(&home.join("index.db")).unwrap();
+    let app = home.join(".ai-session-search/config.toml");
+    let legacy = home.join(".config/ai-session-search/config.toml");
+
+    let text = doctor_output(&home, None, "table");
+    assert!(
+        text.contains(&format!(
+            "Config: {} (platform/legacy discovery; no file there, built-in defaults in use)\n",
+            app.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Config file not read"), "{text}");
+
+    write_marked_config(&legacy, "marker_legacy");
+    let text = doctor_output(&home, None, "table");
+    assert!(
+        text.contains(&format!(
+            "Config: {} (platform/legacy discovery)\n",
+            legacy.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("marker_legacy"), "{text}");
+    assert!(!text.contains("Config file not read"), "{text}");
+
+    write_marked_config(&app, "marker_app");
+    let text = doctor_output(&home, None, "table");
+    assert!(
+        text.contains(&format!(
+            "Config: {} (platform/legacy discovery)\n",
+            app.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("marker_app"), "{text}");
+    assert!(!text.contains("marker_legacy"), "{text}");
+    assert_eq!(text.matches("Config file not read: ").count(), 1, "{text}");
+    assert!(
+        text.contains(&format!("Config file not read: {}\n", legacy.display())),
+        "{text}"
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&doctor_output(&home, None, "json")).unwrap();
+    assert_eq!(
+        document["config_files_not_read"],
+        serde_json::json!([legacy])
+    );
+
+    // The active file named through a symbolic link is still the active file.
+    let alias = home.join("alias");
+    std::os::unix::fs::symlink(app.parent().unwrap(), &alias).unwrap();
+    let text = doctor_output(&home, Some(&alias.join("config.toml")), "table");
+    assert_eq!(text.matches("Config file not read: ").count(), 1, "{text}");
+    assert!(
+        text.contains(&format!("Config file not read: {}\n", legacy.display())),
+        "{text}"
+    );
 }
 
 /// The result ceiling a registration sets in its own `env` block reaches the server it launches.
