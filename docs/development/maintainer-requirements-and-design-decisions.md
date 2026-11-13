@@ -645,11 +645,11 @@ Upgrading is replacing the executable, by whichever manager owns it; a user who 
 setting must not need to change anything, and one who did must not have to edit it again. A renamed
 config key keeps its old name as a serde alias, and a key a release accepted is not removed before
 the next major version. Installed files change only in ways the post-upgrade refresh applies without
-touching an edit (`REQ024-delegate-package-updates`). Release notes never carry upgrade steps. The
-CI `rust` job on every push, the local gate, and the publish `upgrade` job that `verify` waits for
-install each published release's integrations and printed config from `UPGRADE_FLOOR` in
-`scripts/verify_upgrade_path.py` on, run the new executable, and fail when anything would need a
-manual step.
+touching an edit (`REQ024-delegate-package-updates`). Release notes carry no step a user must run
+for settings or installed files to keep working. The CI `rust` job on every push, the local gate,
+and the publish `upgrade` job that `verify` waits for install each published release's integrations
+and printed config from `UPGRADE_FLOOR` in `scripts/verify_upgrade_path.py` on, run the new
+executable, and fail when anything would need a manual step.
 
 Starting with 1.1.0, ordinary config tables tolerate unknown keys from newer releases. Serde's
 ignored-field tracking collects dotted paths on `Config::unknown_config_keys`; loading prints
