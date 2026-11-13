@@ -1527,8 +1527,8 @@ mod tests {
     }
 
     /// `aise skills corrections -- --help` once printed `Usage: aise-skill-capability [OPTIONS]`,
-    /// the internal argv[0] placeholder, which names no executable; a Pi session hit exactly that
-    /// on 2026-08-14. The usage line must show the invocation a reader can actually run.
+    /// the internal argv[0] placeholder, which names no executable. The usage line must show the
+    /// invocation a reader can actually run.
     #[test]
     fn capability_help_names_the_real_invocation_not_the_internal_placeholder() {
         use clap::CommandFactory;

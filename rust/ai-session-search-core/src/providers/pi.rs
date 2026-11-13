@@ -1572,7 +1572,7 @@ mod tests {
     ///
     /// Requiring a session id in a top-level transcript's filename told bookkeeping apart from
     /// transcripts, but it also dropped any transcript pi names some other way — silently, since
-    /// discovery warns only about I/O. Measuring 15 files on one machine is not evidence about
+    /// discovery warns only about I/O. The files of one installation are not evidence about
     /// every pi version. Anchoring depth on the innermost `sessions` component had the mirror
     /// problem: it matched that name anywhere below the root, so a UUID-named file two levels
     /// under some unrelated `sessions` directory was promoted to a top-level pi session.

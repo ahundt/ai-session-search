@@ -1301,7 +1301,7 @@ mod execution_runtime_tests {
     /// build cannot decode. Before this guard the older build failed deep inside whichever query
     /// touched such a row with "unrecognized provider ... run `aise reindex --full`", and that
     /// command failed the same way while enumerating retained sessions -- circular advice that
-    /// locked the older build out of every command.
+    /// locked the older build out of every command that opens the index.
     /// The open must refuse once, name the provider, and say the fix: upgrade aise.
     #[test]
     fn ordinary_open_refuses_an_index_carrying_a_provider_this_build_does_not_know() {

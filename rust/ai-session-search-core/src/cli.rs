@@ -3291,13 +3291,13 @@ mod tests {
         }
     }
 
-    /// The shipped skill and README are what an agent reads instead of `--help`, so an example
-    /// that names a flag this build no longer accepts teaches the wrong command with authority.
-    /// That happened: `messages search --regex/--fuzzy/--explain` were renamed to `--query-mode`
-    /// and `--receipt-level` on 2026-07-22 and the skill kept the old spellings through rc1;
-    /// session history shows agents on Pi and Claude Code paying for it with `--help` probes and
-    /// failed calls. Every documented invocation must parse against the current CLI, including
-    /// the capability arguments after `skills <name>`, which the root parser passes through.
+    /// The shipped skill and README are what an agent reads instead of `--help`, so an example that
+    /// names a flag this build no longer accepts teaches the wrong command with authority. That
+    /// happened: `messages search --regex/--fuzzy/--explain` were renamed to `--query-mode` and
+    /// `--receipt-level` and the skill kept the old spellings through rc1; agents paid for it with
+    /// `--help` probes and failed calls. Every documented invocation must parse against the current
+    /// CLI, including the capability arguments after `skills <name>`, which the root parser passes
+    /// through.
     #[test]
     fn every_documented_aise_example_parses_against_the_current_cli() {
         let documents = [

@@ -7411,9 +7411,10 @@ fn store_parsed_messages(
 ///
 /// The invariant: a stored row the parse does not hold stays (the archive rule) unless it equals
 /// what an earlier parser made of a record that is still in the source and that this parser
-/// declines. The parser's verdict is authoritative for records still present; content whose
-/// record is gone from the source is never deleted. Only rows the parse left unclaimed are
-/// candidates, and each declined rendering takes at most one row. Equal columns are tried first,
+/// declines. The parser's verdict is authoritative for records still present; a row is taken only
+/// when it can be attributed to such a record, and the rules below say where that attribution is
+/// weaker than an identity. Only rows the parse left unclaimed are candidates, and each declined
+/// rendering takes at most one row. Equal columns are tried first,
 /// for every declined row, so a pruned record's row is not taken for a declined copy of the same
 /// text; role and content second, for rows an older renderer stored with other metadata. The
 /// second rule requires the same timestamp for notices and never takes an identified row. Text at
@@ -7421,13 +7422,14 @@ fn store_parsed_messages(
 ///
 /// For a notice, equal role, content and time do not prove which record a row came from: a row
 /// stored for a record now gone and a declined record still present can agree on all three, and
-/// a notice without an identity has no other column that names its record. Neither rule
-/// therefore removes the last copy of a notice unless a native identity matches. A notice row is
-/// taken only when the session keeps another row with the same role and content afterwards,
-/// counting every parsed message and every stored row this call leaves in place. So a declined
-/// notice with no other copy stays in an upgraded index although a fresh build omits it. Other
-/// rows are an earlier rendering of a record the parse now stores as different text, so no second
-/// copy is expected for them; for those, equal role and content still decide.
+/// a notice without an identity has no other column that names its record. A matching native
+/// identity still takes a notice row outright. Without one, both rules require that the session
+/// keeps another row with the same role and content afterwards, counting every parsed message and
+/// every stored row this call leaves in place; with two such stored copies one can still be
+/// taken. So a declined notice with no other copy stays in an upgraded index although a fresh
+/// build omits it. Other rows are an earlier rendering of a record the parse now stores as
+/// different text, so no second copy is expected for them; for those, equal role and content
+/// still decide.
 /// O(stored + declined + parsed) time and key memory.
 fn take_retracted_rows(
     stored: &[(i64, MessageKeys)],
@@ -7525,8 +7527,8 @@ fn take_retracted_rows(
     }
     for keys in loose {
         let key = if keys.timestamped_notice {
-            // The parse stores a notice again under an identity whenever its record is still
-            // present, so a declined copy of it always leaves another copy behind.
+            // Require another copy: when the parse still stores the notice from its own record,
+            // the declined copy is a duplicate; when it does not, this row may be all that is left.
             if copies.get(&keys.role_and_content).copied().unwrap_or(0) < 2 {
                 continue;
             }
