@@ -14,13 +14,13 @@ tokens, `F` discovered source files, `E` filtered file edits, `B` source bytes, 
 
 | Operation | Time | Memory |
 | --- | --- | --- |
-| `list_sessions` / `aise list` | `O(log S + offset + K)`; paging uses SQL `OFFSET` | `O(K)` |
+| `list_sessions` / `aise list` | `O(log S + offset + K)` with favorable indexes; up to `O(S log S + offset + K)` with a temporary sort, plus `O(S)` span checks; paging uses SQL `OFFSET` | `O(K)` records plus their text and SQLite cache/sort memory |
 | `get_session` / `messages get`, `show`, `messages evidence` | `O(log M + C)` after an `O(S)` id resolve | returned window |
 | `get_resume_command` / `aise resume` | `O(S)` id scan | `O(1)` |
 | `get_index_status` / `aise doctor` | `O(F)` discovered files | `O(F)` |
 | Literal or regex `search_messages` | `O(P_Q + C + verified bytes)`: word and trigram indexes admit candidates, then the exact predicate is verified; a short or unsafe anchor falls back to the filtered corpus, `O(B)` worst case | finite page `O(W + D_W)`; explicit all-results `O(N + D_K)` |
 | Fuzzy `search_messages` | `O(T + N + W log W)`; every structurally eligible row is read and scored in bounded parallel batches | one batch plus its largest row, retained `W` text, per-worker matcher scratch |
-| `search_sessions` / `aise search` | `O(T*(A+1) + N + K log K)`; every eligible session's title, summary, paths, preview, and transcript are read | retained `K` records plus the batch budget and largest session |
+| `search_sessions` / `aise search` | `O(S + T*(A+1) + N + K log K)`; every eligible session's title, summary, paths, preview, and transcript are read | retained `K` records plus the batch budget and largest session |
 | `query_session_index` / `aise db query` | a predicate without a usable index scans `O(R)` rows | bounded by `limit`/`max_cell_chars` |
 | `files search`/`history`/`cross-ref`/`extract` | `O(E + K log K)` filtered edits/results | `O(K)` |
 | Refresh | incremental `O(B_new)`; full `O(B_all)` | streaming |

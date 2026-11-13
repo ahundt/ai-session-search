@@ -337,8 +337,6 @@ provider's own spelling (namespaced on Claude, a bare leaf name on Codex; match 
 
 ### Recover an edited file
 
-To reconstruct an edited file:
-
 ```sh
 aise files search '*.rs' --path ~/source/project --limit 50
 aise files history src/db.rs --path ~/source/project --limit 50

@@ -1,7 +1,7 @@
 # Releasing AI Session Search
 
-**Start here. This is the whole release procedure, start to finish, and the only document a
-release has to follow.** Work down it in order: set the version, pass the gate, finish
+This is the complete release procedure and the only document a release has to follow.
+Work down it in order: set the version, pass the gate, finish
 ["Before tagging, confirm"](#local-gate), tag, then approve each protected environment.
 
 | Document | When |
@@ -160,7 +160,7 @@ The version published by hand is the release version itself, never a placeholder
 `X.Y.Z-rc.0`: a placeholder consumes a version number nobody installs and invites a yank that
 is not warranted, and it is unnecessary because the `crate` job builds the crate twice and
 requires `cmp` to pass, so `cargo package` output is deterministic and reproduces the
-workflow's attested crate byte for byte. Verify that rather than assume it. Because the
+workflow's attested crate byte for byte. Verify the match. Because the
 comparison needs the attested artifact, this happens after the tag, between the workflow
 parking at `crates-io` and approving that environment:
 
@@ -197,8 +197,7 @@ parking at `crates-io` and approving that environment:
 
 ## Pre-release semantics
 
-Three surfaces express pre-release status, two of them implicitly. Verify all three rather than
-assuming the version string carried through:
+Verify pre-release status on all three surfaces; two express it implicitly:
 
 | Surface | How it is expressed | Verify |
 | --- | --- | --- |
@@ -250,7 +249,7 @@ install block.
 `cargo install` selects a candidate only when its version requirement asks for one. Stable
 installation uses the unqualified command in the table above. Test the documented invocation.
 
-The Python result surprises people, so do not "fix" it.
+Do not "fix" Python's pre-release selection.
 [PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases) excludes pre-releases
 from version specifiers "unless they are already present on the system, explicitly requested by
 the user, or if the only available version that satisfies the version specifier is a
@@ -277,9 +276,9 @@ environment, override it:
 AI_SESSION_SEARCH_RUSTC_WRAPPER= ./run_ci_local.sh
 ```
 
-That form exports an empty `RUSTC_WRAPPER`, which turns the wrapper off. The gate also sets
-`CARGO_INCREMENTAL=0`, so with no wrapper every run is a cold full rebuild of a large workspace
-and takes far longer than a cached one.
+That form exports an empty `RUSTC_WRAPPER`, which turns the wrapper off. The gate defaults
+`CARGO_INCREMENTAL=0` when unset or empty. With no wrapper, a full rebuild of the large workspace
+takes far longer than a cached one.
 
 The gate checks both lockfiles, builds the current ABI3 extension, runs Ruff, mypy, stub parity,
 Python tests, Rust formatting/check/Clippy/tests/doctests, the release executable and MCP

@@ -42,11 +42,11 @@ uv run --isolated --no-project python scripts/verify_python_install_methods.py \
   --timeout-seconds 600
 ```
 
-The harness deliberately accepts the repository and revision as parameters. It
+The harness accepts the repository and revision as parameters. It
 rejects mutable or abbreviated revisions, insecure HTTP, embedded credentials,
 and relative local paths. Temporary virtual environments, tool installations,
 configuration, and application caches are scoped to one temporary root and removed
-on success or failure. The harness deliberately inherits the caller's content-addressed
+on success or failure. The harness inherits the caller's content-addressed
 uv cache and `CARGO_TARGET_DIR`: normal standalone invocations reuse uv's platform cache,
 while `run_ci_local.sh` selects the workspace `target` directory. Set either environment
 variable explicitly to use a different shared cache; the harness never deletes it.

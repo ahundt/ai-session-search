@@ -61,7 +61,7 @@ if sessions:
 
 `newest` selects the last N records and returns them chronologically. Use `seq_from`/`seq_to`
 for inclusive ranges, or `message_context(id, seq, context_before=1, context_after=3)` around one
-turn. `transcript(id, lines=-20)` reads the text tail; positive lines keeps the head and 0 all.
+turn. `transcript(id, lines=-20)` reads the text tail; positive lines keep the head and 0 all.
 
 ### Recover a file
 
@@ -209,7 +209,8 @@ SQL and index-wide vocabulary refuse `allowed-roots` access. `resume_command(id)
 `transcript(id, lines=N)` returns the Rust transcript window including completeness metadata;
 positive N keeps the head, negative N the tail, and 0 every line.
 
-Fuzzy message search matches query letters in order, allowing gaps. A shorter query may skip characters in the text; every query character must occur in order.
+Fuzzy message search allows gaps: a shorter query may skip characters in the text, but every
+query character must occur in order.
 It is not an edit-distance search.
 It requires at least 3 Unicode scalar values and a positive finite limit. Typed error messages name Python methods for lookup and
 index preparation, while preserving error causes.

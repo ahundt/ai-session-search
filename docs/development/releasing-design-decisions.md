@@ -1,8 +1,7 @@
 # Releasing: design decisions behind the machinery
 
-**This is background. To run a release, use [RELEASING.md](../../RELEASING.md), which is
-the whole procedure.** Nothing here is a step, and no release needs this document to
-succeed.
+For the complete release procedure, use [RELEASING.md](../../RELEASING.md).
+This background document contains no release steps and is never required for a release.
 
 Read it in two situations:
 
@@ -210,9 +209,8 @@ and [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/se
 
 PyPI, crates.io, and GitHub do not provide a cross-registry transaction. The
 workflow orders irreversible operations so a GitHub release is never announced
-before both package registries accept the version. What to do when a stage
-fails is in [RELEASING.md](../../RELEASING.md#post-release-and-recovery), which
-holds the per-failure actions.
+before both package registries accept the version. For per-failure actions, use
+[RELEASING.md](../../RELEASING.md#post-release-and-recovery).
 
 Record a post-mortem with the failing job, artifact hashes, affected targets,
 registry state, user impact, and the exact prevention test. A yanked release is

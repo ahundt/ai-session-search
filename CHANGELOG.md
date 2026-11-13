@@ -192,7 +192,7 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    their identity; decompression failures preserve an existing index snapshot and remain
    retryable.
 2. Literal and regex search find case pairs SQLite's tokenizer does not fold, including Cherokee,
-   Georgian Mtavruli, Osage, and Adlam. A trailing `i` also matches dotted capital `İ`.
+   Georgian Mtavruli, Osage, and Adlam. A query ending in `i` also matches dotted capital `İ`.
 3. Equal session/sequence or timestamp keys have a stable tie-breaker for search, corrections,
    repeats, context, and file replay. Appended messages continue after the highest stored sequence.
 4. Full reindexing reclassifies stored harness notices instead of deleting them. Claude tool-call

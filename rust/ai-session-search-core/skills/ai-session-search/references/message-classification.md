@@ -83,8 +83,8 @@ aise skills validate ~/.claude/skills/my-corrections
 ```
 
 `--capability message-classification` seeds `aise-capability.toml` with the categories `aise`
-ships, so the usual path — start from the defaults, change what you disagree with — needs no
-transcription; without the flag `create` writes only `SKILL.md`, a harness-only skill with no
+ships. Start from those defaults and change what you disagree with, without transcribing them.
+Without the flag, `create` writes only `SKILL.md`, a harness-only skill with no
 capability for `aise` to run. `--output-dir` names the parent directory; set
 `[skills].authoring_root` in `config.toml` to omit it. The scaffold is yours: it carries no
 managed marker, so `aise` leaves it alone on `aise skills update`.

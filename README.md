@@ -31,9 +31,8 @@ or with Rust's `cargo`:
 cargo install ai-session-search --locked && aise integrations install
 ```
 
-Both install the newest stable release. The second command is the one that touches your tools: it
-registers the MCP server and writes guidance for each detected harness, and `--dry-run` previews
-every write.
+Both install the newest stable release. The second command registers the MCP server and writes
+guidance for each detected harness; `--dry-run` previews every write.
 
 ## Common tasks
 

@@ -11,11 +11,11 @@ rust/ai-session-search-python/    PyO3 conversion/module crate only
 ai_session_search/                typed Python facade and stubs
 ```
 
-The core already exposes catalog/message/file/export/source/index/analysis service
+The core exposes catalog/message/file/export/source/index/analysis service
 boundaries. Split it into narrower crates only after a measured compile-time, ownership,
 or independent-versioning need; do not move code and redesign behavior in the same commit.
 Every workspace uses one root `Cargo.lock` and root `target`.
-Executable consolidation is complete: Cargo and Python distributions expose only
+Cargo and Python distributions expose only
 `aise`; the Rust CLI and PyO3-backed Python entry point both serve MCP at
 `aise mcp serve`, and generated client entries use the same argument contract.
 

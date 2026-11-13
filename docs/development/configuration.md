@@ -6,8 +6,8 @@ provider shipping no default root, so it returns nothing until `[providers.aistu
 one. Otherwise create a file only to change a source path or a runtime setting.
 
 When one exists, `aise` resolves it once and the CLI, MCP server, and Python service all read
-that answer. Query filters and migration destinations go on the command that uses them. Result
-limits and line windows do have persistent defaults, under
+the resolved configuration. Query filters and migration destinations go on the command that uses
+them. Result limits and line windows do have persistent defaults, under
 [search extent](#search-extent-and-elapsed-time-defaults) and
 [output windowing](#output-windowing-defaults).
 
@@ -119,7 +119,7 @@ Manually activating a new key can therefore make that file incompatible with 1.0
 
 ## Resolver and write contract
 
-These hold for every surface, including settings added after this document.
+These rules apply to every surface, including future settings.
 
 All entry points use one typed Rust resolver with the precedence above. An omitted value falls
 through to the next source, while an empty path or an invalid number is an error, so neither
@@ -130,7 +130,7 @@ them. Config writes are atomic, preserve unrelated keys, use scoped locks, and c
 files on error. `aise config origins` names the winning source for each setting and never prints
 a secret value. [Atomic configuration initialization](#atomic-configuration-initialization)
 and [MCP client configuration transactions](#mcp-client-configuration-transactions) record how the
-current writers meet that.
+current writers meet these guarantees.
 
 ## Installed integrations after an upgrade
 

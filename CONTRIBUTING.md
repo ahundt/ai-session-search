@@ -9,8 +9,8 @@ Report a suspected vulnerability privately instead of opening an issue. See
 
 Search [existing issues](https://github.com/ahundt/ai-session-search/issues)
 first. A one-line fix needs no issue. Anything that alters public behavior does:
-those are reviewed against recorded product contracts, and settling the contract
-question before you write code is what makes them land.
+those are reviewed against recorded product contracts. Settle the contract
+question before you write code.
 
 State what you measured. A concrete report names the exact command, the exact
 output, the provider and version involved, and the file and line you are talking

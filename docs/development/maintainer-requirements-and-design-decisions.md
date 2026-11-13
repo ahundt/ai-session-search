@@ -152,7 +152,7 @@ administrator" text when the system has more specific context. Errors remain bou
 secrets, but preserving actionability takes priority over shaving a few diagnostic bytes.
 
 A condition that clears without anyone changing the checkout is reported as waiting, not as failed.
-Exhausted storage is the case in hand: free space returns when a person or another program releases
+When storage is exhausted, free space returns when a person or another program releases
 it, which can take minutes or days, so the automatic index refresh reports `postponed` with a retry
 interval and states that the last completed snapshot remains intact. A one-shot detached child and
 an idle MCP worker own no retry timer, so status must not promise that work resumes merely because
@@ -824,7 +824,7 @@ substance being preserved.
 | `REQ011-validate-language-boundaries` | `rust/ai-session-search-python/src/lib.rs`, `ai_session_search/_native.pyi` | native binding tests, stubtest, runtime/stub parity |
 | `REQ014-use-platform-app-paths`; `REQ015-separate-app-harness-roots`; `REQ016-support-multiple-skill-roots`; `REQ017-preserve-install-ownership`; `REQ018-preserve-unmanaged-content`; `REQ019-verify-each-harness` | `config.rs`, `integrations.rs`, `skills.rs`, `skill_manifest.rs`, `text_file_transaction.rs` | integration/config unit tests and repository contracts |
 | `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
-| `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
+| `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_run.rs`, `message_classification.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
 | `REQ024-delegate-package-updates` | `update.rs`, release configuration | package ownership/update tests and installed `aise package status/check` |
 | `REQ049-keep-upgrades-one-command` | `config.rs` serde aliases, `integrations.rs` post-upgrade refresh, `scripts/verify_upgrade_path.py`, CI `rust` job, `run_ci_local.sh`, publish `upgrade` job | alias and refresh unit tests, instruction-text digest test, upgrade check from every published release since `UPGRADE_FLOOR` |
 | `REQ027-use-tdd`; `REQ028-test-cross-surface-contracts`; `REQ029-dogfood-installed-artifacts`; `REQ033-commit-coherent-progress`; `REQ034-gate-release-artifacts` | `tests/`, Rust test suites, `run_ci_local.sh`, release workflows | focused tests followed by all local release-gate stages |

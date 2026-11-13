@@ -113,10 +113,9 @@ uv tool install ai-session-search && aise integrations install
 cargo install ai-session-search --locked && aise integrations install
 ```
 
-They stay two steps on purpose. `aise integrations install` runs only if the package install
-succeeded, so a failing package manager edits no client files, and keeping it a separate command
-is what gives it dry-run, status, per-client selection, durable recovery, and ownership-safe
-uninstall.
+The two commands stay separate so `aise integrations install` runs only if the package install
+succeeded. A failing package manager edits no client files. The separate integration command
+provides dry-run, status, per-client selection, durable recovery, and ownership-safe uninstall.
 
 ### Which executable the installer registers
 
@@ -359,7 +358,7 @@ claims to know whether a change was an intentional edit or corruption, because n
 carries that intent.
 
 Uninstall removes a skill directory only when every managed file is exactly what install recorded
-and nothing else lives in it. Any other state preserves the WHOLE directory and reports each
+and nothing else lives in it. Any other state preserves the whole directory and reports each
 reason: removing an unchanged `SKILL.md` while leaving your edited `aise-capability.toml` would orphan
 your file behind a skill that no longer declares itself. `--force-full-cleanup` deletes everything
 under one exact `--skill-root`, including files you wrote; it requires that root, refuses
