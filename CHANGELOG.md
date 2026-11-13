@@ -13,7 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.1.0] - 2026-11-11
 
-1.1.0 keeps indexed history when an agent rewrites or removes its transcript, finds recorded human
+1.1.0 keeps indexed history when an agent shortens or rewrites its transcript, finds recorded human
 input across message roles, and adds typed library routes for SQL, repeats, word counts, transcript
 reads, and resume commands. See the [library guide](docs/development/library-api.md) and
 [full diff](https://github.com/ahundt/ai-session-search/compare/v1.0.0...v1.1.0).
@@ -116,10 +116,11 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    answer in those alternatives.
 4. `aise vocab` remains callable as a hidden compatibility command. Use Python `vocabulary()` or
    Rust `AnalysisService::vocabulary` for word counts in applications.
-5. Ordinary unknown configuration keys are reported and ignored; access-restricting and search
-   policy tables remain strict. Upgrades preserve existing configuration without adding active
-   keys. Migration receipts, skill manifests, and native ownership receipts preserve additive
-   metadata; unsupported receipt versions fail before recovery writes.
+5. Unknown configuration keys in ordinary tables are reported and ignored, so a configuration
+   written for a newer release still loads; access-restricting and search policy tables remain
+   strict. Upgrades preserve existing configuration without adding active keys. Install records
+   written by a newer release keep their extra fields, and a record in an unsupported format
+   stops the command before it changes anything.
 6. MCP keeps `purpose` and `purpose_version` in its schema when no search presets are configured;
    configured presets supply the accepted purpose names.
    Server instructions name `aise files extract`, `aise export`, `aise analyze`, and `aise reindex`
@@ -183,10 +184,11 @@ reads, and resume commands. See the [library guide](docs/development/library-api
 
 ### Fixed
 
-1. Indexed history survives transcripts that shrink, are rewritten, change session id, or disappear.
-   Parser upgrades reconcile matching rows while preserving archived messages and file edits.
-   Codex compressed `.jsonl.zst` rollouts retain their identity; decompression failures preserve
-   an existing index snapshot and remain retryable.
+1. Indexed history survives transcripts that shrink, are rewritten, or change session id, as it
+   already did for transcripts that disappear. Parser upgrades reconcile matching rows while
+   preserving archived messages and file edits. Codex compressed `.jsonl.zst` rollouts retain
+   their identity; decompression failures preserve an existing index snapshot and remain
+   retryable.
 2. Literal and regex search find case pairs SQLite's tokenizer does not fold, including Cherokee,
    Georgian Mtavruli, Osage, and Adlam. A trailing `i` also matches dotted capital `İ`.
 3. Equal session/sequence or timestamp keys have a stable tie-breaker for search, corrections,
