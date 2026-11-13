@@ -851,7 +851,8 @@ pub struct FilesExtractArgs {
     #[arg(long, conflicts_with = "output_dir")]
     pub restore: bool,
     /// For one version, a directory to write into. With --all, the new directory to atomically
-    /// publish; it must not already exist. Omit to write to the current directory.
+    /// publish; it must not already exist. Omit for stdout, or for a `.recovered` sibling with
+    /// --restore.
     #[arg(long, short)]
     pub output_dir: Option<PathBuf>,
     /// Report what would happen without printing content or writing files.

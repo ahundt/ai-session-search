@@ -245,11 +245,11 @@ pub struct IntegrationTargetsArgs {
     /// manage only the discovered instruction files.
     #[arg(long = "claude-md")]
     pub claude_md_paths: Vec<PathBuf>,
-    /// Extra GEMINI.md path where the managed AI Session Search (`aise`) note is managed.
+    /// Extra GEMINI.md path for the managed AI Session Search (`aise`) note.
     /// Repeatable; omit to manage only the discovered instruction files.
     #[arg(long = "gemini-md")]
     pub gemini_md_paths: Vec<PathBuf>,
-    /// Extra AGENTS.md path where the managed AI Session Search (`aise`) note is managed.
+    /// Extra AGENTS.md path for the managed AI Session Search (`aise`) note.
     /// Repeatable; omit to manage only the discovered instruction files.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,

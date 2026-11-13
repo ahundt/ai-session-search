@@ -129,7 +129,7 @@ enum Commands {
     /// The span can contain gaps and is not continuous runtime.
     #[command(
         display_order = 10,
-        after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY` or select `--query-mode regex|fuzzy`."
+        after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY`; select `--query-mode regex|fuzzy` there."
     )]
     Search(SearchArgs),
     /// Print one session's transcript and metadata (bounded by default).
@@ -1523,8 +1523,8 @@ fn execute(cli: Cli) -> Result<()> {
                 {
                     return Err(anyhow!(
                         "aise export {id} does not accept corpus filters, --limit, or \
-                         --output-dir (those apply to multi-session export); drop --id to \
-                         export a filtered corpus, or drop --limit/--output-dir/filters to \
+                         --output-dir (those apply to multi-session export); omit the session ID \
+                         to export a filtered corpus, or drop --limit/--output-dir/filters to \
                          export just {id}"
                     ));
                 }
