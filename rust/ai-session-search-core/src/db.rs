@@ -524,7 +524,7 @@ fn correction_scope(filters: &MessageFilters) -> MessageFilters {
     filters.role = Some(Role::User);
     // A correction is what a PERSON told the agent. In a subagent transcript the `role='user'`
     // rows are the SPAWNING AGENT's delegation prompt, not anything a human typed, and
-    // subagents outnumber user-started sessions roughly five to one (models.rs SessionKind).
+    // subagent sessions can far outnumber user-started ones (models.rs SessionKind).
     // Leaving them in lets ordinary orchestrator instructions register as corrections --
     // `\bdon'?t forget\b` matches "don't forget to check the tests" exactly.
     //
@@ -9479,8 +9479,8 @@ mod tests {
 
         // `claude:other` is named by a run but is not itself a row, which is the ordinary case
         // rather than corruption: providers keep a run's transcript after the parent
-        // conversation is rotated away, and 69 of 69 unresolved parents in one project
-        // directory had no transcript left on disk. The run must still store and still select,
+        // conversation is rotated away, so a run can name a parent with no transcript left on
+        // disk. The run must still store and still select,
         // which is what makes that otherwise-unreachable work searchable.
         assert_eq!(
             ids(Some(vec![SessionKind::Subagent]), Some("claude:other")),
@@ -16699,7 +16699,8 @@ mod tests {
     }
 
     /// Add a message tied with an existing one on (session_id, seq) that also matches the needle,
-    /// so the published order has to break a tie. The live index holds three such groups.
+    /// so the published order has to break a tie. Indexes built from real sessions hold such
+    /// groups.
     #[cfg(test)]
     fn inject_tied_twin(db: &Db, seq: i64, needle: &str) {
         db.conn
@@ -18278,7 +18279,7 @@ mod tests {
     }
 
     // S14: a subagent transcript's `role='user'` rows are the SPAWNING AGENT's delegation prompt,
-    // not anything a person typed. Subagents outnumber user-started sessions ~5:1, and the
+    // not anything a person typed. Subagent sessions can far outnumber user-started ones, and the
     // built-in patterns match ordinary orchestrator text directly, so counting them turns routine
     // delegation into "the user corrected me". Narrowing by role alone is not enough.
     #[test]
@@ -20051,10 +20052,10 @@ mod tests {
 
     #[test]
     fn reindexing_a_shrunk_or_rewritten_source_keeps_every_stored_message() {
-        // Harnesses compact, rewrite and prune their own transcripts (Codex rewrote a 4,720-row
-        // session down to 74 records). The index is the archive: a re-parse that no longer
-        // holds a stored message must not delete it. New parse messages are appended after the
-        // highest stored seq.
+        // Harnesses compact, rewrite and prune their own transcripts (Codex has rewritten a long
+        // session down to a small fraction of its records). The index is the archive: a re-parse
+        // that no longer holds a stored message must not delete it. New parse messages are appended
+        // after the highest stored seq.
         use crate::models::MessageKind::Conversation;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -21431,8 +21432,8 @@ mod tests {
     #[test]
     fn vocabulary_prefix_selects_only_terms_starting_with_it() {
         // Without a prefix the only way to ask about one term is to read every term and filter
-        // outside SQLite: 1,591,051 rows and 22.7s against this author's index, versus 0.05s for
-        // the equivalent term-range query. The prefix has to reach the query, not the output.
+        // outside SQLite, which reads the whole vocabulary where a term-range query reads only
+        // the matching terms. The prefix has to reach the query, not the output.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         seed_messages(

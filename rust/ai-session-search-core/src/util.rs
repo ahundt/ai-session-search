@@ -3016,12 +3016,12 @@ pub(crate) mod tests {
             String::new(),
         );
         parsed.session.parent_session_id =
-            Some("claude:f330ed56-af97-4b90-a866-99f0a6e11117".to_string());
+            Some("claude:11111111-2222-4333-8444-555555555555".to_string());
         let error = with_stub_binary_on_path("claude", || resume_plan(&parsed.session))
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("claude --resume f330ed56-af97-4b90-a866-99f0a6e11117"),
+            error.contains("claude --resume 11111111-2222-4333-8444-555555555555"),
             "names the spawning session's resume command: {error}"
         );
         assert!(

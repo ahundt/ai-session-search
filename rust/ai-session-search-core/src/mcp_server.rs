@@ -13457,7 +13457,7 @@ mod tests {
     }
 
     /// A correction is what a PERSON told the agent. In a spawned run the `user` rows are the
-    /// calling agent's delegation prompt, and those outnumber user-started sessions ~5:1.
+    /// calling agent's delegation prompt, and such runs can far outnumber user-started sessions.
     #[test]
     fn run_skill_scans_user_started_sessions_unless_asked_for_more() {
         let (dir, db) = corrections_fixture();

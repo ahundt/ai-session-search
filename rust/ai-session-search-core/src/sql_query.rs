@@ -1842,7 +1842,7 @@ mod tests {
 
     #[test]
     fn full_text_indexes_and_their_vocabularies_are_internal_whatever_they_are_named() {
-        // The live index names its two fts5vocab views `messages_vocab` and
+        // The index names its two fts5vocab views `messages_vocab` and
         // `messages_trigram_terms`. A name-shaped rule hid the first and listed the second, so one
         // term-frequency view read as part of the documented schema and the other did not exist.
         let dir = tempfile::tempdir().unwrap();

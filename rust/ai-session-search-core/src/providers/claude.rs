@@ -740,7 +740,7 @@ impl ClaudeAdapter {
         // Rebinding on every line lets any later record retarget the whole file, and the
         // `on conflict(id) do update` upsert in db.rs would then overwrite the row that id
         // belongs to instead of storing this session. See codex.rs for the same guard, where
-        // an unguarded rebind cost 65 of 414 sessions.
+        // an unguarded rebind overwrote the rows of other sessions.
         let mut session_id_bound = false;
         // A subagent transcript's records all carry its PARENT's sessionId, so no record in it
         // may bind this session's id. Hold the binding shut and compose the id after the loop,
@@ -2629,7 +2629,7 @@ mod tests {
     // These four cases were previously asserted against `should_skip_message`, i.e. that the
     // records were discarded. They are now stored as `MessageKind::HarnessNotice` and excluded
     // at query time instead, because discarding them also removed the only evidence of what a
-    // hook told an agent: 82 of 82 "CANNOT STOP" records in one session were unsearchable.
+    // hook told an agent: every Stop-hook feedback record of a session was unsearchable.
     // Each test asserts the record is CLASSIFIED as a notice and NOT skipped, so a regression
     // to dropping fails here rather than silently emptying a category.
 

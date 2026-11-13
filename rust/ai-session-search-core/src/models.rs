@@ -1215,14 +1215,13 @@ impl SourceFile {
 /// Who started a session — the session-level counterpart of [`MessageKind`], selected the same
 /// way through a set rather than a flag per class.
 ///
-/// The two spellings are the providers' own. Codex stores this exact enum on its session
-/// metadata as `thread_source`, with the values `user` and `subagent` (167 and 247 of the 414
-/// rollouts this was checked against). `subagent` is what every provider that marks the concept
-/// calls it: codex's `thread_source` value and `source.subagent` key, the `subagents`
-/// directory claude and cursor both write, claude's `subagent_type` Task parameter, and
-/// gemini-cli's `subagent_N` author labels. `user` is the counterpart because it is the one
-/// reading no provider contradicts — and because a subagent IS an agent, so naming the other
-/// class `agent` would make `[agent]` unpredictable, while nothing about a subagent is a user.
+/// The two spellings are the providers' own. Codex stores this exact enum on its session metadata
+/// as `thread_source`, with the values `user` and `subagent`. `subagent` is what every provider
+/// that marks the concept calls it: codex's `thread_source` value and `source.subagent` key, the
+/// `subagents` directory claude and cursor both write, claude's `subagent_type` Task parameter, and
+/// gemini-cli's `subagent_N` author labels. `user` is the counterpart because it is the one reading
+/// no provider contradicts — and because a subagent IS an agent, so naming the other class `agent`
+/// would make `[agent]` unpredictable, while nothing about a subagent is a user.
 ///
 /// Derived from [`SessionRecord::parent_session_id`] rather than stored, so the classes are
 /// exhaustive by construction and no row can fall outside them. That is why selection needs no
