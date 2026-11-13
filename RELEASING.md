@@ -494,11 +494,18 @@ git rev-list -n1 vX.Y.ZrcN   # must equal the commit CI passed on
 
 **2. Find the run and watch it.**
 
-- Browser: `https://github.com/<owner>/<repo>/actions/workflows/publish.yml`, newest run.
+Select the run by the tag's commit. The newest run can belong to another tag or to a manual
+dispatch started in the meantime.
+
+- Browser: `https://github.com/<owner>/<repo>/actions/workflows/publish.yml`, the push run whose
+  commit is the one `git rev-list -n1 vX.Y.ZrcN` printed.
 - Commands:
 
 ```bash
-RID=$(gh run list --workflow publish.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+TAG_SHA=$(git rev-list -n1 vX.Y.ZrcN)
+RID=$(gh run list --workflow publish.yml --event push --limit 20 --json databaseId,headSha \
+  --jq ".[] | select(.headSha == \"$TAG_SHA\") | .databaseId" | head -n1)
+test -n "$RID"   # empty means the run has not started yet; wait and repeat
 gh run watch "$RID"
 gh run view "$RID" --json status,jobs \
   --jq '{status, waiting:[.jobs[]|select(.status=="waiting")|.name],
@@ -569,9 +576,25 @@ Editing a release body changes a public page; it does not change the tag or any 
 
 ## Post-release and recovery
 
-Install the published version into clean Cargo and Python environments. Verify `aise --version`,
-`aise package status`, a typed search, Python imports, MCP startup/EOF/cancellation, and database
-compatibility against an index written by the previous release.
+Install the published version into clean Cargo and Python environments, then run the checks
+below from a checkout of the tagged commit. `PYTHON` is the interpreter of the environment the
+package was installed into and `AISE` is the installed executable.
+
+```bash
+# Version, help, configuration contract, Python import, MCP initialize, tools/list and exit on EOF.
+PATH="$(dirname "$PYTHON"):$PATH" "$PYTHON" -I scripts/verify_installed_distribution.py \
+  --source-root "$PWD"
+# The same contract for a Cargo or native-archive executable, plus `aise package status`.
+"$PYTHON" -I scripts/verify_native_executable.py --executable "$AISE"
+# An index written by each published release opens, refreshes, and equals a fresh build.
+uv run --no-project python -m scripts.verify_upgrade_path --executable "$AISE"
+```
+
+Then upgrade your own installation, run one typed search against your own index, such as
+`aise messages search --query-mode regex 'fn \w+' --limit 3`, and confirm that a harness with the
+MCP server registered lists its tools. MCP cancellation is tested at the tagged commit by
+`cargo test -p ai-session-search --lib official_rmcp`; no script cancels a request against an
+installed executable.
 
 If a stage fails:
 
