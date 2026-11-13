@@ -494,17 +494,17 @@ git rev-list -n1 vX.Y.ZrcN   # must equal the commit CI passed on
 
 **2. Find the run and watch it.**
 
-Select the run by the tag's commit. The newest run can belong to another tag or to a manual
+Select the run by the tag and its commit. The newest run can belong to another tag or to a manual
 dispatch started in the meantime.
 
-- Browser: `https://github.com/<owner>/<repo>/actions/workflows/publish.yml`, the push run whose
-  commit is the one `git rev-list -n1 vX.Y.ZrcN` printed.
+- Browser: `https://github.com/<owner>/<repo>/actions/workflows/publish.yml`, the push run for
+  the tag, whose commit is the one `git rev-list -n1 vX.Y.ZrcN` printed.
 - Commands:
 
 ```bash
 TAG_SHA=$(git rev-list -n1 vX.Y.ZrcN)
-RID=$(gh run list --workflow publish.yml --event push --limit 20 --json databaseId,headSha \
-  --jq ".[] | select(.headSha == \"$TAG_SHA\") | .databaseId" | head -n1)
+RID=$(gh run list --workflow publish.yml --event push --branch vX.Y.ZrcN \
+  --json databaseId,headSha --jq ".[] | select(.headSha == \"$TAG_SHA\") | .databaseId" | head -n1)
 test -n "$RID"   # empty means the run has not started yet; wait and repeat
 gh run watch "$RID"
 gh run view "$RID" --json status,jobs \
@@ -581,10 +581,13 @@ below from a checkout of the tagged commit. `PYTHON` is the interpreter of the e
 package was installed into and `AISE` is the installed executable.
 
 ```bash
-# Version, help, configuration contract, Python import, MCP initialize, tools/list and exit on EOF.
+"$AISE" --version          # must print the released version
+"$AISE" package status     # must name the manager that installed it
+# The installed Python package, not the checkout: help, configuration contract, import, and
+# MCP initialize, tools/list and exit on EOF.
 PATH="$(dirname "$PYTHON"):$PATH" "$PYTHON" -I scripts/verify_installed_distribution.py \
   --source-root "$PWD"
-# The same contract for a Cargo or native-archive executable, plus `aise package status`.
+# The same command-line contract for a Cargo or native-archive executable, with isolated state.
 "$PYTHON" -I scripts/verify_native_executable.py --executable "$AISE"
 # An index written by each published release opens, refreshes, and equals a fresh build.
 uv run --no-project python -m scripts.verify_upgrade_path --executable "$AISE"
