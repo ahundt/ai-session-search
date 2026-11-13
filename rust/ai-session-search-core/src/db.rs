@@ -11146,8 +11146,9 @@ mod tests {
 
     #[test]
     fn read_session_messages_edge_cases_from_the_premortem_catalog() {
-        // Covers failure modes F6-F14 from
-        // notes/2026_07_20_2230_read_capability_premortem_and_failure_modes.md.
+        // Edge cases of a session read, labelled F6-F14 below: inclusive range endpoints, a range
+        // combined with a limit or offset, an offset or range past the end, an inverted range, a
+        // role with no matches, and a single-message session.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
