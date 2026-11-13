@@ -2006,9 +2006,26 @@ impl Db {
         })
     }
 
-    /// Reclaim free pages to the OS by rewriting the database file (`VACUUM`). Run AFTER
-    /// [`Db::optimize_fts`]: VACUUM repacks page bytes but does NOT merge FTS5 segments, so optimize
-    /// must logically compact the index first (the documented OPTIMIZE → VACUUM order). VACUUM takes
+    /// Rebuild derived postings from message content, removing live delete flags that FTS5
+    /// optimize preserves. Explicit maintenance only: O(B + P) tokenization/I/O for B content
+    /// bytes and P emitted postings across the entire index, regardless of rows just refreshed.
+    /// SQLite streams through its bounded pager/FTS buffers; rollback preserves the old indexes.
+    pub(crate) fn rebuild_fts(&self) -> Result<()> {
+        self.with_immediate_transaction(|| {
+            self.conn
+                .execute_batch("insert into messages_fts(messages_fts) values('rebuild');")?;
+            if self.schema_version()? >= 4 {
+                self.conn.execute_batch(
+                    "insert into messages_trigram(messages_trigram) values('rebuild');",
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Reclaim free pages to the OS by rewriting the database file (`VACUUM`). The compaction
+    /// service rebuilds postings first: VACUUM repacks pages but does not remove FTS5 delete flags.
+    /// VACUUM takes
     /// an exclusive lock and needs up to ~2x the database size in free disk while it runs, and cannot
     /// run inside a transaction — `execute_batch` runs it in autocommit.
     pub fn vacuum(&self) -> Result<()> {
@@ -6868,12 +6885,18 @@ fn update_message_row(
         );
     }
     let correlation = message.provenance.correlation_identity.as_ref();
+    // Naming content in an UPDATE fires FTS delete/insert triggers even when text is unchanged.
+    // Keep metadata repairs out of both full-text indexes; actual text changes remain atomic.
+    tx.execute(
+        "update messages set content=?1 where id=?2 and content is not ?1",
+        params![message.content, message_id],
+    )?;
     tx.execute(
         "update messages set provider = ?1, role = ?2, ts = ?3, tool_name = ?4,
-         kind = ?5, tool_call_id = ?6, is_compaction = ?7, content = ?8,
-         authorship = ?9, correlation_authority = ?10, correlation_scope = ?11,
-         correlation_id = ?12, input_delivery_state = ?13, input_origin = ?14,
-         record_relation = ?15 where id = ?16",
+         kind = ?5, tool_call_id = ?6, is_compaction = ?7,
+         authorship = ?8, correlation_authority = ?9, correlation_scope = ?10,
+         correlation_id = ?11, input_delivery_state = ?12, input_origin = ?13,
+         record_relation = ?14 where id = ?15",
         params![
             session.provider.as_str(),
             message.role.as_str(),
@@ -6882,7 +6905,6 @@ fn update_message_row(
             message.kind.as_str(),
             message.tool_call_id,
             message.is_compaction as i64,
-            message.content,
             message.provenance.authorship.as_str(),
             correlation.map(|value| value.authority.as_str()),
             correlation.map(|value| value.scope.as_str()),

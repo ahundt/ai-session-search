@@ -111,9 +111,10 @@ enum Commands {
     /// Use `aise doctor` to see what is already indexed or diagnose indexing failures.
     #[command(display_order = 21)]
     Reindex(ReindexArgs),
-    /// Reclaim disk space: merge FTS segments, `VACUUM`, then truncate the WAL.
+    /// Reclaim disk space: rebuild full-text indexes, `VACUUM`, then truncate the WAL.
     ///
-    /// Use `aise doctor` first to see whether the index is large enough to be worth compacting.
+    /// Scans and rewrites the whole index under the writer lock; allow up to twice its size in
+    /// temporary disk space. Use `aise doctor` first to inspect storage.
     #[command(display_order = 42)]
     Compact,
     /// List recent sessions, optionally intersecting their known spans with a date period.
@@ -1607,7 +1608,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Compact => {
             let before = db.storage_allocation()?.total_bytes;
             eprintln!(
-                "aise: compacting index ({}) — optimize + vacuum + wal checkpoint…",
+                "aise: compacting index ({}) — rebuild full-text indexes + vacuum + wal checkpoint…",
                 mib(before)
             );
             let outcome = app.maintenance().compact()?;

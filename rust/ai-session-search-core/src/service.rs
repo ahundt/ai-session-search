@@ -2381,12 +2381,14 @@ impl<'app> MaintenanceService<'app> {
         crate::diagnostics::collect(self.config, self.db)
     }
 
-    /// Merge FTS segments, rebuild the database, and checkpoint the WAL while
-    /// holding the same process lock used by index writers.
+    /// Rebuild FTS postings and the database, then checkpoint the WAL while
+    /// holding the same process lock used by index writers. Work is O(B + P + D) for all message
+    /// bytes B, emitted postings P, and database bytes D, with SQLite's streaming buffers and up
+    /// to roughly 2D temporary disk space. Interrupted transactions recover through SQLite.
     pub fn compact(&self) -> Result<CompactOutcome> {
         indexer::with_index_update_lock(self.config, || {
             let before_bytes = self.db.storage_allocation()?.total_bytes;
-            self.db.optimize_fts()?;
+            self.db.rebuild_fts()?;
             self.db.vacuum()?;
             self.db.checkpoint_truncate()?;
             Ok(CompactOutcome {

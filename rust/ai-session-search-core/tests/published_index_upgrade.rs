@@ -250,3 +250,94 @@ fn published_queue_notifications_match_fresh_without_losing_archive() {
         }
     }
 }
+
+#[test]
+fn published_metadata_refresh_keeps_full_text_size_near_fresh() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let sources = dir.path().join("sources");
+    std::fs::create_dir_all(sources.join("claude")).unwrap();
+    let records: Vec<_> = (0..2048)
+        .map(|i| {
+            let content = format!(
+                "synthetic migration record {i} {}end",
+                "searchable notification payload ".repeat(16)
+            );
+            json!({"type":"user","uuid":format!("input-{i}"),"sessionId":"upgrade-claude",
+            "timestamp":"2026-06-01T10:00:00Z","message":{"role":"user","content":content}})
+        })
+        .collect();
+    std::fs::write(
+        sources.join("claude/session.jsonl"),
+        records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let fresh_config = config(&dir.path().join("fresh"), &sources);
+    let fresh = SessionSearch::open(fresh_config.clone()).unwrap();
+    fresh.index().reindex_report(false).unwrap();
+    drop(fresh);
+    let sizes = |path: &Path| {
+        let conn = Connection::open(path).unwrap();
+        ["messages_fts", "messages_trigram"].map(|table| {
+            conn.query_row(
+                "select coalesce(sum(pgsize),0) from dbstat where name glob ?1",
+                [format!("{table}_*")],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        })
+    };
+    let expected = sizes(&fresh_config.db_path());
+    for full in [false, true] {
+        let root = dir.path().join(if full { "full" } else { "incremental" });
+        std::fs::create_dir_all(&root).unwrap();
+        let config = config(&root, &sources);
+        let mut conn = Connection::open(config.db_path()).unwrap();
+        conn.execute_batch(
+            &include_str!("fixtures/v1_0_0_populated.sql")
+                .replace("@SOURCES@", &sources.to_string_lossy().replace('\'', "''")),
+        )
+        .unwrap();
+        conn.execute_batch("delete from messages; delete from transcripts; delete from file_edits; delete from sessions where provider='codex';").unwrap();
+        let tx = conn.transaction().unwrap();
+        for (i, record) in records.iter().enumerate() {
+            tx.execute("insert into messages(session_id,provider,seq,role,ts,kind,content,authorship,record_relation,correlation_authority,correlation_scope,correlation_id) values ('claude:upgrade-claude','claude',?1,'user','2026-06-01T10:00:00+00:00','conversation',?2,'human','original','anthropic','claude:upgrade-claude',?3)", rusqlite::params![i as i64,record["message"]["content"].as_str().unwrap(),record["uuid"].as_str().unwrap()]).unwrap();
+        }
+        tx.commit().unwrap();
+        conn.execute_batch("insert into messages_fts(messages_fts) values('rebuild'); insert into messages_trigram(messages_trigram) values('rebuild');").unwrap();
+        drop(conn);
+        let upgraded = SessionSearch::open(config.clone()).unwrap();
+        upgraded.index().reindex_report(full).unwrap();
+        drop(upgraded);
+        for (observed, fresh) in sizes(&config.db_path()).into_iter().zip(expected) {
+            assert!(
+                observed <= fresh * 110 / 100 + 65536,
+                "full={full} FTS bytes: upgraded={observed} fresh={fresh}"
+            );
+        }
+        assert_eq!(
+            snapshot(&config.db_path()),
+            snapshot(&fresh_config.db_path())
+        );
+        // Repeated in-place text updates leave delete flags even after FTS5 optimize.
+        let conn = Connection::open(config.db_path()).unwrap();
+        conn.execute_batch(
+            "update messages set content=content; update messages set content=content;",
+        )
+        .unwrap();
+        drop(conn);
+        let app = SessionSearch::open(config.clone()).unwrap();
+        app.maintenance().compact().unwrap();
+        drop(app);
+        for (observed, fresh) in sizes(&config.db_path()).into_iter().zip(expected) {
+            assert!(
+                observed <= fresh * 110 / 100 + 65536,
+                "compact full={full} FTS bytes: upgraded={observed} fresh={fresh}"
+            );
+        }
+        assert_eq!(
+            snapshot(&config.db_path()),
+            snapshot(&fresh_config.db_path())
+        );
+    }
+}

@@ -582,8 +582,8 @@ fn full_reindex_optimizes_fts_without_breaking_search() {
 }
 
 #[test]
-fn compact_optimize_then_vacuum_preserves_data_and_search() {
-    // `compact` = Db::optimize_fts(), Db::vacuum(), then Db::checkpoint_truncate().
+fn compact_rebuild_then_vacuum_preserves_data_and_search() {
+    // `compact` rebuilds FTS postings, vacuums, then checkpoints the WAL.
     // VACUUM rewrites the file and the WAL checkpoint folds WAL pages back into the main DB; this
     // must not corrupt the index: message rows, FTS sync, and search results must all survive.
     let dir = tempfile::tempdir().unwrap();
@@ -608,7 +608,7 @@ fn compact_optimize_then_vacuum_preserves_data_and_search() {
     assert_eq!(
         db.messages_fts_count().unwrap(),
         before,
-        "external-content FTS stays in sync through optimize+vacuum+checkpoint"
+        "external-content FTS stays in sync through rebuild+vacuum+checkpoint"
     );
     let hits = db
         .search_messages("substantive", &MessageFilters::default())
