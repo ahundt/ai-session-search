@@ -56,6 +56,7 @@ def test_upgrade_root_cleanup_depends_on_child_shutdown(tmp_path: Path, monkeypa
         raise error("test failure")
 
     monkeypatch.setattr(verify_upgrade_path, "_run", fail)
+    monkeypatch.setattr(verify_upgrade_path, "check_populated_upgrade", lambda *_: [])
     try:
         with pytest.raises(verify_upgrade_path.UpgradeCheckUnavailable) as caught:
             verify_upgrade_path.check_upgrade("1.0.1", tmp_path / "aise")
@@ -185,3 +186,28 @@ def test_archive_fixture_checks_shrink_rewrite_edits_and_injected_rows() -> None
         assert verify_upgrade_path.archive_evidence(database) == {
             "shrink": True, "rewrite": True, "file_edits": True, "injected_rows": True,
         }
+
+
+@pytest.mark.parametrize("mutation", [
+    "update messages set input_origin='queued' where id=(select min(id) from messages)",
+    "update messages set seq=seq+10 where id=(select min(id) from messages)",
+    "update messages set content='different' where id=(select min(id) from messages)",
+    "update file_edits set new_content='different'",
+    "update file_edits set seq=seq+10",
+    "update transcripts set transcript_text='different'",
+])
+def test_populated_comparison_detects_content_order_edits_text_and_provenance(
+    tmp_path: Path, mutation: str,
+) -> None:
+    import sqlite3
+
+    database = tmp_path / "index.db"
+    fixture = verify_upgrade_path.UPGRADE_FIXTURES / "v1_0_0_populated.sql"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(fixture.read_text())
+        connection.executescript("alter table messages add column input_origin text; "
+                                 "alter table messages add column input_delivery_state text;")
+    expected = verify_upgrade_path.populated_index_snapshot(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(mutation)
+    assert verify_upgrade_path.populated_index_snapshot(database) != expected

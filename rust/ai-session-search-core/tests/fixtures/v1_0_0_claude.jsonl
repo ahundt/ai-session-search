@@ -1,0 +1,3 @@
+{"type": "user", "sessionId": "upgrade-claude", "uuid": "input", "timestamp": "2026-06-01T10:00:00Z", "cwd": "/fixture/project", "message": {"role": "user", "content": "synthetic upgrade question"}}
+{"type": "assistant", "sessionId": "upgrade-claude", "uuid": "write", "timestamp": "2026-06-01T10:01:00Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "write-1", "name": "Write", "input": {"file_path": "/fixture/project/saved.txt", "content": "synthetic saved file"}}]}}
+{"type": "user", "sessionId": "upgrade-claude", "uuid": "result", "timestamp": "2026-06-01T10:02:00Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "write-1", "content": "written"}]}}

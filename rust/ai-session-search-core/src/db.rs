@@ -1000,16 +1000,26 @@ impl Db {
             "select not exists(select 1 from index_metadata where key=?1)
                 or exists(select 1 from sqlite_schema where name in ('idx_messages_session','idx_messages_role'))",
             [SESSIONS_FTS_RETIRED_KEY], |row| row.get::<_, bool>(0))?;
-        if generation >= 5
+        let preparation = if generation >= 5
             && !legacy_maintenance
             && crate::indexer::current_schema_layout_problem(&db.conn)?.is_none()
         {
             if generation == 5 {
-                db.with_open_writer_permit(path, || db.promote_compatibility())?;
+                db.with_open_writer_permit(path, || db.promote_compatibility())
+            } else {
+                Ok(())
             }
         } else {
-            db.with_open_writer_permit(path, || db.init())?;
-        }
+            db.with_open_writer_permit(path, || db.init())
+        };
+        preparation.with_context(|| {
+            format!(
+                "failed to upgrade index {}; stop aise processes and retry `aise reindex --full`; \
+             if the failure persists, move this index and its -wal/-shm files aside, \
+             then run `aise reindex --full` to rebuild from available sources",
+                path.display()
+            )
+        })?;
         Ok(db)
     }
 
@@ -1267,7 +1277,7 @@ impl Db {
         Ok(value)
     }
 
-    /// Metadata-only promotion; callers hold the existing cross-process writer permit.
+    /// Additive storage and compatibility promotion; callers hold the cross-process writer permit.
     fn promote_compatibility(&self) -> Result<()> {
         self.with_immediate_transaction(|| {
             if self.schema_version()? != 5 {
@@ -1277,6 +1287,8 @@ impl Db {
                 crate::indexer::current_schema_layout_problem(&self.conn)?.is_none(),
                 "schema generation 5 requires layout repair before compatibility promotion"
             );
+            ensure_message_input_provenance_storage(&self.conn)?;
+            self.ensure_column("files_seen", "file_identity", "file_identity text")?;
             self.conn.execute_batch(
                 "insert into index_metadata(key,value) values
                 ('minimum_reader_compatibility',1), ('minimum_writer_compatibility',1)
@@ -7419,12 +7431,20 @@ fn take_retracted_rows(
     if retracted.is_empty() {
         return Vec::new();
     }
+    let mut by_native_content =
+        HashMap::<(RowDigest, RowDigest), std::collections::VecDeque<usize>>::new();
     let mut by_columns: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
     let mut by_role_and_content: HashMap<RowDigest, std::collections::VecDeque<usize>> =
         HashMap::new();
     for (position, (_, keys)) in stored.iter().enumerate() {
         if matched[position] {
             continue;
+        }
+        if let Some(identity) = keys.correlation {
+            by_native_content
+                .entry((identity, keys.role_and_content))
+                .or_default()
+                .push_back(position);
         }
         by_columns
             .entry(keys.columns_without_seq)
@@ -7453,7 +7473,15 @@ fn take_retracted_rows(
     let mut taken = Vec::new();
     let mut loose = Vec::new();
     for keys in &keys {
-        match take(by_columns.get_mut(&keys.columns_without_seq), matched) {
+        // Additive provenance defaults can differ from the earlier rendering. The same native
+        // record and role/content still prove that this is the declined row, not archived text.
+        let native = keys.correlation.and_then(|identity| {
+            take(
+                by_native_content.get_mut(&(identity, keys.role_and_content)),
+                matched,
+            )
+        });
+        match native.or_else(|| take(by_columns.get_mut(&keys.columns_without_seq), matched)) {
             Some(position) => taken.push(stored[position].0),
             None => loose.push(keys.role_and_content),
         }
