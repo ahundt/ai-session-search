@@ -60,7 +60,6 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    `candidates`) must use rusqlite 0.41 connections, available through
    `ai_session_search::rusqlite` without a separate dependency. Replace these helpers with
    `IndexService::reindex_report` for index preparation and `MessageService::search` for queries.
-
 8. An upgraded index can stay larger on disk than one built fresh, because the refresh leaves
    unused pages behind. Running `aise compact` once after the first refresh is optional and
    reclaims that space. It rebuilds the full-text indexes and rewrites the database while holding
