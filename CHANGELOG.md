@@ -119,8 +119,8 @@ reads, and resume commands. See the [library guide](docs/development/library-api
 5. Unknown configuration keys in ordinary tables are reported and ignored, so a configuration
    written for a newer release still loads; access-restricting and search policy tables remain
    strict. Upgrades preserve existing configuration without adding active keys. Install records
-   written by a newer release keep their extra fields, and a record in an unsupported format
-   stops the command before it changes anything.
+   written by a newer release keep their extra fields, and migration recovery refuses a receipt
+   in an unsupported format before it writes anything.
 6. MCP keeps `purpose` and `purpose_version` in its schema when no search presets are configured;
    configured presets supply the accepted purpose names.
    Server instructions name `aise files extract`, `aise export`, `aise analyze`, and `aise reindex`
