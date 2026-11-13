@@ -2542,7 +2542,7 @@ fn print_doctor(
         );
     }
     // Stated as a consequence, not as a bare count: the reason this mattered is that a reader
-    // seeing only "discovered 414 / indexed 349" concluded the index was healthy.
+    // showing only discovered and indexed counts can conceal identity collisions.
     if status.unindexed_files > 0 {
         println!(
             "Unindexed: {} discovered file(s) produced no session, so their content is \

@@ -251,9 +251,8 @@ impl MessageOrder {
     /// The published message order as a SQL clause, for a statement whose `messages` row is
     /// aliased `m`.
     ///
-    /// `(session_id, seq)` does not identify a message. A live 5,736,231-row index holds three
-    /// groups tied on it, and `idx_messages_session_seq` is not unique, so the row id ends the
-    /// clause and makes the order total. Three properties depend on that:
+    /// `(session_id, seq)` is not unique, so the row ID ends the clause and makes the order
+    /// total. Three properties depend on that:
     ///
     /// - Offset pagination stays coherent. Every page is its own query, so a tie free to come
     ///   back in either order can drop a row between two pages or repeat it in both.
@@ -378,27 +377,16 @@ const SQLITE_MMAP_BYTES: i64 = 256 * 1_024 * 1_024;
 /// Trigram candidates a limited content page needs before it takes its order from
 /// `idx_messages_session_seq` instead of sorting every verified candidate.
 ///
-/// Both plans return the same rows in the same order; they differ in how much they verify. Sorting
-/// rows that carry `content` cannot emit row 1 until the last candidate is verified, so its cost is
-/// `candidates x verify`, measured at 64-133 us per candidate across five queries spanning 15 K to
-/// 1.2 M candidates on a 5.7 M-message index. Taking the order from the index stops at `limit`
-/// matches, and its worst case -- fewer matches than the limit, so the scan reaches the end of the
-/// corpus -- is one full index scan, measured at 511 ms warm for 5.7 M rows.
-///
-/// So the index-ordered plan wins whenever `candidates x verify` exceeds a full index scan, and the
-/// floor is where those meet: 511 ms / 100 us is about 5 K candidates. Below it the sort is already
-/// cheap and the scan would be pure overhead (measured 60 ms against 371 ms at 5 candidates); above
-/// it the saving grows without bound (`aise messages search "session"` verified 1,216,643 candidates
-/// in 77.5 s to return 50 rows). The floor is deliberately the break-even point rather than a
-/// safety margin above it, because the loss below it is bounded by one index scan while the gain
-/// above it is not bounded at all.
+/// Both plans preserve result membership and order. Sorting verifies every candidate before
+/// emitting a page; index order can stop once the page is full. The floor avoids paying for
+/// a full index walk when a small candidate set is cheap to sort.
 const ORDERED_PAGE_CANDIDATE_FLOOR: i64 = 5_000;
 
 /// Partial covering index over the classes the default search predicate can exclude
 /// ([`crate::models::MessageKind::EXCLUDABLE_BY_DEFAULT`]). It exists for one statement: the
 /// receipt's corpus denominator, `count(rows the structural filters admit)`, whose class clause
 /// is `kind != 'harness_notice'`. No index answers a `!=` without visiting rows, and the message
-/// rows carry the bodies, so that count read every page of a 22.6 GB table (117 s). Written as
+/// rows carry the bodies, so a table scan also reads content pages. Written as
 /// `count(every class) - count(only the excluded classes)`, the first term is served by the
 /// index that leads with the selected filter column and the second by this one: it leads with
 /// `kind` and carries every column a structural filter tests, so both terms are index-only.
@@ -409,7 +397,7 @@ const ORDERED_PAGE_CANDIDATE_FLOOR: i64 = 5_000;
 /// walks with a seek plus a temp B-tree sort (checked with `explain query plan` against a
 /// replica of the production schema and `sqlite_stat1`). A partial index is usable only when the
 /// query text implies its `where` clause, so no other statement can pick it, and it holds
-/// 2 % of the rows. That implication is textual: [`excluded_kinds_predicate`] renders the one
+/// only the excluded classes. That implication is textual: [`excluded_kinds_predicate`] renders the one
 /// clause both the DDL and the count use.
 ///
 /// Built by [`Db::ensure_message_kind_index`]: at open only while the table is empty,
@@ -1650,8 +1638,7 @@ impl Db {
         self.conn.execute_batch(MESSAGE_INPUT_INDEXES_SQL)?;
         // `sessions_fts` (an FTS5 copy of every title, summary, preview, and transcript) stopped
         // being read on 2026-07-22, when session search moved to scoring the complete corpus, and
-        // stayed maintained: on one real index it held 464 MB (a second copy of every transcript
-        // plus its tokens) and every session upsert re-tokenized the whole transcript into it. This
+        // stayed maintained, duplicating transcript storage and tokenization. This
         // build writes nothing into it. It is retired in place rather than removed: an aise before
         // 1.0.0rc2 on the same machine (a pinned MCP registration, a second package manager)
         // requires the table in its layout check, refuses existing-only reads without it, and on a
@@ -1739,10 +1726,9 @@ impl Db {
         // turns substring and regex-literal anchors into indexed candidate queries that exact
         // literal or Rust regex verification checks afterward. This is the custom, parallel-built
         // [`crate::trigram_index`] — NOT an FTS5 virtual table — because FTS5's trigram tokenizer
-        // builds single-threaded inside the one SQLite writer, which is ~80% of a cold build
-        // (measured ~145 s for 1.8 GB of content). The custom index tokenizes with Rayon and
-        // bulk-loads compact delta-varint postings: ~5x faster build, same on-disk size, sub-3 ms
-        // candidate queries. It is built LAZILY on first eligible message content search
+        // builds single-threaded inside the SQLite writer. The custom index tokenizes with Rayon
+        // and bulk-loads compact delta-varint postings. It is built lazily on the first eligible
+        // message content search
         // ([`Db::ensure_trigram_base`]), so `reindex` does NO trigram work and
         // `list`/`show`/`paths`/`resume` never pay for it.
         if self.schema_version()? < 4 {
@@ -2003,8 +1989,7 @@ impl Db {
 
     /// Merge each FTS5 index's b-tree segments into one (the `'optimize'` command). A full reindex
     /// deletes and reinserts every message, which leaves `messages_fts` with many unmerged segments
-    /// — measured to roughly DOUBLE its on-disk size (≈1.0 GB → ≈2.0 GB on a 637k-message corpus)
-    /// and to slow queries. `'optimize'` merges them, freeing the redundant pages (reused by later
+    /// and can slow queries. `'optimize'` merges them, freeing redundant pages (reused by later
     /// writes, or returned to the OS by a one-time `VACUUM`). Call ONLY after a full reindex: it
     /// rewrites the whole index, so it must never run on the per-command incremental path. The cost
     /// is in `messages_fts`, amortized over a rare full rebuild.
@@ -3768,27 +3753,12 @@ impl Db {
     ///
     /// Both plans return the same rows in the same order. The index-ordered one also lets
     /// SQLite honor `LIMIT` while scanning, so the verifier runs on the rows up to the last match
-    /// kept rather than on every candidate: measured 601 calls against 26,828 for
-    /// `"permission denied"`, 50 against 14,930 for `"tool_use"`, with identical rows.
+    /// kept rather than on every candidate.
     ///
-    /// Each condition excludes a case measured to lose:
-    ///
-    /// * **A finite limit.** With `--all-results` there is nothing to stop early for, so the scan
-    ///   is pure overhead: 2,060 ms sorted against 2,503 ms index-ordered.
-    /// * **Oldest-first.** Newest-first asks for `session_id` ascending and `seq` descending, which
-    ///   no all-ascending index supplies; steering it keeps a sort anyway
-    ///   (`USE TEMP B-TREE FOR LAST TERM OF ORDER BY`) and pays the scan on top.
-    /// * **A content trigram prefilter.** Without one there is no candidate set to stop against,
-    ///   and the membership test SQLite builds a Bloom filter for is what makes the scan cheap.
-    /// * **[`ORDERED_PAGE_CANDIDATE_FLOOR`] candidates.** Below it the sort is already cheap and
-    ///   the scan is overhead: 60 ms against 371 ms at 5 candidates.
-    /// * **No class or path predicate.** `append_message_filters` writes its predicates before the
-    ///   verifier, so they already short-circuit today's plan, and the index stores neither, so
-    ///   the scan pays a table lookup per row to evaluate them. Worse, narrowing to a minority
-    ///   class cuts match density, so the scan walks proportionally further for the same page:
-    ///   `--role user` measured 395 ms sorted against 802 ms index-ordered. Majority-class values
-    ///   were level (`--role assistant` 0.95x, `--provider claude` 1.04x), and which value is a
-    ///   minority cannot be known without counting it, so the whole family stands aside.
+    /// A finite oldest-first page and a content trigram prefilter are required. The ascending
+    /// session/sequence index cannot satisfy newest-first order. Class and path predicates
+    /// need table lookups and can reduce match density, so those queries retain the sorted plan.
+    /// Small candidate sets also keep sorting to avoid the overhead of an index walk.
     ///
     /// Cost, for `P` postings read by the trigram query, `C` candidates it yields, `M` verified
     /// matches, `L` + `O` the page's limit plus offset, `N` rows in the index, and `k` the index
@@ -3799,17 +3769,15 @@ impl Db {
     /// * Index-ordered plan: O(P + k + candidates before position k · verify) time, and peak
     ///   memory O(C) for the candidate membership set plus O(L + O) emitted rows. `k` is at most
     ///   `N`, so the worst case, matches clustered at the end of the order, is one index walk
-    ///   (511 ms warm for 5.7 M rows), and that is the loss the floor below bounds.
+    ///   and that is the loss the floor below bounds.
     /// * This decision: O(min(C, [`ORDERED_PAGE_CANDIDATE_FLOOR`])) postings for the probe, and
     ///   O(1) memory.
     ///
     /// Offset paging re-verifies earlier pages on both plans: page `p` of width `L` costs as much as
     /// one page of width `p · L`.
     ///
-    /// A time window is deliberately NOT excluded: it reduces the rows admitted without reducing
-    /// match density in a corpus whose rows are mostly recent, and it measured 1.29x at `--since 3d`
-    /// and 10.48x at `--since 1y`. `session_id` and the `seq` bounds are not excluded either,
-    /// because they are this index's own leading columns.
+    /// Time, session, and sequence bounds can still use the ordered index; session and sequence
+    /// are its leading columns.
     fn ordered_page_index_hint(
         &self,
         filters: &MessageFilters,
@@ -3845,12 +3813,7 @@ impl Db {
     /// Whether the content trigram prefilter admits more than `floor` candidates.
     ///
     /// The inner `limit` stops the doclist intersection at `floor + 1` rowids, so this costs
-    /// O(floor) rather than O(candidates) and is cheapest exactly where the answer matters most:
-    /// measured 0.5 ms for a needle with 741,429 candidates and 1.1 ms for one with 1,216,643,
-    /// against 42-75 ms for selective needles whose doclists must be walked further to reach the
-    /// floor. The exact count is never needed, only which side of the floor it falls on, so
-    /// [`Db::fts5_candidate_count`] (which is O(candidates) and applies the filters) is the wrong
-    /// tool here even though it answers a similar-looking question.
+    /// O(floor) rather than O(candidates), with constant memory for the bounded count.
     fn trigram_candidates_reach(&self, fts_query: &str, floor: i64) -> Result<bool> {
         let reached: i64 = self.conn.query_row(
             "select count(*) from (
@@ -4284,12 +4247,7 @@ impl Db {
     /// or SQLite's smallest index for `count(*)`); the second by [`MESSAGE_KIND_INDEX`], which
     /// leads with `kind` and carries every column a structural filter tests. Time is
     /// `O(F + E)` index entries for `F` rows matching the structural filters and `E` rows of the
-    /// excluded classes (2 % of a real index), never `O(N)` message-row page reads. Measured on
-    /// a 22.6 GB / 2.69 M-row index: the previous single `!=` statement scanned every row in
-    /// 117 s; the decomposition reads ~80 MB of index pages in ≈5 s cold and well under a
-    /// second warm. When [`MESSAGE_KIND_INDEX`] is absent (an index an older aise wrote, before
-    /// its elected writer's next refresh builds it), the second term falls back to the row scan
-    /// with the same result. See [`Db::corpus_count_statements`] for the exact statements.
+    /// excluded classes, without reading message content pages.
     fn filtered_corpus_count(&self, filters: &MessageFilters) -> Result<i64> {
         self.corpus_count_with_base("1 = 1", filters)
     }
@@ -4938,14 +4896,8 @@ impl Db {
     /// categories in declaration order, first match wins — so `other` must be last).
     /// `filters.limit == 0` means unlimited.
     ///
-    /// Corrections are intrinsically scoped to `role = 'user'` — the user's own prompts, a small
-    /// slice of the corpus (≈7.7k rows / ~10 MB on the real index vs 628k total). A direct regex
-    /// scan of that slice is milliseconds. We deliberately do NOT route this through the trigram
-    /// prefilter: the correction keywords ("wrong", "stop", "actually", …) have very common
-    /// trigrams, so a prefilter `MATCH` would scan a large fraction of the multi-GB trigram index
-    /// (95% of which is tool output the `role='user'` filter then discards) AND trigger its lazy
-    /// build — measured ~21 s, strictly slower than scanning the user rows outright. The structural
-    /// `role='user'` filter is the selective one here, so we lean on it alone.
+    /// Corrections scan eligible user input directly. Their common keywords would admit many
+    /// irrelevant tool-output trigrams and could trigger an unrelated lazy index build.
     #[cfg(test)]
     pub(crate) fn find_corrections(
         &self,
@@ -7119,8 +7071,7 @@ fn merge_transcripts<'a>(
 /// The next free message seq of a session: one past the highest stored, so no seq is reused
 /// after a gap. Pinned to idx_messages_session_seq, SQLite answers with one O(log N) seek;
 /// folded into a `count(*)` it shared that statement's O(session rows) scan of a covering index
-/// whose second column is not seq (measured on a 40,180-row session: 2.16 ms against 1.30 ms
-/// for the count alone; this form adds 0.002 ms).
+/// whose second column is not seq. Keep the maximum-sequence seek separate from row counting.
 fn next_message_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> {
     Ok(tx.query_row(
         "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
@@ -9357,9 +9308,7 @@ mod tests {
         assert!(ids(Some("2026-03-12T00:00:00+00:00"), None).is_empty());
     }
 
-    /// Subagent runs outnumber the sessions that spawned them — 4,051 against 858 user-started
-    /// claude sessions on the machine this was built against — so selecting a class has to
-    /// work, and the default has to return both rather than quietly halving the index.
+    /// Session-kind filters select user-started or spawned work; the default includes both.
     #[test]
     fn session_kinds_select_user_started_runs_or_both() {
         let dir = tempfile::tempdir().unwrap();
@@ -16617,7 +16566,7 @@ mod tests {
         let needle = "permission denied";
         let db = db_with_candidate_rows(dir.path(), needle, 6_000);
         // A tied (session_id, seq) pair that both match, placed where a 50-row page must include
-        // it. The real index has three such groups across 5.7 M rows.
+        // it, so the test exercises a tie inside the returned page.
         db.conn
             .execute_batch(
                 "insert into messages(session_id, provider, seq, role, ts, content) \
@@ -16672,7 +16621,7 @@ mod tests {
         // The published SQL order must be total, which this asserts of the clause itself: the
         // display reversal in `read_session_messages` sits above it, so a caller never sees this
         // descending sequence directly. (session_id, seq) does not identify a message -- the live
-        // index holds three tied groups across 5,736,231 rows and idx_messages_session_seq is not
+        // index can hold tied groups and idx_messages_session_seq is not
         // unique -- and reversing only the key left a tie in ascending row order in both
         // directions. Observed on a four-row table tied at ids 20 and 21: oldest [10, 20, 21, 30],
         // newest [30, 20, 21, 10], where the reverse of oldest is [30, 21, 20, 10].
@@ -17113,7 +17062,7 @@ mod tests {
         };
         assert!(
             !with(|f| f.role = Some(crate::models::Role::User)),
-            "a role filter must keep the sort: --role user measured 395 ms against 802 ms"
+            "a role filter must keep the sort to avoid low-density index walks"
         );
         assert!(
             !with(|f| f.providers = Some(vec![crate::models::Provider::Claude])),
@@ -17128,7 +17077,7 @@ mod tests {
             "a path filter evaluates a sessions subquery per scanned row"
         );
         // A time window neither reduces match density much nor is cheap to replace, and it
-        // measured 1.29x at --since 3d and 10.48x at --since 1y, so it stays eligible.
+        // uses the ordered index without a separate class or path lookup, so it stays eligible.
         assert!(
             with(|f| f.since =
                 Some(crate::util::parse_datetime("2020-01-01T00:00:00+00:00").unwrap())),
@@ -21945,8 +21894,8 @@ mod tests {
     #[test]
     fn corpus_count_statements_are_served_from_covering_indexes() {
         // A receipt (`receipt_level=summary|full`) must never cost a scan of the messages table:
-        // on a 22.6 GB index that turned a 0.5 s search into 117 s (each row's page is read to
-        // test `kind`). Every statement behind the corpus figure must be answered from an index
+        // reading content pages just to test `kind` adds unrelated I/O. Every corpus-count
+        // statement must be answered from an index
         // that carries every column it tests, for every single-family structural filter.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();

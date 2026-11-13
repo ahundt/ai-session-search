@@ -1242,9 +1242,7 @@ fn enforce_tool_result_ceiling_cancellable(
     // moves its bytes into the fixed side and makes a retry look impossible. `results` is the
     // obvious one. `included` carries one entry per distinct session in the page, so it shrinks
     // too. And the `CallToolResult` carries a text rendering of the same results beside the
-    // structured content, which on a measured 20-result response was 4,200 of its 31,483
-    // characters -- counting that as fixed put the envelope over the ceiling and produced advice
-    // saying no page could ever fit, on a response whose 2-result page measured 4,930.
+    // structured content. Counting the rendering as fixed can make a fitting page look impossible.
     let shape = if let Some(structured) = result.structured_content.as_ref() {
         let rendered = serialized_char_count_or_zero(&result.content, cancellation)?;
         // Each result's own size, in order, so a shorter page is priced by the results it would
@@ -1258,10 +1256,7 @@ fn enforce_tool_result_ceiling_cancellable(
             }
         }
         // `included` is deliberately not counted as scaling. It carries one entry per distinct
-        // session, not per result, and a shorter page usually spans the same sessions: a measured
-        // 20-result page and its 3-result prefix both covered exactly two. Treating it as
-        // shrinking made the estimate 26% optimistic, which is the difference between advice that
-        // works and advice that fails on the caller's next call.
+        // session, not per result; a shorter page may still span the same sessions.
         let scaling = result_sizes.iter().sum::<usize>() + rendered;
         Some(ResponseShape {
             scaling_chars: scaling,
@@ -1383,10 +1378,8 @@ fn returned_items<'a>(
 ///
 /// Response size is affine in the page, not proportional: a fixed envelope plus a per-result
 /// cost. Scaling the page by `ceiling / measured` ignores the envelope and therefore overshoots
-/// whenever the envelope is a real share of the ceiling. An installed search measuring 29,956
-/// characters at `limit=20` against a 6,000 ceiling was told to retry at 3, and 3 measured 6,358:
-/// the advice failed on its own next call. Both quantities are in hand at the moment the error is
-/// built, so they are measured instead.
+/// whenever the envelope is a substantial share of the ceiling. Measure both quantities from
+/// the response in hand so retry advice accounts for the fixed cost.
 #[derive(Debug, Clone)]
 struct ResponseShape {
     /// Everything a smaller page shrinks: the results, the per-session metadata beside them, and
@@ -1412,8 +1405,7 @@ impl ResponseShape {
         /// This is an estimate built from one sample, and the parts it cannot see all push the
         /// same way. The text rendering carries fixed structure that does not shrink with the
         /// page, and a shorter page can span the same sessions as a longer one, so the pieces
-        /// charged proportionally are charged slightly too little. On the measured response the
-        /// remaining error was about 8%, all of it optimistic.
+        /// charged proportionally can be underestimated. Leave headroom for that uncertainty.
         ///
         /// Aiming at the ceiling therefore lands just over it, which is the one outcome that
         /// makes the advice worthless: the caller follows it exactly and gets the same error. The
@@ -1531,13 +1523,8 @@ fn recovery_advice(
 /// `page * ceiling / measured`. Both terms are measured from the response in hand rather than
 /// assumed, which is what makes this exact instead of approximate.
 ///
-/// Two earlier versions of this function each shipped a defect that a caller met before a test
-/// did. The first scaled from a hard-coded 15, so a `limit=1` overflow was told to retry with
-/// `limit=12`: more work than the call that had just failed. The second scaled proportionally
-/// with a 0.85 factor meant to absorb the envelope, and an installed search that measured 29,956
-/// characters at `limit=20` against a 6,000 ceiling was told to retry at 3, which measured 6,358
-/// and failed again. Proportional scaling cannot absorb an envelope whose share of the ceiling is
-/// unknown, and on that response the envelope alone was over a third of it.
+/// Scale the requested page, never a hard-coded default, and retain the fixed envelope.
+/// A proportional safety factor cannot account for an envelope of unknown size.
 ///
 /// `None` means no page fits: either a single result exceeds the ceiling, or the envelope does.
 /// Both are real states, and naming a limit in either would be advice that cannot be followed.
@@ -5966,12 +5953,8 @@ where
 /// `include` member that restores `raw_metadata_json` on session records.
 ///
 /// The field is the provider's metadata blob copied verbatim. For codex it embeds the whole
-/// sandbox policy as escaped JSON, ~2-3 KB per session; measured over a 30-session listing it
-/// was 24,929 of 56,667 characters (44%), and it is why `list_sessions(limit=30)` failed with
-/// "result (55,824 characters) exceeds maximum allowed tokens". Session-level tools have no
-/// field selection, so a caller had no way to ask for less. It is therefore omitted by default
-/// and restored on request, reusing the same `include` mechanism `get_session` already uses for
-/// `time_profile` rather than introducing a second way to say the same thing.
+/// sandbox policy as escaped JSON, which can dominate a session listing. Omit it by default
+/// and restore it through `include` so callers can choose that response cost.
 const INCLUDE_RAW_METADATA: &str = "raw_metadata";
 
 /// Remove `raw_metadata_json` from every session record in a serialized payload unless the
@@ -12558,11 +12541,7 @@ mod tests {
     }
 
     /// `raw_metadata_json` is the provider's verbatim metadata blob and is unbounded: codex
-    /// embeds its whole sandbox policy, ~2-3 KB per session. Measured over a 30-session
-    /// listing it was 24,929 of 56,667 characters (44%), and `list_sessions(limit=30)` failed
-    /// outright with "result (55,824 characters) exceeds maximum allowed tokens" while the
-    /// session-level tools offered no way to ask for less. It is omitted by default and
-    /// restored only on request.
+    /// embeds its whole sandbox policy. Omit the blob by default and restore it only on request.
     #[test]
     fn session_tools_omit_raw_metadata_unless_included() {
         let (dir, db) = fixture();
@@ -15743,32 +15722,22 @@ mod tests {
 
     /// The suggestion is one an installed server can actually honor.
     ///
-    /// Every figure here was measured against a real index through `mcp serve`, because that is
-    /// where each wrong answer this function has given was found. Two shipped and one was caught
-    /// before shipping, and all three are pinned so none can return.
-    ///
-    /// A `limit=20` search measured 30,518 characters against a 6,000-character ceiling and its
-    /// `limit=3` prefix measured 6,358, so 3 does not fit and 2, at 4,732, does.
-    ///
-    /// The first answer was 12, from scaling a hard-coded 15 that ignored the request entirely.
-    /// The second was 3, from scaling `page * ceiling / measured`, which ignores the fixed
-    /// envelope. The third was also 3, from counting `included` as shrinking with the page: it
-    /// holds one entry per distinct session, and this page and its 3-result prefix cover the same
-    /// two sessions, so 1,021 characters that never shrink were being promised away.
+    /// Use a synthetic response with a fixed envelope and a rendered copy of the result text.
+    /// Proportional scaling must not promise a page whose prefix exceeds the ceiling.
     #[test]
     fn the_suggestion_is_one_an_installed_server_can_honor() {
         let ceiling = 6_000;
         let page = 20;
-        // Twenty near-uniform results, as measured: 1,130 characters each.
-        let result_sizes = vec![1_130usize; page];
+        // Synthetic uniform structured results plus their rendered text copy.
+        let result_sizes = vec![1_000usize; page];
         let results_only: usize = result_sizes.iter().sum();
-        let rendered = 4_729;
+        let rendered = 5_000;
         let shape = ResponseShape {
             // Only the results and their text rendering shrink with the page.
             scaling_chars: results_only + rendered,
             // The echoed request, the page block, the wrapper, and the per-session metadata that
             // a shorter page does not shed.
-            envelope_chars: 814 + 1_021,
+            envelope_chars: 2_000,
             result_sizes,
         };
         let measured = shape.scaling_chars + shape.envelope_chars;
@@ -15778,8 +15747,7 @@ mod tests {
 
         assert_eq!(
             suggested, 2,
-            "the installed server measured limit=3 at 6,358 characters against this 6,000 \
-             ceiling and limit=2 at 4,732, so 2 is the largest page a caller can be sent to"
+            "the suggested prefix must fit the synthetic response's fixed and scaling costs"
         );
         assert!(
             suggested < page,
@@ -15792,7 +15760,7 @@ mod tests {
             / ((results_only + rendered) as f64 / page as f64).ceil() as usize;
         assert_eq!(
             mean_priced, 3,
-            "the page mean answers 3 on this shape, and 3 measured over the ceiling"
+            "the page mean overestimates what fits on this synthetic shape"
         );
     }
 
@@ -15957,10 +15925,7 @@ mod tests {
     /// `limit=0` means "every match" on the session tools, and an earlier reading collapsed that
     /// into the same state as a tool advertising no `limit` at all. The advice that follows says
     /// there is no smaller page to ask for -- on a tool whose own schema advertises `limit` with a
-    /// default of 10. An installed Codex run met exactly this: `search_sessions(limit=0)` produced
-    /// 154,174 characters against the 48,000 ceiling, was told no smaller page existed, and then
-    /// answered the same question with `limit=20`. The advice was not merely imprecise; it denied
-    /// the remedy the caller went on to use.
+    /// finite page size. Use the returned count and response shape to suggest a fitting page.
     ///
     /// Two facts make the finite page computable, and both are already in the response: the count
     /// it returned, and the items themselves. The session tools report that count at the top level

@@ -154,10 +154,8 @@ search_sessions_limit = 10
 # Default `list_sessions.limit`: recent-session page size.
 list_sessions_limit = 20
 # Default `search_messages.limit`: message-hit page size. Must be at least 1 so
-# pagination always makes progress. Sized against max_tool_result_chars below: at the
-# measured per-result cost this lands an ordinary call near half the ceiling, leaving
-# room for a long matched message and for detail=full or parsed_references, which
-# measured 4.8x and 2.7x and compose.
+# pagination always makes progress. Leave headroom below max_tool_result_chars for long
+# matched messages, full detail, references, and the protocol envelope.
 search_messages_limit = 15
 # Default `run_skill_capability` message-classification page size. Smaller than the CLI and
 # Python default (`[capabilities.message_classification].limit`) on purpose: an MCP result goes

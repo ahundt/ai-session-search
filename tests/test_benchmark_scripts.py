@@ -316,11 +316,8 @@ def test_generated_fixture_reindex_cannot_reach_the_running_user_s_transcripts()
     # The generated fixture disables every provider by name, which only works for the provider
     # names the config text happens to list. `generate_fixture` deliberately omits the
     # `prime-agent` stanza for the baseline build, so that provider kept its default
-    # `~/.prime/agent/sessions` root: measured here, the baseline config indexed 119 real
-    # transcripts while the all-disabled config indexed none. That put real session content into
-    # an artifact the classifier calls `portable_generated` and `publishable`, and it made the
-    # two builds measure different corpora — 22,546 messages against 512 — so every before/after
-    # comparison and the `require_equal` digest check compared unlike things.
+    # `~/.prime/agent/sessions` root, which could put private content in a generated fixture.
+    # Isolating HOME prevents that regardless of which provider names a build recognizes.
     #
     # Naming providers cannot fix that, because the omission exists precisely for binaries that
     # do not know a name. Pointing HOME at the fixture directory makes the default roots resolve
@@ -603,21 +600,17 @@ def test_tui_browse_wait_ignores_preview_content_that_looks_like_the_title() -> 
 
 
 def test_tui_screen_tracker_rejoins_a_session_id_wrapped_across_preview_rows() -> None:
-    """A subagent id is 67 characters and wraps in the preview pane at 100 columns.
+    """Rejoin a synthetic subagent ID that wraps across preview rows.
 
-    Reading only the row that carries the `Session: ` label returned the first fragment, which
-    never equalled the canonical id, so the semantic traversal waited out its timeout and
-    reported `could not collect TUI session ID at position 13` — a parser limit stated as a TUI
-    failure. Measured against the maintainer's own index, position 13 of a `rust worker` search
-    was exactly such a row.
+    Reading only the label row loses the rest of the canonical ID and makes traversal time out.
     """
     client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
-    identifier = "claude:08a88453-1d07-48fd-8166-a00f1ca70115/agent-a2b498896d3f06295"
+    identifier = "claude:00000000-0000-4000-8000-000000000001/agent-a0000000000000000"
     pane_width = 44
     # Two renderings of the same header. The first is what a mid-value wrap looks like; the
     # second is what the pane actually produced, because an id longer than the pane does not fit
     # after its label at all, so the wrapper puts `Session:` on a row by itself. The second form
-    # is the one the maintainer's own index hit, and matching `"Session: "` returned None for it.
+    # requires accepting the label without a trailing space.
     split_after_label = [
         client.SESSION_FIELD_LABEL,
         *[identifier[start : start + pane_width] for start in range(0, len(identifier), pane_width)],

@@ -711,8 +711,7 @@ impl ClaudeAdapter {
     /// lets a differential test assert a tail parse equals a full parse.
     ///
     /// Streams line-by-line via the reader instead of loading the whole file into a String
-    /// (task #241): a 536MB append-only session previously needed ~1.5GB transient RAM for the
-    /// `read_to_string` String plus a second `lines().count()` pass. We hold only the current
+    /// so input buffering grows with the current line instead of the transcript. We hold the
     /// line and tally `line_count` in this single pass. `BufRead::lines()` yields the same line
     /// content/count as `str::lines()` (verified for `\n`, `\r\n`, trailing/no-trailing newline)
     /// and reads each line via [`crate::util::lines_replacing_invalid_utf8`]: a stray non-UTF-8
@@ -1315,7 +1314,7 @@ impl ClaudeAdapter {
         // A subagent's identity is its parent's id plus what distinguishes the run under that
         // parent. Neither half alone works: the records name only the parent, and the agent id
         // repeats across parents. `Nested` takes the parent from the path because that is what
-        // the run suffix is relative to — the two sources agreed on all 4,051 live transcripts,
+        // the run suffix is relative to; the directory identifies the spawning parent,
         // so preferring the path costs nothing and keeps id and parent consistent by
         // construction.
         let provider = source_kind.provider();
@@ -1356,7 +1355,7 @@ impl ClaudeAdapter {
             // Only a subagent run has a parent, resolved above.
             parent_session_id,
             // The sidecar's `agentType` is the name a reader recognizes; the agent id is the
-            // fallback for the 2,243 transcripts that have no sidecar.
+            // fallback when the transcript has no sidecar.
             agent_label: sidecar
                 .as_ref()
                 .and_then(ClaudeSubagentSidecar::agent_type)
@@ -2428,8 +2427,7 @@ pub(crate) fn tool_result_id(message: &Value) -> Option<&str> {
 /// Whether this record is the harness talking to the agent rather than the user or model.
 ///
 /// These were previously dropped outright, which also removed the only evidence of Stop-hook
-/// denials and PreToolUse blocks: 82 of 82 "CANNOT STOP" records in one session carried
-/// `isMeta` and none was searchable. They are now stored as `MessageKind::HarnessNotice` and
+/// denials and PreToolUse blocks. Store injected records as `MessageKind::HarnessNotice`,
 /// excluded from results by default, which keeps user prose and its analytics unchanged while
 /// leaving the evidence reachable.
 fn is_harness_notice(value: &Value, text: &str) -> bool {
@@ -2468,30 +2466,17 @@ fn is_harness_notice(value: &Value, text: &str) -> bool {
 
 /// How a claude transcript relates to the session that spawned it.
 ///
-/// Subagent transcripts are indexed as sessions in their own right, because what a subagent did
-/// is worth searching — 4,051 of them on this machine against 858 top-level claude sessions.
-/// They need an identity that is neither the parent's nor the bare agent id:
-///
-/// - Every record inside carries the PARENT's `sessionId`, never the run's own, so binding the
-///   id from content points the row at the parent and the `on conflict(id) do update` upsert in
-///   db.rs overwrites the parent with the subagent's content. Four parent rows were found
-///   damaged this way on live data.
-/// - The agent id is unique only within one parent: `agent-a0e105ee7f1fe2c65` appears under two
-///   different parents here, so the bare id merges two runs into one row.
-///
-/// Both variants therefore resolve to a parent-qualified id; see [`SpawnOrigin`].
-///
-/// Decided from the path so discovery stays a directory walk without opening files. The
-/// authoritative in-file marker is `isSidechain: true`, which every observed transcript carries
-/// alongside an `agentId`; the parse reads the `agentId` for the label.
+/// Subagent transcripts are indexed as separate sessions so spawned work remains searchable.
+/// Their records carry the parent's `sessionId`, so content-derived identity would overwrite
+/// the parent. Agent IDs are only unique within a parent; qualify each run with its parent ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClaudeSpawn {
     /// A top-level session: no parent, and its id comes from its own records as before.
     TopLevel,
     /// A run under `<parent-session-id>/subagents/`, where the path names both the parent and
-    /// what distinguishes this run from its siblings. 4,047 of the 4,051 here.
+    /// what distinguishes this run from its siblings.
     Nested(SpawnOrigin),
-    /// A run stored directly beside its parent as `<project>/agent-<id>.jsonl`, 4 files here.
+    /// A run stored directly beside its parent as `<project>/agent-<id>.jsonl`.
     /// The path names no parent, so the parent comes from the records instead.
     BesideParent { run_suffix: String },
 }
@@ -2518,8 +2503,8 @@ impl ClaudeSpawn {
 }
 
 /// The `agent-<id>.meta.json` claude writes beside a subagent transcript, holding the only
-/// record of what the agent was asked to do and what kind of agent it was. Present for 1,808
-/// of the 4,051 transcripts here, so everything it supplies has a fallback.
+/// record of its task and agent type. The sidecar is optional, so every supplied field
+/// has a fallback from the transcript.
 struct ClaudeSubagentSidecar {
     path: PathBuf,
     /// The sidecar object verbatim. Kept whole rather than destructured into named fields, so a
@@ -2632,9 +2617,7 @@ mod tests {
     /// A subagent transcript is worth searching, so it is indexed as a session of its own. It
     /// needs its own identity to be stored at all: every record inside carries the PARENT's
     /// `sessionId`, so binding from content points the row at the parent and the on-conflict
-    /// upsert overwrites the parent's row with the subagent's content. Four such files were
-    /// found colliding this way on live data, each reported as unindexed with no cause until
-    /// `doctor --explain-unindexed` named the holder.
+    /// upsert would overwrite the parent's row with subagent content.
     #[test]
     fn a_subagent_transcript_keeps_its_own_id_and_records_its_parent() {
         let temp = tempdir().unwrap();
@@ -2671,7 +2654,7 @@ mod tests {
         let parsed = adapter.parse(subagent);
         // Parent-qualified rather than the bare `agent-0ccb8736`: taking the parent's id
         // overwrites the parent's row, and the bare agent id merges two runs that share it
-        // under different parents (one such pair among 4,051 live transcripts). Both halves
+        // under different parents. Both halves
         // are needed, so the id carries both.
         assert_eq!(
             parsed.session.provider_session_id,
@@ -3864,15 +3847,8 @@ mod tests {
             .expect("the exact live subagent shape must remain persistable");
     }
 
-    /// Most subagent transcripts live in a `subagents` directory under their parent — 4,047 of
-    /// the 4,051 on this machine — and were skipped outright by discovery.
-    ///
-    /// The id has to be parent-qualified rather than the bare `agent-<id>`, because that id is
-    /// unique only within one parent: `agent-a0e105ee7f1fe2c65` appears under two different
-    /// parents on live data. Under the bare id the `on conflict(id) do update` upsert in db.rs
-    /// keeps whichever was written last and the other run is silently gone. This asserts which
-    /// parent each row belongs to, not merely that the two ids differ — swapping them would
-    /// preserve distinctness and pass a weaker check.
+    /// Discover nested subagent transcripts and qualify agent IDs by their parent. Two
+    /// parents may reuse an agent ID; assert each row's parent as well as distinct identities.
     #[test]
     fn two_subagents_sharing_an_agent_id_under_different_parents_both_survive() {
         let temp = tempdir().unwrap();
@@ -4000,11 +3976,8 @@ mod tests {
         );
     }
 
-    /// A subagent transcript can have an `agent-<id>.meta.json` sidecar beside it — 1,808 of
-    /// 4,051 do. It holds the only description of what the agent was asked to do and the only
-    /// name for what kind of agent it was, so it supplies the title and the label. Keys beyond
-    /// those two are kept verbatim rather than enumerated, so a key added upstream survives
-    /// without a code change here.
+    /// An optional sidecar supplies the subagent's task description and agent type for its
+    /// title and label. Preserve other keys verbatim so upstream additions remain available.
     #[test]
     fn a_subagent_sidecar_supplies_the_title_the_label_and_its_other_keys() {
         let temp = tempdir().unwrap();
@@ -4052,8 +4025,7 @@ mod tests {
         );
     }
 
-    /// Only 1,808 of 4,051 transcripts have a sidecar, so the label falls back to the agent id
-    /// the records carry rather than going empty.
+    /// Without a sidecar, use the transcript's agent ID as the label rather than leaving it empty.
     #[test]
     fn a_subagent_without_a_sidecar_labels_itself_with_its_agent_id() {
         let temp = tempdir().unwrap();

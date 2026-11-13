@@ -5,9 +5,8 @@
 //!
 //! Claude Code injects records the user did not write: Stop-hook feedback, PreToolUse blocks,
 //! local-command caveats, task notifications. They were dropped at index time, which also
-//! removed the only evidence of what a hook told an agent and what it did next. Measured on
-//! real data: 82 of 82 records containing "CANNOT STOP" in one session carried `isMeta`, and
-//! search returned none of them while reporting a healthy index.
+//! removed the evidence of what a hook told an agent and what it did next. `isMeta`
+//! identifies injected feedback, which must remain searchable as harness notices.
 //!
 //! These tests pin both halves of the fix: the records exist after indexing, and they stay out
 //! of results unless asked for, so user prose and the analytics over it are unchanged.

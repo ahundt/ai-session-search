@@ -13,7 +13,7 @@
 # `wrong`, `actually`, `wait,`, `mistake`) fire on benign developer phrasing -- "let's revert to
 # the design doc", "actually, use a HashMap", "this broke down into subtasks". A correction
 # addresses the assistant, so these key on `you ...`, `that|this|it ...`, and explicit corrective
-# phrases. A bare `\bstop\b` measured ~98% false positives on real data, which is why `other`
+# phrases. A bare `\bstop\b` also matches ordinary discussion, which is why `other`
 # keys on imperative stops instead.
 #
 # See references/message-classification.md for the schema, precedence rules, and worked examples.

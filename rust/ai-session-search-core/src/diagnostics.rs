@@ -255,12 +255,8 @@ mod tests {
 
     /// A discovered file that produced no session row is invisible to stale-session
     /// accounting: every health signal is keyed by a session that WAS indexed, so a file
-    /// that never became one contributes to none of them. That is how 65 of 414 codex
-    /// rollouts stayed missing while `get_index_status` reported stale_sessions 0,
-    /// parse_warnings 0 and repair_commands []. The gap is counted by set difference
-    /// against the indexed source paths, NOT by subtracting indexed_sessions from
-    /// discovered_files: retained sessions make indexed exceed discovered (claude reported
-    /// 858 indexed against 645 discovered), so the subtraction is not the same quantity.
+    /// that never became one contributes to none of them. Count the set difference against
+    /// indexed source paths; subtracting counts is wrong when the index retains pruned sources.
     #[test]
     fn unindexed_discovered_files_are_counted_and_offered_a_repair() {
         let discovered = HashSet::from([

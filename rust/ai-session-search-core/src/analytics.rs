@@ -91,7 +91,7 @@ pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static s
                 r"\bbut you\b",
             ],
         ),
-        // Catch-all (last). A bare `\bstop\b` was ~98% false positives on real data:
+        // Catch-all (last). A bare `\bstop\b` also matches ordinary discussion:
         // it matched test fixtures ("run this command once and stop"), checkpoint
         // instructions ("commit and then stop"), and negations ("don't stop"). Restrict
         // to imperative-stop corrections: a leading "stop" (optionally softened by

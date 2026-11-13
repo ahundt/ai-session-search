@@ -712,8 +712,8 @@ impl CodexAdapter {
             // evidence that a given file was matched against that database is a mistake that
             // has already cost one investigation: "all indexed rows are jsonl+sqlite and none
             // is plain jsonl" looks like proof that indexing is gated on the sqlite side, and
-            // it is not. `threads` there holds one row per codex THREAD (79), while rollout
-            // files are per-session (414); the two counts are not comparable.
+            // it is not. `threads` holds one row per thread while rollout files are per-session;
+            // these counts describe different units.
             discovery_source: "jsonl+sqlite".to_string(),
             parent_session_id,
             agent_label,
@@ -2016,9 +2016,8 @@ mod tests {
     /// A forked session's rollout carries TWO session_meta lines: its own first, then the
     /// inherited parent metadata. Binding the id to the last one silently rebinds this file
     /// to the parent's session, and the `on conflict(id) do update` upsert in db.rs then
-    /// overwrites the parent's row instead of storing this session at all. Observed against
-    /// real data as 65 of 414 codex sessions absent from the index with no parse warning and
-    /// no stale entry, because a file that produces no row is invisible to every health signal.
+    /// overwrites the parent's row instead of storing this session. A file that produces
+    /// no row is invisible to health signals keyed only by indexed sessions.
     #[test]
     fn forked_session_keeps_its_own_id_not_the_parents() {
         let temp = tempdir().unwrap();

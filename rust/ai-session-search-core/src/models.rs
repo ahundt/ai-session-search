@@ -311,11 +311,9 @@ impl MessageKind {
     }
 
     /// Every class [`MessageFilters::kind_predicate`] can leave out when the caller names no
-    /// set: `HarnessNotice` always, `Compaction` under `no_compaction`. Together a small share of
-    /// any real index (2 % of 2.69 M rows measured), which is what lets a count over the default
-    /// predicate be written as `count(everything) - count(these)`; the storage layer keeps a
-    /// partial index over exactly this set for the second term. Kept in ascending name order so
-    /// the SQL rendered from it is stable.
+    /// set: `HarnessNotice` always, `Compaction` under `no_compaction`. This lets the default
+    /// count subtract excluded classes from the total using a partial covering index.
+    /// Kept in ascending name order so the rendered SQL is stable.
     pub const EXCLUDABLE_BY_DEFAULT: &'static [Self] = &[Self::Compaction, Self::HarnessNotice];
 
     /// Parse a `kind` value read back from the index, mapping anything unrecognized to
@@ -986,11 +984,8 @@ pub struct SessionRecord {
     /// row carries in `id` and needs no rule about stripping a prefix before comparing.
     ///
     /// PATTERN: this names a row that need not exist. Providers keep a spawned run's transcript
-    /// after the parent conversation is rotated away — in one project directory, 549 runs
-    /// referenced 69 distinct parents and not one of those parent transcripts was still on
-    /// disk. Recovering exactly that otherwise-unreachable work is a reason this is indexed, so
-    /// do NOT add `references sessions(id)` to this column: the constraint would reject every
-    /// such run at insert, and a cascade would delete the runs when a parent is reindexed away.
+    /// after the parent conversation is rotated away. Do not add `references sessions(id)`:
+    /// that would reject an orphaned run or cascade-delete it when its parent is removed.
     pub parent_session_id: Option<String>,
     /// Human-meaningful name for the spawned agent when the provider records one: claude's
     /// `agentType` (`Explore`, `general-purpose`), codex's `agent_nickname`, or the agent's
@@ -1244,13 +1239,12 @@ impl SourceFile {
 #[non_exhaustive]
 pub enum SessionKind {
     /// A session a person started. Codex's `thread_source: "user"`; claude's
-    /// `isSidechain: false`, which held on 143,220 of 143,224 records in top-level transcripts.
+    /// `isSidechain: false` identifies a top-level Claude transcript.
     User,
     /// A run some other session spawned, with [`SessionRecord::parent_session_id`] naming the
     /// spawner and [`SessionRecord::agent_label`] naming the kind of agent. Codex's
-    /// `thread_source: "subagent"`; claude's `isSidechain: true`. On this machine they
-    /// outnumber user-started claude sessions roughly five to one, which is why selecting by
-    /// class is worth a parameter.
+    /// `thread_source: "subagent"`; Claude's `isSidechain: true`. Select this class to
+    /// search spawned work separately from sessions a person started.
     Subagent,
 }
 
@@ -2638,13 +2632,9 @@ mod tests {
     /// The session-class spellings are the providers' own, not invented here, and the
     /// alternatives considered are locked out rather than silently accepted.
     ///
-    /// Evidence, gathered from live data before choosing:
-    /// - codex stores this exact enum as `thread_source` on its session metadata, valued
-    ///   `user` (167 rollouts) and `subagent` (247) — the same partition, already named.
-    /// - `subagent` is unanimous across every provider that marks the concept: codex's
-    ///   `thread_source` value and `source.subagent` key, the `subagents` directory claude and
-    ///   cursor both write, claude's `subagent_type` Task parameter (in 15 of 401 transcripts
-    ///   scanned), and gemini-cli's `subagent_N` author labels.
+    /// Provider spellings include Codex's `thread_source` and `source.subagent`, the
+    /// `subagents` directory used by Claude and Cursor, Claude's `subagent_type` Task
+    /// parameter, and Gemini CLI's `subagent_N` author labels.
     ///
     /// `agent` is rejected on purpose: a subagent IS an agent, so `[agent]` could be read as
     /// "every session" or "every session that is not a subagent", and the caller cannot tell
@@ -2723,10 +2713,7 @@ mod tests {
         assert!(!warnings_only);
     }
 
-    /// The default returns both classes. Subagent runs are real work — 4,051 of them against
-    /// 858 user-started claude sessions here — so unlike `MessageKind::HarnessNotice`, which
-    /// is harness bookkeeping and stays out by default, hiding these would answer "what did I
-    /// do about X" with half the evidence.
+    /// Include user-started and spawned sessions by default so searches cover both kinds of work.
     #[test]
     fn the_default_session_class_set_is_every_class() {
         assert_eq!(

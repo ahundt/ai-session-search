@@ -79,7 +79,7 @@ index format is unchanged, so no reindex is needed. A `rustls` security update i
 1. Typing responds immediately. Searches run on a background thread, a new keystroke cancels the
    search in progress, and the previous results stay on screen until new ones arrive. The TUI
    searches once the query has been still for `[ui].search_debounce_ms` (150 ms by default), so on
-   a 36.5 GB index a five-letter word starts one search instead of five. Enter searches right away,
+   large indexes a typed burst starts one search after the quiet period. Enter searches right away,
    and setting it to `0` searches on every keystroke.
 2. Filter keys: `p` cycles the provider, `f` the session kind, `s` the time window (1, 7, or 30
    days), and `w` shows only sessions with warnings. The status bar shows which filters are on.
@@ -252,8 +252,8 @@ consumer comparing receipt numbers with 1.0.0rc1 sees different values for some 
   three repetitions each: exact content 27.9 ms to 14.3 ms, fuzzy content 50.8 ms to 20.6 ms, regex
   content 20.9 ms to 14.8 ms. All seven benchmark cases returned an identical result digest on both
   versions. Personal session histories are larger than that corpus, and their timings differ.
-- Message-search receipts count the corpus from indexes rather than scanning message rows. On one
-  2.7-million-message index that cut a receipt from tens of seconds to a fraction of a second.
+- Message-search receipts count the corpus from covering indexes rather than reading message
+  content rows, avoiding content-page I/O for the count.
 
 ### Fixed
 
@@ -282,7 +282,7 @@ consumer comparing receipt numbers with 1.0.0rc1 sees different values for some 
 
 - A full-text index over session titles, summaries, and whole transcripts that every session write
   maintained and no query read. It is retired in place, so a 1.0.0rc1 process sharing the same index
-  file still sees a complete layout. On one 2.7-million-message index this reclaimed about 460 MB.
+  file still sees a complete layout. Retiring the duplicate frees its pages for reuse.
 
 ### Security
 

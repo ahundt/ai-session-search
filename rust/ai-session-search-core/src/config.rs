@@ -23,12 +23,8 @@ pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
 /// Default MCP page size for `search_messages`.
 ///
-/// WHY 15. The result ceiling below is a backstop, not the mechanism: a response that errors is
-///   a worse outcome than one that never grew. At the measured marginal cost of about 1,583
-///   characters per result, 15 results land near 25,000 characters, roughly 53% of the ceiling,
-///   leaving about 2x headroom for a long matched message. At 20 the figure was 69%, which the
-///   multiplicative levers consume immediately: `detail=full` measured 4.8x and
-///   `include=[...,"parsed_references"]` 2.7x, and they compose.
+/// Leave room for long messages, full detail, references, and the protocol envelope.
+/// The result ceiling is a backstop; paging keeps ordinary responses below it.
 /// PLATFORM: this repository's MCP surface only. CLI, Rust and Python return all results by
 ///   design and are untouched.
 /// RAISE IT WHEN: `max_tool_result_chars` is raised for this deployment, or the per-result cost
@@ -56,8 +52,7 @@ pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 15;
 /// RAISE IT WHEN: the deployment talks only to clients that announce truncation, or Codex raises
 ///   its own cap. Codex's schema budget already moved 4,000 -> 5,000, so its constants do move.
 /// LOWER IT WHEN: a client is found that truncates silently below this. Antigravity is the live
-///   risk: it superseded Gemini CLI, holds three of the thirteen registrations here, and its
-///   truncation behaviour is unverified.
+///   risk: its truncation behaviour is unverified.
 /// Measured over the serialized `CallToolResult`, not the JSON-RPC envelope around it: the
 /// dispatcher owns the former and not the latter, and they differ by 34 characters.
 pub const DEFAULT_MCP_MAX_TOOL_RESULT_CHARS: usize = 48_000;
@@ -1416,9 +1411,7 @@ fn default_idle_poll_interval_ms() -> u64 {
 fn default_search_debounce_ms() -> u64 {
     // Longer than the gap between keystrokes at a fast typing speed, so a burst becomes one
     // search rather than one cancelled scan per character, and short enough that the wait after
-    // the last key is not the thing a reader notices. Measured on a 36.5 GB index, the search
-    // itself takes 2.3 to 3.6 s, so this is a rounding error there; on a small index it is the
-    // whole wait, which is why it is not larger.
+    // the last key is not the thing a reader notices. Keep the delay short for small indexes.
     150
 }
 

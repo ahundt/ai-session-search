@@ -12,17 +12,9 @@
 //!
 //! # Why a subagent's own id is not enough
 //!
-//! Providers name a subagent with an id that is unique only within its parent. On this
-//! machine's 4,051 claude subagent transcripts, `agent-a0e105ee7f1fe2c65` appears under two
-//! different parent sessions. Storing either under the bare id makes them one row, and the
-//! `on conflict(id) do update` upsert in `db.rs` silently keeps whichever was written last.
-//! That is the same failure that cost 65 of 414 codex sessions (see `codex.rs`) and that
-//! overwrote four claude parent rows with subagent content.
-//!
-//! [`SpawnOrigin::session_id`] therefore qualifies the run with its parent. The suffix comes
-//! from the path, so it is unique by construction: two files with the same parent and the same
-//! suffix would have to be the same file. Verified against live data — 0 collisions across all
-//! 4,051 transcripts, where the bare id collides once.
+//! Providers name a subagent with an ID unique only within its parent. A bare ID would merge
+//! runs from different parents in the session upsert. [`SpawnOrigin::session_id`] qualifies the
+//! run with its parent and path suffix: two files with the same parent and suffix are one file.
 
 use std::path::{Component, Path};
 
@@ -79,10 +71,8 @@ pub(crate) fn parent_link(provider: Provider, parent_provider_session_id: &str) 
 ///
 /// Returns `None` when the path has no `subagents` component or nothing precedes it, which is
 /// how a caller distinguishes a top-level session from a spawned run without opening the file.
-/// Directory-derived rather than content-derived so discovery stays a walk: reading the parent
-/// from inside every candidate would mean opening 4,051 files per index on this machine. The
-/// two agree — the record `sessionId` matched the directory name in 4,051 of 4,051 live claude
-/// transcripts, and was never absent — so nothing is lost by preferring the cheaper source.
+/// Read the parent from the directory so discovery does not need to open every transcript.
+/// The directory also scopes an agent ID to its spawning session.
 pub(crate) fn subagents_dir_origin(path: &Path) -> Option<SpawnOrigin> {
     let mut parent_session_id: Option<String> = None;
     let mut nested: Vec<&str> = Vec::new();
@@ -123,7 +113,7 @@ mod tests {
     /// so each id is checked against the parent it belongs to.
     #[test]
     fn subagents_sharing_an_agent_id_under_different_parents_stay_separate() {
-        // Both paths observed on live data, same `agent-` stem, different parents.
+        // Same agent stem under different synthetic parents.
         let first = PathBuf::from(
             "/p/-Users-x/a2f3f693-e77f-4212-9e71-2b2331565fd4/subagents/agent-a0e105ee7f1fe2c65.jsonl",
         );

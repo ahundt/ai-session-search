@@ -1197,7 +1197,7 @@ pub(crate) fn reindex_until(
     // across the per-command auto-reindex. Cheap when nothing was written (skip then).
     if updated > 0 {
         // A full reindex deletes+reinserts every row, fragmenting the FTS5 index into many
-        // unmerged segments (≈2x on-disk bloat, measured). Merge them back — but ONLY on a full
+        // unmerged segments and redundant pages. Merge them back, but only on a full
         // reindex, never on the per-command incremental path, since `optimize` rewrites the whole
         // index. Incremental appends rely on FTS5's own automerge to stay reasonably compact.
         if full {
@@ -3620,10 +3620,8 @@ mod tests {
     /// `reindex(full = true)` must not delete a session whose source file is gone.
     ///
     /// Agent harnesses clear old sessions on their own schedule, so the index is routinely the
-    /// only surviving copy of that conversation. Measured on live data: 549 subagent runs in one
-    /// project directory named 69 distinct parent sessions and NOT ONE of those parent
-    /// transcripts was still on disk. A full reindex that rebuilt from the filesystem would
-    /// destroy exactly the history this tool exists to keep.
+    /// only surviving copy of that conversation. Rebuilding solely from the filesystem
+    /// would destroy archived history when the harness has pruned its source transcripts.
     ///
     /// The property was documented on `reindex` and enforced by nothing. It is asserted here at
     /// the level that matters — the row, its messages, and its transcript text all survive —

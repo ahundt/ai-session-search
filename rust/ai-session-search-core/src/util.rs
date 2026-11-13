@@ -584,14 +584,8 @@ impl UnicodeLowerNeedle {
     /// That is the whole correctness argument, and it does not depend on where in an expansion an
     /// ASCII character can appear.
     ///
-    /// Measured on 618,778,766 bytes of candidate message content from an index of 5.7 million
-    /// messages, best of seven interleaved runs of
-    /// `aise messages search "permission denied" --limit 50 --index-refresh existing-only
-    /// --format json`: 1.11 s against 3.48 s for the unskipped scan, a 3.1x reduction, with the
-    /// `regex` crate over the same candidates at 0.54 s as the floor. Replacing the scalar
-    /// predicate with `memchr2` plus an `is_ascii` confirmation measured 1.06 s, 6.9% better, and
-    /// was not taken: the gain is in the skip rather than the vectorization, and it would add a
-    /// direct dependency for that 6.9%.
+    /// Skip ASCII bytes that cannot start the folded needle before attempting scalar matching.
+    /// Keep the scalar predicate here to avoid a separate dependency for the same skip rule.
     ///
     /// The agreement a skip could break is checked. `CASELESS_CASES` drives the matcher, `find_in`
     /// and the SQL scalar from one table, including a failed candidate before a match that starts
@@ -2990,8 +2984,6 @@ pub(crate) mod tests {
     /// their `--session`/`--resume <id>` resolvers list; both accept a path, so the plan names the
     /// file. Claude Code has no path resume and its subagent transcripts are not sessions it can
     /// reopen, so the plan is an error that names the spawning session's own resume command.
-    /// Before this, 111 of 119 Prime rows and 4,398 of 5,349 Claude rows on one real index were
-    /// printed with an id their CLI could not resolve.
     #[test]
     fn subagent_runs_resume_by_transcript_path_or_name_the_spawning_session() {
         for (provider, binary, flag) in [

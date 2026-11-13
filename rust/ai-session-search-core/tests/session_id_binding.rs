@@ -9,11 +9,8 @@
 //! no stale entry, because every health signal in the index is keyed by a session that was
 //! successfully indexed. A file that produces no row is invisible.
 //!
-//! That is not hypothetical. Codex rollouts for forked/resumed sessions carry a SECOND
-//! `session_meta` line holding the PARENT's id. The adapter bound the id last-wins, so each
-//! fork overwrote its parent: 414 discovered codex files produced 349 rows, and
-//! `get_index_status` reported the index healthy. Measured on real data 2026-07-24, the 65
-//! missing files were exactly the 65 with more than one `session_meta` line.
+//! Codex forked/resumed rollouts can carry a second `session_meta` with the parent's ID.
+//! Last-wins binding would overwrite the parent; the first metadata record owns the file.
 //!
 //! Each provider below reads an id out of file CONTENT, so each can regress the same way.
 //!
