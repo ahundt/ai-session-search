@@ -7209,6 +7209,7 @@ fn store_parsed_messages(
         HashMap::new();
     let mut stored_by_role_and_content: HashMap<RowDigest, std::collections::VecDeque<usize>> =
         HashMap::new();
+    let mut stored_by_timestamp = HashMap::<RowDigest, std::collections::VecDeque<usize>>::new();
     for (position, (_, keys)) in stored.iter().enumerate() {
         if let Some(identity) = keys.correlation {
             stored_by_identity
@@ -7218,6 +7219,10 @@ fn store_parsed_messages(
         } else {
             // A text fallback may repair a legacy row that has no identity, but must never
             // merge two rows whose provider identities disagree.
+            stored_by_timestamp
+                .entry(keys.role_content_timestamp)
+                .or_default()
+                .push_back(position);
             stored_by_role_and_content
                 .entry(keys.role_and_content)
                 .or_default()
@@ -7291,16 +7296,28 @@ fn store_parsed_messages(
                     .filter(|position| !matched[*position])
             })
             .or_else(|| {
-                stored_by_role_and_content
-                    .get_mut(&keys.role_and_content)
-                    .and_then(|queue| {
-                        while let Some(position) = queue.pop_front() {
-                            if !matched[position] {
-                                return Some(position);
-                            }
+                let legacy = if message
+                    .provenance
+                    .correlation_identity
+                    .as_ref()
+                    .is_some_and(|id| {
+                        id.authority == crate::models::MessageCorrelationAuthority::SourceLocal
+                            && id.scope.starts_with("claude_queue:")
+                    }) {
+                    // A removal record may contain the same notice at another timestamp. It is
+                    // not the enqueue's old rendering, and may belong only to the archive.
+                    stored_by_timestamp.get_mut(&keys.role_content_timestamp)
+                } else {
+                    stored_by_role_and_content.get_mut(&keys.role_and_content)
+                };
+                legacy.and_then(|queue| {
+                    while let Some(position) = queue.pop_front() {
+                        if !matched[position] {
+                            return Some(position);
                         }
-                        None
-                    })
+                    }
+                    None
+                })
             });
         if let Some(position) = position {
             matched[position] = true;
@@ -7372,7 +7389,8 @@ fn store_parsed_messages(
 /// candidates, and each declined rendering takes at most one row. Equal columns are tried first,
 /// for every declined row, so a pruned record's row is not taken for a declined copy of the same
 /// text; role and content second, for rows an older renderer stored with other metadata. The
-/// second rule never takes a row with a native identity, which no declined copy carries.
+/// second rule requires the same timestamp for notices and never takes an identified row. Text at
+/// another timestamp may belong to a record no longer in the source.
 /// O(stored + declined) time and key memory.
 fn take_retracted_rows(
     stored: &[(i64, MessageKeys)],
@@ -7403,7 +7421,11 @@ fn take_retracted_rows(
             .push_back(position);
         if keys.correlation.is_none() {
             by_role_and_content
-                .entry(keys.role_and_content)
+                .entry(if keys.timestamped_notice {
+                    keys.role_content_timestamp
+                } else {
+                    keys.role_and_content
+                })
                 .or_default()
                 .push_back(position);
         }
@@ -7434,7 +7456,11 @@ fn take_retracted_rows(
         });
         match native.or_else(|| take(by_columns.get_mut(&keys.columns_without_seq), matched)) {
             Some(position) => taken.push(stored[position].0),
-            None => loose.push(keys.role_and_content),
+            None => loose.push(if keys.timestamped_notice {
+                keys.role_content_timestamp
+            } else {
+                keys.role_and_content
+            }),
         }
     }
     for key in loose {
@@ -7843,6 +7869,8 @@ type RowDigest = [u8; 32];
 struct MessageKeys {
     content: RowDigest,
     role_and_content: RowDigest,
+    role_content_timestamp: RowDigest,
+    timestamped_notice: bool,
     correlation: Option<RowDigest>,
     tool_result_relation: Option<RowDigest>,
     seq: i64,
@@ -7874,6 +7902,10 @@ impl MessageColumns<'_> {
         let mut role_and_content = FramedSha256::new(b"aise-archive-message-role-v1");
         role_and_content.update_optional_str(self.role);
         role_and_content.update_bytes(&content);
+        let role_and_content = role_and_content.finish_bytes();
+        let mut role_content_timestamp = FramedSha256::new(b"aise-archive-message-timestamp-v1");
+        role_content_timestamp.update_bytes(&role_and_content);
+        role_content_timestamp.update_optional_str(self.ts);
         let mut columns_without_seq = FramedSha256::new(b"aise-archive-message-columns-v1");
         for value in [
             self.role,
@@ -7905,7 +7937,9 @@ impl MessageColumns<'_> {
         };
         MessageKeys {
             content,
-            role_and_content: role_and_content.finish_bytes(),
+            role_and_content,
+            role_content_timestamp: role_content_timestamp.finish_bytes(),
+            timestamped_notice: self.kind == Some("harness_notice"),
             correlation,
             tool_result_relation: (self.kind == Some("tool_result"))
                 .then(|| tool_result_relation_key(self.tool_name, self.tool_call_id))

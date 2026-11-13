@@ -134,3 +134,119 @@ fn failed_promotion_rolls_back_schema_and_names_recovery() {
         messages
     );
 }
+
+#[test]
+fn published_queue_notifications_match_fresh_without_losing_archive() {
+    use serde_json::json;
+    // v1.0.0 wrote every queue-operation containing a notice, including remove.
+    for arrangement in [
+        "enqueue_remove",
+        "repeated",
+        "enqueue_only",
+        "delivered_only",
+        "archive",
+        "archive_enqueue",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = dir.path().join("sources");
+        std::fs::create_dir_all(sources.join("claude")).unwrap();
+        let notice = "<task-notification>synthetic completion</task-notification>";
+        let mut records = Vec::new();
+        let mut legacy = Vec::new();
+        let operations: &[&str] = match arrangement {
+            "enqueue_remove" | "archive" => &["enqueue", "remove"],
+            "repeated" => &["enqueue", "remove", "enqueue", "remove"],
+            "enqueue_only" => &["enqueue"],
+            "archive_enqueue" => &["enqueue", "enqueue"],
+            _ => &[],
+        };
+        for (i, operation) in operations.iter().enumerate() {
+            let ts = format!("2026-06-01T11:00:{i:02}+00:00");
+            legacy.push((ts.clone(), None));
+            if (arrangement != "archive" || *operation != "remove")
+                && (arrangement != "archive_enqueue" || i != 0)
+            {
+                records.push(json!({"type":"queue-operation","operation":operation,
+                    "sessionId":"upgrade-claude","timestamp":ts,"content":notice}));
+            }
+        }
+        if arrangement != "enqueue_only" {
+            records.push(
+                json!({"type":"attachment","uuid":"delivery","sessionId":"upgrade-claude",
+                "timestamp":"2026-06-01T11:01:00Z","attachment":{"type":"queued_command",
+                "commandMode":"task-notification","prompt":notice}}),
+            );
+        }
+        if arrangement == "archive" {
+            // A replay at a different timestamp cannot retract the absent removal record.
+            records.push(records.last().unwrap().clone());
+        }
+        if arrangement == "delivered_only" {
+            let ts = "2026-06-01T11:02:00+00:00".to_string();
+            records.push(
+                json!({"type":"user","uuid":"direct-notice","sessionId":"upgrade-claude",
+                "timestamp":ts,"message":{"role":"user","content":notice}}),
+            );
+            legacy.push((ts, Some("direct-notice")));
+        }
+        let text = include_str!("fixtures/v1_0_0_claude.jsonl").to_string()
+            + &records.iter().map(|v| format!("{v}\n")).collect::<String>();
+        std::fs::write(sources.join("claude/session.jsonl"), text).unwrap();
+        let fresh_config = config(&dir.path().join("fresh"), &sources);
+        let fresh = SessionSearch::open(fresh_config.clone()).unwrap();
+        fresh.index().reindex_report(true).unwrap();
+        drop(fresh);
+        let expected = snapshot(&fresh_config.db_path());
+        for full in [false, true] {
+            let root = dir.path().join(if full { "full" } else { "incremental" });
+            std::fs::create_dir_all(&root).unwrap();
+            let config = config(&root, &sources);
+            let conn = Connection::open(config.db_path()).unwrap();
+            conn.execute_batch(
+                &include_str!("fixtures/v1_0_0_populated.sql")
+                    .replace("@SOURCES@", &sources.to_string_lossy().replace('\'', "''")),
+            )
+            .unwrap();
+            conn.execute("delete from messages where provider='codex'", [])
+                .unwrap();
+            conn.execute("delete from sessions where provider='codex'", [])
+                .unwrap();
+            conn.execute(
+                "delete from transcripts where session_id like 'codex:%'",
+                [],
+            )
+            .unwrap();
+            for (i, (ts, id)) in legacy.iter().enumerate() {
+                conn.execute("insert into messages(session_id,provider,seq,role,ts,kind,content,authorship,record_relation,correlation_authority,correlation_scope,correlation_id) values ('claude:upgrade-claude','claude',?1,'user',?2,'harness_notice',?3,'harness','original',?4,?5,?6)", rusqlite::params![4+i as i64,ts,notice,id.map(|_|"anthropic"),id.map(|_|"claude:upgrade-claude"),id]).unwrap();
+            }
+            drop(conn);
+            let upgraded = SessionSearch::open(config.clone()).unwrap();
+            upgraded.index().reindex_report(full).unwrap();
+            drop(upgraded);
+            let observed = snapshot(&config.db_path());
+            if arrangement.starts_with("archive") {
+                let notices: Vec<_> = observed[0]
+                    .iter()
+                    .filter(|r| r[5] == Value::Text("harness_notice".into()))
+                    .collect();
+                assert_eq!(
+                    notices.len(),
+                    2,
+                    "missing source record must remain full={full}"
+                );
+                assert!(notices.iter().any(|r| r[4]
+                    == Value::Text(
+                        if arrangement == "archive" {
+                            "2026-06-01T11:00:01+00:00"
+                        } else {
+                            "2026-06-01T11:00:00+00:00"
+                        }
+                        .into()
+                    )
+                    && r[11] == Value::Null));
+            } else {
+                assert_eq!(observed, expected, "arrangement={arrangement} full={full}");
+            }
+        }
+    }
+}

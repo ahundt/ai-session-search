@@ -924,6 +924,25 @@ impl ClaudeAdapter {
                     *queue_operation_counts
                         .entry(operation.to_string())
                         .or_default() += 1;
+                    if operation != "enqueue" {
+                        // Earlier parsers stored notices from queue removal records too. Only
+                        // retract the rendering of this still-present record, never absent text.
+                        if let Some(content) = value.get("content").and_then(Value::as_str) {
+                            if is_harness_notice(&value, content) && substantive_text(content) {
+                                let mut row = RawMessage::harness_notice(
+                                    content.trim().to_string(),
+                                    timestamp,
+                                );
+                                if let Some(event_id) = event_id {
+                                    row = row.with_native_event_identity(
+                                        MessageCorrelationAuthority::Anthropic,
+                                        event_id,
+                                    );
+                                }
+                                retracted_messages.push(row);
+                            }
+                        }
+                    }
                     if operation == "enqueue" {
                         requires_full_parse_for_tail = true;
                         if let Some(content) = value.get("content").and_then(Value::as_str) {
