@@ -1,0 +1,8 @@
+{"type":"queue-operation","operation":"enqueue","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:00:00Z","content":"<task-notification>synthetic completion repeated</task-notification>"}
+{"type":"queue-operation","operation":"remove","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:00:01Z","content":"<task-notification>synthetic completion repeated</task-notification>"}
+{"type":"queue-operation","operation":"enqueue","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:00:02Z","content":"<task-notification>synthetic completion repeated</task-notification>"}
+{"type":"queue-operation","operation":"remove","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:00:03Z","content":"<task-notification>synthetic completion repeated</task-notification>"}
+{"type":"queue-operation","operation":"enqueue","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:00:04Z","content":"<task-notification>synthetic completion undelivered</task-notification>"}
+{"type":"attachment","uuid":"repeated-delivery","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:01:00Z","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>synthetic completion repeated</task-notification>"}}
+{"type":"attachment","uuid":"repeated-delivery","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:01:00Z","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>synthetic completion repeated</task-notification>"}}
+{"type":"user","uuid":"without-enqueue","sessionId":"upgrade-queue","timestamp":"2026-06-01T12:02:00Z","message":{"role":"user","content":"<task-notification>synthetic completion direct</task-notification>"}}

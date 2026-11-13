@@ -211,3 +211,30 @@ def test_populated_comparison_detects_content_order_edits_text_and_provenance(
     with sqlite3.connect(database) as connection:
         connection.execute(mutation)
     assert verify_upgrade_path.populated_index_snapshot(database) != expected
+
+
+def test_populated_sources_include_queue_removal_replay_and_repeated_text(tmp_path: Path) -> None:
+    verify_upgrade_path.write_upgrade_sources(tmp_path)
+    records = [json.loads(line) for line in (tmp_path / "claude/queue.jsonl").read_text().splitlines()]
+    enqueues = [r["content"] for r in records if r.get("operation") == "enqueue"]
+    assert len(enqueues) > len(set(enqueues))
+    assert any(r.get("operation") == "remove" for r in records)
+    assert len([r for r in records if r.get("uuid") == "repeated-delivery"]) == 2
+
+
+def test_populated_comparison_counts_duplicate_messages_outside_seed_sessions(tmp_path: Path) -> None:
+    import sqlite3
+
+    database = tmp_path / "index.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript((verify_upgrade_path.UPGRADE_FIXTURES / "v1_0_0_populated.sql").read_text())
+        connection.executescript("alter table messages add column input_origin text; "
+                                "alter table messages add column input_delivery_state text;")
+        connection.execute("insert into messages(session_id,provider,seq,role,kind,content) "
+                           "values ('claude:additional','claude',0,'user','harness_notice','<task-notification>synthetic</task-notification>')")
+    expected = verify_upgrade_path.populated_index_snapshot(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("insert into messages(session_id,provider,seq,role,kind,content) "
+                           "select session_id,provider,seq,role,kind,content from messages where session_id='claude:additional'")
+    observed = verify_upgrade_path.populated_index_snapshot(database)
+    assert observed["messages"] != expected["messages"]

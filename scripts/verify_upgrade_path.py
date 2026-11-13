@@ -385,7 +385,7 @@ UPGRADE_FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "rust/ai-sessio
 
 
 def populated_index_snapshot(path: pathlib.Path) -> dict[str, list[tuple[object, ...]]]:
-    """Compare content and provenance, excluding physical row IDs and refresh timestamps."""
+    """Compare message multisets (including seq), provenance, edits, and transcripts."""
     queries = {
         "messages": "select session_id,provider,seq,role,ts,kind,content,tool_name,tool_call_id,is_compaction,authorship,correlation_authority,correlation_scope,correlation_id,input_delivery_state,input_origin,record_relation from messages order by session_id,seq,id",
         "file_edits": "select session_id,provider,seq,file_path,file_name,ts,tool,new_content,edits_json from file_edits order by session_id,seq,id",
@@ -393,7 +393,10 @@ def populated_index_snapshot(path: pathlib.Path) -> dict[str, list[tuple[object,
         "content_parts": "select m.session_id,m.seq,p.ordinal,p.start_char,p.end_char,p.authorship,p.origin from message_content_parts p join messages m on m.id=p.message_id order by m.session_id,m.seq,p.ordinal",
     }
     with sqlite3.connect(path.as_uri() + "?immutable=1", uri=True) as database:
-        return {name: database.execute(sql).fetchall() for name, sql in queries.items()}
+        snapshot = {name: database.execute(sql).fetchall() for name, sql in queries.items()}
+        # Retain every occurrence across every session, independently of presentation order.
+        snapshot["messages"].sort(key=repr)
+        return snapshot
 
 
 def write_upgrade_sources(sources: pathlib.Path) -> None:
@@ -408,6 +411,7 @@ def write_upgrade_sources(sources: pathlib.Path) -> None:
         destination = sources / provider
         destination.mkdir(parents=True)
         shutil.copyfile(UPGRADE_FIXTURES / f"v1_0_0_{provider}.jsonl", destination / "session.jsonl")
+    shutil.copyfile(UPGRADE_FIXTURES / "v1_0_0_queue.jsonl", sources / "claude/queue.jsonl")
     write("claude-desktop/local-agent-mode-sessions/install/account/local_upgrade-desktop/audit.jsonl", [
         {"type": "user", "uuid": "desktop-input", "session_id": "upgrade-desktop",
          "_audit_timestamp": "2026-06-01T10:00:00Z", "message": {"role": "user", "content": "synthetic desktop question"}},
