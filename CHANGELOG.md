@@ -61,9 +61,11 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    `ai_session_search::rusqlite` without a separate dependency. Replace these helpers with
    `IndexService::reindex_report` for index preparation and `MessageService::search` for queries.
 
-8. After upgrading and refreshing, `aise compact` reclaims unused pages and full-text delete
-   markers by rebuilding the full-text indexes and rewriting the database under the writer lock,
-   with work proportional to the whole index and up to twice its size in temporary disk space.
+8. An upgraded index can stay larger on disk than one built fresh, because the refresh leaves
+   unused pages behind. Running `aise compact` once after the first refresh is optional and
+   reclaims that space. It rebuilds the full-text indexes and rewrites the database while holding
+   the writer lock, so its time grows with the size of the whole index and it needs up to twice
+   the index size in temporary disk space.
 
 ### Added
 
