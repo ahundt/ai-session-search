@@ -442,3 +442,45 @@ fn published_queue_archive_keeps_lone_removal() {
 fn published_queue_archive_keeps_identical_enqueues() {
     queue_archive_refresh("two_enqueues");
 }
+
+#[test]
+fn queue_removal_keeps_the_last_copy_of_a_notice_stored_from_another_record() {
+    // The notice is stored from a record that then leaves the source; a queue removal record with
+    // the same text and time takes its place. Equal columns do not prove the stored row came from
+    // the removal record, so the row stays.
+    use serde_json::json;
+    for full in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = dir.path().join("sources");
+        std::fs::create_dir_all(sources.join("claude")).unwrap();
+        let notice = "<task-notification>synthetic archived completion</task-notification>";
+        let ts = "2026-06-01T10:00:00Z";
+        let file = sources.join("claude/session.jsonl");
+        let stored_from = json!({
+            "type":"user", "sessionId":"upgrade-claude", "timestamp":ts,
+            "message":{"role":"user", "content":notice}
+        });
+        std::fs::write(&file, format!("{stored_from}\n")).unwrap();
+        let config = config(&dir.path().join("index"), &sources);
+        let search = SessionSearch::open(config.clone()).unwrap();
+        search.index().reindex_report(false).unwrap();
+        drop(search);
+        let before = snapshot(&config.db_path());
+        assert_eq!(before[0].len(), 1, "the notice is stored once");
+        assert_eq!(
+            before[0][0][13],
+            Value::Null,
+            "the stored notice has no identity"
+        );
+        let removal = json!({
+            "type":"queue-operation", "operation":"remove",
+            "sessionId":"upgrade-claude", "timestamp":ts, "content":notice
+        });
+        std::fs::write(&file, format!("{removal}\n")).unwrap();
+        let search = SessionSearch::open(config.clone()).unwrap();
+        search.index().reindex_report(full).unwrap();
+        drop(search);
+        let after = snapshot(&config.db_path());
+        assert_eq!(after[0], before[0], "full={full}");
+    }
+}

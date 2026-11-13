@@ -7420,11 +7420,14 @@ fn store_parsed_messages(
 /// another timestamp may belong to a record no longer in the source.
 ///
 /// For a notice, equal role, content and time do not prove which record a row came from: a row
-/// stored for a record now gone and a declined record still present can agree on all three. The
-/// second rule therefore never removes the last copy of a notice. It takes the row only when the
-/// session keeps another row with the same role and content afterwards, counting every parsed
-/// message and every stored row this call leaves in place. Other rows are an earlier rendering of
-/// a record the parse now stores as different text, so no second copy is expected for them.
+/// stored for a record now gone and a declined record still present can agree on all three, and
+/// a notice without an identity has no other column that names its record. Neither rule
+/// therefore removes the last copy of a notice unless a native identity matches. A notice row is
+/// taken only when the session keeps another row with the same role and content afterwards,
+/// counting every parsed message and every stored row this call leaves in place. So a declined
+/// notice with no other copy stays in an upgraded index although a fresh build omits it. Other
+/// rows are an earlier rendering of a record the parse now stores as different text, so no second
+/// copy is expected for them; for those, equal role and content still decide.
 /// O(stored + declined + parsed) time and key memory.
 fn take_retracted_rows(
     stored: &[(i64, MessageKeys)],
@@ -7500,7 +7503,17 @@ fn take_retracted_rows(
                 matched,
             )
         });
-        match native.or_else(|| take(by_columns.get_mut(&keys.columns_without_seq), matched)) {
+        // Without an identity, a notice's columns are its role, text and time and nothing that
+        // names its record, so neither rule below may take its last copy.
+        let last_copy_of_notice =
+            keys.timestamped_notice && copies.get(&keys.role_and_content).copied().unwrap_or(0) < 2;
+        let by_equal_columns = || {
+            if last_copy_of_notice && keys.correlation.is_none() {
+                return None;
+            }
+            take(by_columns.get_mut(&keys.columns_without_seq), matched)
+        };
+        match native.or_else(by_equal_columns) {
             Some(position) => {
                 if let Some(count) = copies.get_mut(&stored[position].1.role_and_content) {
                     *count -= 1;
@@ -7512,8 +7525,8 @@ fn take_retracted_rows(
     }
     for keys in loose {
         let key = if keys.timestamped_notice {
-            // A notice is short text a harness repeats, and the parse stores it again under an
-            // identity whenever its record is still present, so another copy must remain.
+            // The parse stores a notice again under an identity whenever its record is still
+            // present, so a declined copy of it always leaves another copy behind.
             if copies.get(&keys.role_and_content).copied().unwrap_or(0) < 2 {
                 continue;
             }
