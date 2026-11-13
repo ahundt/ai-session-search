@@ -2097,17 +2097,20 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        let home = home_dir_fallback();
-        let app = home.join(".ai-session-search/config.toml");
-        let platform_legacy = dirs::config_dir()
-            .unwrap_or_else(|| home.join(".config"))
-            .join("ai-session-search/config.toml");
-        let xdg_legacy = home.join(".config/ai-session-search/config.toml");
-        choose_config_path(
-            nonempty_env_path("AI_SESSION_SEARCH_CONFIG"),
-            app,
-            &[platform_legacy, xdg_legacy],
-        )
+        let [app, legacy @ ..] = config_discovery_paths();
+        choose_config_path(nonempty_env_path("AI_SESSION_SEARCH_CONFIG"), app, &legacy)
+    }
+
+    /// Config files that exist at a discovery location and are not `active`, in discovery order.
+    /// Exactly one config file is read, so a setting in any of these has no effect.
+    pub fn config_files_not_read(active: &std::path::Path) -> Vec<PathBuf> {
+        let mut unread = Vec::<PathBuf>::new();
+        for path in config_discovery_paths() {
+            if path != active && path.is_file() && !unread.contains(&path) {
+                unread.push(path);
+            }
+        }
+        unread
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -2735,6 +2738,19 @@ fn toml_has_nested_key(document: &toml::Value, table: &str, nested: &str, key: &
         .and_then(|value| value.get(nested).cloned())
         .and_then(|value| value.get(key).cloned())
         .is_some()
+}
+
+/// Where a config file is looked for when none is named: the app directory first, then the two
+/// locations earlier releases used.
+fn config_discovery_paths() -> [PathBuf; 3] {
+    let home = home_dir_fallback();
+    [
+        home.join(".ai-session-search/config.toml"),
+        dirs::config_dir()
+            .unwrap_or_else(|| home.join(".config"))
+            .join("ai-session-search/config.toml"),
+        home.join(".config/ai-session-search/config.toml"),
+    ]
 }
 
 fn choose_config_path(

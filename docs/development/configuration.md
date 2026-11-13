@@ -29,7 +29,10 @@ here can select an existing database without moving it.
    migration destinations on the command that uses them.
 4. Run `aise config show`, `aise config origins`, and `aise doctor`. The first
    command prints merged values, the second identifies each winning source,
-   and the third reports invalid or inaccessible runtime paths.
+   and the third reports invalid or inaccessible runtime paths. `aise doctor`
+   also names the config file in use and lists any other config file at a
+   discovery location; exactly one file is read, so a setting in a listed file
+   has no effect.
 
 For automation, set a canonical `AI_SESSION_SEARCH_*` variable or pass the corresponding CLI/API
 argument instead of generating machine-specific TOML. A missing file is only an error when you

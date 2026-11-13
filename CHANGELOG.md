@@ -98,10 +98,12 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    `[integrations.paths]` destinations. `--no-index-preparation` installs integrations without
    starting background indexing. Codex receives a marketplace-backed MCP plugin listing;
    Pi and Prime Agent receive native MCP registrations and instructions.
-7. `aise config check` validates settings without opening the index and rejects unknown keys.
-   Doctor and index status report ignored ordinary keys with spelling suggestions. Duration input
-   also accepts ISO 8601, compound, and spelled-out forms; date ranges accept EDTF open intervals
-   and trailing IANA zones such as `2026-01-15[Europe/Berlin]`.
+7. `aise config check` validates settings without opening the index and rejects unknown keys. Doctor
+   and index status report ignored ordinary keys with spelling suggestions. `aise doctor` names the
+   config file in use, how it was selected, and any other config file at a discovery location that
+   is not read; its JSON adds `config_file` and `config_files_not_read`. Duration input also accepts
+   ISO 8601, compound, and spelled-out forms; date ranges accept EDTF open intervals and trailing
+   IANA zones such as `2026-01-15[Europe/Berlin]`.
 
 ### Changed
 

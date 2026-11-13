@@ -858,6 +858,63 @@ fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     );
 }
 
+/// A setting that has no effect is usually in a file aise is not reading. `doctor` names the file
+/// in use with how it was selected, and every other file at a discovery location, in both formats.
+#[test]
+fn doctor_names_the_config_file_in_use_and_the_ones_it_does_not_read() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+    let unread = [
+        root.path().join(".ai-session-search/config.toml"),
+        root.path().join(".config/ai-session-search/config.toml"),
+    ];
+    for path in &unread {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "[search]\ndefault_limit = 7\n").unwrap();
+    }
+    let run = |format: &str| {
+        let output = aise(root.path())
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .args(["--config", config.to_str().unwrap()])
+            .args([
+                "--index-refresh",
+                "existing-only",
+                "doctor",
+                "--format",
+                format,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let text = run("table");
+    assert!(
+        text.contains(&format!("Config: {} (cli --config)\n", config.display())),
+        "{text}"
+    );
+    for path in &unread {
+        assert!(
+            text.contains(&format!("Config file not read: {}\n", path.display())),
+            "{text}"
+        );
+    }
+
+    let document: serde_json::Value = serde_json::from_str(&run("json")).unwrap();
+    assert_eq!(
+        document["config_file"],
+        serde_json::json!({"path": config, "origin": "cli --config", "exists": true})
+    );
+    assert_eq!(document["config_files_not_read"], serde_json::json!(unread));
+}
+
 /// The result ceiling a registration sets in its own `env` block reaches the server it launches.
 ///
 /// The over-ceiling error tells callers to "raise the ceiling for this deployment with ...

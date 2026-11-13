@@ -1620,7 +1620,7 @@ fn execute(cli: Cli) -> Result<()> {
             );
         }
         Commands::Dates => unreachable!("date reference returns before opening the DB"),
-        Commands::Doctor(args) => print_doctor(&config, db, args.format, args.explain_unindexed)?,
+        Commands::Doctor(args) => print_doctor(&resolved, db, args.format, args.explain_unindexed)?,
         Commands::Tui => {
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
             let selected = tui::select_session(&config, db)?;
@@ -2482,25 +2482,40 @@ fn print_unindexed_explanation(unindexed: &[crate::diagnostics::UnindexedFile]) 
 }
 
 fn print_doctor(
-    config: &Config,
+    resolved: &ResolvedConfig,
     db: &Db,
     format: DoctorFormat,
     explain_unindexed: bool,
 ) -> Result<()> {
+    let config = &resolved.config;
+    let config_file_exists = resolved.config_path.is_file();
+    let config_files_not_read = Config::config_files_not_read(&resolved.config_path);
     let diagnostics = crate::diagnostics::collect(config, db)?;
     let unindexed = explain_unindexed
         .then(|| crate::diagnostics::explain_unindexed(config, db))
         .transpose()?;
     if format == DoctorFormat::Json {
         let mut document = serde_json::to_value(&diagnostics)?;
+        let fields = document
+            .as_object_mut()
+            .expect("DiagnosticStatus serializes as an object");
+        fields.insert(
+            "config_file".to_string(),
+            serde_json::json!({
+                "path": resolved.config_path,
+                "origin": resolved.origins.config,
+                "exists": config_file_exists,
+            }),
+        );
+        fields.insert(
+            "config_files_not_read".to_string(),
+            serde_json::to_value(&config_files_not_read)?,
+        );
         if let Some(unindexed) = unindexed {
-            document
-                .as_object_mut()
-                .expect("DiagnosticStatus serializes as an object")
-                .insert(
-                    "unindexed_file_explanations".to_string(),
-                    serde_json::to_value(unindexed)?,
-                );
+            fields.insert(
+                "unindexed_file_explanations".to_string(),
+                serde_json::to_value(unindexed)?,
+            );
         }
         println!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(());
@@ -2508,6 +2523,19 @@ fn print_doctor(
     let status = &diagnostics.index_status;
     let health = &diagnostics.providers;
     let warnings = status.parser_health.parse_warnings;
+    println!(
+        "Config: {} ({}{})",
+        resolved.config_path.display(),
+        resolved.origins.config,
+        if config_file_exists {
+            ""
+        } else {
+            "; no file there, built-in defaults in use"
+        }
+    );
+    for path in &config_files_not_read {
+        println!("Config file not read: {}", path.display());
+    }
     if !config.unknown_config_keys.is_empty() {
         println!(
             "Ignored config keys: {}; run `aise config check`",
