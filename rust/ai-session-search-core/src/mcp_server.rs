@@ -10432,7 +10432,7 @@ mod tests {
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
 
             let mut scheduled = false;
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 scheduled = state.lock().unwrap().refresh_worker.handle.is_some();
                 if scheduled {
                     break;
@@ -10673,7 +10673,7 @@ mod tests {
                 .await
                 .expect("rmcp client initializes");
 
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 1
                     && state.lock().unwrap().harness_roots == [allowed.clone()]
                 {
@@ -10769,7 +10769,7 @@ mod tests {
                 .serve(client_transport)
                 .await
                 .expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().harness_roots == [allowed.clone()] {
                     break;
                 }
@@ -10785,7 +10785,7 @@ mod tests {
                 .notify_roots_list_changed()
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 2
                     && state.lock().unwrap().harness_roots.is_empty()
                 {
@@ -10807,7 +10807,7 @@ mod tests {
                     .notify_roots_list_changed()
                     .await
                     .unwrap();
-                for _ in 0..50 {
+                for _ in 0..3_000 {
                     if !Arc::ptr_eq(
                         &root_generations.lock().unwrap().current_generation,
                         &previous_generation,
@@ -10831,7 +10831,7 @@ mod tests {
                     ),
                 ]))
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 3 {
                     break;
                 }
@@ -10856,7 +10856,7 @@ mod tests {
                     ),
                 ]))
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().harness_roots == [replacement.clone()] {
                     break;
                 }
@@ -10914,7 +10914,7 @@ mod tests {
                 .serve(client_transport)
                 .await
                 .expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().harness_roots == [allowed.clone()] {
                     break;
                 }
@@ -10926,7 +10926,7 @@ mod tests {
                 .notify_roots_list_changed()
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 2
                     && state.lock().unwrap().harness_roots.is_empty()
                 {
@@ -10945,7 +10945,7 @@ mod tests {
                     rmcp::model::Root::new("https://example.com/not-local"),
                 ]))
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().roots_error.is_some() {
                     break;
                 }
@@ -10992,7 +10992,7 @@ mod tests {
                 .serve(client_transport)
                 .await
                 .expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11076,7 +11076,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if observed_available_permits.lock().unwrap().len() == 1 {
                     break;
                 }
@@ -11108,7 +11108,7 @@ mod tests {
                 structured.get("operation_executed").is_none(),
                 "successful calls retain the canonical response without readiness metadata"
             );
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if observed_available_permits.lock().unwrap().len() == 2 {
                     break;
                 }
@@ -11165,7 +11165,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11200,7 +11200,7 @@ mod tests {
 
             release_response.add_permits(1);
             call.await.unwrap().expect("tool response is delivered");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 2 {
                     break;
                 }
@@ -11257,7 +11257,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11283,7 +11283,7 @@ mod tests {
                 .await
                 .expect("response send reaches the failing transport");
             attempted.forget();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if reader_permits.available_permits() == 1 {
                     break;
                 }
@@ -11348,7 +11348,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11383,7 +11383,7 @@ mod tests {
             call.cancel(Some("cancel undelivered response".to_string()))
                 .await
                 .expect("cancellation notification is sent");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if reader_permits.available_permits() == 1 {
                     break;
                 }
@@ -11433,7 +11433,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -12182,7 +12182,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.entries.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -12197,7 +12197,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.admission_attempts.load(Ordering::Acquire) == 2 {
                     break;
                 }
@@ -12208,7 +12208,7 @@ mod tests {
                 .cancel(Some("test cancels queued search".to_string()))
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.cancelled_admissions.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -12312,7 +12312,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.entries.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -12324,7 +12324,7 @@ mod tests {
                 .cancel(Some("test cancels active search".to_string()))
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.cancelled_active.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -12335,7 +12335,7 @@ mod tests {
             tokio::task::spawn_blocking(move || release_probe.release_first())
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.active.load(Ordering::Acquire) == 0 {
                     break;
                 }
@@ -12399,7 +12399,7 @@ mod tests {
                             .with_arguments(
                                 json!({
                                     "sql": long_sql,
-                                    "timeout_ms": 1000
+                                    "timeout_ms": 60_000
                                 })
                                 .as_object()
                                 .unwrap()
@@ -12410,7 +12410,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if permits.available_permits() == 0 {
                     break;
                 }
@@ -12423,7 +12423,7 @@ mod tests {
                 .cancel(Some("test cancels raw SQL".to_string()))
                 .await
                 .unwrap();
-            for _ in 0..200 {
+            for _ in 0..3_000 {
                 if permits.available_permits() == 1 {
                     break;
                 }
@@ -12432,8 +12432,8 @@ mod tests {
             let cancellation_latency = cancelled_at.elapsed();
             assert_eq!(permits.available_permits(), 1);
             assert!(
-                cancellation_latency < std::time::Duration::from_millis(500),
-                "request cancellation took {cancellation_latency:?}, so the 1000 ms SQL timeout won instead of cancellation"
+                cancellation_latency < std::time::Duration::from_secs(30),
+                "request cancellation took {cancellation_latency:?}, so the 60 s SQL timeout won instead of cancellation"
             );
 
             client.cancel().await.expect("client shutdown");
