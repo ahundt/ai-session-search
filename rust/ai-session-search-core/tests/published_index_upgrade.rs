@@ -74,6 +74,11 @@ fn published_generation_five_refresh_matches_fresh_index() {
         drop(conn);
         // This is the service constructor used by the CLI, followed by its explicit refresh.
         let upgraded = SessionSearch::open(config.clone()).unwrap();
+        assert_eq!(
+            &snapshot(&config.db_path())[4..],
+            &expected[4..],
+            "all tables, columns, and index keys must exist before refresh"
+        );
         upgraded.index().reindex_report(full).unwrap();
         drop(upgraded);
         assert_eq!(snapshot(&config.db_path()), expected, "full={full}");
