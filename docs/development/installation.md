@@ -233,8 +233,8 @@ for the target platform, because SQLite is built from bundled C.
 ## Update and uninstall
 
 Before upgrading an index 1.0.0 uses, **stop running aise processes (restart harnesses)**. 1.1.0
-moves the index to generation 6 on first open. A newly started 1.0.0 refuses it, but a 1.0.0
-process that already has it open can delete the history 1.1.0 keeps from shrunk, rewritten, or
+moves the index to generation 6 on first writable open. A newly started 1.0.0 refuses it, but a
+1.0.0 process that already has it open can delete the history 1.1.0 keeps from shrunk, rewritten, or
 deleted transcripts.
 
 To downgrade, stop every aise process, then:

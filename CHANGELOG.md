@@ -20,11 +20,12 @@ reads, and resume commands. See the [library guide](docs/development/library-api
 
 ### Upgrade notes
 
-1. Stop running aise processes, including MCP servers in harnesses, before upgrading. First open
-   promotes the index to generation 6. A newly started 1.0.0 refuses that index, but an already
+1. Stop running aise processes, including MCP servers in harnesses, before upgrading. The first
+   writable open promotes the index to generation 6. A newly started 1.0.0 refuses that index, but an already
    running 1.0.0 process can still delete archived history. A healthy generation-5 index upgrades
-   through metadata without a transcript reparse. To downgrade, stop processes, move the index
-   and its WAL files aside, and use 1.0.0 `aise reindex --full` to rebuild from source transcripts.
+   its storage in place without reparsing transcripts; refresh applies current provider parsers.
+   To downgrade, stop processes, move the index and its WAL files aside, and use 1.0.0
+   `aise reindex --full` to rebuild from source transcripts.
    Keep the moved files to retain archived history. Follow the
    [downgrade steps](docs/development/installation.md#update-and-uninstall).
 2. Rust public structs and enums are now `#[non_exhaustive]`. Replace struct literals with a
