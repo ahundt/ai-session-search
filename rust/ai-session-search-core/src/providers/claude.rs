@@ -2629,7 +2629,7 @@ mod tests {
     // These four cases were previously asserted against `should_skip_message`, i.e. that the
     // records were discarded. They are now stored as `MessageKind::HarnessNotice` and excluded
     // at query time instead, because discarding them also removed the only evidence of what a
-    // hook told an agent: every Stop-hook feedback record of a session was unsearchable.
+    // hook told an agent.
     // Each test asserts the record is CLASSIFIED as a notice and NOT skipped, so a regression
     // to dropping fails here rather than silently emptying a category.
 

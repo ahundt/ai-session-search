@@ -8533,7 +8533,7 @@ fn decode_db_enum<T>(
     // aise wrote the row and the fix is to upgrade, while an unknown role means corruption and
     // the fix is a full reparse. This wrapper only adds where the value was read. It must not
     // append its own `aise reindex --full` advice: for a provider that is the command that fails
-    // the same way, the circular advice a Pi session hit on 2026-08-13.
+    // the same way, which makes the advice circular.
     decode(&value).map_err(|reason| {
         rusqlite::Error::FromSqlConversionFailure(
             column_index,
@@ -20065,10 +20065,9 @@ mod tests {
 
     #[test]
     fn reindexing_a_shrunk_or_rewritten_source_keeps_every_stored_message() {
-        // Harnesses compact, rewrite and prune their own transcripts (Codex has rewritten a long
-        // session down to a small fraction of its records). The index is the archive: a re-parse
-        // that no longer holds a stored message must not delete it. New parse messages are appended
-        // after the highest stored seq.
+        // Harnesses compact, rewrite and prune their own transcripts. The index is the archive: a
+        // re-parse that no longer holds a stored message must not delete it. New parse messages
+        // are appended after the highest stored seq.
         use crate::models::MessageKind::Conversation;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();

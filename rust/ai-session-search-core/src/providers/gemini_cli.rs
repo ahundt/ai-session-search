@@ -1557,8 +1557,8 @@ mod tests {
     /// The chat file records tool traffic on the `gemini` turn (`toolCalls` with args and
     /// result), echoes results back as `functionResponse` parts on a `user` turn, and writes
     /// hook and CLI notices as `warning`/`info`/`error` turns. Every one of those was skipped or
-    /// mislabelled: 3,592 tool calls across 200 local files were absent from the index, and the
-    /// echoed responses were user-role conversation rows of unknown authorship.
+    /// mislabelled: tool calls were absent from the index, and the echoed responses were
+    /// user-role conversation rows of unknown authorship.
     #[test]
     fn records_tool_calls_results_notices_and_human_prompts() {
         let dir = tempfile::tempdir().unwrap();
