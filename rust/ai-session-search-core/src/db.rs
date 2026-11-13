@@ -7372,7 +7372,12 @@ fn store_parsed_messages(
         }
     }
     let mut delete = tx.prepare("delete from messages where id = ?1")?;
-    for id in take_retracted_rows(&stored, &mut matched, &parsed.retracted.messages) {
+    for id in take_retracted_rows(
+        &stored,
+        &mut matched,
+        &parsed.retracted.messages,
+        &parsed_keys,
+    ) {
         delete.execute(params![id])?;
     }
     let has_archive = matched.iter().any(|matched| !matched);
@@ -7413,14 +7418,33 @@ fn store_parsed_messages(
 /// text; role and content second, for rows an older renderer stored with other metadata. The
 /// second rule requires the same timestamp for notices and never takes an identified row. Text at
 /// another timestamp may belong to a record no longer in the source.
-/// O(stored + declined) time and key memory.
+///
+/// For a notice, equal role, content and time do not prove which record a row came from: a row
+/// stored for a record now gone and a declined record still present can agree on all three. The
+/// second rule therefore never removes the last copy of a notice. It takes the row only when the
+/// session keeps another row with the same role and content afterwards, counting every parsed
+/// message and every stored row this call leaves in place. Other rows are an earlier rendering of
+/// a record the parse now stores as different text, so no second copy is expected for them.
+/// O(stored + declined + parsed) time and key memory.
 fn take_retracted_rows(
     stored: &[(i64, MessageKeys)],
     matched: &mut [bool],
     retracted: &[Message],
+    parsed: &[MessageKeys],
 ) -> Vec<i64> {
     if retracted.is_empty() {
         return Vec::new();
+    }
+    // Copies of each role and content the session will hold: every parsed message is stored,
+    // and every unclaimed stored row stays unless this call takes it.
+    let mut copies = HashMap::<RowDigest, usize>::new();
+    for keys in parsed {
+        *copies.entry(keys.role_and_content).or_default() += 1;
+    }
+    for (position, (_, keys)) in stored.iter().enumerate() {
+        if !matched[position] {
+            *copies.entry(keys.role_and_content).or_default() += 1;
+        }
     }
     let mut by_native_content =
         HashMap::<(RowDigest, RowDigest), std::collections::VecDeque<usize>>::new();
@@ -7477,16 +7501,30 @@ fn take_retracted_rows(
             )
         });
         match native.or_else(|| take(by_columns.get_mut(&keys.columns_without_seq), matched)) {
-            Some(position) => taken.push(stored[position].0),
-            None => loose.push(if keys.timestamped_notice {
-                keys.role_content_timestamp
-            } else {
-                keys.role_and_content
-            }),
+            Some(position) => {
+                if let Some(count) = copies.get_mut(&stored[position].1.role_and_content) {
+                    *count -= 1;
+                }
+                taken.push(stored[position].0);
+            }
+            None => loose.push(keys),
         }
     }
-    for key in loose {
+    for keys in loose {
+        let key = if keys.timestamped_notice {
+            // A notice is short text a harness repeats, and the parse stores it again under an
+            // identity whenever its record is still present, so another copy must remain.
+            if copies.get(&keys.role_and_content).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            keys.role_content_timestamp
+        } else {
+            keys.role_and_content
+        };
         if let Some(position) = take(by_role_and_content.get_mut(&key), matched) {
+            if let Some(count) = copies.get_mut(&stored[position].1.role_and_content) {
+                *count -= 1;
+            }
             taken.push(stored[position].0);
         }
     }
@@ -19410,6 +19448,38 @@ mod tests {
             ["kept turn", "copy", "identified copy", "pruned"],
             "one copy is the parse's, one was declined; the identified and pruned rows stay"
         );
+    }
+
+    #[test]
+    fn reindex_declined_metadata_fallback_retracts_an_earlier_rendering_of_a_non_notice() {
+        // A declined record's earlier rendering can differ from the stored row in metadata only.
+        // The row is that record's and leaves, also when no other row holds the same text: the
+        // last-copy rule is for notices, whose text the parse stores again under an identity.
+        for (stored_count, parsed_count, expected) in [(1, 0, 0), (2, 0, 0), (2, 1, 1), (1, 2, 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
+            let stored =
+                parsed_with_messages("claude:loose", &vec!["synthetic copy"; stored_count]);
+            db.upsert_session(&stored, 1, 1).unwrap();
+            let mut current =
+                parsed_with_messages("claude:loose", &vec!["synthetic copy"; parsed_count]);
+            current.session.parse_version = "v2".into();
+            current.retracted.messages =
+                parsed_with_messages("claude:loose", &["synthetic copy", "synthetic copy"])
+                    .messages;
+            for message in &mut current.retracted.messages {
+                message.provenance.authorship = MessageAuthorship::Human;
+            }
+            db.upsert_session(&current, 2, 2).unwrap();
+            let count: i64 = db
+                .conn
+                .query_row("select count(*) from messages", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                count, expected,
+                "stored={stored_count} parsed={parsed_count}"
+            );
+        }
     }
 
     #[test]

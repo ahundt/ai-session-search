@@ -341,3 +341,104 @@ fn published_metadata_refresh_keeps_full_text_size_near_fresh() {
         );
     }
 }
+
+// Legacy queue rows have no identity; equal text and time cannot identify a removed event.
+fn queue_archive_refresh(case: &str) {
+    use serde_json::json;
+    for full in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = dir.path().join("sources");
+        std::fs::create_dir_all(sources.join("claude")).unwrap();
+        let notice = "<task-notification>synthetic archived completion</task-notification>";
+        let ts = "2026-06-01T10:00:00+00:00";
+        let later = "2026-06-01T10:00:01+00:00";
+        let queue = |operation: &str, timestamp: &str| {
+            json!({
+                "type":"queue-operation", "operation":operation,
+                "sessionId":"upgrade-claude", "timestamp":timestamp, "content":notice
+            })
+        };
+        let records = match case {
+            "both_present" => vec![queue("enqueue", ts), queue("remove", ts)],
+            "two_enqueues" => vec![queue("enqueue", ts), queue("enqueue", ts)],
+            "enqueue_gone_pair" => vec![queue("remove", later)],
+            "identified_remove" => {
+                let mut removal = queue("remove", ts);
+                removal["uuid"] = json!("distinct-removal");
+                vec![removal]
+            }
+            _ => vec![queue("remove", ts)],
+        };
+        std::fs::write(
+            sources.join("claude/session.jsonl"),
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let fresh_config = config(&dir.path().join("fresh"), &sources);
+        let fresh = SessionSearch::open(fresh_config.clone()).unwrap();
+        fresh.index().reindex_report(full).unwrap();
+        drop(fresh);
+        let expected = snapshot(&fresh_config.db_path());
+        let config = config(&dir.path().join("upgrade"), &sources);
+        std::fs::create_dir_all(config.db_path().parent().unwrap()).unwrap();
+        let conn = Connection::open(config.db_path()).unwrap();
+        conn.execute_batch(
+            &include_str!("fixtures/v1_0_0_populated.sql")
+                .replace("@SOURCES@", &sources.to_string_lossy().replace('\'', "''")),
+        )
+        .unwrap();
+        conn.execute_batch("delete from messages; delete from file_edits; delete from transcripts; delete from sessions where provider='codex';").unwrap();
+        let stored_times = match case {
+            "both_present" | "two_enqueues" => vec![ts, ts],
+            "enqueue_gone_pair" => vec![ts, later],
+            _ => vec![ts],
+        };
+        for (seq, ts) in stored_times.iter().enumerate() {
+            conn.execute("insert into messages(session_id,provider,seq,role,ts,kind,content,authorship,record_relation) values ('claude:upgrade-claude','claude',?1,'user',?2,'harness_notice',?3,'harness','original')",
+                rusqlite::params![seq as i64, ts, notice]).unwrap();
+        }
+        let before: i64 = conn
+            .query_row("select count(*) from messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before as usize, stored_times.len());
+        drop(conn);
+        let upgraded = SessionSearch::open(config.clone()).unwrap();
+        upgraded.index().reindex_report(full).unwrap();
+        drop(upgraded);
+        let observed = snapshot(&config.db_path());
+        let count = if case == "two_enqueues" { 2 } else { 1 };
+        assert_eq!(observed[0].len(), count, "case={case} full={full}");
+        if matches!(case, "both_present" | "two_enqueues") {
+            assert_eq!(observed, expected, "case={case} full={full}");
+        } else {
+            assert!(expected[0].is_empty());
+            assert_eq!(observed[0][0][4], Value::Text(ts.into()));
+            assert_eq!(observed[0][0][13], Value::Null);
+        }
+    }
+}
+
+#[test]
+fn published_queue_archive_keeps_last_equal_time_copy() {
+    queue_archive_refresh("enqueue_gone");
+}
+#[test]
+fn published_queue_archive_keeps_last_copy_with_distinct_removal_identity() {
+    queue_archive_refresh("identified_remove");
+}
+#[test]
+fn published_queue_archive_retracts_remove_with_enqueue_present() {
+    queue_archive_refresh("both_present");
+}
+#[test]
+fn published_queue_archive_retracts_remove_but_keeps_missing_enqueue() {
+    queue_archive_refresh("enqueue_gone_pair");
+}
+#[test]
+fn published_queue_archive_keeps_lone_removal() {
+    queue_archive_refresh("remove_only");
+}
+#[test]
+fn published_queue_archive_keeps_identical_enqueues() {
+    queue_archive_refresh("two_enqueues");
+}
