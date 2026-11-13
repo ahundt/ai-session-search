@@ -210,13 +210,15 @@ def reviewed_declaration(
     contract: dict[str, Any], baseline: str, candidate: str
 ) -> dict[str, Any] | None:
     """Return the manifest declaration that pins this exact digest pair, if the pair is accepted."""
-    if not result_pair_accepted(contract, baseline, candidate):
-        return None
+    # The declaration that makes the pair accepted, not merely one naming the same digests: a
+    # second entry for the pair can lack a category or a stated difference.
     return next(
-        cast(dict[str, Any], declaration)
-        for declaration in contract["accepted_results"]
-        if declaration.get("baseline_sha256") == baseline
-        and declaration.get("candidate_sha256") == candidate
+        (
+            cast(dict[str, Any], declaration)
+            for declaration in contract.get("accepted_results", [])
+            if result_pair_accepted({"accepted_results": [declaration]}, baseline, candidate)
+        ),
+        None,
     )
 
 

@@ -1481,6 +1481,14 @@ def test_renderer_separates_reviewed_result_differences_from_regressions(tmp_pat
             "changelog": "Added: structured message hits include timestamps",
         }]},
         "drifted-case": {},
+        # An unreviewed entry for the same digests must not be the one the report prints.
+        "twice-declared-case": {"accepted_results": [
+            {"baseline_sha256": digests["baseline"], "candidate_sha256": digests["candidate"],
+             "category": "unexplained"},
+            {"baseline_sha256": digests["baseline"], "candidate_sha256": digests["candidate"],
+             "category": "documented_change", "difference": "rows are ordered by sequence",
+             "changelog": "Fixed: stable tie-breaker"},
+        ]},
     }
     rows = []
     for build in ("baseline", "candidate"):
@@ -1504,6 +1512,9 @@ def test_renderer_separates_reviewed_result_differences_from_regressions(tmp_pat
     assert ("- `timestamp-case` (field_added): hits add timestamp. Changelog: Added: structured "
             "message hits include timestamps.") in reviewed
     assert "drifted-case" not in reviewed
+    assert ("- `twice-declared-case` (documented_change): rows are ordered by sequence. Changelog: "
+            "Fixed: stable tie-breaker.") in reviewed
+    assert "twice-declared-case" not in regressions
     assert "Required-equal result-digest mismatches: 1." in report
 
 
