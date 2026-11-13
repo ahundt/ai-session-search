@@ -367,7 +367,13 @@ Before tagging, confirm:
   temporary files were cleaned up in each case.
 - Latency and memory were measured against the prior release and any regression is understood.
   Use `scripts/benchmark_release.py` with `--fixture generated`, then compare the baseline and
-  candidate JSONL with `scripts/render_benchmark_report.py`. A release whose diff cannot change a
+  candidate JSONL with `scripts/render_benchmark_report.py`. Cross-version comparison requires
+  equal result digests or an exact baseline/candidate digest pair in that case's `accepted_results`
+  manifest declaration. Each declaration names an added field or documented change, its exact
+  difference, and the changelog reference. The checked pairs use the default generated fixture
+  (seed 20260716, 128 sessions, 32 messages per session). Review a new pair when outputs change;
+  `require_equal=false` and `baseline_allow_failure=true` are deprecated and no longer bypass
+  comparison or process failures. A release whose diff cannot change a
   hot path can record that reasoning instead of a measurement, naming the diff.
 
 ## TestPyPI rehearsal

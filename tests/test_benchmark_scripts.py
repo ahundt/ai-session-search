@@ -1483,3 +1483,44 @@ def test_every_measured_case_runs_with_an_owned_config_and_home(tmp_path: Path) 
     assert "enabled = false" in (tmp_path / "sandbox" / "config.toml").read_text(encoding="utf-8")
     source = (ROOT / "scripts" / "benchmark_release.py").read_text(encoding="utf-8")
     assert "environment=hermetic_environment(sandbox)" in source
+
+
+def test_cross_version_comparison_requires_an_exact_reviewed_case_declaration() -> None:
+    benchmark = load_script("benchmark_release.py")
+    case: dict[str, Any] = {"id": "search"}
+    assert benchmark.result_pair_accepted(case, "same", "same")
+    assert not benchmark.result_pair_accepted(case, "old", "new")
+    assert not benchmark.result_pair_accepted({**case, "require_equal": False}, "old", "new")
+    declaration = {"baseline_sha256": "old", "candidate_sha256": "new",
+                   "category": "field_added", "difference": "hits add timestamp",
+                   "changelog": "Added: structured message hits include timestamps"}
+    case["accepted_results"] = [declaration]
+    assert benchmark.result_pair_accepted(case, "old", "new")
+    assert not benchmark.result_pair_accepted(case, "old", "unreviewed")
+    assert not benchmark.result_pair_accepted(case, "unreviewed", "new")
+    declaration["category"] = "unexplained"
+    assert not benchmark.result_pair_accepted(case, "old", "new")
+
+
+def test_generated_fixture_refresh_time_is_independent_of_build_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = load_script("benchmark_release.py")
+    schema = (ROOT / "rust/ai-session-search-core/tests/fixtures/v1_0_0_populated.sql").read_text()
+    clock = 0
+
+    def seed_empty_index(*_args: Any, **kwargs: Any) -> None:
+        nonlocal clock
+        clock += 1
+        with sqlite3.connect(kwargs["cwd"] / "generated.db") as connection:
+            connection.executescript(schema)
+            connection.execute("update index_metadata set value=? where key like 'auto_reindex_completed_%'", (clock,))
+
+    monkeypatch.setattr(benchmark.subprocess, "run", seed_empty_index)
+    monkeypatch.setattr(benchmark, "OVERSIZED_TRANSCRIPT_BYTES", 128)
+    timestamps = []
+    for label in ("baseline", "candidate"):
+        path = benchmark.generate_fixture(tmp_path / label, Path("aise"), 1, 1, 1)
+        with sqlite3.connect(path) as connection:
+            timestamps.append(connection.execute("select key,value from index_metadata where key like 'auto_reindex_completed_%' order by key").fetchall())
+    assert timestamps[0] == timestamps[1]

@@ -10,9 +10,15 @@ import argparse
 import json
 import math
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
+
+if not __package__:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from scripts.benchmark_release import result_pair_accepted
 
 BENCHMARK_JSON_PREFIX = "AISE_BENCHMARK_JSON="
 
@@ -299,8 +305,9 @@ def render(
         contracts = {case["id"]: case for case in manifest["cases"]}
     semantic_mismatches = [
         case for case in shared
-        if contracts.get(case, {}).get("require_equal", True)
-        and summarize(baseline_rows[case])["digest"] != summarize(candidate_rows[case])["digest"]
+        if not result_pair_accepted(contracts.get(case, {}),
+                                    summarize(baseline_rows[case])["digest"],
+                                    summarize(candidate_rows[case])["digest"])
     ]
     candidate_durable_mutations = sum(
         bool(row.get("durable_fixture_mutated"))

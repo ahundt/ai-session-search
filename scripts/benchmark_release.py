@@ -43,6 +43,24 @@ class Build(TypedDict):
     repository: Path
 
 
+def result_pair_accepted(case: dict[str, Any], baseline: str, candidate: str) -> bool:
+    """Require exact equality or an explicitly reviewed digest pair for this case.
+
+    Each exception pins both outputs and names an added field or a documented behavior change.
+    Neither a global relaxation nor the deprecated require_equal=False bypasses this rule.
+    """
+    if baseline == candidate:
+        return True
+    return any(
+        declaration.get("baseline_sha256") == baseline
+        and declaration.get("candidate_sha256") == candidate
+        and declaration.get("category") in {"field_added", "documented_change"}
+        and bool(declaration.get("difference"))
+        and bool(declaration.get("changelog"))
+        for declaration in case.get("accepted_results", [])
+    )
+
+
 def balanced_build_order(builds: list[Build], repetition: int) -> tuple[Build, ...]:
     """Alternate first-run ownership so time and thermal drift do not favor one build."""
     ordered = builds if repetition % 2 == 0 else reversed(builds)
@@ -280,6 +298,12 @@ def generate_fixture(
                 "insert into file_edits (session_id, provider, seq, ts, tool, file_path, file_name, new_content) values (?, 'codex', 31, ?, 'Edit', ?, ?, ?)",
                 (session_id, timestamp, f"src/file_{session_number:02d}.rs", f"file_{session_number:02d}.rs", f"// deterministic edit {session_number}\n"),
             )
+        # The generated fixture describes fixed event times, not the clock when its empty index
+        # was initialized. Doctor must compare the same refresh timestamp across builds and runs.
+        connection.execute("update index_metadata set value = case key "
+                           "when 'auto_reindex_completed_ms' then 1767268800000 "
+                           "when 'auto_reindex_completed_ns' then 1767268800000000000 end "
+                           "where key in ('auto_reindex_completed_ms','auto_reindex_completed_ns')")
         connection.commit()
         connection.execute("pragma wal_checkpoint(truncate)").fetchone()
     finally:
@@ -680,7 +704,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
         )
         fixtures = {str(build["label"]): fixture for build in builds}
     contracts = {
-        case["id"]: {"require_equal": case.get("require_equal", True)}
+        case["id"]: {"require_equal": True, "accepted_results": case.get("accepted_results", [])}
         for case in manifest["cases"]
     }
     for build in builds:
@@ -707,7 +731,6 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                 + "\n"
             )
 
-    expected_by_case: dict[str, str] = {}
     expected_by_build_case: dict[tuple[str, str], str] = {}
     for case in selected:
         for repetition in range(repetitions):
@@ -789,10 +812,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                     if sample["exit_code"] != 0:
                         output.write(json.dumps(sample, sort_keys=True) + "\n")
                         output.flush()
-                        if label == "baseline" and case.get(
-                            "baseline_allow_failure", False
-                        ):
-                            continue
+                        # Deprecated manifest bypasses never turn a process failure into equality.
                         raise SystemExit(f"{label}/{case['id']} failed: {sample['stderr']}")
                     comparison_digest = sample.get(
                         "semantic_result_sha256", sample["result_sha256"]
@@ -805,13 +825,10 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                         raise SystemExit(
                             f"non-deterministic result digest: {label}/{case['id']}"
                         )
-                    prior_build_digest = expected_by_case.setdefault(
-                        case["id"], comparison_digest
-                    )
-                    if (
-                        case.get("require_equal", True)
-                        and comparison_digest != prior_build_digest
-                    ):
+                    baseline_digest = expected_by_build_case.get(("baseline", case["id"]))
+                    candidate_digest = expected_by_build_case.get(("candidate", case["id"]))
+                    if (baseline_digest is not None and candidate_digest is not None
+                            and not result_pair_accepted(case, baseline_digest, candidate_digest)):
                         raise SystemExit(
                             f"baseline/candidate result mismatch: {case['id']}"
                         )

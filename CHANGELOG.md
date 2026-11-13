@@ -70,6 +70,7 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    recorded sender. Reports count excluded input as `unattributed_input_count` and record the
    opt-in as `unattributed_input_included`; `aise repeats --format json --report` returns the
    complete report object. MCP `run_skill_capability` and both libraries expose the same opt-in.
+   SQL message rows expose input origin and delivery state.
 3. Rust adds `ServiceError` codes for lookup, ambiguity, invalid arguments, missing or unrefreshed
    indexes, file versions, and destination collisions. `SessionSearch::sql()` runs scoped read-only
    SQL; `AnalysisService::repeats` and `vocabulary` return typed reports; `CatalogService` supplies
