@@ -2007,8 +2007,8 @@ impl Db {
     }
 
     /// Rebuild derived postings from message content, removing live delete flags that FTS5
-    /// optimize preserves. Explicit maintenance only: O(B + P) tokenization/I/O for B content
-    /// bytes and P emitted postings across the entire index, regardless of rows just refreshed.
+    /// optimize preserves. Explicit maintenance only: scans all content and regenerates all
+    /// postings, including SQLite's segment-merge write amplification, regardless of rows refreshed.
     /// SQLite streams through its bounded pager/FTS buffers; rollback preserves the old indexes.
     pub(crate) fn rebuild_fts(&self) -> Result<()> {
         self.with_immediate_transaction(|| {

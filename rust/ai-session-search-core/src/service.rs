@@ -2382,9 +2382,10 @@ impl<'app> MaintenanceService<'app> {
     }
 
     /// Rebuild FTS postings and the database, then checkpoint the WAL while
-    /// holding the same process lock used by index writers. Work is O(B + P + D) for all message
-    /// bytes B, emitted postings P, and database bytes D, with SQLite's streaming buffers and up
-    /// to roughly 2D temporary disk space. Interrupted transactions recover through SQLite.
+    /// holding the same process lock used by index writers. Scans all message bytes, regenerates
+    /// all postings (including SQLite's merge work), and rewrites all D database bytes, regardless
+    /// of rows recently refreshed. Uses SQLite's streaming buffers and up to roughly 2D temporary
+    /// disk space. Interrupted transactions recover through SQLite.
     pub fn compact(&self) -> Result<CompactOutcome> {
         indexer::with_index_update_lock(self.config, || {
             let before_bytes = self.db.storage_allocation()?.total_bytes;
