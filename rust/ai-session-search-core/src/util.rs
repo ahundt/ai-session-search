@@ -6,7 +6,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 
@@ -21,22 +21,6 @@ use crate::models::{
     MessageCorrelationAuthority, MessageCorrelationIdentity, MessageInputOrigin, MessageKind,
     MessageProvenance, MessageRecordRelation, ParsedSession, Provider, Role, SessionRecord,
 };
-
-/// Bound whole-file provider snapshots and optional title sidecars before decoding or parsing.
-/// JSON trees can require several times their input size; JSONL transcripts use streaming paths.
-pub(crate) const MAX_PROVIDER_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
-
-pub(crate) fn read_provider_snapshot(reader: impl io::Read) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_PROVIDER_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() as u64 <= MAX_PROVIDER_SNAPSHOT_BYTES,
-        "provider snapshot exceeds {MAX_PROVIDER_SNAPSHOT_BYTES} byte limit"
-    );
-    Ok(bytes)
-}
 
 /// Source bytes a cooperative scan may cross before it re-checks cancellation.
 ///
