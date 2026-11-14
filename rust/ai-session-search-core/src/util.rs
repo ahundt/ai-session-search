@@ -2280,6 +2280,40 @@ pub fn current_repo(config: &Config) -> Option<String> {
 pub const RESUME_COMMAND_POLICY_NOTE: &str =
     "Provider defaults only: add your own permission or approval flags if your workflow uses them.";
 
+/// Provider-level executable discovery and native resume syntax, independent of a session.
+pub(crate) struct ResumeCapability {
+    pub binaries: &'static [&'static str],
+    pub resume_argument: Option<&'static str>,
+}
+
+impl ResumeCapability {
+    pub fn cli_available(&self) -> bool {
+        self.binaries.iter().any(|binary| which(binary).is_some())
+    }
+
+    pub fn command_template(&self) -> Option<String> {
+        self.resume_argument
+            .map(|argument| format!("{} {argument} <session-id>", self.binaries[0]))
+    }
+}
+
+pub(crate) fn provider_resume_capability(provider: Provider) -> ResumeCapability {
+    let (binaries, resume_argument): (&[&str], Option<&str>) = match provider {
+        Provider::Claude => (&["claude"], Some("--resume")),
+        Provider::Codex => (&["codex"], Some("resume")),
+        Provider::Pi => (&["pi"], Some("--session")),
+        Provider::PrimeAgent => (&["prime-agent"], Some("--resume")),
+        Provider::GeminiCli => (&["gemini"], Some("--resume")),
+        Provider::Cursor => (&["cursor"], None),
+        Provider::Antigravity => (&["agy", "antigravity"], None),
+        Provider::ClaudeDesktop | Provider::AiStudio => (&[], None),
+    };
+    ResumeCapability {
+        binaries,
+        resume_argument,
+    }
+}
+
 /// Build the provider CLI invocation that reopens `session`, plus the directory to run it from.
 ///
 /// The command carries the provider's own resume verb and this session's id and nothing else. It
@@ -2291,21 +2325,16 @@ pub const RESUME_COMMAND_POLICY_NOTE: &str =
 /// index observes, and guessing one from transcript history would silently widen what an agent may
 /// do. Surfaces that print this command say so, so a caller adds its own flags deliberately.
 pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<String>)> {
-    let binary = match session.provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
-        Provider::Pi => "pi",
-        Provider::PrimeAgent => "prime-agent",
-        Provider::GeminiCli => "gemini",
-        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity | Provider::AiStudio => {
-            let id = &session.id;
-            let provider = session.provider.as_str();
-            return Err(anyhow!(
-                "resuming is not supported for {provider} sessions — read this one here with \
-                 `aise show {id}` or `aise export {id}`"
-            ));
-        }
+    let capability = provider_resume_capability(session.provider);
+    let Some(argument) = capability.resume_argument else {
+        let id = &session.id;
+        let provider = session.provider.as_str();
+        return Err(anyhow!(
+            "resuming is not supported for {provider} sessions — read this one here with \
+             `aise show {id}` or `aise export {id}`"
+        ));
     };
+    let binary = capability.binaries[0];
     if which(binary).is_none() {
         let id = &session.id;
         return Err(anyhow!(
@@ -2363,36 +2392,12 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             session.provider_session_id.clone()
         }
     };
-    let command = match session.provider {
-        Provider::Claude => vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            session.provider_session_id.clone(),
-        ],
-        Provider::Codex => vec![
-            "codex".to_string(),
-            "resume".to_string(),
-            session.provider_session_id.clone(),
-        ],
-        Provider::Pi => vec![
-            "pi".to_string(),
-            "--session".to_string(),
-            pi_family_target(),
-        ],
-        Provider::PrimeAgent => vec![
-            "prime-agent".to_string(),
-            "--resume".to_string(),
-            pi_family_target(),
-        ],
-        Provider::GeminiCli => vec![
-            "gemini".to_string(),
-            "--resume".to_string(),
-            session.provider_session_id.clone(),
-        ],
-        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity | Provider::AiStudio => {
-            unreachable!("resume is handled before command construction")
-        }
+    let target = if matches!(session.provider, Provider::Pi | Provider::PrimeAgent) {
+        pi_family_target()
+    } else {
+        session.provider_session_id.clone()
     };
+    let command = vec![binary.to_string(), argument.to_string(), target];
     Ok((command, cwd))
 }
 

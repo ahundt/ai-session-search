@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::{DiagnosticStatus, IndexStatus, ParserHealth, Provider, ProviderHealth};
-use crate::util::{normalize_path, which};
+use crate::util::{normalize_path, provider_resume_capability};
 
 pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
     let inventory = crate::source::inventory_snapshot(config);
@@ -43,29 +43,11 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                 .providers
                 .iter()
                 .find(|item| item.provider == provider);
-            let (cli_available, resume_command) = match provider {
-                Provider::Claude => (
-                    which("claude").is_some(),
-                    Some("claude --resume <session-id>"),
-                ),
-                Provider::Codex => (which("codex").is_some(), Some("codex resume <session-id>")),
-                Provider::Pi => (which("pi").is_some(), Some("pi --session <session-id>")),
-                Provider::PrimeAgent => (
-                    which("prime-agent").is_some(),
-                    Some("prime-agent --resume <session-id>"),
-                ),
-                Provider::Cursor => (which("cursor").is_some(), None),
-                Provider::Antigravity => (
-                    which("agy").is_some() || which("antigravity").is_some(),
-                    None,
-                ),
-                Provider::ClaudeDesktop => (false, None),
-                Provider::AiStudio | Provider::GeminiCli => (false, None),
-            };
+            let capability = provider_resume_capability(provider);
             ProviderHealth {
                 provider,
                 enabled: source.enabled,
-                cli_available,
+                cli_available: capability.cli_available(),
                 roots: source.roots,
                 discovered_files: source.discovered_files,
                 indexed_sessions: parser.map_or(0, |item| item.indexed_sessions),
@@ -88,7 +70,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                     .iter()
                     .filter(|source| source.0 == provider && !indexed.contains(*source))
                     .count() as i64,
-                resume_command: resume_command.map(str::to_string),
+                resume_command: capability.command_template(),
             }
         })
         .collect::<Vec<_>>();
@@ -238,6 +220,77 @@ fn classify_index_status(
 mod tests {
     use super::*;
     use crate::db::SCHEMA_VERSION;
+
+    fn isolated_config(dir: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.providers.claude.enabled = false;
+        config.providers.claude_desktop.enabled = false;
+        config.providers.codex.enabled = false;
+        config.providers.cursor.enabled = false;
+        config.providers.antigravity.enabled = false;
+        config.providers.pi.enabled = false;
+        config.providers.prime_agent.enabled = false;
+        config.providers.aistudio.enabled = false;
+        config.providers.gemini_cli.enabled = false;
+        config.index.db_path = Some(normalize_path(&dir.join("index.db")));
+        config.index.cache_dir = Some(normalize_path(&dir.join("cache")));
+        config
+    }
+
+    #[test]
+    fn doctor_resume_capabilities_agree_with_main_session_plans() {
+        use crate::util::{minimal_record, resume_plan, tests::with_stub_binary_on_path};
+        let dir = tempfile::tempdir().unwrap();
+        let config = isolated_config(dir.path());
+        let db = Db::open(&config.db_path()).unwrap();
+        for (provider, binary) in [
+            (Provider::Claude, "claude"),
+            (Provider::Codex, "codex"),
+            (Provider::Pi, "pi"),
+            (Provider::PrimeAgent, "prime-agent"),
+            (Provider::GeminiCli, "gemini"),
+            (Provider::Cursor, "cursor"),
+            (Provider::Antigravity, "agy"),
+            (Provider::ClaudeDesktop, "synthetic-desktop"),
+            (Provider::AiStudio, "synthetic-studio"),
+        ] {
+            with_stub_binary_on_path(binary, || {
+                let mut parsed = minimal_record(
+                    provider,
+                    &dir.path().join("session-synthetic.jsonl"),
+                    String::new(),
+                );
+                parsed.session.cwd = Some(normalize_path(dir.path()));
+                parsed.session.provider_session_id = "synthetic".into();
+                let report = collect(&config, &db).unwrap();
+                let health = report
+                    .providers
+                    .iter()
+                    .find(|health| health.provider == provider)
+                    .unwrap();
+                assert_eq!(
+                    health.cli_available,
+                    !matches!(provider, Provider::ClaudeDesktop | Provider::AiStudio),
+                    "{provider}"
+                );
+                match resume_plan(&parsed.session) {
+                    Ok((argv, _)) => {
+                        assert!(health.cli_available, "{provider}");
+                        assert_eq!(
+                            health
+                                .resume_command
+                                .as_deref()
+                                .unwrap()
+                                .replace("<session-id>", "synthetic"),
+                            argv.join(" "),
+                            "{provider}"
+                        );
+                    }
+                    Err(_) => assert!(health.resume_command.is_none(), "{provider}"),
+                }
+            });
+        }
+    }
 
     fn health(schema_current: bool, stale_sessions: i64) -> ParserHealth {
         ParserHealth {
