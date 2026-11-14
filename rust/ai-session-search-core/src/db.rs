@@ -984,13 +984,16 @@ impl Db {
             return Ok(db);
         }
         db.configure_query_connection()?;
-        // Migration publishes a self-contained rollback-journal file. Restore WAL under the
-        // writer permit; healthy WAL opens only read the mode and never elect a writer here.
+        // Migration publishes a self-contained rollback-journal file. WAL restoration is
+        // optional: never wait for the writer permit, and retry on a later writable open if
+        // an existing reader prevents conversion. Healthy WAL opens never elect a writer.
         let journal_mode: String = db
             .conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         if !journal_mode.eq_ignore_ascii_case("wal") {
-            db.with_open_writer_permit(path, || {
+            let mut config = crate::config::Config::default();
+            config.index.db_path = Some(path.to_string_lossy().into_owned());
+            let _ = crate::indexer::IndexCoordinator::new(&config).try_with_elected_writer(|_| {
                 db.require_write_compatibility()?;
                 let current: String = db
                     .conn
@@ -999,7 +1002,7 @@ impl Db {
                     db.conn.pragma_update(None, "journal_mode", "wal")?;
                 }
                 Ok(())
-            })?;
+            });
         }
         db.conn.pragma_update(None, "synchronous", "normal")?;
         let generation = db.schema_version()?;
@@ -9217,6 +9220,128 @@ mod tests {
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
+
+    fn migrated_rollback_index(dir: &Path) -> std::path::PathBuf {
+        let source_path = dir.join("source.db");
+        let destination = dir.join("migrated.db");
+        let source = Db::open(&source_path).unwrap();
+        seed_messages(&source, &[("user", "synthetic archived prompt")]);
+        drop(source);
+        crate::migration::migrate_database(&crate::migration::DatabaseMigrationOptions::new(
+            source_path,
+            destination.clone(),
+            dir.join("receipt.json"),
+        ))
+        .unwrap();
+        destination
+    }
+
+    #[test]
+    fn migrated_open_defers_wal_while_a_rollback_reader_holds_a_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = migrated_rollback_index(dir.path());
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("begin; select * from messages;")
+            .unwrap();
+        let opened = Db::open_with_threads(&path, 0, NonZeroUsize::MIN).unwrap();
+        assert_eq!(opened.message_count().unwrap(), 1);
+        assert_eq!(
+            opened
+                .conn
+                .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        reader.execute_batch("rollback").unwrap();
+        let retried = Db::open_with_threads(&path, 0, NonZeroUsize::MIN).unwrap();
+        assert_eq!(
+            retried
+                .conn
+                .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(retried.message_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn migrated_open_does_not_wait_for_the_writer_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = migrated_rollback_index(dir.path());
+        let mut lock =
+            crate::indexer::open_index_update_lock(&crate::indexer::index_update_lock_path(&path))
+                .unwrap();
+        let guard = lock.write().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            send.send(
+                Db::open_with_threads(&path, 0, NonZeroUsize::MIN)
+                    .map(|db| db.message_count().unwrap()),
+            )
+            .unwrap();
+        });
+        let result = recv.recv_timeout(Duration::from_secs(30));
+        drop(guard);
+        handle.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), 1);
+    }
+
+    #[test]
+    fn migrated_open_concurrent_readers_all_succeed_and_allow_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = migrated_rollback_index(dir.path());
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Db::open_with_threads(&path, 250, NonZeroUsize::MIN)
+                })
+            })
+            .collect();
+        let opened: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        for db in &opened {
+            assert_eq!(db.message_count().unwrap(), 1);
+        }
+        assert_eq!(
+            opened[0]
+                .conn
+                .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        let root = dir.path().join("claude");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("new.jsonl"), "{\"type\":\"user\",\"sessionId\":\"after-migration\",\"message\":{\"role\":\"user\",\"content\":\"synthetic new prompt\"}}\n").unwrap();
+        let mut config = crate::config::Config::default();
+        config.index.db_path = Some(crate::util::normalize_path(&path));
+        for provider in [
+            &mut config.providers.claude,
+            &mut config.providers.claude_desktop,
+            &mut config.providers.codex,
+            &mut config.providers.cursor,
+            &mut config.providers.antigravity,
+            &mut config.providers.pi,
+            &mut config.providers.prime_agent,
+            &mut config.providers.aistudio,
+            &mut config.providers.gemini_cli,
+        ] {
+            provider.enabled = false;
+            provider.paths.clear();
+        }
+        config.providers.claude.enabled = true;
+        config.providers.claude.paths = vec![crate::util::normalize_path(&root)];
+        crate::indexer::reindex(&config, &opened[0], false, None).unwrap();
+        for db in &opened {
+            assert_eq!(db.message_count().unwrap(), 2);
+        }
+    }
 
     #[test]
     fn migrated_writable_service_restores_wal_and_normal_synchronous() {
