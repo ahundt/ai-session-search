@@ -96,6 +96,7 @@ from ._native import (
     SkillRunReport,
     SkillSelector,
     ToolActivity,
+    UnknownConfigKey,
     UnrecognizedRecordType,
     serve_mcp,
 )
@@ -188,6 +189,7 @@ __all__ = [
     "SkillRunReport",
     "SkillSelector",
     "ToolActivity",
+    "UnknownConfigKey",
     "UnrecognizedRecordType",
     "serve_mcp",
 ]

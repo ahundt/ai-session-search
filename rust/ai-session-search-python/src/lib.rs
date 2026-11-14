@@ -4328,6 +4328,8 @@ impl From<ParserHealth> for NativeParserHealth {
 )]
 struct NativeIndexStatus {
     #[pyo3(get)]
+    unindexed_files: i64,
+    #[pyo3(get)]
     parser_health: NativeParserHealth,
     #[pyo3(get)]
     repairable_stale_sessions: i64,
@@ -4426,6 +4428,7 @@ impl From<IndexReadinessStatus> for NativeIndexReadinessStatus {
 impl From<IndexStatus> for NativeIndexStatus {
     fn from(status: IndexStatus) -> Self {
         Self {
+            unindexed_files: status.unindexed_files,
             parser_health: status.parser_health.into(),
             repairable_stale_sessions: status.repairable_stale_sessions,
             unavailable_stale_sessions: status.unavailable_stale_sessions,
@@ -4444,6 +4447,8 @@ impl From<IndexStatus> for NativeIndexStatus {
     skip_from_py_object
 )]
 struct NativeProviderHealth {
+    #[pyo3(get)]
+    unindexed_files: i64,
     #[pyo3(get)]
     provider: String,
     #[pyo3(get)]
@@ -4473,6 +4478,7 @@ struct NativeProviderHealth {
 impl From<ProviderHealth> for NativeProviderHealth {
     fn from(health: ProviderHealth) -> Self {
         Self {
+            unindexed_files: health.unindexed_files,
             provider: health.provider.as_str().to_string(),
             enabled: health.enabled,
             cli_available: health.cli_available,
@@ -4489,6 +4495,21 @@ impl From<ProviderHealth> for NativeProviderHealth {
     }
 }
 
+/// An ignored configuration key and its optional suggested spelling.
+#[derive(Clone)]
+#[pyclass(
+    name = "UnknownConfigKey",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
+struct NativeUnknownConfigKey {
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    suggestion: Option<String>,
+}
+
 /// Database, parser, automatic-update, and provider health report.
 #[pyclass(
     name = "DiagnosticStatus",
@@ -4496,6 +4517,8 @@ impl From<ProviderHealth> for NativeProviderHealth {
     frozen
 )]
 struct NativeDiagnosticStatus {
+    #[pyo3(get)]
+    unknown_config_keys: Vec<NativeUnknownConfigKey>,
     #[pyo3(get)]
     db_path: String,
     #[pyo3(get)]
@@ -5595,6 +5618,14 @@ impl SessionSearch {
                 .diagnostics()
                 .map(|status| NativeDiagnosticStatus {
                     db_path: status.db_path,
+                    unknown_config_keys: status
+                        .unknown_config_keys
+                        .into_iter()
+                        .map(|key| NativeUnknownConfigKey {
+                            path: key.path,
+                            suggestion: key.suggestion,
+                        })
+                        .collect(),
                     index_status: status.index_status.into(),
                     discovery_warnings: status
                         .discovery_warnings
@@ -5718,6 +5749,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeIndexRefreshStatus>()?;
     module.add_class::<NativeProviderHealth>()?;
     module.add_class::<NativeDiagnosticStatus>()?;
+    module.add_class::<NativeUnknownConfigKey>()?;
     module.add_class::<NativeProviderDiscoveryWarning>()?;
     module.add_class::<NativeCompactOutcome>()?;
     Ok(())
@@ -5834,15 +5866,17 @@ python_value! { NativeUnrecognizedRecordType, slf => value_fields(slf.as_any(), 
 
 python_value! { NativeParserHealth, slf => value_fields(slf.as_any(), &["schema_version","expected_schema_version","schema_current","indexed_sessions","current_sessions","stale_sessions","parse_warnings","providers","unrecognized_record_types"]); }
 
-python_value! { NativeIndexStatus, slf => value_fields(slf.as_any(), &["parser_health","repairable_stale_sessions","unavailable_stale_sessions","repair_commands","readiness"]); }
+python_value! { NativeIndexStatus, slf => value_fields(slf.as_any(), &["unindexed_files","parser_health","repairable_stale_sessions","unavailable_stale_sessions","repair_commands","readiness"]); }
 
 python_value! { NativeIndexReadinessStatus, slf => value_fields(slf.as_any(), &["snapshot_availability","last_successful_refresh_at","refresh"]); }
 
 python_value! { NativeIndexRefreshStatus, slf => value_fields(slf.as_any(), &["state","started_by","started_at","finished_at","files_discovered","files_processed","sessions_updated","retry_after_ms","message","next_command"]); }
 
-python_value! { NativeProviderHealth, slf => value_fields(slf.as_any(), &["provider","enabled","cli_available","roots","discovered_files","indexed_sessions","expected_parse_version","current_sessions","stale_sessions","repairable_stale_sessions","unavailable_stale_sessions","resume_command"]); }
+python_value! { NativeProviderHealth, slf => value_fields(slf.as_any(), &["unindexed_files","provider","enabled","cli_available","roots","discovered_files","indexed_sessions","expected_parse_version","current_sessions","stale_sessions","repairable_stale_sessions","unavailable_stale_sessions","resume_command"]); }
 
-python_value! { NativeDiagnosticStatus, slf => value_fields(slf.as_any(), &["db_path","index_status","discovery_warnings","providers"]); }
+python_value! { NativeUnknownConfigKey, slf => value_fields(slf.as_any(), &["path","suggestion"]); }
+
+python_value! { NativeDiagnosticStatus, slf => value_fields(slf.as_any(), &["unknown_config_keys","db_path","index_status","discovery_warnings","providers"]); }
 
 python_value! { NativeProviderDiscoveryWarning, slf => value_fields(slf.as_any(), &["provider","path","operation","message","readable_sources_preserved","verification_command","guidance"]); }
 

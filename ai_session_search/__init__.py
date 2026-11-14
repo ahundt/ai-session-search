@@ -98,6 +98,7 @@ from .native import (
     SkillRunReport,
     SkillSelector,
     ToolActivity,
+    UnknownConfigKey,
     UnrecognizedRecordType,
 )
 from .types import (
@@ -171,6 +172,7 @@ __all__ = [  # noqa: RUF022 - preserve public export order
     "ClassificationMatch",
     "CompactOutcome",
     "DiagnosticStatus",
+    "UnknownConfigKey",
     "ExportDocument",
     "ExportPublicationReceipt",
     "FileCrossRef",
