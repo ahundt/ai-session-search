@@ -2010,11 +2010,7 @@ fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
-// Unused today: every caller is a `#[cfg(unix)]` test, so no Windows test exercises a symlinked
-// skill root. Kept because the gap is in the tests, not here, and `expect` rather than `allow` so
-// that un-gating one of those tests fails the build until this attribute is removed.
 #[cfg(all(test, windows))]
-#[expect(dead_code)]
 fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
 }
@@ -7207,8 +7203,6 @@ mod tests {
         );
     }
 
-    // Only the unix-gated layout test calls this; Windows CI denies dead code.
-    #[cfg(unix)]
     fn parse_integration_args<T: clap::Args>(arguments: Vec<std::ffi::OsString>) -> T {
         let matches = T::augment_args(clap::Command::new("aise"))
             .try_get_matches_from(
@@ -7495,7 +7489,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn environment_layout_is_shared_by_install_status_uninstall_and_refresh() {
         for platform in [
@@ -11101,7 +11094,6 @@ mod tests {
         assert!(skill_targets_for_layout(McpClient::Opencode, &layout).is_empty());
     }
 
-    #[cfg(unix)]
     fn install_test_skills(targets: &[SkillTarget], receipt: &Path) -> Vec<SymlinkChange> {
         let manifest = crate::skill_manifest::manifest_path(receipt);
         let mutations =
@@ -11198,7 +11190,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn gemini_redirected_links_survive_other_harness_uninstall() {
         for legacy_manifest in [false, true] {
@@ -11338,7 +11329,6 @@ mod tests {
             .exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn gemini_install_retires_owned_legacy_link_and_dry_run_plans_both_paths() {
         let dir = tempdir().unwrap();
@@ -11759,7 +11749,6 @@ mod tests {
         assert_eq!(targets[1].root, PathBuf::from("/custom/ai-session-search"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn canonical_install_creates_real_skill_and_harness_symlink() {
         let dir = tempdir().unwrap();
@@ -11867,7 +11856,6 @@ mod tests {
             .is_file());
     }
 
-    #[cfg(unix)]
     #[test]
     fn second_discovery_link_install_failure_restores_text_and_first_link() {
         let dir = tempdir().unwrap();
@@ -11909,7 +11897,6 @@ mod tests {
         assert!(!receipt.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn second_discovery_link_uninstall_failure_restores_text_and_first_link() {
         let dir = tempdir().unwrap();
@@ -11991,7 +11978,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn uninstall_transaction_removes_only_a_planned_owned_discovery_link() {
         let dir = tempdir().unwrap();

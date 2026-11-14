@@ -129,9 +129,9 @@ impl ExecutableAliases {
                     alias.display()
                 )),
                 AliasStatus::Owned => {
-                    fs::remove_file(alias).with_context(|| {
-                        format!("failed to remove executable alias {}", alias.display())
-                    })?;
+                    crate::durable_fs::remove_owned_link(alias, &self.target).with_context(
+                        || format!("failed to remove executable alias {}", alias.display()),
+                    )?;
                     lines.push(format!("removed executable alias {}", alias.display()));
                 }
                 AliasStatus::Conflict => lines.push(format!(
@@ -200,7 +200,7 @@ impl Drop for AliasInstallGuard {
             if !matches!(fs::read_link(alias), Ok(existing) if existing == *target) {
                 continue;
             }
-            if let Err(error) = fs::remove_file(alias) {
+            if let Err(error) = crate::durable_fs::remove_owned_link(alias, target) {
                 eprintln!(
                     "warning: failed to roll back executable alias {}: {error}",
                     alias.display()
@@ -390,6 +390,45 @@ mod tests {
                 .all(|l| l.contains("configured executable alias") && l.contains("-> aise")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn native_alias_install_status_rollback_and_uninstall_follow_replacement_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join(executable_name("aise"));
+        let target = PathBuf::from(executable.file_name().unwrap());
+        let aliases = ExecutableAliases {
+            aliases: ALIAS_NAMES
+                .iter()
+                .map(|name| dir.path().join(executable_name(name)))
+                .collect(),
+            target,
+        };
+        fs::write(&executable, "old binary").unwrap();
+        let guard = aliases.install().unwrap();
+        assert!(aliases
+            .statuses()
+            .unwrap()
+            .iter()
+            .all(|(_, state)| *state == "configured"));
+        drop(guard);
+        assert!(aliases
+            .statuses()
+            .unwrap()
+            .iter()
+            .all(|(_, state)| *state == "missing"));
+        aliases.install().unwrap().commit();
+        fs::remove_file(&executable).unwrap();
+        fs::write(&executable, "new binary").unwrap();
+        for alias in &aliases.aliases {
+            assert_eq!(fs::read_to_string(alias).unwrap(), "new binary");
+        }
+        aliases.uninstall_lines(false).unwrap();
+        assert!(aliases
+            .aliases
+            .iter()
+            .all(|alias| fs::symlink_metadata(alias).is_err()));
+        assert_eq!(fs::read_to_string(executable).unwrap(), "new binary");
     }
 
     #[test]

@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::durable_path::EncodedPath;
 
 use crate::durable_fs::{
-    atomic_write_file, entry_exists, open_existing_file_lock, open_file_lock, sync_parent,
-    AtomicWriteMode,
+    atomic_write_file, entry_exists, is_link_entry, open_existing_file_lock, open_file_lock,
+    remove_owned_link, sync_parent, AtomicWriteMode,
 };
 
 const RECEIPT_VERSION: u32 = 2;
@@ -190,7 +190,7 @@ pub(crate) fn publish_symlink_change(change: &SymlinkChange) -> Result<()> {
 }
 
 pub(crate) fn apply_symlink_change_after(change: &SymlinkChange) -> Result<()> {
-    apply_symlink_image(&change.path, &change.after)
+    apply_symlink_image(&change.path, &change.after, &change.before)
 }
 
 #[cfg(test)]
@@ -549,7 +549,7 @@ fn rollback_prepared(receipt: &TransactionReceipt) -> Result<usize> {
         let removed_directory_before_link =
             matches!(&change.before, SymlinkImage::Directory) && current == SymlinkImage::Absent;
         if current == change.after || removed_directory_before_link {
-            if let Err(error) = apply_symlink_image(&path, &change.before) {
+            if let Err(error) = apply_symlink_image(&path, &change.before, &current) {
                 conflicts.push(format!("{}: {error:#}", path.display()));
             } else {
                 restored += 1;
@@ -627,7 +627,7 @@ pub(crate) fn snapshot_symlink_image(path: &Path) -> Result<SymlinkImage> {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
     };
-    if metadata.file_type().is_symlink() {
+    if is_link_entry(&metadata) {
         let target = fs::read_link(path)
             .with_context(|| format!("failed to read symlink {}", path.display()))?;
         return Ok(SymlinkImage::link(&target));
@@ -653,16 +653,25 @@ fn verify_symlink_image(path: &Path, expected: &SymlinkImage) -> Result<()> {
     }
 }
 
-fn apply_symlink_image(path: &Path, image: &SymlinkImage) -> Result<()> {
+fn apply_symlink_image(path: &Path, image: &SymlinkImage, previous: &SymlinkImage) -> Result<()> {
+    let remove_link = || -> Result<()> {
+        let SymlinkImage::Link { target } = previous else {
+            bail!(
+                "no link ownership evidence for {}; preserved entry",
+                path.display()
+            );
+        };
+        remove_owned_link(path, &target.to_path_buf()?)
+            .with_context(|| format!("failed to remove owned link {}", path.display()))
+    };
     match image {
         SymlinkImage::Absent => match fs::symlink_metadata(path) {
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => {
                 Err(error).with_context(|| format!("failed to inspect {}", path.display()))
             }
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                fs::remove_file(path)
-                    .with_context(|| format!("failed to remove symlink {}", path.display()))?;
+            Ok(metadata) if is_link_entry(&metadata) => {
+                remove_link()?;
                 Ok(sync_parent(path)?)
             }
             Ok(_) => bail!("refusing to remove non-symlink entry {}", path.display()),
@@ -676,14 +685,13 @@ fn apply_symlink_image(path: &Path, image: &SymlinkImage) -> Result<()> {
             Err(error) => {
                 Err(error).with_context(|| format!("failed to inspect {}", path.display()))
             }
-            Ok(metadata) if metadata.is_dir() => Ok(()),
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                fs::remove_file(path)
-                    .with_context(|| format!("failed to remove symlink {}", path.display()))?;
+            Ok(metadata) if is_link_entry(&metadata) => {
+                remove_link()?;
                 fs::create_dir_all(path)
                     .with_context(|| format!("failed to restore directory {}", path.display()))?;
                 Ok(sync_parent(path)?)
             }
+            Ok(metadata) if metadata.is_dir() => Ok(()),
             Ok(_) => bail!("refusing to replace non-directory entry {}", path.display()),
         },
         SymlinkImage::Link { target } => {
@@ -897,7 +905,60 @@ mod tests {
         assert!(!receipt.exists());
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn link_removal_preserves_a_retargeted_entry_and_both_targets() {
+        let dir = tempdir().unwrap();
+        let expected = dir.path().join("expected");
+        let foreign = dir.path().join("foreign");
+        let link = dir.path().join("link");
+        for target in [&expected, &foreign] {
+            fs::create_dir(target).unwrap();
+            fs::write(target.join("data"), "preserved").unwrap();
+        }
+        create_directory_symlink(&foreign, &link).unwrap();
+        assert!(
+            apply_symlink_change_after(&SymlinkChange::remove(link.clone(), expected.clone()))
+                .is_err()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), foreign);
+        for target in [&expected, &foreign] {
+            assert_eq!(
+                fs::read_to_string(target.join("data")).unwrap(),
+                "preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_link_removal_and_directory_restoration_preserve_target_contents() {
+        for restore_directory in [false, true] {
+            let dir = tempdir().unwrap();
+            let target = dir.path().join("target");
+            let link = dir.path().join("link");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("data"), "preserved").unwrap();
+            create_directory_symlink(&target, &link).unwrap();
+            let mut change = SymlinkChange::remove(link.clone(), target.clone());
+            if restore_directory {
+                change.after = SymlinkImage::Directory;
+            }
+            publish_symlink_change(&change).unwrap();
+            assert_eq!(
+                fs::read_to_string(target.join("data")).unwrap(),
+                "preserved"
+            );
+            if restore_directory {
+                assert!(!fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert_eq!(fs::read_dir(&link).unwrap().count(), 0);
+            } else {
+                assert!(fs::symlink_metadata(&link).is_err());
+            }
+        }
+    }
+
     #[test]
     fn prepared_receipt_recovery_restores_symlink_and_text_preimages() {
         let dir = tempdir().unwrap();

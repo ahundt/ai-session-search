@@ -23,6 +23,103 @@ pub(crate) fn entry_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Remove only a link whose stored target still matches the transaction's ownership evidence.
+/// Never traverse the entry or recursively delete anything beneath it.
+pub(crate) fn remove_owned_link(path: &Path, expected_target: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !is_link_entry(&metadata) || fs::read_link(path)? != expected_target {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "link no longer points to the expected target; preserved entry",
+        ));
+    }
+    if link_removal_uses_directory_api(cfg!(windows), link_entry_is_directory(&metadata)) {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+pub(crate) fn is_link_entry(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // read_link validates the reparse tag before removal; this also admits junctions.
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn link_entry_is_directory(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_dir()
+    }
+}
+
+fn link_removal_uses_directory_api(windows: bool, directory: bool) -> bool {
+    windows && directory
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn link_removal_dispatches_windows_directory_reparse_points_only_to_remove_dir() {
+        assert!(link_removal_uses_directory_api(true, true));
+        assert!(!link_removal_uses_directory_api(true, false));
+        assert!(!link_removal_uses_directory_api(false, true));
+        assert!(!link_removal_uses_directory_api(false, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_junction_removal_never_deletes_target_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("junction");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("data"), "preserved").unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let expected = fs::read_link(&link).unwrap();
+        remove_owned_link(&link, &expected).unwrap();
+        assert!(fs::symlink_metadata(link).is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("data")).unwrap(),
+            "preserved"
+        );
+    }
+
+    #[test]
+    fn owned_link_removal_refuses_regular_files_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data");
+        fs::write(&file, "preserved").unwrap();
+        assert!(remove_owned_link(&file, &file).is_err());
+        assert!(remove_owned_link(dir.path(), dir.path()).is_err());
+        assert_eq!(fs::read_to_string(file).unwrap(), "preserved");
+    }
+}
+
 /// Open a non-following regular file suitable for an advisory inter-process lock.
 pub(crate) fn open_file_lock(path: &Path) -> io::Result<RwLock<File>> {
     let parent = file_parent(path);

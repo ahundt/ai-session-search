@@ -1006,7 +1006,6 @@ fn registration_keeps_config_file_database_selection_editable() {
     assert_eq!(paths["database"], serde_json::json!(changed));
 }
 
-#[cfg(unix)]
 #[test]
 fn integrations_use_config_paths_and_keep_cli_extras_through_the_lifecycle() {
     let root = tempfile::tempdir().unwrap();
