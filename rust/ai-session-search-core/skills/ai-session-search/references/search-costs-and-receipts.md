@@ -23,7 +23,14 @@ tokens, `F` discovered source files, `E` filtered file edits, `B` source bytes, 
 | `search_sessions` / `aise search` | `O(S + T*(A+1) + N + K log K)`; every eligible session's title, summary, paths, preview, and transcript are read | retained `K` records plus the batch budget and largest session |
 | `query_session_index` / `aise db query` | a predicate without a usable index scans `O(R)` rows | bounded by `limit`/`max_cell_chars` |
 | `files search`/`history`/`cross-ref`/`extract` | `O(E + K log K)` filtered edits/results | `O(K)` |
-| Refresh | incremental `O(B_new)`; full `O(B_all)` | streaming |
+| Refresh | incremental source reads normally `O(B_new + overlap)`; whole-source fallbacks `O(B_all)` | streaming reads; full parses retain one source |
+
+`B_new` is appended source bytes, `B_all` is all bytes in a source, and the backward overlap is
+bounded at 1 MiB. Whole-source parsing applies when checkpoints or earlier context cannot be
+reused, including queued submissions, interactive questions or answers, Codex fork settings,
+overlap mismatches, and Codex forks affected by changed ancestor edits; compressed sources and
+providers without incremental parsing also read the whole source. Index persistence additionally
+counts stored session messages and copies stored transcript bytes.
 
 Structural filters (`--workspace-path`/`workspace_path_prefix`, `--session-id`, `--role`,
 `--when`, `--kinds`, `--tool-name-contains`) shrink `N`, `T`, and `C` before the query runs.

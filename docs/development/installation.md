@@ -203,9 +203,10 @@ selected discovery directory; shared destinations are deduplicated. Use repeatab
 `--skill-root DIR` for one or more exact additional package destinations. Each custom directory
 must end in `ai-session-search`; it names a package directory, not a file inside one.
 
-Nothing you edited is overwritten. A modified file, an extra user file, an unmanaged directory, or
-a retargeted link is preserved and reported instead. Pass `--dry-run` to see every planned write
-and removal before anything changes.
+For skill, marketplace, and instruction content, a modified file, an extra user file, an unmanaged
+directory, or a retargeted link is preserved and reported. An explicit `aise integrations install`
+rewrites the named MCP entry, including customized launch arguments. Pass `--dry-run` to see every
+planned write and removal before anything changes.
 
 Reinstall replaces a prerelease copied harness package with a discovery
 link only when the old copy is provably app-managed and untouched. Uninstall removes a discovery

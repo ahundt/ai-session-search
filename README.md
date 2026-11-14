@@ -170,8 +170,10 @@ requested match. A selective fragment and structural filters reduce the scan. Fu
 every eligible row, so narrow by project, provider, session, or date first. `--receipt-level
 summary` explains the selected query plan.
 
-Refresh reads changed source bytes; it is separate from query cost. Use `--index-refresh
-before-query` to wait for source updates, or `existing-only` to skip refresh. See the
+Refresh is separate from query cost: incremental reads normally cover appended bytes plus a
+bounded overlap, with [whole-source fallbacks](skills/ai-session-search/references/search-costs-and-receipts.md#per-operation)
+when earlier context or checkpoints cannot be reused. Use `--index-refresh before-query` to wait
+for source updates, or `existing-only` to skip refresh. See the
 [search cost reference](skills/ai-session-search/references/search-costs-and-receipts.md).
 
 ## Providers
@@ -420,8 +422,12 @@ second step that does all of that, adds the `aisearch` and `ai_session_search` a
 starts building the index in the background. Run `aise doctor` afterward for readiness and
 recovery guidance.
 
-After an upgrade, the first `aise` command brings the skill and instructions it installed up to
-date. Set `[integrations] refresh_after_upgrade = false` to turn that off.
+After an upgrade, the first ordinary `aise` command refreshes the skill and instructions it
+installed and migrates recognized MCP registrations even without a skill install, preserving
+launch arguments; explicit `aise integrations install` regenerates those arguments.
+Unrecognized entries stay unchanged and `aise integrations status` reports them; empty checks
+are recorded once per version when possible. Set `[integrations] refresh_after_upgrade = false`
+to turn automatic refresh off.
 
 To remove it, take the integrations out before the executable, because the uninstaller is what
 knows which entries are its own:
