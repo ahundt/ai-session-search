@@ -2609,6 +2609,122 @@ mod tests {
     }
 
     #[test]
+    fn codex_parent_publication_skips_forks_without_matching_stored_edits() {
+        codex_parent_publication_filters_forks(false);
+    }
+
+    #[test]
+    fn codex_parent_tail_reconciles_matching_stored_fork_edit() {
+        codex_parent_publication_filters_forks(true);
+    }
+
+    fn codex_parent_publication_filters_forks(matching: bool) {
+        use std::io::Write as _;
+        for full in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent_root = dir.path().join("parent");
+            let child_root = dir.path().join("child");
+            std::fs::create_dir_all(&parent_root).unwrap();
+            std::fs::create_dir_all(&child_root).unwrap();
+            let parent = "00000000-0000-4000-8000-000000000081";
+            let child = "00000000-0000-4000-8000-000000000082";
+            let parent_path = parent_root.join(format!("rollout-{parent}.jsonl"));
+            let child_path = child_root.join(format!("rollout-{child}.jsonl"));
+            let mutation = |path: &str, content: &str| {
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":path,"name":"apply_patch","input":format!("*** Begin Patch\n*** Add File: /synthetic/{path}.rs\n+{content}\n*** End Patch")}}),
+                    serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":path,"output":format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/{path}.rs\n")}})
+                )
+            };
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":parent}});
+            std::fs::write(
+                &parent_path,
+                format!("{header}\n{}", mutation("initial", "parent")),
+            )
+            .unwrap();
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":child,"forked_from_id":parent}});
+            let settings =
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n";
+            // An equal older edit must not make an unrelated tail append reparse this fork.
+            let own_edit = if !matching && !full {
+                mutation("initial", "parent")
+            } else {
+                mutation("child-only", "child")
+            };
+            std::fs::write(
+                &child_path,
+                format!(
+                    "{header}\n{}{settings}{}",
+                    mutation(
+                        "later",
+                        if matching {
+                            "parent"
+                        } else {
+                            "different content"
+                        }
+                    ),
+                    own_edit
+                ),
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let db = Db::open(&db_path).unwrap();
+            let mut config = config_with_single_claude_fixture(&db_path, &child_root);
+            config.providers.claude.enabled = false;
+            config.providers.codex.enabled = true;
+            config.providers.codex.paths =
+                vec![normalize_path(&child_root), normalize_path(&parent_root)];
+            reindex(&config, &db, false, None).unwrap();
+            assert_eq!(db.file_edit_count().unwrap(), 3);
+            config.providers.codex.paths = vec![normalize_path(&parent_root)];
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&parent_path)
+                .unwrap()
+                .write_all(mutation("later", "parent").as_bytes())
+                .unwrap();
+            crate::db::CODEX_FORK_AFTER_READ.with(|hook| {
+                hook.set(Some(if matching {
+                    |_| {}
+                } else {
+                    |_| panic!("parent publication parsed a fork without a matching stored edit")
+                }))
+            });
+            if full {
+                reindex(&config, &db, true, None).unwrap();
+            } else {
+                let adapters = ProviderSet::new(&config);
+                let source = adapters.discover_enabled(&config).sources.pop().unwrap();
+                assert!(matches!(
+                    try_tail(
+                        &source,
+                        &normalize_path(&source.path),
+                        Some(&format!("codex:{parent}")),
+                        &db,
+                        &|| false,
+                        |r, p| adapters.codex.parse_reader(r, p)
+                    )
+                    .unwrap(),
+                    TailOutcome::Appended
+                ));
+            }
+            assert_eq!(
+                crate::db::CODEX_FORK_AFTER_READ
+                    .with(|hook| hook.take())
+                    .is_none(),
+                matching
+            );
+            assert_eq!(db.file_edit_count().unwrap(), if matching { 3 } else { 4 });
+            let history = crate::files::history(&db, "later.rs", &Default::default()).unwrap();
+            assert_eq!(history.len(), if matching { 1 } else { 2 });
+            assert!(history
+                .iter()
+                .any(|edit| edit.session_id == format!("codex:{parent}")));
+        }
+    }
+
+    #[test]
     fn codex_fork_edits_converge_across_root_order_and_parent_repair() {
         use std::io::Write as _;
         for order in [[0, 1, 2], [1, 0, 2], [2, 1, 0]] {
@@ -2992,13 +3108,21 @@ mod tests {
                     }),
                     _ => unreachable!(),
                 }
+                // The matching recovery edit keeps the fork eligible for the failed read.
                 // Publish only the parent; retrying the fork is a separate refresh.
                 config.providers.codex.paths = vec![normalize_path(&parent_root)];
                 std::fs::OpenOptions::new()
                     .append(true)
                     .open(&parent_path)
                     .unwrap()
-                    .write_all(mutation("parent-later", "parent-later").as_bytes())
+                    .write_all(
+                        format!(
+                            "{}{}",
+                            mutation("parent-later", "parent-later"),
+                            mutation("recovered-later", "fork-only")
+                        )
+                        .as_bytes(),
+                    )
                     .unwrap();
                 reindex(&config, &db, full_parse, None).unwrap();
                 assert!(crate::db::CODEX_FORK_AFTER_READ

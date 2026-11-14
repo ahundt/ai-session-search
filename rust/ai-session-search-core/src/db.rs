@@ -2737,7 +2737,7 @@ impl Db {
         )?;
         store_parsed_file_edits(&tx, parsed, same_parser)?;
         // A repaired ancestry link can change descendants even without changing these edits.
-        reconcile_codex_fork_edits(&tx, session)?;
+        reconcile_codex_fork_edits(&tx, session, None)?;
         if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
             // union rather than the parse alone.
@@ -2952,7 +2952,7 @@ impl Db {
         )?;
 
         if !tail.new_file_edits.is_empty() {
-            reconcile_codex_fork_edits(&tx, session)?;
+            reconcile_codex_fork_edits(&tx, session, Some(next_edit_seq))?;
         }
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward,
@@ -7999,15 +7999,41 @@ const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f
          (case when json_valid(s.raw_metadata_json)
           then 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id') end) = ?1";
 
+// Full publications can repair an empty ancestry link: include retained edits above that link.
+// UNION makes the indexed ancestry walk cycle-safe. Tail publications need only the new rows.
+const CODEX_FORK_MATCHING_EDIT_SQL: &str = "with recursive ancestry(id) as (
+    select ?1
+    union
+    select 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id')
+    from ancestry a join sessions s on s.id = a.id
+    where ?3 is null and s.provider = 'codex' and
+        case when json_valid(s.raw_metadata_json)
+        then json_type(s.raw_metadata_json, '$.forked_from_id') = 'text' else 0 end
+)
+select 1 from ancestry a
+cross join file_edits p indexed by idx_file_edits_session
+cross join file_edits c indexed by idx_file_edits_path
+where p.session_id = a.id and (?3 is null or p.seq >= ?3)
+    and c.file_path = p.file_path and c.session_id = ?2
+    and c.tool = p.tool and c.new_content is p.new_content and c.edits_json is p.edits_json
+limit 1";
+
 /// Reconcile indexed descendants before publishing changed Codex edits. For S sessions and R
 /// receipts, each parent lookup costs O(log S + K(log S + log R)) for K children, retaining
 /// O(K) paths plus O(D) visited identities for D reachable descendants. A no-fork publication
 /// visits no unrelated session metadata or source receipts.
-/// Each dependent source is parsed at most once; each reparse also reads its indexed ancestry
+/// Candidate probes use the session and path edit indexes, comparing tool/content/replacements
+/// only on matching paths. They scan the publisher's stored edits (and indexed ancestors on a
+/// full publication); a tail restricts matches to newly inserted seqs. No candidate means no
+/// child source bytes are read. Each candidate is parsed at most once and reads its ancestry
 /// (bounded by chain depth, stopping at cycles). Memory adds one parsed fork, its stored/parsed
 /// keys and ancestor keys, plus visited ancestor identities and the largest stored edit body.
 /// This work extends the writer transaction; non-Codex publications skip it.
-fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
+fn reconcile_codex_fork_edits(
+    tx: &Transaction<'_>,
+    session: &SessionRecord,
+    first_new_edit_seq: Option<i64>,
+) -> Result<()> {
     if session.provider != Provider::Codex {
         return Ok(());
     }
@@ -8015,6 +8041,7 @@ fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> 
     if !statement.exists([&session.id])? {
         return Ok(());
     }
+    let mut matching_edit = tx.prepare_cached(CODEX_FORK_MATCHING_EDIT_SQL)?;
     let mut adapter = None;
     let mut pending = vec![session.id.clone()];
     let mut visited = std::collections::HashSet::from([session.id.clone()]);
@@ -8039,6 +8066,9 @@ fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> 
             }
             // Descendants can use a higher ancestor even if this source is unchanged or unavailable.
             pending.push(id.clone());
+            if !matching_edit.exists(params![session.id, id, first_new_edit_seq])? {
+                continue;
+            }
             let adapter = adapter
                 .get_or_insert_with(|| crate::providers::codex::CodexAdapter::new(Vec::new()));
             let current = || {
@@ -9412,6 +9442,39 @@ mod tests {
     use crate::models::SessionKind;
 
     include!("db/publication_benchmark.rs");
+    include!("db/fork_publication_benchmark.rs");
+
+    #[test]
+    fn codex_fork_matching_edit_uses_session_and_path_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for first_seq in [None, Some(1_i64)] {
+            let plan = db
+                .conn
+                .prepare(&format!(
+                    "explain query plan {CODEX_FORK_MATCHING_EDIT_SQL}"
+                ))
+                .unwrap()
+                .query_map(params!["codex:parent", "codex:child", first_seq], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for expected in [
+                "SEARCH p USING INDEX idx_file_edits_session",
+                "SEARCH c USING INDEX idx_file_edits_path",
+            ] {
+                assert!(plan.iter().any(|line| line.contains(expected)), "{plan:?}");
+            }
+            assert!(
+                !plan.iter().any(|line| ["SCAN p", "SCAN c", "SCAN s"]
+                    .iter()
+                    .any(|scan| line.starts_with(scan))),
+                "{plan:?}"
+            );
+        }
+    }
 
     #[test]
     fn codex_fork_lookup_is_indexed_and_upgrades_on_writable_open() {
@@ -9487,7 +9550,8 @@ mod tests {
         db.append_tail(&tail, 2, 2).unwrap();
         let peer = Db::open(&path).unwrap();
         peer.append_tail(&tail, 3, 3).unwrap();
-        let mut fork = archive_session(Vec::new(), Vec::new());
+        // A matching stored edit makes the missing fork a reconciliation candidate.
+        let mut fork = archive_session(Vec::new(), tail.new_file_edits.clone());
         fork.session.id = "codex:fork".into();
         fork.session.provider_session_id = "fork".into();
         fork.session.source_path =
@@ -9530,7 +9594,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("minimum_writer_compatibility"));
-        assert_eq!(db.file_edit_count().unwrap(), 3);
+        assert_eq!(db.file_edit_count().unwrap(), 4);
     }
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
