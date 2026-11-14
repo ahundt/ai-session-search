@@ -393,7 +393,7 @@ impl PiAdapter {
                         _ => continue,
                     }
                 }
-                Some("compaction" | "custom_message") => {
+                Some("compaction" | "branch_summary" | "custom_message") => {
                     if let Some(mut raw) =
                         pi_native_input_record(&value, timestamp, spawned.is_some())
                     {
@@ -627,7 +627,9 @@ fn pi_native_input_record(
         .or_else(|| value.get("type").and_then(Value::as_str))?;
     let (input_key, generated_key, stored_role) = match role {
         "bashExecution" => ("command", "output", "user"),
-        "compactionSummary" | "compaction" => ("customInstructions", "summary", "compaction"),
+        "compactionSummary" | "compaction" | "branch_summary" => {
+            ("customInstructions", "summary", "compaction")
+        }
         "custom" | "custom_message" => {
             let text = extract_text(value);
             return (!text.trim().is_empty()).then(|| RawMessage::harness_notice(text, timestamp));
@@ -638,10 +640,21 @@ fn pi_native_input_record(
         .get(input_key)
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let generated = value
+    let mut generated = value
         .get(generated_key)
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
+    if stored_role == "compaction" {
+        if let Some(system) = value.get("systemMessage") {
+            // Preserve the complete prompt/tool state, including named sections and schemas.
+            // It is generated context even when adjacent customInstructions are human input.
+            if !generated.is_empty() {
+                generated.push('\n');
+            }
+            generated.push_str(&system.to_string());
+        }
+    }
     if input.is_empty() && generated.is_empty() {
         return None;
     }
@@ -656,7 +669,7 @@ fn pi_native_input_record(
     if !input.is_empty() && !generated.is_empty() {
         content.push('\n');
     }
-    content.push_str(generated);
+    content.push_str(&generated);
     let mut raw = RawMessage::message(stored_role, content, timestamp, None);
     if input.is_empty() || input_author == ContentPartAuthorship::Generated {
         return Some(raw.with_authorship(MessageAuthorship::Generated));
@@ -957,6 +970,64 @@ mod tests {
                     .unwrap();
                     assert_eq!(service.search(request).unwrap().hits().len(), count);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_system_messages_and_branch_summaries_are_generated() {
+        use crate::models::{MessageAuthorship, MessageKind};
+        let rows = concat!(
+            "{\"type\":\"session\",\"id\":\"summaries\"}\n",
+            "{\"type\":\"compaction\",\"id\":\"compact\",\"customInstructions\":\"retain input\",\"summary\":\"generated digest\",\"systemMessage\":{\"role\":\"system\",\"content\":\"generated prompt 🦀\"}}\n",
+            "{\"type\":\"branch_summary\",\"id\":\"branch\",\"summary\":\"generated branch digest\"}\n"
+        );
+        for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
+            let parsed = adapter
+                .parse_reader(
+                    std::io::Cursor::new(rows),
+                    std::path::Path::new("/synthetic/summaries.jsonl"),
+                )
+                .unwrap();
+            assert_eq!(parsed.messages.len(), 2);
+            assert!(parsed.messages[0].content.contains("generated prompt 🦀"));
+            assert_eq!(parsed.messages[0].kind, MessageKind::Compaction);
+            assert_eq!(parsed.messages[1].kind, MessageKind::Compaction);
+            assert_eq!(
+                parsed.messages[1].provenance.authorship,
+                MessageAuthorship::Generated
+            );
+            for row in &parsed.messages {
+                row.provenance.validate(&row.content).unwrap();
+            }
+            let dir = tempdir().unwrap();
+            let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+            let mut old = parsed.clone();
+            old.session.parse_version = "legacy-summary-parser".into();
+            old.messages.truncate(1);
+            old.messages[0].content = "retain input\ngenerated digest".into();
+            old.messages[0].provenance.content_parts[1].end_char =
+                old.messages[0].content.chars().count();
+            db.upsert_session(&old, 1, 1).unwrap();
+            db.upsert_session(&parsed, 1, 1).unwrap();
+            use crate::message_search::{
+                MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+            };
+            let config = crate::config::Config::default();
+            let service = crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+            for (query, count) in [
+                ("retain input", 1),
+                ("generated prompt 🦀", 0),
+                ("generated branch digest", 0),
+            ] {
+                let request = MessageSearchRequest::builder(
+                    MessageQuery::literal(query).unwrap(),
+                    MessageTarget::content(),
+                )
+                .role(crate::models::Role::User)
+                .build()
+                .unwrap();
+                assert_eq!(service.search(request).unwrap().hits().len(), count);
             }
         }
     }
