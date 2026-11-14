@@ -2740,6 +2740,48 @@ mod tests {
     }
 
     #[test]
+    fn claude_queued_sender_evidence_does_not_match_an_earlier_turn() {
+        let mut observed = Vec::new();
+        for with_enqueue in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut records = vec![
+                serde_json::json!({"type":"user","uuid":"ordinary","sessionId":"queue-evidence","timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":"repeat synthetic request"}}),
+            ];
+            if with_enqueue {
+                records.push(serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"queue-evidence","timestamp":"2026-11-01T00:00:01Z","content":"repeat synthetic request"}));
+            }
+            records.push(serde_json::json!({"type":"attachment","uuid":"queued","sessionId":"queue-evidence","timestamp":"2026-11-01T00:00:02Z","attachment":{"type":"queued_command","prompt":"repeat synthetic request","commandMode":"prompt","origin":{"kind":"human"}}}));
+            std::fs::write(
+                root.join("session.jsonl"),
+                records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let counts: (i64, i64, i64) = conn.query_row("select count(*), sum(authorship='human'), count(distinct correlation_id) from messages where content='repeat synthetic request'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            let hits = db
+                .search_messages(
+                    "repeat synthetic request",
+                    &crate::models::MessageFilters {
+                        role: Some(crate::models::Role::User),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .len();
+            observed.push((counts, hits));
+            reindex(&config, &db, true, None).unwrap();
+            assert_eq!(db.message_count().unwrap(), counts.0);
+        }
+        assert_eq!(observed, vec![((2, 2, 2), 2), ((2, 2, 2), 2)]);
+    }
+
+    #[test]
     fn queue_state_beyond_overlap_forces_full_parse_and_preserves_metadata() {
         use std::io::Write as _;
 

@@ -430,8 +430,9 @@ impl UnrecognizedRecordTypes {
 /// enqueue, and when it is delivered as this attachment. Recent enqueues often omit `content`,
 /// so the attachment can be the only copy of what the person typed. The structured
 /// `attachment.prompt` is used, never the wrapped `rendered` text. A prompt already indexed from a
-/// `queue-operation` enqueue or a `user` record of the same file is not added again: each indexed
-/// copy of a text absorbs one attachment of that text, in file order, by the same
+/// `queue-operation` enqueue is not added again. Without an enqueue, only the immediately
+/// following rendered user row can absorb its attachment as a delivery copy. Earlier ordinary
+/// turns cannot consume a later submission's sender evidence. Matching uses the same
 /// `strip_command_markup`-then-trim content digest the queue identity uses.
 ///
 /// An enqueue records only that something was queued, not who sent it. When an enqueue's row
@@ -504,10 +505,10 @@ impl QueuedCommand {
     /// queued command no other record of the file already indexed, in file order.
     ///
     /// `enqueued` maps the position in `messages` of each row built from a `queue-operation`
-    /// enqueue to its line in `transcript_lines`.
+    /// enqueue to its optional line in `transcript_lines` (notices have no transcript).
     fn place(
         queued: Vec<Self>,
-        enqueued: &HashMap<usize, usize>,
+        enqueued: &HashMap<usize, Option<usize>>,
         messages: &mut Vec<RawMessage>,
         transcript_lines: &mut Vec<String>,
         retracted_transcript_lines: &mut Vec<String>,
@@ -517,11 +518,10 @@ impl QueuedCommand {
         if queued.is_empty() {
             return;
         }
-        // Harness notices are stored with role `user`, so a notice already indexed from a
-        // `user` record also absorbs its attachment copy.
+        // Queue records take sender evidence before any possible direct delivery copy.
         let mut indexed: HashMap<String, std::collections::VecDeque<usize>> = HashMap::new();
         for (position, message) in messages.iter().enumerate() {
-            if message.role() == "user" {
+            if enqueued.contains_key(&position) {
                 indexed
                     .entry(sha256(message.content().trim().as_bytes()))
                     .or_default()
@@ -529,16 +529,24 @@ impl QueuedCommand {
             }
         }
         let mut retired_lines = false;
+        let mut delivered = std::collections::HashSet::new();
         let mut kept: Vec<Self> = Vec::new();
         for queued in queued {
             let Some(position) = indexed
                 .get_mut(&queued.digest)
                 .and_then(std::collections::VecDeque::pop_front)
             else {
-                kept.push(queued);
+                let delivery_copy = !enqueued.contains_key(&queued.position)
+                    && messages.get(queued.position).is_some_and(|message| {
+                        message.role() == "user"
+                            && sha256(message.content().trim().as_bytes()) == queued.digest
+                    });
+                if !delivery_copy || !delivered.insert(queued.position) {
+                    kept.push(queued);
+                }
                 continue;
             };
-            let Some(&line) = enqueued.get(&position) else {
+            let Some(&Some(line)) = enqueued.get(&position) else {
                 continue;
             };
             let row = &mut messages[position];
@@ -780,8 +788,8 @@ impl ClaudeAdapter {
         // Queued prompts recorded only as attachments, placed after the loop once every
         // conversation and queue record of the file is known; see `QueuedCommand`.
         let mut queued_commands: Vec<QueuedCommand> = Vec::new();
-        // Position in `messages` of each enqueue's row -> its line in `transcript_lines`.
-        let mut enqueued: HashMap<usize, usize> = HashMap::new();
+        // Enqueue row -> transcript line, or None for a harness notice.
+        let mut enqueued: HashMap<usize, Option<usize>> = HashMap::new();
         let mut unrecognized = UnrecognizedRecordTypes::default();
         // What earlier parsers made of the records this one declines; see `RetractedRows`.
         let mut retracted_messages = Vec::new();
@@ -994,8 +1002,9 @@ impl ClaudeAdapter {
                                 // `user` record of that text follows.
                                 if is_harness_notice(&value, &content) {
                                     raw_message.retag_harness_notice();
+                                    enqueued.insert(messages.len(), None);
                                 } else {
-                                    enqueued.insert(messages.len(), transcript_lines.len());
+                                    enqueued.insert(messages.len(), Some(transcript_lines.len()));
                                     transcript_lines
                                         .push(format_transcript_line("user", timestamp, &content));
                                 }
