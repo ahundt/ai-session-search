@@ -167,7 +167,6 @@ impl GeminiCliAdapter {
 
     pub(crate) fn parse_raw(&self, path: &Path, raw: String) -> Result<ParsedSession> {
         let data: Value = serde_json::from_str(&raw).context("invalid Gemini CLI JSON")?;
-        let strip_references = referenced_file_block_regex()?;
         let evidence = gemini_session_evidence(data.get("kind").and_then(Value::as_str));
         let mut messages = Vec::new();
         let mut file_edits = Vec::new();
@@ -207,10 +206,12 @@ impl GeminiCliAdapter {
                 continue;
             }
             let content = content_text(message.get("content"));
-            let content = strip_references
-                .replace_all(&content, "")
-                .trim()
-                .to_string();
+            let (content, attachments) = if role == "user" {
+                split_referenced_files(&content, event_id.unwrap_or("user"), timestamp)
+            } else {
+                (content, Vec::new())
+            };
+            messages.extend(attachments.into_iter().map(|(_, row)| row));
             if !content.is_empty() {
                 let mut raw_message = RawMessage::message(role, content, timestamp, None);
                 if let Some(event_id) = event_id {
@@ -599,6 +600,41 @@ fn referenced_file_block_regex() -> Result<&'static Regex> {
         .map_err(|error| anyhow::anyhow!(error.clone()))
 }
 
+/// Match Claude's attached-file rows: searchable tool context, never human input.
+/// O(content bytes) scan/copy, with only decoded attachment bytes retained.
+fn split_referenced_files(
+    content: &str,
+    event_id: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> (String, Vec<(String, RawMessage)>) {
+    let Ok(regex) = referenced_file_block_regex() else {
+        return (content.to_string(), Vec::new());
+    };
+    let attachments = regex
+        .find_iter(content)
+        .enumerate()
+        .map(|(ordinal, found)| {
+            let identity = format!(
+                "attachment:{event_id}:{ordinal}:{}",
+                sha256(found.as_str().as_bytes())
+            );
+            let row = RawMessage::tool_result_with_name(
+                None,
+                found.as_str().to_string(),
+                None,
+                timestamp,
+            )
+            .with_authorship(MessageAuthorship::Harness)
+            .with_native_event_identity(MessageCorrelationAuthority::Google, identity.clone());
+            (identity, row)
+        })
+        .collect();
+    (
+        regex.replace_all(content, "").trim().to_string(),
+        attachments,
+    )
+}
+
 fn is_chat_source(root: &Path, path: &Path) -> bool {
     let Some(relative) = path.strip_prefix(root).ok() else {
         return false;
@@ -793,7 +829,14 @@ impl NativeReplay {
 
     fn observe(&mut self, id: &str, record: &Value) {
         if record.get("type").and_then(Value::as_str) == Some("user") {
-            let text = direct_user_text(record.get("content"));
+            let text = direct_user_text(record.get("content")).map(|text| {
+                let (text, attachments) =
+                    split_referenced_files(&text, id, record_timestamp(record));
+                for (key, attachment) in attachments {
+                    self.retain_history(key, attachment);
+                }
+                text
+            });
             if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
                 if !is_generated_context(&text) && !self.first_user_text.contains_key(id) {
                     self.first_user_text.insert(id.to_string(), text.clone());
@@ -887,11 +930,17 @@ impl NativeReplay {
         let timestamp = record_timestamp(record);
         match record.get("type").and_then(Value::as_str) {
             Some("user") => {
-                let Some(text) =
-                    direct_user_text(record.get("content")).filter(|text| !text.trim().is_empty())
-                else {
+                let Some(text) = direct_user_text(record.get("content")) else {
                     return;
                 };
+                let (text, attachments) = split_referenced_files(&text, id, timestamp);
+                for (key, attachment) in attachments {
+                    rendered.keys.insert(key);
+                    rendered.messages.push(attachment);
+                }
+                if text.trim().is_empty() {
+                    return;
+                }
                 let first = self.first_user_text.get(id);
                 // A context patch must not mask an earlier recorded user submission.
                 if is_generated_context(&text) && first.is_none() {
@@ -962,16 +1011,8 @@ impl NativeReplay {
                 if !content.trim().is_empty() {
                     rendered.keys.insert(format!("record:{id}"));
                     rendered.messages.push(
-                        RawMessage::message(
-                            "assistant",
-                            referenced_file_block_regex()
-                                .ok()
-                                .map(|regex| regex.replace_all(&content, "").trim().to_string())
-                                .unwrap_or(content),
-                            timestamp,
-                            None,
-                        )
-                        .with_native_event_identity(MessageCorrelationAuthority::Google, id),
+                        RawMessage::message("assistant", content, timestamp, None)
+                            .with_native_event_identity(MessageCorrelationAuthority::Google, id),
                     );
                 }
                 for call in record
@@ -1706,6 +1747,86 @@ mod tests {
     }
 
     #[test]
+    fn referenced_files_are_searchable_context_not_human_input_in_both_formats() {
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        let text = "please inspect α\n--- Content from referenced files ---\nattachment-only β\n--- End of content ---\n";
+        let record = json!({"id":"u","type":"user","content":[{"text":text}]});
+        let legacy = adapter
+            .parse_raw(
+                Path::new("session-attachment.json"),
+                json!({"sessionId":"attachment","messages":[record.clone()]}).to_string(),
+            )
+            .unwrap();
+        let records = format!(
+            "{}\n{}\n",
+            json!({"sessionId":"attachment","kind":"main"}),
+            record
+        );
+        let native = adapter
+            .parse_reader(
+                std::io::Cursor::new(&records),
+                Path::new("session-attachment.jsonl"),
+            )
+            .unwrap();
+        let rewound = adapter
+            .parse_reader(
+                std::io::Cursor::new(format!("{records}{{\"$rewindTo\":\"u\"}}\n")),
+                Path::new("session-attachment.jsonl"),
+            )
+            .unwrap();
+        for parsed in [legacy, native, rewound] {
+            assert_eq!(parsed.messages.len(), 2);
+            let prompt = parsed
+                .messages
+                .iter()
+                .find(|m| m.content == "please inspect α")
+                .unwrap();
+            assert_eq!(prompt.provenance.authorship, MessageAuthorship::Human);
+            let attachment = parsed
+                .messages
+                .iter()
+                .find(|m| m.content.contains("attachment-only β"))
+                .unwrap();
+            assert_eq!(attachment.kind, MessageKind::ToolResult);
+            assert_eq!(attachment.provenance.authorship, MessageAuthorship::Harness);
+            let dir = tempfile::tempdir().unwrap();
+            let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+            // v6 had no attachment row; repair the native prompt in place and append context.
+            let mut old = parsed.clone();
+            old.messages.retain(|m| m.content == "please inspect α");
+            if parsed.session.discovery_source == "jsonl" {
+                old.messages[0].content = text.to_string();
+            }
+            old.session.parse_version = "gemini-cli-v6".into();
+            db.upsert_session(&old, 1, 1).unwrap();
+            for generation in [2, 3] {
+                db.upsert_session(&parsed, generation, generation).unwrap();
+                assert_eq!(
+                    db.search_messages("attachment-only β", &Default::default())
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                let human = crate::models::MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                };
+                assert!(db
+                    .search_messages("attachment-only β", &human)
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    db.search_messages("please inspect α", &human)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(db.message_count().unwrap(), 2);
+            }
+        }
+    }
+
+    #[test]
     fn answer_output_preserves_numeric_question_order() {
         let answers: serde_json::Map<String, Value> = (0..12)
             .map(|i| (i.to_string(), Value::String(format!("answer {i}"))))
@@ -1719,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_messages_resolves_project_and_strips_file_blocks() {
+    fn discovers_messages_resolves_project_and_preserves_file_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let gemini = dir.path().join(".gemini");
         let project = "/tmp/example-project";
@@ -1745,21 +1866,25 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(parsed.session.cwd.as_deref(), Some(project));
         assert!(parsed.session.created_at.is_some());
-        assert_eq!(parsed.messages.len(), 2);
-        assert_eq!(parsed.messages[0].content, "hello");
-        assert_eq!(parsed.messages[1].content, "hi");
+        assert_eq!(parsed.messages.len(), 3);
+        assert!(parsed.messages[0].content.contains("secret"));
         assert_eq!(
             parsed.messages[0].provenance.authorship,
+            MessageAuthorship::Harness
+        );
+        let messages = &parsed.messages[1..];
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].content, "hi");
+        assert_eq!(
+            messages[0].provenance.authorship,
             crate::models::MessageAuthorship::Human,
-            "a Gemini CLI chat is one person-started session per file; its user turns are the \
-             person's prompts once referenced-file blocks are stripped and function responses \
-             are set aside"
+            "attached file text is separated from the person's prompt"
         );
         assert_eq!(
-            parsed.messages[1].provenance.authorship,
+            messages[1].provenance.authorship,
             crate::models::MessageAuthorship::Agent
         );
-        for (message, expected_id) in parsed.messages.iter().zip(["u1", "a1"]) {
+        for (message, expected_id) in messages.iter().zip(["u1", "a1"]) {
             let identity = message
                 .provenance
                 .correlation_identity
