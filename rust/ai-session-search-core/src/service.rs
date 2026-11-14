@@ -1876,7 +1876,10 @@ impl<'app> AnalysisService<'app> {
                         if selector.name.as_str() == crate::corrections::EMBEDDED_POLICY_NAME
                 )
             }) {
-                bail!("skill \"corrections\" was selected more than once");
+                return Err(crate::ServiceError::invalid_argument(
+                    "skill \"corrections\" was selected more than once",
+                )
+                .into());
             }
             let mut capability_budget = crate::message_classification::CapabilityLoadBudget::new();
             let mut compiled = vec![match &query.definition {
@@ -1899,10 +1902,11 @@ impl<'app> AnalysisService<'app> {
                         frontmatter.name == crate::corrections::EMBEDDED_POLICY_NAME
                     })
                 }) {
-                    bail!(
+                    return Err(crate::ServiceError::invalid_argument(
                         "the embedded corrections skill and an installed corrections package \
-                         identify the same capability; remove the duplicate --skill selector"
-                    );
+                         identify the same capability; remove the duplicate --skill selector",
+                    )
+                    .into());
                 }
                 let additional = crate::message_classification::compile_skill_descriptors(
                     descriptors,
@@ -3736,6 +3740,12 @@ impl<'db> MessageService<'db> {
         filters: &MessageFilters,
         order: crate::db::MessageOrder,
     ) -> Result<Vec<MessageHit>> {
+        if filters.session_id.is_none() {
+            return Err(crate::ServiceError::invalid_argument(
+                "read_session_messages requires filters.session_id because sequence numbers are session-local"
+            ).into());
+        }
+        filters.validate("")?;
         self.db.ensure_refreshed_for_read()?;
         self.db.read_session_messages(filters, order)
     }
