@@ -3231,13 +3231,23 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(responses.len(), 3);
-    assert_eq!(responses[0]["id"], 1);
-    assert_eq!(responses[1]["id"], 2);
-    assert_eq!(responses[2]["id"], 3);
+    for id in 1..=3 {
+        response_with_id(&responses, id);
+    }
     assert_eq!(
-        responses[2]["result"]["structuredContent"]["run"]["resolved_skill"]["name"],
+        response_with_id(&responses, 3)["result"]["structuredContent"]["run"]["resolved_skill"]
+            ["name"],
         "corrections"
     );
+}
+
+/// The MCP server answers requests concurrently, so responses can arrive in any order.
+/// Select a response by its request id, never by its position in the output.
+fn response_with_id(responses: &[serde_json::Value], id: u64) -> &serde_json::Value {
+    responses
+        .iter()
+        .find(|response| response["id"] == id)
+        .unwrap_or_else(|| panic!("no response with id {id} in {responses:?}"))
 }
 
 #[test]
@@ -3282,9 +3292,9 @@ fn future_config_keys_keep_mcp_protocol_only_and_stderr_empty() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(responses.len(), 3);
-    assert_eq!(responses[0]["id"], 1);
-    assert!(responses[1]["result"]["tools"].is_array());
-    let status = &responses[2]["result"]["structuredContent"];
+    response_with_id(&responses, 1);
+    assert!(response_with_id(&responses, 2)["result"]["tools"].is_array());
+    let status = &response_with_id(&responses, 3)["result"]["structuredContent"];
     assert_eq!(
         status["unknown_config_keys"][1]["path"],
         "ui.preview_body_linse"
