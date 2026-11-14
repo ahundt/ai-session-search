@@ -150,8 +150,10 @@ def test_resume_command_and_transcript_use_catalog(corpus):
 
 @pytest.mark.integration
 def test_gemini_resume_python_and_cli_use_native_id_and_project_cwd(
-    corpus, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
+    corpus = aise.SessionSearch(tmp_path / "gemini-index.db")
+    corpus.refresh()
     executable = tmp_path / "gemini"
     executable.write_text("#!/bin/sh\nexit 1\n")
     executable.chmod(0o755)
@@ -167,6 +169,7 @@ def test_gemini_resume_python_and_cli_use_native_id_and_project_cwd(
             "VALUES (?, 'gemini-cli', ?, ?, '', ?, 'test', 'fixture')",
             (session_id, native_id, str(project), str(tmp_path / "session-synthetic.jsonl")),
         )
+    db.close()
     command = corpus.resume_command(session_id)
     assert command["argv"] == ["gemini", "--resume", native_id]
     assert command["cwd"] == str(project)
@@ -180,9 +183,11 @@ def test_gemini_resume_python_and_cli_use_native_id_and_project_cwd(
     assert str(project) in result.stdout
     with sqlite3.connect(corpus.db_path) as db:
         db.execute("UPDATE sessions SET cwd = NULL WHERE id = ?", (session_id,))
+    db.close()
     unavailable = corpus.resume_command(session_id)
     assert unavailable["argv"] is None
     assert "project directory" in unavailable["unavailable_reason"]
+    corpus.close()
 
 
 def test_sql_and_vocabulary_enforce_access_scope(corpus, tmp_path: Path):
