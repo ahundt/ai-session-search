@@ -608,16 +608,16 @@ impl CodexAdapter {
         }
 
         let mut retracted = crate::models::RetractedRows::default();
-        if let (Some(parent), Some(range)) = (fork_parent, replayed_file_edits) {
+        if let (Some(parent), Some(range)) = (fork_parent.as_ref(), replayed_file_edits) {
             // Discovery retains O(F) filename identities for F sources once per adapter. This
-            // check reads no other transcript; absent parents retain the fork's only copy.
+            // check only proposes retractions; storage must prove an indexed parent copy.
             if self.rollout_paths.get().is_none() {
                 self.discover_with_warnings();
             }
             if self
                 .rollout_paths
                 .get()
-                .and_then(|paths| paths.get(&parent))
+                .and_then(|paths| paths.get(parent))
                 .is_some_and(|parent_path| parent_path != path && parent_path.is_file())
             {
                 retracted.file_edits = file_edits.drain(range).collect();
@@ -658,10 +658,14 @@ impl CodexAdapter {
             "rollout_path": meta.rollout_path,
             "session_path": normalize_path(path),
         });
+        if let Some(parent) = fork_parent {
+            raw_metadata["forked_from_id"] = json!(parent);
+        }
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
         }
-        if requires_full_parse_for_tail {
+        if requires_full_parse_for_tail || !retracted.file_edits.is_empty() {
+            // Replay edits need storage reconciliation against the indexed parent.
             // An answer may be in the appended tail while its native call and question ids are
             // before the overlap. The indexer owns the provider guard; this marker is the parser's
             // evidence that a tail-only parse cannot safely correlate that output.
@@ -2894,6 +2898,15 @@ mod tests {
                 }
             );
             let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+            if parent_present {
+                let parent_source = adapter
+                    .discover()
+                    .into_iter()
+                    .find(|source| source.path == parent_path)
+                    .unwrap();
+                db.upsert_session(&adapter.parse(&parent_source), 1, 1)
+                    .unwrap();
+            }
             let mut old = parsed.clone();
             old.session.parse_version = "codex-v10".into();
             old.file_edits.extend(parsed.retracted.file_edits.clone());
@@ -2902,7 +2915,7 @@ mod tests {
             db.upsert_session(&parsed, 1, 1).unwrap();
             assert_eq!(
                 db.file_edit_count().unwrap(),
-                parsed.file_edits.len() as i64
+                parsed.file_edits.len() as i64 + i64::from(parent_present)
             );
         }
     }

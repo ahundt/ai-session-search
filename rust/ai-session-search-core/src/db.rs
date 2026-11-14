@@ -7714,11 +7714,52 @@ fn store_parsed_file_edits(
     same_parser: bool,
 ) -> Result<()> {
     let session = &parsed.session;
+    let mut file_edits: Vec<&FileEdit> = parsed.file_edits.iter().collect();
+    let mut retracted_file_edits = Vec::new();
+    let parent = (session.provider == Provider::Codex)
+        .then(|| {
+            session
+                .raw_metadata_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        })
+        .flatten()
+        .and_then(|metadata| {
+            metadata["forked_from_id"]
+                .as_str()
+                .map(|id| format!("codex:{id}"))
+        })
+        .filter(|id| id != &session.id);
+    // A filename cannot prove recovery safety. Consume equivalent indexed parent edits once
+    // each; otherwise the fork retains its copy. O(parent edits + replay edits) key memory.
+    let mut parent_edits = match &parent {
+        Some(parent) => key_counts(
+            stored_file_edit_keys(tx, parent)?
+                .iter()
+                .map(|(_, _, keys)| keys.edit),
+        ),
+        None => HashMap::new(),
+    };
+    for edit in &parsed.retracted.file_edits {
+        if parent.is_some() {
+            let count = parent_edits
+                .entry(parsed_file_edit_keys(edit)?.edit)
+                .or_default();
+            if *count == 0 {
+                file_edits.push(edit);
+                continue;
+            }
+            *count -= 1;
+        }
+        retracted_file_edits.push(edit);
+    }
+    if file_edits.len() != parsed.file_edits.len() {
+        file_edits.sort_by_key(|edit| edit.seq);
+    }
     let stored = stored_file_edit_keys(tx, &session.id)?;
-    let parsed_keys = parsed
-        .file_edits
+    let parsed_keys = file_edits
         .iter()
-        .map(parsed_file_edit_keys)
+        .map(|edit| parsed_file_edit_keys(edit))
         .collect::<Result<Vec<_>>>()?;
     if same_parser
         && stored
@@ -7736,7 +7777,7 @@ fn store_parsed_file_edits(
             "delete from file_edits where session_id = ?1",
             params![session.id],
         )?;
-        insert_file_edits(tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
+        insert_file_edits(tx, session, file_edits.iter().map(|e| (e.seq, *e)))?;
         return Ok(());
     }
     let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
@@ -7756,7 +7797,7 @@ fn store_parsed_file_edits(
             "update file_edits set ts = ?1, tool = ?2, file_path = ?3, file_name = ?4,
              new_content = ?5, edits_json = ?6 where id = ?7",
         )?;
-        for (edit, position) in parsed.file_edits.iter().zip(&matched) {
+        for (edit, position) in file_edits.iter().zip(&matched) {
             if let Some(position) = position {
                 let edits_json = serialize_edits_json(edit)?;
                 update.execute(params![
@@ -7776,7 +7817,7 @@ fn store_parsed_file_edits(
     // for the invariant. Claude's request copies repeated each edit; an `Edit` replayed a second
     // time no longer finds its old text, which invalidates the reconstructed file version.
     let mut retracted = vec![false; stored.len()];
-    for edit in &parsed.retracted.file_edits {
+    for edit in retracted_file_edits {
         let key = parsed_file_edit_keys(edit)?.edit;
         if let Some(position) = positions.get_mut(&key).and_then(|queue| queue.pop_front()) {
             retracted[position] = true;
@@ -7791,11 +7832,7 @@ fn store_parsed_file_edits(
             "delete from file_edits where session_id = ?1",
             params![session.id],
         )?;
-        insert_file_edits(
-            tx,
-            session,
-            parsed.file_edits.iter().map(|edit| (edit.seq, edit)),
-        )?;
+        insert_file_edits(tx, session, file_edits.iter().map(|edit| (edit.seq, *edit)))?;
         return Ok(());
     }
     let mut delete = tx.prepare("delete from file_edits where id = ?1")?;
@@ -7827,7 +7864,7 @@ fn store_parsed_file_edits(
                 renumber.execute(params![seq, id])?;
             }
         } else {
-            inserts.push((seq, &parsed.file_edits[index]));
+            inserts.push((seq, file_edits[index]));
         }
     }
     insert_file_edits(tx, session, inserts.into_iter())

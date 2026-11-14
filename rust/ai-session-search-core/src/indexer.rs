@@ -2509,6 +2509,55 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_keeps_recoverable_edits_when_parent_lacks_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let parent = "019f4a0e-d714-7cc3-8003-543a04a1a822";
+        let own = "019f5ce8-afff-76a3-86f2-174307f3fa08";
+        let path = root.join(format!("rollout-{own}.jsonl"));
+        let parent_path = root.join(format!("rollout-{parent}.jsonl"));
+        let records = [
+            serde_json::json!({"type":"session_meta","payload":{"id":own,"forked_from_id":parent}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"copied-edit","name":"apply_patch","input":"*** Begin Patch\n*** Add File: /synthetic/retained.rs\n+recoverable content\n*** End Patch"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"copied-edit","output":"Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/retained.rs\n"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+        ];
+        std::fs::write(
+            &path,
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_single_claude_fixture(&db_path, &root);
+        config.providers.claude.enabled = false;
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&root)];
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(db.file_edit_count().unwrap(), 1);
+        // A parent filename without the copied mutation is not proof of a recoverable copy.
+        for body in [
+            serde_json::json!({"type":"session_meta","payload":{"id":parent}}).to_string(),
+            "{malformed".into(),
+        ] {
+            std::fs::write(&parent_path, format!("{body}\n")).unwrap();
+            reindex(&config, &db, true, None).unwrap();
+            assert_eq!(db.file_edit_count().unwrap(), 1);
+            let versions =
+                crate::files::reconstruct_versions_query(&db, "retained.rs", &Default::default())
+                    .unwrap()
+                    .collect::<Vec<_>>();
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].content, "recoverable content");
+            let fresh_path = dir.path().join(format!("fresh-{}.db", body.len()));
+            let fresh = Db::open(&fresh_path).unwrap();
+            reindex(&config, &fresh, true, None).unwrap();
+            assert_eq!(fresh.file_edit_count().unwrap(), 1);
+        }
+    }
+
+    #[test]
     fn codex_spawn_metadata_beyond_overlap_forces_full_parse() {
         use std::io::Write as _;
 
