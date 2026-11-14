@@ -247,6 +247,8 @@ pub struct CorrectionsArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
+    #[command(flatten)]
+    pub exclusions: crate::cli::ExclusionArgs,
     /// Max matches. Omit for `[capabilities.message_classification].limit`.
     /// Deprecated: 0 means every match; use --all-results instead.
     #[arg(long, conflicts_with = "all_results")]
@@ -338,6 +340,8 @@ pub(crate) struct StatsArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
+    #[command(flatten)]
+    pub exclusions: crate::cli::ExclusionArgs,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -394,6 +398,8 @@ pub(crate) fn message_classification_filters(
         },
         args.offset,
     )?;
+    filters.exclude_path_prefixes = args.exclusions.normalized_paths();
+    filters.exclude_session_ids = args.exclusions.exclude_sessions.clone();
     // Left as `None` when the caller named no class, so `find_corrections` applies its own
     // user-only default. Setting it here instead would put the "what a correction IS" decision in
     // the CLI adapter, where the Python and MCP surfaces could not inherit it.
@@ -579,7 +585,7 @@ pub(crate) fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Res
 }
 
 pub(crate) fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()> {
-    let filters = filters_from(
+    let mut filters = filters_from(
         db,
         &args.session_id,
         args.provider,
@@ -588,6 +594,8 @@ pub(crate) fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()
         0,
         0,
     )?;
+    filters.exclude_path_prefixes = args.exclusions.normalized_paths();
+    filters.exclude_session_ids = args.exclusions.exclude_sessions.clone();
     let rows = crate::service::AnalysisService::new(config, db).role_statistics(&filters)?;
     emit(&rows, args.format)
 }
@@ -898,6 +906,8 @@ pub(crate) struct RepeatsArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
+    #[command(flatten)]
+    pub exclusions: crate::cli::ExclusionArgs,
     /// Neighboring messages before/after each match in generated follow-up commands.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
     pub context: i64,
@@ -958,6 +968,8 @@ pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Resul
             role: args.role,
             providers: args.provider.map(|provider| vec![provider]),
             session_id: args.session_id.clone(),
+            exclude_path_prefixes: args.exclusions.normalized_paths(),
+            exclude_session_ids: args.exclusions.exclude_sessions.clone(),
             path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
             since,
             until,

@@ -154,3 +154,67 @@ fn file_exclusions_and_dates_apply_before_paging() {
     );
     assert_eq!(extracted.stdout, b"version 61\n");
 }
+
+#[test]
+fn analytics_exclusions_remove_the_candidate_population() {
+    let dir = fixture();
+    for command in [
+        vec!["skills", "corrections"],
+        vec!["repeats", "needle"],
+        vec!["stats"],
+    ] {
+        let unfiltered = rows(&dir, &command);
+        if command[0] == "skills" {
+            assert_eq!(
+                unfiltered["output"]["result"]["report"]["matches"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
+        if command[0] == "repeats" {
+            assert!(!unfiltered.as_array().unwrap().is_empty());
+        }
+        if command[0] == "stats" {
+            assert_eq!(
+                unfiltered[0]["count"].as_i64().unwrap() + unfiltered[1]["count"].as_i64().unwrap(),
+                6
+            );
+        }
+        let mut session_args = command.clone();
+        session_args.extend([
+            "--exclude-session",
+            "claude:cli-0",
+            "--exclude-session",
+            "claude:cli-1",
+        ]);
+        if command[0] == "skills" {
+            session_args.extend(["--limit", "1"]);
+            let scoped = rows(&dir, &session_args);
+            assert_eq!(
+                scoped["output"]["result"]["report"]["matches"][0]["session_id"],
+                "claude:cli-2"
+            );
+        } else if command[0] == "stats" {
+            let scoped = rows(&dir, &session_args);
+            assert_eq!(
+                scoped[0]["count"].as_i64().unwrap() + scoped[1]["count"].as_i64().unwrap(),
+                2
+            );
+        } else {
+            let scoped = rows(&dir, &session_args);
+            assert!(scoped.as_array().unwrap().is_empty());
+        }
+        let mut args = command;
+        args.extend(["--exclude-path", "/synthetic", "--format", "json"]);
+        let value: Value = serde_json::from_slice(&output(&dir, &args).stdout).unwrap();
+        if args[0] == "repeats" {
+            assert_eq!(value, json!([]));
+        } else if args[0] == "skills" {
+            assert_eq!(value["output"]["result"]["report"]["matches"], json!([]));
+        } else {
+            assert_eq!(value, json!([]));
+        }
+    }
+}
