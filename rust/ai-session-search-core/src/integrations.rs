@@ -5422,11 +5422,21 @@ fn plan_upsert_json_server(
 fn plan_upsert_json_server_with_state(
     path: &Path,
     format: ConfigFormat,
-    mut entry: Value,
+    entry: Value,
     state: Option<&RegistrationState>,
 ) -> Result<Vec<PlannedFileMutation>> {
-    let layout = json_layout_for(format)?;
     let original = read_optional_utf8_regular_file(path)?;
+    plan_upsert_json_server_from_snapshot(path, format, entry, state, original)
+}
+
+fn plan_upsert_json_server_from_snapshot(
+    path: &Path,
+    format: ConfigFormat,
+    mut entry: Value,
+    state: Option<&RegistrationState>,
+    original: Option<String>,
+) -> Result<Vec<PlannedFileMutation>> {
+    let layout = json_layout_for(format)?;
     let parsed = parse_json_object_or_empty(path, original.as_deref(), layout.syntax)?;
     let old = json_container(&parsed, layout.container)
         .and_then(|servers| servers.get(SERVER_NAME))
@@ -5579,7 +5589,11 @@ fn plan_upsert_codex_mcp_server(
     server.insert("args", toml_edit::value(args));
     let mut mutations = Vec::new();
     if let Some(root) = marketplace {
-        let (record_original, mut record) = checked_codex_marketplace_record(root, &document)?;
+        let CheckedCodexMarketplace {
+            original: record_original,
+            mut record,
+            contents,
+        } = checked_codex_marketplace_record(root, &document)?;
         let source = root.to_str().ok_or_else(|| {
             anyhow!(
                 "the aise Codex marketplace path {} is not valid UTF-8 and cannot be written to {}",
@@ -5604,15 +5618,16 @@ fn plan_upsert_codex_mcp_server(
         marketplaces.insert(SERVER_NAME, toml_edit::Item::Table(marketplace_entry));
         for (file, content) in codex_marketplace_files(root, binary)? {
             if file.file_name().is_some_and(|name| name == ".mcp.json") {
-                mutations.extend(plan_upsert_json_server_with_state(
+                mutations.extend(plan_upsert_json_server_from_snapshot(
                     &file,
                     ConfigFormat::JsonMcpServers,
                     entry.clone(),
                     state,
+                    contents.get(&file).cloned(),
                 )?);
                 continue;
             }
-            let original = read_optional_utf8_regular_file(&file)?;
+            let original = contents.get(&file).cloned();
             mutations.push(planned_write(&file, &original, content));
         }
         let registration =
@@ -5674,12 +5689,16 @@ fn plan_remove_codex_mcp_server(
     let mut document = parse_codex_document(path, text)?;
     let owned_marketplace = if let Some(root) = marketplace {
         match checked_codex_marketplace_record(root, &document) {
-            Ok((record_original, record)) if record.installation(root).is_some() => {
+            Ok(CheckedCodexMarketplace {
+                original: record_original,
+                record,
+                contents,
+            }) if record.installation(root).is_some() => {
                 for (file, _) in codex_marketplace_files(root, "")? {
-                    if let Some(original) = read_optional_utf8_regular_file(&file)? {
+                    if let Some(original) = contents.get(&file) {
                         mutations.push(PlannedFileMutation::Remove {
                             path: file,
-                            original,
+                            original: original.clone(),
                         });
                     }
                 }
@@ -5751,14 +5770,28 @@ fn codex_marketplace_registration(document: &toml_edit::DocumentMut) -> Option<S
     Some(registration.to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static MARKETPLACE_CHECKED_EDIT: std::cell::RefCell<Option<(PathBuf, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+struct CheckedCodexMarketplace {
+    original: Option<String>,
+    record: crate::skill_manifest::SkillInstallManifest,
+    contents: std::collections::BTreeMap<PathBuf, String>,
+}
+
 /// Keep marketplace ownership separate from skills, using the same durable digest format.
 fn checked_codex_marketplace_record(
     root: &Path,
     document: &toml_edit::DocumentMut,
-) -> Result<(Option<String>, crate::skill_manifest::SkillInstallManifest)> {
+) -> Result<CheckedCodexMarketplace> {
     let path = root.with_extension("install-manifest.json");
     let original = read_optional_utf8_regular_file(&path)?;
-    let record = crate::skill_manifest::load_manifest(&path)?
+    let record = original
+        .as_deref()
+        .map(crate::skill_manifest::parse_manifest)
+        .unwrap_or(crate::skill_manifest::ManifestState::Absent)
         .writable_manifest(&path)
         .with_context(|| {
             format!(
@@ -5775,17 +5808,30 @@ fn checked_codex_marketplace_record(
     if let Some(registration) = codex_marketplace_registration(document) {
         contents.push((CODEX_MARKETPLACE_REGISTRATION.to_string(), registration));
     }
-    for (relative, text) in contents {
+    for (relative, text) in &contents {
         let owned = record
             .installation(root)
-            .and_then(|installation| installation.file(&relative));
+            .and_then(|installation| installation.file(relative));
         if !owned.is_some_and(|file| {
             file.bytes == text.len() && file.sha256 == crate::hashing::sha256(text.as_bytes())
         }) {
-            bail!("Codex marketplace file {} is unrecorded or modified; inspect or move it before reinstalling", root.join(&relative).display());
+            bail!("Codex marketplace file {} is unrecorded or modified; inspect or move it before reinstalling", root.join(relative).display());
         }
     }
-    Ok((original, record))
+    #[cfg(test)]
+    MARKETPLACE_CHECKED_EDIT.with(|edit| {
+        if let Some((path, text)) = edit.borrow_mut().take() {
+            std::fs::write(path, text).unwrap();
+        }
+    });
+    Ok(CheckedCodexMarketplace {
+        original,
+        record,
+        contents: contents
+            .into_iter()
+            .map(|(relative, text)| (root.join(relative), text))
+            .collect(),
+    })
 }
 
 /// The developer name Codex shows for the plugin; Cargo.toml carries no `authors`.
@@ -8354,6 +8400,49 @@ mod tests {
         assert!(!marketplace.exists() && !plugin.join(".mcp.json").exists());
         assert!(!root.with_extension("install-manifest.json").exists());
         assert_eq!(status_target(&target).unwrap(), "not configured");
+    }
+
+    #[test]
+    fn codex_marketplace_plans_reject_edits_after_ownership_check() {
+        for uninstall in [false, true] {
+            for index in 0..3 {
+                let dir = tempdir().unwrap();
+                let config = dir.path().join("config.toml");
+                let root = dir.path().join("codex-marketplace");
+                let receipt = dir.path().join("transaction.json");
+                let initial =
+                    plan_upsert_codex_mcp_server(&config, "/synthetic/aise", Some(&root), None)
+                        .unwrap();
+                execute_planned_transaction(&receipt, &initial).unwrap();
+                let before = fs::read_to_string(&config).unwrap();
+                let file = codex_marketplace_files(&root, "").unwrap()[index].0.clone();
+                let checked = fs::read_to_string(&file).unwrap();
+                let edited = format!("{checked}\n");
+                MARKETPLACE_CHECKED_EDIT
+                    .with(|edit| *edit.borrow_mut() = Some((file.clone(), edited.clone())));
+                let plan = if uninstall {
+                    plan_remove_codex_mcp_server(&config, Some(&root))
+                } else {
+                    plan_upsert_codex_mcp_server(&config, "/synthetic/new-aise", Some(&root), None)
+                }
+                .unwrap();
+                let mutation = plan
+                    .iter()
+                    .find(|mutation| mutation.path() == file)
+                    .unwrap();
+                let original = match mutation {
+                    PlannedFileMutation::Write { original, .. } => original.as_deref().unwrap(),
+                    PlannedFileMutation::Remove { original, .. } => original.as_str(),
+                };
+                assert_eq!(
+                    original, checked,
+                    "the plan must use the ownership-checked bytes"
+                );
+                assert!(execute_planned_transaction(&receipt, &plan).is_err(), "an edit after ownership validation must refuse publication: uninstall={uninstall}, file={file:?}");
+                assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+                assert_eq!(fs::read_to_string(&config).unwrap(), before);
+            }
+        }
     }
 
     #[test]
