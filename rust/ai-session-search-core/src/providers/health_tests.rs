@@ -46,6 +46,247 @@ fn parse(provider: Provider, path: &Path, records: &[Value]) -> ParsedSession {
     }
 }
 
+const SYNTHETIC_ID: &str = "cafe0000-cafe-cafe-cafe-000000000002";
+
+fn input_record(provider: Provider, id: &str, text: &str) -> Value {
+    match provider {
+        Provider::Claude | Provider::ClaudeDesktop => {
+            json!({"type":"user","uuid":id,"sessionId":SYNTHETIC_ID,"message":{"role":"user","content":text}})
+        }
+        Provider::Codex => {
+            json!({"type":"response_item","payload":{"type":"message","id":id,"role":"user","content":[{"type":"input_text","text":text}]}})
+        }
+        Provider::Cursor => {
+            json!({"role":"user","message":{"content":[{"type":"text","text":text}]}})
+        }
+        Provider::Antigravity => {
+            json!({"type":"USER_INPUT","source":"USER_EXPLICIT","content":text,"created_at":"2026-01-01T00:00:00Z"})
+        }
+        Provider::Pi | Provider::PrimeAgent => {
+            json!({"type":"message","id":id,"message":{"role":"user","content":text}})
+        }
+        Provider::AiStudio => json!({"role":"user","text":text}),
+        Provider::GeminiCli => {
+            json!({"type":"user","id":id,"content":text,"timestamp":"2026-01-01T00:00:00Z"})
+        }
+    }
+}
+
+fn write_records(provider: Provider, path: &Path, records: &[Value]) {
+    let raw = if provider == Provider::AiStudio {
+        json!({"chunkedPrompt":{"chunks":records}}).to_string()
+    } else {
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    };
+    std::fs::write(path, raw).unwrap();
+}
+
+fn upgrade_retains_history(provider: Provider, previous: &str, expected: &str) {
+    assert_eq!(crate::util::provider_parse_version(provider), expected);
+    let dir = tempfile::tempdir().unwrap();
+    let source_root = dir.path().join("sources");
+    let relative = match provider {
+        Provider::ClaudeDesktop => {
+            "local-agent-mode-sessions/install/account/local_synthetic/audit.jsonl".to_string()
+        }
+        Provider::Cursor => format!("project/agent-transcripts/{SYNTHETIC_ID}.jsonl"),
+        Provider::Antigravity => {
+            format!("brain/{SYNTHETIC_ID}/.system_generated/logs/transcript.jsonl")
+        }
+        Provider::AiStudio => "synthetic.json".into(),
+        Provider::GeminiCli => "project/chats/session-synthetic.jsonl".into(),
+        _ => format!("{SYNTHETIC_ID}.jsonl"),
+    };
+    let path = source_root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let header = match provider {
+        Provider::Codex => Some(json!({"type":"session_meta","payload":{"id":SYNTHETIC_ID}})),
+        Provider::Pi | Provider::PrimeAgent => Some(json!({"type":"session","id":SYNTHETIC_ID})),
+        Provider::GeminiCli => Some(json!({"sessionId":SYNTHETIC_ID,"kind":"main"})),
+        _ => None,
+    };
+    let archived = input_record(provider, "archived", "archived synthetic input");
+    let retained = input_record(provider, "retained", "retained synthetic input");
+    let unknown = json!({"type":"future-kind","role":"future-kind"});
+    let records = header
+        .iter()
+        .cloned()
+        .chain([archived, retained.clone(), unknown.clone()])
+        .collect::<Vec<_>>();
+    write_records(provider, &path, &records);
+    let path = std::fs::canonicalize(path).unwrap();
+    let mut complete = parse(provider, &path, &records);
+    assert_eq!(complete.session.provider, provider);
+    // A recorded snapshot can outlive its tool record, including for providers whose current
+    // exports no longer contain file mutations. Retention is a database contract.
+    let mut edit = crate::models::FileEdit::new(0, "Write", "/synthetic/archived.txt");
+    edit.new_content = Some("archived synthetic bytes".into());
+    complete.file_edits.push(edit);
+    let mut old = complete.clone();
+    old.session.parse_version = previous.into();
+    let surviving_old = old
+        .messages
+        .iter_mut()
+        .find(|message| message.content == "retained synthetic input")
+        .unwrap();
+    surviving_old.provenance.authorship = crate::models::MessageAuthorship::Unknown;
+    let mut metadata: Value =
+        serde_json::from_str(old.session.raw_metadata_json.as_deref().unwrap_or("{}")).unwrap();
+    metadata
+        .as_object_mut()
+        .unwrap()
+        .remove(health::UNRECOGNIZED_RECORD_TYPES_KEY);
+    old.session.raw_metadata_json = Some(metadata.to_string());
+
+    let upgraded_path = dir.path().join("upgraded.db");
+    let fresh_path = dir.path().join("fresh.db");
+    let upgraded = crate::db::Db::open(&upgraded_path).unwrap();
+    let fresh = crate::db::Db::open(&fresh_path).unwrap();
+    for db in [&upgraded, &fresh] {
+        db.mark_schema_current().unwrap();
+    }
+    upgraded.upsert_session(&old, 0, 0).unwrap();
+    // Build the comparison index with the new parser over the same source history. A new
+    // index of only the shortened file cannot contain source records that are already gone.
+    fresh.upsert_session(&complete, 0, 0).unwrap();
+    let surviving = header
+        .into_iter()
+        .chain([retained, unknown])
+        .collect::<Vec<_>>();
+    write_records(provider, &path, &surviving);
+    let current = parse(provider, &path, &surviving);
+    let mut config = isolated_config();
+    let selected = match provider {
+        Provider::Claude => &mut config.providers.claude,
+        Provider::ClaudeDesktop => &mut config.providers.claude_desktop,
+        Provider::Codex => &mut config.providers.codex,
+        Provider::Cursor => &mut config.providers.cursor,
+        Provider::Antigravity => &mut config.providers.antigravity,
+        Provider::Pi => &mut config.providers.pi,
+        Provider::PrimeAgent => &mut config.providers.prime_agent,
+        Provider::AiStudio => &mut config.providers.aistudio,
+        Provider::GeminiCli => &mut config.providers.gemini_cli,
+    };
+    selected.enabled = true;
+    selected.paths = vec![source_root.to_string_lossy().into_owned()];
+    let snapshot = |db: &crate::db::Db| {
+        db.search_messages("", &Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|hit| serde_json::to_value(hit).unwrap())
+            .collect::<Vec<_>>()
+    };
+    for (db, db_path) in [(&upgraded, &upgraded_path), (&fresh, &fresh_path)] {
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        for _ in 0..2 {
+            let result = crate::service::IndexService::new(&config, db)
+                .reindex_report(false)
+                .unwrap();
+            assert_eq!(result.files_seen, 1, "{provider:?}");
+            assert_eq!(
+                db.resolve_session_record(&complete.session.id)
+                    .unwrap()
+                    .parse_version,
+                expected
+            );
+            assert_eq!(db.message_count().unwrap(), 2, "{provider:?}");
+            assert_eq!(db.file_edit_count().unwrap(), 1, "{provider:?}");
+            let connection = rusqlite::Connection::open(db_path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "select authorship from messages where content='retained synthetic input'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                "human",
+                "{provider:?}"
+            );
+            assert_eq!(connection.query_row(
+                "select new_content from file_edits where file_path='/synthetic/archived.txt'", [],
+                |row| row.get::<_, String>(0)).unwrap(), "archived synthetic bytes");
+            assert_eq!(
+                db.search_messages("archived synthetic input", &Default::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let stored = db
+                .search_messages("retained synthetic input", &Default::default())
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(
+                stored[0].content, current.messages[0].content,
+                "{provider:?}"
+            );
+            assert_eq!(stored[0].role, current.messages[0].role, "{provider:?}");
+            assert_eq!(stored[0].kind, current.messages[0].kind, "{provider:?}");
+            let inventory = db.parser_health().unwrap().unrecognized_record_types;
+            assert_eq!(inventory.len(), 1, "{provider:?}");
+            assert_eq!(inventory[0].record_type, "future-kind");
+            assert_eq!(inventory[0].records, 1);
+        }
+    }
+    assert_eq!(snapshot(&upgraded), snapshot(&fresh), "{provider:?}");
+    assert_eq!(
+        upgraded
+            .resolve_session(&complete.session.id)
+            .unwrap()
+            .transcript_text,
+        fresh
+            .resolve_session(&complete.session.id)
+            .unwrap()
+            .transcript_text
+    );
+}
+
+#[test]
+fn claude_v20_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Claude, "claude-v19", "claude-v20");
+}
+#[test]
+fn claude_desktop_v20_upgrade_retains_history() {
+    upgrade_retains_history(
+        Provider::ClaudeDesktop,
+        "claude-desktop-local-agent-v19",
+        "claude-desktop-local-agent-v20",
+    );
+}
+#[test]
+fn codex_v13_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Codex, "codex-v12", "codex-v13");
+}
+#[test]
+fn cursor_v6_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Cursor, "cursor-v5", "cursor-v6");
+}
+#[test]
+fn antigravity_v7_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Antigravity, "antigravity-v6", "antigravity-v7");
+}
+#[test]
+fn pi_v6_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Pi, "pi-v5", "pi-v6");
+}
+#[test]
+fn prime_agent_v4_upgrade_retains_history() {
+    upgrade_retains_history(Provider::PrimeAgent, "prime-agent-v3", "prime-agent-v4");
+}
+#[test]
+fn aistudio_v5_upgrade_retains_history() {
+    upgrade_retains_history(Provider::AiStudio, "aistudio-v4", "aistudio-v5");
+}
+#[test]
+fn gemini_cli_v11_upgrade_retains_history() {
+    upgrade_retains_history(Provider::GeminiCli, "gemini-cli-v10", "gemini-cli-v11");
+}
+
 fn isolated_config() -> crate::config::Config {
     let mut config = crate::config::Config::default();
     for provider in [

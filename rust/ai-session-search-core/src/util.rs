@@ -2086,26 +2086,33 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 }
 
 #[test]
-fn parser_versions_pin_claude_attachment_and_codex_fork_rules() {
-    assert_eq!(provider_parse_version(Provider::Claude), "claude-v19");
-    assert_eq!(
-        provider_parse_version(Provider::ClaudeDesktop),
-        "claude-desktop-local-agent-v19"
-    );
-    assert_eq!(provider_parse_version(Provider::Codex), "codex-v12");
+fn parser_versions_pin_record_and_health_reconciliation() {
+    for (provider, version) in [
+        (Provider::Claude, "claude-v20"),
+        (Provider::ClaudeDesktop, "claude-desktop-local-agent-v20"),
+        (Provider::Codex, "codex-v13"),
+        (Provider::Cursor, "cursor-v6"),
+        (Provider::Antigravity, "antigravity-v7"),
+        (Provider::Pi, "pi-v6"),
+        (Provider::PrimeAgent, "prime-agent-v4"),
+        (Provider::AiStudio, "aistudio-v5"),
+        (Provider::GeminiCli, "gemini-cli-v11"),
+    ] {
+        assert_eq!(provider_parse_version(provider), version);
+    }
 }
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v19",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v19",
-        Provider::Codex => "codex-v12",
-        Provider::Cursor => "cursor-v5",
-        Provider::Antigravity => "antigravity-v6",
-        Provider::Pi => "pi-v5",
-        Provider::PrimeAgent => "prime-agent-v3",
-        Provider::AiStudio => "aistudio-v4",
-        Provider::GeminiCli => "gemini-cli-v10",
+        Provider::Claude => "claude-v20",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v20",
+        Provider::Codex => "codex-v13",
+        Provider::Cursor => "cursor-v6",
+        Provider::Antigravity => "antigravity-v7",
+        Provider::Pi => "pi-v6",
+        Provider::PrimeAgent => "prime-agent-v4",
+        Provider::AiStudio => "aistudio-v5",
+        Provider::GeminiCli => "gemini-cli-v11",
     }
 }
 
