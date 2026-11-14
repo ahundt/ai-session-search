@@ -664,21 +664,30 @@ impl PiParentCopy {
 /// Returns a byte boundary; provenance below converts it to Unicode scalar coordinates.
 fn pi_skill_argument_start(text: &str) -> Option<usize> {
     let (header, rest) = text.split_once('\n')?;
-    if !header.starts_with("<skill name=\"")
-        || !header.contains("\" location=\"")
-        || !header.ends_with("\">")
-        || !rest.starts_with("References are relative to ")
-    {
+    let attributes = header.strip_prefix("<skill name=\"")?.strip_suffix("\">")?;
+    let (name, location) = attributes.split_once("\" location=\"")?;
+    if name.is_empty() || location.is_empty() || name.contains('"') || location.contains('"') {
         return None;
     }
-    let end = text.rfind("\n</skill>")? + "\n</skill>".len();
-    if end == text.len() {
-        Some(end)
-    } else if text[end..].starts_with("\n\n") {
-        Some(end + 2)
-    } else {
-        None
-    }
+    let (reference, _) = rest.split_once("\n\n")?;
+    reference
+        .strip_prefix("References are relative to ")?
+        .strip_suffix('.')?;
+    // Both harnesses strip frontmatter, trim the body, and append a standalone close
+    // followed by either EOF or two newlines and arguments. The body is not escaped:
+    // an earlier matching close may be a body example. Keep the earliest possible
+    // boundary, conservatively treating the ambiguous suffix as input, never swallowing
+    // arguments that contain another close. Fenced/prefixed quotations fail the header.
+    text.match_indices("\n</skill>").find_map(|(index, close)| {
+        let end = index + close.len();
+        if end == text.len() {
+            Some(end)
+        } else if text[end..].starts_with("\n\n") {
+            Some(end + 2)
+        } else {
+            None
+        }
+    })
 }
 
 fn pi_skill_arguments(text: &str) -> &str {
@@ -1020,7 +1029,11 @@ mod tests {
         use serde_json::json;
         let skill = "<skill name=\"sample\" location=\"/synthetic/SKILL.md\">\nReferences are relative to /synthetic.\n\nGenerated 🦀 instructions\n</skill>";
         for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
-            for args in ["", "\n\nplease check α"] {
+            for args in [
+                "",
+                "\n\nplease check α",
+                "\n\nPlease explain this closing tag:\n</skill>",
+            ] {
                 let text = format!("{skill}{args}");
                 let records = format!(
                     "{{\"type\":\"session\",\"id\":\"skills\"}}\n{}",
@@ -1034,7 +1047,9 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     parsed.session.title.as_deref(),
-                    (!args.is_empty()).then_some("please check α")
+                    (!args.is_empty())
+                        .then(|| crate::util::truncate_for_display(args.trim(), 100))
+                        .as_deref()
                 );
                 let row = &parsed.messages[0];
                 row.provenance.validate(&row.content).unwrap();
@@ -1053,7 +1068,11 @@ mod tests {
                 let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
                 let mut old = parsed.clone();
                 old.session.parse_version = "legacy-skill-parser".into();
-                old.messages[0].provenance.authorship = MessageAuthorship::Human;
+                old.messages[0].provenance.authorship = if args.is_empty() {
+                    MessageAuthorship::Human
+                } else {
+                    MessageAuthorship::Generated
+                };
                 old.messages[0].provenance.content_parts.clear();
                 db.upsert_session(&old, 1, 1).unwrap();
                 db.upsert_session(&parsed, 1, 1).unwrap();
@@ -1065,7 +1084,14 @@ mod tests {
                     crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
                 for (query, count) in [
                     ("Generated 🦀", 0),
-                    ("please check α", usize::from(!args.is_empty())),
+                    (
+                        "please check α",
+                        usize::from(args.contains("please check α")),
+                    ),
+                    (
+                        "Please explain this closing tag:",
+                        usize::from(args.contains("Please explain")),
+                    ),
                 ] {
                     let request = MessageSearchRequest::builder(
                         MessageQuery::literal(query).unwrap(),
@@ -1076,6 +1102,59 @@ mod tests {
                     .unwrap();
                     assert_eq!(service.search(request).unwrap().hits().len(), count);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn skill_body_closing_tags_and_quoted_envelopes_preserve_human_input() {
+        use serde_json::json;
+        let envelope = "<skill name=\"sample\" location=\"/synthetic/SKILL.md\">\nReferences are relative to /synthetic.\n\nExample closing tag:\n</skill>\n\nBody after example\n</skill>";
+        for text in [
+            envelope.to_owned(),
+            format!("{envelope}\n\nTyped request"),
+            format!("Quoted example:\n{envelope}"),
+            format!("\u{0060}\u{0060}\u{0060}xml\n{envelope}\n\u{0060}\u{0060}\u{0060}"),
+        ] {
+            for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
+                let records = format!(
+                    "{}\n{}",
+                    json!({"type":"session","id":"skill-tags"}),
+                    json!({"type":"message","id":"input","message":{"role":"user","content":text}})
+                );
+                let parsed = adapter
+                    .parse_reader(
+                        std::io::Cursor::new(records),
+                        std::path::Path::new("/synthetic/tags.jsonl"),
+                    )
+                    .unwrap();
+                let dir = tempdir().unwrap();
+                let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+                let mut old = parsed.clone();
+                old.session.parse_version = "legacy-skill-tags".into();
+                old.messages[0].provenance.authorship = crate::models::MessageAuthorship::Generated;
+                old.messages[0].provenance.content_parts.clear();
+                db.upsert_session(&old, 1, 1).unwrap();
+                db.upsert_session(&parsed, 1, 1).unwrap();
+                use crate::message_search::{
+                    MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+                };
+                let config = crate::config::Config::default();
+                let service =
+                    crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+                let query = if text.starts_with("<skill") {
+                    "Body after example"
+                } else {
+                    "Example closing tag:"
+                };
+                let request = MessageSearchRequest::builder(
+                    MessageQuery::literal(query).unwrap(),
+                    MessageTarget::content(),
+                )
+                .role(crate::models::Role::User)
+                .build()
+                .unwrap();
+                assert_eq!(service.search(request).unwrap().hits().len(), 1, "{text}");
             }
         }
     }
