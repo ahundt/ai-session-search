@@ -481,8 +481,13 @@ def test_native_date_resolution_reads_zones_from_values_and_reference_times() ->
     new_york_nov_7 = ("2026-11-07T05:00:00Z", "2026-11-08T04:59:59.999999999Z")
     # An RFC 9557 reference time names the zone values without an offset are read in.
     assert resolve("today", "2026-11-08T01:00:00Z[America/New_York]") == new_york_nov_7
-    # An RFC 3339 reference keeps its offset as the zone.
-    assert resolve("2026-11-07", "2026-11-07T20:00:00-05:00") == new_york_nov_7
+    # Equivalent RFC 3339 reference instants preserve UTC calendar membership.
+    for when in ["2026-11-07", "today", "2026-11", "1mo"]:
+        for reference in ["2026-11-07T20:00:00-05:00", "2026-11-08T10:00:00+09:00", "2026-11-08T06:30:00+05:30"]:
+            assert resolve(when, reference) == resolve(when, "2026-11-08T01:00:00Z")
+    assert resolve("2026-11-07", "2026-11-07T20:00:00-05:00") == (
+        "2026-11-07T00:00:00Z", "2026-11-07T23:59:59.999999999Z",
+    )
     # A trailing zone on the value overrides it.
     assert resolve("2026-11-07[America/New_York]", "2026-11-07T20:00:00Z") == new_york_nov_7
     # EDTF open intervals leave a side unbounded.

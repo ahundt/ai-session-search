@@ -2463,9 +2463,9 @@ python_value! { DateRange, slf => value_fields(slf.as_any(), &["since","until","
 
     /// Resolve all expressions through the canonical Rust date parser.
     ///
-    /// Values without an offset or explicit zone use UTC, preserving published date queries.
-    /// `reference_time` fixes "now" for reproducible results: an RFC 3339 timestamp, whose offset
-    /// becomes the zone, or an RFC 9557 one naming a zone, such as
+    /// Unzoned values use UTC unless `reference_time` explicitly names a zone.
+    /// `reference_time` fixes "now" for reproducible results: an RFC 3339 timestamp normalized
+    /// to UTC, or an RFC 9557 one naming a zone, such as
     /// `2026-06-15T12:00:00[America/New_York]`.
     #[pyo3(signature = (*, reference_time=None))]
     fn resolve_bounds(&self, reference_time: Option<&str>) -> PyResult<ResolvedDateRange> {

@@ -116,9 +116,9 @@ impl DateRange {
         self.resolve_zoned(&in_local_zone(Utc::now())?)
     }
 
-    /// Resolve relative to `reference_time`, an RFC 3339 timestamp (`2026-06-15T12:00:00-04:00`,
-    /// whose offset becomes the zone) or an RFC 9557 one naming a zone
-    /// (`2026-06-15T12:00:00[America/New_York]`). Makes relative input reproducible.
+    /// Resolve relative to an RFC 3339 `reference_time`, normalized to UTC, or an RFC 9557
+    /// timestamp explicitly naming a zone (`2026-06-15T12:00:00[America/New_York]`).
+    /// Makes relative input reproducible without changing unzoned values' UTC default.
     pub fn resolve_at(&self, reference_time: &str) -> Result<Bounds> {
         self.resolve_zoned(&reference_zoned(reference_time)?)
     }
@@ -249,8 +249,7 @@ fn annotated_zone(annotations: &str) -> Result<Option<TimeZone>> {
     }
 }
 
-/// `now` for a reference timestamp: RFC 9557 keeps its named zone, and RFC 3339 keeps its offset
-/// as a fixed zone (`Z` is UTC).
+/// RFC 3339 fixes the reference instant in UTC; RFC 9557 explicitly selects a calendar zone.
 fn reference_zoned(reference_time: &str) -> Result<jiff::Zoned> {
     if reference_time.trim_end().ends_with(']') {
         return reference_time
@@ -264,14 +263,7 @@ fn reference_zoned(reference_time: &str) -> Result<jiff::Zoned> {
         )
     };
     let timestamp: jiff::Timestamp = reference_time.parse().map_err(|_| invalid())?;
-    let offset = match jiff::fmt::temporal::Pieces::parse(reference_time)
-        .map_err(|_| invalid())?
-        .offset()
-    {
-        Some(jiff::fmt::temporal::PiecesOffset::Numeric(numeric)) => numeric.offset(),
-        _ => jiff::tz::Offset::UTC,
-    };
-    Ok(timestamp.to_zoned(TimeZone::fixed(offset)))
+    Ok(timestamp.to_zoned(TimeZone::UTC))
 }
 
 /// The closed span of a token without a zone annotation, read in `now`'s zone.
@@ -790,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_time_carries_its_zone() {
+    fn reference_offsets_preserve_utc_unless_a_zone_is_named() {
         let day = |reference: &str| {
             DateRange {
                 when: Some("today".to_string()),
@@ -799,17 +791,16 @@ mod tests {
             .resolve_at(reference)
             .unwrap()
         };
-        // RFC 3339: the offset is the zone. RFC 9557: the named zone, with its rules.
         assert_eq!(
             day("2026-11-07T20:00:00-05:00"),
+            day("2026-11-08T01:00:00Z")
+        );
+        assert_eq!(
+            day("2026-11-08T01:00:00Z[America/New_York]"),
             (
                 Some(iso("2026-11-07T05:00:00Z")),
                 Some(iso("2026-11-08T04:59:59.999999999Z"))
             )
-        );
-        assert_eq!(
-            day("2026-11-08T01:00:00Z[America/New_York]"),
-            day("2026-11-07T20:00:00-05:00")
         );
         assert_eq!(
             day("2026-06-25T12:00:00Z"),
