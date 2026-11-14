@@ -103,6 +103,7 @@ impl GeminiCliAdapter {
         let mut line_count = 0usize;
         let mut malformed_line_count = 0usize;
         let mut valid_record_count = 0usize;
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
             line_count += 1;
@@ -117,6 +118,7 @@ impl GeminiCliAdapter {
                 }
             };
             valid_record_count += 1;
+            unrecognized.observe(Provider::GeminiCli, &value);
             replay.apply(value);
         }
 
@@ -167,12 +169,14 @@ impl GeminiCliAdapter {
         }
         set_nested_parent(&mut parsed, path);
         parsed.file_edits = rendered.file_edits;
+        unrecognized.publish(&mut metadata);
         parsed.session.raw_metadata_json = Some(metadata.to_string());
         Ok(parsed)
     }
 
     pub(crate) fn parse_raw(&self, path: &Path, raw: String) -> Result<ParsedSession> {
         let data: Value = serde_json::from_str(&raw).context("invalid Gemini CLI JSON")?;
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
         let evidence = gemini_session_evidence(data.get("kind").and_then(Value::as_str));
         let mut messages = Vec::new();
         let mut file_edits = Vec::new();
@@ -184,6 +188,7 @@ impl GeminiCliAdapter {
             .into_iter()
             .flatten()
         {
+            unrecognized.observe(Provider::GeminiCli, message);
             let timestamp = message
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -318,6 +323,7 @@ impl GeminiCliAdapter {
         parsed.file_edits = file_edits;
         parsed.session.raw_metadata_json =
             Some(json!({"file_edit_call_ids":file_edit_call_ids}).to_string());
+        unrecognized.publish_session(&mut parsed);
         Ok(parsed)
     }
 
@@ -473,6 +479,7 @@ pub(crate) fn merge_migration_family(
         }
     }
     merge_file_mutations(&mut successor, &predecessor)?;
+    super::health::UnrecognizedRecordTypes::merge_sources(&mut successor, &predecessor);
     let mut predecessor_ids = HashSet::new();
     let mut additions = Vec::new();
     for message in predecessor.messages {

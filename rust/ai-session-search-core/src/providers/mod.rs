@@ -7,6 +7,9 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod gemini_cli;
+pub(crate) mod health;
+#[cfg(test)]
+mod health_tests;
 pub mod pi;
 mod snapshot;
 pub(crate) mod spawn;

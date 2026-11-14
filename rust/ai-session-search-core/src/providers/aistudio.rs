@@ -61,6 +61,7 @@ impl AiStudioAdapter {
 
     pub(crate) fn parse_raw(&self, path: &Path, raw: String) -> Result<ParsedSession> {
         let mut turns: Vec<Turn> = Vec::new();
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
         let discovery_source = if path
             .extension()
             .and_then(|value| value.to_str())
@@ -78,6 +79,7 @@ impl AiStudioAdapter {
                 .into_iter()
                 .flatten()
             {
+                unrecognized.observe(Provider::AiStudio, chunk);
                 let role = match chunk.get("role").and_then(Value::as_str) {
                     Some("user") => "user",
                     Some("model" | "assistant") => "assistant",
@@ -98,7 +100,7 @@ impl AiStudioAdapter {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("session");
-        Ok(parsed_session(
+        let mut parsed = parsed_session(
             Provider::AiStudio,
             path,
             SnapshotMetadata {
@@ -109,7 +111,9 @@ impl AiStudioAdapter {
                 discovery_source,
             },
             turns,
-        ))
+        );
+        unrecognized.publish_session(&mut parsed);
+        Ok(parsed)
     }
 }
 

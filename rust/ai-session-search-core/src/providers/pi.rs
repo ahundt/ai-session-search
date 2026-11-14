@@ -201,6 +201,7 @@ impl PiAdapter {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
         // Pi gives a spawned run a session id from the same space as a top-level one, so the
         // `session` record below binds it either way and no parent qualification is needed —
         // unlike claude, whose subagent records carry only the PARENT's id. The origin is used
@@ -241,6 +242,7 @@ impl PiAdapter {
                 }
             };
             valid_record_count += 1;
+            unrecognized.observe(self.provider, &value);
 
             let timestamp = value
                 .get("timestamp")
@@ -470,6 +472,7 @@ impl PiAdapter {
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
         }
+        unrecognized.publish(&mut raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let session = SessionRecord {
