@@ -1795,6 +1795,12 @@ pub struct MessageHit {
 }
 
 impl MessageHit {
+    /// Total indexed row order within one session, shared by flat context merging and
+    /// structured before/after partitioning. Sequence alone cannot identify an anchor.
+    pub(crate) const fn indexed_row_order(&self) -> (i64, i64) {
+        (self.seq, self.row_id)
+    }
+
     /// Construct a hit with no timestamp, tool, score or provenance metadata.
     pub fn new(
         session_id: impl Into<String>,

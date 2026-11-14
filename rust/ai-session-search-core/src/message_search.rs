@@ -3140,7 +3140,7 @@ impl Serialize for SemanticResult<'_> {
             map.serialize_entry(
                 "context",
                 &SemanticContext {
-                    anchor_seq: hit.message.seq,
+                    anchor: &hit.message,
                     messages: context,
                     presentation: self.presentation,
                 },
@@ -3156,7 +3156,7 @@ struct SemanticResultIncluded<'a> {
 }
 
 struct SemanticContext<'a> {
-    anchor_seq: i64,
+    anchor: &'a crate::models::MessageHit,
     messages: &'a [crate::models::MessageHit],
     presentation: ResolvedMessagePresentation,
 }
@@ -3169,7 +3169,7 @@ impl Serialize for SemanticContext<'_> {
         let messages_before = self
             .messages
             .iter()
-            .filter(|message| message.seq < self.anchor_seq)
+            .filter(|message| message.indexed_row_order() < self.anchor.indexed_row_order())
             .map(|message| SemanticContextMessage {
                 message,
                 presentation: self.presentation,
@@ -3178,7 +3178,7 @@ impl Serialize for SemanticContext<'_> {
         let messages_after = self
             .messages
             .iter()
-            .filter(|message| message.seq > self.anchor_seq)
+            .filter(|message| message.indexed_row_order() > self.anchor.indexed_row_order())
             .map(|message| SemanticContextMessage {
                 message,
                 presentation: self.presentation,

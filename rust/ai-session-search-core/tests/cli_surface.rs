@@ -146,8 +146,27 @@ fn message_context_preserves_tied_row_identity_and_evidence_in_every_format() {
                             row["match"]["literal_occurrence"]["field_start_char"],
                             expected.find(query).unwrap()
                         );
-                        for side in ["messages_before", "messages_after"] {
-                            assert_eq!(row["context"][side].as_array().unwrap().len(), 2, "{row}");
+                        let anchor = contents
+                            .iter()
+                            .position(|(_, text)| text == expected)
+                            .unwrap();
+                        for (side, neighbours) in [
+                            ("messages_before", &contents[..anchor]),
+                            ("messages_after", &contents[anchor + 1..]),
+                        ] {
+                            let texts = row["context"][side]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|peer| {
+                                    peer["presentation"]["field_view"]["text"].as_str().unwrap()
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                texts,
+                                neighbours.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+                                "{row}"
+                            );
                         }
                     }
                 } else {

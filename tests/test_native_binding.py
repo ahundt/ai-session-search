@@ -2863,6 +2863,47 @@ def test_message_session_selectors_share_python_and_cli_identities(tmp_path: Pat
         native.MessageSearchRequest(scope=native.MessageScope(), session_kinds=["subagent"])
 
 
+def test_structured_context_keeps_tied_peers_and_exact_anchor(tmp_path: Path) -> None:
+    database = tmp_path / "context-ties.db"
+    search = native.SessionSearch(database)
+    contents = [
+        (0, "before first"), (0, "before second"),
+        (1, "needle alpha"), (1, "needle beta"), (1, "unmatched peer"),
+        (2, "after first"), (2, "after second"),
+    ]
+    with write_database(database) as connection:
+        connection.execute(
+            "insert into sessions(id,provider,provider_session_id,source_path,preview_text,parse_version,discovery_source)"
+            " values('claude:context-ties','claude','context-ties','/synthetic/context-ties','','test','fixture')"
+        )
+        connection.executemany(
+            "insert into messages(session_id,provider,seq,role,kind,content)"
+            " values('claude:context-ties','claude',?,'assistant','conversation',?)",
+            contents,
+        )
+    for query in ["needle", "alpha"]:
+        response = search.search_messages(query, native.MessageSearchRequest(
+            session_id="claude:context-ties", context=1, all_results=True,
+        ))
+        command = [
+            sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+            "--database", str(database), "messages", "search", query, "--session-id", "claude:context-ties",
+            "--context", "1", "--all-results", "--format", "json", "--index-refresh", "existing-only",
+        ]
+        cli = subprocess.run(command, env=isolated_environment(tmp_path), text=True, capture_output=True, check=True)
+        cli_results = json.loads(cli.stdout)["results"]
+        assert len(response.results) == (2 if query == "needle" else 1)
+        for index, hit in enumerate(response.results):
+            assert hit["context"] == cli_results[index]["context"]
+            before = [row["presentation"]["field_view"]["text"] for row in hit["context"]["messages_before"]]
+            after = [row["presentation"]["field_view"]["text"] for row in hit["context"]["messages_after"]]
+            anchor = 2 + index
+            assert before == [text for _, text in contents[:anchor]]
+            assert after == [text for _, text in contents[anchor + 1:]]
+            assert hit["presentation"]["field_view"]["text"] == contents[anchor][1]
+            assert len(before) + len(after) + 1 == len(contents)
+
+
 def test_python_interfaces_return_the_shared_parity_cases(tmp_path: Path) -> None:
     database, spec = _parity_database(tmp_path)
     failures = []

@@ -522,6 +522,102 @@ fn message_session_classes_filter_before_paging_on_every_surface() {
     );
 }
 
+#[test]
+fn structured_context_preserves_tied_peers_and_exact_anchor_across_surfaces() {
+    let f = fixture();
+    let db = Db::open(&f.db_path).unwrap();
+    let contents = [
+        (0, "before first"),
+        (0, "before second"),
+        (1, "needle alpha"),
+        (1, "needle beta"),
+        (1, "unmatched peer"),
+        (2, "after first"),
+        (2, "after second"),
+    ];
+    let session = SessionRecord::new(
+        "claude:context-ties",
+        Provider::Claude,
+        "context-ties",
+        "/synthetic/context-ties",
+        "test",
+        "fixture",
+    );
+    db.upsert_session(
+        &ParsedSession::new(
+            session,
+            contents
+                .iter()
+                .map(|(seq, content)| Message::new(*seq, Role::Assistant, *content))
+                .collect(),
+        ),
+        0,
+        0,
+    )
+    .unwrap();
+    for query in ["needle", "alpha"] {
+        let output = aise(&f)
+            .args([
+                "messages",
+                "search",
+                query,
+                "--session-id",
+                "claude:context-ties",
+                "--context",
+                "1",
+                "--all-results",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mcp = mcp_calls(&f, &[("search_messages", json!({
+            "query":query, "session_id":"claude:context-ties", "context":1, "all_results":true,
+            "field_view":{"kind":"no_char_limit"}, "include":[],
+        }))]).remove(0).unwrap();
+        let cli_results = cli["results"].as_array().unwrap();
+        let results = mcp["results"].as_array().unwrap();
+        assert_eq!(results.len(), if query == "needle" { 2 } else { 1 });
+        for (index, hit) in results.iter().enumerate() {
+            assert_eq!(hit["context"], cli_results[index]["context"]);
+            let before: Vec<_> = hit["context"]["messages_before"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["presentation"]["field_view"]["text"].as_str().unwrap())
+                .collect();
+            let after: Vec<_> = hit["context"]["messages_after"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["presentation"]["field_view"]["text"].as_str().unwrap())
+                .collect();
+            let anchor_index = 2 + index;
+            assert_eq!(
+                before,
+                contents[..anchor_index]
+                    .iter()
+                    .map(|(_, text)| *text)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                after,
+                contents[anchor_index + 1..]
+                    .iter()
+                    .map(|(_, text)| *text)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                hit["presentation"]["field_view"]["text"],
+                contents[anchor_index].1
+            );
+            assert_eq!(before.len() + after.len() + 1, contents.len());
+        }
+    }
+}
+
 type Ids = Vec<(i64, String)>;
 
 struct Fixture {
