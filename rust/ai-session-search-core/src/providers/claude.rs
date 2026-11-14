@@ -592,9 +592,29 @@ impl QueuedCommand {
                         });
                 if !delivery_copy || !delivered.insert(queued.delivery_position) {
                     kept.push(queued);
+                } else {
+                    if queued.prompt {
+                        retracted_transcript_lines.push(format_transcript_line(
+                            "user",
+                            queued.timestamp,
+                            queued.message.content(),
+                        ));
+                    }
+                    retired.push(queued.message);
                 }
                 continue;
             };
+            // A later enqueue replaces the standalone attachment identity already published.
+            if position == queued.position {
+                if queued.prompt {
+                    retracted_transcript_lines.push(format_transcript_line(
+                        "user",
+                        queued.timestamp,
+                        queued.message.content(),
+                    ));
+                }
+                retired.push(queued.message.clone());
+            }
             let Some(line) = enqueued.get(&position).and_then(|enqueue| enqueue.line) else {
                 continue;
             };
@@ -788,6 +808,15 @@ impl ClaudeAdapter {
         reader: R,
         path: &Path,
     ) -> Result<ParsedSession> {
+        self.parse_reader_with_context(reader, path, None)
+    }
+
+    pub(crate) fn parse_reader_with_context<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+        context: Option<crate::tail::TailContext>,
+    ) -> Result<ParsedSession> {
         let source_kind = ClaudeSourceKind::from_path(path);
         let source_path = normalize_path(path);
         let desktop = match source_kind {
@@ -851,6 +880,7 @@ impl ClaudeAdapter {
         let mut enqueued: HashMap<usize, QueueEnqueue> = HashMap::new();
         let mut pending_enqueues = std::collections::VecDeque::<Option<usize>>::new();
         let mut pending_direct_delivery = false;
+        let mut stored_pending_delivery = context.is_some_and(|c| c.pending_direct_delivery);
         let mut unrecognized = UnrecognizedRecordTypes::default();
         // What earlier parsers made of the records this one declines; see `RetractedRows`.
         let mut retracted_messages = Vec::new();
@@ -864,8 +894,12 @@ impl ClaudeAdapter {
         let mut attachments = AttachmentRows::default();
         let mut attachment_positions = std::collections::HashSet::new();
 
-        for line in crate::util::lines_replacing_invalid_utf8(reader) {
-            let line = line?;
+        for line in crate::util::lines_with_byte_offsets(reader) {
+            let (byte_offset, line) = line?;
+            let is_new = context.is_none_or(|c| byte_offset >= c.new_bytes_start);
+            if is_new && std::mem::take(&mut stored_pending_delivery) {
+                pending_direct_delivery = true;
+            }
             line_count += 1;
             if line.trim().is_empty() {
                 continue;
@@ -959,7 +993,8 @@ impl ClaudeAdapter {
                     ) {
                         // Whether it duplicates another record is decided after the loop, over
                         // the whole file, so a tail slice cannot decide it alone.
-                        requires_full_parse_for_tail = true;
+                        requires_full_parse_for_tail |=
+                            is_new && !repeated && context.is_none_or(|c| c.prefix_truncated);
                         if repeated {
                             // A previous parser may already have stored this replay.
                             if queued.prompt {
@@ -1016,7 +1051,6 @@ impl ClaudeAdapter {
                         .or_default() += 1;
                     if operation == "dequeue" {
                         pending_direct_delivery = true;
-                        requires_full_parse_for_tail = true;
                     }
                     if operation != "enqueue" {
                         // Earlier parsers stored notices from queue removal records too. Only
@@ -1038,7 +1072,6 @@ impl ClaudeAdapter {
                         }
                     }
                     if operation == "enqueue" {
-                        requires_full_parse_for_tail = true;
                         let position = messages.len();
                         if let Some(content) = value.get("content").and_then(Value::as_str) {
                             let content = strip_command_markup(content).trim().to_string();
@@ -1125,7 +1158,8 @@ impl ClaudeAdapter {
                 result.get("answers").is_some_and(Value::is_object)
                     || result.get("response").is_some_and(Value::is_string)
             }) {
-                requires_full_parse_for_tail = true;
+                requires_full_parse_for_tail |=
+                    is_new && context.is_none_or(|c| c.prefix_truncated);
             }
 
             // Claude Code and Claude Desktop SDK user records carry this optional, structural
@@ -1316,6 +1350,9 @@ impl ClaudeAdapter {
                     }
                     let is_user_role = role.as_deref() == Some("user");
                     if !retract && is_user_role && std::mem::take(&mut pending_direct_delivery) {
+                        // Its enqueue may precede the overlap; only a new delivery needs it.
+                        requires_full_parse_for_tail |=
+                            is_new && context.is_none_or(|c| c.prefix_truncated);
                         // Match the oldest open enqueue of this text, across cancellations.
                         let pending = pending_enqueues
                             .iter()
@@ -1448,6 +1485,9 @@ impl ClaudeAdapter {
         }
         if requires_full_parse_for_tail {
             raw_metadata["requires_full_parse_for_tail"] = json!(true);
+        }
+        if pending_direct_delivery {
+            raw_metadata["pending_direct_delivery"] = json!(true);
         }
         if !unrecognized.counts.is_empty() {
             raw_metadata[UNRECOGNIZED_RECORD_TYPES_KEY] = json!(unrecognized.counts);
@@ -3184,11 +3224,11 @@ mod tests {
     }
 
     #[test]
-    fn queue_enqueues_and_dequeues_require_history_for_tail_parsing() {
+    fn queue_operations_only_persist_unresolved_dequeue() {
         let adapter = ClaudeAdapter::new(vec![]);
         for (operation, full_parse) in [
-            ("enqueue", true),
-            ("dequeue", true),
+            ("enqueue", false),
+            ("dequeue", false),
             ("remove", false),
             ("popAll", false),
         ] {
@@ -3208,6 +3248,12 @@ mod tests {
                     .as_bool()
                     .unwrap_or(false),
                 full_parse
+            );
+            assert_eq!(
+                metadata["pending_direct_delivery"]
+                    .as_bool()
+                    .unwrap_or(false),
+                operation == "dequeue"
             );
             assert!(parsed.session.parse_warning.is_none());
         }

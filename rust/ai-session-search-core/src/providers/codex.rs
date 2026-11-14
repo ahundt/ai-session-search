@@ -183,6 +183,15 @@ impl CodexAdapter {
         reader: R,
         path: &Path,
     ) -> Result<ParsedSession> {
+        self.parse_reader_with_context(reader, path, None)
+    }
+
+    pub(crate) fn parse_reader_with_context<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+        context: Option<crate::tail::TailContext>,
+    ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
@@ -226,8 +235,9 @@ impl CodexAdapter {
         let mut fork_parent = None;
         let mut replayed_file_edits = None;
 
-        for line in crate::util::lines_replacing_invalid_utf8(reader) {
-            let line = line?;
+        for line in crate::util::lines_with_byte_offsets(reader) {
+            let (byte_offset, line) = line?;
+            let is_new = context.is_none_or(|c| byte_offset >= c.new_bytes_start);
             line_count += 1;
             if line.trim().is_empty() {
                 continue;
@@ -414,7 +424,8 @@ impl CodexAdapter {
                         {
                             tool_call_names.insert(call_id.to_string(), name.to_string());
                             if name == "request_user_input" {
-                                requires_full_parse_for_tail = true;
+                                // Calls add rows; only responses need the prefix on a tail parse.
+                                requires_full_parse_for_tail |= context.is_none();
                                 let question_ids = codex_request_user_input_question_ids(
                                     &codex_tool_call_args(payload),
                                 );
@@ -482,7 +493,8 @@ impl CodexAdapter {
                         )
                         .is_some()
                         {
-                            requires_full_parse_for_tail = true;
+                            requires_full_parse_for_tail |=
+                                is_new && context.is_none_or(|c| c.prefix_truncated);
                         }
                         let output = codex_output_text(payload.get("output"));
                         let call_id = payload.get("call_id").and_then(Value::as_str);
@@ -567,7 +579,8 @@ impl CodexAdapter {
                     if event_type == Some("thread_settings_applied") {
                         // Closing a replay changes earlier rows even when its header is outside
                         // the overlap; append-only storage cannot reconcile those rows.
-                        requires_full_parse_for_tail = true;
+                        requires_full_parse_for_tail |=
+                            is_new && context.is_none_or(|c| c.prefix_truncated);
                         if fork_replay.open.is_some() {
                             replayed_file_edits = Some(0..file_edits.len());
                         }
@@ -646,7 +659,7 @@ impl CodexAdapter {
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
         }
-        if requires_full_parse_for_tail || !retracted.file_edits.is_empty() {
+        if requires_full_parse_for_tail || (context.is_none() && !retracted.file_edits.is_empty()) {
             // Replay edits need storage reconciliation against the indexed parent.
             // An answer may be in the appended tail while its native call and question ids are
             // before the overlap. The indexer owns the provider guard; this marker is the parser's

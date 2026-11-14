@@ -925,7 +925,11 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p| adapters.claude.parse_reader(r, p),
+                    |r, p, context| {
+                        adapters
+                            .claude
+                            .parse_reader_with_context(r, p, Some(context))
+                    },
                 )?,
                 Provider::Codex => try_tail(
                     source,
@@ -933,7 +937,11 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p| adapters.codex.parse_reader(r, p),
+                    |r, p, context| {
+                        adapters
+                            .codex
+                            .parse_reader_with_context(r, p, Some(context))
+                    },
                 )?,
                 Provider::Cursor => try_tail(
                     source,
@@ -941,7 +949,7 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p| adapters.cursor.parse_reader(r, p),
+                    |r, p, _| adapters.cursor.parse_reader(r, p),
                 )?,
                 Provider::Antigravity => try_tail(
                     source,
@@ -949,7 +957,7 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p| adapters.antigravity.parse_reader(r, p),
+                    |r, p, _| adapters.antigravity.parse_reader(r, p),
                 )?,
                 Provider::Pi => try_tail(
                     source,
@@ -957,7 +965,7 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p| adapters.pi.parse_reader(r, p),
+                    |r, p, _| adapters.pi.parse_reader(r, p),
                 )?,
                 Provider::PrimeAgent => try_tail(
                     source,
@@ -965,7 +973,7 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p| adapters.prime_agent.parse_reader(r, p),
+                    |r, p, _| adapters.prime_agent.parse_reader(r, p),
                 )?,
                 Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
             };
@@ -1757,7 +1765,11 @@ fn try_tail<F>(
     parse_slice: F,
 ) -> Result<TailOutcome>
 where
-    F: Fn(std::io::Cursor<Vec<u8>>, &std::path::Path) -> Result<crate::models::ParsedSession>,
+    F: Fn(
+        std::io::Cursor<Vec<u8>>,
+        &std::path::Path,
+        crate::tail::TailContext,
+    ) -> Result<crate::models::ParsedSession>,
 {
     // A compressed rollout is immutable once written and its byte offsets are not JSONL offsets,
     // so it is always read whole.
@@ -1789,26 +1801,31 @@ where
     let Some(stored_digest) = db.file_overlap_digest(source.provider, source_path)? else {
         return Ok(TailOutcome::FullParse);
     };
-    // A dequeue can precede the overlap while still awaiting its user text. Unlike
-    // interactive answers, dequeue sessions must keep their full-read guard on later growth.
+    // Carry only an unresolved dequeue across overlap eviction, never a lifetime guard.
+    let mut pending_direct_delivery = false;
     if matches!(source.provider, Provider::Claude | Provider::ClaudeDesktop) {
         if let Some(id) = expected_session_id {
             let stored = db.resolve_session_record(id)?;
-            let has_dequeue = stored
+            let metadata: serde_json::Value = stored
                 .raw_metadata_json
                 .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .is_some_and(|metadata| {
-                    metadata["queue_operations"]["dequeue"]
-                        .as_u64()
-                        .is_some_and(|count| count > 0)
-                });
-            if has_dequeue && tail_requires_full_parse(&stored) {
-                return Ok(TailOutcome::FullParse);
-            }
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            pending_direct_delivery = metadata["pending_direct_delivery"]
+                .as_bool()
+                .unwrap_or(false);
         }
     }
-    match crate::tail::tail_parse_until(&source.path, offset, should_cancel, parse_slice) {
+    match crate::tail::tail_parse_until(
+        &source.path,
+        offset,
+        Some(&stored_digest),
+        should_cancel,
+        |r, p, mut context| {
+            context.pending_direct_delivery = pending_direct_delivery;
+            parse_slice(r, p, context)
+        },
+    ) {
         Ok(crate::tail::TailParseRun::Complete(Some(mut tail))) => {
             // Some providers declare their immutable session ID only near the file head, outside
             // the bounded tail overlap. Never insert child rows under a fallback ID: re-read the
@@ -1859,6 +1876,7 @@ where
             Ok(TailOutcome::Appended)
         }
         Ok(crate::tail::TailParseRun::Complete(None)) => Ok(TailOutcome::NothingNew),
+        Ok(crate::tail::TailParseRun::ChangedOverlap) => Ok(TailOutcome::FullParse),
         Ok(crate::tail::TailParseRun::Cancelled) => Ok(TailOutcome::Cancelled),
         // The tail fast path is a pure optimization, so ANY failure parsing the appended slice
         // degrades to a full re-read rather than aborting the reindex (this module's "on any doubt
@@ -2194,7 +2212,11 @@ mod tests {
                 Some(&parsed.session.id),
                 &db,
                 &|| false,
-                |reader, path| adapters.claude.parse_reader(reader, path)
+                |reader, path, context| adapters.claude.parse_reader_with_context(
+                    reader,
+                    path,
+                    Some(context)
+                )
             )
             .unwrap(),
             TailOutcome::Appended
@@ -2228,7 +2250,11 @@ mod tests {
                 Some(&parsed.session.id),
                 &db,
                 &|| false,
-                |reader, path| adapters.claude.parse_reader(reader, path)
+                |reader, path, context| adapters.claude.parse_reader_with_context(
+                    reader,
+                    path,
+                    Some(context)
+                )
             )
             .unwrap(),
             TailOutcome::FullParse
@@ -2427,7 +2453,11 @@ mod tests {
             Some("claude:ordinary-tail"),
             &db,
             &|| false,
-            |reader, path| adapters.claude.parse_reader(reader, path),
+            |reader, path, context| {
+                adapters
+                    .claude
+                    .parse_reader_with_context(reader, path, Some(context))
+            },
         )
         .unwrap();
         assert!(matches!(outcome, TailOutcome::Appended));
@@ -2484,7 +2514,7 @@ mod tests {
                 Some("claude:ask-tail"),
                 &db,
                 &|| false,
-                |reader, path| adapters.claude.parse_reader(reader, path),
+                |reader, path, context| adapters.claude.parse_reader_with_context(reader, path, Some(context)),
             )
             .unwrap();
             assert!(matches!(outcome, TailOutcome::FullParse));
@@ -2558,7 +2588,7 @@ mod tests {
                     Some("claude:ask-tail"),
                     &db,
                     &|| false,
-                    |reader, path| adapters.claude.parse_reader(reader, path),
+                    |reader, path, context| adapters.claude.parse_reader_with_context(reader, path, Some(context)),
                 )
                 .unwrap();
                 assert!(
@@ -2624,7 +2654,11 @@ mod tests {
             Some(&session_id),
             &db,
             &|| false,
-            |reader, path| adapters.codex.parse_reader(reader, path),
+            |reader, path, context| {
+                adapters
+                    .codex
+                    .parse_reader_with_context(reader, path, Some(context))
+            },
         )
         .unwrap();
         assert!(matches!(outcome, TailOutcome::FullParse));
@@ -2639,6 +2673,20 @@ mod tests {
             1
         );
         assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+        assert_eq!(
+            db.search_messages("tail answer α", &filters).unwrap().len(),
+            1
+        );
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":"synthetic reply after answer"}})).unwrap();
+        TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            TEST_TAIL_OUTCOMES.with(|outcomes| std::mem::take(&mut *outcomes.borrow_mut())
+                .into_iter()
+                .map(|outcome| matches!(outcome, TailOutcome::FullParse))
+                .collect::<Vec<_>>()),
+            [false]
+        );
         assert_eq!(
             db.search_messages("tail answer α", &filters).unwrap().len(),
             1
@@ -2931,7 +2979,11 @@ mod tests {
                         Some(&format!("codex:{parent}")),
                         &db,
                         &|| false,
-                        |r, p| adapters.codex.parse_reader(r, p)
+                        |r, p, context| adapters.codex.parse_reader_with_context(
+                            r,
+                            p,
+                            Some(context)
+                        )
                     )
                     .unwrap(),
                     TailOutcome::Appended
@@ -3442,7 +3494,11 @@ mod tests {
             Some(&session_id),
             &db,
             &|| false,
-            |reader, path| adapters.codex.parse_reader(reader, path),
+            |reader, path, context| {
+                adapters
+                    .codex
+                    .parse_reader_with_context(reader, path, Some(context))
+            },
         )
         .unwrap();
         assert!(
@@ -3604,6 +3660,315 @@ mod tests {
             )
             .unwrap();
             check(&fresh_path);
+        }
+    }
+
+    // Exercise the same guarded tail attempt used by reindex, then compare persisted rows.
+    fn assert_queue_refresh(config: &Config, db: &Db, root: &Path, full: bool) {
+        TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+        reindex(config, db, false, None).unwrap();
+        let outcomes = TEST_TAIL_OUTCOMES.with(|outcomes| {
+            std::mem::take(&mut *outcomes.borrow_mut())
+                .into_iter()
+                .map(|outcome| matches!(outcome, TailOutcome::FullParse))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(outcomes, [full], "expected full={full}");
+        let fresh_path = root.parent().unwrap().join("fresh.db");
+        let fresh = Db::open(&fresh_path).unwrap();
+        reindex(
+            &config_with_single_claude_fixture(&fresh_path, root),
+            &fresh,
+            true,
+            None,
+        )
+        .unwrap();
+        let rows = |path: &Path| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "select count(*) from messages where content='synthetic queued text'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            let mut stmt = conn.prepare("select json_array(role,tool_name,kind,tool_call_id,is_compaction,content,authorship,correlation_authority,correlation_scope,correlation_id,input_delivery_state,input_origin,record_relation) from messages order by seq,id").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let transcript: String = conn
+                .query_row("select transcript_text from transcripts", [], |r| r.get(0))
+                .unwrap();
+            (rows, transcript)
+        };
+        assert_eq!(
+            rows(&root.parent().unwrap().join("index.db")),
+            rows(&fresh_path)
+        );
+    }
+
+    #[test]
+    fn codex_overlap_markers_do_not_reparse_ordinary_appends() {
+        use std::io::Write as _;
+        let mut observed = Vec::new();
+        for record in [
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"ask","arguments":"{\"questions\":[{\"id\":\"q\",\"question\":\"Proceed?\"}]}"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"ask","output":{"answers":{"q":{"answers":["yes"]}}}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("codex");
+            std::fs::create_dir_all(&root).unwrap();
+            let id = "019efd97-d602-7922-89dd-467272106505";
+            let path = root.join(format!("rollout-2026-06-25T03-04-06-{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n{record}\n",
+                    serde_json::json!({"type":"session_meta","payload":{"id":id}})
+                ),
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let mut config = config_with_no_providers(&db_path);
+            config.providers.codex.enabled = true;
+            config.providers.codex.paths = vec![normalize_path(&root)];
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(),"{}",serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":"synthetic reply"}})).unwrap();
+            TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+            let start = std::time::Instant::now();
+            reindex(&config, &db, false, None).unwrap();
+            let outcomes = TEST_TAIL_OUTCOMES.with(|outcomes| {
+                std::mem::take(&mut *outcomes.borrow_mut())
+                    .into_iter()
+                    .map(|outcome| matches!(outcome, TailOutcome::FullParse))
+                    .collect::<Vec<_>>()
+            });
+            eprintln!(
+                "Codex overlap {record}: full={outcomes:?}, seconds={:.4}",
+                start.elapsed().as_secs_f64()
+            );
+            observed.extend(outcomes);
+        }
+        assert_eq!(observed, [false, false, false]);
+    }
+
+    #[test]
+    fn claude_queue_refresh_enqueue_replaces_attachment_identity() {
+        queue_refresh_attachment_replacement(true);
+    }
+
+    #[test]
+    fn claude_queue_refresh_user_replaces_attachment_identity() {
+        queue_refresh_attachment_replacement(false);
+    }
+
+    fn queue_refresh_attachment_replacement(enqueue: bool) {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let attachment = serde_json::json!({"type":"attachment","uuid":"delivery","timestamp":"2026-11-01T00:00:00Z","sessionId":"queue-routing","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic queued text","origin":{"kind":"human"}}});
+        std::fs::write(&path, format!("{attachment}\n")).unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let mut delivery = if enqueue {
+            serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"queue-routing","uuid":"enqueue","content":"synthetic queued text"})
+        } else {
+            serde_json::json!({"type":"user","uuid":"user-copy","sessionId":"queue-routing","message":{"role":"user","content":"synthetic queued text"}})
+        };
+        delivery["timestamp"] = serde_json::json!("2026-11-01T00:00:01Z");
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{delivery}"
+        )
+        .unwrap();
+        assert_queue_refresh(&config, &db, &root, true);
+    }
+
+    #[test]
+    fn claude_queue_refresh_retires_attachment_transcript_with_archive() {
+        use std::io::Write as _;
+        for enqueue in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let archive = serde_json::json!({"type":"assistant","uuid":"archived","sessionId":"queue-routing","message":{"role":"assistant","content":"synthetic archived reply"}});
+            let attachment = serde_json::json!({"type":"attachment","uuid":"delivery","timestamp":"2026-11-01T00:00:00Z","sessionId":"queue-routing","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic queued text","origin":{"kind":"human"}}});
+            std::fs::write(&path, format!("{archive}\n{attachment}\n")).unwrap();
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            std::fs::write(&path, format!("{attachment}\n")).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let mut delivery = if enqueue {
+                serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"queue-routing","uuid":"enqueue","content":"synthetic queued text"})
+            } else {
+                serde_json::json!({"type":"user","uuid":"user-copy","sessionId":"queue-routing","message":{"role":"user","content":"synthetic queued text"}})
+            };
+            delivery["timestamp"] = serde_json::json!("2026-11-01T00:00:01Z");
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "{delivery}"
+            )
+            .unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "select count(*) from messages where content='synthetic queued text'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            let transcript: String = conn
+                .query_row("select transcript_text from transcripts", [], |r| r.get(0))
+                .unwrap();
+            assert!(transcript.contains("synthetic archived reply"));
+            assert_eq!(
+                transcript.matches("synthetic queued text").count(),
+                1,
+                "enqueue={enqueue}: {transcript}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_queue_refresh_completed_delivery() {
+        queue_refresh_delivery(true);
+    }
+
+    #[test]
+    fn claude_queue_refresh_enqueue_then_delivery() {
+        queue_refresh_delivery(false);
+    }
+
+    fn queue_refresh_delivery(already_delivered: bool) {
+        use std::io::Write as _;
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let enqueue = serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"queue-routing","uuid":"enqueue","content":"synthetic queued text"});
+            let attachment = serde_json::json!({"type":"attachment","uuid":"delivery","sessionId":"queue-routing","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic queued text","origin":{"kind":"human"}}});
+            let remove = serde_json::json!({"type":"queue-operation","operation":"remove","sessionId":"queue-routing"});
+            let ordinary = |i| serde_json::json!({"type":"assistant","uuid":format!("reply-{i}"),"sessionId":"queue-routing","message":{"role":"assistant","content":format!("synthetic reply {i}")}});
+            std::fs::write(
+                &path,
+                if already_delivered {
+                    format!("{enqueue}\n{}\n{attachment}\n{remove}\n", ordinary(0))
+                } else {
+                    format!("{}\n", ordinary(0))
+                },
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            if !already_delivered {
+                writeln!(file, "{enqueue}").unwrap();
+                assert_queue_refresh(&config, &db, &root, false);
+                writeln!(file, "{attachment}").unwrap();
+                assert_queue_refresh(&config, &db, &root, true);
+                writeln!(file, "{remove}").unwrap();
+                assert_queue_refresh(&config, &db, &root, false);
+                writeln!(file, "{}", serde_json::json!({"type":"queue-operation","operation":"popAll","sessionId":"queue-routing"})).unwrap();
+                assert_queue_refresh(&config, &db, &root, false);
+            }
+            for i in 1..=3 {
+                writeln!(file, "{}", ordinary(i)).unwrap();
+                assert_queue_refresh(&config, &db, &root, false);
+            }
+        }
+    }
+
+    #[test]
+    fn claude_queue_refresh_distant_delivery() {
+        queue_refresh_distant(false, false);
+    }
+
+    #[test]
+    fn claude_queue_refresh_distant_split_delivery() {
+        queue_refresh_distant(true, false);
+    }
+
+    #[test]
+    fn claude_queue_refresh_distant_attachment_delivery() {
+        queue_refresh_distant(false, true);
+    }
+
+    fn queue_refresh_distant(split: bool, attachment: bool) {
+        use std::io::Write as _;
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let enqueue = serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"queue-routing","uuid":"enqueue","content":"synthetic queued text"});
+            std::fs::write(
+                &path,
+                format!(
+                    "{enqueue}\n{}",
+                    claude_overlap_padding("queue-routing")
+                        .lines()
+                        .skip(1)
+                        .map(|l| format!("{l}\n"))
+                        .collect::<String>()
+                ),
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file,"{}",serde_json::json!({"type":"queue-operation","operation":"dequeue","sessionId":"queue-routing"})).unwrap();
+            if split {
+                assert_queue_refresh(&config, &db, &root, false);
+                // Evict the dequeue itself from the overlap while it still awaits user text.
+                writeln!(file, "{}", serde_json::json!({"type":"assistant","uuid":"padding-after-dequeue","sessionId":"queue-routing","message":{"role":"assistant","content":"z".repeat(2 * crate::tail::OVERLAP_BYTES as usize)}})).unwrap();
+                assert_queue_refresh(&config, &db, &root, false);
+            }
+            let delivery = if attachment {
+                serde_json::json!({"type":"attachment","uuid":"delivery","sessionId":"queue-routing","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic queued text","origin":{"kind":"human"}}})
+            } else {
+                serde_json::json!({"type":"user","uuid":"delivery","sessionId":"queue-routing","message":{"role":"user","content":"synthetic queued text"}})
+            };
+            writeln!(file, "{delivery}").unwrap();
+            assert_queue_refresh(&config, &db, &root, true);
+            if !attachment {
+                let stored = db.resolve_session_record("claude:queue-routing").unwrap();
+                let metadata: serde_json::Value =
+                    serde_json::from_str(stored.raw_metadata_json.as_deref().unwrap()).unwrap();
+                assert!(metadata.get("pending_direct_delivery").is_none());
+            }
+            writeln!(file,"{}",serde_json::json!({"type":"assistant","uuid":"after","sessionId":"queue-routing","message":{"role":"assistant","content":"synthetic following reply"}})).unwrap();
+            assert_queue_refresh(&config, &db, &root, false);
         }
     }
 
@@ -3804,7 +4169,11 @@ mod tests {
                     Some("claude:direct-tail"),
                     &db,
                     &|| false,
-                    |reader, path| adapters.claude.parse_reader(reader, path)
+                    |reader, path, context| adapters.claude.parse_reader_with_context(
+                        reader,
+                        path,
+                        Some(context)
+                    )
                 )
                 .unwrap(),
                 TailOutcome::FullParse
@@ -4078,7 +4447,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_state_beyond_overlap_forces_full_parse_and_preserves_metadata() {
+    fn queue_enqueue_beyond_overlap_appends_and_preserves_metadata() {
         use std::io::Write as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4113,10 +4482,14 @@ mod tests {
             Some("claude:queue-tail"),
             &db,
             &|| false,
-            |reader, path| adapters.claude.parse_reader(reader, path),
+            |reader, path, context| {
+                adapters
+                    .claude
+                    .parse_reader_with_context(reader, path, Some(context))
+            },
         )
         .unwrap();
-        assert!(matches!(outcome, TailOutcome::FullParse));
+        assert!(matches!(outcome, TailOutcome::Appended));
         reindex(&config, &db, false, None).unwrap();
         let messages = db
             .search_messages(
@@ -4130,7 +4503,7 @@ mod tests {
         let queued = messages
             .iter()
             .find(|message| message.content == "queued tail correction")
-            .expect("full parse preserved queue input");
+            .expect("tail parse preserved queue input");
         let stored = rusqlite::Connection::open(&db_path).unwrap();
         let metadata: (String, String, String) = stored
             .query_row(
@@ -5510,7 +5883,11 @@ mod tests {
             Some("claude:migrated-id"),
             &db,
             &|| false,
-            |reader, path| adapters.claude.parse_reader(reader, path),
+            |reader, path, context| {
+                adapters
+                    .claude
+                    .parse_reader_with_context(reader, path, Some(context))
+            },
         )
         .unwrap();
         assert!(
@@ -6068,7 +6445,11 @@ mod tests {
             Some("claude:s1"),
             &db,
             &|| false,
-            |reader, path| adapters.claude.parse_reader(reader, path),
+            |reader, path, context| {
+                adapters
+                    .claude
+                    .parse_reader_with_context(reader, path, Some(context))
+            },
         )
         .unwrap();
         assert!(matches!(tail_outcome, TailOutcome::FullParse));

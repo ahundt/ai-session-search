@@ -918,7 +918,7 @@ impl MessageProvenance {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Message {
     pub seq: i64,
@@ -1070,7 +1070,7 @@ pub struct AnalysisDocumentPage {
 /// extracted from an assistant turn. Threaded through [`ParsedSession`] like
 /// [`Message`], persisted to the `file_edits` table, and replayed to reconstruct
 /// historical file content (`files extract`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FileEdit {
     /// Monotonic order within the session (independent of message seq).

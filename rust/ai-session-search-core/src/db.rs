@@ -3015,6 +3015,29 @@ impl Db {
             new_count,
         ])?;
 
+        if matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop) {
+            let metadata: serde_json::Value = session
+                .raw_metadata_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            // Null in a merge patch clears the resolved lifecycle bit, preserving other metadata.
+            let patch = if metadata["pending_direct_delivery"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                r#"{"pending_direct_delivery":true}"#
+            } else {
+                r#"{"pending_direct_delivery":null}"#
+            };
+            tx.execute(
+                "update sessions set raw_metadata_json = json_patch(
+                    case when json_valid(raw_metadata_json) then raw_metadata_json else '{}' end,
+                    ?2) where id = ?1",
+                params![session.id, patch],
+            )?;
+        }
+
         // Append the new conversation text to the transcript blob, then rebuild this session's FTS
         // row from the now-current sessions + transcripts rows (no drift from the live values).
         if !tail.new_transcript.is_empty() {

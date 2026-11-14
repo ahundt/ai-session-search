@@ -46,13 +46,23 @@ pub(crate) const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 pub fn lines_replacing_invalid_utf8<R: io::BufRead>(
     reader: R,
 ) -> impl Iterator<Item = io::Result<String>> {
-    reader.split(b'\n').map(|line| {
+    lines_with_byte_offsets(reader).map(|line| line.map(|(_, text)| text))
+}
+
+/// Original byte positions survive CRLF stripping and lossy UTF-8 decoding.
+pub(crate) fn lines_with_byte_offsets<R: io::BufRead>(
+    reader: R,
+) -> impl Iterator<Item = io::Result<(usize, String)>> {
+    let mut offset = 0;
+    reader.split(b'\n').map(move |line| {
         line.map(|mut bytes| {
+            let start = offset;
+            offset += bytes.len() + 1;
             // `BufRead::split` keeps the `\r` of a `\r\n` ending; drop it to match `lines`.
             if bytes.last() == Some(&b'\r') {
                 bytes.pop();
             }
-            String::from_utf8_lossy(&bytes).into_owned()
+            (start, String::from_utf8_lossy(&bytes).into_owned())
         })
     })
 }
@@ -2077,18 +2087,18 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 #[test]
 fn parser_versions_pin_claude_attachment_and_codex_fork_rules() {
-    assert_eq!(provider_parse_version(Provider::Claude), "claude-v18");
+    assert_eq!(provider_parse_version(Provider::Claude), "claude-v19");
     assert_eq!(
         provider_parse_version(Provider::ClaudeDesktop),
-        "claude-desktop-local-agent-v18"
+        "claude-desktop-local-agent-v19"
     );
     assert_eq!(provider_parse_version(Provider::Codex), "codex-v12");
 }
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v18",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v18",
+        Provider::Claude => "claude-v19",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v19",
         Provider::Codex => "codex-v12",
         Provider::Cursor => "cursor-v5",
         Provider::Antigravity => "antigravity-v6",
@@ -2931,6 +2941,22 @@ pub(crate) mod tests {
         assert!(error.contains("argument 1"), "{error}");
         assert!(error.contains("U+0000"), "{error}");
         assert!(error.contains("NUL cannot be represented"), "{error}");
+    }
+
+    #[test]
+    fn line_offsets_count_original_crlf_and_invalid_utf8_bytes() {
+        let lines = lines_with_byte_offsets(std::io::Cursor::new(b"\xff\r\n\nnext\r\nlast"))
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            lines,
+            [
+                (0, "�".into()),
+                (3, "".into()),
+                (4, "next".into()),
+                (10, "last".into())
+            ]
+        );
     }
 
     #[test]
