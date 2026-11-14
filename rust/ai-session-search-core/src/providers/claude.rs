@@ -850,6 +850,7 @@ impl ClaudeAdapter {
         // Enqueue row -> transcript line and optional direct-delivery boundary.
         let mut enqueued: HashMap<usize, QueueEnqueue> = HashMap::new();
         let mut pending_enqueues = std::collections::VecDeque::<Option<usize>>::new();
+        let mut pending_direct_delivery = false;
         let mut unrecognized = UnrecognizedRecordTypes::default();
         // What earlier parsers made of the records this one declines; see `RetractedRows`.
         let mut retracted_messages = Vec::new();
@@ -1003,8 +1004,8 @@ impl ClaudeAdapter {
                     }
                     continue;
                 }
-                // Enqueue records submissions; dequeue closes a FIFO candidate delivered as
-                // an ordinary user turn. Remove and popAll do not prove delivery on their own.
+                // Only the user text after dequeue identifies its enqueue. Remove and popAll
+                // carry no delivery evidence and cannot close text-bearing submissions.
                 Some("queue-operation") => {
                     let operation = value
                         .get("operation")
@@ -1014,12 +1015,8 @@ impl ClaudeAdapter {
                         .entry(operation.to_string())
                         .or_default() += 1;
                     if operation == "dequeue" {
-                        if let Some(Some(position)) = pending_enqueues.pop_front() {
-                            enqueued
-                                .get_mut(&position)
-                                .expect("pending enqueue exists")
-                                .dequeued_at = Some(messages.len());
-                        }
+                        pending_direct_delivery = true;
+                        requires_full_parse_for_tail = true;
                     }
                     if operation != "enqueue" {
                         // Earlier parsers stored notices from queue removal records too. Only
@@ -1318,6 +1315,24 @@ impl ClaudeAdapter {
                         observe_session_end(&mut updated_at, timestamp);
                     }
                     let is_user_role = role.as_deref() == Some("user");
+                    if !retract && is_user_role && std::mem::take(&mut pending_direct_delivery) {
+                        // Match the oldest open enqueue of this text, across cancellations.
+                        let pending = pending_enqueues
+                            .iter()
+                            .position(|position| {
+                                position.is_some_and(|p| {
+                                    out.get(p).is_some_and(|row| row.content().trim() == text)
+                                })
+                            })
+                            .or_else(|| pending_enqueues.iter().position(Option::is_none));
+                        if let Some(pending) = pending {
+                            if let Some(Some(position)) = pending_enqueues.remove(pending) {
+                                if let Some(enqueue) = enqueued.get_mut(&position) {
+                                    enqueue.dequeued_at = Some(out.len());
+                                }
+                            }
+                        }
+                    }
                     let mut raw_message = RawMessage::message(
                         role.unwrap_or_default(),
                         text.clone(),
@@ -3169,9 +3184,14 @@ mod tests {
     }
 
     #[test]
-    fn only_queue_enqueues_require_occurrence_history_for_tail_parsing() {
+    fn queue_enqueues_and_dequeues_require_history_for_tail_parsing() {
         let adapter = ClaudeAdapter::new(vec![]);
-        for (operation, full_parse) in [("enqueue", true), ("popAll", false)] {
+        for (operation, full_parse) in [
+            ("enqueue", true),
+            ("dequeue", true),
+            ("remove", false),
+            ("popAll", false),
+        ] {
             let record = json!({"type":"queue-operation", "sessionId":"queue-tail-state",
                 "operation":operation, "content":"queued prompt"})
             .to_string();

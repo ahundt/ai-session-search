@@ -1789,6 +1789,25 @@ where
     let Some(stored_digest) = db.file_overlap_digest(source.provider, source_path)? else {
         return Ok(TailOutcome::FullParse);
     };
+    // A dequeue can precede the overlap while still awaiting its user text. Unlike
+    // interactive answers, dequeue sessions must keep their full-read guard on later growth.
+    if matches!(source.provider, Provider::Claude | Provider::ClaudeDesktop) {
+        if let Some(id) = expected_session_id {
+            let stored = db.resolve_session_record(id)?;
+            let has_dequeue = stored
+                .raw_metadata_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|metadata| {
+                    metadata["queue_operations"]["dequeue"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+                });
+            if has_dequeue && tail_requires_full_parse(&stored) {
+                return Ok(TailOutcome::FullParse);
+            }
+        }
+    }
     match crate::tail::tail_parse_until(&source.path, offset, should_cancel, parse_slice) {
         Ok(crate::tail::TailParseRun::Complete(Some(mut tail))) => {
             // Some providers declare their immutable session ID only near the file head, outside
@@ -3585,6 +3604,227 @@ mod tests {
             )
             .unwrap();
             check(&fresh_path);
+        }
+    }
+
+    #[test]
+    fn claude_direct_queue_delivery_orders_through_indexer() {
+        use std::io::Write as _;
+        // X/Y enqueue text, D dequeue, R remove, P popAll, A reply, U direct X,
+        // T/W attachment X/Y, C contentless enqueue, O unrelated user turn.
+        for (name, order, expected) in [
+            ("dequeue-direct", "XDUA", (1, 0)),
+            ("cancelled-then-dequeue", "YRAXDUA", (1, 1)),
+            ("popall-then-dequeue", "YPAXDUA", (1, 1)),
+            ("attach-remove", "XTRA", (1, 0)),
+            ("a-attach-remove", "XAOTRA", (1, 0)),
+            ("remove-before-attach", "XARTA", (1, 0)),
+            ("attach-then-dequeue-same-text", "XATRAXDUA", (2, 0)),
+            ("two-queued-fifo", "XYATWRRA", (1, 1)),
+            ("contentless-dequeue-then-attach", "CDOAXATR", (1, 0)),
+            ("cancelled-then-attach-other", "YRXATRXDU", (2, 1)),
+            ("empty-dequeue", "DU", (1, 0)),
+            ("undelivered-dequeue", "XD", (1, 0)),
+            ("unmatched-direct", "YDU", (1, 1)),
+            ("oldest-matching-enqueue", "XXDUT", (2, 0)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            for (i, ch) in order.chars().enumerate() {
+                let text = if matches!(ch, 'Y' | 'W') {
+                    "probe text yankee"
+                } else {
+                    "probe text xray"
+                };
+                let mut record = match ch {
+                    'X' | 'Y' => {
+                        serde_json::json!({"type":"queue-operation","operation":"enqueue","content":text})
+                    }
+                    'C' => serde_json::json!({"type":"queue-operation","operation":"enqueue"}),
+                    'D' | 'R' | 'P' => {
+                        serde_json::json!({"type":"queue-operation","operation":match ch { 'D' => "dequeue", 'R' => "remove", _ => "popAll" }})
+                    }
+                    'T' | 'W' => {
+                        serde_json::json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","prompt":text,"origin":{"kind":"human"}}})
+                    }
+                    _ => {
+                        serde_json::json!({"type":if ch == 'A' { "assistant" } else { "user" },"message":{"role":if ch == 'A' { "assistant" } else { "user" },"content":match ch { 'A' => "synthetic reply", 'O' => "other", _ => text }}})
+                    }
+                };
+                record["sessionId"] = serde_json::json!("direct-orders");
+                record["uuid"] = serde_json::json!(format!("event-{i}"));
+                record["timestamp"] = serde_json::json!(format!("2026-11-01T00:00:{i:02}Z"));
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(format!("{record}\n").as_bytes())
+                    .unwrap();
+                reindex(&config, &db, false, None).unwrap();
+            }
+            let check = |db_path: &Path, mode: &str| {
+                let conn = rusqlite::Connection::open(db_path).unwrap();
+                let count = |text: &str| {
+                    conn.query_row(
+                    "select count(*) from messages where content=?1 and role='user' and kind='conversation'",
+                    [text], |r| r.get::<_, i64>(0)).unwrap()
+                };
+                assert_eq!(
+                    (count("probe text xray"), count("probe text yankee")),
+                    expected,
+                    "{name} {mode}"
+                );
+                if name == "oldest-matching-enqueue" {
+                    let surviving: String = conn.query_row("select ts from messages where content='probe text xray' and input_origin='queued'", [], |r| r.get(0)).unwrap();
+                    assert!(
+                        surviving.contains("00:00:01"),
+                        "oldest enqueue must close: {surviving}"
+                    );
+                }
+            };
+            check(&db_path, "stepwise");
+            reindex(&config, &db, true, None).unwrap();
+            check(&db_path, "full refresh");
+            let fresh_path = dir.path().join("fresh.db");
+            let fresh = Db::open(&fresh_path).unwrap();
+            reindex(
+                &config_with_single_claude_fixture(&fresh_path, &root),
+                &fresh,
+                false,
+                None,
+            )
+            .unwrap();
+            check(&fresh_path, "fresh");
+        }
+    }
+
+    #[test]
+    fn claude_direct_queue_delivery_reparses_v17_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let records = [
+            serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"upgrade-direct","content":"cancelled synthetic input"}),
+            serde_json::json!({"type":"queue-operation","operation":"remove","sessionId":"upgrade-direct"}),
+            serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"upgrade-direct","content":"delivered synthetic input"}),
+            serde_json::json!({"type":"queue-operation","operation":"dequeue","sessionId":"upgrade-direct"}),
+            serde_json::json!({"type":"user","uuid":"direct","sessionId":"upgrade-direct","message":{"role":"user","content":"delivered synthetic input"}}),
+        ];
+        let render = |skip_dequeue: bool| {
+            records
+                .iter()
+                .filter(|r| !skip_dequeue || r["operation"] != "dequeue")
+                .map(|r| format!("{r}\n"))
+                .collect::<String>()
+        };
+        std::fs::write(&path, render(false)).unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let adapters = ProviderSet::new(&config);
+        let source = adapters.discover_enabled(&config).sources.remove(0);
+        // v17 retained both enqueue and direct user row after cancellation. Omitting dequeue
+        // reproduces those same stored rows without keeping a copy of the old parser.
+        let mut old = adapters
+            .claude
+            .parse_reader(std::io::Cursor::new(render(true)), &source.path)
+            .unwrap();
+        old.session.parse_version = "claude-v17".into();
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        db.upsert_session(&old, source.mtime_ns, source.size_bytes)
+            .unwrap();
+        let (offset, fingerprint) = full_parse_checkpoint(&source).unwrap();
+        db.set_file_checkpoint(
+            source.provider,
+            &normalize_path(&path),
+            offset,
+            &fingerprint,
+        )
+        .unwrap();
+        let count = || {
+            db.search_messages("delivered synthetic input", &Default::default())
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count(), 2);
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 1);
+        assert_eq!(count(), 1);
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+    }
+
+    #[test]
+    fn claude_direct_queue_delivery_beyond_overlap() {
+        use std::io::Write as _;
+        for dequeue_before_padding in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let enqueue = "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"sessionId\":\"direct-tail\",\"content\":\"synthetic tail delivery\"}\n";
+            let dequeue = "{\"type\":\"queue-operation\",\"operation\":\"dequeue\",\"sessionId\":\"direct-tail\"}\n";
+            std::fs::write(
+                &path,
+                format!(
+                    "{enqueue}{}{}",
+                    if dequeue_before_padding { dequeue } else { "" },
+                    claude_overlap_padding("direct-tail")
+                        .lines()
+                        .skip(1)
+                        .map(|line| format!("{line}\n"))
+                        .collect::<String>()
+                ),
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            if !dequeue_before_padding {
+                file.write_all(dequeue.as_bytes()).unwrap();
+            }
+            reindex(&config, &db, false, None).unwrap();
+            file.write_all(b"{\"type\":\"user\",\"uuid\":\"delivered\",\"sessionId\":\"direct-tail\",\"message\":{\"role\":\"user\",\"content\":\"synthetic tail delivery\"}}\n").unwrap();
+            let adapters = ProviderSet::new(&config);
+            let source = adapters.discover_enabled(&config).sources.remove(0);
+            assert!(matches!(
+                try_tail(
+                    &source,
+                    &normalize_path(&path),
+                    Some("claude:direct-tail"),
+                    &db,
+                    &|| false,
+                    |reader, path| adapters.claude.parse_reader(reader, path)
+                )
+                .unwrap(),
+                TailOutcome::FullParse
+            ));
+            reindex(&config, &db, false, None).unwrap();
+            assert_eq!(
+                db.search_messages("synthetic tail delivery", &Default::default())
+                    .unwrap()
+                    .len(),
+                1,
+                "dequeue before padding={dequeue_before_padding}"
+            );
+            reindex(&config, &db, true, None).unwrap();
+            assert_eq!(
+                db.search_messages("synthetic tail delivery", &Default::default())
+                    .unwrap()
+                    .len(),
+                1,
+                "dequeue before padding={dequeue_before_padding}"
+            );
         }
     }
 
