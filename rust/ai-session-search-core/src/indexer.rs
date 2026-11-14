@@ -2179,6 +2179,59 @@ mod tests {
     }
 
     #[test]
+    fn claude_turn_after_attachment_matches_fresh_index() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let initial = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"user","sessionId":"attachment-turn","message":{"role":"user","content":"initial prompt"}}),
+            serde_json::json!({"type":"attachment","sessionId":"attachment-turn","attachment":{"type":"instructions","files":[{"path":"/synthetic/rules.txt","content":"attachment rule ".repeat(200)}]}})
+        );
+        std::fs::write(&path, initial).unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(
+            b"{\"type\":\"assistant\",\"sessionId\":\"attachment-turn\",\"message\":{\"role\":\"assistant\",\"content\":\"appended response\"}}\n"
+        ).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            db.search_messages("appended response", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        let fresh_path = dir.path().join("fresh.db");
+        let fresh = Db::open(&fresh_path).unwrap();
+        reindex(
+            &config_with_single_claude_fixture(&fresh_path, &root),
+            &fresh,
+            false,
+            None,
+        )
+        .unwrap();
+        let rows = |path: &Path| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "select json_array(role,kind,content,correlation_id) from messages order by 1",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(rows(&db_path), rows(&fresh_path));
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(rows(&db_path), rows(&fresh_path));
+    }
+
+    #[test]
     fn ordinary_claude_append_keeps_incremental_tail_fast_path() {
         use std::io::Write as _;
 

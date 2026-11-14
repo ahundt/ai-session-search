@@ -1314,7 +1314,8 @@ impl ClaudeAdapter {
         if has_queue_operations {
             raw_metadata["queue_operations"] = json!(queue_operation_counts);
         }
-        if requires_full_parse_for_tail {
+        // Attachments render after conversation rows, so their overlap is not a row prefix.
+        if requires_full_parse_for_tail || !attachments.rows.is_empty() {
             raw_metadata["requires_full_parse_for_tail"] = json!(true);
         }
         if !unrecognized.counts.is_empty() {
