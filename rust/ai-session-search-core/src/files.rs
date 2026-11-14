@@ -639,24 +639,10 @@ pub fn reconstruct_versions_query(
 /// Version numbers are 1-based and preserve provider event order.
 pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
     let groups = group_by_session(db.file_edits_for_query(file, query)?);
-    if groups.is_empty() {
-        return Err(crate::ServiceError::file_not_found(file).into());
-    }
     let mut versions = Vec::new();
     for (session_id, provider, edits) in &groups {
         let line_counts = version_line_counts(edits);
         for (index, edit) in edits.iter().enumerate() {
-            // Replay the complete history first: bounds select displayed versions, not bases
-            // or deltas, and never renumber the original causal versions.
-            if query
-                .since
-                .is_some_and(|since| edit.ts.is_none_or(|ts| ts < since))
-                || query
-                    .until
-                    .is_some_and(|until| edit.ts.is_none_or(|ts| ts > until))
-            {
-                continue;
-            }
             versions.push(FileVersion {
                 session_id: session_id.clone(),
                 provider: *provider,
@@ -667,6 +653,9 @@ pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion
                 file_path: edit.file_path.clone(),
             });
         }
+    }
+    if versions.is_empty() {
+        return Err(crate::ServiceError::file_not_found(file).into());
     }
     let page = versions
         .into_iter()
@@ -820,8 +809,6 @@ pub struct FilesHistoryArgs {
     pub file: String,
     #[command(flatten)]
     pub scope: FileScopeArgs,
-    #[command(flatten)]
-    pub dates: DateRange,
     /// Max versions to return. Omit or use 0 for every version.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -947,10 +934,7 @@ pub(crate) fn run_command(db: &Db, cmd: &FilesCmd) -> Result<()> {
             )
         }
         FilesCmd::History(args) => {
-            let (since, until) = args.dates.resolve_now()?;
             let query = FileQuery {
-                since,
-                until,
                 limit: args.limit,
                 offset: args.offset,
                 ..args.scope.resolved_query(db)?

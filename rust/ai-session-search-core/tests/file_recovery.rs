@@ -83,24 +83,6 @@ fn edits_only(rows: Vec<(String, ai_session_search::models::Provider, FileEdit)>
 }
 
 #[test]
-fn history_date_bounds_preserve_replay_bases_and_causal_version_numbers() {
-    let (_dir, db) = indexed();
-    let query = FileQuery::default()
-        .with_session_id("claude:sess-fr-1")
-        .with_since("2026-06-02T10:01:00Z".parse().unwrap())
-        .with_limit(1);
-    let versions = FileService::new(&db).history("app.py", &query).unwrap();
-    assert_eq!(versions.len(), 1);
-    assert_eq!(versions[0].version, 2);
-    assert_eq!(versions[0].lines, 3);
-    let versions = FileService::new(&db)
-        .history("app.py", &query.with_offset(1))
-        .unwrap();
-    assert_eq!(versions[0].version, 3);
-    assert_eq!(versions[0].lines, 3);
-}
-
-#[test]
 fn tool_calls_are_extracted_and_counted() {
     let (_dir, db) = indexed();
     // 4 edits in session 1 (Write app, Edit app, MultiEdit app, Write util) + 1 in session 2.

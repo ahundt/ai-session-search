@@ -115,30 +115,29 @@ fn file_history_default_returns_every_version_and_explicit_pages_still_work() {
 fn file_exclusions_and_dates_apply_before_paging() {
     let dir = fixture();
     for command in ["search", "cross-ref", "history"] {
-        let got = rows(
-            &dir,
-            &[
-                "files",
-                command,
-                "app.rs",
-                "--exclude-path",
-                "/synthetic/0",
-                "--exclude-session",
-                "claude:cli-1",
-                "--since",
-                "2026-06-01",
-                "--until",
-                "2026-06-03",
-                "--limit",
-                "1",
-            ],
-        );
+        let mut args = vec![
+            "files",
+            command,
+            "app.rs",
+            "--exclude-path",
+            "/synthetic/0",
+            "--exclude-session",
+            "claude:cli-1",
+            "--limit",
+            "1",
+        ];
+        if command != "history" {
+            args.extend(["--since", "2026-06-01", "--until", "2026-06-03"]);
+        }
+        let got = rows(&dir, &args);
         assert_eq!(got.as_array().unwrap().len(), 1);
         if command != "search" {
             assert_eq!(got[0]["session_id"], "claude:cli-2");
         }
-        let empty = rows(&dir, &["files", command, "app.rs", "--since", "2026-06-04"]);
-        assert!(empty.as_array().unwrap().is_empty());
+        if command != "history" {
+            let empty = rows(&dir, &["files", command, "app.rs", "--since", "2026-06-04"]);
+            assert!(empty.as_array().unwrap().is_empty());
+        }
     }
     let extracted = output(
         &dir,
