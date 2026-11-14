@@ -2735,9 +2735,9 @@ impl Db {
             !family_members.is_empty(),
             family_members.len() == 1,
         )?;
-        if store_parsed_file_edits(&tx, parsed, same_parser)? {
-            reconcile_codex_fork_edits(&tx, session)?;
-        }
+        store_parsed_file_edits(&tx, parsed, same_parser)?;
+        // A repaired ancestry link can change descendants even without changing these edits.
+        reconcile_codex_fork_edits(&tx, session)?;
         if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
             // union rather than the parse alone.
@@ -7820,8 +7820,9 @@ fn codex_fork_parent(session: &SessionRecord) -> Option<String> {
 /// lists after it (last when none follows): version replay applies edits in seq order, and a
 /// `Write` appended after a retained `Edit` it preceded would reset the file afterwards. Edit
 /// seqs are an order within the session, independent of message seqs, so renumbering moves no
-/// message reference. Returns whether edits changed, so only edit publications revisit forks.
-/// O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory.
+/// message reference. Returns whether edits changed.
+/// O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory,
+/// plus the indexed ancestry lookup below for Codex replays.
 fn store_parsed_file_edits(
     tx: &rusqlite::Transaction<'_>,
     parsed: &ParsedSession,
@@ -7830,17 +7831,31 @@ fn store_parsed_file_edits(
     let session = &parsed.session;
     let mut file_edits: Vec<&FileEdit> = parsed.file_edits.iter().collect();
     let mut retracted_file_edits = Vec::new();
-    let parent = codex_fork_parent(session).filter(|_| !parsed.retracted.file_edits.is_empty());
-    // A filename cannot prove recovery safety. Consume equivalent indexed parent edits once
-    // each; otherwise the fork retains its copy. O(parent edits + replay edits) key memory.
-    let mut parent_edits = match &parent {
-        Some(parent) => key_counts(
-            stored_file_edit_keys(tx, parent)?
-                .iter()
-                .map(|(_, _, keys)| keys.edit),
-        ),
-        None => HashMap::new(),
-    };
+    let mut parent = codex_fork_parent(session).filter(|_| !parsed.retracted.file_edits.is_empty());
+    // Only indexed copies prove recovery safety; consume each ancestor occurrence once.
+    // For depth D, S sessions, F indexed edits, E ancestor edits and B ancestor bytes:
+    // O(D(log S + log F) + E log E + B) time; O(D + E) keys plus the largest edit body.
+    let mut parent_edits = HashMap::new();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(id) = parent {
+        if id == session.id || !visited.insert(id.clone()) {
+            break;
+        }
+        for (_, _, keys) in stored_file_edit_keys(tx, &id)? {
+            *parent_edits.entry(keys.edit).or_insert(0) += 1;
+        }
+        parent = tx
+            .query_row(
+                "select case when json_valid(raw_metadata_json) then
+                    case when json_type(raw_metadata_json, '$.forked_from_id') = 'text'
+                    then 'codex:' || json_extract(raw_metadata_json, '$.forked_from_id') end
+                 end from sessions where id = ?1 and provider = 'codex'",
+                [&id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
     for edit in &parsed.retracted.file_edits {
         if session.provider == Provider::Codex {
             let count = parent_edits
@@ -7988,10 +8003,10 @@ const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f
 /// receipts, each parent lookup costs O(log S + K(log S + log R)) for K children, retaining
 /// O(K) paths plus O(D) visited identities for D reachable descendants. A no-fork publication
 /// visits no unrelated session metadata or source receipts.
-/// Each dependent source is parsed at most once: O(B + C + E + N log N) for B source/output
-/// bytes, C stored parent/fork edit bytes, E parent edits and N stored/parsed fork edits.
-/// Memory adds one parsed fork, O(E + N) keys and the largest stored edit body. This work
-/// extends the writer transaction; unchanged edit sets and non-Codex publications skip it.
+/// Each dependent source is parsed at most once; each reparse also reads its indexed ancestry
+/// (bounded by chain depth, stopping at cycles). Memory adds one parsed fork, its stored/parsed
+/// keys and ancestor keys, plus visited ancestor identities and the largest stored edit body.
+/// This work extends the writer transaction; non-Codex publications skip it.
 fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
     if session.provider != Provider::Codex {
         return Ok(());
@@ -8022,6 +8037,8 @@ fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> 
             if !visited.insert(id.clone()) {
                 continue;
             }
+            // Descendants can use a higher ancestor even if this source is unchanged or unavailable.
+            pending.push(id.clone());
             let adapter = adapter
                 .get_or_insert_with(|| crate::providers::codex::CodexAdapter::new(Vec::new()));
             let current = || {
@@ -8063,9 +8080,7 @@ fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> 
                 continue;
             };
             crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
-            if store_parsed_file_edits(tx, &parsed, true)? {
-                pending.push(id);
-            }
+            store_parsed_file_edits(tx, &parsed, true)?;
         }
     }
     Ok(())

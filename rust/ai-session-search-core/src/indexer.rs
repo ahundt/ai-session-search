@@ -2611,19 +2611,19 @@ mod tests {
     #[test]
     fn codex_fork_edits_converge_across_root_order_and_parent_repair() {
         use std::io::Write as _;
-        for parent_first in [false, true] {
+        for order in [[0, 1, 2], [1, 0, 2], [2, 1, 0]] {
             for initial_parent in [
                 "ready",
                 "missing",
                 "malformed",
                 "metadata",
-                "descendant",
                 "temporarily-unavailable",
             ] {
                 let dir = tempfile::tempdir().unwrap();
                 let parent_root = dir.path().join("parent");
                 let fork_root = dir.path().join("fork");
-                for root in [&parent_root, &fork_root] {
+                let descendant_root = dir.path().join("descendant");
+                for root in [&parent_root, &fork_root, &descendant_root] {
                     std::fs::create_dir_all(root).unwrap();
                 }
                 let parent = "00000000-0000-4000-8000-000000000001";
@@ -2657,11 +2657,11 @@ mod tests {
                     ),
                 )
                 .unwrap();
-                let expected = if initial_parent == "descendant" {
+                let expected = {
                     let descendant = "00000000-0000-4000-8000-000000000003";
                     let header = serde_json::json!({"type":"session_meta","payload":{"id":descendant,"forked_from_id":fork,"timestamp":"2026-11-01T00:00:00Z"}});
                     std::fs::write(
-                        fork_root.join(format!("rollout-{descendant}.jsonl")),
+                        descendant_root.join(format!("rollout-{descendant}.jsonl")),
                         format!(
                             "{header}\n{}{settings}\n{}",
                             mutation("shared-copy", "shared"),
@@ -2669,12 +2669,10 @@ mod tests {
                         ),
                     )
                     .unwrap();
-                    6
-                } else {
-                    4
+                    5
                 };
                 match initial_parent {
-                    "ready" | "descendant" => std::fs::write(&parent_path, &parent_body).unwrap(),
+                    "ready" => std::fs::write(&parent_path, &parent_body).unwrap(),
                     "malformed" => std::fs::write(&parent_path, "{malformed\n").unwrap(),
                     "metadata" => std::fs::write(&parent_path, format!("{header}\n")).unwrap(),
                     _ => {}
@@ -2683,15 +2681,20 @@ mod tests {
                 let mut config = config_with_single_claude_fixture(&db_path, &fork_root);
                 config.providers.claude.enabled = false;
                 config.providers.codex.enabled = true;
-                config.providers.codex.paths = if parent_first {
-                    vec![normalize_path(&parent_root), normalize_path(&fork_root)]
-                } else {
-                    vec![normalize_path(&fork_root), normalize_path(&parent_root)]
-                };
+                let roots = [&parent_root, &fork_root, &descendant_root];
+                config.providers.codex.paths.clear();
                 let db = Db::open(&db_path).unwrap();
-                reindex(&config, &db, false, None).unwrap();
-                if !matches!(initial_parent, "ready" | "descendant") {
-                    assert_eq!(db.file_edit_count().unwrap(), 3);
+                // Publish each root separately to prove the discovery order actually differs.
+                for index in order {
+                    config
+                        .providers
+                        .codex
+                        .paths
+                        .push(normalize_path(roots[index]));
+                    reindex(&config, &db, false, None).unwrap();
+                }
+                if initial_parent != "ready" {
+                    assert_eq!(db.file_edit_count().unwrap(), 4);
                     if initial_parent == "temporarily-unavailable" {
                         std::fs::rename(&fork_path, fork_path.with_extension("saved")).unwrap();
                     }
@@ -2704,10 +2707,13 @@ mod tests {
                     std::fs::rename(fork_path.with_extension("saved"), &fork_path).unwrap();
                     reindex(&config, &db, false, None).unwrap();
                 }
+                let history = crate::files::history(&db, "shared.rs", &Default::default()).unwrap();
+                assert_eq!(history.len(), 1, "shared edit must have one indexed owner");
+                assert_eq!(history[0].session_id, format!("codex:{parent}"));
                 assert_eq!(
                     db.file_edit_count().unwrap(),
                     expected,
-                    "parent_first={parent_first}, initial_parent={initial_parent}"
+                    "order={order:?}, initial_parent={initial_parent}"
                 );
                 let rows = |path: &Path| {
                     let conn = rusqlite::Connection::open(path).unwrap();
@@ -2766,6 +2772,94 @@ mod tests {
                 reindex(&config, &appended, false, None).unwrap();
                 assert_eq!(rows(&db_path), rows(&appended_path));
                 assert_eq!(db.file_edit_count().unwrap(), expected);
+                assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_fork_ancestry_counts_edits_and_repairs_empty_links() {
+        for bridge in [false, true] {
+            for initial_middle in ["ready", "missing", "metadata", "malformed", "cycle"] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join("codex");
+                std::fs::create_dir_all(&root).unwrap();
+                let ids = [
+                    "00000000-0000-4000-8000-000000000021",
+                    "00000000-0000-4000-8000-000000000022",
+                    "00000000-0000-4000-8000-000000000023",
+                ];
+                let paths = ids.map(|id| root.join(format!("rollout-{id}.jsonl")));
+                let body = |index: usize, parent: Option<&str>, replay: usize, own: usize| {
+                    let header = serde_json::json!({"type":"session_meta","payload":{"id":ids[index],"forked_from_id":parent}});
+                    let mut body = format!("{header}\n");
+                    for n in 0..replay + own {
+                        if n == replay {
+                            body.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n");
+                        }
+                        let call = format!("edit-{n}");
+                        let input = "*** Begin Patch\n*** Add File: /synthetic/shared.rs\n+synthetic content\n*** End Patch";
+                        body.push_str(&format!("{}\n{}\n",
+                            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":call,"name":"apply_patch","input":input}}),
+                            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":call,"output":"Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/shared.rs\n"}})));
+                    }
+                    if own == 0 {
+                        body.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n");
+                    }
+                    body
+                };
+                std::fs::write(&paths[0], body(0, None, 0, 2)).unwrap();
+                let middle = body(1, Some(ids[0]), if bridge { 0 } else { 3 }, 0);
+                match initial_middle {
+                    "ready" => std::fs::write(&paths[1], &middle).unwrap(),
+                    "metadata" => std::fs::write(&paths[1], body(1, None, 0, 0)).unwrap(),
+                    "malformed" => std::fs::write(&paths[1], "{malformed\n").unwrap(),
+                    "cycle" => std::fs::write(&paths[1], body(1, Some(ids[2]), 0, 0)).unwrap(),
+                    _ => {}
+                }
+                // The extra equal replay must survive; a post-fork equal edit is also real.
+                let replay = if bridge { 3 } else { 4 };
+                std::fs::write(&paths[2], body(2, Some(ids[1]), replay, 1)).unwrap();
+                let db_path = dir.path().join("index.db");
+                let mut config = config_with_single_claude_fixture(&db_path, &root);
+                config.providers.claude.enabled = false;
+                config.providers.codex.enabled = true;
+                config.providers.codex.paths = vec![normalize_path(&root)];
+                let db = Db::open(&db_path).unwrap();
+                reindex(&config, &db, false, None).unwrap();
+                let history = |db: &Db| {
+                    crate::files::history(db, "shared.rs", &Default::default())
+                        .unwrap()
+                        .into_iter()
+                        .map(|v| (v.session_id, v.version))
+                        .collect::<Vec<_>>()
+                };
+                if initial_middle != "ready" {
+                    // Without an indexed link, the root's equal edits are not ancestry evidence.
+                    assert_eq!(history(&db).len(), 2 + replay + 1);
+                    std::fs::write(&paths[1], &middle).unwrap();
+                    reindex(&config, &db, false, None).unwrap();
+                }
+                let versions = history(&db);
+                assert_eq!(
+                    versions.len(),
+                    replay + 1,
+                    "bridge={bridge}, initial_middle={initial_middle}"
+                );
+                for (id, count) in [(ids[0], 2), (ids[1], usize::from(!bridge)), (ids[2], 2)] {
+                    assert_eq!(
+                        versions
+                            .iter()
+                            .filter(|(s, _)| s == &format!("codex:{id}"))
+                            .count(),
+                        count
+                    );
+                }
+                reindex(&config, &db, true, None).unwrap();
+                assert_eq!(history(&db), versions);
+                let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+                reindex(&config, &fresh, false, None).unwrap();
+                assert_eq!(history(&fresh), versions);
                 assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
             }
         }
