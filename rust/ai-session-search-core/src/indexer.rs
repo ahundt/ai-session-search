@@ -2712,20 +2712,7 @@ mod tests {
             if full {
                 reindex(&config, &db, true, None).unwrap();
             } else {
-                let adapters = ProviderSet::new(&config);
-                let source = adapters.discover_enabled(&config).sources.pop().unwrap();
-                assert!(matches!(
-                    try_tail(
-                        &source,
-                        &normalize_path(&source.path),
-                        Some(&format!("codex:{parent}")),
-                        &db,
-                        &|| false,
-                        |r, p| adapters.codex.parse_reader(r, p)
-                    )
-                    .unwrap(),
-                    TailOutcome::Appended
-                ));
+                reindex_tail_outcome(&config, &db, TailOutcome::Appended);
             }
             assert_eq!(
                 crate::db::CODEX_FORK_AFTER_READ
@@ -2734,6 +2721,35 @@ mod tests {
                 matching
             );
             assert_eq!(db.file_edit_count().unwrap(), if matching { 3 } else { 4 });
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            for first_seq in [None, Some(1_i64)] {
+                let plan = conn
+                    .prepare(&format!(
+                        "explain query plan {}",
+                        crate::db::CODEX_FORK_MATCHING_EDIT_SQL
+                    ))
+                    .unwrap()
+                    .query_map(
+                        rusqlite::params![
+                            format!("codex:{parent}"),
+                            format!("codex:{child}"),
+                            first_seq
+                        ],
+                        |r| r.get::<_, String>(3),
+                    )
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert!(
+                    plan.iter()
+                        .any(|line| line.contains("SEARCH c USING INDEX idx_file_edits_session")),
+                    "child probe must read its own edits: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|line| line.contains("idx_file_edits_path")),
+                    "{plan:?}"
+                );
+            }
             let history = crate::files::history(&db, "later.rs", &Default::default()).unwrap();
             assert_eq!(history.len(), if matching { 1 } else { 2 });
             assert!(history

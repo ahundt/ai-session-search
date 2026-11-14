@@ -8031,7 +8031,7 @@ const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f
 
 // Full publications can repair an empty ancestry link: include retained edits above that link.
 // UNION makes the indexed ancestry walk cycle-safe. Tail publications need only the new rows.
-const CODEX_FORK_MATCHING_EDIT_SQL: &str = "with recursive ancestry(id) as (
+pub(crate) const CODEX_FORK_MATCHING_EDIT_SQL: &str = "with recursive ancestry(id) as (
     select ?1
     union
     select 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id')
@@ -8042,7 +8042,7 @@ const CODEX_FORK_MATCHING_EDIT_SQL: &str = "with recursive ancestry(id) as (
 )
 select 1 from ancestry a
 cross join file_edits p indexed by idx_file_edits_session
-cross join file_edits c indexed by idx_file_edits_path
+cross join file_edits c indexed by idx_file_edits_session
 where p.session_id = a.id and (?3 is null or p.seq >= ?3)
     and c.file_path = p.file_path and c.session_id = ?2
     and c.tool = p.tool and c.new_content is p.new_content and c.edits_json is p.edits_json
@@ -8052,12 +8052,15 @@ limit 1";
 /// receipts, each parent lookup costs O(log S + K(log S + log R)) for K children, retaining
 /// O(K) paths plus O(D) visited identities for D reachable descendants. A no-fork publication
 /// visits no unrelated session metadata or source receipts.
-/// Candidate probes use the session and path edit indexes, comparing tool/content/replacements
-/// only on matching paths. They scan the publisher's stored edits (and indexed ancestors on a
-/// full publication); a tail restricts matches to newly inserted seqs. No candidate means no
-/// child source bytes are read. Each candidate is parsed at most once and reads its ancestry
-/// (bounded by chain depth, stopping at cycles). Memory adds one parsed fork, its stored/parsed
-/// keys and ancestor keys, plus visited ancestor identities and the largest stored edit body.
+/// Candidate probes read both sides through the session edit index. For P publisher/ancestor
+/// edits and C child edits, each probe scans O(P) publisher rows and compares O(P * C) pairs
+/// in the worst case, plus index lookups; unrelated edits to the same path are never visited.
+/// A tail restricts comparisons to newly inserted publisher seqs (the index still scans P).
+/// Comparison time also depends on path/content bytes; probes retain only the current rows.
+/// No candidate means no child source bytes are read. Each candidate is parsed at most once
+/// and reads its ancestry (bounded by chain depth, stopping at cycles). Memory adds one parsed
+/// fork, its stored/parsed keys and ancestor keys, plus visited ancestor identities and the
+/// largest stored edit body.
 /// This work extends the writer transaction; non-Codex publications skip it.
 fn reconcile_codex_fork_edits(
     tx: &Transaction<'_>,
@@ -9453,7 +9456,7 @@ mod tests {
     include!("db/fork_publication_benchmark.rs");
 
     #[test]
-    fn codex_fork_matching_edit_uses_session_and_path_indexes() {
+    fn codex_fork_matching_edit_uses_family_session_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         for first_seq in [None, Some(1_i64)] {
@@ -9471,10 +9474,14 @@ mod tests {
                 .unwrap();
             for expected in [
                 "SEARCH p USING INDEX idx_file_edits_session",
-                "SEARCH c USING INDEX idx_file_edits_path",
+                "SEARCH c USING INDEX idx_file_edits_session",
             ] {
                 assert!(plan.iter().any(|line| line.contains(expected)), "{plan:?}");
             }
+            assert!(
+                !plan.iter().any(|line| line.contains("idx_file_edits_path")),
+                "{plan:?}"
+            );
             assert!(
                 !plan.iter().any(|line| ["SCAN p", "SCAN c", "SCAN s"]
                     .iter()

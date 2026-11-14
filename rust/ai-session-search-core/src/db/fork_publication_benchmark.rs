@@ -6,15 +6,22 @@
 #[test]
 #[ignore]
 fn fork_publication_benchmark() {
+    for case in ["unique-path", "common-path-no-match", "common-path-match"] {
+        fork_publication_case(case);
+    }
+}
+
+fn fork_publication_case(case: &str) {
     use std::io::Write as _;
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("index.db")).unwrap();
     let adapter = crate::providers::codex::CodexAdapter::new(Vec::new());
     let mutation = |n: &str| {
+        let path = if case == "unique-path" { n } else { "common" };
         format!(
             "{}\n{}\n",
-            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":n,"name":"apply_patch","input":format!("*** Begin Patch\n*** Add File: /synthetic/{n}.rs\n+content {n}\n*** End Patch")}}),
-            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":n,"output":format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/{n}.rs\n")}})
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":n,"name":"apply_patch","input":format!("*** Begin Patch\n*** Add File: /synthetic/{path}.rs\n+content {n}\n*** End Patch")}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":n,"output":format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/{path}.rs\n")}})
         )
     };
     let header = |id: &str, parent: Option<&str>| {
@@ -55,6 +62,11 @@ fn fork_publication_benchmark() {
         if i < 4 {
             body.push_str(&mutation("shared"));
         }
+        if case == "common-path-match" {
+            for n in 0..50 {
+                body.push_str(&mutation(&format!("parent-tail-{n}")));
+            }
+        }
         body.push_str(
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n",
         );
@@ -63,8 +75,29 @@ fn fork_publication_benchmark() {
         fs::write(&path, body).unwrap();
         publish(&path);
     }
+    // Unrelated sessions share the hot path but must not affect child-side probe work.
+    db.with_immediate_transaction(|| {
+        db.conn.execute_batch(
+            "with recursive n(i) as (values(0) union all select i+1 from n where i<49999)
+             insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+             select 'codex:unrelated-'||i,'codex','unrelated-'||i,'','/synthetic/unrelated-'||i,'synthetic','synthetic' from n;
+             insert into file_edits(session_id,provider,seq,tool,file_path,file_name,new_content)
+             select id,'codex',0,'apply_patch','/synthetic/common.rs','common.rs','unrelated content'
+             from sessions where id like 'codex:unrelated-%';"
+        )?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(
+        db.conn
+            .query_row(
+                "select count(*) from file_edits where session_id like 'codex:unrelated-%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        50_000
+    );
     let prior = db.file_edit_count().unwrap();
-    assert!((81..=85).contains(&prior));
     let mut times = Vec::new();
     for i in 0..50 {
         let body = mutation(&format!("parent-tail-{i}"));
@@ -96,10 +129,17 @@ fn fork_publication_benchmark() {
         db.append_tail(&tail, i + 2, meta.len() as i64).unwrap();
         times.push(start.elapsed().as_secs_f64() * 1000.0);
     }
-    assert_eq!(db.file_edit_count().unwrap(), prior + 50);
+    assert_eq!(
+        db.file_edit_count().unwrap(),
+        if case == "common-path-match" {
+            prior + 50 - 80 * 50
+        } else {
+            prior + 50
+        }
+    );
     times.sort_by(f64::total_cmp);
     println!(
-        "80 children, 5 MiB each, 50 appends: min/median/max ms = {:.3}/{:.3}/{:.3}",
+        "{case}: Q=50000, K=80, 5 MiB each, 50 appends: min/median/max ms = {:.3}/{:.3}/{:.3}",
         times[0],
         (times[24] + times[25]) / 2.0,
         times[49]
