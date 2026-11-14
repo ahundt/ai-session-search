@@ -2834,6 +2834,86 @@ mod tests {
     }
 
     #[test]
+    fn claude_queued_attachments_do_not_consume_later_submissions() {
+        use std::io::Write as _;
+        for arrangement in ["contentless", "attachment-first", "enqueue-first"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let attachment = serde_json::json!({"type":"attachment","uuid":"first-delivery","sessionId":"repeat-queue","timestamp":"2026-11-01T00:00:02Z","attachment":{"type":"queued_command","prompt":"repeat synthetic submission","commandMode":"prompt","origin":{"kind":"human"}}});
+            let enqueue = serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"repeat-queue","timestamp":"2026-11-01T00:00:01Z","content":"repeat synthetic submission"});
+            let records = if arrangement == "contentless" {
+                vec![
+                    serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"repeat-queue"}),
+                    attachment,
+                ]
+            } else if arrangement == "attachment-first" {
+                vec![attachment, enqueue]
+            } else {
+                vec![enqueue, attachment]
+            };
+            std::fs::write(
+                &path,
+                records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let reply = serde_json::json!({"type":"assistant","uuid":"reply","sessionId":"repeat-queue","message":{"role":"assistant","content":"synthetic response"}});
+            let later = serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"repeat-queue","timestamp":"2026-11-01T00:00:03Z","content":"repeat synthetic submission"});
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(format!("{reply}\n{later}\n").as_bytes())
+                .unwrap();
+            let rows = |path: &Path| {
+                let conn = rusqlite::Connection::open(path).unwrap();
+                let mut stmt = conn.prepare("select json_array(role,kind,content,authorship,input_origin,input_delivery_state,correlation_authority,correlation_scope,correlation_id) from messages order by seq,id").unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            reindex(&config, &db, false, None).unwrap();
+            let fresh_path = dir.path().join("fresh.db");
+            let fresh = Db::open(&fresh_path).unwrap();
+            reindex(
+                &config_with_single_claude_fixture(&fresh_path, &root),
+                &fresh,
+                false,
+                None,
+            )
+            .unwrap();
+            for indexed in [&db, &fresh] {
+                assert_eq!(
+                    indexed
+                        .search_messages(
+                            "repeat synthetic submission",
+                            &crate::models::MessageFilters {
+                                role: Some(crate::models::Role::User),
+                                ..Default::default()
+                            }
+                        )
+                        .unwrap()
+                        .len(),
+                    2,
+                    "{arrangement}"
+                );
+            }
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let authors: (i64,i64) = conn.query_row("select sum(authorship='human'),sum(authorship='unknown') from messages where content='repeat synthetic submission'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(authors, (1, 1));
+            assert_eq!(rows(&db_path), rows(&fresh_path));
+            reindex(&config, &db, true, None).unwrap();
+            assert_eq!(rows(&db_path), rows(&fresh_path));
+        }
+    }
+
+    #[test]
     fn claude_queued_sender_evidence_does_not_match_an_earlier_turn() {
         let mut observed = Vec::new();
         for with_enqueue in [false, true] {

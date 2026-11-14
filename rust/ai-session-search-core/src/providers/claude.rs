@@ -535,10 +535,15 @@ impl QueuedCommand {
         let mut delivered = std::collections::HashSet::new();
         let mut kept: Vec<Self> = Vec::new();
         for queued in queued {
-            let Some(position) = indexed
-                .get_mut(&queued.digest)
-                .and_then(std::collections::VecDeque::pop_front)
-            else {
+            let Some(position) = indexed.get_mut(&queued.digest).and_then(|positions| {
+                // A later enqueue is a delivery copy only at the next conversation
+                // position; an intervening reply starts an independent submission.
+                (positions
+                    .front()
+                    .is_some_and(|&p| p <= queued.delivery_position))
+                .then(|| positions.pop_front())
+                .flatten()
+            }) else {
                 let delivery_copy = !enqueued.contains_key(&queued.delivery_position)
                     && messages
                         .get(queued.delivery_position)
