@@ -135,8 +135,8 @@ impl UnrecognizedRecordTypes {
                         "message.",
                         message
                             .get("role")
-                            .or_else(|| message.get("type"))
-                            .and_then(Value::as_str),
+                            .and_then(Value::as_str)
+                            .or_else(|| message.get("type").and_then(Value::as_str)),
                         &[
                             "user",
                             "assistant",
@@ -161,7 +161,7 @@ impl UnrecognizedRecordTypes {
                 );
             }
             Provider::Antigravity => {
-                if kind.is_none()
+                if kind.is_none_or(str::is_empty)
                     && matches!(
                         value.get("source").and_then(Value::as_str),
                         Some("USER_EXPLICIT" | "USER" | "MODEL")
