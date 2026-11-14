@@ -126,8 +126,8 @@ Origin and delivery evidence use `null` in JSON and `None` in Rust/Python when a
 Legacy indexes remain searchable through an internal storage marker; `unknown` is not an
 origin or delivery enum value. Both Rust enums are non-exhaustive.
 
-Legacy Claude queue operations lack per-item sender receipts and links proving delivery. They
-remain `authorship=unknown`, `input_origin=queued`, and `input_delivery_state=submitted`, while
+Without a delivery record, legacy Claude queue submissions remain `authorship=unknown`,
+`input_origin=queued`, and `input_delivery_state=submitted`, while
 `role="user"` still finds the recorded submission. When Claude Code also wrote a
 `queued_command` attachment naming the sender, the queued row takes that sender (`human` for a
 person), and a `task-notification` attachment makes it a harness notice.
@@ -135,8 +135,9 @@ person), and a `task-notification` attachment makes it a harness notice.
 Recurrence and correction analytics read rows with structural evidence of a human author,
 queued rows included. Queued rows with no recorded sender are left out and counted in
 `MessageClassificationReport.unattributed_input_count`;
-`MessageClassificationQuery.include_unattributed_input` reads them. A queued submission
-that was delivered as a prompt counts as that prompt. Independent same-text submissions stay
+`MessageClassificationQuery.include_unattributed_input` reads them. Queued Claude submissions
+appear once when delivered through a queued-command attachment or directly after a dequeue,
+including after an earlier entry was cancelled or cleared. Independent same-text submissions stay
 distinct; text equality alone does not establish that two submissions are the same event.
 
 Recurrence analytics join attributable fragments within a message before matching; their

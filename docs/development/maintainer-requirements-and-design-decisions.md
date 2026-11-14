@@ -185,7 +185,7 @@ describe current source behavior, not a timeless latency guarantee.
 
 | Key surface | Current time bound | Current peak/retained memory | Latency, output, and regression guard |
 | --- | --- | --- | --- |
-| Provider discovery and indexing | Discovery `O(F)`; incremental source parse normally `O(B_new + overlap)` with bounded overlap; [whole-source fallbacks](../../skills/ai-session-search/references/search-costs-and-receipts.md#per-operation) `O(B_all)`; persistence also counts stored session messages and copies stored transcript bytes; full rebuild `O(B_all)` | Discovery retains `O(F)` source metadata. A full provider parse currently retains normalized messages, transcript lines, file edits, and the joined transcript for one source, so peak growth is `O(B_session)`; custom trigram rebuild is `O(B + P)`. | Benchmark cold and incremental refresh separately. The existing 40 MiB fixture guards full versus incremental time. Measure peak RSS and cancellation latency before claiming a lower parser bound; trigram rebuild remains another known peak-memory cliff. |
+| Provider discovery and indexing | Discovery `O(F)`; incremental source parse `O(B_new + overlap)` with at most 1 MiB overlap; [whole-source fallbacks](../../skills/ai-session-search/references/search-costs-and-receipts.md#per-operation) `O(B_all)`; persistence also counts stored session messages and copies stored transcript bytes; full rebuild `O(B_all)` | Discovery retains `O(F)` source metadata. A full provider parse currently retains normalized messages, transcript lines, file edits, and the joined transcript for one source, so peak growth is `O(B_session)`; custom trigram rebuild is `O(B + P)`. | Benchmark cold and incremental refresh separately. The existing 40 MiB fixture guards full versus incremental time. Measure peak RSS and cancellation latency before claiming a lower parser bound; trigram rebuild remains another known peak-memory cliff. |
 | Session list, resolve, and focused read | Session-span filtering is worst-case `O(R)` constant-time comparisons; favorable indexed list is `O(log N + O + K)` because current paging uses SQL `OFFSET`, while a planner-selected temporary sort is conservatively `O(R log R + O + K)`; zero-limit list is `O(R)` plus any sort; focused read is `O(log M + K)` after resolution; current partial-ID resolution is `O(N)` | `O(K + D_K)` returned rows plus SQLite cache/temp-sort memory; overlap itself adds `O(1)` application memory | Date bounds use closed overlap: known start <= query end and known end >= query start. Do not call list paging keyset-based. Track offset skipping, query plans, and the known case-insensitive `LIKE` session-resolution scan; never hide work behind a small output page. |
 | Exact and regex message search | Indexed safe candidates plus authoritative verification `O(P_Q + C + verified bytes)`; unsafe/no-literal regex worst case `O(B)` | Finite page `O(W + D_W + evidence bytes)`; explicit all-results `O(N + D_K + evidence bytes)` | Row-count bounds alone do not bound retained text bytes. Content and JSON-stable tool-argument anchors reuse schema-v4's raw-content trigram superset; RFC 6901 projection and matching remain authoritative. Context is fetched for retained hits in one batched statement, not N+1 queries. |
 | Fuzzy message search | `O(B + N + W log W)` aggregate work | `O(D_A + D_W + D_max + J × Q + evidence bytes)`; retained row count is corpus-independent for finite `W`, but text bytes are not | Score the complete eligible corpus in bounded parallel batches, compact retained top-K deterministically, and reject unbounded fuzzy requests. Tool-argument projection is exhaustive because subsequence matches have no required contiguous trigram. Benchmark exact/regex/fuzzy across content, tool name, and tool arguments, including giant rows. |
@@ -239,10 +239,15 @@ archive-only rows, and appends parse-only rows after the highest stored sequence
 rows remain. With no archive-only rows, messages and file edits follow the current parser’s source
 order. Matches are counted, so repeated text cannot stand in for a missing occurrence.
 
-Grown-source tail parsing validates the unchanged head and the exact source bytes in the
-last 1 MiB before the stored checkpoint. A changed or missing overlap digest forces a full
-parse; equal bytes allow overlap rows to be dropped by count, regardless of parser context
-or archive order. Rewrites between the head and overlap remain undetected until a full parse.
+Tail parsing checks both the head fingerprint and overlap digest. An older build's checkpoint
+without a digest, a parser-version change, changed overlap bytes, or an appended record that
+changes an indexed row requires a full parse. Queued Claude delivery through an attachment or directly after dequeue
+needs at most one full parse per delivery; queue records that only add rows stay incremental.
+Linked Claude interactive answers, Codex `request_user_input` responses, and Codex
+`thread_settings_applied` records closing fork replay can also require earlier context.
+Rewrites between the head and overlap remain undetected by refresh; use `aise reindex --full`.
+Codex fork reconciliation checks each fork's own edits through its session index; a parent edit
+reparses a fork only when that fork holds a matching edit.
 The optional digest column is added on writable open within generation 6; read-only opens
 also accept older layouts without it.
 

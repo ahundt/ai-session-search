@@ -57,9 +57,11 @@ contain generated text. Known prompts from a parent agent to a subagent stay out
 selector. Omit `--role` to search complete content.
 
 Claude Code conversation and attachment records supply the searchable text; saved API request
-copies do not add repeated turns or file edits. A queued submission delivered as a prompt counts
-as that prompt; independent same-text submissions remain distinct. Files a person mentions,
-attached file snippets, memory and plan text, and invoked skill contents are searchable by default.
+copies do not add repeated turns or file edits. Queued Claude submissions appear once when
+delivered through a queued-command attachment or directly after a dequeue, including after an
+earlier entry was cancelled or cleared; independent same-text submissions remain distinct. Files a
+person mentions, attached file snippets, memory and plan text, and invoked skill contents are
+searchable by default.
 Injected instructions, session context, hook messages, and interrupt notices are harness notices:
 find them with `--kinds harness-notice`. `aise doctor` reports unrecognized record and attachment
 types; malformed attachments and skipped binary payloads appear as parse warnings.
@@ -170,9 +172,10 @@ requested match. A selective fragment and structural filters reduce the scan. Fu
 every eligible row, so narrow by project, provider, session, or date first. `--receipt-level
 summary` explains the selected query plan.
 
-Refresh is separate from query cost: incremental reads normally cover appended bytes plus a
-bounded overlap, with [whole-source fallbacks](skills/ai-session-search/references/search-costs-and-receipts.md#per-operation)
-when earlier context or checkpoints cannot be reused. Use `--index-refresh before-query` to wait
+Refresh is separate from query cost: incremental reads cover appended bytes plus at most 1 MiB
+of overlap. [Whole-source fallbacks](skills/ai-session-search/references/search-costs-and-receipts.md#per-operation)
+apply to older checkpoints or parser versions, changed overlap bytes, and new records that change
+indexed rows. Use `--index-refresh before-query` to wait
 for source updates, or `existing-only` to skip refresh. See the
 [search cost reference](skills/ai-session-search/references/search-costs-and-receipts.md).
 

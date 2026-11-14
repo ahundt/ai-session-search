@@ -365,9 +365,9 @@ current source files to be indexed, `--index-refresh existing-only` to read with
 no implicit refresh, `aise reindex` for an explicit incremental rebuild, and `aise reindex --full`
 only when a complete reparse is required. Run `compact` only when asked, after `aise doctor` and
 a disk check: compaction mutates the database and may need temporary space. Refresh is separate
-from query cost: incremental refresh normally reads appended bytes plus a bounded overlap;
-[whole-source fallbacks](references/search-costs-and-receipts.md#per-operation) reparse all source
-bytes when earlier context or checkpoints cannot be reused.
+from query cost: incremental refresh reads appended bytes plus at most 1 MiB of overlap.
+[Whole-source fallbacks](references/search-costs-and-receipts.md#per-operation) apply to older
+checkpoints or parser versions, changed overlap bytes, and new records that change indexed rows.
 
 For library use, Python `search_sessions()`/`list_sessions()`, `search_messages()`,
 `read_session_messages()`/`message_context()`, `reconstruct_file()`, `classify_messages()` and

@@ -46,10 +46,10 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    the request mode instead of overriding it with `literal`; pass `query_mode="literal"` to
    preserve that override.
 5. Scripts can see fewer duplicate search results and file edits: Claude Code saved API request
-   copies and repeated record identities no longer add extra turns or edits. Queued submissions
-   delivered as prompts appear once with their recorded sender across intervening assistant turns;
-   independent same-text submissions stay distinct, including a dequeued direct delivery followed
-   by a later submission with the same text.
+   copies and repeated record identities no longer add extra turns or edits. Queued Claude submissions
+   appear once when delivered through a queued-command attachment or directly after a dequeue,
+   including after an earlier entry was cancelled or cleared. Independent same-text submissions
+   stay distinct.
    Copied parent history in Codex forks stays searchable but does not count as new human input.
 6. Date input keeps the published UTC default and fixed-duration shorthand: `m` or `M` means
    30 days, and `y` or `Y` means 365 days. Use `min` for minutes, `mo` or `P1M` for calendar
@@ -145,8 +145,7 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    Compatible aliases remain accepted; conflicting simultaneous values fail.
 8. Python `search_sessions("")` → `list_sessions(request)`; `diagnostics()` → `doctor()`.
    Both emit `DeprecationWarning`.
-9. Rust compatibility items remain callable with compiler warnings. This table follows the
-   public deprecation attributes, grouping duplicate aliases and fields on deprecated types:
+9. Rust compatibility items remain callable with compiler warnings:
 
    | Rust items | Replacement |
    | --- | --- |
@@ -194,7 +193,7 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    their identity; decompression failures preserve an existing index snapshot and remain
    retryable. Refresh detects records rewritten in place within the last 1 MiB of a growing
    transcript and reindexes that transcript, keeping archived history and sequence numbers; a
-   rewrite earlier in the file needs `aise reindex --full`.
+   rewrite between the head fingerprint and that overlap needs `aise reindex --full`.
 2. Literal and regex search find case pairs SQLite's tokenizer does not fold, including Cherokee,
    Georgian Mtavruli, Osage, and Adlam. A query ending in `i` also matches dotted capital `İ`.
 3. Equal session/sequence or timestamp keys have a stable tie-breaker for search, corrections,
@@ -222,11 +221,13 @@ reads, and resume commands. See the [library guide](docs/development/library-api
 8. File recovery errors identify the first version that cannot be reconstructed and the missing
    information; earlier recoverable versions remain extractable. Codex forks omit a copied file
    edit only when an equivalent edit is retained in the index under a session in their ancestry,
-   including forks of forks; otherwise they keep their recoverable copy.
+   including forks of forks; otherwise they keep their recoverable copy. Reconciliation checks
+   each fork's own edits; a parent edit reparses a fork only when that fork holds a matching edit.
 9. Codex marketplace ownership is recorded at install: reinstall refuses files edited since
    install, and uninstall preserves them.
-10. An index published by `aise migrate` returns to WAL on a later writable open when no other
-    process is using it.
+10. A writable open attempts to return an index published by `aise migrate` to WAL without waiting
+    for the writer lock. If the lock is unavailable or a reader prevents conversion, a later
+    writable open retries.
 
 ### Performance
 
@@ -237,7 +238,11 @@ they describe the named workloads, not a release-build latency guarantee.
    took a median 129 ms instead of 139 ms across 25 repetitions after catalogue reuse.
 2. With that generated fixture plus a synthetic 1,537-message Claude session, four incremental
    refreshes of a growing transcript took a median 163 ms instead of 1,134 ms across 15
-   repetitions. Unchanged sidecar metadata permits incremental transcript reads.
+   repetitions. With unchanged sidecar metadata, incremental refresh reads appended bytes plus
+   at most 1 MiB of overlap. It reparses the transcript for an older checkpoint without an overlap
+   digest, a parser-version change, changed overlap bytes, or a new record changing an indexed row:
+   queued Claude delivery, a linked interactive answer, or Codex fork replay closure. A queued delivery needs
+   at most one full parse; queue records that only add rows stay incremental.
 
 ### Security
 
