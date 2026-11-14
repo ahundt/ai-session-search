@@ -983,6 +983,24 @@ impl Db {
             return Ok(db);
         }
         db.configure_query_connection()?;
+        // Migration publishes a self-contained rollback-journal file. Restore WAL under the
+        // writer permit; healthy WAL opens only read the mode and never elect a writer here.
+        let journal_mode: String = db
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            db.with_open_writer_permit(path, || {
+                db.require_write_compatibility()?;
+                let current: String = db
+                    .conn
+                    .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+                if !current.eq_ignore_ascii_case("wal") {
+                    db.conn.pragma_update(None, "journal_mode", "wal")?;
+                }
+                Ok(())
+            })?;
+        }
+        db.conn.pragma_update(None, "synchronous", "normal")?;
         let generation = db.schema_version()?;
         let legacy_maintenance = generation == 6 && db.conn.query_row(
             "select not exists(select 1 from index_metadata where key=?1)
@@ -1430,7 +1448,6 @@ impl Db {
 
     fn init(&self) -> Result<()> {
         self.require_write_compatibility()?;
-        self.conn.execute_batch("pragma journal_mode=wal; pragma foreign_keys=on; pragma synchronous=normal; pragma temp_store=memory;")?;
         self.with_immediate_transaction(|| self.init_layout())?;
         let version = self.schema_version()?;
         let problem = match version {
@@ -9174,6 +9191,103 @@ mod tests {
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
+
+    #[test]
+    fn migrated_writable_service_restores_wal_and_normal_synchronous() {
+        use crate::util::normalize_path;
+        use std::io::Write as _;
+        for generation in [6, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.db");
+            let destination = dir.path().join("destination.db");
+            let root = dir.path().join("claude");
+            fs::create_dir_all(&root).unwrap();
+            let transcript = root.join("session.jsonl");
+            fs::write(&transcript, "{\"type\":\"user\",\"sessionId\":\"migrated\",\"message\":{\"role\":\"user\",\"content\":\"initial migration prompt\"}}\n").unwrap();
+            let mut config = crate::config::Config::default();
+            config.index.db_path = Some(normalize_path(&source_path));
+            config.index.cache_dir = Some(normalize_path(&dir.path().join("cache")));
+            config.index.busy_timeout_ms = 0;
+            for provider in [
+                &mut config.providers.claude,
+                &mut config.providers.claude_desktop,
+                &mut config.providers.codex,
+                &mut config.providers.cursor,
+                &mut config.providers.antigravity,
+                &mut config.providers.pi,
+                &mut config.providers.prime_agent,
+                &mut config.providers.aistudio,
+                &mut config.providers.gemini_cli,
+            ] {
+                provider.enabled = false;
+                provider.paths.clear();
+            }
+            config.providers.claude.enabled = true;
+            config.providers.claude.paths = vec![normalize_path(&root)];
+            let source = Db::open(&source_path).unwrap();
+            crate::indexer::reindex(&config, &source, false, None).unwrap();
+            if generation == 5 {
+                source.conn.execute_batch("pragma user_version=5; delete from index_metadata where key in ('minimum_reader_compatibility','minimum_writer_compatibility')").unwrap();
+            }
+            drop(source);
+            crate::migration::migrate_database(&crate::migration::DatabaseMigrationOptions::new(
+                source_path,
+                destination.clone(),
+                dir.path().join("receipt.json"),
+            ))
+            .unwrap();
+            let published = Connection::open(&destination).unwrap();
+            assert_eq!(
+                published
+                    .query_row("pragma journal_mode", [], |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "delete"
+            );
+            assert_eq!(
+                published
+                    .query_row("pragma user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                generation
+            );
+            drop(published);
+            config.index.db_path = Some(normalize_path(&destination));
+            let app = crate::service::SessionSearch::open(config.clone()).unwrap();
+            let policy: (String, i64) = app.database().conn.query_row("select (select journal_mode from pragma_journal_mode), (select synchronous from pragma_synchronous)", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(policy, ("wal".into(), 1), "source generation {generation}");
+            let reader = Connection::open(&destination).unwrap();
+            reader.execute_batch("begin").unwrap();
+            assert_eq!(
+                reader
+                    .query_row("select count(*) from messages", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            fs::OpenOptions::new().append(true).open(&transcript).unwrap().write_all(b"{\"type\":\"assistant\",\"sessionId\":\"migrated\",\"message\":{\"role\":\"assistant\",\"content\":\"appended migration reply\"}}\n").unwrap();
+            app.index().reindex_report(false).unwrap();
+            // The commit succeeds while the old reader snapshot remains open.
+            assert_eq!(
+                reader
+                    .query_row("select count(*) from messages", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            app.database()
+                .conn
+                .execute_batch("begin immediate")
+                .unwrap();
+            let next = crate::service::SessionSearch::open(config).unwrap();
+            assert_eq!(next.database().message_count().unwrap(), 2);
+            assert_eq!(
+                next.database()
+                    .conn
+                    .query_row("pragma synchronous", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            app.database().conn.execute_batch("rollback").unwrap();
+            reader.execute_batch("rollback").unwrap();
+        }
+    }
 
     #[test]
     fn message_row_rejects_corrupt_provider_and_role_with_recovery_context() {
