@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlite_helpers import write_database
 
 import ai_session_search
 from scripts.verify_harness_discovery import environment as isolated_environment
@@ -26,7 +27,7 @@ native = pytest.importorskip("ai_session_search.native", reason="native extensio
 def test_released_index_user_role_search_preserves_stored_rows(tmp_path: Path, surface: str) -> None:
     database = tmp_path / "index.db"
     fixture = Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/tests/fixtures/v1_0_0_populated.sql"
-    with sqlite3.connect(database) as connection:
+    with write_database(database) as connection:
         connection.executescript(fixture.read_text())
     before = hashlib.sha256(database.read_bytes()).hexdigest()
     expected = [("claude:upgrade-claude", 0), ("codex:upgrade-codex", 0)]
@@ -67,7 +68,7 @@ def test_released_index_user_role_search_preserves_stored_rows(tmp_path: Path, s
 def test_legacy_input_sentinels_return_none_without_selecting_current_unknown_input(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     search = native.SessionSearch(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with write_database(db_path) as connection:
         connection.executescript("""
             insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
             values ('claude:legacy', 'claude', 'legacy', '', '/legacy', 'test', 'test');
@@ -92,7 +93,7 @@ def test_legacy_input_sentinels_return_none_without_selecting_current_unknown_in
 def test_human_content_selection_changes_membership_and_preserves_coordinates(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     search = native.SessionSearch(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with write_database(db_path) as connection:
         connection.executescript("""
             insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
             values ('claude:human', 'claude', 'human', '', '/human', 'test', 'test');
@@ -555,8 +556,7 @@ def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:
 def test_native_recent_directory_listing_and_session_span_filtering(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             "insert into sessions (id, provider, provider_session_id, title, cwd, created_at, updated_at, preview_text, source_path, parse_version, discovery_source) values (?, 'claude', ?, 'shared needle', ?, ?, ?, 'shared needle', ?, 'test', 'fixture')",
             [
@@ -569,9 +569,6 @@ def test_native_recent_directory_listing_and_session_span_filtering(tmp_path: Pa
             "insert into transcripts (session_id, transcript_text) values (?, 'shared needle')",
             [("claude:long",), ("claude:february",), ("claude:sibling",)],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     for dates in (native.DateRange(when="2026-01"), native.DateRange(when="2026-02-15T00:00:00Z")):
         request = native.SessionQuery(dates=dates, limit=0)
@@ -637,8 +634,7 @@ def test_native_session_search_serves_concurrent_readers_from_several_threads(
 
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             "insert into sessions (id, provider, provider_session_id, title, cwd, created_at, updated_at, preview_text, source_path, parse_version, discovery_source) values (?, 'claude', ?, 'shared needle', '/work/project', '2026-01-10T00:00:00+00:00', '2026-01-11T00:00:00+00:00', 'shared needle', ?, 'test', 'fixture')",
             [(f"claude:s{index}", f"s{index}", f"/s{index}.jsonl") for index in range(12)],
@@ -647,9 +643,6 @@ def test_native_session_search_serves_concurrent_readers_from_several_threads(
             "insert into transcripts (session_id, transcript_text) values (?, 'shared needle')",
             [(f"claude:s{index}",) for index in range(12)],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     expected_ids = sorted(f"claude:s{index}" for index in range(12))
 
@@ -771,8 +764,7 @@ def test_session_query_selects_session_classes_and_follows_the_spawn_link(
     """
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             """
             insert into sessions (
@@ -792,9 +784,6 @@ def test_session_query_selects_session_classes_and_follows_the_spawn_link(
                 ),
             ],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     def ids(**kwargs: object) -> list[str]:
         return sorted(session.id for session in search.list_sessions(native.SessionQuery(**kwargs)))
@@ -860,8 +849,7 @@ def test_native_session_search_uses_configured_current_repo_when_omitted(tmp_pat
 
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             """
             insert into sessions (
@@ -874,9 +862,6 @@ def test_native_session_search_uses_configured_current_repo_when_omitted(tmp_pat
                 ("claude:z-current", "z-current", str(current_repo), "/current.jsonl"),
             ],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     implicit = search.search_sessions("needle", native.SessionQuery(limit=2))
     assert [hit.session.id for hit in implicit] == ["claude:z-current", "claude:a-other"]
@@ -888,8 +873,7 @@ def test_native_session_search_uses_configured_current_repo_when_omitted(tmp_pat
 def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -903,9 +887,6 @@ def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> 
             "insert into transcripts (session_id, transcript_text) values (?, ?)",
             ("claude:abc", "[user] hello\n\n[assistant] hi"),
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     document = search.export_session("abc", "markdown")
 
@@ -1195,8 +1176,7 @@ def test_native_compatibility_reader_only_refuses_maintenance(tmp_path: Path) ->
 def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         for session_id, provider in [("claude:analysis", "claude"), ("codex:other", "codex")]:
             connection.execute(
                 """
@@ -1297,9 +1277,6 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
                 ),
             ],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     scope = native.QueryScope(provider="claude", session_id="analysis")
     message_scope = native.MessageScope(
@@ -1551,8 +1528,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
 def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -1570,9 +1546,6 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
             """,
             ("needle opening line\nmiddle detail\nfinal exit status 0",),
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     full = search.search_messages("needle", native.MessageSearchRequest())
     assert full.results[0]["presentation"]["field_view"]["text"] == "needle opening line\nmiddle detail\nfinal exit status 0"
@@ -1589,8 +1562,7 @@ def test_native_harness_notice_keeps_its_typed_kind_after_database_read(
 ) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -1606,9 +1578,6 @@ def test_native_harness_notice_keeps_its_typed_kind_after_database_read(
                     'Stop hook feedback: CANNOT STOP')
             """
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     assert search.search_messages("CANNOT STOP", native.MessageSearchRequest()).results == [], (
         "harness notices stay excluded by default"
@@ -1631,8 +1600,7 @@ def test_normalized_session_metadata_names_the_spawning_session_and_agent(tmp_pa
     """
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             """
             insert into sessions (
@@ -1659,9 +1627,6 @@ def test_normalized_session_metadata_names_the_spawning_session_and_agent(tmp_pa
             """,
             [("claude:root",), ("claude:root/agent-a",)],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     response = search.search_messages(
         "shared needle",
@@ -1680,8 +1645,7 @@ def test_normalized_session_metadata_names_the_spawning_session_and_agent(tmp_pa
 def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -1709,9 +1673,6 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
                 ),
             ],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     cases = [
         ("content", "literal", "cargo test"),
@@ -1849,8 +1810,7 @@ def test_native_message_search_response_exposes_only_the_canonical_version_one_d
 ) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -1870,9 +1830,6 @@ def test_native_message_search_response_exposes_only_the_canonical_version_one_d
             )
             """
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     response = search.search_messages(
         "exact needle",
@@ -1928,8 +1885,7 @@ def test_native_message_search_response_exposes_only_the_canonical_version_one_d
 def test_native_message_search_batches_match_the_simple_materialized_api(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -1946,9 +1902,6 @@ def test_native_message_search_batches_match_the_simple_materialized_api(tmp_pat
             """,
             [(seq, f"needle message {seq} https://example.com/{seq}") for seq in range(5)],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     request = native.MessageSearchRequest(
         all_results=True,
@@ -2025,8 +1978,7 @@ def test_native_message_search_batch_projection_failure_closes_the_producer(
 ) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -2047,9 +1999,6 @@ def test_native_message_search_batch_projection_failure_closes_the_producer(
             )
             """
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     batches = search.search_message_batches(
         "projection cleanup",
@@ -2070,8 +2019,7 @@ def test_native_message_search_batch_projection_failure_closes_the_producer(
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -2092,9 +2040,6 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
             )
             """
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     scope = native.MessageScope(session_id="tool-event")
     timeline = search.search_messages("", native.MessageSearchRequest(scope=scope)).results
@@ -2182,8 +2127,7 @@ def test_native_message_scope_keeps_workspace_and_transcript_paths_independent(
 ) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             """
             insert into sessions (
@@ -2204,9 +2148,6 @@ def test_native_message_scope_keeps_workspace_and_transcript_paths_independent(
             """,
             [("claude:aa",), ("claude:ab",), ("claude:ba",)],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     def ids(scope) -> list[str]:
         response = search.search_messages("needle", native.MessageSearchRequest(scope=scope))
@@ -2237,8 +2178,7 @@ def test_native_message_scope_keeps_workspace_and_transcript_paths_independent(
 def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.execute(
             """
             insert into sessions (
@@ -2260,9 +2200,6 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
                 (3, "slash", "2026-01-15T12:03:00+00:00", "turn 3"),
             ],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     def seqs(hits):
         return [h.seq for h in hits]
@@ -2292,8 +2229,7 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
 def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             """
             insert into sessions (
@@ -2322,9 +2258,6 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
             ],
         )
         connection.execute("drop table transcripts")
-        connection.commit()
-    finally:
-        connection.close()
 
     request = native.SessionQuery(provider="claude", limit=1)
     first = search.analysis_documents(request)
@@ -2359,8 +2292,7 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
 def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             """
             insert into sessions (
@@ -2389,9 +2321,6 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
                 ("gemini-cli:child", "gemini-cli", "Use TDD"),
             ],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     policy = native.AnalysisPolicy(
         classification_rules=[native.ClassificationRule("technique", "tdd", r"(?i)\btdd\b", weight=7)],
@@ -2493,8 +2422,7 @@ def test_native_analyze_omitted_request_does_not_silently_select_only_fifty_sess
 ) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    connection = sqlite3.connect(database)
-    try:
+    with write_database(database) as connection:
         connection.executemany(
             """
             insert into sessions (
@@ -2512,9 +2440,6 @@ def test_native_analyze_omitted_request_does_not_silently_select_only_fifty_sess
                 for index in range(51)
             ],
         )
-        connection.commit()
-    finally:
-        connection.close()
 
     analysis = search.analyze()
     assert len(analysis.result.sessions) == 51
