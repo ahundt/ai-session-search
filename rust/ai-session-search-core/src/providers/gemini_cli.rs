@@ -13,11 +13,12 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::files::{FileMutationPayload, PendingFileMutations};
 use crate::hashing::sha256;
 use crate::models::{
-    ContentPartAuthorship, ContentPartOrigin, Message, MessageAuthorship, MessageContentPart,
-    MessageCorrelationAuthority, MessageCorrelationIdentity, MessageInputOrigin, MessageKind,
-    ParsedSession, Provider, Role, SourceFile,
+    ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, Message, MessageAuthorship,
+    MessageContentPart, MessageCorrelationAuthority, MessageCorrelationIdentity,
+    MessageInputOrigin, MessageKind, ParsedSession, Provider, Role, SourceFile,
 };
 use crate::providers::snapshot::{
     parsed_session_from_raw_with_evidence, source_file, SnapshotMetadata,
@@ -159,6 +160,7 @@ impl GeminiCliAdapter {
         if let Some(kind) = unknown_kind {
             metadata["unknown_session_kind"] = json!(kind);
         }
+        parsed.file_edits = rendered.file_edits;
         parsed.session.raw_metadata_json = Some(metadata.to_string());
         Ok(parsed)
     }
@@ -168,6 +170,8 @@ impl GeminiCliAdapter {
         let strip_references = referenced_file_block_regex()?;
         let evidence = gemini_session_evidence(data.get("kind").and_then(Value::as_str));
         let mut messages = Vec::new();
+        let mut file_edits = Vec::new();
+        let mut mutations = PendingFileMutations::default();
         for message in data
             .get("messages")
             .and_then(Value::as_array)
@@ -232,6 +236,7 @@ impl GeminiCliAdapter {
                     .and_then(Value::as_str)
                     .and_then(parse_datetime)
                     .or(timestamp);
+                collect_file_mutation(call, call_ts, &mut mutations, &mut file_edits);
                 let args = call.get("args").cloned().unwrap_or(Value::Null);
                 let mut call_raw = RawMessage::tool_call(name, args, call_id, call_ts);
                 if let Some(call_id) = call_id {
@@ -283,7 +288,7 @@ impl GeminiCliAdapter {
             .get("lastUpdated")
             .and_then(Value::as_str)
             .and_then(parse_datetime);
-        Ok(parsed_session_from_raw_with_evidence(
+        let mut parsed = parsed_session_from_raw_with_evidence(
             Provider::GeminiCli,
             path,
             SnapshotMetadata {
@@ -295,7 +300,9 @@ impl GeminiCliAdapter {
             },
             messages,
             evidence,
-        ))
+        );
+        parsed.file_edits = file_edits;
+        Ok(parsed)
     }
 
     fn resolve_project_path(&self, path: &Path) -> Option<String> {
@@ -635,6 +642,8 @@ struct NativeReplay {
 
 struct RenderedMessages {
     messages: Vec<RawMessage>,
+    mutations: PendingFileMutations,
+    file_edits: Vec<FileEdit>,
     keys: HashSet<String>,
 }
 
@@ -854,6 +863,8 @@ impl NativeReplay {
     fn render(&self, evidence: UserRoleEvidence, provider_id: &str) -> RenderedMessages {
         let mut rendered = RenderedMessages {
             messages: Vec::new(),
+            mutations: PendingFileMutations::default(),
+            file_edits: Vec::new(),
             keys: HashSet::new(),
         };
         for id in &self.order {
@@ -974,6 +985,12 @@ impl NativeReplay {
                     };
                     let call_id = call.get("id").and_then(Value::as_str);
                     let call_ts = call_timestamp(call, record);
+                    collect_file_mutation(
+                        call,
+                        call_ts,
+                        &mut rendered.mutations,
+                        &mut rendered.file_edits,
+                    );
                     let key = call_id
                         .map(|id| format!("tool:{id}"))
                         .unwrap_or_else(|| format!("tool:{id}:{name}"));
@@ -1089,6 +1106,100 @@ impl NativeReplay {
                 Some(raw)
             })
             .collect()
+    }
+}
+
+/// Decode only outcomes bound to the recorded call. Missing outcomes, errors and rejected
+/// calls are not filesystem evidence. Time and retained memory are linear in argument bytes;
+/// the shared mutation tracker assigns causal edit sequences without buffering the source.
+fn collect_file_mutation(
+    call: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    pending: &mut PendingFileMutations,
+    edits: &mut Vec<FileEdit>,
+) {
+    let Some(name) = call.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    let id = call.get("id").and_then(Value::as_str);
+    let Some(id) = id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if call
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status != "success")
+    {
+        return;
+    }
+    let Some(results) = call.get("result").and_then(Value::as_array) else {
+        return;
+    };
+    let mut success = false;
+    for response in results
+        .iter()
+        .filter_map(|part| part.get("functionResponse"))
+    {
+        if response.get("id").and_then(Value::as_str) != Some(id)
+            || response.get("name").and_then(Value::as_str) != Some(name)
+        {
+            continue;
+        }
+        let Some(response) = response.get("response") else {
+            continue;
+        };
+        if response.get("error").is_some() {
+            return;
+        }
+        success |= response.get("output").is_some();
+    }
+    if !success {
+        return;
+    }
+    pending.stage(
+        Some(id),
+        timestamp,
+        name,
+        file_mutation_payload(name, call.get("args")),
+    );
+    pending.finish(Some(id), true, edits);
+}
+
+fn file_mutation_payload(name: &str, args: Option<&Value>) -> Option<FileMutationPayload> {
+    let args = args?;
+    let path = args.get("file_path")?.as_str()?.to_string();
+    match name {
+        "write_file" => Some((
+            path,
+            Some(args.get("content")?.as_str()?.to_string()),
+            Vec::new(),
+        )),
+        "replace" => {
+            let old = args.get("old_string")?.as_str()?.to_string();
+            let new = args.get("new_string")?.as_str()?.to_string();
+            // Gemini uses empty old_string for file creation.
+            if old.is_empty() {
+                return Some((path, Some(new), Vec::new()));
+            }
+            let replace_all = args
+                .get("allow_multiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || args
+                    .get("expected_replacements")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| n > 1);
+            Some((
+                path,
+                None,
+                vec![EditOp {
+                    old,
+                    new,
+                    replace_all,
+                }],
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -1484,6 +1595,115 @@ fn read_json(path: PathBuf) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_file_mutations_match_results_in_json_and_jsonl() {
+        let calls = json!([
+            {"id":"w","name":"write_file","args":{"file_path":"/tmp/example.txt","content":"one one"},"status":"success",
+             "result":[{"functionResponse":{"id":"w","name":"write_file","response":{"output":"written"}}}]},
+            {"id":"r","name":"replace","args":{"file_path":"/tmp/example.txt","old_string":"one","new_string":"two","expected_replacements":2},
+             "result":[{"functionResponse":{"id":"r","name":"replace","response":{"output":"replaced"}}}]},
+            {"id":"bad","name":"write_file","args":{"file_path":"/tmp/bad.txt","content":"bad"},"status":"error",
+             "result":[{"functionResponse":{"id":"bad","name":"write_file","response":{"error":"denied"}}}]},
+            {"id":"rejected","name":"write_file","args":{"file_path":"/tmp/bad.txt","content":"bad"},"status":"cancelled"},
+            {"id":"missing","name":"write_file","args":{"file_path":"/tmp/bad.txt","content":"bad"},"status":"success"},
+            {"id":"mismatch","name":"write_file","args":{"file_path":"/tmp/bad.txt","content":"bad"},
+             "result":[{"functionResponse":{"id":"other","name":"write_file","response":{"output":"written"}}}]}
+        ]);
+        let record = json!({"id":"m","type":"gemini","content":[],"toolCalls":calls});
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        let legacy = adapter
+            .parse_raw(
+                Path::new("session-files.json"),
+                json!({"sessionId":"files","messages":[record.clone()]}).to_string(),
+            )
+            .unwrap();
+        let native = adapter
+            .parse_reader(
+                std::io::Cursor::new(format!(
+                    "{}\n{}\n",
+                    json!({"sessionId":"files","kind":"main"}),
+                    record
+                )),
+                Path::new("session-files.jsonl"),
+            )
+            .unwrap();
+        for parsed in [legacy, native] {
+            assert_eq!(parsed.file_edits.len(), 2, "{:?}", parsed.file_edits);
+            assert_eq!(
+                crate::files::reconstruct(&parsed.file_edits, 2).as_deref(),
+                Some("two two")
+            );
+            assert_eq!(parsed.file_edits[1].seq, 1);
+        }
+    }
+
+    #[test]
+    fn file_mutation_upgrade_and_rewind_preserve_indexed_edits() {
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        let path = Path::new("session-upgrade.json");
+        let parsed = adapter.parse_raw(path, json!({"sessionId":"upgrade","messages":[
+            {"id":"m","type":"gemini","content":[],"toolCalls":[
+                {"id":"w","name":"write_file","args":{"file_path":"/tmp/example.txt","content":"written"},
+                 "result":[{"functionResponse":{"id":"w","name":"write_file","response":{"output":"written"}}}]}
+            ]}]}).to_string()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        let mut old = parsed.clone();
+        old.file_edits.clear();
+        old.session.parse_version = "gemini-cli-v6".into();
+        db.upsert_session(&old, 1, 1).unwrap();
+        for generation in [2, 3] {
+            db.upsert_session(&parsed, generation, generation).unwrap();
+        }
+        let mut shortened = parsed.clone();
+        shortened.messages.clear();
+        shortened.file_edits.clear();
+        db.upsert_session(&shortened, 4, 4).unwrap();
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        let count: i64 = connection
+            .query_row("select count(*) from file_edits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let content: String = connection
+            .query_row("select new_content from file_edits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "written");
+    }
+
+    #[test]
+    fn native_file_mutations_follow_result_patches_and_active_tool_history() {
+        let records = r#"
+{"sessionId":"files","kind":"main"}
+{"id":"u","type":"user","content":"edit"}
+{"id":"m","type":"gemini","content":[],"toolCalls":[{"id":"w","name":"write_file","args":{"file_path":"/tmp/example.txt","content":"written"}}]}
+{"$patch":{"id":"m","toolCalls":[{"id":"w","result":[{"functionResponse":{"id":"w","name":"write_file","response":{"output":"written"}}}]}]}}
+"#;
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        let parse = |text: String| {
+            adapter
+                .parse_reader(std::io::Cursor::new(text), Path::new("session-files.jsonl"))
+                .unwrap()
+        };
+        assert_eq!(parse(records.to_string()).file_edits.len(), 1);
+        // Content masking does not change tool outcomes.
+        assert_eq!(
+            parse(format!(
+                "{records}\n{{\"$patch\":{{\"id\":\"m\",\"content\":[]}}}}"
+            ))
+            .file_edits
+            .len(),
+            1
+        );
+        let rewound = parse(format!("{records}\n{{\"$rewindTo\":\"m\"}}"));
+        assert!(rewound.file_edits.is_empty());
+        assert!(!rewound
+            .messages
+            .iter()
+            .any(|m| m.kind == MessageKind::ToolCall));
+        assert!(rewound.messages.iter().any(|m| m.content == "edit"));
+    }
 
     #[test]
     fn answer_output_preserves_numeric_question_order() {
