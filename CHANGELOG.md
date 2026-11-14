@@ -47,7 +47,9 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    preserve that override.
 5. Scripts can see fewer duplicate search results and file edits: Claude Code saved API request
    copies and repeated record identities no longer add extra turns or edits. Queued submissions
-   delivered as prompts count as those prompts; independent same-text submissions stay distinct.
+   delivered as prompts appear once with their recorded sender across intervening assistant turns;
+   independent same-text submissions stay distinct, including a dequeued direct delivery followed
+   by a later submission with the same text.
    Copied parent history in Codex forks stays searchable but does not count as new human input.
 6. Date input keeps the published UTC default and fixed-duration shorthand: `m` or `M` means
    30 days, and `y` or `Y` means 365 days. Use `min` for minutes, `mo` or `P1M` for calendar
@@ -190,7 +192,8 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    already did for transcripts that disappear. Parser upgrades reconcile matching rows while
    preserving archived messages and file edits. Codex compressed `.jsonl.zst` rollouts retain
    their identity; decompression failures preserve an existing index snapshot and remain
-   retryable.
+   retryable. Refresh adds new tool calls and hook notices when later transcript records are
+   rewritten in place, keeping archived history and sequence numbers.
 2. Literal and regex search find case pairs SQLite's tokenizer does not fold, including Cherokee,
    Georgian Mtavruli, Osage, and Adlam. A query ending in `i` also matches dotted capital `İ`.
 3. Equal session/sequence or timestamp keys have a stable tie-breaker for search, corrections,
@@ -205,13 +208,24 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    OpenClaw, Claude Code, and Cursor. JSONC/JSON5 comments and unrelated settings survive edits.
    Post-upgrade refresh relocates existing owned entries and preserves their executable paths.
    Gemini and Codex share a skill discovery link when their resolved paths match.
+   Recognized MCP registrations migrate on the first ordinary command after an upgrade even
+   without a skill install; set `[integrations] refresh_after_upgrade = false` to opt out.
+   Automatic migration preserves launch arguments such as `--index-refresh existing-only`, while
+   explicit `aise integrations install` regenerates them; unrecognized same-name entries stay
+   unchanged and `aise integrations status` reports them, and homes with nothing to migrate are
+   checked once per version when the check can be recorded.
 7. MCP registrations retain explicit application and harness paths across client restarts;
    reinstall preserves unrelated environment and fields. `aise config init` and package-update
    refresh retain selected database and cache paths. `aise migrate config` accepts its required
    `--cache-dir` and writes it to the converted configuration.
 8. File recovery errors identify the first version that cannot be reconstructed and the missing
-   information; earlier recoverable versions remain extractable. Codex forks omit copied parent
-   file edits when the parent transcript is available, and retain them when it is absent.
+   information; earlier recoverable versions remain extractable. Codex forks omit a copied file
+   edit only when an equivalent edit is retained in the index under a session in their ancestry,
+   including forks of forks; otherwise they keep their recoverable copy.
+9. Codex marketplace ownership is recorded at install: reinstall refuses files edited since
+   install, and uninstall preserves them.
+10. An index published by `aise migrate` returns to WAL on a later writable open when no other
+    process is using it.
 
 ### Performance
 
