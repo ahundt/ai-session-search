@@ -1,6 +1,62 @@
 // SPDX-FileCopyrightText: 2026 Andrew Hundt
 // SPDX-License-Identifier: Apache-2.0
 
+use super::health::{
+    RecordDisposition::{Ignored, Indexed},
+    RecordTypeRule,
+};
+
+// Native schema: packages/core/src/services/chatRecordingService.ts; console/network
+// are devtools transport events, not chat-recording turns.
+// Native discriminator inventory. Unlisted names are unknown and reported.
+pub(crate) const RECORD_TYPES: &[RecordTypeRule] = &[
+    ("user", Indexed("NativeReplay message user")),
+    ("gemini", Indexed("NativeReplay message gemini")),
+    ("warning", Indexed("NativeReplay message warning")),
+    ("info", Indexed("NativeReplay message info")),
+    ("error", Indexed("NativeReplay message error")),
+    (
+        "console",
+        Ignored("Devtools console transport logs are not chat turns"),
+    ),
+    (
+        "network",
+        Ignored("Devtools network transport logs are not chat turns"),
+    ),
+    (
+        "operation.$set",
+        Ignored("Snapshot/metadata envelope is replayed, with message types inspected separately"),
+    ),
+    (
+        "operation.$rewindTo",
+        Ignored("Active-history position bookkeeping is replayed, not a separate message"),
+    ),
+    (
+        "operation.$remove",
+        Ignored("Deletion-ID bookkeeping is replayed, not a separate message"),
+    ),
+    (
+        "operation.$patch",
+        Ignored("Content/tool-state edits are replayed, not separate messages"),
+    ),
+    (
+        "metadata.sessionId",
+        Ignored("Session identity metadata is not a chat turn"),
+    ),
+    (
+        "metadata.startTime",
+        Ignored("Session start metadata is not a chat turn"),
+    ),
+    (
+        "metadata.lastUpdated",
+        Ignored("Session clock metadata is not a chat turn"),
+    ),
+    (
+        "metadata.kind",
+        Ignored("Session-kind metadata is not a chat turn"),
+    ),
+];
+
 use std::collections::VecDeque;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;

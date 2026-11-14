@@ -23,9 +23,14 @@ def test_codex_unknown_record_inventory_matches_python_cli_and_mcp(
     sessions = tmp_path / "sessions"
     sessions.mkdir()
     (sessions / "rollout-cafe0000-cafe-cafe-cafe-000000000001.jsonl").write_text(
-        '{"type":"session_meta","payload":{"id":"synthetic-health"}}\n'
+        '{"type":"session_meta","payload":{"id":"cafe0000-cafe-cafe-cafe-000000000001"}}\n'
         '{"type":"future-kind","payload":{"content":"synthetic payload"}}\n'
         '{"type":"response_item","payload":{"type":"future-payload"}}\n'
+        '{"type":"world_state"}\n'
+        '{"type":"response_item","payload":{"type":"reasoning"}}\n'
+        '{"type":"event_msg","payload":{"type":"item_completed"}}\n'
+        + json.dumps({"type": "turn_context", "padding": "x" * (2 * 1024 * 1024)}) + "\n"
+        + '{"type":"future-kind"}\n'
     )
     config = tmp_path / "config.toml"
     config.write_text("\n".join(
@@ -47,7 +52,7 @@ def test_codex_unknown_record_inventory_matches_python_cli_and_mcp(
 
     run("reindex")
     expected = [
-        {"provider": "codex", "record_type": "future-kind", "records": 1, "sessions": 1},
+        {"provider": "codex", "record_type": "future-kind", "records": 2, "sessions": 1},
         {"provider": "codex", "record_type": "response_item.future-payload", "records": 1, "sessions": 1},
     ]
     python = aise.SessionSearch(tmp_path / "index.db").doctor().to_dict()
@@ -65,20 +70,28 @@ def test_codex_unknown_record_inventory_matches_python_cli_and_mcp(
             "name": "get_index_status", "arguments": {},
         }},
     ]
-    output = run("mcp", "serve", payload="".join(json.dumps(row) + "\n" for row in requests))
-    response = next(json.loads(line) for line in output.splitlines() if json.loads(line).get("id") == 2)
-    assert "error" not in response, response
-    result = response["result"]
-    assert not result.get("isError"), result
-    status = result.get("structuredContent") or json.loads(result["content"][0]["text"])
-    assert status["parser_health"]["unrecognized_record_types"] == expected
+    def check_mcp() -> None:
+        output = run("mcp", "serve", payload="".join(json.dumps(row) + "\n" for row in requests))
+        response = next(
+            json.loads(line) for line in output.splitlines() if json.loads(line).get("id") == 2
+        )
+        assert "error" not in response, response
+        result = response["result"]
+        assert not result.get("isError"), result
+        status = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+        assert status["parser_health"]["unrecognized_record_types"] == expected
+
+    check_mcp()
 
     # New unknown records must refresh health even when no searchable row is appended.
     transcript = next(sessions.glob("*.jsonl"))
     with transcript.open("a") as stream:
         stream.write('{"type":"future-kind"}\n')
-    expected[0]["records"] = 2
+    expected[0]["records"] = 3
     for _ in range(2):
         run("reindex")
         refreshed = json.loads(run("doctor", "--format", "json"))
         assert refreshed["parser_health"]["unrecognized_record_types"] == expected
+        python = aise.SessionSearch(tmp_path / "index.db").doctor().to_dict()
+        assert python["index_status"]["parser_health"]["unrecognized_record_types"] == expected
+        check_mcp()

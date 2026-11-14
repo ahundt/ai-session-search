@@ -2,6 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Adam Zhao
 // SPDX-License-Identifier: Apache-2.0
 
+use super::health::{RecordDisposition::Indexed, RecordTypeRule};
+
+// Native discriminator inventory. Unlisted names are unknown and reported.
+pub(crate) const RECORD_TYPES: &[RecordTypeRule] = &[
+    ("user", Indexed("message role user")),
+    ("assistant", Indexed("message role assistant")),
+];
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

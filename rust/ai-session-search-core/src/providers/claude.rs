@@ -52,61 +52,334 @@ pub(crate) fn claude_queue_scope(canonical_path: &str) -> String {
 /// of each message of each API request. Taking the role from `message.role` indexed every copy
 /// as another user or assistant turn and repeated its tool calls, tool results and file edits,
 /// so harness wrappers and repeated prompts reached corrections, repeats and user search.
-const MESSAGE_RECORD_TYPES: [&str; 3] = ["user", "assistant", "system"];
+use super::health::{
+    RecordDisposition::{Ignored, Indexed},
+    RecordTypeRule,
+};
 
-/// Record types Claude Code and Claude Desktop write that are deliberately not indexed: titles,
-/// modes, request bookkeeping, file-history snapshots, progress and status events, and the
-/// `api-request-blob` request copies; conversation and attachment text are read from their own
-/// records instead. A type
-/// in neither list is counted and named in the session's parse warning, so a new record kind
-/// appears in `aise doctor` instead of silently changing what is indexed.
-const IGNORED_RECORD_TYPES: [&str; 27] = [
-    "agent-name",
-    "ai-title",
-    "api-request",
-    "api-request-blob",
-    "api-request-shape",
-    "atis-latch",
-    "command_lifecycle",
-    "cost-state",
-    "custom-title",
-    "file-history-delta",
-    "file-history-snapshot",
-    "fork-context-ref",
-    "frame-link",
-    "mode",
-    "permission-mode",
-    "pr-link",
-    "progress",
-    "rate_limit_event",
-    "relocated",
-    "result",
-    "session-owner",
-    "started",
-    // Conversation-summary records from older Claude Code releases; no message content.
-    "summary",
-    "tool_progress",
-    "tool_use_summary",
-    "tools-used",
-    "worktree-state",
-];
-
-/// SDK system subtypes that describe state rather than searchable notices. In particular,
-/// progress descriptions repeat task prompts; permission requests carry tool input, not prose.
-const IGNORED_SYSTEM_SUBTYPES: &[&str] = &[
-    "init",
-    "status",
-    "thinking_tokens",
-    "task_progress",
-    "task_updated",
-    "compact_boundary",
-    "microcompact_boundary",
-    "turn_duration",
-    "stop_hook_summary",
-    "permission_request",
-    "permission_response",
-    "permission_auto_approved",
-    "commands_changed",
+// Native types and SDK/attachment subtypes. Unlisted names are unknown and reported.
+pub(crate) const RECORD_TYPES: &[RecordTypeRule] = &[
+    ("user", Indexed("conversation")),
+    ("assistant", Indexed("conversation")),
+    ("system", Indexed("conversation")),
+    ("attachment", Indexed("attachment dispatch")),
+    ("queue-operation", Indexed("queue-operation dispatch")),
+    ("last-prompt", Indexed("last-prompt dispatch")),
+    (
+        "agent-name",
+        Ignored("Display titles/names are not imported as conversation"),
+    ),
+    (
+        "ai-title",
+        Ignored("Display titles/names are not imported as conversation"),
+    ),
+    (
+        "api-request",
+        Ignored("Request bookkeeping and request copies are not indexed again"),
+    ),
+    (
+        "api-request-blob",
+        Ignored("Request bookkeeping and request copies are not indexed again"),
+    ),
+    (
+        "api-request-shape",
+        Ignored("Request bookkeeping and request copies are not indexed again"),
+    ),
+    (
+        "atis-latch",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "command_lifecycle",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "cost-state",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "custom-title",
+        Ignored("Display titles/names are not imported as conversation"),
+    ),
+    (
+        "file-history-delta",
+        Ignored("File-history snapshots are not imported as conversation"),
+    ),
+    (
+        "file-history-snapshot",
+        Ignored("File-history snapshots are not imported as conversation"),
+    ),
+    (
+        "fork-context-ref",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "frame-link",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "mode",
+        Ignored("Configuration state is not imported as conversation"),
+    ),
+    (
+        "permission-mode",
+        Ignored("Configuration state is not imported as conversation"),
+    ),
+    (
+        "pr-link",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "progress",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "rate_limit_event",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "relocated",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "result",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "session-owner",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "started",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "summary",
+        Ignored("Legacy summary bookkeeping is not imported independently of conversation"),
+    ),
+    (
+        "tool_progress",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "tool_use_summary",
+        Ignored("Legacy summary bookkeeping is not imported independently of conversation"),
+    ),
+    (
+        "tools-used",
+        Ignored("Harness state/status bookkeeping is not imported as conversation"),
+    ),
+    (
+        "worktree-state",
+        Ignored("Configuration state is not imported as conversation"),
+    ),
+    (
+        "system/init",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/status",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/thinking_tokens",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/task_progress",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/task_updated",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/compact_boundary",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/microcompact_boundary",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/turn_duration",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/stop_hook_summary",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/permission_request",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/permission_response",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/permission_auto_approved",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    (
+        "system/commands_changed",
+        Ignored("SDK state, progress and permission bookkeeping is not imported as a notice"),
+    ),
+    ("system/task_started", Indexed("SDK notice prompt")),
+    ("system/task_notification", Indexed("SDK notice summary")),
+    ("system/api_retry", Indexed("SDK notice error")),
+    ("system/permission_denied", Indexed("SDK notice message")),
+    (
+        "system/model_refusal_fallback",
+        Indexed("SDK notice content"),
+    ),
+    ("attachment/file", Indexed("attachment_file")),
+    ("attachment/edited_text_file", Indexed("attachment_file")),
+    ("attachment/nested_memory", Indexed("attachment_file")),
+    ("attachment/plan_file_reference", Indexed("attachment_file")),
+    ("attachment/directory", Indexed("attachment_file")),
+    ("attachment/invoked_skills", Indexed("attachment_file")),
+    ("attachment/dynamic_skill", Indexed("attachment_file")),
+    ("attachment/skill_mention", Indexed("attachment_file")),
+    ("attachment/instructions", Indexed("attachment_context")),
+    ("attachment/session_context", Indexed("attachment_context")),
+    ("attachment/diagnostics", Indexed("attachment_context")),
+    (
+        "attachment/hook_blocking_error",
+        Indexed("attachment_context"),
+    ),
+    (
+        "attachment/hook_non_blocking_error",
+        Indexed("attachment_context"),
+    ),
+    (
+        "attachment/hook_additional_context",
+        Indexed("attachment_context"),
+    ),
+    ("attachment/hook_cancelled", Indexed("attachment_context")),
+    (
+        "attachment/hook_permission_decision",
+        Indexed("attachment_context"),
+    ),
+    (
+        "attachment/async_hook_response",
+        Indexed("attachment_context"),
+    ),
+    (
+        "attachment/read_truncation_notice",
+        Indexed("attachment_context"),
+    ),
+    (
+        "attachment/max_turns_reached",
+        Indexed("attachment_context"),
+    ),
+    (
+        "attachment/session_cron_carry",
+        Ignored("Scheduled prompts already in indexed rows."),
+    ),
+    ("attachment/queued_command", Indexed("attachment_queued")),
+    (
+        "attachment/hook_success",
+        Ignored("High-volume hook success boilerplate."),
+    ),
+    (
+        "attachment/total_tokens_reminder",
+        Ignored("Token-budget boilerplate."),
+    ),
+    (
+        "attachment/hook_system_message",
+        Ignored("Messages mostly repeat indexed hook feedback."),
+    ),
+    (
+        "attachment/task_reminder",
+        Ignored("High-volume task-state snapshots; task operations stay indexed."),
+    ),
+    (
+        "attachment/environment",
+        Ignored("Environment metadata, not message content."),
+    ),
+    (
+        "attachment/deferred_tools_delta",
+        Ignored("Tool catalogue boilerplate."),
+    ),
+    (
+        "attachment/batching_reminder_sent",
+        Ignored("Batching instruction boilerplate."),
+    ),
+    (
+        "attachment/skill_listing",
+        Ignored("Repeated skill catalogue boilerplate."),
+    ),
+    (
+        "attachment/bash_output_audience_note",
+        Ignored("Shell output framing boilerplate."),
+    ),
+    (
+        "attachment/silent_turn_reminder",
+        Ignored("Turn instruction boilerplate."),
+    ),
+    (
+        "attachment/mcp_instructions_delta",
+        Ignored("MCP instruction boilerplate."),
+    ),
+    (
+        "attachment/agent_listing_delta",
+        Ignored("Agent catalogue boilerplate."),
+    ),
+    (
+        "attachment/compact_file_reference",
+        Ignored("File references already present in indexed rows."),
+    ),
+    ("attachment/auto_mode", Ignored("Automatic-mode settings.")),
+    ("attachment/prompt_snapshot", Indexed("attachment_context")),
+    (
+        "attachment/goal_status",
+        Ignored("Goal prose mostly repeats indexed instructions."),
+    ),
+    ("attachment/date", Ignored("Calendar metadata.")),
+    ("attachment/model", Ignored("Model identity metadata.")),
+    (
+        "attachment/credential_org",
+        Ignored("Credential organization metadata."),
+    ),
+    (
+        "attachment/command_permissions",
+        Ignored("Permission configuration metadata."),
+    ),
+    (
+        "attachment/deferred_tools_record",
+        Ignored("Tool schema catalogue boilerplate."),
+    ),
+    ("attachment/date_change", Ignored("Calendar metadata.")),
+    (
+        "attachment/task_status",
+        Ignored("Task descriptions already in indexed task rows."),
+    ),
+    ("attachment/budget_usd", Ignored("Numeric cost budget.")),
+    (
+        "attachment/thinking_drop",
+        Ignored("Reason codes and counters, not prose."),
+    ),
+    (
+        "attachment/plan_mode",
+        Ignored("Plan-mode instruction boilerplate."),
+    ),
+    (
+        "attachment/plan_mode_exit",
+        Ignored("Plan-mode transition boilerplate."),
+    ),
+    (
+        "attachment/plan_mode_reentry",
+        Ignored("Plan-mode transition boilerplate."),
+    ),
+    (
+        "attachment/workflow_keyword_request",
+        Ignored("Workflow instruction boilerplate."),
+    ),
+    (
+        "attachment/auto_mode_exit",
+        Ignored("Automatic-mode transition metadata."),
+    ),
 ];
 
 /// `raw_metadata_json` key holding counts of unrecognized record types and attachment layouts,
@@ -122,64 +395,20 @@ enum AttachmentPolicy {
     Skipped,
 }
 
-const ATTACHMENT_TYPES: &[(&str, AttachmentPolicy)] = &[
-    ("file", AttachmentPolicy::File),             // Attached file text.
-    ("edited_text_file", AttachmentPolicy::File), // Attached file snippet.
-    ("nested_memory", AttachmentPolicy::File),    // Memory file content needed for recovery.
-    ("plan_file_reference", AttachmentPolicy::File), // Plan text or its attached file reference.
-    ("directory", AttachmentPolicy::File),        // Attached directory listing.
-    ("invoked_skills", AttachmentPolicy::File),   // Invoked skill file contents.
-    ("dynamic_skill", AttachmentPolicy::File),    // Loaded skill file contents.
-    ("skill_mention", AttachmentPolicy::File),    // Mentioned skill contents or reference.
-    ("instructions", AttachmentPolicy::Context),  // Harness instruction files.
-    ("session_context", AttachmentPolicy::Context), // Harness session context.
-    ("diagnostics", AttachmentPolicy::Context),   // Diagnostics explain failures.
-    ("hook_blocking_error", AttachmentPolicy::Context), // Hook errors and commands explain blocked actions.
-    ("hook_non_blocking_error", AttachmentPolicy::Context), // Hook errors explain degraded actions.
-    ("hook_additional_context", AttachmentPolicy::Context), // Additional hook context is otherwise missing.
-    ("hook_cancelled", AttachmentPolicy::Context), // Cancellation messages explain interrupted hooks.
-    ("hook_permission_decision", AttachmentPolicy::Context), // Permission messages explain allowed or blocked actions.
-    ("async_hook_response", AttachmentPolicy::Context), // Asynchronous hook messages explain later actions.
-    ("read_truncation_notice", AttachmentPolicy::Context), // Truncation messages explain incomplete reads.
-    ("max_turns_reached", AttachmentPolicy::Context), // Turn-limit messages explain stopped sessions.
-    ("session_cron_carry", AttachmentPolicy::Skipped), // Scheduled prompts already in indexed rows.
-    ("queued_command", AttachmentPolicy::Queued), // Queued input is reconciled with submitted turns.
-    ("hook_success", AttachmentPolicy::Skipped),  // High-volume hook success boilerplate.
-    ("total_tokens_reminder", AttachmentPolicy::Skipped), // Token-budget boilerplate.
-    ("hook_system_message", AttachmentPolicy::Skipped), // Messages mostly repeat indexed hook feedback.
-    ("task_reminder", AttachmentPolicy::Skipped), // High-volume task-state snapshots; task operations stay indexed.
-    ("environment", AttachmentPolicy::Skipped),   // Environment metadata, not message content.
-    ("deferred_tools_delta", AttachmentPolicy::Skipped), // Tool catalogue boilerplate.
-    ("batching_reminder_sent", AttachmentPolicy::Skipped), // Batching instruction boilerplate.
-    ("skill_listing", AttachmentPolicy::Skipped), // Repeated skill catalogue boilerplate.
-    ("bash_output_audience_note", AttachmentPolicy::Skipped), // Shell output framing boilerplate.
-    ("silent_turn_reminder", AttachmentPolicy::Skipped), // Turn instruction boilerplate.
-    ("mcp_instructions_delta", AttachmentPolicy::Skipped), // MCP instruction boilerplate.
-    ("agent_listing_delta", AttachmentPolicy::Skipped), // Agent catalogue boilerplate.
-    ("compact_file_reference", AttachmentPolicy::Skipped), // File references already present in indexed rows.
-    ("auto_mode", AttachmentPolicy::Skipped),              // Automatic-mode settings.
-    ("prompt_snapshot", AttachmentPolicy::Context), // System prompt text explains the harness instructions.
-    ("goal_status", AttachmentPolicy::Skipped), // Goal prose mostly repeats indexed instructions.
-    ("date", AttachmentPolicy::Skipped),        // Calendar metadata.
-    ("model", AttachmentPolicy::Skipped),       // Model identity metadata.
-    ("credential_org", AttachmentPolicy::Skipped), // Credential organization metadata.
-    ("command_permissions", AttachmentPolicy::Skipped), // Permission configuration metadata.
-    ("deferred_tools_record", AttachmentPolicy::Skipped), // Tool schema catalogue boilerplate.
-    ("date_change", AttachmentPolicy::Skipped), // Calendar metadata.
-    ("task_status", AttachmentPolicy::Skipped), // Task descriptions already in indexed task rows.
-    ("budget_usd", AttachmentPolicy::Skipped),  // Numeric cost budget.
-    ("thinking_drop", AttachmentPolicy::Skipped), // Reason codes and counters, not prose.
-    ("plan_mode", AttachmentPolicy::Skipped),   // Plan-mode instruction boilerplate.
-    ("plan_mode_exit", AttachmentPolicy::Skipped), // Plan-mode transition boilerplate.
-    ("plan_mode_reentry", AttachmentPolicy::Skipped), // Plan-mode transition boilerplate.
-    ("workflow_keyword_request", AttachmentPolicy::Skipped), // Workflow instruction boilerplate.
-    ("auto_mode_exit", AttachmentPolicy::Skipped), // Automatic-mode transition metadata.
-];
+fn record_disposition(scope: &str, name: &str) -> Option<super::health::RecordDisposition> {
+    RECORD_TYPES.iter().find_map(|(known, disposition)| {
+        super::health::scoped_name_matches(known, scope, name).then_some(*disposition)
+    })
+}
 
 fn attachment_policy(kind: &str) -> Option<AttachmentPolicy> {
-    ATTACHMENT_TYPES
-        .iter()
-        .find_map(|(name, policy)| (*name == kind).then_some(*policy))
+    match record_disposition("attachment/", kind)? {
+        Indexed("attachment_file") => Some(AttachmentPolicy::File),
+        Indexed("attachment_context") => Some(AttachmentPolicy::Context),
+        Indexed("attachment_queued") => Some(AttachmentPolicy::Queued),
+        Ignored(_) => Some(AttachmentPolicy::Skipped),
+        Indexed(_) => unreachable!("attachment table must name its dispatch arm"),
+    }
 }
 
 const ATTACHMENT_ID_PREFIX: &str = "claude_attachment:";
@@ -918,7 +1147,14 @@ impl ClaudeAdapter {
                         "api_retry" => "error",
                         "permission_denied" => "message",
                         "model_refusal_fallback" => "content",
-                        subtype if IGNORED_SYSTEM_SUBTYPES.contains(&subtype) => continue,
+                        subtype
+                            if matches!(
+                                record_disposition("system/", subtype),
+                                Some(Ignored(_))
+                            ) =>
+                        {
+                            continue
+                        }
                         subtype => {
                             unrecognized.count(Some(&format!("system/{subtype}")));
                             continue;
@@ -939,12 +1175,14 @@ impl ClaudeAdapter {
                 None
             };
             // The one place that decides what a record may produce, by its type. A record of any
-            // type outside `MESSAGE_RECORD_TYPES` yields no message, tool call, tool result or
+            // type outside the conversation table entries yields no message, tool call, tool result or
             // file edit, whatever fields it carries; see that constant for why.
             let retract = match record_type {
-                Some(kind) if MESSAGE_RECORD_TYPES.contains(&kind) => event_id.is_some_and(|id| {
-                    !seen_records.insert((id.to_owned(), sha256(value.to_string().as_bytes())))
-                }),
+                Some(kind) if record_disposition("", kind) == Some(Indexed("conversation")) => {
+                    event_id.is_some_and(|id| {
+                        !seen_records.insert((id.to_owned(), sha256(value.to_string().as_bytes())))
+                    })
+                }
                 Some("last-prompt") => {
                     if let Some(prompt) = value.get("lastPrompt").and_then(Value::as_str) {
                         let prompt = prompt.trim();
@@ -1130,7 +1368,7 @@ impl ClaudeAdapter {
                     }
                     continue;
                 }
-                Some(kind) if IGNORED_RECORD_TYPES.contains(&kind) => true,
+                Some(kind) if matches!(record_disposition("", kind), Some(Ignored(_))) => true,
                 other => {
                     unrecognized.count(other);
                     continue;
@@ -5566,16 +5804,23 @@ mod tests {
 
     #[test]
     fn attachment_classification_leaves_only_new_types_in_health() {
-        use super::{AttachmentPolicy, ATTACHMENT_TYPES};
-        let names = ATTACHMENT_TYPES
+        use super::{AttachmentPolicy, RECORD_TYPES};
+        let attachments = RECORD_TYPES
+            .iter()
+            .filter_map(|(name, _)| {
+                name.strip_prefix("attachment/")
+                    .map(|kind| (kind, super::attachment_policy(kind).unwrap()))
+            })
+            .collect::<Vec<_>>();
+        let names = attachments
             .iter()
             .map(|(name, _)| name)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ATTACHMENT_TYPES.len(), 51);
+        assert_eq!(attachments.len(), 51);
         assert_eq!(names.len(), 51);
         let mut rows = super::AttachmentRows::default();
         let mut health = super::UnrecognizedRecordTypes::default();
-        for (kind, policy) in ATTACHMENT_TYPES {
+        for (kind, policy) in &attachments {
             if *policy == AttachmentPolicy::Skipped {
                 for _ in 0..100 {
                     rows.read(&json!({"attachment":{"type":kind}}), &mut health);
