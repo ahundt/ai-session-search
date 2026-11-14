@@ -160,15 +160,20 @@ fn reconstruct_version(edits: &[FileEdit], version: usize) -> Result<String> {
                 index + 1
             );
         }
-        apply_edits(&mut content, &edit.edits)
+        apply_edits(&mut content, edit)
             .map_err(|reason| anyhow!("version {} cannot be rebuilt: {reason}", index + 1))?;
     }
     Ok(content)
 }
 
 /// Apply replacements in order; an error names why a requested replacement cannot be replayed.
-fn apply_edits(content: &mut String, edits: &[EditOp]) -> std::result::Result<(), &'static str> {
-    for op in edits {
+fn apply_edits(content: &mut String, edit: &FileEdit) -> std::result::Result<(), &'static str> {
+    // Prime kernel display diffs carry positions that EditOp cannot express. This also
+    // protects archived diffs parsed before positional evidence was accounted for.
+    if edit.tool == "ipython" {
+        return Err("ipython display diff positions cannot be replayed");
+    }
+    for op in &edit.edits {
         if op.old.is_empty() {
             return Err("replacement old text is empty");
         }
@@ -194,7 +199,7 @@ fn advance_reconstruction(content: &mut Option<String>, edit: &FileEdit) {
     } else if edit.edits.is_empty()
         || !content
             .as_mut()
-            .is_some_and(|current| apply_edits(current, &edit.edits).is_ok())
+            .is_some_and(|current| apply_edits(current, edit).is_ok())
     {
         *content = None;
     }
