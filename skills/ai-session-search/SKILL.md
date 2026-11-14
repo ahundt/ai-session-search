@@ -149,6 +149,10 @@ selectivity to improve by anchoring on a rarer literal. Per-tool complexity boun
 fields, and what the corpus count costs are in
 [references/search-costs-and-receipts.md](references/search-costs-and-receipts.md).
 
+After an MCP `search_messages` call that sets filters, compare `effective_request` in the result
+with what you sent. A client can drop a misspelled or unsupported parameter before the server
+receives it; the search then runs without that filter and the result shows no error.
+
 ## 6. Commands by task
 
 ### List recent sessions by metadata, then read them
@@ -186,6 +190,9 @@ aise messages search 'timeout|lock|busy' --query-mode regex --limit 20 --lines-p
 aise messages search "approximate remembered wording" --query-mode fuzzy --limit 20
 aise messages search misunderstood --role user --when 14d --limit 20 --context 2
 aise messages search "CANNOT STOP" --kinds harness-notice --when 2d --limit 20
+# What the harness denied in one session, then the tool call each denial answered:
+aise messages search 'denied|blocked|not allowed' --query-mode regex --kinds harness-notice --session-id SESSION_ID --limit 50 --lines-per-message 3
+aise messages get SESSION_ID --seq 42 --context 2 --kinds conversation,harness-notice
 aise messages search exec --field tool-name --query-mode fuzzy --limit 20
 aise messages search "cargo test" --field tool-argument --argument-path /cmd --limit 20
 aise messages search "cargo test" --field tool-argument --argument-path /command --tool-name-contains Bash --limit 20
