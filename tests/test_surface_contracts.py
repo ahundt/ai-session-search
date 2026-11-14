@@ -127,3 +127,7 @@ def test_rust_result_fields_reach_native_wrappers() -> None:
             fields = {"timestamp" if field == "ts" else field for field in fields}
             python_fields = set(re.findall(r"^    (\w+):", native[1], re.M))
             assert fields <= python_fields, (name, fields - python_fields)
+            serializer = re.search(rf"python_value! \{{ Native{name},(.*?)(?=\n\n|\Z)", binding, re.S)
+            assert serializer, name
+            emitted = set(re.findall(r'"(\w+)"', serializer[1]))
+            assert fields <= emitted, (name, "to_dict", fields - emitted)
