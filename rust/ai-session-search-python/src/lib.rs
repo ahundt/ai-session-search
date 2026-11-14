@@ -2862,6 +2862,8 @@ impl MessageScopeInput {
             Self::Shared(scope) => MessageScope {
                 providers: scope.provider.map(|provider| vec![provider]),
                 session_id: scope.session_id,
+                session_kinds: None,
+                parent_session_id: None,
                 workspace_path_prefix: scope.path_prefix,
                 transcript_path_prefix: None,
                 exclusions: MessageExclusions {
@@ -2937,6 +2939,9 @@ python_value! { MessageExclusions, slf => value_fields(slf.as_any(), &["workspac
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageScope {
     providers: Option<Vec<Provider>>,
+    session_kinds: Option<Vec<SessionKind>>,
+    #[pyo3(get)]
+    parent_session_id: Option<String>,
     #[pyo3(get)]
     session_id: Option<String>,
     #[pyo3(get)]
@@ -2947,12 +2952,15 @@ struct MessageScope {
     dates: DateRange,
 }
 
-python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","session_id","workspace_path_prefix","transcript_path_prefix","exclusions","dates"]);
+python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","session_id","session_kinds","parent_session_id","workspace_path_prefix","transcript_path_prefix","exclusions","dates"]);
     #[new]
-    #[pyo3(signature = (*, providers=None, session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, providers=None, session_id=None, session_kinds=None, parent_session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
     fn new(
         providers: Option<Vec<String>>,
         session_id: Option<String>,
+        session_kinds: Option<Vec<String>>,
+        parent_session_id: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
         workspace_path_prefix: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
@@ -2962,12 +2970,19 @@ python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","s
     ) -> PyResult<Self> {
         Ok(Self {
             providers: parse_provider_set(providers)?,
+            session_kinds: parse_session_kinds(session_kinds)?,
+            parent_session_id,
             session_id,
             workspace_path_prefix,
             transcript_path_prefix,
             exclusions: exclusions.unwrap_or_default(),
             dates: dates.unwrap_or_default(),
         })
+    }
+
+    #[getter]
+    fn session_kinds(&self) -> Option<Vec<String>> {
+        self.session_kinds.as_ref().map(|kinds| kinds.iter().map(|kind| kind.as_str().to_owned()).collect())
     }
 
     #[getter]
@@ -3046,7 +3061,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None, query_mode=None, provider=None, session_id=None, path_prefix=None, dates=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None, query_mode=None, provider=None, session_id=None, path_prefix=None, dates=None, session_kinds=None, parent_session_id=None))]
     fn new(
         scope: Option<MessageScopeInput>,
         role: Option<&str>,
@@ -3079,16 +3094,23 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
         #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         dates: Option<DateRange>,
+        session_kinds: Option<Vec<String>>,
+        parent_session_id: Option<String>,
     ) -> PyResult<Self> {
         if query_mode.as_deref().is_some_and(|mode| !matches!(mode, "literal" | "regex" | "fuzzy")) {
             return Err(invalid_argument_error("query_mode must be literal, regex, or fuzzy"));
         }
-        if scope.is_some() && (provider.is_some() || session_id.is_some() || path_prefix.is_some() || dates.is_some()) {
-            return Err(invalid_argument_error("scope cannot be combined with flat provider, session_id, path_prefix, or dates filters"));
+        if scope.is_some() && (provider.is_some() || session_id.is_some() || path_prefix.is_some() || dates.is_some() || session_kinds.is_some() || parent_session_id.is_some()) {
+            return Err(invalid_argument_error("scope cannot be combined with flat provider, session_id, path_prefix, dates, session_kinds, or parent_session_id filters"));
         }
         let scope = match scope {
             Some(scope) => scope.into_scope(),
-            None => MessageScopeInput::Shared(QueryScope::new(provider, session_id, path_prefix, None, dates)?).into_scope(),
+            None => {
+                let mut scope = MessageScopeInput::Shared(QueryScope::new(provider, session_id, path_prefix, None, dates)?).into_scope();
+                scope.session_kinds = parse_session_kinds(session_kinds)?;
+                scope.parent_session_id = parent_session_id;
+                scope
+            },
         };
         let nonnegative = |name: &'static str, value: Option<i64>| -> PyResult<Option<usize>> {
             value
@@ -3368,6 +3390,12 @@ impl MessageSearchRequest {
         }
         if let Some(value) = self.scope.session_id {
             builder = builder.session_id(value).map_err(value_error)?;
+        }
+        if let Some(kinds) = self.scope.session_kinds {
+            builder = builder.session_kinds(kinds);
+        }
+        if let Some(parent) = self.scope.parent_session_id {
+            builder = builder.parent_session_id(parent).map_err(value_error)?;
         }
         if let Some(value) = self.scope.workspace_path_prefix {
             builder = builder.workspace_path_prefix(value).map_err(value_error)?;

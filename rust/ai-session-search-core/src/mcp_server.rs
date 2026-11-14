@@ -3458,6 +3458,8 @@ fn message_search_mcp_fields(parameter: MessageSearchParameter) -> &'static [&'s
         MessageSearchParameter::Kinds => &["kind", "kinds"],
         MessageSearchParameter::Providers => &["providers"],
         MessageSearchParameter::SessionId => &["session_id"],
+        MessageSearchParameter::SessionKinds => &["session_kinds"],
+        MessageSearchParameter::ParentSessionId => &["parent_session_id"],
         MessageSearchParameter::WorkspacePathPrefix => &["workspace_path_prefix"],
         MessageSearchParameter::TranscriptPathPrefix => &["transcript_path_prefix"],
         MessageSearchParameter::ExcludeWorkspacePathPrefixes => {
@@ -3600,6 +3602,16 @@ const MESSAGE_SEARCH_MCP_FIELDS: &[(&str, MessageSearchParameter, McpFieldRole)]
     (
         "providers",
         MessageSearchParameter::Providers,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "session_kinds",
+        MessageSearchParameter::SessionKinds,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "parent_session_id",
+        MessageSearchParameter::ParentSessionId,
         McpFieldRole::Canonical,
     ),
     (
@@ -4558,6 +4570,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
                         "argument_path": { "type": "string" },
                         "providers": provider_set_schema(&provider_values),
+                        "session_kinds": session_kinds_schema(),
+                        "parent_session_id": parent_session_id_schema(),
                         "tool_name_contains": { "type": "string" },
                         "session_id": { "type": "string" },
                         "workspace_path_prefix": { "type": "string" },
@@ -6546,6 +6560,14 @@ fn tool_search_messages_cancellable(
     if let Some(providers) = parse_enum_array::<Provider>(args, "providers")? {
         builder = builder
             .providers(providers)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(kinds) = parse_enum_array(args, "session_kinds")? {
+        builder = builder.session_kinds(kinds);
+    }
+    if let Some(parent) = args.get("parent_session_id").and_then(Value::as_str) {
+        builder = builder
+            .parent_session_id(parent)
             .map_err(|error| error.to_string())?;
     }
     if let Some(session) = args.get("session_id").and_then(Value::as_str) {
@@ -15556,7 +15578,7 @@ mod tests {
             advertised.difference(&accepted).collect::<Vec<_>>(),
             accepted.difference(&advertised).collect::<Vec<_>>()
         );
-        assert_eq!(advertised.len(), 37, "{advertised:?}");
+        assert_eq!(advertised.len(), 39, "{advertised:?}");
 
         // `offset` is the field an earlier design proposed hiding. It cannot be hidden: the
         // response tells callers to send it back, so concealing it would publish an instruction

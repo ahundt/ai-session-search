@@ -2947,7 +2947,7 @@ impl<'db> MessageService<'db> {
         config: &Config,
         surface: SearchSurface,
         request: MessageSearchRequest,
-        resolve_session: impl FnOnce(&str) -> Result<SessionRecord>,
+        resolve_session: impl Fn(&str) -> Result<SessionRecord>,
     ) -> Result<MessageSearchPlan> {
         let purpose = request
             .purpose()
@@ -3239,7 +3239,12 @@ impl<'db> MessageService<'db> {
         };
 
         let predicates = request.predicates();
-        let resolved_session = predicates.session().map(resolve_session).transpose()?;
+        let resolved_session = predicates.session().map(&resolve_session).transpose()?;
+        let parent_session_id = predicates
+            .parent_session_id()
+            .map(&resolve_session)
+            .transpose()?
+            .map(|session| session.id);
         if let (Some(session), Some(providers)) = (&resolved_session, predicates.providers()) {
             if !providers.contains(&session.provider) {
                 let selected = providers
@@ -3264,6 +3269,8 @@ impl<'db> MessageService<'db> {
             role: predicates.role(),
             kinds: predicates.kinds().map(<[_]>::to_vec),
             providers: predicates.providers().map(<[_]>::to_vec),
+            session_kinds: predicates.session_kinds().map(<[_]>::to_vec),
+            parent_session_id,
             session_id,
             workspace_path_prefix: predicates.workspace_path_prefix().map(normalize),
             transcript_path_prefix: predicates.transcript_path_prefix().map(normalize),

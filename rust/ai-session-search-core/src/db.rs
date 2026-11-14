@@ -3318,6 +3318,8 @@ impl Db {
                 .map(|pointer| pointer.as_str().to_string()),
             providers: plan.predicates.providers.clone(),
             session_id: plan.predicates.session_id.clone(),
+            session_kinds: plan.predicates.session_kinds.clone(),
+            parent_session_id: plan.predicates.parent_session_id.clone(),
             workspace_path_prefix: plan.predicates.workspace_path_prefix.clone(),
             transcript_path_prefix: plan.predicates.transcript_path_prefix.clone(),
             exclude_workspace_path_prefixes: plan
@@ -6905,7 +6907,13 @@ fn append_message_filters_with_class(
         sql.push_str(" and m.session_id = ?");
         args.push(Value::Text(session_id.clone()));
     }
-    push_message_session_kinds(sql, "m.session_id", filters.session_kinds.as_ref());
+    push_message_session_kinds(
+        sql,
+        args,
+        "m.session_id",
+        filters.session_kinds.as_ref(),
+        filters.parent_session_id.as_deref(),
+    );
     push_access_scope(sql, args, "m.session_id", access);
     push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "m.session_id", &filters.exclude_path_prefixes);
@@ -9207,25 +9215,29 @@ fn push_session_kinds(sql: &mut String, filters: &SearchFilters) {
 /// `<id_col> in (select id from sessions where ...)` shape `push_path_prefix` uses.
 fn push_message_session_kinds(
     sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
     id_col: &str,
     session_kinds: Option<&Vec<crate::models::SessionKind>>,
+    parent_session_id: Option<&str>,
 ) {
     use std::fmt::Write as _;
-    let Some(selected) = session_kinds else {
-        // None = every class, which is what `messages search` and `list` already return.
-        return;
-    };
-    let Some(predicate) = session_kind_predicate(selected, "sessions") else {
-        return;
-    };
-    if predicate == "0" {
+    let predicate = session_kinds.and_then(|selected| session_kind_predicate(selected, "sessions"));
+    if predicate.as_deref() == Some("0") {
         sql.push_str(" and 0");
         return;
     }
-    let _ = write!(
-        sql,
-        " and {id_col} in (select id from sessions where {predicate})"
-    );
+    if predicate.is_none() && parent_session_id.is_none() {
+        return;
+    }
+    // One scan of sessions for both selectors, independent of child count. SQL text adds
+    // at most one class clause and one parent bind; SQLite owns the O(children) ID set.
+    let _ = write!(sql, " and {id_col} in (select id from sessions where ");
+    sql.push_str(predicate.as_deref().unwrap_or("1 = 1"));
+    if let Some(parent) = parent_session_id {
+        sql.push_str(" and parent_session_id = ?");
+        args.push(rusqlite::types::Value::Text(parent.to_owned()));
+    }
+    sql.push(')');
 }
 
 /// Append closed-interval overlap predicates for a session's known indexed span.
@@ -24929,6 +24941,20 @@ mod tests {
         vec![
             ("default", MessageFilters::default()),
             (
+                "session_kinds",
+                MessageFilters {
+                    session_kinds: Some(vec![crate::models::SessionKind::Subagent]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "parent_session",
+                MessageFilters {
+                    parent_session_id: Some("claude:s1".into()),
+                    ..Default::default()
+                },
+            ),
+            (
                 "role",
                 MessageFilters {
                     role: Some(Role::User),
@@ -25024,6 +25050,135 @@ mod tests {
         .filter_map(Result::ok)
         .collect::<Vec<_>>()
         .join(" | ")
+    }
+
+    #[test]
+    fn session_selectors_keep_message_plans_index_backed() {
+        check_session_selector_plans(12, 4, false);
+    }
+
+    #[test]
+    #[ignore = "100k-message measurement; run explicitly and record samples outside the test suite"]
+    fn session_selectors_keep_message_plans_index_backed_at_scale() {
+        check_session_selector_plans(502, 200, true);
+    }
+
+    fn check_session_selector_plans(sessions: i64, messages_per_session: i64, measure: bool) {
+        use crate::models::SessionKind;
+        use std::time::Instant;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // Every mode sees the same text, so corpus/candidate counts are independent of
+        // page look-ahead. Only the explicitly ignored measurement creates a large fixture.
+        db.conn.execute_batch(&format!(
+            "begin;
+             with recursive n(x) as (values(0) union all select x+1 from n where x<{})
+             insert into sessions(id,provider,provider_session_id,source_path,preview_text,parse_version,discovery_source,parent_session_id)
+             select 'claude:scale-'||x,'claude',cast(x as text),'/synthetic/'||x,'','test','fixture',
+                    case when x>=2 then 'claude:scale-'||(x%2) end from n;
+             with recursive n(x) as (values(0) union all select x+1 from n where x<{})
+             insert into messages(session_id,provider,seq,role,kind,content)
+             select s.id,'claude',n.x,'assistant','conversation','indexed needle '||n.x from sessions s cross join n;
+             commit;", sessions - 1, messages_per_session - 1
+        )).unwrap();
+        for mode in [
+            MessageSearchMode::Literal,
+            MessageSearchMode::Regex,
+            MessageSearchMode::Fuzzy,
+        ] {
+            for (name, kinds, parent, count) in [
+                ("both", None, None, sessions * messages_per_session),
+                (
+                    "subagent",
+                    Some(vec![SessionKind::Subagent]),
+                    None,
+                    (sessions - 2) * messages_per_session,
+                ),
+                (
+                    "parent",
+                    None,
+                    Some("claude:scale-0".to_owned()),
+                    (sessions - 2) / 2 * messages_per_session,
+                ),
+                (
+                    "combined",
+                    Some(vec![SessionKind::Subagent]),
+                    Some("claude:scale-0".to_owned()),
+                    (sessions - 2) / 2 * messages_per_session,
+                ),
+            ] {
+                let filters = MessageFilters {
+                    session_kinds: kinds,
+                    parent_session_id: parent,
+                    match_mode: mode,
+                    limit: 50,
+                    ..Default::default()
+                };
+                let (sql, args) = if mode == MessageSearchMode::Fuzzy {
+                    let mut sql = String::from("select m.id from messages m where 1 = 1");
+                    let mut args = Vec::new();
+                    append_message_filters(&mut sql, &mut args, &filters, &db.access_scope);
+                    sql.push_str(MessageOrder::OldestFirst.order_by_clause());
+                    (sql, args)
+                } else {
+                    let prepared = db
+                        .prepare_non_fuzzy_message_query(
+                            "indexed needle",
+                            &filters,
+                            true,
+                            MessageOrder::OldestFirst,
+                        )
+                        .unwrap();
+                    assert_eq!(prepared.explain.as_ref().unwrap().corpus, count);
+                    assert_eq!(prepared.explain.as_ref().unwrap().candidates, Some(count));
+                    (prepared.sql, prepared.args)
+                };
+                let plan = query_plan(&db, &sql, &args);
+                assert!(
+                    sql.len() < 10_000 && args.len() < 16,
+                    "SQL must not grow with child count"
+                );
+                if mode != MessageSearchMode::Fuzzy {
+                    assert!(plan.contains("messages_trigram"), "{mode:?}/{name}: {plan}");
+                }
+                for step in plan.split(" | ") {
+                    if step.contains("SCAN m ") || step.contains("SEARCH m ") {
+                        assert!(
+                            step.contains("INDEX") || step.contains("PRIMARY KEY"),
+                            "{mode:?}/{name}: {plan}"
+                        );
+                    }
+                }
+                let mut elapsed = Vec::new();
+                for _ in 0..if measure { 3 } else { 1 } {
+                    let start = measure.then(Instant::now);
+                    let (hits, explain) = db
+                        .search_messages_with_explain("indexed needle", &filters, true)
+                        .unwrap();
+                    let explain = explain.unwrap();
+                    if let Some(start) = start {
+                        elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    assert_eq!(hits.len(), 50.min(count as usize));
+                    assert_eq!(explain.corpus, count);
+                    assert_eq!(explain.candidates, Some(count));
+                    if filters.parent_session_id.is_some() {
+                        assert!(hits.iter().all(|hit| hit
+                            .session_id
+                            .strip_prefix("claude:scale-")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap()
+                            % 2
+                            == 0));
+                    }
+                }
+                if measure {
+                    elapsed.sort_by(f64::total_cmp);
+                    println!("SCALE {mode:?}/{name}: median_ms={:.3}; corpus={count}; sql_bytes={}; binds={}; plan={plan}", elapsed[1], sql.len(), args.len());
+                }
+            }
+        }
     }
 
     #[test]

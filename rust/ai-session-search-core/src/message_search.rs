@@ -762,6 +762,8 @@ pub struct MessagePredicates {
     kinds: Option<Vec<MessageKind>>,
     providers: Option<Vec<Provider>>,
     session: Option<NonEmptyValue>,
+    session_kinds: Option<Vec<crate::models::SessionKind>>,
+    parent_session_id: Option<NonEmptyValue>,
     workspace_path_prefix: Option<NonEmptyValue>,
     transcript_path_prefix: Option<NonEmptyValue>,
     exclude_workspace_path_prefixes: Vec<NonEmptyValue>,
@@ -780,6 +782,8 @@ impl Default for MessagePredicates {
             kinds: None,
             providers: None,
             session: None,
+            session_kinds: None,
+            parent_session_id: None,
             workspace_path_prefix: None,
             transcript_path_prefix: None,
             exclude_workspace_path_prefixes: Vec::new(),
@@ -809,6 +813,14 @@ impl MessagePredicates {
 
     pub fn session(&self) -> Option<&str> {
         self.session.as_ref().map(NonEmptyValue::as_str)
+    }
+
+    pub fn session_kinds(&self) -> Option<&[crate::models::SessionKind]> {
+        self.session_kinds.as_deref()
+    }
+
+    pub fn parent_session_id(&self) -> Option<&str> {
+        self.parent_session_id.as_ref().map(NonEmptyValue::as_str)
     }
 
     pub fn workspace_path_prefix(&self) -> Option<&str> {
@@ -949,6 +961,8 @@ pub enum MessageSearchParameter {
     Kinds,
     Providers,
     SessionId,
+    SessionKinds,
+    ParentSessionId,
     WorkspacePathPrefix,
     TranscriptPathPrefix,
     ExcludeWorkspacePathPrefixes,
@@ -982,6 +996,8 @@ impl MessageSearchParameter {
             Self::Kinds => "kinds",
             Self::Providers => "providers",
             Self::SessionId => "session_id",
+            Self::SessionKinds => "session_kinds",
+            Self::ParentSessionId => "parent_session_id",
             Self::WorkspacePathPrefix => "workspace_path_prefix",
             Self::TranscriptPathPrefix => "transcript_path_prefix",
             Self::ExcludeWorkspacePathPrefixes => "exclude_workspace_path_prefixes",
@@ -1350,6 +1366,18 @@ impl MessageSearchParameterRegistry {
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
+                MessageSearchParameter::SessionKinds,
+                "Classes; [] matches none; with parent, nonempty needs subagent.",
+                set_domain(serialized_variants::<crate::models::SessionKind>()),
+                MessageSearchOmission::AllEligible,
+            ),
+            parameter(
+                MessageSearchParameter::ParentSessionId,
+                "Direct children of session ID/prefix.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::AllEligible,
+            ),
+            parameter(
                 MessageSearchParameter::SessionId,
                 "One session by ID or prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
@@ -1644,6 +1672,8 @@ pub(crate) struct ResolvedMessagePredicates {
     pub(crate) kinds: Option<Vec<MessageKind>>,
     pub(crate) providers: Option<Vec<Provider>>,
     pub(crate) session_id: Option<String>,
+    pub(crate) session_kinds: Option<Vec<crate::models::SessionKind>>,
+    pub(crate) parent_session_id: Option<String>,
     pub(crate) workspace_path_prefix: Option<String>,
     pub(crate) transcript_path_prefix: Option<String>,
     pub(crate) exclude_workspace_path_prefixes: Vec<String>,
@@ -3334,6 +3364,13 @@ impl MessageSearchRequest {
     }
 
     fn validate(&self) -> Result<(), MessageSearchError> {
+        crate::models::SearchFilters {
+            session_kinds: self.predicates.session_kinds.clone(),
+            parent_session_id: self.predicates.parent_session_id().map(str::to_owned),
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|error| MessageSearchError::Conflict(error.to_string()))?;
         if self.presentation.detail.is_some()
             && (self.presentation.message_lines.is_some()
                 || self.presentation.field_view.is_some()
@@ -3441,6 +3478,22 @@ impl MessageSearchRequestBuilder {
         providers.sort_unstable_by_key(|provider| provider.as_str());
         providers.dedup();
         self.request.predicates.providers = Some(providers);
+        Ok(self)
+    }
+
+    /// Select session classes using the same set semantics as session search; empty matches none.
+    pub fn session_kinds(mut self, kinds: Vec<crate::models::SessionKind>) -> Self {
+        self.request.predicates.session_kinds = Some(kinds);
+        self
+    }
+
+    /// Keep direct children of this session, resolving canonical IDs and unique prefixes.
+    pub fn parent_session_id(
+        mut self,
+        parent: impl Into<String>,
+    ) -> Result<Self, MessageSearchError> {
+        self.request.predicates.parent_session_id =
+            Some(NonEmptyValue::new("parent_session_id", parent)?);
         Ok(self)
     }
 

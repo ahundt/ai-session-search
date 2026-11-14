@@ -60,6 +60,7 @@ These are shipped defaults from an empty configuration. Positive `limit` counts 
 | `role` | `user`, `assistant`, `tool`, `slash`, `compaction` | `all_eligible` |
 | `kinds` | `conversation`, `compaction`, `tool_call`, `tool_result`, `harness_notice`, `unknown` | `typed_default` |
 | `providers` | `claude`, `claude-desktop`, `codex`, `cursor`, `antigravity`, `pi`, `prime-agent`, `aistudio`, `gemini-cli` | `all_eligible` |
+| `session_kinds` | `user`, `subagent` | `all_eligible` |
 | `match_window` | `earliest`, `latest` | `typed_default` |
 | `detail` | `compact`, `full` | `surface_policy` |
 | `field_view` | `no_char_limit`, `max_chars {max_chars: positive_character_count}` | `surface_policy` |

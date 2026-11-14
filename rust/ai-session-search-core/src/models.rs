@@ -1590,6 +1590,8 @@ pub struct MessageFilters {
     /// `crate::db::Db::find_corrections`, which forces `User` for the same reason it forces
     /// `Role::User`.
     pub session_kinds: Option<Vec<SessionKind>>,
+    /// Restrict messages to direct children of this canonical session ID.
+    pub parent_session_id: Option<String>,
     /// Maximum messages returned. 0 (the default) returns every match; fuzzy matching requires
     /// a positive limit.
     pub limit: usize,
