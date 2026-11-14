@@ -576,6 +576,9 @@ impl CodexAdapter {
                         .or_else(|| payload.get("event_type"))
                         .and_then(Value::as_str);
                     if event_type == Some("thread_settings_applied") {
+                        // Closing a replay changes earlier rows even when its header is outside
+                        // the overlap; append-only storage cannot reconcile those rows.
+                        requires_full_parse_for_tail = true;
                         if fork_replay.open.is_some() {
                             replayed_file_edits = Some(0..file_edits.len());
                         }

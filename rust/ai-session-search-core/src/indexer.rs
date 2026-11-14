@@ -2558,6 +2558,91 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_settings_reconcile_previously_indexed_replay() {
+        use std::io::Write as _;
+        for beyond_overlap in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("codex");
+            std::fs::create_dir_all(&root).unwrap();
+            let own = "019f5ce8-afff-76a3-86f2-174307f3fa09";
+            let path = root.join(format!("rollout-{own}.jsonl"));
+            let mut initial = format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":own,"forked_from_id":"parent"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"copied parent prompt"}]}})
+            );
+            if beyond_overlap {
+                initial.push_str(&format!("{}\n", serde_json::json!({"type":"padding","text":"x".repeat(crate::tail::OVERLAP_BYTES as usize + crate::tail::FINGERPRINT_LEN)})));
+            }
+            std::fs::write(&path, initial).unwrap();
+            let db_path = dir.path().join("index.db");
+            let mut config = config_with_single_claude_fixture(&db_path, &root);
+            config.providers.claude.enabled = false;
+            config.providers.codex.enabled = true;
+            config.providers.codex.paths = vec![normalize_path(&root)];
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let filters = crate::models::MessageFilters {
+                role: Some(crate::models::Role::User),
+                ..Default::default()
+            };
+            assert_eq!(
+                db.search_messages("copied parent prompt", &filters)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let appended = format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new fork prompt"}]}})
+            );
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(appended.as_bytes())
+                .unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            assert!(
+                db.search_messages("copied parent prompt", &filters)
+                    .unwrap()
+                    .is_empty(),
+                "header beyond overlap: {beyond_overlap}"
+            );
+            assert_eq!(
+                db.search_messages("new fork prompt", &filters)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let relation: String = conn
+                .query_row(
+                    "select record_relation from messages where content='copied parent prompt'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(relation, "mirror");
+            let transcript: String = conn
+                .query_row("select transcript_text from transcripts", [], |r| r.get(0))
+                .unwrap();
+            assert!(!transcript.contains("copied parent prompt"));
+            let fresh_path = dir.path().join("fresh.db");
+            let fresh = Db::open(&fresh_path).unwrap();
+            reindex(&config, &fresh, true, None).unwrap();
+            let fresh_conn = rusqlite::Connection::open(&fresh_path).unwrap();
+            let fresh_transcript: String = fresh_conn
+                .query_row("select transcript_text from transcripts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(transcript, fresh_transcript);
+            reindex(&config, &db, true, None).unwrap();
+            assert_eq!(db.message_count().unwrap(), fresh.message_count().unwrap());
+        }
+    }
+
+    #[test]
     fn codex_spawn_metadata_beyond_overlap_forces_full_parse() {
         use std::io::Write as _;
 
