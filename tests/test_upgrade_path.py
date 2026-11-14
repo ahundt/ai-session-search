@@ -17,6 +17,51 @@ from scripts import verify_upgrade_path
 from scripts.verify_upgrade_path import problems_in_status
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the documented downgrade uses bash")
+@pytest.mark.parametrize("obstacle", ["archive", "wal_archive", "directory", "move_failure", "none"])
+def test_documented_downgrade_preserves_every_archive_byte(tmp_path: Path, obstacle: str) -> None:
+    database = tmp_path / "index.db"
+    originals = {path: path.name.encode() for path in verify_upgrade_path._index_files(database)}
+    for path, content in originals.items():
+        path.write_bytes(content)
+    backup = database.with_name(database.name + ".from-1.1.0")
+    sentinels = {}
+    if obstacle in {"archive", "wal_archive"}:
+        # Both the former flat archives and the directory recipe must remain untouched.
+        path = backup if obstacle == "archive" else Path(str(database) + "-wal.from-1.1.0")
+        path.write_bytes(b"retained history")
+        sentinels[path] = path.read_bytes()
+    if obstacle == "directory":
+        backup.mkdir()
+        path = backup / database.name
+        path.write_bytes(b"retained history")
+        sentinels[path] = path.read_bytes()
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    aise = commands / "aise"
+    aise.write_text('#!/bin/sh\nprintf \'{"database":"%s"}\\n\' "$AI_SESSION_SEARCH_DATABASE"\n')
+    aise.chmod(0o755)
+    if obstacle == "move_failure":
+        move = commands / "mv"
+        move.write_text('#!/bin/sh\ncase "$1" in *-wal) exit 42;; esac\nexec /bin/mv "$@"\n')
+        move.chmod(0o755)
+    environment = verify_upgrade_path._environment(tmp_path / "home", commands)
+    environment["AI_SESSION_SEARCH_DATABASE"] = str(database)
+    result = verify_upgrade_path._move_index_as_documented(aise, environment, database)
+    for path, content in sentinels.items():
+        assert path.read_bytes() == content
+    assert isinstance(result, dict) == (obstacle == "none"), result
+    if isinstance(result, dict):
+        assert result == {path: backup / path.name for path in originals}
+    for path, content in originals.items():
+        retained = backup / path.name
+        assert (path.exists() and path.read_bytes() == content) or (retained.exists() and retained.read_bytes() == content)
+    if obstacle in {"archive", "wal_archive", "directory"}:
+        assert all(path.read_bytes() == content for path, content in originals.items())
+    if obstacle == "move_failure":
+        assert Path(str(database) + "-shm").read_bytes() == originals[Path(str(database) + "-shm")]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="historical upgrades require a disposable Windows profile")
 def test_upgrade_command_terminates_and_waits_for_background_children(tmp_path: Path) -> None:
     stopped = tmp_path / "stopped"

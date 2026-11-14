@@ -324,7 +324,8 @@ def _move_index_as_documented(
     if result.returncode != 0 or result.stdout != str(database):
         return (f"the guide's commands did not move {database}: exit {result.returncode}, "
                 f"printed {result.stdout!r}, {result.stderr.strip()}")
-    moved = {path: path.with_name(path.name + ".from-1.1.0") for path in _index_files(database)}
+    backup = database.with_name(database.name + ".from-1.1.0")
+    moved = {path: backup / path.name for path in _index_files(database)}
     left = [str(path) for path in _index_files(database) if path.exists()]
     if left or not moved[database].exists():
         return f"the guide's commands left {left or [str(database)]} in place"

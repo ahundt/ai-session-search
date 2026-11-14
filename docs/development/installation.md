@@ -239,18 +239,32 @@ deleted transcripts.
 To downgrade, stop every aise process, then:
 
 ```bash
+set -euo pipefail
 # The index 1.1.0 uses, before anything moves.
 DB="$(aise config paths --format json | python -c 'import json, sys; print(json.load(sys.stdin)["database"])')"
-# Move the index and its WAL files aside together.
-for f in "$DB" "$DB-wal" "$DB-shm"; do [ -e "$f" ] && mv "$f" "$f.from-1.1.0"; done
+# Refuse every old archive name before moving any file, including dangling symlinks.
+for f in "$DB" "$DB-wal" "$DB-shm"; do
+  if [ -e "$f.from-1.1.0" ] || [ -L "$f.from-1.1.0" ]; then
+    echo "Archive already exists: $f.from-1.1.0" >&2; exit 1
+  fi
+done
+BACKUP="$DB.from-1.1.0"
+mkdir "$BACKUP" || exit 1
+# A failed move stops the downgrade; keep both locations until it is resolved.
+for f in "$DB" "$DB-wal" "$DB-shm"; do
+  if [ -e "$f" ]; then mv "$f" "$BACKUP/" || exit 1; fi
+done
 uv tool install --force 'ai-session-search==1.0.0'   # or your package manager's command below
 aise --database "$DB" reindex --full                 # rebuild at the same path from the transcripts
 ```
 
 Name the path for the rebuild: with the file moved, 1.0.0 could otherwise resolve its default to a
 different directory. 1.0.0 loads the config and integration state 1.1.0 leaves. History that only
-1.1.0 kept stays in the `.from-1.1.0` files; after upgrading again and stopping every aise process, move the rebuilt index and its WAL files
-to a separate backup before restoring the retained files to their original paths.
+1.1.0 kept stays in the `$BACKUP` directory. The recipe refuses existing archives before moving
+anything; choose a new backup name or preserve the earlier archive elsewhere before retrying.
+If a move fails, stop and inspect both locations before proceeding. After upgrading again and
+stopping every aise process, move the rebuilt index and its WAL files to a separate backup before
+restoring the retained files to their original paths.
 
 Use the same owner for installation, update, and removal. Before removing a
 global command, remove its MCP registrations while the command is still
