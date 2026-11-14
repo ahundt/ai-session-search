@@ -591,12 +591,31 @@ impl CodexAdapter {
                         }
                     }
                 }
+                Some("compacted") => {
+                    // replacement_history is model context, not new conversation. Retain the
+                    // summary without replacing or reclassifying rows already published.
+                    if let Some(text) = value.pointer("/payload/message").and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            messages.push(RawMessage::message(
+                                "compaction",
+                                text.to_owned(),
+                                timestamp,
+                                None,
+                            ));
+                            observe_session_end(&mut updated_at, timestamp);
+                        }
+                    }
+                }
                 Some("event_msg") => {
                     let payload = value.get("payload").unwrap_or(&value);
                     let event_type = payload
                         .get("type")
                         .or_else(|| payload.get("event_type"))
                         .and_then(Value::as_str);
+                    if event_type == Some("turn_aborted") {
+                        messages.push(RawMessage::harness_notice(payload.to_string(), timestamp));
+                        observe_session_end(&mut updated_at, timestamp);
+                    }
                     if event_type == Some("thread_settings_applied") {
                         // Closing a replay changes earlier rows even when its header is outside
                         // the overlap; append-only storage cannot reconcile those rows.
@@ -3053,6 +3072,83 @@ mod tests {
             .query_row("select count(*) from messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn lifecycle_records_are_searchable_without_rewriting_history() {
+        use crate::models::{MessageAuthorship, MessageKind};
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-00000000-0000-0000-0000-000000000002.jsonl");
+        let adapter = CodexAdapter::new(vec![]);
+        let initial = format!(
+            "{}\n{}\n",
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"original input"}]}}),
+            json!({"type":"ignored","padding":"x".repeat(300_000)})
+        );
+        fs::write(&path, &initial).unwrap();
+        let before = adapter
+            .parse_reader(std::io::Cursor::new(&initial), &path)
+            .unwrap();
+        let suffix = [
+            json!({"timestamp":"2026-01-01T00:01:00Z","type":"compacted","payload":{"message":"compaction sentinel","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"must not duplicate history"}]}]}}),
+            json!({"timestamp":"2026-01-01T00:02:00Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"synthetic-turn","reason":"interrupted"}})
+        ].into_iter().map(|r| r.to_string() + "\n").collect::<String>();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        let full = adapter
+            .parse_reader(std::io::Cursor::new(format!("{initial}{suffix}")), &path)
+            .unwrap();
+        assert!(full.messages.starts_with(&before.messages));
+        assert_eq!(full.messages.len(), 3);
+        assert_eq!(full.messages[1].kind, MessageKind::Compaction);
+        assert!(full.messages[1].is_compaction);
+        assert_eq!(full.messages[2].kind, MessageKind::HarnessNotice);
+        assert_eq!(
+            full.messages[2].provenance.authorship,
+            MessageAuthorship::Harness
+        );
+        assert!(full.messages[2].content.contains("interrupted"));
+        assert!(full.messages[2].content.contains("turn_aborted"));
+        assert_eq!(full.transcript_text, before.transcript_text);
+        let run = crate::tail::tail_parse_until(
+            &path,
+            initial.len() as i64,
+            None,
+            &|| false,
+            |r, p, c| adapter.parse_reader_with_context(r, p, Some(c)),
+        )
+        .unwrap();
+        let crate::tail::TailParseRun::Complete(Some(tail)) = run else {
+            panic!("lifecycle append must not force full parse")
+        };
+        assert_eq!(tail.new_messages.len(), 2);
+        assert!(!tail
+            .session
+            .raw_metadata_json
+            .as_deref()
+            .unwrap()
+            .contains("must not duplicate history"));
+        let db = crate::db::Db::open(&dir.path().join("lifecycle.db")).unwrap();
+        let mut old = before.clone();
+        old.session.parse_version = "codex-v12".into();
+        db.upsert_session(&old, 1, initial.len() as i64).unwrap();
+        db.upsert_session(&full, 2, (initial.len() + suffix.len()) as i64)
+            .unwrap();
+        db.upsert_session(&full, 3, (initial.len() + suffix.len()) as i64)
+            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("lifecycle.db")).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
