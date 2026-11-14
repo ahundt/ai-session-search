@@ -107,6 +107,7 @@ __all__ = [
     "SkillRunReport",
     "SkillSelector",
     "ToolActivity",
+    "UnknownConfigKey",
     "UnrecognizedRecordType",
     "_run_cli_command",
     "serve_mcp",
@@ -1662,6 +1663,7 @@ class IndexStatus:
     def __eq__(self, other: object, /) -> bool: ...
 
     parser_health: ParserHealth
+    unindexed_files: int
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
     repair_commands: list[str]
@@ -1721,6 +1723,18 @@ class ProviderHealth:
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
     resume_command: str | None
+    unindexed_files: int
+
+@final
+class UnknownConfigKey:
+    """An ignored configuration key and its optional suggested spelling."""
+
+    path: str
+    suggestion: str | None
+
+    def to_dict(self) -> dict[str, Any]: ...
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
 @final
 class DiagnosticStatus:
@@ -1733,6 +1747,7 @@ class DiagnosticStatus:
 
     db_path: str
     index_status: IndexStatus
+    unknown_config_keys: list[UnknownConfigKey]
     discovery_warnings: list[ProviderDiscoveryWarning]
     providers: list[ProviderHealth]
 
