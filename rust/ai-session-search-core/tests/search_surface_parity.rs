@@ -126,6 +126,402 @@ fn filtered_range_reads_share_event_dates_role_and_newest_order() {
     assert_eq!(read_rows(&response), expected);
 }
 
+#[test]
+fn message_session_classes_filter_before_paging_on_every_surface() {
+    let f = fixture();
+    let db = Db::open(&f.db_path).unwrap();
+    for (id, parent) in [
+        ("claude:class-root-a", None),
+        ("claude:class-root-b", None),
+        ("claude:class-child-a", Some("claude:class-root-a")),
+        ("claude:class-child-b", Some("claude:class-root-b")),
+        ("claude:class-nested", Some("claude:class-child-a")),
+    ] {
+        let mut session = SessionRecord::new(
+            id,
+            Provider::Claude,
+            id,
+            format!("/synthetic/classes/{id}"),
+            "test",
+            "test",
+        );
+        session.parent_session_id = parent.map(str::to_owned);
+        session.cwd = Some("/synthetic/workspace".into());
+        db.upsert_session(
+            &ParsedSession::new(
+                session,
+                (0..2)
+                    .map(|seq| {
+                        let mut message = Message::new(seq, Role::Assistant, "class needle");
+                        message.ts =
+                            ai_session_search::util::parse_datetime("2026-01-15T00:00:00Z");
+                        message
+                    })
+                    .collect(),
+            ),
+            0,
+            0,
+        )
+        .unwrap();
+    }
+    let identities = |value: &Value| -> Vec<(String, i64)> {
+        value["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| {
+                (
+                    hit["message_ref"]["session_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    hit["message_ref"]["message_seq"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    for (selector, expected) in [
+        (
+            json!({"session_kinds":["subagent"]}),
+            vec![
+                ("claude:class-child-a".to_owned(), 0),
+                ("claude:class-child-a".to_owned(), 1),
+                ("claude:class-child-b".to_owned(), 0),
+                ("claude:class-child-b".to_owned(), 1),
+                ("claude:class-nested".to_owned(), 0),
+                ("claude:class-nested".to_owned(), 1),
+            ],
+        ),
+        (
+            json!({"parent_session_id":"claude:class-root-a"}),
+            vec![
+                ("claude:class-child-a".to_owned(), 0),
+                ("claude:class-child-a".to_owned(), 1),
+            ],
+        ),
+        (
+            json!({"session_kinds":["user"]}),
+            vec![
+                ("claude:class-root-a".to_owned(), 0),
+                ("claude:class-root-a".to_owned(), 1),
+                ("claude:class-root-b".to_owned(), 0),
+                ("claude:class-root-b".to_owned(), 1),
+            ],
+        ),
+        (
+            json!({"parent_session_id":"claude:class-root-a","session_kinds":["subagent"]}),
+            vec![
+                ("claude:class-child-a".to_owned(), 0),
+                ("claude:class-child-a".to_owned(), 1),
+            ],
+        ),
+        (json!({"session_kinds":[]}), vec![]),
+    ] {
+        for mode in ["literal", "regex", "fuzzy"] {
+            let mut args = selector.clone();
+            args["query"] = json!("class needle");
+            args["query_mode"] = json!(mode);
+            args["limit"] = json!(100);
+            args["include"] = json!([]);
+            args["role"] = json!("assistant");
+            args["kinds"] = json!(["conversation"]);
+            args["providers"] = json!(["claude"]);
+            args["workspace_path_prefix"] = json!("/synthetic/workspace");
+            args["transcript_path_prefix"] = json!("/synthetic/classes");
+            args["receipt_level"] = json!("full");
+            args["when"] = json!("2026-01");
+            let result = mcp_calls(&f, &[("search_messages", args.clone())])
+                .remove(0)
+                .unwrap();
+            assert_eq!(identities(&result), expected, "{selector}, {mode}");
+            assert_eq!(
+                result["receipt"]["search_explanation"]["corpus"],
+                json!(expected.len())
+            );
+            if !expected.is_empty() {
+                assert_eq!(
+                    result["receipt"]["search_explanation"]["candidates"],
+                    json!(expected.len())
+                );
+            }
+            let config = Config::default();
+            let service = MessageService::new(&config, &db, SearchSurface::Rust);
+            let query = match mode {
+                "literal" => MessageQuery::literal("class needle").unwrap(),
+                "regex" => MessageQuery::regex("class needle").unwrap(),
+                _ => MessageQuery::fuzzy("class needle").unwrap(),
+            };
+            let mut builder = MessageSearchRequest::builder(query, MessageTarget::content())
+                .role(Role::Assistant)
+                .kind(MessageKind::Conversation)
+                .provider(Provider::Claude)
+                .time(
+                    ai_session_search::message_search::RequestedTimeRange::new(
+                        ai_session_search::util::parse_datetime("2026-01-01T00:00:00Z"),
+                        ai_session_search::util::parse_datetime("2026-01-31T23:59:59Z"),
+                    )
+                    .unwrap(),
+                )
+                .workspace_path_prefix("/synthetic/workspace")
+                .unwrap()
+                .transcript_path_prefix("/synthetic/classes")
+                .unwrap()
+                .extent(RequestedExtent::page(Some(100), 0).unwrap());
+            let mut cli_args = vec![
+                "messages".to_owned(),
+                "search".into(),
+                "class needle".into(),
+                "--query-mode".into(),
+                mode.into(),
+                "--format".into(),
+                "json".into(),
+                "--limit".into(),
+                "100".into(),
+                "--role".into(),
+                "assistant".into(),
+                "--kinds".into(),
+                "conversation".into(),
+                "--provider".into(),
+                "claude".into(),
+                "--workspace-path".into(),
+                "/synthetic/workspace".into(),
+                "--transcript-path".into(),
+                "/synthetic/classes".into(),
+                "--when".into(),
+                "2026-01".into(),
+            ];
+            if let Some(kinds) = selector["session_kinds"].as_array() {
+                builder = builder.session_kinds(
+                    kinds
+                        .iter()
+                        .map(|kind| kind.as_str().unwrap().parse().unwrap())
+                        .collect(),
+                );
+                if !kinds.is_empty() {
+                    cli_args.extend([
+                        "--session-kinds".into(),
+                        kinds
+                            .iter()
+                            .map(|kind| kind.as_str().unwrap())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ]);
+                }
+            }
+            if let Some(parent) = selector["parent_session_id"].as_str() {
+                builder = builder.parent_session_id(parent).unwrap();
+                cli_args.extend(["--parent-session".into(), parent.into()]);
+            }
+            let response = service.search(builder.build().unwrap()).unwrap();
+            let rust_ids: Vec<_> = response
+                .hits()
+                .iter()
+                .map(|hit| (hit.session_id.clone(), hit.message.seq))
+                .collect();
+            assert_eq!(rust_ids, expected);
+            // CLI cannot spell an empty set; it intentionally requires at least one value.
+            if selector["session_kinds"] != json!([]) {
+                let output = aise(&f).args(&cli_args).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    identities(&serde_json::from_slice(&output.stdout).unwrap()),
+                    expected
+                );
+            }
+            let mut paged = Vec::new();
+            for offset in 0..expected.len() {
+                args["limit"] = json!(1);
+                args["offset"] = json!(offset);
+                paged.extend(identities(
+                    &mcp_calls(&f, &[("search_messages", args.clone())])
+                        .remove(0)
+                        .unwrap(),
+                ));
+            }
+            assert_eq!(paged, expected);
+            if mode != "fuzzy" {
+                args.as_object_mut().unwrap().remove("limit");
+                args["offset"] = json!(0);
+                args["all_results"] = json!(true);
+                assert_eq!(
+                    identities(
+                        &mcp_calls(&f, &[("search_messages", args)])
+                            .remove(0)
+                            .unwrap()
+                    ),
+                    expected
+                );
+            }
+        }
+    }
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    let request = |parent: &str| {
+        MessageSearchRequest::builder(
+            MessageQuery::literal("class needle").unwrap(),
+            MessageTarget::content(),
+        )
+        .parent_session_id(parent)
+        .unwrap()
+        .extent(RequestedExtent::all_results())
+        .build()
+        .unwrap()
+    };
+    assert_eq!(
+        service
+            .search(request("claude:class-root-a"))
+            .unwrap()
+            .hits()
+            .len(),
+        2
+    );
+    // Resolve parents before searching, even if the message query would match nothing.
+    for parent in ["claude:class-root-", "claude:missing-parent"] {
+        assert!(service.search(request(parent)).is_err());
+        assert!(mcp_calls(
+            &f,
+            &[(
+                "search_messages",
+                json!({
+                    "query":"class needle", "parent_session_id":parent,
+                })
+            )]
+        )
+        .remove(0)
+        .is_err());
+        assert!(!aise(&f)
+            .args([
+                "messages",
+                "search",
+                "class needle",
+                "--parent-session",
+                parent
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    for args in [
+        json!({"session_kinds":["user"], "parent_session_id":"claude:class-root-a"}),
+        json!({"session_kinds":["agent"]}),
+        json!({"session_kinds":"subagent"}),
+    ] {
+        assert!(mcp_calls(&f, &[("search_messages", args)])
+            .remove(0)
+            .is_err());
+    }
+    assert!(
+        MessageSearchRequest::builder(MessageQuery::All, MessageTarget::content())
+            .session_kinds(vec![ai_session_search::models::SessionKind::User])
+            .parent_session_id("claude:class-root-a")
+            .unwrap()
+            .build()
+            .is_err()
+    );
+    let alias = aise(&f)
+        .args([
+            "messages",
+            "search",
+            "class needle",
+            "--session-kind",
+            "subagent",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(alias.status.success());
+    assert_eq!(
+        identities(&serde_json::from_slice(&alias.stdout).unwrap()).len(),
+        6
+    );
+    for (id, parent) in [
+        ("claude:prefix-parent-long", None),
+        ("claude:prefix-child", Some("claude:prefix-parent-long")),
+    ] {
+        let mut session = SessionRecord::new(
+            id,
+            Provider::Claude,
+            id,
+            format!("/synthetic/{id}"),
+            "test",
+            "test",
+        );
+        session.parent_session_id = parent.map(str::to_owned);
+        db.upsert_session(
+            &ParsedSession::new(
+                session,
+                vec![Message::new(0, Role::Assistant, "prefix needle")],
+            ),
+            0,
+            0,
+        )
+        .unwrap();
+    }
+    let prefix_request = MessageSearchRequest::builder(
+        MessageQuery::literal("prefix needle").unwrap(),
+        MessageTarget::content(),
+    )
+    .parent_session_id("claude:prefix-parent-")
+    .unwrap()
+    .build()
+    .unwrap();
+    assert_eq!(service.search(prefix_request).unwrap().hits().len(), 1);
+    let prefix_result = mcp_calls(
+        &f,
+        &[(
+            "search_messages",
+            json!({"query":"prefix needle","parent_session_id":"claude:prefix-parent-"}),
+        )],
+    )
+    .remove(0)
+    .unwrap();
+    assert_eq!(
+        identities(&prefix_result),
+        vec![("claude:prefix-child".into(), 0)]
+    );
+    let prefix_cli = aise(&f)
+        .args([
+            "messages",
+            "search",
+            "prefix needle",
+            "--parent-session",
+            "claude:prefix-parent-",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(prefix_cli.status.success());
+    assert_eq!(
+        identities(&serde_json::from_slice(&prefix_cli.stdout).unwrap()),
+        vec![("claude:prefix-child".into(), 0)]
+    );
+    let prefix = mcp_calls(
+        &f,
+        &[(
+            "search_messages",
+            json!({
+                "query":"class needle", "parent_session_id":"claude:class-child-a",
+            }),
+        )],
+    )
+    .remove(0)
+    .unwrap();
+    assert_eq!(
+        identities(&prefix),
+        vec![
+            ("claude:class-nested".into(), 0),
+            ("claude:class-nested".into(), 1)
+        ]
+    );
+}
+
 type Ids = Vec<(i64, String)>;
 
 struct Fixture {

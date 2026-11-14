@@ -2786,6 +2786,83 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
     return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=environment, timeout=120)
 
 
+@pytest.mark.parametrize("mode", ["literal", "regex", "fuzzy"])
+def test_message_session_selectors_share_python_and_cli_identities(tmp_path: Path, mode: str) -> None:
+    database = tmp_path / "classes.db"
+    search = native.SessionSearch(database)
+    sessions = [
+        ("claude:class-root-a", None),
+        ("claude:class-root-b", None),
+        ("claude:class-child-a", "claude:class-root-a"),
+        ("claude:class-child-b", "claude:class-root-b"),
+        ("claude:class-nested", "claude:class-child-a"),
+    ]
+    with write_database(database) as connection:
+        connection.executemany(
+            "insert into sessions(id,provider,provider_session_id,source_path,preview_text,parse_version,discovery_source,parent_session_id,cwd)"
+            " values(?,'claude',?,?,'','test','fixture',?,'/synthetic/workspace')",
+            [(sid, sid, f"/synthetic/classes/{sid}", parent) for sid, parent in sessions],
+        )
+        connection.executemany(
+            "insert into messages(session_id,provider,seq,role,kind,ts,content)"
+            " values(?,'claude',?,'assistant','conversation','2026-01-15T00:00:00Z','class needle')",
+            [(sid, seq) for sid, _ in sessions for seq in range(2)],
+        )
+    def identities(results: list[dict]) -> list[tuple[str, int]]:
+        return [(hit["message_ref"]["session_id"], hit["message_ref"]["message_seq"]) for hit in results]
+
+    for kinds, parent, selected in [
+        (None, None, [sid for sid, _ in sessions]),
+        (["user"], None, ["claude:class-root-a", "claude:class-root-b"]),
+        (["subagent"], None, ["claude:class-child-a", "claude:class-child-b", "claude:class-nested"]),
+        (None, "claude:class-root-a", ["claude:class-child-a"]),
+        (["subagent"], "claude:class-root-a", ["claude:class-child-a"]),
+        ([], None, []),
+    ]:
+        expected = sorted((sid, seq) for sid in selected for seq in range(2))
+        scope = native.MessageScope(
+            session_kinds=kinds, parent_session_id=parent, providers=["claude"],
+            workspace_path_prefix="/synthetic/workspace", transcript_path_prefix="/synthetic/classes",
+            dates=native.DateRange(when="2026-01"),
+        )
+        request = native.MessageSearchRequest(scope=scope, role="assistant", kinds=["conversation"], limit=100)
+        result = search.search_messages("class needle", request, query_mode=mode)
+        assert identities(result.results) == expected
+        flat = native.MessageSearchRequest(session_kinds=kinds, parent_session_id=parent, limit=100)
+        assert identities(search.search_messages("class needle", flat, query_mode=mode).results) == expected
+        walked = []
+        for offset in range(len(expected)):
+            page = native.MessageSearchRequest(scope=scope, limit=1, offset=offset)
+            walked += identities(search.search_messages("class needle", page, query_mode=mode).results)
+        assert walked == expected
+        if mode != "fuzzy":
+            all_rows = native.MessageSearchRequest(scope=scope, all_results=True)
+            assert identities(search.search_messages("class needle", all_rows, query_mode=mode).results) == expected
+        if kinds == []:
+            continue
+        command = [
+            sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+            "--database", str(database), "messages", "search", "class needle",
+            "--query-mode", mode, "--format", "json", "--limit", "100",
+            "--role", "assistant", "--kinds", "conversation", "--provider", "claude",
+            "--workspace-path", "/synthetic/workspace", "--transcript-path", "/synthetic/classes",
+            "--when", "2026-01", "--index-refresh", "existing-only", "--skip-release-notification",
+        ]
+        if kinds:
+            command += ["--session-kinds", ",".join(kinds)]
+        if parent:
+            command += ["--parent-session", parent]
+        completed = subprocess.run(command, env=isolated_environment(tmp_path), text=True, capture_output=True, check=True)
+        assert identities(json.loads(completed.stdout)["results"]) == expected
+
+    with pytest.raises(native.InvalidArgumentError, match="session_kinds"):
+        search.search_messages("class needle", native.MessageSearchRequest(session_kinds=["user"], parent_session_id="claude:class-root-a"))
+    with pytest.raises(native.InvalidArgumentError):
+        native.MessageScope(session_kinds=["agent"])
+    with pytest.raises(native.InvalidArgumentError, match="scope"):
+        native.MessageSearchRequest(scope=native.MessageScope(), session_kinds=["subagent"])
+
+
 def test_python_interfaces_return_the_shared_parity_cases(tmp_path: Path) -> None:
     database, spec = _parity_database(tmp_path)
     failures = []

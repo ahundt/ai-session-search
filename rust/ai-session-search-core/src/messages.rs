@@ -624,6 +624,9 @@ const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-descri
             "providers",
             "query_mode",
             "session_id",
+            "session_kind",
+            "session_kinds",
+            "parent_session",
             "workspace_path",
             "transcript_path",
             "exclude_workspace_paths",
@@ -702,6 +705,15 @@ pub struct MessageSearchArgs {
     /// Scope to one exact session id or unique prefix. Omit to search every session.
     #[arg(help_heading = FILTER_HEADING, long)]
     pub session_id: Option<String>,
+    /// Restrict to one session class; one-value alias for --session-kinds.
+    #[arg(help_heading = FILTER_HEADING, long, value_enum)]
+    pub session_kind: Option<crate::models::SessionKind>,
+    /// Session classes: user or subagent. Omit for both; with --parent-session include subagent.
+    #[arg(help_heading = FILTER_HEADING, long, value_enum, num_args = 1.., value_delimiter = ',', conflicts_with = "session_kind")]
+    pub session_kinds: Vec<crate::models::SessionKind>,
+    /// Direct children of this session ID or unique prefix; not recursive.
+    #[arg(help_heading = FILTER_HEADING, long)]
+    pub parent_session: Option<String>,
     /// Restrict to sessions whose working directory or repository root is this directory or a
     /// descendant of it (a component boundary: `project` matches `project/src`, never
     /// `project-other`). Omit to search every root.
@@ -1223,6 +1235,14 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     }
     if let Some(session) = &args.session_id {
         builder = builder.session_id(session)?;
+    }
+    if let Some(kind) = args.session_kind {
+        builder = builder.session_kinds(vec![kind]);
+    } else if !args.session_kinds.is_empty() {
+        builder = builder.session_kinds(args.session_kinds.clone());
+    }
+    if let Some(parent) = &args.parent_session {
+        builder = builder.parent_session_id(parent)?;
     }
     if let Some(path) = &args.workspace_path {
         builder = builder.workspace_path_prefix(path)?;

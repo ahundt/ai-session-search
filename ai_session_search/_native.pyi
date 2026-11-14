@@ -1157,6 +1157,8 @@ class MessageScope:
     def __eq__(self, other: object, /) -> bool: ...
 
     providers: list[_ProviderId] | None
+    session_kinds: list[_SessionKind] | None
+    parent_session_id: str | None
     session_id: str | None
     workspace_path_prefix: str | None
     transcript_path_prefix: str | None
@@ -1168,6 +1170,8 @@ class MessageScope:
         *,
         providers: list[_ProviderId] | None = None,
         session_id: str | None = None,
+        session_kinds: list[_SessionKind] | None = None,
+        parent_session_id: str | None = None,
         workspace_path_prefix: _PathInput | None = None,
         transcript_path_prefix: _PathInput | None = None,
         exclusions: MessageExclusions | None = None,
@@ -1258,6 +1262,8 @@ class MessageSearchRequest:
         session_id: str | None = None,
         path_prefix: _PathInput | None = None,
         dates: DateRange | None = None,
+        session_kinds: list[_SessionKind] | None = None,
+        parent_session_id: str | None = None,
     ) -> Self: ...
 
 @final
