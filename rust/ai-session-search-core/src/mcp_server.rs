@@ -5138,6 +5138,14 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
     let summary = mcp_bool_arg(args, "summary", false);
+    if !summary {
+        reject_present(
+            args,
+            "summary_items",
+            "summary_items only applies with summary=true",
+        )?;
+        reject_present(args, "include", "include only applies with summary=true")?;
+    }
     let sequence_arg = |key: &str| {
         args.get(key).filter(|value| !value.is_null()).map(|raw| {
             mcp_nonnegative_i64_arg(args, key, 0).map_err(|_| format!(
@@ -5257,12 +5265,6 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         )
         .and_then(ToolResponse::structured);
     }
-    reject_present(
-        args,
-        "summary_items",
-        "summary_items only applies with summary=true",
-    )?;
-    reject_present(args, "include", "include only applies with summary=true")?;
     reject_present(
         args,
         "context",
@@ -7023,6 +7025,38 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn focused_and_range_reads_reject_summary_only_options() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        for selector in [
+            json!({"seq":0}),
+            json!({"seq_from":0}),
+            json!({"transcript_lines":2}),
+        ] {
+            for (key, value) in [
+                ("summary_items", json!(1)),
+                ("include", json!(["time_profile"])),
+            ] {
+                let mut args = selector.clone();
+                args["session_id"] = json!("claude:test1");
+                args[key] = value;
+                let error = tool_get_session(&args, &config, &db).unwrap_err();
+                assert!(
+                    error.contains(&format!("{key} only applies with summary=true")),
+                    "{error}"
+                );
+            }
+        }
+        assert!(tool_get_session(
+            &json!({"session_id":"claude:test1", "summary":true,
+            "summary_items":1, "include":["time_profile"]}),
+            &config,
+            &db
+        )
+        .is_ok());
     }
 
     fn fixture() -> (tempfile::TempDir, Db) {
