@@ -591,47 +591,90 @@ impl PiAdapter {
     }
 }
 
-/// Parent record bodies are streamed and discarded. Only native IDs and fixed-size digests
-/// remain: O(parent bytes + child bytes) time, O(parent entries) keys plus one record body.
-/// Branching may rewrite parentId links; copied message bodies retain their fields.
+#[cfg(test)]
+thread_local! {
+    static PI_PARENT_READS: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Retain only native IDs and fixed-size digests, never parent record bodies. Cached
+/// snapshots share their map; each parse consumes matches independently in O(child entries).
+#[derive(Clone)]
 struct PiParentCopy {
     session_id: String,
-    entries: HashMap<String, Option<[u8; 32]>>,
+    entries: std::sync::Arc<HashMap<String, Option<[u8; 32]>>>,
+    consumed: HashSet<String>,
 }
 
 impl PiParentCopy {
     fn read(child: &Path, parent: &str) -> Option<Self> {
-        let parent = child.parent()?.join(parent);
-        if std::fs::canonicalize(&parent).ok()? == std::fs::canonicalize(child).ok()? {
+        // One current snapshot per canonical parent, shared across adapters and refreshes
+        // in this process. Cost is O(sum of distinct parent entries), not parent bytes or
+        // refresh count. Replacing a stamp drops the old snapshot once its readers finish.
+        // Per-parent locks prevent duplicate scans without serializing unrelated parents.
+        type Stamp = (file_id::FileId, u64, std::time::SystemTime);
+        type Slot = std::sync::Arc<std::sync::Mutex<Option<(Stamp, Option<PiParentCopy>)>>>;
+        type Cache = std::sync::Mutex<HashMap<PathBuf, Slot>>;
+        static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+        let parent = std::fs::canonicalize(child.parent()?.join(parent)).ok()?;
+        if parent == std::fs::canonicalize(child).ok()? {
             return None;
+        }
+        let stamp = || -> Option<Stamp> {
+            let identity = file_id::get_file_id(&parent).ok()?;
+            let metadata = std::fs::metadata(&parent).ok()?;
+            Some((identity, metadata.len(), metadata.modified().ok()?))
+        };
+        let slot = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(parent.clone())
+            .or_default()
+            .clone();
+        let mut cache = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let before = stamp()?;
+        if let Some((cached_stamp, snapshot)) = cache.as_ref() {
+            if cached_stamp == &before {
+                return snapshot.clone();
+            }
         }
         let file = std::fs::File::open(&parent).ok()?;
-        let before = file.metadata().ok()?;
-        let mut session_id = None;
-        let mut entries = HashMap::new();
-        for line in crate::util::lines_replacing_invalid_utf8(std::io::BufReader::new(&file)) {
-            let line = line.ok()?;
-            if line.trim().is_empty() {
-                continue;
+        #[cfg(test)]
+        PI_PARENT_READS.with(|reads| {
+            let (count, bytes) = reads.get();
+            reads.set((count + 1, bytes + before.1));
+        });
+        let snapshot = (|| {
+            let mut session_id = None;
+            let mut entries = HashMap::new();
+            for line in crate::util::lines_replacing_invalid_utf8(std::io::BufReader::new(&file)) {
+                let line = line.ok()?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&line).ok()?;
+                if value.get("type").and_then(Value::as_str) == Some("session") {
+                    session_id = value.get("id").and_then(Value::as_str).map(str::to_owned);
+                } else if let Some((id, digest)) = Self::key(&value) {
+                    entries
+                        .entry(id)
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(digest));
+                }
             }
-            let value: Value = serde_json::from_str(&line).ok()?;
-            if value.get("type").and_then(Value::as_str) == Some("session") {
-                session_id = value.get("id").and_then(Value::as_str).map(str::to_owned);
-            } else if let Some((id, digest)) = Self::key(&value) {
-                entries
-                    .entry(id)
-                    .and_modify(|entry| *entry = None)
-                    .or_insert(Some(digest));
-            }
-        }
+            Some(Self {
+                session_id: session_id?,
+                entries: std::sync::Arc::new(entries),
+                consumed: HashSet::new(),
+            })
+        })();
         let after = file.metadata().ok()?;
-        if before.len() != after.len() || before.modified().ok()? != after.modified().ok()? {
+        if before != stamp()? || before.1 != after.len() || before.2 != after.modified().ok()? {
+            *cache = None;
             return None;
         }
-        Some(Self {
-            session_id: session_id?,
-            entries,
-        })
+        *cache = Some((before, snapshot.clone()));
+        snapshot
     }
 
     fn key(value: &Value) -> Option<(String, [u8; 32])> {
@@ -648,14 +691,7 @@ impl PiParentCopy {
 
     fn take_copy(&mut self, value: &Value) -> bool {
         Self::key(value).is_some_and(|(id, digest)| {
-            self.entries.get_mut(&id).is_some_and(|entry| {
-                if *entry == Some(digest) {
-                    *entry = None;
-                    true
-                } else {
-                    false
-                }
-            })
+            self.entries.get(&id) == Some(&Some(digest)) && self.consumed.insert(id)
         })
     }
 }
@@ -1214,6 +1250,180 @@ mod tests {
                 .unwrap();
                 assert_eq!(service.search(request).unwrap().hits().len(), count);
             }
+        }
+    }
+
+    #[test]
+    fn growing_fork_reuses_unchanged_parent_evidence() {
+        use serde_json::json;
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let parent_path = dir.path().join("parent.jsonl");
+        let child_path = dir.path().join("child.jsonl");
+        let copied = json!({"type":"message","id":"copied","message":{"role":"user","content":"ancestor input"}});
+        let mut parent = std::io::BufWriter::new(fs::File::create(&parent_path).unwrap());
+        let prefix = format!("{}\n{copied}\n", json!({"type":"session","id":"parent"}));
+        parent.write_all(prefix.as_bytes()).unwrap();
+        let target = 50 * 1024 * 1024;
+        let mut remaining = target - prefix.len();
+        let mut index = 0;
+        while remaining > 0 {
+            let mut row = json!({"type":"message","id":format!("padding-{index}"),"message":{"role":"assistant","content":""}});
+            let empty_len = row.to_string().len() + 1;
+            let len = remaining.min(64 * 1024);
+            row["message"]["content"] = json!("x".repeat(len - empty_len));
+            writeln!(parent, "{row}").unwrap();
+            remaining -= len;
+            index += 1;
+        }
+        parent.flush().unwrap();
+        assert_eq!(fs::metadata(&parent_path).unwrap().len(), target as u64);
+        fs::write(
+            &child_path,
+            format!(
+                "{}\n{copied}\n",
+                json!({"type":"session","id":"child","parentSession":"parent.jsonl"})
+            ),
+        )
+        .unwrap();
+        super::PI_PARENT_READS.with(|reads| reads.set((0, 0)));
+        let start = std::time::Instant::now();
+        for index in 0..10 {
+            let checkpoint = fs::metadata(&child_path).unwrap().len() as i64;
+            let mut child = fs::OpenOptions::new()
+                .append(true)
+                .open(&child_path)
+                .unwrap();
+            writeln!(child, "{}", json!({"type":"message","id":format!("new-{index}"),"message":{"role":"user","content":format!("new input {index}")}})).unwrap();
+            let adapter = PiAdapter::new(vec![]);
+            let result = crate::tail::tail_parse_until(
+                &child_path,
+                checkpoint,
+                None,
+                &|| false,
+                |reader, path, _| adapter.parse_reader(reader, path),
+            )
+            .unwrap();
+            let crate::tail::TailParseRun::Complete(Some(tail)) = result else {
+                panic!("expected append")
+            };
+            assert_eq!(tail.new_messages.len(), 1);
+            assert_eq!(tail.new_messages[0].content, format!("new input {index}"));
+            assert_eq!(
+                tail.new_messages[0].provenance.record_relation,
+                crate::models::MessageRecordRelation::Original
+            );
+        }
+        let measured = super::PI_PARENT_READS.with(|reads| reads.get());
+        eprintln!(
+            "50 MiB parent, 10 appends: reads={}, bytes={}, elapsed={:?}",
+            measured.0,
+            measured.1,
+            start.elapsed()
+        );
+        assert_eq!(measured, (1, target as u64));
+    }
+
+    #[test]
+    fn parent_cache_validates_identity_and_stamp_and_consumes_per_parse() {
+        use super::PiParentCopy;
+        use serde_json::json;
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let child = dir.path().join("child.jsonl");
+        let parent = dir.path().join("parent.jsonl");
+        fs::write(&child, "").unwrap();
+        let record =
+            json!({"type":"message","id":"entry","message":{"role":"user","content":"same"}});
+        let prefix = format!("{}\n{record}\n", json!({"type":"session","id":"parent"}));
+        fs::write(&parent, &prefix).unwrap();
+        super::PI_PARENT_READS.with(|reads| reads.set((0, 0)));
+        let mut first = PiParentCopy::read(&child, "parent.jsonl").unwrap();
+        assert!(first.take_copy(&record));
+        assert!(!first.take_copy(&record));
+        let mut second = PiParentCopy::read(&child, "parent.jsonl").unwrap();
+        assert!(second.take_copy(&record));
+        assert_eq!(super::PI_PARENT_READS.with(|reads| reads.get().0), 1);
+
+        // Replacement with the same length and modification time must miss on identity.
+        let modified = fs::metadata(&parent).unwrap().modified().unwrap();
+        let replacement = dir.path().join("replacement.jsonl");
+        fs::write(&replacement, prefix.replace("same", "else")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::rename(&replacement, &parent).unwrap();
+        let mut replaced = PiParentCopy::read(&child, "parent.jsonl").unwrap();
+        assert!(!replaced.take_copy(&record));
+        assert_eq!(super::PI_PARENT_READS.with(|reads| reads.get().0), 2);
+        // Growth invalidates the stamp and duplicated native IDs cease to prove a copy.
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&parent).unwrap(),
+            "{record}"
+        )
+        .unwrap();
+        let mut grown = PiParentCopy::read(&child, "parent.jsonl").unwrap();
+        assert!(!grown.take_copy(&record));
+        assert_eq!(super::PI_PARENT_READS.with(|reads| reads.get().0), 3);
+        // Cache invalid parent evidence too, rather than rescanning twice per tail refresh.
+        fs::write(&parent, "not json\n").unwrap();
+        assert!(PiParentCopy::read(&child, "parent.jsonl").is_none());
+        assert!(PiParentCopy::read(&child, "parent.jsonl").is_none());
+        assert_eq!(super::PI_PARENT_READS.with(|reads| reads.get().0), 4);
+    }
+
+    #[test]
+    fn fork_tail_after_header_overlap_matches_fresh_original_messages() {
+        use serde_json::json;
+        use std::io::Write;
+        for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
+            let dir = tempdir().unwrap();
+            let parent = dir.path().join("parent.jsonl");
+            let child_id = "11111111-2222-4333-8444-555555555555";
+            let child = dir.path().join(format!("{child_id}.jsonl"));
+            let copied = json!({"type":"message","id":"copied","message":{"role":"user","content":"ancestor input"}});
+            fs::write(
+                &parent,
+                format!("{}\n{copied}\n", json!({"type":"session","id":"parent"})),
+            )
+            .unwrap();
+            let padding = json!({"type":"message","id":"padding","message":{"role":"assistant","content":"x".repeat(crate::tail::OVERLAP_BYTES as usize + 100)}});
+            fs::write(
+                &child,
+                format!(
+                    "{}\n{copied}\n{padding}\n",
+                    json!({"type":"session","id":child_id,"parentSession":"parent.jsonl"})
+                ),
+            )
+            .unwrap();
+            let before = adapter.parse_inner(&child).unwrap();
+            let checkpoint = fs::metadata(&child).unwrap().len() as i64;
+            let appended = json!({"type":"message","id":"new","message":{"role":"user","content":"new input"}});
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&child).unwrap(),
+                "{appended}"
+            )
+            .unwrap();
+            let result = crate::tail::tail_parse_until(
+                &child,
+                checkpoint,
+                None,
+                &|| false,
+                |reader, path, _| adapter.parse_reader(reader, path),
+            )
+            .unwrap();
+            let crate::tail::TailParseRun::Complete(Some(tail)) = result else {
+                panic!("expected append")
+            };
+            let fresh = adapter.parse_inner(&child).unwrap();
+            let suffix = &fresh.messages[before.messages.len()..];
+            assert_eq!(tail.new_messages.len(), 1);
+            assert_eq!(suffix.len(), 1);
+            assert_eq!(tail.new_messages[0].content, suffix[0].content);
+            assert_eq!(tail.new_messages[0].provenance, suffix[0].provenance);
         }
     }
 
