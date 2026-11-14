@@ -311,6 +311,8 @@ impl PiAdapter {
                         if self.provider == Provider::PrimeAgent
                             && message.get("toolName").and_then(Value::as_str) == Some("ipython")
                         {
+                            // Preserve display diffs for history; file reconstruction rejects
+                            // ipython deltas because EditOp cannot retain their line coordinates.
                             let payloads = message
                                 .pointer("/details/diffs")
                                 .and_then(Value::as_array)
@@ -1608,7 +1610,83 @@ mod tests {
     }
 
     #[test]
-    fn prime_ipython_diffs_replay_successful_results_only() {
+    fn prime_ipython_positioned_diffs_never_guess_file_content() {
+        use serde_json::json;
+        for (base, diffs) in [
+            (
+                "same\nsame\n",
+                json!([
+                    {"path":"a.txt","oldStr":"same","newStr":"changed","startLine":2}
+                ]),
+            ),
+            (
+                "one\ntwo\n",
+                json!([
+                    {"path":"a.txt","oldStr":"one","newStr":"first","startLine":1},
+                    {"path":"a.txt","oldStr":"two","newStr":"second","startLine":2}
+                ]),
+            ),
+            (
+                "one\ntwo\n",
+                json!([
+                    {"path":"a.txt","oldStr":"one","newStr":"two","startLine":1},
+                    {"path":"a.txt","oldStr":"two","newStr":"second","startLine":2}
+                ]),
+            ),
+        ] {
+            let rows = [
+                json!({"type":"session","id":"positioned-diffs"}),
+                json!({"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"base","name":"write","arguments":{"path":"a.txt","content":base}}]}}),
+                json!({"type":"message","message":{"role":"toolResult","toolName":"write","toolCallId":"base","isError":false}}),
+                json!({"type":"message","message":{"role":"toolResult","toolName":"ipython","toolCallId":"delta","isError":false,"details":{"diffs":diffs}}}),
+            ];
+            let text = rows
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parsed = PiAdapter::prime_agent(vec![])
+                .parse_reader(
+                    std::io::Cursor::new(text),
+                    std::path::Path::new("/synthetic/diffs.jsonl"),
+                )
+                .unwrap();
+            assert_eq!(
+                crate::files::reconstruct(&parsed.file_edits, 1).as_deref(),
+                Some(base)
+            );
+            assert_eq!(crate::files::reconstruct(&parsed.file_edits, 2), None);
+            assert_eq!(
+                crate::files::reconstruct(&parsed.file_edits, parsed.file_edits.len()),
+                None
+            );
+            let dir = tempdir().unwrap();
+            let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+            // Already-indexed deltas must be refused without deleting archived versions.
+            let mut old = parsed.clone();
+            old.session.parse_version = "legacy-positioned-diffs".into();
+            db.upsert_session(&old, 1, 1).unwrap();
+            db.upsert_session(&parsed, 1, 1).unwrap();
+            assert_eq!(
+                db.file_edit_count().unwrap(),
+                parsed.file_edits.len() as i64
+            );
+            let query = crate::models::FileQuery::default();
+            assert_eq!(
+                crate::files::reconstruct_query(&db, "a.txt", &query, Some(1))
+                    .unwrap()
+                    .content,
+                base
+            );
+            let error = crate::files::reconstruct_query(&db, "a.txt", &query, None).unwrap_err();
+            assert!(format!("{error:#}").contains(
+                "version 2 cannot be rebuilt: ipython display diff positions cannot be replayed"
+            ));
+        }
+    }
+
+    #[test]
+    fn prime_ipython_diffs_record_successful_results_without_replay() {
         use serde_json::json;
         let mut rows = vec![
             json!({"type":"session","id":"diff-session"}),
@@ -1660,10 +1738,7 @@ mod tests {
             .into_iter()
             .map(|(_, _, edit)| edit)
             .collect::<Vec<_>>();
-        assert_eq!(
-            crate::files::reconstruct(&edits, 3).as_deref(),
-            Some("gamma δ")
-        );
+        assert_eq!(crate::files::reconstruct(&edits, 3), None);
     }
 
     #[test]
