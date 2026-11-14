@@ -170,7 +170,7 @@ impl ContextWindowUnion {
         window: &[MessageHit],
     ) -> Result<Vec<PendingContextRow>> {
         let session_id = anchor.message().session_id.as_str();
-        let anchor_key = (anchor.seq, anchor.message().row_id);
+        let anchor_key = anchor.message().indexed_row_order();
         let mut ready = Vec::new();
         if self.current_session.as_deref() != Some(session_id) {
             if let Some(current_session) = self.current_session.as_deref() {
@@ -197,7 +197,7 @@ impl ContextWindowUnion {
                 "context row session {:?} does not match anchor session {session_id:?}",
                 hit.session_id
             );
-            let key = (hit.seq, hit.row_id);
+            let key = hit.indexed_row_order();
             if self
                 .last_emitted
                 .is_none_or(|last_emitted| key > last_emitted)
@@ -230,7 +230,7 @@ impl ContextWindowUnion {
                 .pending
                 .pop_first()
                 .expect("first_key_value proved a pending context row exists");
-            self.last_emitted = Some((row.hit.seq, row.hit.row_id));
+            self.last_emitted = Some(row.hit.indexed_row_order());
             ready.push(row);
         }
         self.last_anchor = Some(anchor_key);
@@ -1422,7 +1422,7 @@ fn context_hits_in_encounter_order(windows: &[Vec<MessageHit>]) -> Vec<MessageHi
     windows
         .iter()
         .flatten()
-        .filter(|hit| seen.insert((hit.session_id.clone(), hit.seq, hit.row_id)))
+        .filter(|hit| seen.insert((hit.session_id.as_str(), hit.indexed_row_order())))
         .cloned()
         .collect()
 }
