@@ -310,9 +310,10 @@ roots in the install manifest, and replaces an aise instruction block in a harne
 AGENTS.md, or GEMINI.md in place, as long as that block still holds text some release wrote. An
 edited file or block is left alone and reported on stderr.
 
-The recorded skill is the refresh's evidence that aise installed integrations for this
-configuration. An install made with `--no-skill` therefore gets no automatic refresh, and
-instruction files added with `--claude-md`, `--agents-md`, or `--gemini-md` are not visited;
+Recognized MCP launch registrations refresh even for OpenCode-only or `--no-skill` installs,
+preserving their executable and launch arguments without installing a skill. Skill and instruction
+refresh still require a recorded skill installation. Instruction files added with `--claude-md`,
+`--agents-md`, or `--gemini-md` are not visited;
 rerun `aise integrations install` for those. Commands that install or remove integrations
 themselves skip the refresh. `aise integrations status --format json` reports each integration
 with a `current` field for scripts. Turn the automatic refresh off with:

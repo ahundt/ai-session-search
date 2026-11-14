@@ -623,8 +623,9 @@ silent registry replacement. After a version change by any manager, the first co
 owned skill files once, visiting only manifest-recorded roots, and replaces in place each client
 instruction block that still holds text some release wrote; the `skills update` that
 `aise package update` runs does the same first, then also visits detected client roots that still
-exist. Neither configures a new client or rewrites an edited file. Stable executable paths,
-aliases, and MCP registrations do not need rewriting. Instruction blocks carry no ownership record, so a block is
+exist. Neither configures a new client or rewrites an edited file. Stable executable paths and
+aliases need no rewriting. MCP registration formats migrate from recognized launch contracts even
+without a skill record, retaining the executable and launch arguments. Instruction blocks carry no ownership record, so a block is
 recognized by its text: changing a line requires adding the old line's digest to
 `EARLIER_INSTRUCTION_LINE_DIGESTS`, which a pinned-digest test enforces. Uninstall integrations
 before removing the global executable.

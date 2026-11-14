@@ -18,6 +18,99 @@ mod support;
 use support::aise;
 
 #[test]
+fn upgrade_migrates_published_mcp_registrations_without_installing_skills() {
+    for client in [
+        "opencode",
+        "cursor",
+        "codex",
+        "foreign-bare",
+        "foreign-args",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = aise(root.path());
+        for key in include_str!("../harness-environment.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            command.env_remove(key);
+        }
+        let binary = env!("CARGO_BIN_EXE_aise");
+        let (relative, original) = match client {
+            "codex" => (".codex/config.toml", format!("[mcp_servers.ai-session-search]\ncommand = {}\nargs = ['mcp', 'serve']\n", serde_json::json!(binary))),
+            "cursor" => (".cursor/mcp.json", serde_json::json!({"mcpServers":{"ai-session-search":{"command":binary,"args":["mcp","serve"]}}}).to_string()),
+            _ => {
+                let args = match client {
+                    "foreign-bare" => vec![binary],
+                    "foreign-args" => vec![binary, "serve"],
+                    _ => vec![binary,"mcp","serve"],
+                };
+                (".config/opencode/opencode.json", serde_json::json!({"mcp":{"ai-session-search":{"command":args,"enabled":true}}}).to_string())
+            }
+        };
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(!root.path().join("skill-install-manifest.json").exists());
+        let output = command
+            .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+            .args(["dates"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if client.starts_with("foreign") {
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        } else if client == "codex" {
+            let text = fs::read_to_string(&path).unwrap();
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(
+                value["marketplaces"]["ai-session-search"]["source_type"].as_str(),
+                Some("local")
+            );
+            assert!(root
+                .path()
+                .join("codex-marketplace/plugins/ai-session-search/.mcp.json")
+                .exists());
+        } else {
+            let value: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            if client == "opencode" {
+                assert_eq!(
+                    value["mcp"]["servers"]["ai-session-search"]["type"],
+                    "local"
+                );
+                assert!(value["mcp"].get("ai-session-search").is_none());
+                assert_eq!(
+                    value["mcp"]["servers"]["ai-session-search"]["command"],
+                    serde_json::json!([binary, "mcp", "serve"])
+                );
+            } else {
+                assert_eq!(value["mcpServers"]["ai-session-search"]["type"], "stdio");
+                assert_eq!(value["mcpServers"]["ai-session-search"]["command"], binary);
+            }
+        }
+        assert!(!root.path().join("skill-install-manifest.json").exists());
+        assert!(!root.path().join("skills").exists());
+        assert!(!root.path().join(".agents/skills").exists());
+        assert!(!root.path().join(".claude.json").exists());
+        if client != "codex" {
+            assert!(!root.path().join(".codex/config.toml").exists());
+        }
+        if !client.starts_with("foreign") {
+            assert!(root.path().join("integrations-refreshed-version").is_file());
+            let before = fs::read(&path).unwrap();
+            let repeated = command.output().unwrap();
+            assert!(repeated.status.success());
+            assert!(!String::from_utf8_lossy(&repeated.stderr).contains("moved the aise MCP"));
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
 fn codex_marketplace_edits_survive_reinstall_refresh_and_uninstall() {
     for action in ["install", "refresh", "uninstall"] {
         for edited in [
@@ -185,7 +278,11 @@ fn upgrade_preserves_mcp_launch_policy_arguments() {
         {
             command.env_remove(key);
         }
-        command.args(args).output().unwrap()
+        command
+            .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
     };
     let installed = run(&[
         "integrations",
@@ -339,7 +436,11 @@ fn upgrade_keeps_current_mcp_registration_over_obsolete_duplicates() {
             {
                 command.env_remove(key);
             }
-            command.args(args).output().unwrap()
+            command
+                .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+                .args(args)
+                .output()
+                .unwrap()
         };
         let installed = run(&[
             "integrations",

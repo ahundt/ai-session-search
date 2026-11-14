@@ -3975,9 +3975,9 @@ pub(crate) fn write_owned_skills_with_harness_home(
 /// What the post-upgrade refresh did, so the caller can say so in one line.
 #[derive(Debug)]
 pub(crate) enum UpgradeRefresh {
-    /// Already refreshed for this version, or no aise-owned skill is recorded as installed.
+    /// Already refreshed for this version, or no owned integration needs refreshing.
     NotNeeded,
-    /// Every recorded skill root and every client instruction file was checked once.
+    /// Owned integration components were checked for this version.
     Checked {
         skills: Vec<SkillWriteOutcome>,
         instructions: Vec<InstructionRefresh>,
@@ -4024,7 +4024,7 @@ pub(crate) fn refresh_integrations_after_upgrade(
     )
 }
 
-/// `layout` locates the client instruction files; `None` checks skills only.
+/// `layout` locates MCP and instruction files; `None` checks skills only.
 fn refresh_integrations_for_version(
     receipt_path: &Path,
     version: &str,
@@ -4037,19 +4037,18 @@ fn refresh_integrations_for_version(
     let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
     let mut roots = manifest_recorded_skill_roots(&manifest)
         .with_context(|| format!("read the skill install record {}", manifest_path.display()))?;
-    // Instruction files hold no install record, so the recorded skill is the evidence that aise
-    // installed integrations with this configuration; without one there is nothing to refresh,
-    // and a process run with its own empty configuration never reads the user's client files.
-    if roots.is_empty() {
-        return Ok(UpgradeRefresh::NotNeeded);
-    }
+    // Skill and instruction refresh require a skill record; an MCP launch contract is its own
+    // ownership evidence, including installs that never selected a skill.
+    let has_skill_install = !roots.is_empty();
     // A recorded root whose directory is gone was removed by the user; an upgrade must not put it
     // back. `aise integrations install` restores it on request.
     roots.retain(|root| root.is_dir());
     let outcome = (|| {
         let mut skills = match layout {
-            Some(layout) => refresh_gemini_skill_discovery(receipt_path, layout)?,
-            None => Vec::new(),
+            Some(layout) if has_skill_install => {
+                refresh_gemini_skill_discovery(receipt_path, layout)?
+            }
+            _ => Vec::new(),
         };
         // Migration may retire recorded copies and add the canonical package.
         roots =
@@ -4067,7 +4066,11 @@ fn refresh_integrations_for_version(
                     resolve_mcp_binary(None)
                 })?;
                 (
-                    refresh_earlier_instruction_blocks(receipt_path, layout)?,
+                    if has_skill_install {
+                        refresh_earlier_instruction_blocks(receipt_path, layout)?
+                    } else {
+                        Vec::new()
+                    },
                     mcp,
                 )
             }
@@ -4086,6 +4089,9 @@ fn refresh_integrations_for_version(
         }
         Err(error) => return Err(error),
     };
+    if !has_skill_install && mcp.is_empty() {
+        return Ok(UpgradeRefresh::NotNeeded);
+    }
     // Recorded only after the check completed, so a failure is retried by the next command rather
     // than silenced until the next release; an edited file is an outcome, not a failure, and is
     // reported once. A config directory that cannot hold the marker only costs repeating a check
@@ -4206,6 +4212,7 @@ fn refresh_superseded_mcp_entries(
                             })
                 });
         let existing_binary = superseded_entry(&target)
+            .filter(|entry| entry_arguments(entry).is_some_and(mcp_serve_arguments))
             .as_ref()
             .and_then(entry_command)
             .or_else(|| codex_entry_without_marketplace(&target));
@@ -4301,6 +4308,14 @@ fn entry_command(entry: &Value) -> Option<String> {
         .or_else(|| command.as_array()?.first()?.as_str())
         .filter(|command| !command.is_empty())
         .map(str::to_string)
+}
+
+fn entry_arguments(entry: &Value) -> Option<&[Value]> {
+    entry
+        .get("args")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .or_else(|| entry.get("command")?.as_array()?.get(1..))
 }
 
 fn owned_entry<'a>(root: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
@@ -5091,21 +5106,9 @@ fn merge_registration_arguments(
             }
         }
     }
-    let old_args = old
-        .and_then(|old| {
-            old.get("args")
-                .or_else(|| old.get("command").filter(|value| value.is_array()))
-        })
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let old_args = old.and_then(entry_arguments).unwrap_or_default();
     let mut selections = selected_arguments(old_args);
-    let entry_args = entry
-        .get("args")
-        .or_else(|| entry.get("command").filter(|value| value.is_array()))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let entry_args = entry_arguments(entry).unwrap_or_default();
     for (flag, value) in selected_arguments(entry_args) {
         if !selections.iter().any(|(existing, _)| existing == &flag) {
             selections.push((flag, value));
@@ -5128,15 +5131,10 @@ fn merge_registration_arguments(
     // Explicit reinstall selects state; automatic migration retains the user's launch policy.
     let mut args: Vec<Value> =
         if state.is_none() && (!old_args.is_empty() || !entry_args.is_empty()) {
-            let (retained, has_args) = if old_args.is_empty() {
-                (entry_args, entry.get("args").is_some())
+            let retained = if old_args.is_empty() {
+                entry_args
             } else {
-                (old_args, old.is_some_and(|old| old.get("args").is_some()))
-            };
-            let retained = if has_args {
-                retained
-            } else {
-                retained.get(1..).unwrap_or_default()
+                old_args
             };
             if !mcp_serve_arguments(retained) {
                 bail!(
@@ -10155,9 +10153,8 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_reads_no_client_file_without_a_recorded_install() {
-        // A process that runs with its own empty configuration, as every test does, must not
-        // rewrite the client files of whoever runs it.
+    fn an_upgrade_preserves_instructions_without_a_recorded_skill() {
+        // Instruction refresh still requires a skill record for this configuration.
         let dir = tempdir().unwrap();
         let (_, layout) = home_with_rc1_instructions(dir.path());
         let receipt = default_transaction_receipt(&dir.path().join("other/config.toml"));
