@@ -3191,6 +3191,155 @@ mod tests {
     }
 
     #[test]
+    fn claude_queue_delivery_orders_through_indexer() {
+        use std::io::Write as _;
+        for shape in [
+            "u", "auR", "uR", "au", "aRu", "Ru", "auauR", "uRR", "auau", "auRR", "RRu", "Rau",
+            "uau", "aPu", "aaauRR",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let mut records = vec![
+                serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"delivery-orders","content":"synthetic queued request"}),
+            ];
+            for (i, ch) in shape.chars().enumerate() {
+                records.push(match ch {
+                    'a' | 'u' => serde_json::json!({"type":if ch == 'a' {"assistant"} else {"user"},"uuid":format!("turn-{i}"),"sessionId":"delivery-orders","message":{"role":if ch == 'a' {"assistant"} else {"user"},"content":format!("synthetic turn {i}")}}),
+                    _ => serde_json::json!({"type":"queue-operation","operation":if ch == 'P' {"popAll"} else {"remove"},"sessionId":"delivery-orders"}),
+                });
+            }
+            records.push(serde_json::json!({"type":"attachment","uuid":"delivery","sessionId":"delivery-orders","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic queued request","origin":{"kind":"human"}}}));
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            for record in &records {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(format!("{record}\n").as_bytes())
+                    .unwrap();
+                reindex(&config, &db, false, None).unwrap();
+            }
+            let check = |db_path: &Path| {
+                let conn = rusqlite::Connection::open(db_path).unwrap();
+                let counts: (i64, i64) = conn.query_row("select count(*),sum(authorship='human') from messages where content='synthetic queued request'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+                assert_eq!(counts, (1, 1), "{shape}");
+            };
+            check(&db_path);
+            reindex(&config, &db, true, None).unwrap();
+            check(&db_path);
+            let fresh_path = dir.path().join("fresh.db");
+            let fresh = Db::open(&fresh_path).unwrap();
+            reindex(
+                &config_with_single_claude_fixture(&fresh_path, &root),
+                &fresh,
+                false,
+                None,
+            )
+            .unwrap();
+            check(&fresh_path);
+        }
+    }
+
+    #[test]
+    fn claude_queue_sender_evidence_is_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let records = [
+            serde_json::json!({"type":"queue-operation","operation":"enqueue","uuid":"first","sessionId":"fifo","content":"synthetic repeated request"}),
+            serde_json::json!({"type":"queue-operation","operation":"enqueue","uuid":"second","sessionId":"fifo","content":"synthetic repeated request"}),
+            serde_json::json!({"type":"assistant","uuid":"reply","sessionId":"fifo","message":{"role":"assistant","content":"synthetic reply"}}),
+            serde_json::json!({"type":"attachment","uuid":"human-delivery","sessionId":"fifo","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic repeated request","origin":{"kind":"human"}}}),
+            serde_json::json!({"type":"attachment","uuid":"agent-delivery","sessionId":"fifo","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic repeated request","origin":{"kind":"peer","agent_id":"synthetic-worker"}}}),
+        ];
+        let db_path = dir.path().join("index.db");
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        let mut source = String::new();
+        for record in records {
+            source.push_str(&format!("{record}\n"));
+            std::fs::write(root.join("session.jsonl"), &source).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+        }
+        for full in [false, true] {
+            reindex(&config, &db, full, None).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn.prepare("select correlation_id,authorship from messages where content='synthetic repeated request' order by seq,id").unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("first".into(), "human".into()),
+                    ("second".into(), "agent".into())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_dequeue_closes_only_its_own_submission() {
+        use std::io::Write as _;
+        for later_content in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let mut later = serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"dequeue"});
+            if later_content {
+                later["content"] = serde_json::json!("synthetic repeat");
+            }
+            let records = [
+                serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"dequeue","content":"synthetic repeat"}),
+                serde_json::json!({"type":"queue-operation","operation":"dequeue","sessionId":"dequeue"}),
+                serde_json::json!({"type":"user","uuid":"direct","sessionId":"dequeue","message":{"role":"user","content":"synthetic repeat"}}),
+                serde_json::json!({"type":"assistant","uuid":"reply","sessionId":"dequeue","message":{"role":"assistant","content":"synthetic reply"}}),
+                later,
+                serde_json::json!({"type":"attachment","uuid":"delivery","sessionId":"dequeue","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"synthetic repeat","origin":{"kind":"human"}}}),
+            ];
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            for record in &records {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(format!("{record}\n").as_bytes())
+                    .unwrap();
+                reindex(&config, &db, false, None).unwrap();
+            }
+            let check = |db_path: &Path| {
+                let conn = rusqlite::Connection::open(db_path).unwrap();
+                let rows: (i64, i64) = conn.query_row("select count(*),sum(authorship='human') from messages where content='synthetic repeat'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+                assert_eq!(rows, (2, 2), "later content={later_content}");
+            };
+            check(&db_path);
+            reindex(&config, &db, true, None).unwrap();
+            check(&db_path);
+            let fresh_path = dir.path().join("fresh.db");
+            let fresh = Db::open(&fresh_path).unwrap();
+            reindex(
+                &config_with_single_claude_fixture(&fresh_path, &root),
+                &fresh,
+                false,
+                None,
+            )
+            .unwrap();
+            check(&fresh_path);
+        }
+    }
+
+    #[test]
     fn claude_queued_attachments_do_not_consume_other_submissions() {
         use std::io::Write as _;
         for arrangement in [
@@ -3276,13 +3425,27 @@ mod tests {
                         )
                         .unwrap()
                         .len(),
-                    2,
+                    if arrangement == "earlier-enqueue" {
+                        1
+                    } else {
+                        2
+                    },
                     "{arrangement}"
                 );
             }
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             let authors: (i64,i64) = conn.query_row("select sum(authorship='human'),sum(authorship='unknown') from messages where content='repeat synthetic submission'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-            assert_eq!(authors, (1, 1));
+            assert_eq!(
+                authors,
+                (
+                    1,
+                    if arrangement == "earlier-enqueue" {
+                        0
+                    } else {
+                        1
+                    }
+                )
+            );
             assert_eq!(rows(&db_path), rows(&fresh_path));
             reindex(&config, &db, true, None).unwrap();
             assert_eq!(rows(&db_path), rows(&fresh_path));

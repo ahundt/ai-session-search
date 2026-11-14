@@ -423,6 +423,11 @@ impl UnrecognizedRecordTypes {
     }
 }
 
+struct QueueEnqueue {
+    line: Option<usize>,
+    dequeued_at: Option<usize>,
+}
+
 /// A queued prompt or notice found in an `attachment` record with
 /// `attachment.type == "queued_command"`, held until the whole file is read.
 ///
@@ -508,48 +513,70 @@ impl QueuedCommand {
     /// queued command no other record of the file already indexed, in file order.
     ///
     /// `enqueued` maps the position in `messages` of each row built from a `queue-operation`
-    /// enqueue to its optional line in `transcript_lines` (notices have no transcript).
+    /// enqueue to its optional transcript line and closing dequeue position.
     fn place(
         queued: Vec<Self>,
-        enqueued: &HashMap<usize, Option<usize>>,
+        enqueued: &HashMap<usize, QueueEnqueue>,
         messages: &mut Vec<RawMessage>,
         transcript_lines: &mut Vec<String>,
         retracted_transcript_lines: &mut Vec<String>,
         created_at: &mut Option<DateTime<Utc>>,
         updated_at: &mut Option<DateTime<Utc>>,
-    ) {
-        if queued.is_empty() {
-            return;
+    ) -> Vec<RawMessage> {
+        if queued.is_empty()
+            && enqueued
+                .values()
+                .all(|enqueue| enqueue.dequeued_at.is_none())
+        {
+            return Vec::new();
+        }
+        // A dequeue is a direct delivery, not a candidate for a later attachment. Retire its
+        // enqueue rendering only when the next ordinary user row actually supplies the text.
+        let mut retired = Vec::new();
+        let mut removed = std::collections::HashSet::new();
+        let mut delivered = std::collections::HashSet::new();
+        let mut closed: Vec<_> = enqueued
+            .iter()
+            .filter(|(_, enqueue)| enqueue.dequeued_at.is_some())
+            .collect();
+        closed.sort_unstable_by_key(|(position, _)| **position);
+        for (&position, enqueue) in closed {
+            if let Some(delivery) = enqueue.dequeued_at {
+                if !enqueued.contains_key(&delivery)
+                    && messages.get(delivery).is_some_and(|row| {
+                        row.role() == "user"
+                            && row.content().trim() == messages[position].content().trim()
+                    })
+                    && delivered.insert(delivery)
+                {
+                    removed.insert(position);
+                    retired.push(messages[position].clone());
+                    if let Some(line) = enqueue.line {
+                        retracted_transcript_lines
+                            .push(std::mem::take(&mut transcript_lines[line]));
+                    }
+                }
+            }
         }
         // Queue records take sender evidence before any possible direct delivery copy.
         let mut indexed: HashMap<String, std::collections::VecDeque<usize>> = HashMap::new();
         for (position, message) in messages.iter().enumerate() {
-            if enqueued.contains_key(&position) {
+            if enqueued
+                .get(&position)
+                .is_some_and(|enqueue| enqueue.dequeued_at.is_none())
+            {
                 indexed
                     .entry(sha256(message.content().trim().as_bytes()))
                     .or_default()
                     .push_back(position);
             }
         }
-        let mut retired_lines = false;
-        let mut delivered = std::collections::HashSet::new();
+        let mut retired_lines = !removed.is_empty();
         let mut kept: Vec<Self> = Vec::new();
-        let mut scanned = 0;
-        let mut enqueue_start = 0;
         for queued in queued {
-            // An attachment cannot supply delivery evidence across an intervening reply.
-            for (offset, message) in messages[scanned..queued.position].iter().enumerate() {
-                if message.role() == "assistant" {
-                    enqueue_start = scanned + offset + 1;
-                }
-            }
-            scanned = queued.position;
             let Some(position) = indexed.get_mut(&queued.digest).and_then(|positions| {
-                while positions.front().is_some_and(|&p| p < enqueue_start) {
-                    positions.pop_front();
-                }
-                // A later enqueue is a delivery copy only at the next conversation
-                // position; an intervening reply starts an independent submission.
+                // Earlier unclosed enqueues match FIFO across replies. A later enqueue
+                // can only be the immediately following delivery copy.
                 (positions
                     .front()
                     .is_some_and(|&p| p <= queued.delivery_position))
@@ -568,7 +595,7 @@ impl QueuedCommand {
                 }
                 continue;
             };
-            let Some(&Some(line)) = enqueued.get(&position) else {
+            let Some(line) = enqueued.get(&position).and_then(|enqueue| enqueue.line) else {
                 continue;
             };
             let row = &mut messages[position];
@@ -583,23 +610,33 @@ impl QueuedCommand {
             }
         }
 
-        // Back to front, so each recorded position still names the place it was read at.
-        for queued in kept.into_iter().rev() {
-            if queued.prompt {
-                observe_session_start(created_at, queued.timestamp);
-                observe_session_end(updated_at, queued.timestamp);
-                transcript_lines.insert(
-                    queued.transcript_position,
-                    format_transcript_line("user", queued.timestamp, queued.message.content()),
-                );
+        // Back to front, so insertions and proven direct-delivery removals use source positions.
+        for position in (0..=messages.len()).rev() {
+            if removed.contains(&position) {
+                messages.remove(position);
             }
-            messages.insert(queued.position, queued.message);
+            while kept
+                .last()
+                .is_some_and(|queued| queued.position == position)
+            {
+                let queued = kept.pop().expect("last queued position was checked");
+                if queued.prompt {
+                    observe_session_start(created_at, queued.timestamp);
+                    observe_session_end(updated_at, queued.timestamp);
+                    transcript_lines.insert(
+                        queued.transcript_position,
+                        format_transcript_line("user", queued.timestamp, queued.message.content()),
+                    );
+                }
+                messages.insert(queued.position, queued.message);
+            }
         }
         if retired_lines {
             // Formatted transcript lines are never empty, so only the retired ones go. Removed
             // after the insertions above, whose recorded positions count every line.
             transcript_lines.retain(|line| !line.is_empty());
         }
+        retired
     }
 }
 
@@ -795,7 +832,7 @@ impl ClaudeAdapter {
         let mut cwd = desktop.cwd.clone();
         let mut created_at: Option<DateTime<Utc>> = desktop.created_at;
         let mut updated_at: Option<DateTime<Utc>> = desktop.updated_at;
-        let mut messages = Vec::new();
+        let mut messages: Vec<RawMessage> = Vec::new();
         let mut transcript_lines = Vec::new();
         let mut last_prompt = desktop.initial_message.clone();
         let mut file_edits: Vec<FileEdit> = Vec::new();
@@ -810,8 +847,9 @@ impl ClaudeAdapter {
         // Queued prompts recorded only as attachments, placed after the loop once every
         // conversation and queue record of the file is known; see `QueuedCommand`.
         let mut queued_commands: Vec<QueuedCommand> = Vec::new();
-        // Enqueue row -> transcript line, or None for a harness notice.
-        let mut enqueued: HashMap<usize, Option<usize>> = HashMap::new();
+        // Enqueue row -> transcript line and optional direct-delivery boundary.
+        let mut enqueued: HashMap<usize, QueueEnqueue> = HashMap::new();
+        let mut pending_enqueues = std::collections::VecDeque::<Option<usize>>::new();
         let mut unrecognized = UnrecognizedRecordTypes::default();
         // What earlier parsers made of the records this one declines; see `RetractedRows`.
         let mut retracted_messages = Vec::new();
@@ -932,6 +970,20 @@ impl ClaudeAdapter {
                             }
                             retracted_messages.push(queued.message);
                         } else {
+                            // Text-bearing enqueues win over contentless queue markers. Each
+                            // delivery consumes one pending candidate, even before a dequeue.
+                            let pending = pending_enqueues
+                                .iter()
+                                .position(|position| {
+                                    position.is_some_and(|p| {
+                                        messages[p].content().trim()
+                                            == queued.message.content().trim()
+                                    })
+                                })
+                                .or_else(|| pending_enqueues.iter().position(Option::is_none));
+                            if let Some(pending) = pending {
+                                pending_enqueues.remove(pending);
+                            }
                             queued_commands.push(queued);
                         }
                     } else if value["attachment"]["type"] != "queued_command" {
@@ -951,8 +1003,8 @@ impl ClaudeAdapter {
                     }
                     continue;
                 }
-                // Only enqueue records a submission; other queue operations establish neither a
-                // new input nor a link proving delivery. Keep repeated submissions independently.
+                // Enqueue records submissions; dequeue closes a FIFO candidate delivered as
+                // an ordinary user turn. Remove and popAll do not prove delivery on their own.
                 Some("queue-operation") => {
                     let operation = value
                         .get("operation")
@@ -961,6 +1013,14 @@ impl ClaudeAdapter {
                     *queue_operation_counts
                         .entry(operation.to_string())
                         .or_default() += 1;
+                    if operation == "dequeue" {
+                        if let Some(Some(position)) = pending_enqueues.pop_front() {
+                            enqueued
+                                .get_mut(&position)
+                                .expect("pending enqueue exists")
+                                .dequeued_at = Some(messages.len());
+                        }
+                    }
                     if operation != "enqueue" {
                         // Earlier parsers stored notices from queue removal records too. Only
                         // retract the rendering of this still-present record, never absent text.
@@ -982,6 +1042,7 @@ impl ClaudeAdapter {
                     }
                     if operation == "enqueue" {
                         requires_full_parse_for_tail = true;
+                        let position = messages.len();
                         if let Some(content) = value.get("content").and_then(Value::as_str) {
                             let content = strip_command_markup(content).trim().to_string();
                             if substantive_text(&content) {
@@ -1031,15 +1092,28 @@ impl ClaudeAdapter {
                                 // `user` record of that text follows.
                                 if is_harness_notice(&value, &content) {
                                     raw_message.retag_harness_notice();
-                                    enqueued.insert(messages.len(), None);
+                                    enqueued.insert(
+                                        messages.len(),
+                                        QueueEnqueue {
+                                            line: None,
+                                            dequeued_at: None,
+                                        },
+                                    );
                                 } else {
-                                    enqueued.insert(messages.len(), Some(transcript_lines.len()));
+                                    enqueued.insert(
+                                        messages.len(),
+                                        QueueEnqueue {
+                                            line: Some(transcript_lines.len()),
+                                            dequeued_at: None,
+                                        },
+                                    );
                                     transcript_lines
                                         .push(format_transcript_line("user", timestamp, &content));
                                 }
                                 messages.push(raw_message);
                             }
                         }
+                        pending_enqueues.push_back((messages.len() > position).then_some(position));
                     }
                     continue;
                 }
@@ -1283,7 +1357,7 @@ impl ClaudeAdapter {
                 queued.delivery_position += 1;
             }
         }
-        QueuedCommand::place(
+        retracted_messages.extend(QueuedCommand::place(
             queued_commands,
             &enqueued,
             &mut messages,
@@ -1291,7 +1365,7 @@ impl ClaudeAdapter {
             &mut retracted_transcript_lines,
             &mut created_at,
             &mut updated_at,
-        );
+        ));
 
         let first_user = messages
             .iter()
