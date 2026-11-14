@@ -1852,8 +1852,9 @@ impl<'app> AnalysisService<'app> {
         &self,
         query: &crate::skill_run::SkillRunQuery,
     ) -> Result<crate::skill_run::SkillRunReport> {
-        self.db.ensure_refreshed_for_read()?;
         let crate::skill_run::SkillCapabilityInput::MessageClassification(arguments) = &query.input;
+        arguments.filters.validate("run_skill_capability")?;
+        self.db.ensure_refreshed_for_read()?;
         let embedded_primary = matches!(
             &query.skill,
             crate::skill_catalog::SkillSelector::Name(selector)

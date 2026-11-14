@@ -5596,10 +5596,6 @@ fn tool_run_skill_capability(
         session_kinds: parse_enum_array(args, "session_kinds")?,
         ..Default::default()
     };
-    filters
-        .validate("run_skill_capability")
-        .map_err(|error| format!("{error:#}"))?;
-
     let primary = parse_mcp_skill_selector(
         args.get("skill")
             .ok_or_else(|| "run_skill_capability requires skill".to_string())?,
@@ -7078,6 +7074,21 @@ mod tests {
                 },
             ),
         };
+        let mut invalid_range = query.clone();
+        let crate::skill_run::SkillCapabilityInput::MessageClassification(input) =
+            &mut invalid_range.input;
+        input.additional_skills.clear();
+        input.filters.seq_from = Some(4);
+        input.filters.seq_to = Some(1);
+        let error = crate::service::AnalysisService::new(&config, &db)
+            .run_skill(&invalid_range)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::ServiceError>()
+                .map(crate::ServiceError::code),
+            Some("invalid-argument")
+        );
         let error = crate::service::AnalysisService::new(&config, &db)
             .run_skill(&query)
             .unwrap_err();
