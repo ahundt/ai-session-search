@@ -8,56 +8,18 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import sys
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
+from sqlite_helpers import write_database
 
 import ai_session_search as aise
 
 # The console script of the package under test, so the tests need no separate Cargo build.
 CLI = shutil.which("aise")
 assert CLI is not None, "run `uv run maturin develop --uv` to install the aise console script"
-
-
-class SqlStatements:
-    def __init__(self) -> None:
-        self.statements: list[tuple[str, tuple[Any, ...]]] = []
-
-    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> None:
-        self.statements.append((sql, parameters))
-
-
-@contextmanager
-def write_database(database: str | Path) -> Iterator[SqlStatements]:
-    """Commit fixture SQL in a process with no native aise SQLite connections.
-
-    Python and rusqlite link separate SQLite copies. Their in-process Unix lock/WAL
-    bookkeeping is not shared, even when writes are sequential. In particular,
-    sqlite3's transaction context does not close its connection; a later finalizer
-    can checkpoint stale pages after the Rust service has closed and reopened.
-    A child process preserves real cross-process reader/writer locking instead.
-    """
-    statements = SqlStatements()
-    yield statements
-    subprocess.run(
-        [sys.executable, "-c", """
-import json
-import sqlite3
-import sys
-from contextlib import closing
-
-with closing(sqlite3.connect(sys.argv[1])) as connection, connection:
-    for sql, parameters in json.load(sys.stdin):
-        connection.execute(sql, parameters)
-""", str(database)],
-        input=json.dumps(statements.statements), text=True, capture_output=True,
-        check=True, timeout=15,
-    )
 
 
 @pytest.fixture
