@@ -1887,44 +1887,66 @@ mod tests {
 
     #[test]
     fn renamed_claude_queue_source_reconciles_path_scoped_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("index.db");
-        let root = dir.path().join("claude");
-        std::fs::create_dir_all(&root).unwrap();
-        let old_path = root.join("session.jsonl");
-        let record = r#"{"type":"queue-operation","operation":"enqueue","sessionId":"queue-move","timestamp":"2026-06-17T00:00:00Z","content":"moved queued input"}"#;
-        std::fs::write(&old_path, format!("{record}\n{record}\n")).unwrap();
-        let config = config_with_single_claude_fixture(&db_path, &root);
-        let db = Db::open(&db_path).unwrap();
-        reindex(&config, &db, false, None).unwrap();
-        let stored = rusqlite::Connection::open(&db_path).unwrap();
-        let old_scope: String = stored
-            .query_row(
-                "select correlation_scope from messages where content = 'moved queued input'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        drop(stored);
-        assert!(old_scope.contains("session.jsonl"), "{old_scope}");
-        let new_path = root.join("renamed.jsonl");
-        std::fs::rename(&old_path, &new_path).unwrap();
-        reindex(&config, &db, false, None).unwrap();
-        let stored = rusqlite::Connection::open(&db_path).unwrap();
-        let (count, new_scope): (i64, String) = stored
-            .query_row(
-                "select count(*), min(correlation_scope) from messages
-                 where content = 'moved queued input'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            count, 2,
-            "a physical rename must preserve both independent submissions without duplicating them"
-        );
-        assert!(new_scope.contains("renamed.jsonl"), "{new_scope}");
-        assert_ne!(old_scope, new_scope);
+        for explicit_id in [false, true] {
+            for multiplicity in [1, 2] {
+                let dir = tempfile::tempdir().unwrap();
+                let db_path = dir.path().join("index.db");
+                let root = dir.path().join("claude");
+                std::fs::create_dir_all(&root).unwrap();
+                let old_path = root.join("session.jsonl");
+                let mut record = serde_json::json!({"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-17T00:00:00Z","content":"moved queued input"});
+                if explicit_id {
+                    record["sessionId"] = serde_json::json!("queue-move");
+                }
+                std::fs::write(&old_path, format!("{record}\n").repeat(multiplicity)).unwrap();
+                let config = config_with_single_claude_fixture(&db_path, &root);
+                let db = Db::open(&db_path).unwrap();
+                reindex(&config, &db, false, None).unwrap();
+                let stored = rusqlite::Connection::open(&db_path).unwrap();
+                let old_scope: String = stored
+                    .query_row(
+                        "select correlation_scope from messages where content='moved queued input'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(old_scope.contains("session.jsonl"), "{old_scope}");
+                let new_path = root.join("renamed.jsonl");
+                std::fs::rename(&old_path, &new_path).unwrap();
+                for full in [false, false, true, false] {
+                    reindex(&config, &db, full, None).unwrap();
+                    let counts: (i64, i64, i64) = stored.query_row("select count(*), count(distinct correlation_scope), sum(correlation_scope like '%renamed.jsonl%') from messages where content='moved queued input'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                    assert_eq!(
+                        counts,
+                        (multiplicity as i64, 1, multiplicity as i64),
+                        "explicit id: {explicit_id}, full: {full}"
+                    );
+                    let new_scope: String = stored
+                        .query_row("select correlation_scope from messages", [], |r| r.get(0))
+                        .unwrap();
+                    assert_ne!(old_scope, new_scope);
+                    let session_count: i64 = stored
+                        .query_row("select count(*) from sessions", [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(session_count, 1);
+                    let id = if explicit_id {
+                        "claude:queue-move"
+                    } else {
+                        "claude:renamed"
+                    };
+                    assert_eq!(
+                        db.resolve_session_record(id).unwrap().source_path,
+                        crate::util::canonical_source_path(&new_path)
+                    );
+                    assert_eq!(
+                        db.search_messages("moved queued input", &Default::default())
+                            .unwrap()
+                            .len(),
+                        multiplicity
+                    );
+                }
+            }
+        }
     }
 
     #[test]

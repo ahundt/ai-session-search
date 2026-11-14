@@ -2566,7 +2566,7 @@ impl Db {
             }
         }
         if matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop) {
-            remap_verified_queue_scopes(&tx, session, source_aliases)?;
+            remap_verified_queue_scopes(&tx, session, &retired_ids, source_aliases)?;
         }
         let mut prior_transcripts: Vec<String> = Vec::new();
         for id in &retired_ids {
@@ -7931,6 +7931,7 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
 fn remap_verified_queue_scopes(
     tx: &rusqlite::Transaction<'_>,
     session: &SessionRecord,
+    retired_ids: &[String],
     aliases: &[String],
 ) -> Result<()> {
     if aliases.is_empty() {
@@ -7953,15 +7954,18 @@ fn remap_verified_queue_scopes(
             continue;
         };
         let old_scope = claude_queue_scope(&receipt.canonical_path);
-        tx.execute(
-            "update messages
+        // Remap before moving retiring rows, while their verified alias receipts still exist.
+        for id in std::iter::once(&session.id).chain(retired_ids) {
+            tx.execute(
+                "update messages
              set correlation_scope = ?1
              where session_id = ?2
                and correlation_authority = 'source_local'
                and correlation_id is not null
                and correlation_scope = ?3",
-            params![new_scope, session.id, old_scope],
-        )?;
+                params![new_scope, id, old_scope],
+            )?;
+        }
     }
     Ok(())
 }
