@@ -404,7 +404,10 @@ accepts, under the index tokenizer's own case folding, which differs from the ve
 tokenizer folds a character differently (`trigram::FTS5_UNFOLDED_LOWERCASE`, U+0130), the
 prefilter leaves that position out rather than requiring a trigram that excludes matching rows;
 `the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes that set from the
-linked SQLite.
+linked SQLite and the compiling Rust toolchain's `char::to_lowercase` mappings. Literal matching
+uses those same Rust mappings, so its Unicode version follows the compiler; regex case matching
+uses the locked regex dependency's Unicode tables. The exclusion table retains the union needed
+by supported compilers, including entries an older compiler does not yet recognize.
 
 `max_hits_per_page` and `max_context_neighbors_per_hit` are policy ceilings: an oversized resolved
 request errors. They do not silently clamp the request. Explicit `all_results` is not a finite page

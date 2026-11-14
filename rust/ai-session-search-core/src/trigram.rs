@@ -176,9 +176,11 @@ where
 /// ordinary written form is the uppercase syllabary; Georgian Mtavruli; Osage; Adlam; and Latin
 /// letters added in later Unicode versions). Stored text keeps the uppercase scalar while a query
 /// trigram carries the lowercase one, so a trigram containing one of these would exclude rows
-/// the verifier accepts. 445 scalars in 60 inclusive ranges, sorted.
-/// `the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes this from the
-/// SQLite this crate links and fails if a SQLite upgrade changes it.
+/// the verifier accepts. The union covers the case pairs recognized by supported Rust
+/// toolchains; literal matching uses that toolchain's `char::to_lowercase`, while regex uses
+/// the locked regex crate's Unicode tables. Older compilers may not recognize every pair.
+/// `the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes the required
+/// entries from Rust's case mappings and the linked SQLite tokenizer.
 const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0x019B, 0x019B),
     (0x025C, 0x025C),
@@ -186,6 +188,8 @@ const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0x0264, 0x0264),
     (0x026A, 0x026A),
     (0x026C, 0x026C),
+    (0x0277, 0x0277),
+    (0x027C, 0x027C),
     (0x0282, 0x0282),
     (0x0287, 0x0287),
     (0x029D, 0x029E),
@@ -227,6 +231,7 @@ const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0xA7D9, 0xA7D9),
     (0xA7DB, 0xA7DB),
     (0xA7F6, 0xA7F6),
+    (0xAB4B, 0xAB4C),
     (0xAB53, 0xAB53),
     (0xAB70, 0xABBF),
     (0x104D8, 0x104FB),
@@ -239,6 +244,22 @@ const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0x118C0, 0x118DF),
     (0x16E60, 0x16E7F),
     (0x16EBB, 0x16ED3),
+    (0x1DF41, 0x1DF41),
+    (0x1DF49, 0x1DF49),
+    (0x1DF4B, 0x1DF4B),
+    (0x1DF4E, 0x1DF4E),
+    (0x1DF52, 0x1DF52),
+    (0x1DF69, 0x1DF69),
+    (0x1DF6B, 0x1DF6B),
+    (0x1DF6D, 0x1DF6D),
+    (0x1DF6F, 0x1DF6F),
+    (0x1DF73, 0x1DF73),
+    (0x1DF75, 0x1DF75),
+    (0x1DF77, 0x1DF77),
+    (0x1DF79, 0x1DF79),
+    (0x1DF7B, 0x1DF7B),
+    (0x1DF7D, 0x1DF7D),
+    (0x1DF7F, 0x1DF7F),
     (0x1E922, 0x1E943),
 ];
 
@@ -690,6 +711,22 @@ mod tests {
             "FTS5_UNFOLDED_LOWERCASE disagrees with the linked tokenizer: \
              missing {missing:?}, extra {extra:?}"
         );
+    }
+
+    #[test]
+    fn newer_case_pairs_cannot_constrain_the_fts5_candidates() {
+        for code in [
+            0x0277, 0x027C, 0xAB4B, 0xAB4C, 0x1DF41, 0x1DF49, 0x1DF4B, 0x1DF4E, 0x1DF52, 0x1DF69,
+            0x1DF6B, 0x1DF6D, 0x1DF6F, 0x1DF73, 0x1DF75, 0x1DF77, 0x1DF79, 0x1DF7B, 0x1DF7D,
+            0x1DF7F,
+        ] {
+            let lower = char::from_u32(code).unwrap();
+            assert_eq!(literal_to_trigrams(&format!("a{lower}b")), None);
+            assert_eq!(
+                literal_to_trigrams(&format!("safe{lower}run")),
+                Some(vec![vec!["afe".into(), "run".into(), "saf".into()]])
+            );
+        }
     }
 
     #[test]
