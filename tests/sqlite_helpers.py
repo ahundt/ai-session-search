@@ -50,7 +50,7 @@ import sqlite3
 import sys
 from contextlib import closing
 
-with closing(sqlite3.connect(sys.argv[1])) as connection, connection:
+with closing(sqlite3.connect(sys.argv[1], timeout=120)) as connection, connection:
     for operation, sql, parameters in json.load(sys.stdin):
         if operation == "executescript":
             connection.executescript(sql)
@@ -58,5 +58,6 @@ with closing(sqlite3.connect(sys.argv[1])) as connection, connection:
             connection.execute(sql, parameters)
 """, str(database)],
         input=json.dumps(statements.statements), text=True, capture_output=True,
-        check=True, timeout=15,
+        # Hang guard only: far above any plausible duration on a busy or virtualized runner.
+        check=True, timeout=300,
     )
