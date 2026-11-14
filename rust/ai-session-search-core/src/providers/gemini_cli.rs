@@ -125,7 +125,11 @@ impl GeminiCliAdapter {
             .as_deref()
             .or_else(|| path.file_stem().and_then(|value| value.to_str()))
             .unwrap_or("session");
-        let evidence = gemini_session_evidence(replay.kind.as_deref());
+        let evidence = gemini_session_evidence(
+            nested_parent_id(path)
+                .map(|_| "subagent")
+                .or(replay.kind.as_deref()),
+        );
         let unknown_kind = replay
             .kind
             .as_deref()
@@ -160,6 +164,7 @@ impl GeminiCliAdapter {
         if let Some(kind) = unknown_kind {
             metadata["unknown_session_kind"] = json!(kind);
         }
+        set_nested_parent(&mut parsed, path);
         parsed.file_edits = rendered.file_edits;
         parsed.session.raw_metadata_json = Some(metadata.to_string());
         Ok(parsed)
@@ -633,6 +638,79 @@ fn split_referenced_files(
         regex.replace_all(content, "").trim().to_string(),
         attachments,
     )
+}
+
+fn nested_parent_id(path: &Path) -> Option<&str> {
+    if path.extension()?.to_str()? != "jsonl" {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.parent()?.file_name()?.to_str()? != "chats" {
+        return None;
+    }
+    parent.file_name()?.to_str().filter(|id| !id.is_empty())
+}
+
+/// Native subagent files live in chats/<complete parent id>/<run>.jsonl. The parent's
+/// canonical aise id is path-based, so resolve its native id among the sibling chat files.
+/// This reads sibling metadata without retaining transcripts: O(sibling source bytes) time,
+/// O(largest JSON record) memory. An absent parent keeps a native orphan link, not a guessed
+/// path; a later reparse can resolve it when the parent's source is available.
+fn set_nested_parent(parsed: &mut ParsedSession, path: &Path) {
+    let Some(parent_id) = nested_parent_id(path) else {
+        return;
+    };
+    let Some(chats) = path.parent().and_then(Path::parent) else {
+        return;
+    };
+    let parent_prefix = parent_id.chars().take(8).collect::<String>();
+    let mut candidates = fs::read_dir(chats)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("session-"))
+        })
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("json" | "jsonl")
+            )
+        })
+        .filter(|candidate| {
+            candidate
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&format!("-{parent_prefix}")))
+        })
+        .filter(|candidate| {
+            native_session_id_until(candidate, &|| false)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(parent_id)
+        })
+        .collect::<Vec<_>>();
+    // Migration families retain the predecessor's path-based primary key.
+    candidates.sort_by_key(|path| {
+        (
+            path.extension().and_then(|ext| ext.to_str()) != Some("json"),
+            path.clone(),
+        )
+    });
+    parsed.session.parent_session_id = Some(
+        candidates
+            .first()
+            .map(|path| format!("gemini-cli:{}", crate::util::normalize_path(path)))
+            .unwrap_or_else(|| format!("gemini-cli:{parent_id}")),
+    );
+    parsed.session.agent_label = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
 }
 
 fn is_chat_source(root: &Path, path: &Path) -> bool {
@@ -2438,6 +2516,57 @@ not json
             answer.provenance.input_origin,
             Some(crate::models::MessageInputOrigin::InteractiveAnswer)
         );
+    }
+
+    #[test]
+    fn nested_children_link_to_the_parent_row_but_flat_children_stay_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tmp");
+        let chats = root.join("project").join("chats");
+        let nested = chats.join("parent-id");
+        fs::create_dir_all(&nested).unwrap();
+        let parent = chats.join("session-2026-02-23T04-07-parent-i.jsonl");
+        let child = nested.join("child-id.jsonl");
+        let flat = chats.join("flat-id.jsonl");
+        fs::write(&parent, "{\"sessionId\":\"parent-id\",\"kind\":\"main\"}\n").unwrap();
+        for path in [&child, &flat] {
+            fs::write(path, "{\"sessionId\":\"child-id\",\"kind\":\"subagent\"}\n{\"id\":\"u\",\"type\":\"user\",\"content\":\"delegated\"}\n").unwrap();
+        }
+        let adapter = GeminiCliAdapter::new(vec![root]);
+        let parent = adapter.parse_path(&parent).unwrap();
+        let child = adapter.parse_path(&child).unwrap();
+        let flat = adapter.parse_path(&flat).unwrap();
+        assert_eq!(
+            child.session.parent_session_id.as_deref(),
+            Some(parent.session.id.as_str())
+        );
+        assert_eq!(child.session.agent_label.as_deref(), Some("child-id"));
+        assert_eq!(
+            child.messages[0].provenance.authorship,
+            MessageAuthorship::Agent
+        );
+        assert!(flat.session.parent_session_id.is_none());
+        assert!(flat.session.agent_label.is_none());
+        let db_path = dir.path().join("index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        let mut old = child.clone();
+        old.session.parent_session_id = None;
+        old.session.agent_label = None;
+        old.session.parse_version = "gemini-cli-v6".into();
+        db.upsert_session(&old, 1, 1).unwrap();
+        db.upsert_session(&parent, 2, 2).unwrap();
+        for generation in [3, 4] {
+            db.upsert_session(&child, generation, generation).unwrap();
+        }
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        let link: String = connection
+            .query_row(
+                "select parent_session_id from sessions where provider_session_id='child-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(link, parent.session.id);
     }
 
     #[test]
