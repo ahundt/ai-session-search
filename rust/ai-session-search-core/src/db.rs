@@ -9458,6 +9458,7 @@ mod tests {
         db.upsert_session(&parsed, 1, 1).unwrap();
         let tail = crate::tail::TailParse {
             session: parsed.session.clone(),
+            overlap_messages: Vec::new(),
             new_messages: vec![archive_message(
                 0,
                 "synthetic",
