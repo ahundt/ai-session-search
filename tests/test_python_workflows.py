@@ -8,6 +8,9 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -21,6 +24,42 @@ CLI = shutil.which("aise")
 assert CLI is not None, "run `uv run maturin develop --uv` to install the aise console script"
 
 
+class SqlStatements:
+    def __init__(self) -> None:
+        self.statements: list[tuple[str, tuple[Any, ...]]] = []
+
+    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> None:
+        self.statements.append((sql, parameters))
+
+
+@contextmanager
+def write_database(database: str | Path) -> Iterator[SqlStatements]:
+    """Commit fixture SQL in a process with no native aise SQLite connections.
+
+    Python and rusqlite link separate SQLite copies. Their in-process Unix lock/WAL
+    bookkeeping is not shared, even when writes are sequential. In particular,
+    sqlite3's transaction context does not close its connection; a later finalizer
+    can checkpoint stale pages after the Rust service has closed and reopened.
+    A child process preserves real cross-process reader/writer locking instead.
+    """
+    statements = SqlStatements()
+    yield statements
+    subprocess.run(
+        [sys.executable, "-c", """
+import json
+import sqlite3
+import sys
+from contextlib import closing
+
+with closing(sqlite3.connect(sys.argv[1])) as connection, connection:
+    for sql, parameters in json.load(sys.stdin):
+        connection.execute(sql, parameters)
+""", str(database)],
+        input=json.dumps(statements.statements), text=True, capture_output=True,
+        check=True, timeout=15,
+    )
+
+
 @pytest.fixture
 def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     executable = tmp_path / "claude"
@@ -30,7 +69,7 @@ def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     database = tmp_path / "index.db"
     search = aise.SessionSearch(database)
     search.refresh()
-    with sqlite3.connect(database) as db:
+    with write_database(database) as db:
         for n in range(3):
             sid = f"claude:synthetic-{n}"
             db.execute(
@@ -52,7 +91,19 @@ def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "VALUES (?, 'claude', 0, 'Write', '/synthetic/project/app.py', 'app.py', 'print(42)')",
                 (sid,),
             )
-    return search
+    try:
+        yield search
+    finally:
+        search.close()
+
+
+def test_corpus_does_not_open_python_sqlite_connections(request, monkeypatch):
+    def forbidden_connection(*args, **kwargs):
+        pytest.fail("fixture writes must not load a second SQLite library on the live index")
+
+    monkeypatch.setattr(sqlite3, "connect", forbidden_connection)
+    search = request.getfixturevalue("corpus")
+    assert len(search.search_messages("forgot").results) == 9
 
 
 def cli(search, *args):
@@ -162,14 +213,13 @@ def test_gemini_resume_python_and_cli_use_native_id_and_project_cwd(
     project.mkdir()
     native_id = "11111111-2222-4333-8444-555555555555"
     session_id = "gemini-cli:synthetic-resume"
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         db.execute(
             "INSERT INTO sessions (id, provider, provider_session_id, cwd, "
             "preview_text, source_path, parse_version, discovery_source) "
             "VALUES (?, 'gemini-cli', ?, ?, '', ?, 'test', 'fixture')",
             (session_id, native_id, str(project), str(tmp_path / "session-synthetic.jsonl")),
         )
-    db.close()
     command = corpus.resume_command(session_id)
     assert command["argv"] == ["gemini", "--resume", native_id]
     assert command["cwd"] == str(project)
@@ -181,9 +231,8 @@ def test_gemini_resume_python_and_cli_use_native_id_and_project_cwd(
     )
     assert f"gemini --resume {native_id}" in result.stdout
     assert str(project) in result.stdout
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         db.execute("UPDATE sessions SET cwd = NULL WHERE id = ?", (session_id,))
-    db.close()
     unavailable = corpus.resume_command(session_id)
     assert unavailable["argv"] is None
     assert "project directory" in unavailable["unavailable_reason"]
@@ -320,18 +369,18 @@ def test_structured_search_hits_include_timestamp(corpus):
     assert response.to_dict() == cli(corpus, "messages", "search", "forgot", "--format", "json")
     database = corpus.db_path
     corpus.close()
-    with sqlite3.connect(database) as db:
+    with write_database(database) as db:
         db.execute("UPDATE messages SET ts = NULL")
-    db.close()
     with aise.SessionSearch(database, index_refresh="existing-only") as reopened:
         updated = reopened.search_messages("forgot")
+        assert len(updated.results) == 9
         assert all(row["timestamp"] is None for row in updated.results)
         assert updated.to_dict() == cli(reopened, "messages", "search", "forgot", "--format", "json")
 
 
 @pytest.mark.integration
 def test_message_ranges_can_include_harness_notices(corpus):
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         db.execute("INSERT INTO messages (session_id, provider, seq, role, kind, content) VALUES ('claude:synthetic-0', 'claude', 3, 'user', 'harness_notice', 'synthetic hook notice')")
     assert [row.seq for row in corpus.read_session_messages("synthetic-0")] == [0, 1, 2]
     kinds = ["conversation", "harness_notice"]
@@ -343,7 +392,7 @@ def test_message_ranges_can_include_harness_notices(corpus):
 
 
 def test_native_workspace_path_input(corpus, tmp_path: Path):
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         db.execute("UPDATE sessions SET cwd = ?", (str(tmp_path),))
     assert corpus.list_sessions(aise.SessionQuery(path_prefix=tmp_path))
     assert aise.QueryScope(path_prefix=tmp_path).path_prefix == str(tmp_path)
@@ -377,7 +426,7 @@ def test_restore_documents_and_preserves_destinations(corpus, tmp_path: Path):
     assert doc and "output_dir" in doc and ".recovered" in doc
     original = tmp_path / "app.py"
     original.write_text("current file")
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         db.execute("UPDATE file_edits SET file_path = ? WHERE session_id = 'claude:synthetic-0'", (str(original),))
     recovered = corpus.reconstruct_file(original, request=aise.FileQuery(session_id="synthetic-0"))
     first = recovered.restore()
@@ -427,7 +476,7 @@ def test_native_errors_and_fuzzy_help_name_python_actions(corpus):
 
 @pytest.mark.integration
 def test_file_query_default_matches_cli_without_hidden_fifty_row_limit(corpus):
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         for n in range(60):
             db.execute("INSERT INTO file_edits (session_id, provider, seq, tool, file_path, file_name, new_content) VALUES ('claude:synthetic-0', 'claude', ?, 'Write', ?, ?, 'fixture')", (100 + n, f"/synthetic/generated-{n}.py", f"generated-{n}.py"))
     files = corpus.search_files("generated-*.py")
@@ -483,7 +532,7 @@ def test_library_guide_runs_each_of_the_five_purposes(corpus, tmp_path: Path, mo
 
 
 def test_signed_windows_keep_head_tail_or_all(corpus):
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         db.execute("INSERT INTO transcripts (session_id, transcript_text) VALUES ('claude:synthetic-0', 'head\nmiddle\ntail')")
         db.execute("UPDATE messages SET content = 'head\nmiddle\ntail' WHERE session_id = 'claude:synthetic-0' AND seq = 0")
     for count, expected in [(1, "head"), (-1, "tail"), (0, "head\nmiddle\ntail")]:
@@ -498,7 +547,7 @@ def test_signed_windows_keep_head_tail_or_all(corpus):
 
 @pytest.mark.parametrize("pattern", ["rate_%.py", "*/rate_%.py", "rate_*.py"])
 def test_file_search_keeps_percent_and_underscore_literal(corpus, pattern):
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         for n, name in enumerate(["rate_%.py", "rateXY.py", "rate_12.py"]):
             db.execute(
                 "INSERT INTO file_edits (session_id, provider, seq, tool, file_path, "
@@ -534,7 +583,7 @@ def test_readme_and_classification_reference_python_examples(corpus, tmp_path: P
 def test_cli_preserves_published_date_interpretations(corpus, monkeypatch: pytest.MonkeyPatch, case):
     monkeypatch.setenv("TZ", "America/New_York")
     timestamp = (datetime.now(UTC) - timedelta(days=2)).isoformat() if case == "month-shorthand" else "2026-01-15T00:30:00Z"
-    with sqlite3.connect(corpus.db_path) as db:
+    with write_database(corpus.db_path) as db:
         db.execute(
             "INSERT INTO messages (session_id, provider, seq, role, kind, ts, content, authorship) "
             "VALUES ('claude:synthetic-0', 'claude', 50, 'user', 'conversation', ?, 'compatibility-date-boundary', 'human')",
