@@ -467,6 +467,9 @@ struct QueryArgs {
     /// Maximum number of rows to return. Omit to use `[search].default_limit`; zero means all.
     #[arg(help_heading = SESSION_OUTPUT_HEADING, long)]
     limit: Option<usize>,
+    /// Skip this many rows in the same deterministic list or ranked order.
+    #[arg(help_heading = SESSION_OUTPUT_HEADING, long, default_value_t = 0)]
+    offset: usize,
     /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
     /// emit machine-readable rows.
     #[arg(help_heading = SESSION_OUTPUT_HEADING, long, value_enum, default_value_t = OutputFormat::Table)]
@@ -494,14 +497,8 @@ struct SessionFilterArgs {
     /// Omit to search every allowed root.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     path: Option<String>,
-    /// Exclude sessions whose cwd, repo root, or transcript path is this directory or a
-    /// descendant of it (component boundary). Repeat to exclude multiple noisy worktrees or
-    /// transcript roots. Omit to exclude none.
-    #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-path")]
-    exclude_paths: Vec<String>,
-    /// Exclude one exact session id. Repeat to exclude multiple sessions. Omit to exclude none.
-    #[arg(help_heading = SESSION_FILTER_HEADING, long = "exclude-session")]
-    exclude_sessions: Vec<String>,
+    #[command(flatten)]
+    exclusions: ExclusionArgs,
     /// Restrict to one session class; one-value alias for --session-kinds. Omit for both classes.
     #[arg(help_heading = SESSION_FILTER_HEADING, long = "session-kind", value_enum)]
     session_kind: Option<SessionKind>,
@@ -526,6 +523,28 @@ struct SessionFilterArgs {
     /// Show only sessions that produced a parse warning.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     warnings_only: bool,
+}
+
+/// Session-wide exclusions shared by CLI queries before ordering and paging.
+#[derive(Debug, Args, Clone, Default)]
+#[non_exhaustive]
+pub struct ExclusionArgs {
+    /// Exclude sessions whose cwd, repo root, or transcript path is this directory or a
+    /// descendant of it (component boundary). Repeat to exclude multiple roots.
+    #[arg(long = "exclude-path")]
+    pub exclude_paths: Vec<String>,
+    /// Exclude one exact canonical session id. Repeat to exclude multiple sessions.
+    #[arg(long = "exclude-session")]
+    pub exclude_sessions: Vec<String>,
+}
+
+impl ExclusionArgs {
+    pub(crate) fn normalized_paths(&self) -> Vec<String> {
+        self.exclude_paths
+            .iter()
+            .map(|path| crate::util::normalize_path_prefix(path))
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -627,14 +646,14 @@ impl QueryArgs {
         let Self {
             filters,
             limit,
+            offset,
             format,
             include,
         } = self;
         let SessionFilterArgs {
             provider,
             path,
-            exclude_paths,
-            exclude_sessions,
+            exclusions,
             session_kind,
             session_kinds,
             parent_session,
@@ -658,10 +677,10 @@ impl QueryArgs {
         if let Some(path) = path {
             push(&mut command, "--path", path);
         }
-        for path in exclude_paths {
+        for path in &exclusions.exclude_paths {
             push(&mut command, "--exclude-path", path);
         }
-        for session in exclude_sessions {
+        for session in &exclusions.exclude_sessions {
             push(&mut command, "--exclude-session", session);
         }
         if let Some(kind) = session_kind {
@@ -694,6 +713,9 @@ impl QueryArgs {
         }
         if let Some(limit) = limit {
             push(&mut command, "--limit", &limit.to_string());
+        }
+        if *offset > 0 {
+            push(&mut command, "--offset", &offset.to_string());
         }
         if *format != OutputFormat::Table {
             push(&mut command, "--format", format.as_str());
@@ -1398,7 +1420,7 @@ fn execute(cli: Cli) -> Result<()> {
             let include = args.include;
             let filters =
                 build_filters(&args.filters, configured_search_limit(args.limit, &config))?;
-            let sessions = app.catalog().list_sessions(&filters)?;
+            let sessions = app.catalog().list_sessions_page(&filters, args.offset)?;
             match format {
                 OutputFormat::Table => print_sessions(&sessions),
                 other => render_session_rows(&sessions, other, &include)?,
@@ -1413,11 +1435,12 @@ fn execute(cli: Cli) -> Result<()> {
                 configured_search_limit(args.filters.limit, &config),
             )?;
             let current_repo = current_repo(&config);
-            let hits = app.catalog().search_sessions(
+            let hits = app.catalog().search_sessions_page(
                 query,
                 &filters,
                 current_repo.as_deref(),
                 &config.search.scoring,
+                args.filters.offset,
             )?;
             match format {
                 OutputFormat::Table => {
@@ -2334,12 +2357,8 @@ fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters
     let filters = SearchFilters {
         provider: args.provider,
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
-        exclude_path_prefixes: args
-            .exclude_paths
-            .iter()
-            .map(|path| crate::util::normalize_path_prefix(path))
-            .collect(),
-        exclude_session_ids: args.exclude_sessions.clone(),
+        exclude_path_prefixes: args.exclusions.normalized_paths(),
+        exclude_session_ids: args.exclusions.exclude_sessions.clone(),
         // Clap enforces that --session-kind and --session-kinds are not both given, so this
         // cannot silently drop one. Same resolution as messages.rs for --kind/--kinds.
         session_kinds: args
@@ -3110,6 +3129,8 @@ mod tests {
             "2026-02",
             "--limit",
             "25",
+            "--offset",
+            "7",
             "--format",
             "json",
             "--include",
