@@ -84,7 +84,8 @@ fn fork_publication_benchmark() {
         let meta = fs::metadata(&parent_path).unwrap();
         let tail = crate::tail::TailParse {
             session: parent.session.clone(),
-            overlap_messages: Vec::new(),
+            overlap_digest: String::new(),
+            new_overlap_digest: String::new(),
             new_messages: Vec::new(),
             new_file_edits: parsed.file_edits,
             new_transcript: String::new(),

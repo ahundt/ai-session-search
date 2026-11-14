@@ -239,6 +239,13 @@ archive-only rows, and appends parse-only rows after the highest stored sequence
 rows remain. With no archive-only rows, messages and file edits follow the current parser’s source
 order. Matches are counted, so repeated text cannot stand in for a missing occurrence.
 
+Grown-source tail parsing validates the unchanged head and the exact source bytes in the
+last 1 MiB before the stored checkpoint. A changed or missing overlap digest forces a full
+parse; equal bytes allow overlap rows to be dropped by count, regardless of parser context
+or archive order. Rewrites between the head and overlap remain undetected until a full parse.
+The optional digest column is added on writable open within generation 6; read-only opens
+also accept older layouts without it.
+
 Index compatibility uses three independent controls. Generation 6 fences executables that predate
 archive preservation; the healthy generation 5 to 6 promotion inserts only compatibility metadata
 and updates `user_version` under the elected writer in one immediate transaction. Parser generation

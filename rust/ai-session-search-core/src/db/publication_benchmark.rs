@@ -62,7 +62,8 @@ fn no_fork_publication_benchmark() {
         assert_eq!(edit.file_edits.len(), 1);
         let tail = crate::tail::TailParse {
             session: parsed.session.clone(),
-            overlap_messages: Vec::new(),
+            overlap_digest: String::new(),
+            new_overlap_digest: String::new(),
             new_messages: Vec::new(),
             new_file_edits: edit.file_edits,
             new_transcript: String::new(),

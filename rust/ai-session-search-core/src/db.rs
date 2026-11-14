@@ -1039,6 +1039,16 @@ impl Db {
                     Ok(())
                 }))?;
             }
+            let has_digest: bool = db.conn.query_row(
+                "select exists(select 1 from pragma_table_info('files_seen') where name='overlap_digest')",
+                [], |row| row.get(0),
+            )?;
+            if !has_digest {
+                db.with_open_writer_permit(path, || db.with_immediate_transaction(|| {
+                    db.ensure_column("files_seen", "overlap_digest", "overlap_digest text")?;
+                    Ok(())
+                }))?;
+            }
             Ok(())
         });
         preparation.with_context(|| {
@@ -1534,6 +1544,7 @@ impl Db {
                 -- used to detect rewrite/rotation. NULL = no checkpoint → always a full parse.
                 tail_byte_offset integer,
                 prefix_fingerprint text,
+                overlap_digest text,
                 primary key(provider, source_path)
             );
             create table if not exists index_metadata (
@@ -2864,43 +2875,61 @@ impl Db {
         tail_byte_offset: i64,
         prefix_fingerprint: &str,
     ) -> Result<()> {
+        self.set_file_checkpoint_with_digest(
+            provider,
+            source_path,
+            tail_byte_offset,
+            prefix_fingerprint,
+            None,
+        )
+    }
+
+    pub(crate) fn set_file_checkpoint_with_digest(
+        &self,
+        provider: Provider,
+        source_path: &str,
+        tail_byte_offset: i64,
+        prefix_fingerprint: &str,
+        overlap_digest: Option<&str>,
+    ) -> Result<()> {
         self.with_immediate_transaction(|| {
             self.conn.execute(
-                "update files_seen set tail_byte_offset = ?3, prefix_fingerprint = ?4
+                "update files_seen set tail_byte_offset = ?3, prefix_fingerprint = ?4, overlap_digest = ?5
              where provider = ?1 and source_path = ?2",
                 params![
                     provider.as_str(),
                     source_path,
                     tail_byte_offset,
-                    prefix_fingerprint
+                    prefix_fingerprint,
+                    overlap_digest
                 ],
             )?;
             Ok(())
         })
     }
 
-    /// Validate the reread overlap before treating it as already indexed. Read only the
-    /// matching suffix: O(overlap rows + stored suffix bytes) time and O(overlap rows) keys.
-    /// Timestamps may have been backfilled from an earlier file mtime; other columns must match.
-    pub(crate) fn tail_overlap_matches(
+    /// Optional optimization state: generation-6 readers also accept older layouts without it.
+    pub(crate) fn file_overlap_digest(
         &self,
-        session_id: &str,
-        overlap: &[crate::models::Message],
-    ) -> Result<bool> {
-        if overlap.is_empty() {
-            return Ok(true);
-        }
-        let tx = self.conn.unchecked_transaction()?;
-        let stored = stored_message_keys(
-            &tx,
-            session_id,
-            StoredMessageSelection::Suffix(overlap.len()),
+        provider: Provider,
+        source_path: &str,
+    ) -> Result<Option<String>> {
+        let present: bool = self.conn.query_row(
+            "select exists(select 1 from pragma_table_info('files_seen') where name='overlap_digest')",
+            [], |row| row.get(0),
         )?;
-        Ok(stored.len() == overlap.len()
-            && stored.iter().zip(overlap).all(|((_, old), incoming)| {
-                old.columns_without_seq_and_time
-                    == parsed_message_keys(incoming).columns_without_seq_and_time
-            }))
+        if !present {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "select overlap_digest from files_seen where provider=?1 and source_path=?2",
+                params![provider.as_str(), source_path],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Append ONLY the new rows from an incremental tail parse to an already-indexed session, in
@@ -3001,7 +3030,7 @@ impl Db {
         tx.prepare_cached(
             "update files_seen set
                 file_identity = ?3, mtime_ns = ?4, size_bytes = ?5, last_indexed_at = ?6,
-                tail_byte_offset = ?7, prefix_fingerprint = ?8, parse_version = ?9
+                tail_byte_offset = ?7, prefix_fingerprint = ?8, parse_version = ?9, overlap_digest = ?10
              where provider = ?1 and source_path = ?2",
         )?
         .execute(params![
@@ -3014,6 +3043,7 @@ impl Db {
             tail.new_tail_offset,
             tail.new_fingerprint,
             session.parse_version,
+            tail.new_overlap_digest,
         ])?;
         tx.commit()?;
         Ok(())
@@ -8227,7 +8257,6 @@ type RowDigest = [u8; 32];
 ///   rows keep their archive coordinates even when the source's sequence shifts after pruning.
 /// - `columns_without_seq` covers other message columns; mixed-message parts are compared
 ///   separately because provider structure can change attribution without changing content.
-/// - `columns_without_seq_and_time` validates a tail overlap despite mtime-backed timestamps.
 #[derive(PartialEq, Eq)]
 struct MessageKeys {
     content: RowDigest,
@@ -8238,7 +8267,6 @@ struct MessageKeys {
     tool_result_relation: Option<RowDigest>,
     seq: i64,
     columns_without_seq: RowDigest,
-    columns_without_seq_and_time: RowDigest,
 }
 
 /// The stored message columns the archive keys read; `None` is SQL NULL.
@@ -8271,8 +8299,7 @@ impl MessageColumns<'_> {
         role_content_timestamp.update_bytes(&role_and_content);
         role_content_timestamp.update_optional_str(self.ts);
         let mut columns_without_seq = FramedSha256::new(b"aise-archive-message-columns-v1");
-        let mut columns_without_seq_and_time = FramedSha256::new(b"aise-tail-message-columns-v1");
-        for (index, value) in [
+        for value in [
             self.role,
             self.kind,
             self.authorship,
@@ -8285,20 +8312,11 @@ impl MessageColumns<'_> {
             self.input_delivery_state,
             self.input_origin,
             self.record_relation,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        ] {
             columns_without_seq.update_optional_str(value);
-            // The fourth column is time, which can come from the previous source mtime.
-            if index != 3 {
-                columns_without_seq_and_time.update_optional_str(value);
-            }
         }
         columns_without_seq.update_u8(u8::from(self.is_compaction));
         columns_without_seq.update_bytes(&content);
-        columns_without_seq_and_time.update_u8(u8::from(self.is_compaction));
-        columns_without_seq_and_time.update_bytes(&content);
         let correlation = match self.correlation {
             [Some(authority), Some(scope), Some(id)] => {
                 let mut digest = FramedSha256::new(b"aise-archive-message-correlation-v1");
@@ -8320,7 +8338,6 @@ impl MessageColumns<'_> {
                 .flatten(),
             seq: self.seq,
             columns_without_seq: columns_without_seq.finish_bytes(),
-            columns_without_seq_and_time: columns_without_seq_and_time.finish_bytes(),
         }
     }
 }
@@ -8383,11 +8400,9 @@ fn tool_result_relation_key(name: Option<&str>, call_id: Option<&str>) -> Option
 enum StoredMessageSelection {
     All,
     Sequence(i64),
-    Suffix(usize),
 }
 
-/// Message keys in source order. Sequence and suffix reads use the session/sequence index;
-/// suffix validation retains only O(selected rows) keys, not the whole session archive.
+/// Message keys in archive order. Sequence reads use the session/sequence index.
 fn stored_message_keys(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -8402,14 +8417,10 @@ fn stored_message_keys(
              order by id"
         ),
         StoredMessageSelection::All => format!("{COLUMNS} where session_id = ?1 order by seq, id"),
-        StoredMessageSelection::Suffix(_) => format!("{COLUMNS} indexed by idx_messages_session_seq where session_id = ?1 order by seq desc, id desc limit ?2"),
     })?;
     let mut rows = match selection {
         StoredMessageSelection::Sequence(seq) => statement.query(params![session_id, seq])?,
         StoredMessageSelection::All => statement.query(params![session_id])?,
-        StoredMessageSelection::Suffix(count) => {
-            statement.query(params![session_id, count as i64])?
-        }
     };
     let mut keys = Vec::new();
     while let Some(row) = rows.next()? {
@@ -8437,9 +8448,6 @@ fn stored_message_keys(
             content: &content,
         };
         keys.push((row.get(0)?, columns.keys()));
-    }
-    if matches!(selection, StoredMessageSelection::Suffix(_)) {
-        keys.reverse();
     }
     Ok(keys)
 }
@@ -9528,6 +9536,45 @@ mod tests {
     }
 
     #[test]
+    fn overlap_digest_upgrades_generation_six_only_on_writable_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        db.upsert_session(&archive_session(Vec::new(), Vec::new()), 1, 1)
+            .unwrap();
+        db.conn
+            .execute_batch("alter table files_seen drop column overlap_digest")
+            .unwrap();
+        drop(db);
+        let reader = Db::open_existing_read_only_with_threads(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        assert_eq!(reader.schema_version().unwrap(), 6);
+        assert_eq!(
+            reader
+                .file_overlap_digest(Provider::Claude, "/synthetic")
+                .unwrap(),
+            None
+        );
+        assert!(!reader.conn.query_row("select exists(select 1 from pragma_table_info('files_seen') where name='overlap_digest')", [], |r| r.get::<_, bool>(0)).unwrap());
+        drop(reader);
+        for _ in 0..2 {
+            let writer = Db::open(&path).unwrap();
+            assert_eq!(writer.schema_version().unwrap(), 6);
+            assert!(writer.conn.query_row("select exists(select 1 from pragma_table_info('files_seen') where name='overlap_digest')", [], |r| r.get::<_, bool>(0)).unwrap());
+            assert_eq!(
+                writer
+                    .file_overlap_digest(Provider::Claude, "/synthetic")
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn publication_statements_observe_peer_commits() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
@@ -9536,7 +9583,8 @@ mod tests {
         db.upsert_session(&parsed, 1, 1).unwrap();
         let tail = crate::tail::TailParse {
             session: parsed.session.clone(),
-            overlap_messages: Vec::new(),
+            overlap_digest: String::new(),
+            new_overlap_digest: String::new(),
             new_messages: vec![archive_message(
                 0,
                 "synthetic",
@@ -16814,7 +16862,8 @@ mod tests {
             .unwrap());
         assert!(!reader.implicit_index_maintenance);
         let tail = crate::tail::TailParse {
-            overlap_messages: Vec::new(),
+            overlap_digest: String::new(),
+            new_overlap_digest: String::new(),
             new_messages: Vec::new(),
             new_file_edits: Vec::new(),
             session: parsed_with_messages("claude:s1", &["saved"]).session,

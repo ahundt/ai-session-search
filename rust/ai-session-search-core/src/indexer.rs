@@ -969,6 +969,8 @@ pub(crate) fn reindex_until(
                 )?,
                 Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
             };
+            #[cfg(test)]
+            TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().push(outcome));
             match outcome {
                 TailOutcome::Appended => {
                     updated += 1;
@@ -1179,7 +1181,14 @@ pub(crate) fn reindex_until(
         // Record/refresh the tail checkpoint so the next reindex of this grown file can append
         // incrementally from the end of what we just parsed (instead of re-reading it all).
         let (offset, fingerprint) = full_parse_checkpoint(source)?;
-        db.set_file_checkpoint(source.provider, &source_path, offset, &fingerprint)?;
+        let digest = crate::tail::overlap_digest(&source.path, offset)?;
+        db.set_file_checkpoint_with_digest(
+            source.provider,
+            &source_path,
+            offset,
+            &fingerprint,
+            Some(&digest),
+        )?;
         updated += 1;
         if let Some(cb) = progress.as_deref_mut() {
             cb(i + 1, total, updated);
@@ -1700,6 +1709,7 @@ pub fn ensure_schema_backfilled(
 }
 
 /// Outcome of an incremental tail-parse attempt for one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TailOutcome {
     /// New rows were parsed from the appended bytes and appended to the index.
     Appended,
@@ -1710,6 +1720,11 @@ enum TailOutcome {
     /// must perform a full parse.
     FullParse,
     Cancelled,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TAIL_OUTCOMES: std::cell::RefCell<Vec<TailOutcome>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Read a parser's conservative marker when records depend on an earlier prefix.
@@ -1731,8 +1746,8 @@ fn tail_requires_full_parse(session: &crate::models::SessionRecord) -> bool {
 /// Parsing A appended bytes plus the fixed overlap costs O(A + overlap) time/memory.
 /// Stamp checks are O(1). Persistence still counts O(M) stored session messages and copies
 /// O(B + A) transcript bytes in SQLite, including transient memory, for B stored bytes.
-/// Returned messages and validation overlap retain O(A + overlap) bytes. Validation reads
-/// O(overlap rows + stored suffix bytes), plus the existing table/FTS maintenance costs.
+/// Returned messages retain O(A + overlap) bytes. Digest validation shares the tail buffer,
+/// adding O(overlap) hashing and no file I/O, plus existing table/FTS maintenance costs.
 fn try_tail<F>(
     source: &SourceFile,
     source_path: &str,
@@ -1771,6 +1786,9 @@ where
     {
         return Ok(TailOutcome::FullParse);
     }
+    let Some(stored_digest) = db.file_overlap_digest(source.provider, source_path)? else {
+        return Ok(TailOutcome::FullParse);
+    };
     match crate::tail::tail_parse_until(&source.path, offset, should_cancel, parse_slice) {
         Ok(crate::tail::TailParseRun::Complete(Some(mut tail))) => {
             // Some providers declare their immutable session ID only near the file head, outside
@@ -1799,9 +1817,9 @@ where
             if tail_requires_full_parse(&tail.session) {
                 return Ok(TailOutcome::FullParse);
             }
-            // A grown file can rewrite records beyond its unchanged head. The merge may skip
-            // overlap rows only when they still match the archive; otherwise reconcile in full.
-            if !db.tail_overlap_matches(&tail.session.id, &tail.overlap_messages)? {
+            // Source bytes determine equality; parsed overlap rows can lack earlier context
+            // and stored rows can retain archive order after a rewrite.
+            if tail.overlap_digest != stored_digest {
                 return Ok(TailOutcome::FullParse);
             }
             // Fills the tail's volatile end for `append_tail`; the tail's `created_at` is never
@@ -3486,6 +3504,16 @@ mod tests {
             assert_eq!(check(&conn, "refreshed"), expected, "full={full}");
             assert_eq!(&retained()[..before.len()], before.as_slice());
             assert_eq!(db.message_count().unwrap(), 46);
+        }
+        use std::io::Write as _;
+        for i in 0..2 {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(format!("{}\n", turn(100 + i)).as_bytes())
+                .unwrap();
+            reindex_tail_outcome(&config, &db, TailOutcome::Appended);
         }
     }
 
@@ -5826,5 +5854,218 @@ mod tests {
             tool, None,
             "the full parse must correct stale prefix metadata"
         );
+    }
+
+    fn reindex_tail_outcome(config: &Config, db: &Db, expected: TailOutcome) {
+        TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+        reindex(config, db, false, None).unwrap();
+        TEST_TAIL_OUTCOMES.with(|outcomes| assert_eq!(*outcomes.borrow(), vec![expected]));
+    }
+
+    fn checkpoint_record(role: &str, content: serde_json::Value) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":role,"sessionId":"byte-window",
+            "timestamp":"2026-01-01T00:00:00Z","message":{"role":role,"content":content}})
+        )
+    }
+
+    fn checkpoint_rows(path: &std::path::Path) -> Vec<Vec<String>> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        ["select json_array(role,kind,ts,tool_name,content) from messages order by 1",
+         "select json_array(m.content,p.ordinal,p.start_char,p.end_char,p.authorship,p.origin) from message_content_parts p join messages m on m.id=p.message_id order by 1",
+         "select json_array(ts,tool,file_path,new_content,edits_json) from file_edits order by 1"]
+        .iter().map(|sql| conn.prepare(sql).unwrap().query_map([], |r| r.get(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap()).collect()
+    }
+
+    fn assert_checkpoint_fresh(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        db_path: &std::path::Path,
+        n: usize,
+    ) {
+        let fresh_path = dir.join(format!("fresh-{n}.db"));
+        let fresh = Db::open(&fresh_path).unwrap();
+        reindex(
+            &config_with_single_claude_fixture(&fresh_path, root),
+            &fresh,
+            false,
+            None,
+        )
+        .unwrap();
+        let actual = checkpoint_rows(db_path);
+        let expected = checkpoint_rows(&fresh_path);
+        for (table, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(actual.len(), expected.len(), "table {table}");
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(
+                    crate::hashing::sha256(actual.as_bytes()),
+                    crate::hashing::sha256(expected.as_bytes()),
+                    "table {table}: {actual:.250} != {expected:.250}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlap_start_between_tool_call_and_result_keeps_tail_path() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let call = checkpoint_record(
+            "assistant",
+            serde_json::json!([{"type":"tool_use","id":"read","name":"Read","input":{}}]),
+        );
+        let result = checkpoint_record(
+            "user",
+            serde_json::json!([{"type":"tool_result","tool_use_id":"read","content":"synthetic result"}]),
+        );
+        let mut body =
+            checkpoint_record("assistant", serde_json::json!("x".repeat(5000))) + &call + &result;
+        // Place the overlap start inside the call: the result's original tool name is unavailable.
+        let padding_len = crate::tail::OVERLAP_BYTES as usize - result.len() - call.len() / 2;
+        let padding = format!("{}\n", " ".repeat(padding_len - 1));
+        body.push_str(&padding);
+        std::fs::write(&path, body).unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        reindex(&config, &db, false, None).unwrap();
+        for i in 0..3 {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(
+                    checkpoint_record("assistant", serde_json::json!(format!("append {i}")))
+                        .as_bytes(),
+                )
+                .unwrap();
+            reindex_tail_outcome(&config, &db, TailOutcome::Appended);
+            assert_checkpoint_fresh(dir.path(), &root, &db_path, i);
+        }
+    }
+
+    #[test]
+    fn overlap_timestamp_rewrite_matches_fresh_index() {
+        checkpoint_rewrite_matches_fresh("timestamp");
+    }
+    #[test]
+    fn overlap_content_parts_rewrite_matches_fresh_index() {
+        checkpoint_rewrite_matches_fresh("parts");
+    }
+    #[test]
+    fn overlap_result_error_rewrite_matches_fresh_index() {
+        checkpoint_rewrite_matches_fresh("error");
+    }
+
+    fn checkpoint_rewrite_matches_fresh(kind: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let head = checkpoint_record("assistant", serde_json::json!("x".repeat(5000)));
+        let call = checkpoint_record(
+            "assistant",
+            serde_json::json!([{"type":"tool_use","id":"write","name":"Write","input":{"file_path":"/synthetic/file.rs","content":"synthetic"}}]),
+        );
+        let result = checkpoint_record(
+            "user",
+            serde_json::json!([{"type":"tool_result","tool_use_id":"write","is_error":true,"content":"output"}]),
+        );
+        let mixed = checkpoint_record(
+            "user",
+            serde_json::json!([{"type":"text","text":"left"},{"type":"tool_result","tool_use_id":"write","content":"output"},{"type":"text","text":"right"}]),
+        );
+        let original = head + &call + &result + &mixed;
+        std::fs::write(&path, &original).unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        reindex(&config, &db, false, None).unwrap();
+        let replacement = match kind {
+            "timestamp" => original.replace(&mixed, &mixed.replace("00:00:00Z", "00:00:01Z")),
+            "parts" => original.replace(&mixed, &checkpoint_record("user", serde_json::json!([{"type":"text","text":"left\noutput"},{"type":"tool_result","tool_use_id":"write","content":"right"}]))),
+            "error" => original.replace("\"is_error\":true", "\"is_error\":false"),
+            _ => unreachable!(),
+        };
+        std::fs::write(
+            &path,
+            replacement + &checkpoint_record("assistant", serde_json::json!("appended")),
+        )
+        .unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        assert_checkpoint_fresh(dir.path(), &root, &db_path, 0);
+    }
+
+    #[test]
+    fn missing_overlap_digest_full_parses_once_then_resumes_tail() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        std::fs::write(
+            &path,
+            checkpoint_record("assistant", serde_json::json!("x".repeat(5000))),
+        )
+        .unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        reindex(&config, &db, false, None).unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("update files_seen set overlap_digest = null", [])
+            .unwrap();
+        for expected in [TailOutcome::FullParse, TailOutcome::Appended] {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(checkpoint_record("assistant", serde_json::json!("append")).as_bytes())
+                .unwrap();
+            reindex_tail_outcome(&config, &db, expected);
+        }
+    }
+
+    #[test]
+    fn rewrite_between_head_and_overlap_is_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let head = checkpoint_record("assistant", serde_json::json!("x".repeat(5000)));
+        let original = head
+            + &checkpoint_record("user", serde_json::json!("original middle"))
+            + &checkpoint_record(
+                "assistant",
+                serde_json::json!("y".repeat(crate::tail::OVERLAP_BYTES as usize + 100)),
+            );
+        std::fs::write(&path, &original).unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        reindex(&config, &db, false, None).unwrap();
+        std::fs::write(
+            &path,
+            original.replace("original middle", "rewritten middl")
+                + &checkpoint_record("assistant", serde_json::json!("append")),
+        )
+        .unwrap();
+        reindex_tail_outcome(&config, &db, TailOutcome::Appended);
+        assert_eq!(
+            db.search_messages("original middle", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .search_messages("rewritten middl", &Default::default())
+            .unwrap()
+            .is_empty());
     }
 }

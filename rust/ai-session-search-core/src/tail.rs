@@ -18,8 +18,8 @@
 //! is within the overlap is still tagged correctly. The new rows are the SUFFIX of the
 //! overlap+tail parse after the rows the overlap alone produces — which, because parsing is a
 //! left-to-right per-line fold over identical leading bytes, is exactly the messages from the
-//! newly appended lines. The indexer also checks the reread overlap against stored rows: an
-//! unchanged head alone cannot prove that later bytes before the checkpoint stayed unchanged.
+//! newly appended lines. The indexer validates the exact overlap bytes against the checkpoint
+//! digest; parser context and archive row order cannot establish source-byte equality.
 
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -141,11 +141,26 @@ fn complete_prefix_offset_inner_until(
     Ok(Some(0))
 }
 
+/// Digest the exact bounded window a later tail parse will reread. O(window) I/O/time,
+/// 64 KiB temporary memory; the tail path hashes its existing buffer instead.
+pub(crate) fn overlap_digest(path: &Path, offset: i64) -> Result<String> {
+    let start = (offset - OVERLAP_BYTES).max(0);
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start as u64))?;
+    let mut window = file.take((offset - start) as u64);
+    let digest = crate::hashing::sha256_reader(&mut window)?;
+    anyhow::ensure!(
+        window.limit() == 0,
+        "source truncated while hashing overlap"
+    );
+    Ok(digest)
+}
+
 /// New rows discovered by an incremental tail parse (to be appended by `Db::append_tail`).
 #[non_exhaustive]
 pub struct TailParse {
-    // Reread prefix rows must match the stored suffix before the merge may skip them.
-    pub(crate) overlap_messages: Vec<Message>,
+    pub(crate) overlap_digest: String,
+    pub(crate) new_overlap_digest: String,
     pub new_messages: Vec<Message>,
     pub new_file_edits: Vec<FileEdit>,
     /// Session metadata re-derived over the [overlap, EOF) window. Used to advance the volatile
@@ -240,6 +255,9 @@ where
     if should_cancel() {
         return Ok(TailParseRun::Cancelled);
     }
+    let overlap_digest = crate::hashing::sha256_reader(&buf[..prefix_len])?;
+    let next_window_start = (new_offset - OVERLAP_BYTES).max(0) - overlap_start;
+    let new_overlap_digest = crate::hashing::sha256_reader(&buf[next_window_start as usize..])?;
     let parsed_all = parse_slice(Cursor::new(buf.clone()), path)?;
     if should_cancel() {
         return Ok(TailParseRun::Cancelled);
@@ -262,7 +280,8 @@ where
         .to_string();
 
     Ok(TailParseRun::Complete(Some(Box::new(TailParse {
-        overlap_messages: parsed_overlap.messages,
+        overlap_digest,
+        new_overlap_digest,
         new_messages,
         new_file_edits,
         session: parsed_all.session,
