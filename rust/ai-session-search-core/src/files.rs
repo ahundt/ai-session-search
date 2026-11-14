@@ -639,10 +639,24 @@ pub fn reconstruct_versions_query(
 /// Version numbers are 1-based and preserve provider event order.
 pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
     let groups = group_by_session(db.file_edits_for_query(file, query)?);
+    if groups.is_empty() {
+        return Err(crate::ServiceError::file_not_found(file).into());
+    }
     let mut versions = Vec::new();
     for (session_id, provider, edits) in &groups {
         let line_counts = version_line_counts(edits);
         for (index, edit) in edits.iter().enumerate() {
+            // Replay the complete history first: bounds select displayed versions, not bases
+            // or deltas, and never renumber the original causal versions.
+            if query
+                .since
+                .is_some_and(|since| edit.ts.is_none_or(|ts| ts < since))
+                || query
+                    .until
+                    .is_some_and(|until| edit.ts.is_none_or(|ts| ts > until))
+            {
+                continue;
+            }
             versions.push(FileVersion {
                 session_id: session_id.clone(),
                 provider: *provider,
@@ -653,9 +667,6 @@ pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion
                 file_path: edit.file_path.clone(),
             });
         }
-    }
-    if versions.is_empty() {
-        return Err(crate::ServiceError::file_not_found(file).into());
     }
     let page = versions
         .into_iter()
@@ -749,13 +760,25 @@ pub struct FileScopeArgs {
     /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
+    #[command(flatten)]
+    pub exclusions: crate::cli::ExclusionArgs,
 }
 
 impl FileScopeArgs {
     fn resolved_query(&self, db: &Db) -> Result<FileQuery> {
         Ok(FileQuery {
             provider: self.provider,
-            session_id: resolve_session_id(db, self.session_id.as_deref())?,
+            session_id: self
+                .session_id
+                .as_deref()
+                .map(|id| {
+                    crate::service::CatalogService::new(db)
+                        .resolve_session(id)
+                        .map(|session| session.id)
+                })
+                .transpose()?,
+            exclude_path_prefixes: self.exclusions.normalized_paths(),
+            exclude_session_ids: self.exclusions.exclude_sessions.clone(),
             path_prefix: self.path.as_deref().map(crate::util::normalize_path_prefix),
             ..Default::default()
         })
@@ -797,8 +820,10 @@ pub struct FilesHistoryArgs {
     pub file: String,
     #[command(flatten)]
     pub scope: FileScopeArgs,
-    /// Max versions to return. 0 = unlimited.
-    #[arg(long, default_value_t = 50)]
+    #[command(flatten)]
+    pub dates: DateRange,
+    /// Max versions to return. Omit or use 0 for every version.
+    #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Skip this many versions in deterministic session/version order.
     #[arg(long, default_value_t = 0)]
@@ -888,7 +913,10 @@ pub(crate) fn run_command(db: &Db, cmd: &FilesCmd) -> Result<()> {
                 offset: args.offset,
                 ..args.scope.resolved_query(db)?
             };
-            emit(&db.file_search(&query)?, args.format)
+            emit(
+                &crate::service::FileService::new(db).search(&query)?,
+                args.format,
+            )
         }
         FilesCmd::CrossRef(args) => {
             if args.pattern.is_some() {
@@ -913,25 +941,25 @@ pub(crate) fn run_command(db: &Db, cmd: &FilesCmd) -> Result<()> {
                 offset: args.offset,
                 ..args.scope.resolved_query(db)?
             };
-            emit(&db.file_cross_ref(&query)?, args.format)
+            emit(
+                &crate::service::FileService::new(db).cross_reference(&query)?,
+                args.format,
+            )
         }
         FilesCmd::History(args) => {
+            let (since, until) = args.dates.resolve_now()?;
             let query = FileQuery {
+                since,
+                until,
                 limit: args.limit,
                 offset: args.offset,
                 ..args.scope.resolved_query(db)?
             };
-            let versions = history(db, &args.file, &query)?;
+            let versions = crate::service::FileService::new(db).history(&args.file, &query)?;
             emit(&versions, args.format)
         }
         FilesCmd::Extract(args) => run_extract(db, args),
     }
-}
-
-fn resolve_session_id(db: &Db, session_id: Option<&str>) -> Result<Option<String>> {
-    session_id
-        .map(|id| db.resolve_session_record(id).map(|session| session.id))
-        .transpose()
 }
 
 fn file_edits_for_scope(
@@ -1060,7 +1088,7 @@ fn restored_file_receipt(
 
 fn run_extract_all(db: &Db, args: &FilesExtractArgs) -> Result<()> {
     let query = args.scope.resolved_query(db)?;
-    let versions = reconstruct_versions_query(db, &args.file, &query)?;
+    let versions = crate::service::FileService::new(db).reconstruct_versions(&args.file, &query)?;
 
     if let Some(output_dir) = &args.output_dir {
         let destination = if output_dir.is_absolute() {

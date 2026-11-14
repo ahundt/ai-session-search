@@ -85,3 +85,72 @@ fn session_cli_pages_reproduce_the_whole_order() {
         }
     }
 }
+
+#[test]
+fn file_history_default_returns_every_version_and_explicit_pages_still_work() {
+    let dir = fixture();
+    let all = rows(
+        &dir,
+        &["files", "history", "app.rs", "--session-id", "claude:cli-0"],
+    );
+    assert_eq!(all.as_array().unwrap().len(), 62);
+    let page = rows(
+        &dir,
+        &[
+            "files",
+            "history",
+            "app.rs",
+            "--session-id",
+            "claude:cli-0",
+            "--limit",
+            "1",
+            "--offset",
+            "61",
+        ],
+    );
+    assert_eq!(page.as_array().unwrap(), &all.as_array().unwrap()[61..]);
+}
+
+#[test]
+fn file_exclusions_and_dates_apply_before_paging() {
+    let dir = fixture();
+    for command in ["search", "cross-ref", "history"] {
+        let got = rows(
+            &dir,
+            &[
+                "files",
+                command,
+                "app.rs",
+                "--exclude-path",
+                "/synthetic/0",
+                "--exclude-session",
+                "claude:cli-1",
+                "--since",
+                "2026-06-01",
+                "--until",
+                "2026-06-03",
+                "--limit",
+                "1",
+            ],
+        );
+        assert_eq!(got.as_array().unwrap().len(), 1);
+        if command != "search" {
+            assert_eq!(got[0]["session_id"], "claude:cli-2");
+        }
+        let empty = rows(&dir, &["files", command, "app.rs", "--since", "2026-06-04"]);
+        assert!(empty.as_array().unwrap().is_empty());
+    }
+    let extracted = output(
+        &dir,
+        &[
+            "files",
+            "extract",
+            "app.rs",
+            "--exclude-path",
+            "/synthetic/0",
+            "--exclude-session",
+            "claude:cli-1",
+        ],
+    );
+    assert_eq!(extracted.stdout, b"version 61\n");
+}
