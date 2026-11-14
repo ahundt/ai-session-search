@@ -89,7 +89,9 @@ pub(crate) fn walk_roots(roots: &[PathBuf], max_depth: Option<usize>) -> WalkDis
 
 fn discovery_metadata(entry: &ignore::DirEntry) -> std::result::Result<Metadata, ignore::Error> {
     // Windows directory enumeration can retain the old size while a transcript writer keeps
-    // its handle open. Query a fresh handle before deciding whether indexing can skip a file.
+    // its handle open. Query the file itself before deciding whether indexing can skip it.
+    // `fs::metadata` requests no read access, so a writer that denies read sharing cannot
+    // make discovery fail.
     // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilew
     #[cfg(windows)]
     if entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -100,7 +102,7 @@ fn discovery_metadata(entry: &ignore::DirEntry) -> std::result::Result<Metadata,
 
 #[cfg(any(windows, test))]
 fn live_file_metadata(path: &Path) -> std::io::Result<Metadata> {
-    std::fs::File::open(path)?.metadata()
+    std::fs::metadata(path)
 }
 
 fn path_warning(
