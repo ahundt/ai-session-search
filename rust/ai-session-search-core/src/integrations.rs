@@ -5581,6 +5581,7 @@ fn plan_upsert_codex_mcp_server(
     server.insert("args", toml_edit::value(args));
     let mut mutations = Vec::new();
     if let Some(root) = marketplace {
+        let (record_original, mut record) = checked_codex_marketplace_record(root, &document)?;
         let source = root.to_str().ok_or_else(|| {
             anyhow!(
                 "the aise Codex marketplace path {} is not valid UTF-8 and cannot be written to {}",
@@ -5616,6 +5617,34 @@ fn plan_upsert_codex_mcp_server(
             let original = read_optional_utf8_regular_file(&file)?;
             mutations.push(planned_write(&file, &original, content));
         }
+        let registration =
+            codex_marketplace_registration(&parse_codex_document(path, &document.to_string())?)
+                .expect("the marketplace was inserted above");
+        let mut files: Vec<_> = mutations
+            .iter()
+            .filter_map(|mutation| {
+                let PlannedFileMutation::Write { path, content, .. } = mutation else {
+                    return None;
+                };
+                Some((
+                    path.strip_prefix(root)
+                        .ok()?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    content.as_str(),
+                ))
+            })
+            .collect();
+        files.push((
+            CODEX_MARKETPLACE_REGISTRATION.to_string(),
+            registration.as_str(),
+        ));
+        record.record(root, &files);
+        mutations.push(planned_write(
+            &root.with_extension("install-manifest.json"),
+            &record_original,
+            record.to_json()?,
+        ));
     }
 
     let content = document.to_string();
@@ -5642,26 +5671,45 @@ fn plan_remove_codex_mcp_server(
     marketplace: Option<&Path>,
 ) -> Result<Vec<PlannedFileMutation>> {
     let mut mutations = Vec::new();
-    if let Some(root) = marketplace {
-        for (file, _) in codex_marketplace_files(root, "")? {
-            if let Some(original) = read_optional_utf8_regular_file(&file)? {
-                mutations.push(PlannedFileMutation::Remove {
-                    path: file,
-                    original,
-                });
+    let original = read_optional_utf8_regular_file(path)?;
+    let text = original.as_deref().unwrap_or_default();
+    let mut document = parse_codex_document(path, text)?;
+    let owned_marketplace = if let Some(root) = marketplace {
+        match checked_codex_marketplace_record(root, &document) {
+            Ok((record_original, record)) if record.installation(root).is_some() => {
+                for (file, _) in codex_marketplace_files(root, "")? {
+                    if let Some(original) = read_optional_utf8_regular_file(&file)? {
+                        mutations.push(PlannedFileMutation::Remove {
+                            path: file,
+                            original,
+                        });
+                    }
+                }
+                if let Some(original) = record_original {
+                    mutations.push(PlannedFileMutation::Remove {
+                        path: root.with_extension("install-manifest.json"),
+                        original,
+                    });
+                }
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                eprintln!(
+                    "aise: preserved Codex marketplace {}: {error:#}",
+                    root.display()
+                );
+                false
             }
         }
-    }
-    let original = read_optional_utf8_regular_file(path)?;
-    let Some(text) = original.as_deref() else {
-        return Ok(mutations);
+    } else {
+        false
     };
-    let mut document = parse_codex_document(path, text)?;
     let mut removed = document
         .get_mut("mcp_servers")
         .and_then(toml_edit::Item::as_table_mut)
         .is_some_and(remove_owned_toml_server_entries);
-    if marketplace.is_some() {
+    if owned_marketplace {
         // The marketplace aise registered, and the install record Codex adds when the user
         // installs its plugin, which would otherwise point at a marketplace that no longer exists.
         let installed = format!("{SERVER_NAME}@{SERVER_NAME}");
@@ -5692,6 +5740,54 @@ fn plan_remove_codex_mcp_server(
         mutations.insert(0, planned_write(path, &original, content));
     }
     Ok(mutations)
+}
+
+const CODEX_MARKETPLACE_REGISTRATION: &str = "@marketplace-registration";
+
+/// Serialize the named table with its header comments, as it will be read after publication.
+fn codex_marketplace_registration(document: &toml_edit::DocumentMut) -> Option<String> {
+    let entry = document.get("marketplaces")?.get(SERVER_NAME)?.clone();
+    let mut registration = toml_edit::DocumentMut::new();
+    registration["marketplaces"] = toml_edit::Item::Table(toml_edit::Table::new());
+    registration["marketplaces"][SERVER_NAME] = entry;
+    Some(registration.to_string())
+}
+
+/// Keep marketplace ownership separate from skills, using the same durable digest format.
+fn checked_codex_marketplace_record(
+    root: &Path,
+    document: &toml_edit::DocumentMut,
+) -> Result<(Option<String>, crate::skill_manifest::SkillInstallManifest)> {
+    let path = root.with_extension("install-manifest.json");
+    let original = read_optional_utf8_regular_file(&path)?;
+    let record = crate::skill_manifest::load_manifest(&path)?
+        .writable_manifest(&path)
+        .with_context(|| {
+            format!(
+                "cannot verify Codex marketplace ownership at {}",
+                path.display()
+            )
+        })?;
+    let mut contents = Vec::new();
+    for relative in skill_tree_entries(root)? {
+        if let Some(text) = read_optional_utf8_regular_file(&root.join(&relative))? {
+            contents.push((relative, text));
+        }
+    }
+    if let Some(registration) = codex_marketplace_registration(document) {
+        contents.push((CODEX_MARKETPLACE_REGISTRATION.to_string(), registration));
+    }
+    for (relative, text) in contents {
+        let owned = record
+            .installation(root)
+            .and_then(|installation| installation.file(&relative));
+        if !owned.is_some_and(|file| {
+            file.bytes == text.len() && file.sha256 == crate::hashing::sha256(text.as_bytes())
+        }) {
+            bail!("Codex marketplace file {} is unrecorded or modified; inspect or move it before reinstalling", root.join(&relative).display());
+        }
+    }
+    Ok((original, record))
 }
 
 /// The developer name Codex shows for the plugin; Cargo.toml carries no `authors`.
@@ -6540,9 +6636,11 @@ mod tests {
         value["mcpServers"][SERVER_NAME]["env"] = json!({"TEAM":"keep"});
         value["mcpServers"][SERVER_NAME]["extension"] = json!(42);
         fs::write(&plugin, serde_json::to_string(&value).unwrap()).unwrap();
-        publish_planned_mutations(&plan_upsert_target(&target, Path::new("/bin/aise")).unwrap())
-            .unwrap();
-        let kept: Value = serde_json::from_str(&fs::read_to_string(&plugin).unwrap()).unwrap();
+        // Reinstall must not adopt edited plugin files and later authorize deleting them.
+        let edited = fs::read_to_string(&plugin).unwrap();
+        assert!(plan_upsert_target(&target, Path::new("/bin/aise")).is_err());
+        assert_eq!(fs::read_to_string(&plugin).unwrap(), edited);
+        let kept: Value = serde_json::from_str(&edited).unwrap();
         assert_eq!(kept["mcpServers"][SERVER_NAME]["env"]["TEAM"], "keep");
         assert_eq!(kept["mcpServers"][SERVER_NAME]["extension"], 42);
         fs::remove_file(&plugin).unwrap();
@@ -6568,8 +6666,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains(plugin.to_str().unwrap())
-                && error.contains("env.AI_SESSION_SEARCH_DATABASE"),
+            error.contains(plugin.to_str().unwrap()) && error.contains("unrecorded or modified"),
             "{error}"
         );
         assert_eq!(fs::read_to_string(&target.path).unwrap(), before);
@@ -8206,6 +8303,7 @@ mod tests {
             marketplace.clone(),
             plugin.join(".codex-plugin/plugin.json"),
             plugin.join(".mcp.json"),
+            root.with_extension("install-manifest.json"),
         ];
         let first = snapshot(&files);
         upsert_target(&target, Path::new("/bin/aise")).unwrap();
@@ -8256,6 +8354,7 @@ mod tests {
         assert!(!left.contains(SERVER_NAME), "{left}");
         assert!(left.contains("# mine") && left.contains("[existing]"));
         assert!(!marketplace.exists() && !plugin.join(".mcp.json").exists());
+        assert!(!root.with_extension("install-manifest.json").exists());
         assert_eq!(status_target(&target).unwrap(), "not configured");
     }
 

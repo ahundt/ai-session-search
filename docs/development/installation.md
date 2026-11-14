@@ -360,6 +360,10 @@ either alias path when that path is not an owned symbolic link, and `--no-mcp`,
 
 An ownership marker in `SKILL.md` gates the whole skill directory, so a tree is never left half
 overwritten and half refused.
+Codex marketplace files and the named marketplace registration have a separate
+`codex-marketplace.install-manifest.json` ownership record beside the aise config. Reinstall refuses
+to replace edited or unrecorded marketplace content; uninstall preserves that marketplace and its
+registration together. Inspect or move the conflicting content before reinstalling.
 An unmanaged file at a selected destination stops the entire preflight before MCP, instruction, or
 skill files are published, and the error names the conflicting path and the `--skill-root`
 alternative.

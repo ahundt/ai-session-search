@@ -18,6 +18,163 @@ mod support;
 use support::aise;
 
 #[test]
+fn codex_marketplace_edits_survive_reinstall_refresh_and_uninstall() {
+    for action in ["install", "refresh", "uninstall"] {
+        for edited in [
+            "plugin",
+            "listing",
+            "server",
+            "registration",
+            "registration_comment",
+            "record",
+            "foreign",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let run = |args: &[&str]| {
+                let mut command = aise(root.path());
+                command
+                    .env_remove("CODEX_HOME")
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            let binary = env!("CARGO_BIN_EXE_aise");
+            let install = [
+                "integrations",
+                "install",
+                "--client",
+                "codex",
+                "--no-instructions",
+                "--no-aliases",
+                "--no-index-preparation",
+                "--binary",
+                binary,
+            ];
+            let config = root.path().join(".codex/config.toml");
+            let marketplace = root.path().join("codex-marketplace");
+            let files = [
+                marketplace.join(".agents/plugins/marketplace.json"),
+                marketplace.join("plugins/ai-session-search/.codex-plugin/plugin.json"),
+                marketplace.join("plugins/ai-session-search/.mcp.json"),
+            ];
+            if edited == "foreign" {
+                let skill = run(&[
+                    "integrations",
+                    "install",
+                    "--client",
+                    "codex",
+                    "--no-mcp",
+                    "--no-instructions",
+                    "--no-aliases",
+                    "--no-index-preparation",
+                ]);
+                assert!(
+                    skill.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&skill.stderr)
+                );
+                fs::create_dir_all(config.parent().unwrap()).unwrap();
+                fs::write(&config, format!("[mcp_servers.ai-session-search]\ncommand = {}\nargs = ['mcp', 'serve']\n\n# my marketplace\n[marketplaces.ai-session-search]\nsource_type = 'local'\nsource = '/synthetic/foreign-marketplace'\ncustom = true\n", serde_json::json!(binary))).unwrap();
+            } else {
+                let installed = run(&install);
+                assert!(
+                    installed.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&installed.stderr)
+                );
+                if edited == "record" {
+                    fs::write(marketplace.with_extension("install-manifest.json"), "{").unwrap();
+                } else if edited == "registration_comment" {
+                    let text = fs::read_to_string(&config).unwrap();
+                    fs::write(
+                        &config,
+                        text.replace(
+                            "[marketplaces.ai-session-search]",
+                            "# synthetic marketplace note\n[marketplaces.ai-session-search]",
+                        ),
+                    )
+                    .unwrap();
+                } else if edited == "registration" {
+                    let mut document: toml_edit::DocumentMut =
+                        fs::read_to_string(&config).unwrap().parse().unwrap();
+                    document["marketplaces"]["ai-session-search"]["custom"] =
+                        toml_edit::value("keep");
+                    fs::write(&config, document.to_string()).unwrap();
+                } else {
+                    let index = match edited {
+                        "listing" => 0,
+                        "plugin" => 1,
+                        _ => 2,
+                    };
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&fs::read_to_string(&files[index]).unwrap()).unwrap();
+                    if edited == "listing" {
+                        value["plugins"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({"name":"synthetic-other-plugin"}));
+                    } else {
+                        value["user_extension"] = serde_json::json!("keep");
+                    }
+                    fs::write(&files[index], format!("{value}\n")).unwrap();
+                }
+            }
+            let before_files: Vec<_> = files.iter().map(|path| fs::read(path).ok()).collect();
+            let before_record = fs::read(marketplace.with_extension("install-manifest.json")).ok();
+            let before_config = fs::read_to_string(&config).unwrap();
+            let before_table = before_config.parse::<toml_edit::DocumentMut>().unwrap()
+                ["marketplaces"]["ai-session-search"]
+                .to_string();
+            let output = match action {
+                "install" => run(&install),
+                "refresh" => run(&["dates"]),
+                _ => run(&[
+                    "integrations",
+                    "uninstall",
+                    "--client",
+                    "codex",
+                    "--keep-skill",
+                    "--keep-instructions",
+                    "--keep-aliases",
+                ]),
+            };
+            for (path, before) in files.iter().zip(before_files) {
+                assert!(
+                    fs::read(path).ok() == before,
+                    "{action} {edited}: {} changed",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                fs::read(marketplace.with_extension("install-manifest.json")).ok(),
+                before_record
+            );
+            let after_config = fs::read_to_string(&config).unwrap();
+            if edited == "registration_comment" {
+                assert!(after_config.contains("# synthetic marketplace note"));
+            }
+            let after_table = after_config.parse::<toml_edit::DocumentMut>().unwrap()
+                ["marketplaces"]["ai-session-search"]
+                .to_string();
+            assert_eq!(after_table, before_table, "{action} {edited}");
+            if action == "install" {
+                assert!(!output.status.success());
+                assert_eq!(
+                    after_config, before_config,
+                    "failed preflight must publish nothing"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn upgrade_preserves_mcp_launch_policy_arguments() {
     let root = tempfile::tempdir().unwrap();
     let run = |args: &[&str]| {
