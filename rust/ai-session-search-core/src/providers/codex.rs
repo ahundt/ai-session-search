@@ -3059,6 +3059,21 @@ mod tests {
             size(&db)
         );
         assert_eq!(size(&db), body.len() as i64);
+        let single_path = dir.path().join("single.db");
+        let single_db = crate::db::Db::open(&single_path).unwrap();
+        single_db.upsert_session(&once, 1, 1).unwrap();
+        let allocated =
+            |path: &Path| -> i64 {
+                rusqlite::Connection::open(path).unwrap().query_row(
+                "select page_count * page_size from pragma_page_count(), pragma_page_size()",
+                [], |r| r.get(0)).unwrap()
+            };
+        let single_bytes = allocated(&single_path);
+        let repeated_bytes = allocated(&dir.path().join("index.db"));
+        println!("instruction fixture SQLite allocated bytes: single={single_bytes} repeated_100={repeated_bytes} delta={}", repeated_bytes-single_bytes);
+        assert_eq!(single_bytes, repeated_bytes);
+        let changed = json!({"type":"session_meta","payload":{"base_instructions":{"text":"changed instruction"}}}).to_string();
+        assert_eq!(parse(&format!("{meta}{changed}")).messages.len(), 2);
         // Empty older parses must not retract the retained snapshot.
         let mut old = once.clone();
         old.messages.clear();
