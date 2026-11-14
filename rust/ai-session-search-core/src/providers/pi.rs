@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Nisarg Patel
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use crate::files::{FileMutationPayload, PendingFileMutations};
 use crate::models::{
     ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, MessageAuthorship,
-    MessageContentPart, MessageCorrelationAuthority, MessageInputOrigin, ParsedSession, Provider,
-    SessionRecord, SourceFile,
+    MessageContentPart, MessageCorrelationAuthority, MessageInputOrigin, MessageRecordRelation,
+    ParsedSession, Provider, SessionRecord, SourceFile,
 };
 use crate::providers::{spawn::SpawnOrigin, walk_roots, ProviderDiscovery};
 use crate::util::{
@@ -223,6 +223,9 @@ impl PiAdapter {
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut pending_file_mutations = PendingFileMutations::default();
+        let mut parent_copy = None;
+        let mut copied_any = false;
+        let mut retracted = crate::models::RetractedRows::default();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -244,6 +247,15 @@ impl PiAdapter {
                 .and_then(Value::as_str)
                 .and_then(parse_datetime);
 
+            let copied = parent_copy
+                .as_mut()
+                .is_some_and(|parent: &mut PiParentCopy| parent.take_copy(&value));
+            copied_any |= copied;
+            let relation = if copied {
+                MessageRecordRelation::Mirror
+            } else {
+                MessageRecordRelation::Original
+            };
             match value.get("type").and_then(Value::as_str) {
                 Some("session") => {
                     // First `session` record wins, matching cwd/created_at below. A later
@@ -255,6 +267,11 @@ impl PiAdapter {
                             provider_session_id = id.to_string();
                         }
                         session_id_bound = true;
+                        parent_copy = value
+                            .get("parentSession")
+                            .and_then(Value::as_str)
+                            .and_then(|parent| PiParentCopy::read(path, parent))
+                            .filter(|parent| parent.session_id != provider_session_id);
                     }
                     if cwd.is_none() {
                         cwd = value
@@ -279,7 +296,7 @@ impl PiAdapter {
                         {
                             raw = raw.with_native_event_identity(self.correlation_authority(), id);
                         }
-                        messages.push(raw);
+                        messages.push(raw.with_record_relation(relation));
                         observe_session_end(&mut updated_at, timestamp);
                         continue;
                     }
@@ -287,7 +304,7 @@ impl PiAdapter {
                     // so a tool-only assistant turn (no text) still records its edits.
                     if role == Some("assistant") {
                         collect_pi_file_edits(message, timestamp, &mut pending_file_mutations);
-                        append_pi_tool_calls(message, timestamp, &mut messages);
+                        append_pi_tool_calls(message, timestamp, relation, &mut messages);
                     } else if role == Some("toolResult") {
                         // Pi's persisted ToolResultMessage has an explicit `isError` boolean.
                         // Missing/non-boolean flags are unknown, so they cannot prove a mutation.
@@ -320,7 +337,11 @@ impl PiAdapter {
                         pending_file_mutations.finish(
                             message.get("toolCallId").and_then(Value::as_str),
                             message.get("isError").and_then(Value::as_bool) == Some(false),
-                            &mut file_edits,
+                            if copied {
+                                &mut retracted.file_edits
+                            } else {
+                                &mut file_edits
+                            },
                         );
                     }
                     let text = extract_text(message);
@@ -352,16 +373,21 @@ impl PiAdapter {
                                 raw_message =
                                     pi_skill_provenance(raw_message, text, spawned.is_some());
                             }
-                            if role == Some("user") && substantive_text(pi_skill_arguments(text)) {
+                            if !copied
+                                && role == Some("user")
+                                && substantive_text(pi_skill_arguments(text))
+                            {
                                 first_user_index.get_or_insert(messages.len());
                                 last_user_index = Some(messages.len());
                             }
-                            messages.push(raw_message);
-                            transcript_lines.push(format_transcript_line(
-                                role.unwrap_or("message"),
-                                timestamp,
-                                text,
-                            ));
+                            messages.push(raw_message.with_record_relation(relation));
+                            if !copied {
+                                transcript_lines.push(format_transcript_line(
+                                    role.unwrap_or("message"),
+                                    timestamp,
+                                    text,
+                                ));
+                            }
                         }
                         // Tool output: index as a Role::Tool message (searchable via
                         // `messages search --role tool`), tagged with the tool's name, but
@@ -388,7 +414,7 @@ impl PiAdapter {
                                     event_id,
                                 );
                             }
-                            messages.push(raw_message);
+                            messages.push(raw_message.with_record_relation(relation));
                         }
                         _ => continue,
                     }
@@ -404,7 +430,7 @@ impl PiAdapter {
                         {
                             raw = raw.with_native_event_identity(self.correlation_authority(), id);
                         }
-                        messages.push(raw);
+                        messages.push(raw.with_record_relation(relation));
                         observe_session_end(&mut updated_at, timestamp);
                     }
                 }
@@ -434,6 +460,11 @@ impl PiAdapter {
             "valid_record_count": valid_record_count,
             "session_path": normalize_path(path),
         });
+        if copied_any {
+            if let Some(parent) = &parent_copy {
+                raw_metadata["forked_from_id"] = json!(parent.session_id);
+            }
+        }
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
         }
@@ -482,7 +513,7 @@ impl PiAdapter {
             transcript_text: transcript_lines.join("\n\n"),
             messages,
             file_edits,
-            retracted: Default::default(),
+            retracted,
         })
     }
 
@@ -555,6 +586,75 @@ impl PiAdapter {
     /// [`Self::spawn_origin`] for a path whose root has to be resolved first.
     fn spawn_origin_of(&self, path: &Path) -> Option<SpawnOrigin> {
         self.spawn_origin(self.root_for(path)?, path)
+    }
+}
+
+/// Parent record bodies are streamed and discarded. Only native IDs and fixed-size digests
+/// remain: O(parent bytes + child bytes) time, O(parent entries) keys plus one record body.
+/// Branching may rewrite parentId links; copied message bodies retain their fields.
+struct PiParentCopy {
+    session_id: String,
+    entries: HashMap<String, Option<[u8; 32]>>,
+}
+
+impl PiParentCopy {
+    fn read(child: &Path, parent: &str) -> Option<Self> {
+        let parent = child.parent()?.join(parent);
+        if std::fs::canonicalize(&parent).ok()? == std::fs::canonicalize(child).ok()? {
+            return None;
+        }
+        let file = std::fs::File::open(&parent).ok()?;
+        let before = file.metadata().ok()?;
+        let mut session_id = None;
+        let mut entries = HashMap::new();
+        for line in crate::util::lines_replacing_invalid_utf8(std::io::BufReader::new(&file)) {
+            let line = line.ok()?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).ok()?;
+            if value.get("type").and_then(Value::as_str) == Some("session") {
+                session_id = value.get("id").and_then(Value::as_str).map(str::to_owned);
+            } else if let Some((id, digest)) = Self::key(&value) {
+                entries
+                    .entry(id)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(digest));
+            }
+        }
+        let after = file.metadata().ok()?;
+        if before.len() != after.len() || before.modified().ok()? != after.modified().ok()? {
+            return None;
+        }
+        Some(Self {
+            session_id: session_id?,
+            entries,
+        })
+    }
+
+    fn key(value: &Value) -> Option<(String, [u8; 32])> {
+        let id = value.get("id")?.as_str()?.to_owned();
+        if id.is_empty() || value.get("type")?.as_str()? == "session" {
+            return None;
+        }
+        let mut body = value.clone();
+        body.as_object_mut()?.remove("parentId");
+        let mut digest = crate::hashing::FramedSha256::new(b"pi-parent-entry");
+        digest.update_bytes(body.to_string().as_bytes());
+        Some((id, digest.finish_bytes()))
+    }
+
+    fn take_copy(&mut self, value: &Value) -> bool {
+        Self::key(value).is_some_and(|(id, digest)| {
+            self.entries.get_mut(&id).is_some_and(|entry| {
+                if *entry == Some(digest) {
+                    *entry = None;
+                    true
+                } else {
+                    false
+                }
+            })
+        })
     }
 }
 
@@ -817,6 +917,7 @@ fn is_top_level_session(root: &Path, path: &Path) -> bool {
 fn append_pi_tool_calls(
     message: &Value,
     timestamp: Option<DateTime<Utc>>,
+    relation: MessageRecordRelation,
     messages: &mut Vec<RawMessage>,
 ) {
     let Some(content) = message.get("content").and_then(Value::as_array) else {
@@ -829,12 +930,15 @@ fn append_pi_tool_calls(
         let Some(name) = block.get("name").and_then(Value::as_str) else {
             continue;
         };
-        messages.push(RawMessage::tool_call(
-            name,
-            block.get("arguments").cloned().unwrap_or(Value::Null),
-            block.get("id").and_then(Value::as_str),
-            timestamp,
-        ));
+        messages.push(
+            RawMessage::tool_call(
+                name,
+                block.get("arguments").cloned().unwrap_or(Value::Null),
+                block.get("id").and_then(Value::as_str),
+                timestamp,
+            )
+            .with_record_relation(relation),
+        );
     }
 }
 
@@ -1028,6 +1132,110 @@ mod tests {
                 .build()
                 .unwrap();
                 assert_eq!(service.search(request).unwrap().hits().len(), count);
+            }
+        }
+    }
+
+    #[test]
+    fn fork_copies_are_mirrors_but_parent_headers_do_not_prove_a_copy() {
+        use crate::models::MessageRecordRelation;
+        use serde_json::json;
+        for provider in [Provider::Pi, Provider::PrimeAgent] {
+            for parent_first in [true, false] {
+                let dir = tempdir().unwrap();
+                let parent_path = dir.path().join("parent.jsonl");
+                let child_path = dir.path().join("child.jsonl");
+                let copied = [
+                    json!({"type":"message","id":"input","parentId":null,"message":{"role":"user","content":"ancestor task"}}),
+                    json!({"type":"message","id":"call","parentId":"input","message":{"role":"assistant","content":[{"type":"toolCall","id":"write","name":"write","arguments":{"path":"src/a.txt","content":"snapshot"}}]}}),
+                    json!({"type":"message","id":"result","parentId":"call","message":{"role":"toolResult","toolName":"write","toolCallId":"write","isError":false,"content":"written"}}),
+                ];
+                let render = |rows: Vec<serde_json::Value>| {
+                    rows.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let mut parent = vec![json!({"type":"session","id":"parent"})];
+                parent.extend(copied.clone());
+                fs::write(&parent_path, render(parent)).unwrap();
+                let mut child =
+                    vec![json!({"type":"session","id":"child","parentSession":parent_path})];
+                child.extend(copied.clone());
+                // Re-chaining the branch does not change the native message identity.
+                child[1]["parentId"] = json!("relinked");
+                child.push(json!({"type":"message","id":"own","message":{"role":"user","content":"child task"}}));
+                // An identical entry id alone does not authorize suppressing changed text.
+                child.push(json!({"type":"message","id":"input","message":{"role":"user","content":"independent input"}}));
+                fs::write(&child_path, render(child)).unwrap();
+                let adapter = match provider {
+                    Provider::Pi => PiAdapter::new(vec![]),
+                    _ => PiAdapter::prime_agent(vec![]),
+                };
+                let parsed = adapter.parse_inner(&child_path).unwrap();
+                assert_eq!(
+                    parsed
+                        .messages
+                        .iter()
+                        .filter(|m| m.provenance.record_relation == MessageRecordRelation::Mirror)
+                        .count(),
+                    3
+                );
+                assert!(parsed
+                    .messages
+                    .iter()
+                    .filter(|m| m.content == "child task" || m.content == "independent input")
+                    .all(|m| m.provenance.record_relation == MessageRecordRelation::Original));
+                assert_eq!(parsed.session.title.as_deref(), Some("child task"));
+                assert!(!parsed.transcript_text.contains("ancestor task"));
+                assert_eq!(parsed.file_edits.len(), 0);
+                assert_eq!(parsed.retracted.file_edits.len(), 1);
+                let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+                let parent_parsed = adapter.parse_inner(&parent_path).unwrap();
+                let stamp = |path: &std::path::Path| {
+                    let meta = fs::metadata(path).unwrap();
+                    (
+                        meta.modified()
+                            .unwrap()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos() as i64,
+                        meta.len() as i64,
+                    )
+                };
+                let publish = |parsed: &crate::models::ParsedSession, path: &std::path::Path| {
+                    let (mtime, size) = stamp(path);
+                    db.upsert_session(parsed, mtime, size).unwrap();
+                };
+                if parent_first {
+                    publish(&parent_parsed, &parent_path);
+                }
+                let mut old = parsed.clone();
+                old.session.parse_version = "legacy-fork-parser".into();
+                old.file_edits = old.retracted.file_edits.clone();
+                old.retracted.file_edits.clear();
+                for message in &mut old.messages {
+                    message.provenance.record_relation = MessageRecordRelation::Original;
+                }
+                publish(&old, &child_path);
+                publish(&parsed, &child_path);
+                assert_eq!(db.file_edit_count().unwrap(), 1);
+                if !parent_first {
+                    publish(&parent_parsed, &parent_path);
+                    assert_eq!(db.file_edit_count().unwrap(), 1);
+                }
+                // Spawned children name a parent but contain no copied entries.
+                let spawned = render(vec![
+                    json!({"type":"session","id":"spawned","parentSession":parent_path}),
+                    json!({"type":"message","id":"delegated","message":{"role":"user","content":"separate task"}}),
+                ]);
+                let spawned_path = dir.path().join("spawned.jsonl");
+                fs::write(&spawned_path, spawned).unwrap();
+                let separate = adapter.parse_inner(&spawned_path).unwrap();
+                assert_eq!(
+                    separate.messages[0].provenance.record_relation,
+                    MessageRecordRelation::Original
+                );
             }
         }
     }
