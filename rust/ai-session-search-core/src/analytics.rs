@@ -1035,7 +1035,9 @@ pub(crate) fn mine_repeats(
     // stored with `role=user`. Explicit assistant/tool/slash/compaction analysis retains its
     // role-based contract because those roles do not claim human authorship.
     let human_text = filters.role.is_none() || filters.role == Some(Role::User);
-    filters.role = Some(filters.role.unwrap_or(Role::User));
+    if human_text {
+        filters.role = None;
+    }
     if let Some(id) = filters.session_id.take() {
         filters.session_id = Some(db.resolve_session_record(&id)?.id);
     }
@@ -1413,6 +1415,78 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid planning regex '[unclosed'"), "{err}");
+    }
+
+    #[test]
+    fn repeats_read_human_input_across_storage_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.execute_batch_for_test(include_str!("../tests/fixtures/human_analytics.sql"))
+            .unwrap();
+        for include in [false, true] {
+            for role in [None, Some(Role::User)] {
+                let mut query = RepeatsQuery::default()
+                    .with_filters(MessageFilters {
+                        role,
+                        ..Default::default()
+                    })
+                    .with_min_matches(1)
+                    .with_phrase_min_words(1)
+                    .with_phrase_max_words(3)
+                    .with_max_groups(0)
+                    .with_max_examples_per_group(0);
+                query.include_unattributed_input = include;
+                let report = mine_repeats(&db, &AnalyticsConfig::default(), &query).unwrap();
+                let read = report
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.examples.iter().map(|m| m.seq))
+                    .collect::<BTreeSet<_>>();
+                let expected = if include {
+                    BTreeSet::from([0, 1, 2, 3, 4, 9, 10])
+                } else {
+                    BTreeSet::from([0, 1, 2, 3, 9, 10])
+                };
+                assert_eq!(read, expected);
+                assert_eq!(report.unattributed_input_count, 1);
+                assert_eq!(report.unattributed_input_included, include);
+                assert!(report
+                    .groups
+                    .iter()
+                    .flat_map(|g| &g.examples)
+                    .filter(|m| m.seq == 9)
+                    .all(|m| m.preview == "you forgot mixed"));
+            }
+        }
+    }
+
+    #[test]
+    fn repeats_explicit_tool_role_still_reads_generated_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.execute_batch_for_test(include_str!("../tests/fixtures/human_analytics.sql"))
+            .unwrap();
+        let query = RepeatsQuery::default()
+            .with_filters(MessageFilters {
+                role: Some(Role::Tool),
+                ..Default::default()
+            })
+            .with_min_matches(1)
+            .with_phrase_min_words(1)
+            .with_phrase_max_words(3)
+            .with_max_groups(0)
+            .with_max_examples_per_group(0);
+        let report = mine_repeats(&db, &AnalyticsConfig::default(), &query).unwrap();
+        assert_eq!(
+            report
+                .groups
+                .iter()
+                .flat_map(|g| g.examples.iter().map(|m| m.seq))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 4, 6, 7, 9])
+        );
+        assert_eq!(report.unattributed_input_count, 0);
+        assert!(!report.unattributed_input_included);
     }
 
     #[test]
