@@ -6233,7 +6233,7 @@ fn apply_session_preview_chars(value: &mut Value, preview_chars: Option<usize>) 
 fn session_span_since_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Inclusive query start. Match when the known indexed session end is at or after it. Local time unless given an offset or a [Area/City] suffix; fractional seconds kept. Examples: '2026-01', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
+        "description": "Inclusive query start. Match when the known indexed session end is at or after it. UTC unless given an offset or a [Area/City] suffix; fractional seconds kept. Examples: '2026-01', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
     })
 }
 
@@ -6249,7 +6249,7 @@ fn session_span_until_schema() -> Value {
 fn session_span_when_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Single local period intersected with each known indexed session span, e.g. '2026-01', '7d', or 'yesterday'. Exact RFC 3339 selects spans containing that instant. Spans can contain gaps; this is not continuous process activity. Do not combine with since/until."
+        "description": "Single period (UTC unless given an offset or a [Area/City] suffix) intersected with each known indexed session span, e.g. '2026-01', '7d', or 'yesterday'. Exact RFC 3339 selects spans containing that instant. Spans can contain gaps; this is not continuous process activity. Do not combine with since/until."
     })
 }
 
@@ -9231,6 +9231,44 @@ mod tests {
             "expected to check many advertised values, checked {checked} — the walk found \
              nothing, which passes vacuously"
         );
+    }
+
+    #[test]
+    fn session_date_schemas_match_utc_defaults_and_explicit_zones() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        insert_list_session(&db, "claude:utc-day", "2026-11-07T02:00:00Z");
+        insert_list_session(&db, "claude:new-york-day", "2026-11-08T02:00:00Z");
+
+        for name in ["list_sessions", "search_sessions"] {
+            let tool = tool_input_schema(&config, name);
+            for field in ["since", "when"] {
+                let description = tool["inputSchema"]["properties"][field]["description"]
+                    .as_str()
+                    .unwrap();
+                assert!(description.contains("UTC"), "{name}.{field}: {description}");
+                assert!(
+                    description.contains("[Area/City]"),
+                    "{name}.{field}: {description}"
+                );
+            }
+            for (when, expected) in [
+                ("2026-11-07", "claude:utc-day"),
+                ("2026-11-07[America/New_York]", "claude:new-york-day"),
+            ] {
+                let mut args = json!({"when": when, "limit": 0});
+                if name == "search_sessions" {
+                    args["query"] = json!("Proj");
+                }
+                let response = call_tool(name, args, &config, &db);
+                assert_ne!(response["result"]["isError"], true, "{response}");
+                let sessions = response["result"]["structuredContent"]["sessions"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(sessions.len(), 1, "{name}: {response}");
+                assert_eq!(sessions[0]["id"], expected, "{name}: {response}");
+            }
+        }
     }
 
     /// Both session tools advertise `session_kinds`, they advertise the SAME values, and every
