@@ -790,9 +790,9 @@ impl PiParentCopy {
     }
 }
 
-/// Match the envelope emitted by both harnesses' _expandSkillCommand, not an inline example.
-/// Returns a byte boundary; provenance below converts it to Unicode scalar coordinates.
-fn pi_skill_argument_start(text: &str) -> Option<usize> {
+/// Match the exact native header/reference structure, not a prefixed or fenced quotation.
+/// Return the first and last possible argument boundaries in UTF-8 byte coordinates.
+fn pi_skill_argument_bounds(text: &str) -> Option<(usize, usize)> {
     let (header, rest) = text.split_once('\n')?;
     let attributes = header.strip_prefix("<skill name=\"")?.strip_suffix("\">")?;
     let (name, location) = attributes.split_once("\" location=\"")?;
@@ -803,56 +803,87 @@ fn pi_skill_argument_start(text: &str) -> Option<usize> {
     reference
         .strip_prefix("References are relative to ")?
         .strip_suffix('.')?;
-    // Both harnesses strip frontmatter, trim the body, and append a standalone close
-    // followed by either EOF or two newlines and arguments. The body is not escaped:
-    // an earlier matching close may be a body example. Keep the earliest possible
-    // boundary, conservatively treating the ambiguous suffix as input, never swallowing
-    // arguments that contain another close. Fenced/prefixed quotations fail the header.
-    text.match_indices("\n</skill>").find_map(|(index, close)| {
-        let end = index + close.len();
-        if end == text.len() {
-            Some(end)
-        } else if text[end..].starts_with("\n\n") {
-            Some(end + 2)
-        } else {
-            None
-        }
-    })
+    // Both harnesses persist only expanded text: no original command, argument string,
+    // body length, or expansion marker. Never read the location from a transcript: that
+    // file may have changed and its path is untrusted.
+    // Decision table:
+    // * Nonmatching header/reference: all text is direct input.
+    // * One candidate close: prefix generated, suffix direct input.
+    // * Several closes: prefix through first generated, through last unknown,
+    //   suffix after last direct input. A close inside arguments is also ambiguous.
+    // * Exact typed look-alike: indistinguishable from expansion; use the same rule.
+    // Unknown parts remain searchable without role=user. Analytics currently admits
+    // unknown whole queued rows only, not unknown parts; do not label these queued
+    // or DirectInput (which would count unknown parts as typed input).
+    // One scan takes O(text bytes) time and O(1) additional memory.
+    let mut candidates = text
+        .match_indices("\n</skill>")
+        .filter_map(|(index, close)| {
+            let end = index + close.len();
+            if end == text.len() {
+                Some(end)
+            } else if text[end..].starts_with("\n\n") {
+                Some(end + 2)
+            } else {
+                None
+            }
+        });
+    let first = candidates.next()?;
+    Some((first, candidates.last().unwrap_or(first)))
 }
 
 fn pi_skill_arguments(text: &str) -> &str {
-    pi_skill_argument_start(text).map_or(text, |start| &text[start..])
+    pi_skill_argument_bounds(text).map_or(text, |(_, last)| &text[last..])
 }
 
 fn pi_skill_provenance(raw: RawMessage, text: &str, subagent: bool) -> RawMessage {
-    let Some(start) = pi_skill_argument_start(text) else {
+    let Some((first, last)) = pi_skill_argument_bounds(text) else {
         return raw;
     };
-    if start == text.len() {
+    if first == text.len() {
         return raw.with_authorship(MessageAuthorship::Generated);
     }
-    let start_char = text[..start].chars().count();
+    let mut parts = Vec::with_capacity(3);
+    let mut start_char = 0;
+    for (start, end, authorship, origin) in [
+        (
+            0,
+            first,
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::HarnessContext,
+        ),
+        (
+            first,
+            last,
+            ContentPartAuthorship::Unknown,
+            ContentPartOrigin::Unknown,
+        ),
+        (
+            last,
+            text.len(),
+            if subagent {
+                ContentPartAuthorship::Agent
+            } else {
+                ContentPartAuthorship::Human
+            },
+            ContentPartOrigin::DirectInput,
+        ),
+    ] {
+        if start == end {
+            continue;
+        }
+        let end_char = start_char + text[start..end].chars().count();
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char,
+            end_char,
+            authorship,
+            origin,
+        });
+        start_char = end_char;
+    }
     raw.with_input_origin(MessageInputOrigin::DirectConversation)
-        .with_content_parts(vec![
-            MessageContentPart {
-                ordinal: 0,
-                start_char: 0,
-                end_char: start_char,
-                authorship: ContentPartAuthorship::Generated,
-                origin: ContentPartOrigin::HarnessContext,
-            },
-            MessageContentPart {
-                ordinal: 1,
-                start_char,
-                end_char: text.chars().count(),
-                authorship: if subagent {
-                    ContentPartAuthorship::Agent
-                } else {
-                    ContentPartAuthorship::Human
-                },
-                origin: ContentPartOrigin::DirectInput,
-            },
-        ])
+        .with_content_parts(parts)
 }
 
 /// Native command/instruction fields are input; their adjacent output/summary is generated.
@@ -1159,11 +1190,7 @@ mod tests {
         use serde_json::json;
         let skill = "<skill name=\"sample\" location=\"/synthetic/SKILL.md\">\nReferences are relative to /synthetic.\n\nGenerated 🦀 instructions\n</skill>";
         for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
-            for args in [
-                "",
-                "\n\nplease check α",
-                "\n\nPlease explain this closing tag:\n</skill>",
-            ] {
+            for args in ["", "\n\nplease check α"] {
                 let text = format!("{skill}{args}");
                 let records = format!(
                     "{{\"type\":\"session\",\"id\":\"skills\"}}\n{}",
@@ -1237,54 +1264,70 @@ mod tests {
     }
 
     #[test]
-    fn skill_body_closing_tags_and_quoted_envelopes_preserve_human_input() {
+    fn skill_closing_tag_ambiguity_preserves_exact_authorship_regions() {
+        use crate::models::{ContentPartAuthorship as A, MessageAuthorship};
         use serde_json::json;
-        let envelope = "<skill name=\"sample\" location=\"/synthetic/SKILL.md\">\nReferences are relative to /synthetic.\n\nExample closing tag:\n</skill>\n\nBody after example\n</skill>";
-        for text in [
-            envelope.to_owned(),
-            format!("{envelope}\n\nTyped request"),
-            format!("Quoted example:\n{envelope}"),
-            format!("\u{0060}\u{0060}\u{0060}xml\n{envelope}\n\u{0060}\u{0060}\u{0060}"),
+        let header = "<skill name=\"sample\" location=\"/synthetic/SKILL.md\">\nReferences are relative to /synthetic.\n\n";
+        let first = format!("{header}Example 🦀\n</skill>\n\n");
+        for (generated, unknown, human) in [
+            (first.clone(), "Body after example\n</skill>", ""),
+            (format!("{header}Body\n</skill>\n\n"), "Arguments\n</skill>", ""),
+            (first.clone(), "Body after example\n</skill>\n\nArguments\n</skill>", ""),
+            (first.clone(), "Second\n</skill>\n\nThird\n</skill>\n\n", "Typed request"),
+            (format!("{header}Body\n</skill>\n\n"), "", "Typed request"),
+            (String::new(), "", "<skill name=\"sample\">\nQuoted example\n</skill>"),
+            (String::new(), "", "Quoted example:\n<skill name=\"sample\" location=\"/synthetic/SKILL.md\">\nReferences are relative to /synthetic.\n\nBody\n</skill>"),
+            // Exact typed look-alikes have no distinguishing native evidence.
+            (format!("{header}Body\n</skill>"), "", ""),
         ] {
+            let text = format!("{generated}{unknown}{human}");
             for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
-                let records = format!(
-                    "{}\n{}",
+                let records = format!("{}\n{}",
                     json!({"type":"session","id":"skill-tags"}),
-                    json!({"type":"message","id":"input","message":{"role":"user","content":text}})
-                );
-                let parsed = adapter
-                    .parse_reader(
-                        std::io::Cursor::new(records),
-                        std::path::Path::new("/synthetic/tags.jsonl"),
-                    )
-                    .unwrap();
+                    json!({"type":"message","id":"input","message":{"role":"user","content":text}}));
+                let parsed = adapter.parse_reader(std::io::Cursor::new(records),
+                    std::path::Path::new("/synthetic/tags.jsonl")).unwrap();
+                let row = &parsed.messages[0];
+                row.provenance.validate(&row.content).unwrap();
+                let region = |authorship| -> String {
+                    if row.provenance.content_parts.is_empty() {
+                        return if row.provenance.authorship == MessageAuthorship::from(authorship) {
+                            row.content.clone()
+                        } else { String::new() };
+                    }
+                    row.provenance.content_parts.iter()
+                        .filter(|p| p.authorship == authorship)
+                        .map(|p| row.content.chars().skip(p.start_char).take(p.end_char-p.start_char).collect::<String>())
+                        .collect()
+                };
+                assert_eq!(region(A::Human), human);
+                assert_eq!(region(A::Generated), generated);
+                assert_eq!(region(A::Unknown), unknown);
+                assert_eq!(parsed.session.title, (!human.is_empty()).then(|| crate::util::truncate_for_display(human, 100)));
+                assert_eq!(parsed.session.preview_text, if human.is_empty() {
+                    "(no preview available)".to_owned()
+                } else { crate::util::preview_from_text(human) });
                 let dir = tempdir().unwrap();
                 let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
                 let mut old = parsed.clone();
                 old.session.parse_version = "legacy-skill-tags".into();
-                old.messages[0].provenance.authorship = crate::models::MessageAuthorship::Generated;
+                old.messages[0].provenance.authorship = MessageAuthorship::Human;
                 old.messages[0].provenance.content_parts.clear();
                 db.upsert_session(&old, 1, 1).unwrap();
                 db.upsert_session(&parsed, 1, 1).unwrap();
-                use crate::message_search::{
-                    MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
-                };
+                use crate::message_search::{MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface};
                 let config = crate::config::Config::default();
-                let service =
-                    crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
-                let query = if text.starts_with("<skill") {
-                    "Body after example"
-                } else {
-                    "Example closing tag:"
-                };
-                let request = MessageSearchRequest::builder(
-                    MessageQuery::literal(query).unwrap(),
-                    MessageTarget::content(),
-                )
-                .role(crate::models::Role::User)
-                .build()
-                .unwrap();
-                assert_eq!(service.search(request).unwrap().hits().len(), 1, "{text}");
+                let service = crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+                for (query, count) in [("Body after example", 0), ("Arguments", 0),
+                    ("Typed request", usize::from(human.contains("Typed request")))] {
+                    let request = MessageSearchRequest::builder(MessageQuery::literal(query).unwrap(), MessageTarget::content())
+                        .role(crate::models::Role::User).build().unwrap();
+                    assert_eq!(service.search(request).unwrap().hits().len(), count);
+                }
+                if !unknown.is_empty() {
+                    let request = MessageSearchRequest::builder(MessageQuery::literal(unknown).unwrap(), MessageTarget::content()).build().unwrap();
+                    assert_eq!(service.search(request).unwrap().hits().len(), 1);
+                }
             }
         }
     }
