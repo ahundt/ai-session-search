@@ -192,8 +192,9 @@ reads, and resume commands. See the [library guide](docs/development/library-api
    already did for transcripts that disappear. Parser upgrades reconcile matching rows while
    preserving archived messages and file edits. Codex compressed `.jsonl.zst` rollouts retain
    their identity; decompression failures preserve an existing index snapshot and remain
-   retryable. Refresh adds new tool calls and hook notices when later transcript records are
-   rewritten in place, keeping archived history and sequence numbers.
+   retryable. Refresh detects records rewritten in place within the last 1 MiB of a growing
+   transcript and reindexes that transcript, keeping archived history and sequence numbers; a
+   rewrite earlier in the file needs `aise reindex --full`.
 2. Literal and regex search find case pairs SQLite's tokenizer does not fold, including Cherokee,
    Georgian Mtavruli, Osage, and Adlam. A query ending in `i` also matches dotted capital `İ`.
 3. Equal session/sequence or timestamp keys have a stable tie-breaker for search, corrections,
