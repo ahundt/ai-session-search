@@ -634,6 +634,69 @@ def test_native_session_search_serves_concurrent_readers_from_several_threads(
             future.result()
 
 
+@pytest.mark.parametrize("reader", ["db_path", "message_search_spec", "__enter__"])
+@pytest.mark.parametrize("operation", ["missing_session", "invalid_date"])
+def test_native_errors_do_not_deadlock_concurrent_readers(
+    tmp_path: Path, reader: str, operation: str,
+) -> None:
+    script = """
+import sys
+import threading
+import time
+from pathlib import Path
+from ai_session_search import _native as native
+
+root, reader, operation = sys.argv[1:]
+search = native.SessionSearch(Path(root) / 'index.db')
+entered = threading.Event()
+reading = threading.Event()
+errors = []
+reads = []
+error_name = 'NotFoundError' if operation == 'missing_session' else 'InvalidArgumentError'
+original = getattr(native, error_name)
+
+class PausedError(original):
+    def __init__(self, message):
+        entered.set()
+        assert reading.wait(5)
+        time.sleep(0.2)  # Let the reader contend while error conversion owns the mutex.
+        super().__init__(message)
+
+setattr(native, error_name, PausedError)
+
+def fail():
+    try:
+        if operation == 'missing_session':
+            search.export_session('missing')
+        else:
+            search.search_sessions('needle', native.SessionQuery(dates=native.DateRange(when='invalid')))
+    except original as error:
+        errors.append(str(error))
+
+def read():
+    assert entered.wait(5)
+    reading.set()
+    result = getattr(search, reader)
+    if reader != 'db_path':
+        result()
+    reads.append(reader)
+
+threads = [threading.Thread(target=fail), threading.Thread(target=read)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+assert len(errors) == 1, errors
+assert reads == [reader], reads
+assert search.db_path == Path(root) / 'index.db'
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), reader, operation],
+        env=isolated_environment(tmp_path / "runtime"), check=True,
+        capture_output=True, text=True, timeout=10,
+    )
+
+
 def test_query_exclusions_are_explicit_and_shared() -> None:
     exclusions = native.QueryExclusions(
         path_prefixes=["./generated", "/tmp/cache"],

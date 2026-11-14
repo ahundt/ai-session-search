@@ -54,6 +54,7 @@ use ai_session_search::{
 };
 use pyo3::exceptions::{PyBrokenPipeError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::PyDict;
 
 // Value protocols live at the binding boundary; query and result semantics stay in core.
@@ -4597,7 +4598,8 @@ impl std::ops::Deref for OpenApplication<'_> {
 
 impl SessionSearch {
     fn app(&self) -> PyResult<OpenApplication<'_>> {
-        let guard = self.inner.lock().map_err(runtime_error)?;
+        // A detached operation can reacquire the GIL to construct a typed exception.
+        let guard = Python::attach(|py| self.inner.lock_py_attached(py)).map_err(runtime_error)?;
         if guard.is_none() {
             return Err(runtime_error(
                 "SessionSearch is closed; create a new SessionSearch instance",
