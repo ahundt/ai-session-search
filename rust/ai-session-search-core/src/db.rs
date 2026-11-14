@@ -3029,46 +3029,32 @@ impl Db {
             new_count,
         ])?;
 
-        {
-            // The parser seeded health from this session and observed only appended records.
-            // Publish it in the row/checkpoint transaction, preserving unrelated metadata.
-            let metadata: serde_json::Value = session
-                .raw_metadata_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_default();
-            let key = crate::providers::health::UNRECOGNIZED_RECORD_TYPES_KEY;
-            let patch = serde_json::json!({key: metadata[key]});
-            tx.execute(
-                "update sessions set raw_metadata_json = json_patch(
-                    case when json_valid(raw_metadata_json) then raw_metadata_json else '{}' end,
-                    ?2) where id = ?1",
-                params![session.id, patch.to_string()],
-            )?;
-        }
-
+        // The parser seeded health from this session and observed only appended records.
+        // Publish health and lifecycle together in the row/checkpoint transaction.
+        let metadata: serde_json::Value = session
+            .raw_metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        let key = crate::providers::health::UNRECOGNIZED_RECORD_TYPES_KEY;
+        let mut patch = serde_json::json!({key: metadata[key]});
         if matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop) {
-            let metadata: serde_json::Value = session
-                .raw_metadata_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_default();
-            // Null in a merge patch clears the resolved lifecycle bit, preserving other metadata.
-            let patch = if metadata["pending_direct_delivery"]
+            // Null clears resolved lifecycle state while preserving unrelated metadata.
+            patch["pending_direct_delivery"] = if metadata["pending_direct_delivery"]
                 .as_bool()
                 .unwrap_or(false)
             {
-                r#"{"pending_direct_delivery":true}"#
+                serde_json::json!(true)
             } else {
-                r#"{"pending_direct_delivery":null}"#
+                serde_json::Value::Null
             };
-            tx.execute(
-                "update sessions set raw_metadata_json = json_patch(
-                    case when json_valid(raw_metadata_json) then raw_metadata_json else '{}' end,
-                    ?2) where id = ?1",
-                params![session.id, patch],
-            )?;
         }
+        tx.execute(
+            "update sessions set raw_metadata_json = json_patch(
+                case when json_valid(raw_metadata_json) then raw_metadata_json else '{}' end,
+                ?2) where id = ?1",
+            params![session.id, patch.to_string()],
+        )?;
 
         // Append the new conversation text to the transcript blob, then rebuild this session's FTS
         // row from the now-current sessions + transcripts rows (no drift from the live values).
