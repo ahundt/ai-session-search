@@ -148,6 +148,43 @@ def test_resume_command_and_transcript_use_catalog(corpus):
     assert isinstance(corpus.transcript("synthetic-0")["text"], str)
 
 
+@pytest.mark.integration
+def test_gemini_resume_python_and_cli_use_native_id_and_project_cwd(
+    corpus, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    executable = tmp_path / "gemini"
+    executable.write_text("#!/bin/sh\nexit 1\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    project = tmp_path / "project with spaces"
+    project.mkdir()
+    native_id = "11111111-2222-4333-8444-555555555555"
+    session_id = "gemini-cli:synthetic-resume"
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute(
+            "INSERT INTO sessions (id, provider, provider_session_id, cwd, "
+            "preview_text, source_path, parse_version, discovery_source) "
+            "VALUES (?, 'gemini-cli', ?, ?, '', ?, 'test', 'fixture')",
+            (session_id, native_id, str(project), str(tmp_path / "session-synthetic.jsonl")),
+        )
+    command = corpus.resume_command(session_id)
+    assert command["argv"] == ["gemini", "--resume", native_id]
+    assert command["cwd"] == str(project)
+    assert command["unavailable_reason"] is None
+    result = subprocess.run(
+        [str(CLI), "--index-refresh", "existing-only", "resume", session_id, "--dry-run"],
+        env=dict(os.environ, AI_SESSION_SEARCH_DATABASE=str(corpus.db_path)),
+        text=True, capture_output=True, check=True,
+    )
+    assert f"gemini --resume {native_id}" in result.stdout
+    assert str(project) in result.stdout
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute("UPDATE sessions SET cwd = NULL WHERE id = ?", (session_id,))
+    unavailable = corpus.resume_command(session_id)
+    assert unavailable["argv"] is None
+    assert "project directory" in unavailable["unavailable_reason"]
+
+
 def test_sql_and_vocabulary_enforce_access_scope(corpus, tmp_path: Path):
     config = tmp_path / "scoped.toml"
     config.write_text(f'[search.scope]\nmode = "allowed-roots"\nroots = [{json.dumps(str(tmp_path))}]\n')

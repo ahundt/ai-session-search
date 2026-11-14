@@ -2289,11 +2289,8 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Codex => "codex",
         Provider::Pi => "pi",
         Provider::PrimeAgent => "prime-agent",
-        Provider::ClaudeDesktop
-        | Provider::Cursor
-        | Provider::Antigravity
-        | Provider::AiStudio
-        | Provider::GeminiCli => {
+        Provider::GeminiCli => "gemini",
+        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity | Provider::AiStudio => {
             let id = &session.id;
             let provider = session.provider.as_str();
             return Err(anyhow!(
@@ -2322,6 +2319,28 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
              spawning session: `claude --resume {parent_native}`. Read the run itself with `aise \
              show {id}` or `aise export {id}`"
         ));
+    }
+    // Gemini's SessionSelector enumerates only the current project's top-level chats.
+    // --session-file imports with a new identity, so it cannot substitute for native resume.
+    if session.provider == Provider::GeminiCli {
+        let source = Path::new(&session.source_path);
+        let child_file = source.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with("session-"));
+        if spawned_by.is_some() || child_file {
+            let id = &session.id;
+            return Err(anyhow!("Gemini CLI cannot resume a subagent run by id; resume its parent conversation instead. Read this run with `aise show {id}` or `aise export {id}`"));
+        }
+        if !session
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| Path::new(cwd).is_dir())
+        {
+            let id = &session.id;
+            return Err(anyhow!("Gemini CLI resume requires the recorded project directory, but it is unknown or unavailable. Restore that directory and its Gemini project mapping, then reindex; read this session with `aise show {id}` or `aise export {id}`"));
+        }
     }
     let cwd = session
         .cwd
@@ -2358,11 +2377,12 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "--resume".to_string(),
             pi_family_target(),
         ],
-        Provider::ClaudeDesktop
-        | Provider::Cursor
-        | Provider::Antigravity
-        | Provider::AiStudio
-        | Provider::GeminiCli => {
+        Provider::GeminiCli => vec![
+            "gemini".to_string(),
+            "--resume".to_string(),
+            session.provider_session_id.clone(),
+        ],
+        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity | Provider::AiStudio => {
             unreachable!("resume is handled before command construction")
         }
     };
@@ -2978,6 +2998,49 @@ pub(crate) mod tests {
         assert!(lines(b"").is_empty());
         // Invalid UTF-8 (0xFF) becomes U+FFFD; the rest of the line is preserved, not dropped.
         assert_eq!(lines(&[b'h', b'i', 0xFF, b'!', b'\n']), vec!["hi\u{FFFD}!"]);
+    }
+
+    #[test]
+    fn gemini_resume_plan_requires_project_cwd_and_uses_native_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parsed = minimal_record(
+            Provider::GeminiCli,
+            &dir.path().join("session-synthetic.jsonl"),
+            String::new(),
+        );
+        parsed.session.provider_session_id = "11111111-2222-4333-8444-555555555555".into();
+        parsed.session.cwd = Some(normalize_path(dir.path()));
+        let plan = with_stub_binary_on_path("gemini", || resume_plan(&parsed.session)).unwrap();
+        assert_eq!(
+            plan,
+            (
+                vec![
+                    "gemini".to_string(),
+                    "--resume".to_string(),
+                    parsed.session.provider_session_id.clone()
+                ],
+                parsed.session.cwd.clone()
+            )
+        );
+        parsed.session.cwd = None;
+        let error = with_stub_binary_on_path("gemini", || resume_plan(&parsed.session))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("project directory"), "{error}");
+        parsed.session.cwd = Some(normalize_path(&dir.path().join("missing")));
+        assert!(with_stub_binary_on_path("gemini", || resume_plan(&parsed.session)).is_err());
+        parsed.session.cwd = Some(normalize_path(dir.path()));
+        parsed.session.parent_session_id = Some("gemini-cli:parent".into());
+        let error = with_stub_binary_on_path("gemini", || resume_plan(&parsed.session))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("subagent"), "{error}");
+        parsed.session.parent_session_id = None;
+        parsed.session.source_path = normalize_path(&dir.path().join("chats/flat-child.jsonl"));
+        let error = with_stub_binary_on_path("gemini", || resume_plan(&parsed.session))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("subagent"), "{error}");
     }
 
     #[test]
