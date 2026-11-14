@@ -194,7 +194,7 @@ Antigravity conversations are never copied from a vendor account, and are not se
 | Pi coding agent | `pi` | yes |
 | Prime Agent | `prime-agent` | yes |
 | Google AI Studio | `aistudio` | no; use show/export |
-| Gemini CLI | `gemini-cli` | no; use show/export |
+| Gemini CLI | `gemini-cli` | `gemini --resume <id>` from the recorded project directory (main sessions only) |
 
 Prime Agent is built on Pi but keeps its own root and child-run transcripts under
 `~/.prime/agent`, so `--provider pi` never returns Prime sessions and the two keep separate IDs

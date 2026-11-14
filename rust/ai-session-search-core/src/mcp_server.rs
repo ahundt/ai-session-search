@@ -13091,6 +13091,48 @@ mod tests {
     use crate::util::tests::with_stub_binary_on_path;
 
     #[test]
+    fn gemini_get_resume_command_contains_project_cwd_and_native_id() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let mut parsed = minimal_record(
+            Provider::GeminiCli,
+            &dir.path().join("session-synthetic.jsonl"),
+            String::new(),
+        );
+        parsed.session.provider_session_id = "11111111-2222-4333-8444-555555555555".into();
+        parsed.session.cwd = Some(crate::util::normalize_path(dir.path()));
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        let service = crate::service::CatalogService::new(&db);
+        let plan =
+            with_stub_binary_on_path("gemini", || service.resume_command(&parsed.session.id))
+                .unwrap();
+        assert_eq!(
+            plan.argv.as_ref().unwrap(),
+            &vec!["gemini", "--resume", "11111111-2222-4333-8444-555555555555"]
+        );
+        assert_eq!(plan.cwd, parsed.session.cwd);
+        let response = with_stub_binary_on_path("gemini", || {
+            call_tool(
+                "get_resume_command",
+                json!({"session_id": parsed.session.id}),
+                &config,
+                &db,
+            )
+        });
+        let result = &response["result"];
+        assert!(result["isError"].as_bool() != Some(true), "{response}");
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["cwd"], parsed.session.cwd.unwrap());
+        assert_eq!(structured["resume_command"], result["content"][0]["text"]);
+        let command = structured["resume_command"].as_str().unwrap();
+        assert!(command.starts_with("cd "), "{command}");
+        assert!(
+            command.ends_with(" && gemini --resume 11111111-2222-4333-8444-555555555555"),
+            "{command}"
+        );
+    }
+
+    #[test]
     fn get_resume_command_structured_command_matches_text() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
