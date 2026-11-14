@@ -4840,6 +4840,232 @@ mod tests {
     }
 
     #[test]
+    fn replay_upgrade_retains_the_typed_occurrence_after_source_rewrites() {
+        use crate::models::{MessageFilters, MessageRecordRelation, Role};
+        for (keep_original, keep_replay, second_submission, expected_human, time_mode) in [
+            (true, true, false, 1, 0),
+            (false, true, false, 1, 0),
+            (true, false, false, 1, 0),
+            (false, false, false, 2, 0),
+            (false, true, true, 2, 0),
+            // Equal or absent stored timestamps cannot identify the replay-only row.
+            (false, true, false, 2, 1),
+            (false, true, false, 2, 2),
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp
+                .path()
+                .join("local-agent-mode-sessions/synthetic/audit.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut original = json!({"type":"user","uuid":"input-1","session_id":"synthetic",
+                "_audit_timestamp":"2026-01-01T00:00:00Z",
+                "message":{"role":"user","content":"synthetic repeated submission"}});
+            if time_mode == 2 {
+                original.as_object_mut().unwrap().remove("_audit_timestamp");
+            }
+            let mut replay = original.clone();
+            replay["isReplay"] = json!(true);
+            if time_mode == 0 {
+                replay["_audit_timestamp"] = json!("2026-01-01T00:00:01Z");
+            }
+            let mut second = original.clone();
+            second["uuid"] = json!("input-2");
+            let anchor = json!({"type":"assistant","uuid":"anchor","session_id":"synthetic",
+                "message":{"role":"assistant","content":"unaffected answer"}});
+            let parse = |records: Vec<Value>| {
+                ClaudeAdapter::new(vec![])
+                    .parse_reader(
+                        std::io::Cursor::new(
+                            records
+                                .iter()
+                                .map(Value::to_string)
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        &path,
+                    )
+                    .unwrap()
+            };
+            let mut initial = vec![original.clone(), replay.clone()];
+            if second_submission {
+                initial.push(second.clone());
+            }
+            initial.push(anchor.clone());
+            let mut old = parse(initial);
+            old.session.parse_version = "claude-desktop-local-agent-v18".into();
+            for message in &mut old.messages {
+                message.provenance.record_relation = MessageRecordRelation::Original;
+            }
+            let db_path = temp.path().join("index.db");
+            let db = crate::db::Db::open(&db_path).unwrap();
+            db.upsert_session(&old, 1, 1).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let coordinates = || {
+                conn.prepare("select id, seq from messages order by id")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let before = coordinates();
+            let mut current = Vec::new();
+            if keep_original {
+                current.push(original);
+            }
+            if keep_replay {
+                // A repeated whole record is declined by digest deduplication. It must
+                // not retract the archived typed occurrence sharing its UUID and text.
+                current.push(replay.clone());
+                current.push(replay);
+            }
+            if second_submission {
+                current.push(second);
+            }
+            current.push(anchor);
+            let parsed = parse(current);
+            for generation in [2, 3] {
+                db.upsert_session(&parsed, generation, generation).unwrap();
+                assert_eq!(coordinates(), before, "no deletion or coordinate changes");
+                let human = db
+                    .search_messages(
+                        "",
+                        &MessageFilters {
+                            role: Some(Role::User),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    human.len(),
+                    expected_human,
+                    "original={keep_original}, replay={keep_replay}, second={second_submission}"
+                );
+                let relations: Vec<String> = conn
+                    .prepare("select record_relation from messages order by seq, id")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(
+                    relations[0], "original",
+                    "the archived typed original stays typed"
+                );
+                assert_eq!(
+                    relations[1],
+                    if (keep_original || keep_replay) && time_mode == 0 {
+                        "mirror"
+                    } else {
+                        "original"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_tail_matches_fresh_beyond_the_overlap() {
+        use crate::models::{MessageFilters, MessageRecordRelation, Role};
+        use std::io::Write;
+        let temp = tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("local-agent-mode-sessions/synthetic/audit.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = json!({"type":"user","uuid":"input-1","session_id":"synthetic",
+            "_audit_timestamp":"2026-01-01T00:00:00Z",
+            "message":{"role":"user","content":"synthetic typed input"}});
+        let padding = json!({"type":"system","subtype":"init", "padding": "x".repeat(crate::tail::OVERLAP_BYTES as usize + 8192)});
+        std::fs::write(&path, format!("{original}\n{padding}\n")).unwrap();
+        let adapter = ClaudeAdapter::new(vec![]);
+        let initial = adapter
+            .parse_reader(
+                std::io::BufReader::new(std::fs::File::open(&path).unwrap()),
+                &path,
+            )
+            .unwrap();
+        let db = crate::db::Db::open(&temp.path().join("tail.db")).unwrap();
+        db.upsert_session(&initial, 1, 1).unwrap();
+        let offset = crate::tail::complete_prefix_offset(&path).unwrap();
+        assert!(offset > crate::tail::OVERLAP_BYTES + original.to_string().len() as i64);
+        let mut replay = original.clone();
+        replay["isReplay"] = json!(true);
+        replay["_audit_timestamp"] = json!("2026-01-01T00:00:01Z");
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{replay}"
+        )
+        .unwrap();
+        let crate::tail::TailParseRun::Complete(Some(tail)) = crate::tail::tail_parse_until(
+            &path,
+            offset,
+            None,
+            &|| false,
+            |cursor, path, context| adapter.parse_reader_with_context(cursor, path, Some(context)),
+        )
+        .unwrap() else {
+            panic!("replay classification needs no original in overlap")
+        };
+        assert_eq!(tail.new_messages.len(), 1);
+        assert_eq!(
+            tail.new_messages[0].provenance.record_relation,
+            MessageRecordRelation::Mirror
+        );
+        db.append_tail(&tail, 2, std::fs::metadata(&path).unwrap().len() as i64)
+            .unwrap();
+        let fresh = adapter
+            .parse_reader(
+                std::io::BufReader::new(std::fs::File::open(&path).unwrap()),
+                &path,
+            )
+            .unwrap();
+        let fresh_db = crate::db::Db::open(&temp.path().join("fresh.db")).unwrap();
+        fresh_db.upsert_session(&fresh, 2, 2).unwrap();
+        assert_eq!(
+            db.message_count().unwrap(),
+            fresh_db.message_count().unwrap()
+        );
+        for role in [None, Some(Role::User)] {
+            let filters = MessageFilters {
+                role,
+                ..Default::default()
+            };
+            let signature = |db: &crate::db::Db| {
+                db.search_messages("", &filters)
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| (m.seq, m.content, m.provenance))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(signature(&db), signature(&fresh_db));
+        }
+        assert_eq!(fresh.messages.len(), 2);
+        assert_eq!(
+            db.search_messages(
+                "",
+                &MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let conn = rusqlite::Connection::open(temp.path().join("tail.db")).unwrap();
+        let transcript: String = conn
+            .query_row("select transcript_text from transcripts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(transcript, fresh.transcript_text);
+    }
+
+    #[test]
     fn sdk_system_subtypes_store_notices_and_report_unknowns() {
         use crate::models::{MessageFilters, MessageKind, Role};
         let temp = tempdir().unwrap();

@@ -7464,49 +7464,24 @@ fn store_parsed_messages(
             attachment_content.insert(id, content);
         }
     }
+    let claude_inputs = claude_input_matches(parsed, &parsed_keys, &stored);
     let mut unseen = Vec::new();
     let mut source_sequences = Vec::new();
-    for (message, keys) in parsed.messages.iter().zip(&parsed_keys) {
-        let position = keys
-            .correlation
-            .and_then(|identity| stored_by_identity.get_mut(&identity))
-            .and_then(|queue| {
-                if crate::providers::claude::is_attachment_message(message) {
-                    let index = queue.iter().position(|&position| {
-                        !matched[position]
-                            && attachment_content.get(&stored[position].0) == Some(&message.content)
-                    })?;
-                    return queue.remove(index);
-                }
-                while let Some(position) = queue.pop_front() {
-                    if !matched[position] {
-                        return Some(position);
+    for (parsed_position, (message, keys)) in parsed.messages.iter().zip(&parsed_keys).enumerate() {
+        let position = if let Some(input_match) = claude_inputs.get(&parsed_position) {
+            input_match.stored_position
+        } else {
+            keys.correlation
+                .and_then(|identity| stored_by_identity.get_mut(&identity))
+                .and_then(|queue| {
+                    if crate::providers::claude::is_attachment_message(message) {
+                        let index = queue.iter().position(|&position| {
+                            !matched[position]
+                                && attachment_content.get(&stored[position].0)
+                                    == Some(&message.content)
+                        })?;
+                        return queue.remove(index);
                     }
-                }
-                None
-            })
-            .or_else(|| {
-                keys.tool_result_relation
-                    .and_then(|key| legacy_tool_results.get(&key))
-                    .and_then(|(_, position)| *position)
-                    .filter(|position| !matched[*position])
-            })
-            .or_else(|| {
-                let legacy = if message
-                    .provenance
-                    .correlation_identity
-                    .as_ref()
-                    .is_some_and(|id| {
-                        id.authority == crate::models::MessageCorrelationAuthority::SourceLocal
-                            && id.scope.starts_with("claude_queue:")
-                    }) {
-                    // A removal record may contain the same notice at another timestamp. It is
-                    // not the enqueue's old rendering, and may belong only to the archive.
-                    stored_by_timestamp.get_mut(&keys.role_content_timestamp)
-                } else {
-                    stored_by_role_and_content.get_mut(&keys.role_and_content)
-                };
-                legacy.and_then(|queue| {
                     while let Some(position) = queue.pop_front() {
                         if !matched[position] {
                             return Some(position);
@@ -7514,7 +7489,37 @@ fn store_parsed_messages(
                     }
                     None
                 })
-            });
+                .or_else(|| {
+                    keys.tool_result_relation
+                        .and_then(|key| legacy_tool_results.get(&key))
+                        .and_then(|(_, position)| *position)
+                        .filter(|position| !matched[*position])
+                })
+                .or_else(|| {
+                    let legacy = if message
+                        .provenance
+                        .correlation_identity
+                        .as_ref()
+                        .is_some_and(|id| {
+                            id.authority == crate::models::MessageCorrelationAuthority::SourceLocal
+                                && id.scope.starts_with("claude_queue:")
+                        }) {
+                        // A removal record may contain the same notice at another timestamp. It is
+                        // not the enqueue's old rendering, and may belong only to the archive.
+                        stored_by_timestamp.get_mut(&keys.role_content_timestamp)
+                    } else {
+                        stored_by_role_and_content.get_mut(&keys.role_and_content)
+                    };
+                    legacy.and_then(|queue| {
+                        while let Some(position) = queue.pop_front() {
+                            if !matched[position] {
+                                return Some(position);
+                            }
+                        }
+                        None
+                    })
+                })
+        };
         if let Some(position) = position {
             matched[position] = true;
             source_sequences.push((stored[position].0, stored[position].1.seq, message.seq));
@@ -7535,9 +7540,16 @@ fn store_parsed_messages(
                     continue;
                 }
             }
-            if !same_parser
-                || stored[position].1.columns_without_seq != keys.columns_without_seq
-                || !message_parts_match(tx, stored[position].0, message)?
+            // A legacy row has no raw isReplay flag or record digest. Without a unique
+            // timestamp match, a lone replay cannot identify which equal stored copy to
+            // demote. Claim the row but leave its previous classification intact.
+            let ambiguous_replay = claude_inputs
+                .get(&parsed_position)
+                .is_some_and(|input_match| input_match.preserve_classification);
+            if !ambiguous_replay
+                && (!same_parser
+                    || stored[position].1.columns_without_seq != keys.columns_without_seq
+                    || !message_parts_match(tx, stored[position].0, message)?)
             {
                 update_message_row(tx, stored[position].0, session, message)?;
             }
@@ -7545,8 +7557,34 @@ fn store_parsed_messages(
             unseen.push(message);
         }
     }
+    // A surviving original proves that other archived renderings of the same native
+    // input are copies, even if their isReplay records have left the file. Different
+    // UUIDs (including identical-text submissions) never share this evidence.
+    let original_inputs: std::collections::HashSet<_> = claude_inputs
+        .keys()
+        .filter_map(|&position| {
+            let message = &parsed.messages[position];
+            (message.provenance.record_relation == crate::models::MessageRecordRelation::Original)
+                .then_some((
+                    parsed_keys[position].correlation,
+                    parsed_keys[position].role_and_content,
+                ))
+        })
+        .collect();
+    for (position, (id, keys)) in stored.iter().enumerate() {
+        if !matched[position]
+            && !keys.mirror
+            && original_inputs.contains(&(keys.correlation, keys.role_and_content))
+        {
+            tx.execute(
+                "update messages set record_relation = 'mirror' where id = ?1",
+                params![id],
+            )?;
+        }
+    }
     let mut delete = tx.prepare("delete from messages where id = ?1")?;
     for id in take_retracted_rows(
+        session.provider,
         &stored,
         &mut matched,
         &parsed.retracted.messages,
@@ -7580,6 +7618,106 @@ fn store_parsed_messages(
     Ok(has_archive)
 }
 
+struct ClaudeInputMatch {
+    stored_position: Option<usize>,
+    preserve_classification: bool,
+}
+
+/// Match Claude user occurrences by native identity, content and retained timestamp, not
+/// just UUID: SDK replays reuse the original UUID. Raw metadata and record digests were
+/// never stored per row. Reserve originals first when timestamps are indistinguishable;
+/// callers must not demote ambiguous legacy rows on replay-only evidence.
+/// O(stored + parsed) time and fixed-size key memory.
+fn claude_input_matches(
+    parsed: &ParsedSession,
+    parsed_keys: &[MessageKeys],
+    stored: &[(i64, MessageKeys)],
+) -> HashMap<usize, ClaudeInputMatch> {
+    use crate::models::{MessageCorrelationAuthority, MessageRecordRelation, Role};
+    let mut result = HashMap::new();
+    if !matches!(
+        parsed.session.provider,
+        Provider::Claude | Provider::ClaudeDesktop
+    ) {
+        return result;
+    }
+    let mut by_time = HashMap::<_, std::collections::VecDeque<usize>>::new();
+    let mut native_content = HashMap::<_, usize>::new();
+    for (_, keys) in stored {
+        if let Some(identity) = keys.correlation {
+            *native_content
+                .entry((identity, keys.role_and_content))
+                .or_default() += 1;
+        }
+    }
+    for (position, (_, keys)) in stored.iter().enumerate() {
+        if let Some(identity) = keys.correlation {
+            by_time
+                .entry((identity, keys.role_content_timestamp))
+                .or_default()
+                .push_back(position);
+        }
+    }
+    let counts: HashMap<_, _> = by_time
+        .iter()
+        .map(|(key, queue)| (*key, queue.len()))
+        .collect();
+    let originals: std::collections::HashSet<_> = parsed
+        .messages
+        .iter()
+        .zip(parsed_keys)
+        .filter(|(message, _)| {
+            message.role == Role::User
+                && message.provenance.record_relation == MessageRecordRelation::Original
+        })
+        .map(|(_, keys)| (keys.correlation, keys.role_and_content))
+        .collect();
+    for relation in [
+        MessageRecordRelation::Original,
+        MessageRecordRelation::Mirror,
+    ] {
+        for (position, (message, keys)) in parsed.messages.iter().zip(parsed_keys).enumerate() {
+            if message.role != Role::User
+                || !keys.correlation.is_some_and(|identity| {
+                    native_content
+                        .get(&(identity, keys.role_and_content))
+                        .is_some_and(|&count| {
+                            count > 1 || relation == MessageRecordRelation::Mirror
+                        })
+                })
+                || message.provenance.record_relation != relation
+                || !message
+                    .provenance
+                    .correlation_identity
+                    .as_ref()
+                    .is_some_and(|id| id.authority == MessageCorrelationAuthority::Anthropic)
+            {
+                continue;
+            }
+            let matched = keys
+                .correlation
+                .and_then(|identity| by_time.get_mut(&(identity, keys.role_content_timestamp)))
+                .and_then(|queue| queue.pop_front());
+            let preserve_classification = relation == MessageRecordRelation::Mirror
+                && matched.is_some_and(|p| !stored[p].1.mirror)
+                && keys.correlation.is_some_and(|identity| {
+                    counts
+                        .get(&(identity, keys.role_content_timestamp))
+                        .is_some_and(|&count| count > 1)
+                })
+                && !originals.contains(&(keys.correlation, keys.role_and_content));
+            result.insert(
+                position,
+                ClaudeInputMatch {
+                    stored_position: matched,
+                    preserve_classification,
+                },
+            );
+        }
+    }
+    result
+}
+
 /// Row ids of stored messages derived from records the parse declines (`RetractedRows`), each
 /// marked matched so it is not kept as archive.
 ///
@@ -7604,8 +7742,13 @@ fn store_parsed_messages(
 /// build omits it. Other rows are an earlier rendering of a record the parse now stores as
 /// different text, so no second copy is expected for them; for those, equal role and content
 /// still decide.
+/// Declined Claude user mirrors are whole-record duplicates of an already emitted replay.
+/// Their UUID and text also name the typed original, so neither native nor column equality
+/// authorizes deleting an unclaimed archive row for them. Reconciliation handles replay
+/// classification in place; digest deduplication already existed in the previous parser.
 /// O(stored + declined + parsed) time and key memory.
 fn take_retracted_rows(
+    provider: Provider,
     stored: &[(i64, MessageKeys)],
     matched: &mut [bool],
     retracted: &[Message],
@@ -7667,7 +7810,16 @@ fn take_retracted_rows(
         }
         None
     };
-    let keys: Vec<MessageKeys> = retracted.iter().map(parsed_message_keys).collect();
+    let keys: Vec<MessageKeys> = retracted
+        .iter()
+        .filter(|message| {
+            !(matches!(provider, Provider::Claude | Provider::ClaudeDesktop)
+                && message.role == crate::models::Role::User
+                && message.provenance.record_relation
+                    == crate::models::MessageRecordRelation::Mirror)
+        })
+        .map(parsed_message_keys)
+        .collect();
     let mut taken = Vec::new();
     let mut loose = Vec::new();
     for keys in &keys {
@@ -8397,6 +8549,7 @@ struct MessageKeys {
     role_and_content: RowDigest,
     role_content_timestamp: RowDigest,
     timestamped_notice: bool,
+    mirror: bool,
     correlation: Option<RowDigest>,
     tool_result_relation: Option<RowDigest>,
     seq: i64,
@@ -8466,6 +8619,7 @@ impl MessageColumns<'_> {
             role_and_content,
             role_content_timestamp: role_content_timestamp.finish_bytes(),
             timestamped_notice: self.kind == Some("harness_notice"),
+            mirror: self.record_relation == Some("mirror"),
             correlation,
             tool_result_relation: (self.kind == Some("tool_result"))
                 .then(|| tool_result_relation_key(self.tool_name, self.tool_call_id))
