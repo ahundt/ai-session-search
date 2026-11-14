@@ -382,6 +382,7 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "IndexNotRefreshedError",
 
         "SessionSearch",
+        "SqlSchemaResult",
         "AnalysisPublicationPlan",
         "AnalysisRequest",
         "AnalysisReceipt",

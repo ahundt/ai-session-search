@@ -106,6 +106,7 @@ __all__ = [
     "SkillRunQuery",
     "SkillRunReport",
     "SkillSelector",
+    "SqlSchemaResult",
     "ToolActivity",
     "UnknownConfigKey",
     "UnrecognizedRecordType",
@@ -1077,6 +1078,19 @@ class SessionQuery:
     ) -> Self: ...
 
 @final
+class SqlSchemaResult:
+    """Schema objects or columns with semantic notes from SqlService."""
+
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    truncated: bool
+    truncated_cell_char_limit: int | None
+
+    def to_dict(self) -> dict[str, Any]: ...
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
+@final
 class AnalysisRequest:
     """Scope and explicit population strategy for longitudinal session analysis.
 
@@ -1898,6 +1912,9 @@ class SessionSearch:
         """Read one session's messages, selecting the oldest or newest ``limit`` by ``order``
         (``"oldest"``/``"newest"``), always returned chronologically. To page a long session,
         advance ``seq_from`` (next chunk = last seq + 1) rather than growing ``limit``."""
+        ...
+    def schema(self, *, table: str | None = None, include_internal: bool = False) -> SqlSchemaResult:
+        """Return schema objects or columns with semantic notes; allowed under every access scope."""
         ...
     def inspect_session(
         self,
