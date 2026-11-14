@@ -3338,9 +3338,20 @@ mod tests {
     /// `--receipt-level` and the skill kept the old spellings through rc1; agents paid for it with
     /// `--help` probes and failed calls. Every documented invocation must parse against the current
     /// CLI, including the capability arguments after `skills <name>`, which the root parser passes
-    /// through.
+    /// through. Message reads also execute against a synthetic session to check runtime validation.
     #[test]
     fn every_documented_aise_example_parses_against_the_current_cli() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = Db::open(&temporary.path().join("examples.db")).unwrap();
+        let session = crate::util::minimal_record(
+            Provider::Claude,
+            &temporary
+                .path()
+                .join("00000000-0000-4000-8000-000000000000.jsonl"),
+            String::new(),
+        );
+        db.upsert_session(&session, 1, 1).unwrap();
+        let config = Config::default();
         let documents = [
             (
                 "skills/ai-session-search/SKILL.md",
@@ -3373,6 +3384,13 @@ mod tests {
                         continue;
                     }
                 };
+                if let Commands::Messages(command @ crate::messages::MessagesCmd::Get(_)) =
+                    &cli.command
+                {
+                    if let Err(error) = crate::messages::run_command(&db, command, &config) {
+                        failures.push(format!("{name}:{line}: {rendered}\n    {error}"));
+                    }
+                }
                 if let Commands::Skills(command) = cli.command {
                     if !command.is_management() {
                         if let Err(error) = command.into_execution() {
@@ -3388,7 +3406,7 @@ mod tests {
         );
         assert!(
             failures.is_empty(),
-            "{} documented aise invocation(s) do not parse against this build:\n{}",
+            "{} documented aise invocation(s) fail against this build:\n{}",
             failures.len(),
             failures.join("\n")
         );

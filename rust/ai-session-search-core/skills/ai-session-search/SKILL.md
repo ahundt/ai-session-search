@@ -192,7 +192,8 @@ aise messages search misunderstood --role user --when 14d --limit 20 --context 2
 aise messages search "CANNOT STOP" --kinds harness-notice --when 2d --limit 20
 # What the harness denied in one session, then the tool call each denial answered:
 aise messages search 'denied|blocked|not allowed' --query-mode regex --kinds harness-notice --session-id SESSION_ID --limit 50 --lines-per-message 3
-aise messages get SESSION_ID --seq 42 --context 2 --kinds conversation,harness-notice
+# Use the seq returned by the search; focused context includes every message class.
+aise messages get SESSION_ID --seq 42 --context 2
 aise messages search exec --field tool-name --query-mode fuzzy --limit 20
 aise messages search "cargo test" --field tool-argument --argument-path /cmd --limit 20
 aise messages search "cargo test" --field tool-argument --argument-path /command --tool-name-contains Bash --limit 20
