@@ -63,7 +63,6 @@ pub struct CodexAdapter {
     metadata: Vec<CodexRootMetadata>,
     sidecar_warnings: Vec<CodexSidecarWarning>,
     id_re: Regex,
-    rollout_paths: std::sync::OnceLock<HashMap<String, PathBuf>>,
 }
 
 impl CodexAdapter {
@@ -86,7 +85,6 @@ impl CodexAdapter {
             roots,
             metadata,
             sidecar_warnings,
-            rollout_paths: std::sync::OnceLock::new(),
             id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl(?:\.zst)?$")
                 .expect("valid regex"),
         }
@@ -147,15 +145,6 @@ impl CodexAdapter {
                 size_bytes: entry.metadata.len() as i64,
             });
         }
-        let _ = self.rollout_paths.set(
-            files
-                .iter()
-                .filter_map(|source| {
-                    self.extract_id(&source.path)
-                        .map(|id| (id, source.path.clone()))
-                })
-                .collect(),
-        );
         let mut warnings = walked.warnings;
         warnings.extend(
             self.sidecar_warnings
@@ -611,20 +600,10 @@ impl CodexAdapter {
         }
 
         let mut retracted = crate::models::RetractedRows::default();
-        if let (Some(parent), Some(range)) = (fork_parent.as_ref(), replayed_file_edits) {
-            // Discovery retains O(F) filename identities for F sources once per adapter. This
-            // check only proposes retractions; storage must prove an indexed parent copy.
-            if self.rollout_paths.get().is_none() {
-                self.discover_with_warnings();
-            }
-            if self
-                .rollout_paths
-                .get()
-                .and_then(|paths| paths.get(parent))
-                .is_some_and(|parent_path| parent_path != path && parent_path.is_file())
-            {
-                retracted.file_edits = file_edits.drain(range).collect();
-            }
+        if let Some(range) = replayed_file_edits {
+            // Only indexed parent edits can prove a replay is recoverable, regardless of
+            // whether discovery has seen a parent filename yet. Storage retains unproven copies.
+            retracted.file_edits = file_edits.drain(range).collect();
         }
         let messages = fork_replay.mark(messages, &mut transcript_lines);
         let root_metadata = self.metadata_for_path(path);
@@ -2841,10 +2820,10 @@ mod tests {
     }
 
     #[test]
-    fn fork_replay_edits_are_counted_only_when_the_parent_file_is_absent() {
+    fn fork_replay_edits_are_counted_only_without_an_indexed_parent_copy() {
         let parent = "019f4a0e-d714-7cc3-8003-543a04a1a822";
         let own = "019f5ce8-afff-76a3-86f2-174307f3fa08";
-        for parent_present in [true, false] {
+        for (parent_present, fork_parent) in [(true, parent), (false, parent), (false, own)] {
             let dir = tempdir().unwrap();
             let parent_path = dir.path().join(format!("rollout-{parent}.jsonl"));
             let path = dir.path().join(format!("rollout-{own}.jsonl"));
@@ -2867,8 +2846,9 @@ mod tests {
                 )
                 .unwrap();
             }
-            let mut rows =
-                vec![json!({"type":"session_meta","payload":{"id":own,"forked_from_id":parent}})];
+            let mut rows = vec![
+                json!({"type":"session_meta","payload":{"id":own,"forked_from_id":fork_parent}}),
+            ];
             rows.extend(parent_records);
             rows.push(json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}));
             rows.extend(mutation("fork-call", "fork.rs"));
@@ -2892,14 +2872,8 @@ mod tests {
                 .iter()
                 .map(|edit| edit.file_name.as_str())
                 .collect();
-            assert_eq!(
-                names,
-                if parent_present {
-                    vec!["fork.rs"]
-                } else {
-                    vec!["parent.rs", "fork.rs"]
-                }
-            );
+            assert_eq!(names, vec!["fork.rs"]);
+            assert_eq!(parsed.retracted.file_edits.len(), 1);
             let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
             if parent_present {
                 let parent_source = adapter
@@ -2911,15 +2885,13 @@ mod tests {
                     .unwrap();
             }
             let mut old = parsed.clone();
-            old.session.parse_version = "codex-v10".into();
+            old.session.parse_version = "codex-v11".into();
             old.file_edits.extend(parsed.retracted.file_edits.clone());
+            old.retracted.file_edits.clear();
             old.file_edits.sort_by_key(|edit| edit.seq);
             db.upsert_session(&old, 1, 1).unwrap();
             db.upsert_session(&parsed, 1, 1).unwrap();
-            assert_eq!(
-                db.file_edit_count().unwrap(),
-                parsed.file_edits.len() as i64 + i64::from(parent_present)
-            );
+            assert_eq!(db.file_edit_count().unwrap(), 2);
         }
     }
 

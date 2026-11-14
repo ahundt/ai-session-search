@@ -2603,6 +2603,169 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_edits_converge_across_root_order_and_parent_repair() {
+        use std::io::Write as _;
+        for parent_first in [false, true] {
+            for initial_parent in [
+                "ready",
+                "missing",
+                "malformed",
+                "metadata",
+                "descendant",
+                "temporarily-unavailable",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let parent_root = dir.path().join("parent");
+                let fork_root = dir.path().join("fork");
+                for root in [&parent_root, &fork_root] {
+                    std::fs::create_dir_all(root).unwrap();
+                }
+                let parent = "00000000-0000-4000-8000-000000000001";
+                let fork = "00000000-0000-4000-8000-000000000002";
+                let parent_path = parent_root.join(format!("rollout-{parent}.jsonl"));
+                let fork_path = fork_root.join(format!("rollout-{fork}.jsonl"));
+                let mutation = |call: &str, file: &str| {
+                    let input = format!("*** Begin Patch\n*** Add File: /synthetic/{file}.rs\n+synthetic {file} content\n*** End Patch");
+                    let output = format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/{file}.rs\n");
+                    format!(
+                        "{}\n{}\n",
+                        serde_json::json!({"type":"response_item","timestamp":"2026-11-01T00:00:01Z","payload":{"type":"custom_tool_call","call_id":call,"name":"apply_patch","input":input}}),
+                        serde_json::json!({"type":"response_item","timestamp":"2026-11-01T00:00:01Z","payload":{"type":"custom_tool_call_output","call_id":call,"output":output}})
+                    )
+                };
+                let header = serde_json::json!({"type":"session_meta","payload":{"id":parent,"timestamp":"2026-11-01T00:00:00Z"}});
+                let parent_body = format!(
+                    "{header}\n{}{}",
+                    mutation("shared", "shared"),
+                    mutation("parent-only", "parent-only")
+                );
+                let fork_header = serde_json::json!({"type":"session_meta","payload":{"id":fork,"forked_from_id":parent,"timestamp":"2026-11-01T00:00:00Z"}});
+                let settings = serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}});
+                std::fs::write(
+                    &fork_path,
+                    format!(
+                        "{fork_header}\n{}{}{settings}\n{}",
+                        mutation("shared", "shared"),
+                        mutation("recovered", "fork-recovered"),
+                        mutation("own", "fork-own")
+                    ),
+                )
+                .unwrap();
+                let expected = if initial_parent == "descendant" {
+                    let descendant = "00000000-0000-4000-8000-000000000003";
+                    let header = serde_json::json!({"type":"session_meta","payload":{"id":descendant,"forked_from_id":fork,"timestamp":"2026-11-01T00:00:00Z"}});
+                    std::fs::write(
+                        fork_root.join(format!("rollout-{descendant}.jsonl")),
+                        format!(
+                            "{header}\n{}{settings}\n{}",
+                            mutation("shared-copy", "shared"),
+                            mutation("descendant-own", "descendant-own")
+                        ),
+                    )
+                    .unwrap();
+                    6
+                } else {
+                    4
+                };
+                match initial_parent {
+                    "ready" | "descendant" => std::fs::write(&parent_path, &parent_body).unwrap(),
+                    "malformed" => std::fs::write(&parent_path, "{malformed\n").unwrap(),
+                    "metadata" => std::fs::write(&parent_path, format!("{header}\n")).unwrap(),
+                    _ => {}
+                }
+                let db_path = dir.path().join("index.db");
+                let mut config = config_with_single_claude_fixture(&db_path, &fork_root);
+                config.providers.claude.enabled = false;
+                config.providers.codex.enabled = true;
+                config.providers.codex.paths = if parent_first {
+                    vec![normalize_path(&parent_root), normalize_path(&fork_root)]
+                } else {
+                    vec![normalize_path(&fork_root), normalize_path(&parent_root)]
+                };
+                let db = Db::open(&db_path).unwrap();
+                reindex(&config, &db, false, None).unwrap();
+                if !matches!(initial_parent, "ready" | "descendant") {
+                    assert_eq!(db.file_edit_count().unwrap(), 3);
+                    if initial_parent == "temporarily-unavailable" {
+                        std::fs::rename(&fork_path, fork_path.with_extension("saved")).unwrap();
+                    }
+                    std::fs::write(&parent_path, &parent_body).unwrap();
+                }
+                // The fork's bytes, size and mtime stay unchanged while its parent appears.
+                reindex(&config, &db, false, None).unwrap();
+                if initial_parent == "temporarily-unavailable" {
+                    // Restoring the same inode also restores the identical source stamp.
+                    std::fs::rename(fork_path.with_extension("saved"), &fork_path).unwrap();
+                    reindex(&config, &db, false, None).unwrap();
+                }
+                assert_eq!(
+                    db.file_edit_count().unwrap(),
+                    expected,
+                    "parent_first={parent_first}, initial_parent={initial_parent}"
+                );
+                let rows = |path: &Path| {
+                    let conn = rusqlite::Connection::open(path).unwrap();
+                    let mut stmt = conn.prepare("select json_array(session_id,provider,seq,ts,tool,file_path,file_name,new_content,edits_json) from file_edits order by session_id,seq,id").unwrap();
+                    stmt.query_map([], |r| r.get::<_, String>(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                };
+                let fresh_path = dir.path().join("fresh.db");
+                let fresh = Db::open(&fresh_path).unwrap();
+                reindex(&config, &fresh, false, None).unwrap();
+                assert_eq!(rows(&db_path), rows(&fresh_path));
+                let versions = crate::files::reconstruct_versions_query(
+                    &db,
+                    "fork-recovered.rs",
+                    &Default::default(),
+                )
+                .unwrap()
+                .collect::<Vec<_>>();
+                assert_eq!(versions.len(), 1);
+                assert_eq!(versions[0].content, "synthetic fork-recovered content");
+                reindex(&config, &db, true, None).unwrap();
+                assert_eq!(rows(&db_path), rows(&fresh_path));
+                // Publishing an appended parent edit also reconciles an unchanged fork.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&parent_path)
+                    .unwrap()
+                    .write_all(mutation("recovered-later", "fork-recovered").as_bytes())
+                    .unwrap();
+                let adapters = ProviderSet::new(&config);
+                let source = adapters
+                    .discover_enabled(&config)
+                    .sources
+                    .into_iter()
+                    .find(|source| {
+                        normalize_path(&source.path)
+                            == crate::util::canonical_source_path(&parent_path)
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    try_tail(
+                        &source,
+                        &normalize_path(&source.path),
+                        Some(&format!("codex:{parent}")),
+                        &db,
+                        &|| false,
+                        |r, p| adapters.codex.parse_reader(r, p)
+                    )
+                    .unwrap(),
+                    TailOutcome::Appended
+                ));
+                let appended_path = dir.path().join("appended.db");
+                let appended = Db::open(&appended_path).unwrap();
+                reindex(&config, &appended, false, None).unwrap();
+                assert_eq!(rows(&db_path), rows(&appended_path));
+                assert_eq!(db.file_edit_count().unwrap(), expected);
+                assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
+            }
+        }
+    }
+
+    #[test]
     fn codex_fork_keeps_recoverable_edits_when_parent_lacks_them() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("codex");

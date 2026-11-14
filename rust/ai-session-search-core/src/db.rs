@@ -29,7 +29,7 @@ use crate::models::{
     FileEditSummary, FileQuery, Message, MessageAuthorship, MessageClassificationMatch,
     MessageContentPart, MessageFilters, MessageHit, MessageSearchMode, ParsedSession, ParserHealth,
     PlanningCount, Provider, ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters,
-    SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
+    SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript, SourceFile,
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::{
@@ -2715,7 +2715,9 @@ impl Db {
             !family_members.is_empty(),
             family_members.len() == 1,
         )?;
-        store_parsed_file_edits(&tx, parsed, same_parser)?;
+        if store_parsed_file_edits(&tx, parsed, same_parser)? {
+            reconcile_codex_fork_edits(&tx, session)?;
+        }
         if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
             // union rather than the parse alone.
@@ -2904,6 +2906,10 @@ impl Db {
                 .enumerate()
                 .map(|(i, e)| (next_edit_seq + i as i64, e)),
         )?;
+
+        if !tail.new_file_edits.is_empty() {
+            reconcile_codex_fork_edits(&tx, session)?;
+        }
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward,
         // title/preview take the tail's newest view, cwd fills if it was NULL. created_at stays.
@@ -7747,22 +7753,8 @@ fn stored_message_content_parts(
     Ok(Some((content, parts)))
 }
 
-/// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
-/// replace and keep rules as `store_parsed_messages`. A kept session's edits are renumbered so that
-/// each edit only the parse holds replays immediately before the next stored edit the parse
-/// lists after it (last when none follows): version replay applies edits in seq order, and a
-/// `Write` appended after a retained `Edit` it preceded would reset the file afterwards. Edit
-/// seqs are an order within the session, independent of message seqs, so renumbering moves no
-/// message reference. O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory.
-fn store_parsed_file_edits(
-    tx: &rusqlite::Transaction<'_>,
-    parsed: &ParsedSession,
-    same_parser: bool,
-) -> Result<()> {
-    let session = &parsed.session;
-    let mut file_edits: Vec<&FileEdit> = parsed.file_edits.iter().collect();
-    let mut retracted_file_edits = Vec::new();
-    let parent = (session.provider == Provider::Codex)
+fn codex_fork_parent(session: &SessionRecord) -> Option<String> {
+    (session.provider == Provider::Codex)
         .then(|| {
             session
                 .raw_metadata_json
@@ -7775,7 +7767,26 @@ fn store_parsed_file_edits(
                 .as_str()
                 .map(|id| format!("codex:{id}"))
         })
-        .filter(|id| id != &session.id);
+        .filter(|id| id != &session.id)
+}
+
+/// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
+/// replace and keep rules as `store_parsed_messages`. A kept session's edits are renumbered so that
+/// each edit only the parse holds replays immediately before the next stored edit the parse
+/// lists after it (last when none follows): version replay applies edits in seq order, and a
+/// `Write` appended after a retained `Edit` it preceded would reset the file afterwards. Edit
+/// seqs are an order within the session, independent of message seqs, so renumbering moves no
+/// message reference. Returns whether edits changed, so only edit publications revisit forks.
+/// O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory.
+fn store_parsed_file_edits(
+    tx: &rusqlite::Transaction<'_>,
+    parsed: &ParsedSession,
+    same_parser: bool,
+) -> Result<bool> {
+    let session = &parsed.session;
+    let mut file_edits: Vec<&FileEdit> = parsed.file_edits.iter().collect();
+    let mut retracted_file_edits = Vec::new();
+    let parent = codex_fork_parent(session).filter(|_| !parsed.retracted.file_edits.is_empty());
     // A filename cannot prove recovery safety. Consume equivalent indexed parent edits once
     // each; otherwise the fork retains its copy. O(parent edits + replay edits) key memory.
     let mut parent_edits = match &parent {
@@ -7787,7 +7798,7 @@ fn store_parsed_file_edits(
         None => HashMap::new(),
     };
     for edit in &parsed.retracted.file_edits {
-        if parent.is_some() {
+        if session.provider == Provider::Codex {
             let count = parent_edits
                 .entry(parsed_file_edit_keys(edit)?.edit)
                 .or_default();
@@ -7807,13 +7818,12 @@ fn store_parsed_file_edits(
         .iter()
         .map(|edit| parsed_file_edit_keys(edit))
         .collect::<Result<Vec<_>>>()?;
-    if same_parser
-        && stored
-            .iter()
-            .map(|(_, _, keys)| keys.all_columns)
-            .eq(parsed_keys.iter().map(|keys| keys.all_columns))
+    if stored
+        .iter()
+        .map(|(_, _, keys)| keys.all_columns)
+        .eq(parsed_keys.iter().map(|keys| keys.all_columns))
     {
-        return Ok(());
+        return Ok(false);
     }
     if covers_every_stored_key(
         stored.iter().map(|(_, _, keys)| keys.edit),
@@ -7824,7 +7834,7 @@ fn store_parsed_file_edits(
             params![session.id],
         )?;
         insert_file_edits(tx, session, file_edits.iter().map(|e| (e.seq, *e)))?;
-        return Ok(());
+        return Ok(true);
     }
     let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
     for (position, (_, _, keys)) in stored.iter().enumerate() {
@@ -7838,6 +7848,7 @@ fn store_parsed_file_edits(
                 .and_then(|queue| queue.pop_front())
         })
         .collect();
+    let mut changed = false;
     if !same_parser {
         let mut update = tx.prepare(
             "update file_edits set ts = ?1, tool = ?2, file_path = ?3, file_name = ?4,
@@ -7846,7 +7857,7 @@ fn store_parsed_file_edits(
         for (edit, position) in file_edits.iter().zip(&matched) {
             if let Some(position) = position {
                 let edits_json = serialize_edits_json(edit)?;
-                update.execute(params![
+                changed |= update.execute(params![
                     edit.ts.map(stored_timestamp),
                     edit.tool,
                     edit.file_path,
@@ -7854,7 +7865,7 @@ fn store_parsed_file_edits(
                     edit.new_content,
                     edits_json,
                     stored[*position].0,
-                ])?;
+                ])? > 0;
             }
         }
     }
@@ -7879,12 +7890,12 @@ fn store_parsed_file_edits(
             params![session.id],
         )?;
         insert_file_edits(tx, session, file_edits.iter().map(|edit| (edit.seq, *edit)))?;
-        return Ok(());
+        return Ok(true);
     }
     let mut delete = tx.prepare("delete from file_edits where id = ?1")?;
     for (position, (id, _, _)) in stored.iter().enumerate() {
         if retracted[position] {
-            delete.execute(params![id])?;
+            changed |= delete.execute(params![id])? > 0;
         }
     }
     // (stored position to precede or follow, 0 = parse-only before 1 = stored, tiebreak index).
@@ -7907,13 +7918,99 @@ fn store_parsed_file_edits(
         if source == 1 {
             let (id, stored_seq, _) = stored[index];
             if stored_seq != seq {
-                renumber.execute(params![seq, id])?;
+                changed |= renumber.execute(params![seq, id])? > 0;
             }
         } else {
             inserts.push((seq, file_edits[index]));
         }
     }
-    insert_file_edits(tx, session, inserts.into_iter())
+    changed |= !inserts.is_empty();
+    insert_file_edits(tx, session, inserts.into_iter())?;
+    Ok(changed)
+}
+
+/// Reconcile indexed descendants before publishing changed Codex edits. Scan S session rows
+/// with M metadata bytes and join R source receipts in O(M + S log R), retaining O(S) paths.
+/// Each dependent source is parsed at most once: O(B + C + E + N log N) for B source/output
+/// bytes, C stored parent/fork edit bytes, E parent edits and N stored/parsed fork edits.
+/// Memory adds one parsed fork, O(E + N) keys and the largest stored edit body. This work
+/// extends the writer transaction; unchanged edit sets and non-Codex publications skip it.
+fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
+    if session.provider != Provider::Codex {
+        return Ok(());
+    }
+    let mut children: HashMap<String, Vec<(String, SourceFile)>> = HashMap::new();
+    let mut statement = tx.prepare(
+        "select s.id, s.source_path, f.mtime_ns, f.size_bytes,
+            case when json_valid(s.raw_metadata_json)
+                then 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id') end
+         from sessions s join files_seen f on f.provider = s.provider and f.source_path = s.source_path
+         where s.provider = 'codex'",
+    )?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            SourceFile {
+                provider: Provider::Codex,
+                path: std::path::PathBuf::from(row.get::<_, String>(1)?),
+                mtime_ns: row.get(2)?,
+                size_bytes: row.get(3)?,
+                sidecar: None,
+            },
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })? {
+        let (id, source, parent) = row?;
+        if let Some(parent) = parent.filter(|parent| parent != &id) {
+            children.entry(parent).or_default().push((id, source));
+        }
+    }
+    if !children.contains_key(&session.id) {
+        return Ok(());
+    }
+    let adapter = crate::providers::codex::CodexAdapter::new(Vec::new());
+    let mut pending = vec![session.id.clone()];
+    while let Some(parent) = pending.pop() {
+        for (id, source) in children.remove(&parent).unwrap_or_default() {
+            let current = || {
+                fs::metadata(&source.path).ok().is_some_and(|metadata| {
+                    metadata.len() as i64 == source.size_bytes
+                        && metadata
+                            .modified()
+                            .ok()
+                            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                            .is_some_and(|time| time.as_nanos() as i64 == source.mtime_ns)
+                })
+            };
+            let parsed = (|| {
+                if !current() {
+                    return None;
+                }
+                let reader = crate::source::open_source_reader(&source.path).ok()?;
+                let parsed = adapter
+                    .parse_reader(std::io::BufReader::new(reader), &source.path)
+                    .ok()?;
+                (current()
+                    && parsed.session.id == id
+                    && codex_fork_parent(&parsed.session).as_deref() == Some(&parent))
+                .then_some(parsed)
+            })();
+            let Some(mut parsed) = parsed else {
+                // Keep the archive and retry even if the source returns with an identical stamp.
+                tx.execute(
+                    "update files_seen set parse_version = '', tail_byte_offset = null,
+                        prefix_fingerprint = null where provider = 'codex' and source_path = ?1",
+                    params![crate::util::normalize_path(&source.path)],
+                )?;
+                continue;
+            };
+            crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
+            if store_parsed_file_edits(tx, &parsed, true)? {
+                pending.push(id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Move a retired identity's rows into `target` before the retired session row is deleted. A
