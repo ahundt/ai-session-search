@@ -794,7 +794,7 @@ fn referenced_file_block_regex() -> Result<&'static Regex> {
 }
 
 /// Match Claude's attached-file rows: searchable tool context, never human input.
-/// O(content bytes) scan/copy, with only decoded attachment bytes retained.
+/// O(content bytes + part count) scan/copy, retaining outputs and borrowed part references.
 fn split_referenced_files(
     content: &str,
     recorded_content: Option<&Value>,
@@ -828,7 +828,10 @@ fn split_referenced_files(
             break;
         }
         if let Some(end) = end {
-            let attached = (index..=end).filter_map(text).collect::<String>();
+            // Keep the existing flattened payload and its hash identity for archived rows.
+            // Part boundaries prove authorship; they must not manufacture a second event.
+            let attached = (index..=end).filter_map(text).collect::<Vec<_>>().join(" ");
+            let attached = attached.strip_prefix('\n').unwrap_or(&attached).to_string();
             let identity = format!(
                 "attachment:{event_id}:{}:{}",
                 attachments.len(),
@@ -2353,6 +2356,45 @@ mod tests {
                     assert_eq!(parsed.messages[0].content, text);
                     assert_eq!(parsed.messages[0].provenance.authorship, MessageAuthorship::Human);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn structured_attachment_upgrade_keeps_the_archived_event_identity() {
+        let parts = json!([
+            {"text":"inspect @example.txt"}, {"text":"\n--- Content from referenced files ---"},
+            {"text":"\nContent from @example.txt:\n"}, {"text":"attached"},
+            {"text":"\n--- End of content ---"}
+        ]);
+        let historical = "--- Content from referenced files --- \nContent from @example.txt:\n attached \n--- End of content ---";
+        for parsed in parse_user_content_both_formats(parts) {
+            let mut old = parsed.clone();
+            old.session.parse_version = "gemini-cli-v10".into();
+            let attachment = old
+                .messages
+                .iter_mut()
+                .find(|m| m.kind == MessageKind::ToolResult)
+                .unwrap();
+            attachment.content = historical.into();
+            attachment
+                .provenance
+                .correlation_identity
+                .as_mut()
+                .unwrap()
+                .id = format!("attachment:u:0:{}", sha256(historical.as_bytes()));
+            let dir = tempfile::tempdir().unwrap();
+            let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+            db.upsert_session(&old, 1, 1).unwrap();
+            for generation in [2, 3] {
+                db.upsert_session(&parsed, generation, generation).unwrap();
+                assert_eq!(db.message_count().unwrap(), 2);
+                assert_eq!(
+                    db.search_messages("attached", &Default::default())
+                        .unwrap()
+                        .len(),
+                    1
+                );
             }
         }
     }
