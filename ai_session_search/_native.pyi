@@ -138,8 +138,8 @@ class SessionRecord:
     updated_at: str | None
     last_message_at: str | None
     preview_text: str
-    source_path: str
     raw_metadata_json: str | None
+    source_path: str
     message_count: int | None
     parse_warning: str | None
     parent_session_id: str | None
@@ -1054,6 +1054,7 @@ class SessionQuery:
     exclusions: QueryExclusions
     session_kinds: list[_SessionKind] | None
     parent_session_id: str | None
+    warnings_only: bool
     current_repo: str | None
     dates: DateRange
     limit: int | None
@@ -1067,6 +1068,7 @@ class SessionQuery:
         exclusions: QueryExclusions | None = None,
         session_kinds: list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
+        warnings_only: bool = False,
         current_repo: _PathInput | None = None,
         dates: DateRange | None = None,
         limit: int | None = None,
@@ -1093,6 +1095,7 @@ class AnalysisRequest:
     exclusions: QueryExclusions
     session_kinds: list[_SessionKind] | None
     parent_session_id: str | None
+    warnings_only: bool
     dates: DateRange
     first_canonical_sessions: int | None
 
@@ -1104,6 +1107,7 @@ class AnalysisRequest:
         exclusions: QueryExclusions | None = None,
         session_kinds: list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
+        warnings_only: bool = False,
         dates: DateRange | None = None,
         first_canonical_sessions: int | None = None,
     ) -> Self: ...
@@ -1889,6 +1893,7 @@ class SessionSearch:
         seq_to: int | None = None,
         lines_per_message: int = 0,
         kinds: list[_MessageKind] | None = None,
+        dates: DateRange | None = None,
     ) -> list[MessageHit]:
         """Read one session's messages, selecting the oldest or newest ``limit`` by ``order``
         (``"oldest"``/``"newest"``), always returned chronologically. To page a long session,

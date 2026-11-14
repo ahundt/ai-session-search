@@ -2535,6 +2535,8 @@ struct SessionQuery {
     parent_session_id: Option<String>,
     #[pyo3(get)]
     current_repo: Option<String>,
+    #[pyo3(get)]
+    warnings_only: bool,
     dates: DateRange,
     #[pyo3(get)]
     limit: Option<usize>,
@@ -2542,10 +2544,10 @@ struct SessionQuery {
     offset: usize,
 }
 
-python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","current_repo","dates","limit","offset"]);
+python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","current_repo","warnings_only","dates","limit","offset"]);
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, dates=None, limit=None, offset=0, scope=None))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, warnings_only=false, dates=None, limit=None, offset=0, scope=None))]
     fn new(
         provider: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
@@ -2555,6 +2557,7 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
         parent_session_id: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
         current_repo: Option<String>,
+        warnings_only: bool,
         dates: Option<DateRange>,
         limit: Option<i64>,
         offset: i64,
@@ -2571,6 +2574,7 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
             session_kinds: parse_session_kinds(session_kinds)?,
             parent_session_id,
             current_repo,
+            warnings_only,
             dates: scope.dates,
             limit: limit.map(|value| paging_argument(PagingArgument::Limit, value)).transpose()?,
             offset: paging_argument(PagingArgument::Offset, offset)?,
@@ -2624,6 +2628,7 @@ impl SessionQuery {
             value.exclude_session_ids = exclude_session_ids;
             value.session_kinds = self.session_kinds;
             value.parent_session_id = self.parent_session_id;
+            value.warnings_only = self.warnings_only;
             value.since = since;
             value.until = until;
             value.limit = self.limit.unwrap_or(50);
@@ -2653,15 +2658,17 @@ struct NativeAnalysisRequest {
     session_kinds: Option<Vec<SessionKind>>,
     #[pyo3(get)]
     parent_session_id: Option<String>,
+    #[pyo3(get)]
+    warnings_only: bool,
     dates: DateRange,
     #[pyo3(get)]
     first_canonical_sessions: Option<usize>,
 }
 
-python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","dates","first_canonical_sessions"]);
+python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","warnings_only","dates","first_canonical_sessions"]);
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, dates=None, first_canonical_sessions=None))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, warnings_only=false, dates=None, first_canonical_sessions=None))]
     fn new(
         provider: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
@@ -2669,6 +2676,7 @@ python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["prov
         exclusions: Option<QueryExclusions>,
         session_kinds: Option<Vec<String>>,
         parent_session_id: Option<String>,
+        warnings_only: bool,
         dates: Option<DateRange>,
         first_canonical_sessions: Option<i64>,
     ) -> PyResult<Self> {
@@ -2692,6 +2700,7 @@ python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["prov
             exclusions: exclusions.unwrap_or_default(),
             session_kinds: parse_session_kinds(session_kinds)?,
             parent_session_id,
+            warnings_only,
             dates: dates.unwrap_or_default(),
             first_canonical_sessions,
         })
@@ -2741,6 +2750,7 @@ impl NativeAnalysisRequest {
             session_kinds: self.session_kinds,
             parent_session_id: self.parent_session_id,
             current_repo: None,
+            warnings_only: self.warnings_only,
             dates: self.dates,
             limit: Some(0),
             offset: 0,
@@ -5108,7 +5118,7 @@ impl SessionSearch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (session_id, *, order="oldest", role=None, limit=0, offset=0, seq_from=None, seq_to=None, lines_per_message=0, kinds=None))]
+    #[pyo3(signature = (session_id, *, order="oldest", role=None, limit=0, offset=0, seq_from=None, seq_to=None, lines_per_message=0, kinds=None, dates=None))]
     /// Read one session's messages, selecting the oldest or newest `limit` by `order`, always
     /// returned in chronological (seq-ascending) order.
     ///
@@ -5131,6 +5141,7 @@ impl SessionSearch {
         seq_to: Option<i64>,
         lines_per_message: i64,
         kinds: Option<Vec<String>>,
+        dates: Option<DateRange>,
     ) -> PyResult<Vec<NativeMessageHit>> {
         let order = match order {
             "oldest" => ai_session_search::db::MessageOrder::OldestFirst,
@@ -5155,6 +5166,7 @@ impl SessionSearch {
             .transpose()?;
         let limit = paging_argument(PagingArgument::Limit, limit)?;
         let offset = paging_argument(PagingArgument::Offset, offset)?;
+        let (since, until) = dates.unwrap_or_default().resolve()?;
         py.detach(|| {
             let app = self.app()?;
             let session = app
@@ -5168,6 +5180,8 @@ impl SessionSearch {
                 value.session_id = Some(session.id);
                 value.seq_from = seq_from;
                 value.seq_to = seq_to;
+                value.since = since;
+                value.until = until;
                 value.limit = limit;
                 value.offset = offset;
                 value

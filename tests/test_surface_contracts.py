@@ -15,6 +15,53 @@ import ai_session_search as aise
 from scripts.verify_harness_discovery import environment
 
 
+def test_read_event_dates_and_warning_scopes(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    with aise.SessionSearch(database) as search:
+        with write_database(database) as connection:
+            connection.executescript("""
+                insert into sessions(id,provider,provider_session_id,preview_text,source_path,
+                                     parse_version,discovery_source,parse_warning)
+                values ('claude:healthy','claude','healthy','','/healthy','test','test',null),
+                       ('claude:warning','claude','warning','','/warning','test','test','synthetic warning');
+                insert into messages(session_id,provider,seq,role,kind,ts,content)
+                values ('claude:warning','claude',0,'assistant','conversation','2026-01-01T00:00:00Z','first'),
+                       ('claude:warning','claude',1,'assistant','conversation','2026-02-01T00:00:00Z','second');
+            """)
+        hits = search.read_session_messages("claude:warning", dates=aise.DateRange(when="2026-02"))
+        assert [(hit.session_id, hit.seq) for hit in hits] == [("claude:warning", 1)]
+        request = aise.SessionQuery(warnings_only=True, limit=1)
+        assert request.warnings_only is True
+        assert [row.id for row in search.list_sessions(request)] == ["claude:warning"]
+        assert aise.AnalysisRequest(warnings_only=True).warnings_only is True
+        selected = search.read_session_messages("claude:warning", role="assistant", order="newest",
+                                               limit=1, dates=aise.DateRange(since="2026-02-01T00:00:00Z"))
+        expected = [("claude:warning", 1)]
+        assert [(row.session_id, row.seq) for row in selected] == expected
+        env = environment(tmp_path / "runtime")
+        env["AI_SESSION_SEARCH_DATABASE"] = str(database)
+        command = [sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+                   "--index-refresh", "existing-only"]
+        cli = subprocess.run([*command, "messages", "get", "claude:warning", "--role", "assistant",
+                              "--order", "newest", "--limit", "1", "--since", "2026-02-01T00:00:00Z",
+                              "--format", "json"], env=env, capture_output=True, text=True, check=True)
+        assert [(row["session_id"], row["seq"]) for row in json.loads(cli.stdout)] == expected
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "synthetic", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "get_session", "arguments": {"session_id": "claude:warning", "role": "assistant",
+                "order": "newest", "limit": 1, "since": "2026-02-01T00:00:00Z"}}},
+        ]
+        mcp = subprocess.run([*command, "mcp", "serve"], env=env, capture_output=True, text=True,
+                             input="".join(json.dumps(request) + "\n" for request in requests), check=True)
+        response = next(json.loads(line) for line in mcp.stdout.splitlines() if json.loads(line).get("id") == 2)
+        assert not response["result"].get("isError"), response
+        payload = response["result"]["structuredContent"]
+        assert [(payload["session_id"], row["seq"]) for row in payload["messages"]] == expected
+
 
 def test_result_dictionaries_preserve_shared_serialization(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
