@@ -1619,7 +1619,19 @@ impl Default for Config {
                 },
                 gemini_cli: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".gemini/tmp").to_string_lossy().to_string()],
+                    paths: {
+                        let mut paths =
+                            vec![home.join(".gemini/tmp").to_string_lossy().to_string()];
+                        if cfg!(target_os = "macos") {
+                            // Seatbelt history persists here after leaving sandbox-exec.
+                            paths.push(
+                                home.join(".cache/.gemini/tmp")
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
+                        }
+                        paths
+                    },
                 },
             },
             index: IndexConfig {
@@ -3200,6 +3212,20 @@ mod tests {
                     || path.ends_with("claude/local-agent-mode-sessions")),
             "all candidates point at Claude Desktop local agent session roots: {paths:?}"
         );
+    }
+
+    #[test]
+    fn gemini_default_paths_include_native_and_sandbox_runtime_roots() {
+        let cfg = Config::default();
+        let paths = cfg.gemini_cli_paths();
+        assert!(paths.iter().any(|p| p.ends_with(".gemini/tmp")));
+        assert_eq!(paths.len(), if cfg!(target_os = "macos") { 2 } else { 1 });
+        if cfg!(target_os = "macos") {
+            assert!(paths.iter().any(|p| p.ends_with(".cache/.gemini/tmp")));
+        }
+        let cfg: Config =
+            toml::from_str("[providers.gemini-cli]\npaths = ['custom-only']").unwrap();
+        assert_eq!(cfg.gemini_cli_paths(), vec![PathBuf::from("custom-only")]);
     }
 
     #[test]
