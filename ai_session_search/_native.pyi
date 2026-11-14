@@ -139,6 +139,7 @@ class SessionRecord:
     last_message_at: str | None
     preview_text: str
     source_path: str
+    raw_metadata_json: str | None
     message_count: int | None
     parse_warning: str | None
     parent_session_id: str | None
@@ -148,8 +149,8 @@ class SessionRecord:
 class AnalysisCursor:
     """Opaque keyset cursor for the next non-overlapping analysis document page."""
 
-    def to_dict(self) -> dict[str, Any]:
-        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def to_dict(self) -> str:
+        """Return the serialized opaque cursor token."""
     def __repr__(self) -> str: ...
     def __eq__(self, other: object, /) -> bool: ...
 

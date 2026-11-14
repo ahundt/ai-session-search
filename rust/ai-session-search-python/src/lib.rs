@@ -575,6 +575,8 @@ struct NativeSessionRecord {
     #[pyo3(get)]
     preview_text: String,
     #[pyo3(get)]
+    raw_metadata_json: Option<String>,
+    #[pyo3(get)]
     source_path: String,
     #[pyo3(get)]
     message_count: Option<i64>,
@@ -610,6 +612,7 @@ impl From<SessionRecord> for NativeSessionRecord {
                 .last_message_at
                 .map(ai_session_search::util::display_timestamp),
             preview_text: session.preview_text,
+            raw_metadata_json: session.raw_metadata_json,
             source_path: session.source_path,
             message_count: session.message_count,
             parse_warning: session.parse_warning,
@@ -1050,7 +1053,7 @@ impl NativeAnalysisResult {
     }
 }
 
-python_value! { NativeAnalysisResult, slf => value_fields(slf.as_any(), &["sessions","vocabulary","graph"]);
+python_value! { NativeAnalysisResult, slf => json_compatible(slf.py(), slf.borrow().result());
     #[getter]
     fn sessions(&self, py: Python<'_>) -> PyResult<BTreeMap<String, Py<NativeAnalyzedSession>>> {
         self.result()
@@ -1090,7 +1093,7 @@ struct NativeAnalysisReceipt {
     inner: CoreAnalysisReceipt,
 }
 
-python_value! { NativeAnalysisReceipt, slf => value_fields(slf.as_any(), &["selection_kind","max_selected_sessions","database_schema_version","selected_sessions","messages_in_selected_sessions","analyzed_user_messages","has_more","last_selected_session_id","max_selected_session_updated_at","policy_digest","corpus_digest","result_digest"]);
+python_value! { NativeAnalysisReceipt, slf => json_compatible(slf.py(), &slf.borrow().inner);
     #[getter]
     fn selection_kind(&self) -> String {
         core_name(&self.inner.selection, "kind")
@@ -3485,7 +3488,7 @@ struct NativeSkillSelector {
     inner: ai_session_search::SkillSelector,
 }
 
-python_value! { NativeSkillSelector, slf => value_fields(slf.as_any(), &["name","path"]);
+python_value! { NativeSkillSelector, slf => json_compatible(slf.py(), &slf.borrow().inner);
     #[new]
     #[pyo3(signature = (*, name=None, path=None))]
     fn new(name: Option<String>, path: Option<PathBuf>) -> PyResult<Self> {
@@ -3810,7 +3813,14 @@ struct NativeMessageHit {
     refs: Vec<ai_session_search::refs::MessageRef>,
 }
 
-python_value! { NativeMessageHit, slf => value_fields(slf.as_any(), &["provenance","session_id","provider","seq","role","kind","timestamp","tool_name","tool_call_id","fuzzy_score","content","refs","ref_summary"]);
+python_value! { NativeMessageHit, slf => {
+    let result = value_fields(slf.as_any(), &["provenance","session_id","provider","seq","role","kind","timestamp","tool_name","tool_call_id","fuzzy_score","content"])?;
+    let mapping = result.cast::<PyDict>()?;
+    for key in ["provenance", "tool_call_id", "fuzzy_score"] {
+        if mapping.get_item(key)?.is_some_and(|value| value.is_none()) { mapping.del_item(key)?; }
+    }
+    Ok(result)
+};
     #[getter]
     fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         py.import("json")?
@@ -5748,9 +5758,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-python_value! { NativeSessionRecord, slf => value_fields(slf.as_any(), &["id","provider","provider_session_id","title","summary","cwd","repo_root","created_at","updated_at","last_message_at","preview_text","source_path","message_count","parse_warning","parent_session_id","agent_label","discovery_source","parse_version"]); }
+python_value! { NativeSessionRecord, slf => value_fields(slf.as_any(), &["id","provider","provider_session_id","title","summary","cwd","repo_root","created_at","updated_at","last_message_at","preview_text","raw_metadata_json","source_path","message_count","parse_warning","parent_session_id","agent_label","discovery_source","parse_version"]); }
 
-python_value! { NativeAnalysisCursor, slf => json_compatible(slf.py(), &serde_json::json!({"after_session_id": slf.borrow().inner.as_str()})); }
+python_value! { NativeAnalysisCursor, slf => json_compatible(slf.py(), &slf.borrow().inner); }
 
 python_value! { NativeAnalysisDocument, slf => value_fields(slf.as_any(), &["session","user_text","first_user_text","message_count","user_message_count"]); }
 
@@ -5758,7 +5768,16 @@ python_value! { NativeAnalysisDocumentPage, slf => value_fields(slf.as_any(), &[
 
 python_value! { NativeClassificationMatch, slf => value_fields(slf.as_any(), &["dimension","label","target","weight"]); }
 
-python_value! { NativeRelationshipHint, slf => value_fields(slf.as_any(), &["rule_id","kind","parent_title","status","resolved_session_id","candidate_session_ids"]); }
+python_value! { NativeRelationshipHint, slf => {
+    let value = slf.borrow();
+    let resolution = match value.status.as_str() {
+        "resolved" => serde_json::json!({"status":"resolved", "session_id":value.resolved_session_id}),
+        "ambiguous" => serde_json::json!({"status":"ambiguous", "session_ids":value.candidate_session_ids}),
+        _ => serde_json::json!({"status":"unresolved"}),
+    };
+    json_compatible(slf.py(), &serde_json::json!({"rule_id":value.rule_id, "kind":value.kind,
+        "parent_title":value.parent_title, "resolution":resolution}))
+}; }
 
 python_value! { NativeAnalyzedSession, slf => value_fields(slf.as_any(), &["session","classifications","score","relationship_hints","has_user_text","message_count","user_message_count"]); }
 
@@ -5801,7 +5820,11 @@ python_value! { NativeChangedFileEvidence, slf => value_fields(slf.as_any(), &["
 
 python_value! { NativeSessionTimeProfile, slf => value_fields(slf.as_any(), &["messages","timestamped_messages","undated_messages","first_timestamp","last_timestamp","observed_span_seconds","max_message_gap_seconds","tool_calls","tool_results"]); }
 
-python_value! { NativeSessionInspection, slf => value_fields(slf.as_any(), &["session","user_intent","tool_activity","refs","changed_files","truncated_evidence","time_profile","next_commands"]); }
+python_value! { NativeSessionInspection, slf => {
+    let result = value_fields(slf.as_any(), &["session","user_intent","tool_activity","refs","changed_files","truncated_evidence","time_profile","next_commands"])?;
+    if slf.borrow().time_profile.is_none() { result.cast::<PyDict>()?.del_item("time_profile")?; }
+    Ok(result)
+}; }
 
 python_value! { NativeFileEditSummary, slf => value_fields(slf.as_any(), &["file_path","file_name","edits","sessions","last_edited"]); }
 
@@ -5825,15 +5848,32 @@ python_value! { NativeCapabilityReceipt, slf => value_fields(slf.as_any(), &["na
 
 python_value! { NativeMessageClassificationReport, slf => value_fields(slf.as_any(), &["policies","matches","unattributed_input_count","unattributed_input_included"]); }
 
-python_value! { NativeSelectedSkillLocation, slf => value_fields(slf.as_any(), &["kind","canonical_skill_md"]); }
+python_value! { NativeSelectedSkillLocation, slf => {
+    let result = value_fields(slf.as_any(), &["kind","canonical_skill_md"])?;
+    if slf.borrow().canonical_skill_md.is_none() { result.cast::<PyDict>()?.del_item("canonical_skill_md")?; }
+    Ok(result)
+}; }
 
-python_value! { NativeCapabilityExecutionSource, slf => value_fields(slf.as_any(), &["kind","canonical_capability_toml"]); }
+python_value! { NativeCapabilityExecutionSource, slf => {
+    let result = value_fields(slf.as_any(), &["kind","canonical_capability_toml"])?;
+    if slf.borrow().canonical_capability_toml.is_none() { result.cast::<PyDict>()?.del_item("canonical_capability_toml")?; }
+    Ok(result)
+}; }
 
 python_value! { NativeResolvedSkillReceipt, slf => value_fields(slf.as_any(), &["name","package_version","selected_location","execution_source"]); }
 
 python_value! { NativeMessageClassificationResult, slf => value_fields(slf.as_any(), &["receipt","report"]); }
 
-python_value! { NativeSkillRunReport, slf => value_fields(slf.as_any(), &["requested_selector","resolved_skill","output"]); }
+python_value! { NativeSkillRunReport, slf => {
+    let result = value_fields(slf.as_any(), &["requested_selector","resolved_skill","output"])?;
+    let mapping = result.cast::<PyDict>()?;
+    let output = mapping.get_item("output")?.expect("output");
+    let tagged = PyDict::new(slf.py());
+    tagged.set_item("capability", "message-classification")?;
+    tagged.set_item("result", output)?;
+    mapping.set_item("output", tagged)?;
+    Ok(result)
+}; }
 
 python_value! { NativePlanningCount, slf => value_fields(slf.as_any(), &["command","count","unique_sessions","unique_projects"]); }
 
