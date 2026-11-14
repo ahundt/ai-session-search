@@ -1632,6 +1632,13 @@ impl MessageFilters {
     ///
     /// `query` is interpreted according to [`MessageFilters::match_mode`].
     pub fn validate(&self, query: &str) -> anyhow::Result<()> {
+        // Keep every validation failure typed at the shared boundary, including errors
+        // produced by pointer parsing and checked integer conversions.
+        self.validate_arguments(query)
+            .map_err(|error| crate::ServiceError::invalid_argument(error.to_string()).into())
+    }
+
+    fn validate_arguments(&self, query: &str) -> anyhow::Result<()> {
         use anyhow::{bail, ensure};
 
         if self.match_mode == MessageSearchMode::Fuzzy {
@@ -3024,6 +3031,42 @@ mod tests {
                     "{value} missing from: {rejected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn invalid_message_filters_keep_typed_argument_errors() {
+        for filters in [
+            MessageFilters {
+                seq_from: Some(4),
+                seq_to: Some(1),
+                ..Default::default()
+            },
+            MessageFilters {
+                seq_from: Some(-1),
+                ..Default::default()
+            },
+            MessageFilters {
+                offset: usize::MAX,
+                ..Default::default()
+            },
+            MessageFilters {
+                argument_path: Some("/x".into()),
+                ..Default::default()
+            },
+            MessageFilters {
+                match_mode: MessageSearchMode::Fuzzy,
+                ..Default::default()
+            },
+        ] {
+            let error = filters.validate("").unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::ServiceError>()
+                    .map(crate::ServiceError::code),
+                Some("invalid-argument"),
+                "{error}"
+            );
         }
     }
 
