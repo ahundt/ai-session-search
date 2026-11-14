@@ -2105,7 +2105,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
         Provider::Pi => "pi-v5",
         Provider::PrimeAgent => "prime-agent-v3",
         Provider::AiStudio => "aistudio-v4",
-        Provider::GeminiCli => "gemini-cli-v9",
+        Provider::GeminiCli => "gemini-cli-v10",
     }
 }
 

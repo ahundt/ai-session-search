@@ -156,6 +156,7 @@ impl GeminiCliAdapter {
             "line_count": line_count,
             "valid_record_count": valid_record_count,
             "session_path": crate::util::normalize_path(path),
+            "file_edit_call_ids": rendered.file_edit_call_ids,
         });
         if malformed_line_count > 0 {
             metadata["malformed_line_count"] = json!(malformed_line_count);
@@ -175,6 +176,7 @@ impl GeminiCliAdapter {
         let evidence = gemini_session_evidence(data.get("kind").and_then(Value::as_str));
         let mut messages = Vec::new();
         let mut file_edits = Vec::new();
+        let mut file_edit_call_ids = Vec::new();
         let mut mutations = PendingFileMutations::default();
         for message in data
             .get("messages")
@@ -242,7 +244,13 @@ impl GeminiCliAdapter {
                     .and_then(Value::as_str)
                     .and_then(parse_datetime)
                     .or(timestamp);
-                collect_file_mutation(call, call_ts, &mut mutations, &mut file_edits);
+                collect_file_mutation(
+                    call,
+                    call_ts,
+                    &mut mutations,
+                    &mut file_edits,
+                    &mut file_edit_call_ids,
+                );
                 let args = call.get("args").cloned().unwrap_or(Value::Null);
                 let mut call_raw = RawMessage::tool_call(name, args, call_id, call_ts);
                 if let Some(call_id) = call_id {
@@ -308,6 +316,8 @@ impl GeminiCliAdapter {
             evidence,
         );
         parsed.file_edits = file_edits;
+        parsed.session.raw_metadata_json =
+            Some(json!({"file_edit_call_ids":file_edit_call_ids}).to_string());
         Ok(parsed)
     }
 
@@ -462,6 +472,7 @@ pub(crate) fn merge_migration_family(
                 .push_back(index);
         }
     }
+    merge_file_mutations(&mut successor, &predecessor)?;
     let mut predecessor_ids = HashSet::new();
     let mut additions = Vec::new();
     for message in predecessor.messages {
@@ -526,6 +537,53 @@ pub(crate) fn merge_migration_family(
         .collect::<Vec<_>>()
         .join("\n\n");
     Ok(successor)
+}
+
+/// File payload equality is not event identity: two writes of the same bytes still count as
+/// two versions. Keep the native call ids alongside edits for a linear-time family union.
+fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSession) -> Result<()> {
+    let ids = |parsed: &ParsedSession| -> Result<Vec<String>> {
+        if parsed.file_edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let metadata: Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap_or("{}"))?;
+        let values = metadata
+            .get("file_edit_call_ids")
+            .and_then(Value::as_array)
+            .context("Gemini file mutations lack native call identities")?;
+        let ids = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            ids.len() == parsed.file_edits.len(),
+            "Gemini file mutation identity count differs"
+        );
+        Ok(ids)
+    };
+    let mut successor_ids = ids(successor)?;
+    let mut seen = successor_ids.iter().cloned().collect::<HashSet<_>>();
+    for (id, edit) in ids(predecessor)?.into_iter().zip(&predecessor.file_edits) {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let mut edit = edit.clone();
+        edit.seq = successor.file_edits.last().map_or(0, |edit| edit.seq + 1);
+        successor.file_edits.push(edit);
+        successor_ids.push(id);
+    }
+    let mut metadata: Value = serde_json::from_str(
+        successor
+            .session
+            .raw_metadata_json
+            .as_deref()
+            .unwrap_or("{}"),
+    )?;
+    metadata["file_edit_call_ids"] = json!(successor_ids);
+    successor.session.raw_metadata_json = Some(metadata.to_string());
+    Ok(())
 }
 
 fn message_payload_equal(left: &Message, right: &Message) -> bool {
@@ -758,6 +816,7 @@ struct RenderedMessages {
     messages: Vec<RawMessage>,
     mutations: PendingFileMutations,
     file_edits: Vec<FileEdit>,
+    file_edit_call_ids: Vec<String>,
     keys: HashSet<String>,
 }
 
@@ -986,6 +1045,7 @@ impl NativeReplay {
             messages: Vec::new(),
             mutations: PendingFileMutations::default(),
             file_edits: Vec::new(),
+            file_edit_call_ids: Vec::new(),
             keys: HashSet::new(),
         };
         for id in &self.order {
@@ -1109,6 +1169,7 @@ impl NativeReplay {
                         call_ts,
                         &mut rendered.mutations,
                         &mut rendered.file_edits,
+                        &mut rendered.file_edit_call_ids,
                     );
                     let key = call_id
                         .map(|id| format!("tool:{id}"))
@@ -1236,6 +1297,7 @@ fn collect_file_mutation(
     timestamp: Option<DateTime<Utc>>,
     pending: &mut PendingFileMutations,
     edits: &mut Vec<FileEdit>,
+    call_ids: &mut Vec<String>,
 ) {
     let Some(name) = call.get("name").and_then(Value::as_str) else {
         return;
@@ -1281,7 +1343,11 @@ fn collect_file_mutation(
         name,
         file_mutation_payload(name, call.get("args")),
     );
+    let previous_count = edits.len();
     pending.finish(Some(id), true, edits);
+    if edits.len() > previous_count {
+        call_ids.push(id.to_string());
+    }
 }
 
 fn file_mutation_payload(name: &str, args: Option<&Value>) -> Option<FileMutationPayload> {
@@ -1755,6 +1821,42 @@ mod tests {
             );
             assert_eq!(parsed.file_edits[1].seq, 1);
         }
+    }
+
+    #[test]
+    fn migration_family_keeps_predecessor_only_file_mutations_by_call_identity() {
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        let call = |id: &str| {
+            json!({"id":id,"name":"write_file",
+            "args":{"file_path":"/tmp/example.txt","content":"same content"},
+            "result":[{"functionResponse":{"id":id,"name":"write_file","response":{"output":"written"}}}]})
+        };
+        let record =
+            |id: &str| json!({"id":id,"type":"gemini","content":[],"toolCalls":[call(id)]});
+        let predecessor = adapter
+            .parse_raw(
+                Path::new("session-family.json"),
+                json!({"sessionId":"family","messages":[record("shared"),record("old")]})
+                    .to_string(),
+            )
+            .unwrap();
+        let successor = adapter
+            .parse_reader(
+                std::io::Cursor::new(format!(
+                    "{}\n{}\n{}\n",
+                    json!({"sessionId":"family"}),
+                    record("shared"),
+                    record("new")
+                )),
+                Path::new("session-family.jsonl"),
+            )
+            .unwrap();
+        let merged = merge_migration_family(successor, predecessor).unwrap();
+        assert_eq!(
+            merged.file_edits.len(),
+            3,
+            "identical payloads from distinct calls are separate versions"
+        );
     }
 
     #[test]
