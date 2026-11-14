@@ -870,6 +870,10 @@ pub(crate) fn reindex_until(
             continue;
         }
         let reconciliation = source_reconciliation.get(&(source.provider, source_path.clone()));
+        let current_identity = reconciliation.and_then(|item| item.current_identity);
+        // New sources carry an ID for freshness, but do not prove an existing archive.
+        let reconciliation =
+            reconciliation.filter(|item| item.session_id.is_some() || item.requires_reparse);
         let requires_reconciliation = reconciliation.is_some_and(|item| item.requires_reparse);
         let expected_session_id = reconciliation.and_then(|item| item.session_id.as_deref());
         let parser_version = crate::util::provider_parse_version(source.provider);
@@ -879,7 +883,10 @@ pub(crate) fn reindex_until(
             source.mtime_ns,
             source.size_bytes,
             parser_version,
+            current_identity,
         )?;
+        let requires_reconciliation =
+            requires_reconciliation || refresh_state == SourceFileRefreshState::ChangedIdentity;
         let persisted_gemini_family = (source.provider == Provider::GeminiCli)
             .then(|| persisted_gemini_families.get(&source_path).cloned())
             .flatten();
@@ -1309,6 +1316,7 @@ fn deduplicate_sources(sources: Vec<SourceFile>) -> Vec<SourceFile> {
 
 #[derive(Debug, Default)]
 struct SourceReconciliation {
+    current_identity: Option<file_id::FileId>,
     aliases: Vec<String>,
     requires_reparse: bool,
     session_id: Option<String>,
@@ -1385,6 +1393,7 @@ fn gemini_migration_families(
             predecessor.mtime_ns,
             predecessor.size_bytes,
             parser_version,
+            None,
         )?;
         let successor_refresh = db.source_file_refresh_state(
             Provider::GeminiCli,
@@ -1392,6 +1401,7 @@ fn gemini_migration_families(
             successor.mtime_ns,
             successor.size_bytes,
             parser_version,
+            None,
         )?;
         // A previously joined family has two current files_seen receipts. Do not scan either
         // transcript again just to rediscover a relationship that is already represented by the
@@ -1631,14 +1641,15 @@ fn source_reconciliation(
     }
     Ok(sources
         .iter()
-        .filter_map(|source| {
+        .map(|source| {
             let path = normalize_path(&source.path);
             let mut matches = by_canonical
                 .get(&(source.provider, path.clone()))
                 .cloned()
                 .unwrap_or_default();
             // Missing receipts and changed stamps cannot prove a historical move; preserve the archive.
-            if let Ok(id) = file_id::get_file_id(&source.path) {
+            let current_identity = file_id::get_file_id(&source.path).ok();
+            if let Some(id) = current_identity {
                 matches.extend(
                     by_file
                         .get(&(source.provider, id, source.mtime_ns, source.size_bytes))
@@ -1659,9 +1670,6 @@ fn source_reconciliation(
             }
             matches.sort_unstable_by_key(|entry| &entry.source_path);
             matches.dedup_by_key(|entry| &entry.source_path);
-            if matches.is_empty() {
-                return None;
-            }
             let aliases = matches
                 .iter()
                 .filter(|entry| entry.source_path != path)
@@ -1671,14 +1679,15 @@ fn source_reconciliation(
                 || matches.iter().map(|entry| entry.sessions).sum::<usize>() > 1;
             let session_id = (matches.len() == 1 && matches[0].sessions == 1)
                 .then(|| matches[0].session_id.clone());
-            Some((
+            (
                 (source.provider, path),
                 SourceReconciliation {
+                    current_identity,
                     aliases,
                     requires_reparse,
                     session_id,
                 },
-            ))
+            )
         })
         .collect())
 }
@@ -2034,6 +2043,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn same_stamp_atomic_replacement_is_reparsed_and_preserves_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let line = |id: &str, text: &str| {
+            format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n"
+        )
+        };
+        let old = line("old-session", "old content");
+        let new = line("new-session", "new content");
+        assert_eq!(old.len(), new.len());
+        std::fs::write(&path, &old).unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 1);
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let old_id = file_id::get_file_id(&path).unwrap();
+        let replacement = root.join("replacement.tmp");
+        std::fs::write(&replacement, &new).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        assert_ne!(file_id::get_file_id(&replacement).unwrap(), old_id);
+        // Move the old file aside first: portable to Windows without relying on rename-overwrite.
+        std::fs::rename(&path, root.join("archive.tmp")).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), stamp);
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 1);
+        assert_eq!(
+            db.search_messages("new content", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages("old content", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(reindex(&config, &db, false, None).unwrap().1, 0);
     }
 
     #[test]
@@ -6694,6 +6753,7 @@ mod tests {
                 2,
                 std::fs::metadata(&session_file).unwrap().len() as i64,
                 crate::util::provider_parse_version(Provider::Claude),
+                None,
             )
             .unwrap(),
             SourceFileRefreshState::ChangedParser,
@@ -6733,6 +6793,7 @@ mod tests {
                 2,
                 std::fs::metadata(&session_file).unwrap().len() as i64,
                 crate::util::provider_parse_version(Provider::Claude),
+                None,
             )
             .unwrap(),
             SourceFileRefreshState::ChangedParser,

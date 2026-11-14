@@ -288,6 +288,7 @@ pub(crate) struct MessageBatchVisitOutcome {
 pub(crate) enum SourceFileRefreshState {
     Current,
     ChangedSameParser,
+    ChangedIdentity,
     ChangedParser,
     New,
 }
@@ -2284,7 +2285,7 @@ impl Db {
         parse_version: &str,
     ) -> Result<bool> {
         Ok(
-            self.source_file_refresh_state(provider, path, mtime_ns, size, parse_version)?
+            self.source_file_refresh_state(provider, path, mtime_ns, size, parse_version, None)?
                 == SourceFileRefreshState::Current,
         )
     }
@@ -2302,35 +2303,49 @@ impl Db {
         mtime_ns: i64,
         size: i64,
         parse_version: &str,
+        current_identity: Option<file_id::FileId>,
     ) -> Result<SourceFileRefreshState> {
-        Ok(match self.file_seen_state(provider, path)? {
+        // Reuse reconciliation's file ID: no additional stat or source read here.
+        // Same-identity in-place rewrites preserving size and mtime remain undetected,
+        // as in 1.0.0. Detecting those requires hashing every source on every refresh,
+        // O(total source bytes), rather than this metadata-only unchanged fast path.
+        let state = self
+            .conn
+            .query_row(
+                "select mtime_ns, size_bytes, parse_version, file_identity from files_seen
+             where provider = ?1 and source_path = ?2",
+                params![provider.as_str(), path],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match state {
             None => SourceFileRefreshState::New,
-            Some((_, _, stored_version)) if stored_version != parse_version => {
+            Some((_, _, stored_version, _)) if stored_version != parse_version => {
                 SourceFileRefreshState::ChangedParser
             }
-            Some((stored_mtime, stored_size, _))
+            Some((_, _, _, stored_identity))
+                if stored_identity
+                    .as_deref()
+                    .and_then(file_identity_key)
+                    .zip(current_identity)
+                    .is_some_and(|(stored, current)| stored != current) =>
+            {
+                SourceFileRefreshState::ChangedIdentity
+            }
+            Some((stored_mtime, stored_size, _, _))
                 if stored_mtime == mtime_ns && stored_size == size =>
             {
                 SourceFileRefreshState::Current
             }
             Some(_) => SourceFileRefreshState::ChangedSameParser,
         })
-    }
-
-    fn file_seen_state(
-        &self,
-        provider: Provider,
-        path: &str,
-    ) -> Result<Option<(i64, i64, String)>> {
-        self.conn
-            .query_row(
-                "select mtime_ns, size_bytes, parse_version from files_seen
-                 where provider = ?1 and source_path = ?2",
-                params![provider.as_str(), path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(Into::into)
     }
 
     pub(crate) fn indexed_source_identities(&self) -> Result<Vec<IndexedSourceIdentity>> {
@@ -24544,6 +24559,108 @@ mod tests {
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].source_path, "/old/session.jsonl");
         assert!(identities[0].file_identity.is_none());
+    }
+
+    #[test]
+    fn source_refresh_identity_requires_two_available_different_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let path = "/synthetic/source.jsonl";
+        let first = file_id::FileId::new_inode(7, 11);
+        let second = file_id::FileId::new_inode(7, 12);
+        let receipt = serde_json::to_string(&FileIdentityReceipt {
+            id: first,
+            canonical_path: path.into(),
+        })
+        .unwrap();
+        db.conn.execute(
+            "insert into files_seen (provider, source_path, mtime_ns, size_bytes, last_indexed_at, parse_version, file_identity)
+             values ('claude', ?1, 100, 200, '2026-01-01T00:00:00Z', 'test-parser', ?2)",
+            params![path, receipt],
+        ).unwrap();
+        for (stored, current, expected) in [
+            (
+                Some(receipt.as_str()),
+                Some(first),
+                SourceFileRefreshState::Current,
+            ),
+            (
+                Some(receipt.as_str()),
+                Some(second),
+                SourceFileRefreshState::ChangedIdentity,
+            ),
+            (
+                Some(receipt.as_str()),
+                None,
+                SourceFileRefreshState::Current,
+            ),
+            (None, Some(second), SourceFileRefreshState::Current),
+            (None, None, SourceFileRefreshState::Current),
+            (
+                Some("invalid receipt"),
+                Some(second),
+                SourceFileRefreshState::Current,
+            ),
+        ] {
+            db.conn
+                .execute("update files_seen set file_identity = ?1", [stored])
+                .unwrap();
+            assert_eq!(
+                db.source_file_refresh_state(
+                    Provider::Claude,
+                    path,
+                    100,
+                    200,
+                    "test-parser",
+                    current
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(
+                db.source_file_refresh_state(Provider::Claude, path, 101, 200, "test-parser", None)
+                    .unwrap(),
+                SourceFileRefreshState::ChangedSameParser
+            );
+            assert_eq!(
+                db.source_file_refresh_state(Provider::Claude, path, 100, 201, "test-parser", None)
+                    .unwrap(),
+                SourceFileRefreshState::ChangedSameParser
+            );
+            assert_eq!(
+                db.source_file_refresh_state(
+                    Provider::Claude,
+                    path,
+                    100,
+                    200,
+                    "new-parser",
+                    current
+                )
+                .unwrap(),
+                SourceFileRefreshState::ChangedParser
+            );
+        }
+    }
+
+    #[test]
+    fn source_refresh_receipt_projection_keeps_the_primary_key_lookup_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let plan = |columns: &str| {
+            db.conn.query_row(
+            &format!("explain query plan select {columns} from files_seen where provider = ?1 and source_path = ?2"),
+            params!["claude", "/synthetic/source.jsonl"],
+            |row| row.get::<_, String>(3),
+        ).unwrap()
+        };
+        let before = plan("mtime_ns, size_bytes, parse_version");
+        let after = plan("mtime_ns, size_bytes, parse_version, file_identity");
+        assert_eq!(before, after);
+        assert!(
+            after.contains("SEARCH files_seen USING INDEX sqlite_autoindex_files_seen_1"),
+            "{after}"
+        );
+        assert!(after.contains("provider=? AND source_path=?"), "{after}");
     }
 
     #[test]
