@@ -3855,14 +3855,27 @@ mod tests {
             for n in 0..20 {
                 writeln!(file, "{}", unknown(n)).unwrap();
             }
+            let mut padding_records = 0;
             while file.metadata().unwrap().len() < (mib * 1024 * 1024) as u64 {
                 let record = match provider {
-                    Provider::Codex => {
-                        json!({"type":"response_item","payload":{"type":"reasoning","encrypted_content":"synthetic opaque","padding":"x".repeat(65536)}})
-                    }
+                    Provider::Codex => match padding_records % 4 {
+                        0 => {
+                            json!({"type":"response_item","payload":{"type":"reasoning","encrypted_content":"synthetic opaque","padding":"x".repeat(65536)}})
+                        }
+                        1 => {
+                            json!({"type":"world_state","payload":{"state":{},"padding":"x".repeat(65536)}})
+                        }
+                        2 => {
+                            json!({"type":"event_msg","payload":{"type":"item_completed","padding":"x".repeat(65536)}})
+                        }
+                        _ => {
+                            json!({"type":"response_item","payload":{"type":"additional_tools","tools":[],"padding":"x".repeat(65536)}})
+                        }
+                    },
                     _ => unknown(19),
                 };
                 writeln!(file, "{record}").unwrap();
+                padding_records += 1;
             }
             file.flush().unwrap();
             let db_path = dir.path().join("index.db");
@@ -3926,6 +3939,34 @@ mod tests {
                         "{provider:?} turn {turn}"
                     );
                 }
+            }
+            if !benchmark {
+                let before =
+                    serde_json::to_value(db.parser_health().unwrap().unrecognized_record_types)
+                        .unwrap();
+                write!(file, "{{\"type\":\"partial").unwrap();
+                file.flush().unwrap();
+                reindex(&config, &db, false, None).unwrap();
+                assert_eq!(
+                    serde_json::to_value(db.parser_health().unwrap().unrecognized_record_types)
+                        .unwrap(),
+                    before
+                );
+                writeln!(file, "-unknown\"}}").unwrap();
+                file.flush().unwrap();
+                reindex(&config, &db, false, None).unwrap();
+                let fresh_path = dir.path().join("fresh-partial.db");
+                let fresh = Db::open(&fresh_path).unwrap();
+                let mut fresh_config = config.clone();
+                fresh_config.index.db_path = Some(normalize_path(&fresh_path));
+                reindex(&fresh_config, &fresh, true, None).unwrap();
+                assert_eq!(
+                    serde_json::to_value(db.parser_health().unwrap().unrecognized_record_types)
+                        .unwrap(),
+                    serde_json::to_value(fresh.parser_health().unwrap().unrecognized_record_types)
+                        .unwrap(),
+                    "{provider:?}: completed partial record"
+                );
             }
             eprintln!("HEALTH_REFRESH provider={provider:?} bytes={} full={full_count} tail={} seconds={latencies:?}",file.metadata().unwrap().len(),16-full_count);
         }

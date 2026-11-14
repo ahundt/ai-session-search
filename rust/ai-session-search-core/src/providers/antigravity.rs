@@ -2,6 +2,75 @@
 // SPDX-FileCopyrightText: 2026 Adam Zhao
 // SPDX-License-Identifier: Apache-2.0
 
+use super::health::{
+    RecordDisposition::{Ignored, Indexed},
+    RecordTypeRule,
+};
+
+// Native discriminator inventory. Unlisted names are unknown and reported.
+pub(crate) const RECORD_TYPES: &[RecordTypeRule] = &[
+    (
+        "USER_INPUT",
+        Indexed("classify_antigravity_record USER_INPUT"),
+    ),
+    (
+        "PLANNER_RESPONSE",
+        Indexed("classify_antigravity_record PLANNER_RESPONSE"),
+    ),
+    (
+        "SYSTEM_MESSAGE",
+        Indexed("classify_antigravity_record SYSTEM_MESSAGE"),
+    ),
+    (
+        "ERROR_MESSAGE",
+        Indexed("classify_antigravity_record ERROR_MESSAGE"),
+    ),
+    (
+        "CHECKPOINT",
+        Indexed("classify_antigravity_record CHECKPOINT"),
+    ),
+    (
+        "RUN_COMMAND",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "SEARCH_WEB",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "VIEW_FILE",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "CODE_ACTION",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "FILE_CHANGE",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "GREP_SEARCH",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "LIST_DIRECTORY",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "GENERIC",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "MCP_TOOL",
+        Indexed("classify_antigravity_record tool-step fallback"),
+    ),
+    (
+        "CONVERSATION_HISTORY",
+        Ignored("Conversation replay is not indexed again"),
+    ),
+];
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

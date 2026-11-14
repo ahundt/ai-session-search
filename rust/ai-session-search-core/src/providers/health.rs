@@ -7,6 +7,42 @@ use crate::models::{ParsedSession, Provider};
 
 pub(crate) const UNRECOGNIZED_RECORD_TYPES_KEY: &str = "unrecognized_record_types";
 
+/// Each provider table names the indexed arm or why known content is deliberately omitted.
+/// Anything absent from that table is unknown and reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordDisposition {
+    Indexed(&'static str),
+    Ignored(&'static str),
+}
+
+impl RecordDisposition {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Indexed(arm) | Self::Ignored(arm) => arm,
+        }
+    }
+}
+
+pub(crate) type RecordTypeRule = (&'static str, RecordDisposition);
+
+/// Match the native discriminator at its own scope, not a coincidentally equal dotted name.
+pub(crate) fn scoped_name_matches(known: &str, scope: &str, name: &str) -> bool {
+    let split = known.rfind(['.', '/']).map_or(0, |index| index + 1);
+    &known[..split] == scope && &known[split..] == name
+}
+
+pub(crate) fn rules(provider: Provider) -> &'static [RecordTypeRule] {
+    match provider {
+        Provider::Claude | Provider::ClaudeDesktop => super::claude::RECORD_TYPES,
+        Provider::Codex => super::codex::RECORD_TYPES,
+        Provider::Pi | Provider::PrimeAgent => super::pi::RECORD_TYPES,
+        Provider::Cursor => super::cursor::RECORD_TYPES,
+        Provider::Antigravity => super::antigravity::RECORD_TYPES,
+        Provider::AiStudio => super::aistudio::RECORD_TYPES,
+        Provider::GeminiCli => super::gemini_cli::RECORD_TYPES,
+    }
+}
+
 /// Names only, never payload text. Retains 16 names of at most 64 characters plus one
 /// overflow bucket, matching the original Claude inventory bound.
 pub(crate) struct UnrecognizedRecordTypes {
@@ -72,124 +108,65 @@ impl UnrecognizedRecordTypes {
         *self.counts.entry(name).or_default() += count;
     }
 
-    fn check(&mut self, scope: &str, name: Option<&str>, handled: &[&str], ignored: &[&str]) {
-        if !name.is_some_and(|name| handled.contains(&name) || ignored.contains(&name)) {
+    fn check(&mut self, provider: Provider, scope: &str, name: Option<&str>) {
+        if !name.is_some_and(|name| {
+            rules(provider).iter().any(|(known, disposition)| {
+                scoped_name_matches(known, scope, name) && !disposition.description().is_empty()
+            })
+        }) {
             self.count_in(scope, name);
         }
     }
 
-    /// Observe before dispatch/empty-text filtering so unfamiliar empty records are visible too.
-    /// Ignored lists contain format bookkeeping, not speculative future record names.
+    /// Inspect native discriminators before empty-text filtering. Provider-local tables own
+    /// classification; an unmatched discriminator is unknown, even when its payload is empty.
     pub(crate) fn observe(&mut self, provider: Provider, value: &Value) {
         let kind = value.get("type").and_then(Value::as_str);
         match provider {
             Provider::Codex => {
-                self.check(
-                    "",
-                    kind,
-                    &["session_meta", "response_item", "compacted", "event_msg"],
-                    // Turn settings and numeric usage counters have no conversation body.
-                    &["turn_context", "token_usage_record"],
-                );
+                self.check(provider, "", kind);
                 if kind == Some("response_item") {
                     let payload = value.get("payload").unwrap_or(&Value::Null);
                     self.check(
+                        provider,
                         "response_item.",
                         payload.get("type").and_then(Value::as_str),
-                        &[
-                            "message",
-                            "function_call",
-                            "custom_tool_call",
-                            "function_call_output",
-                            "custom_tool_call_output",
-                        ],
-                        &[],
                     );
                     if payload.get("type").and_then(Value::as_str) == Some("message") {
                         self.check(
+                            provider,
                             "response_item.message.",
                             payload.get("role").and_then(Value::as_str),
-                            &["user", "assistant"],
-                            // Undispatched instruction text must remain visible in health.
-                            &[],
                         );
                     }
                 } else if kind == Some("event_msg") {
                     let payload = value.get("payload").unwrap_or(value);
                     self.check(
+                        provider,
                         "event_msg.",
                         payload
                             .get("type")
                             .or_else(|| payload.get("event_type"))
                             .and_then(Value::as_str),
-                        &[
-                            "turn_aborted",
-                            "thread_settings_applied",
-                            "thread_goal_updated",
-                            "web_search_end",
-                            "mcp_tool_call_end",
-                        ],
-                        // Usage and task lifecycle counters; completion prose is a final-message echo.
-                        &["token_count", "task_started", "task_complete"],
                     );
                 }
             }
             Provider::Pi | Provider::PrimeAgent => {
-                self.check(
-                    "",
-                    kind,
-                    &[
-                        "session",
-                        "message",
-                        "compaction",
-                        "branch_summary",
-                        "custom_message",
-                    ],
-                    // Model/usage settings, extension state, bookmarks and display metadata.
-                    &[
-                        "thinking_level_change",
-                        "model_change",
-                        "usage",
-                        "custom",
-                        "label",
-                        "session_info",
-                        "service_tier_change",
-                        "child_usage_attributed",
-                        "session_state",
-                        "agent_status",
-                        "git_state",
-                    ],
-                );
+                self.check(provider, "", kind);
                 if kind == Some("message") {
                     let message = value.get("message").unwrap_or(&Value::Null);
                     self.check(
+                        provider,
                         "message.",
                         message
                             .get("role")
                             .and_then(Value::as_str)
                             .or_else(|| message.get("type").and_then(Value::as_str)),
-                        &[
-                            "user",
-                            "assistant",
-                            "toolResult",
-                            "bashExecution",
-                            "compactionSummary",
-                            "compaction",
-                            "branch_summary",
-                            "custom",
-                            "custom_message",
-                        ],
-                        &[],
                     );
                 }
             }
-            Provider::Cursor => {
-                self.check(
-                    "",
-                    value.get("role").and_then(Value::as_str),
-                    &["user", "assistant"],
-                    &[],
-                );
+            Provider::Cursor | Provider::AiStudio => {
+                self.check(provider, "", value.get("role").and_then(Value::as_str))
             }
             Provider::Antigravity => {
                 if kind.is_none_or(str::is_empty)
@@ -200,35 +177,7 @@ impl UnrecognizedRecordTypes {
                 {
                     return;
                 }
-                self.check(
-                    "",
-                    kind,
-                    &[
-                        "USER_INPUT",
-                        "PLANNER_RESPONSE",
-                        "SYSTEM_MESSAGE",
-                        "ERROR_MESSAGE",
-                        "CHECKPOINT",
-                        "RUN_COMMAND",
-                        "SEARCH_WEB",
-                        "VIEW_FILE",
-                        "CODE_ACTION",
-                        "FILE_CHANGE",
-                        "GREP_SEARCH",
-                        "LIST_DIRECTORY",
-                        "GENERIC",
-                    ],
-                    // Replay of conversation already present in the transcript.
-                    &["CONVERSATION_HISTORY"],
-                );
-            }
-            Provider::AiStudio => {
-                self.check(
-                    "",
-                    value.get("role").and_then(Value::as_str),
-                    &["user", "model", "assistant"],
-                    &[],
-                );
+                self.check(provider, "", kind);
             }
             Provider::GeminiCli => {
                 if let Some(set) = value.get("$set") {
@@ -238,29 +187,19 @@ impl UnrecognizedRecordTypes {
                         }
                     }
                 } else if kind.is_some() {
-                    self.check(
-                        "",
-                        kind,
-                        &["user", "gemini", "warning", "info", "error"],
-                        // Devtools transport logs, not chat turns.
-                        &["console", "network"],
-                    );
-                } else if ![
-                    "$rewindTo",
-                    "$remove",
-                    "$patch",
-                    "sessionId",
-                    "startTime",
-                    "lastUpdated",
-                    "kind",
-                ]
-                .iter()
-                .any(|key| value.get(*key).is_some())
+                    self.check(provider, "", kind);
+                } else if !rules(provider)
+                    .iter()
+                    .filter_map(|(name, _)| {
+                        name.strip_prefix("metadata.")
+                            .or_else(|| name.strip_prefix("operation."))
+                    })
+                    .any(|name| value.get(name).is_some())
                 {
                     self.count(None);
                 }
             }
-            // Claude dispatch also diagnoses attachment layouts and SDK system subtypes.
+            // Claude diagnoses system subtypes and attachment layouts at their dispatch arms.
             Provider::Claude | Provider::ClaudeDesktop => {}
         }
     }
@@ -345,6 +284,65 @@ impl UnrecognizedRecordTypes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discriminator_scopes_do_not_hide_missing_or_unknown_types() {
+        let mut codex = UnrecognizedRecordTypes::default();
+        codex.observe(Provider::Codex, &json!({"type":"response_item.reasoning"}));
+        assert_eq!(
+            codex.counts,
+            std::collections::BTreeMap::from([("response_item.reasoning".into(), 1)])
+        );
+        let mut gemini = UnrecognizedRecordTypes::default();
+        gemini.observe(Provider::GeminiCli, &json!({"user":"not a discriminator"}));
+        gemini.observe(Provider::GeminiCli, &json!({"type":"$set"}));
+        assert_eq!(
+            gemini.counts,
+            std::collections::BTreeMap::from([("(no type)".into(), 1), ("$set".into(), 1)])
+        );
+    }
+
+    #[test]
+    fn seeded_inventory_preserves_admission_and_ignores_overlap_diagnostics() {
+        let mut full = UnrecognizedRecordTypes::default();
+        for n in 0..15 {
+            full.count(Some(&format!("first-{n}")));
+        }
+        let mut metadata = json!({});
+        full.publish(&mut metadata);
+        let raw = metadata.to_string();
+        let context = crate::tail::TailContext {
+            health_seed: Some(&raw),
+            new_bytes_start: 100,
+            ..Default::default()
+        };
+        let mut tail = UnrecognizedRecordTypes::for_context(Some(context));
+        tail.record(Some(context), 99);
+        tail.count(Some("overlap-only"));
+        tail.layout("future-layout", "overlap", &json!({}));
+        tail.record(Some(context), 100);
+        let unicode = "α".repeat(100);
+        for name in [
+            unicode.as_str(),
+            "overflow-name",
+            "first-0",
+            unicode.as_str(),
+        ] {
+            tail.count(Some(name));
+            full.count(Some(name));
+        }
+        assert_eq!(tail.counts, full.counts);
+        assert_eq!(tail.counts.len(), 17);
+        assert_eq!(tail.counts[UnrecognizedRecordTypes::OVERFLOW], 1);
+        let overlap = crate::tail::TailContext {
+            new_bytes_start: usize::MAX,
+            ..context
+        };
+        let mut overlap_inventory = UnrecognizedRecordTypes::for_context(Some(overlap));
+        overlap_inventory.record(Some(overlap), 100);
+        overlap_inventory.count(Some("overlap-only"));
+        assert!(overlap_inventory.counts.is_empty());
+    }
 
     #[test]
     fn inventory_retains_claude_name_and_bucket_bounds() {

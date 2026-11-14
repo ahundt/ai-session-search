@@ -2,6 +2,87 @@
 // SPDX-FileCopyrightText: 2026 Nisarg Patel
 // SPDX-License-Identifier: Apache-2.0
 
+use super::health::{
+    RecordDisposition::{Ignored, Indexed},
+    RecordTypeRule,
+};
+
+// Shared family schema: session-manager.d.ts FileEntry and messages.d.ts custom roles.
+// Pi and Prime persist the same branch-summary content as an entry or projected message.
+// Native discriminator inventory. Unlisted names are unknown and reported.
+pub(crate) const RECORD_TYPES: &[RecordTypeRule] = &[
+    ("session", Indexed("session header")),
+    ("message", Indexed("message dispatch")),
+    ("compaction", Indexed("pi_native_input_record")),
+    ("branch_summary", Indexed("pi_native_input_record")),
+    ("custom_message", Indexed("pi_native_input_record")),
+    (
+        "thinking_level_change",
+        Ignored("Reasoning-level settings are not conversation"),
+    ),
+    (
+        "model_change",
+        Ignored("Model selection settings are not conversation"),
+    ),
+    (
+        "usage",
+        Ignored("Usage accounting and its optional note are not imported as conversation"),
+    ),
+    (
+        "custom",
+        Ignored("Extension persistence state is excluded from model context"),
+    ),
+    (
+        "label",
+        Ignored("Bookmarks are not imported as conversation"),
+    ),
+    (
+        "session_info",
+        Ignored("Display names are not imported as conversation"),
+    ),
+    (
+        "service_tier_change",
+        Ignored("Service-tier settings are not conversation"),
+    ),
+    (
+        "child_usage_attributed",
+        Ignored("Folded child usage is not imported as conversation"),
+    ),
+    (
+        "session_state",
+        Ignored("Active/archive/crash state is not conversation"),
+    ),
+    (
+        "agent_status",
+        Ignored("Derived agent-view status is excluded from model context"),
+    ),
+    (
+        "git_state",
+        Ignored("Repository-state snapshots are excluded from model context"),
+    ),
+    (
+        "context_edit",
+        Ignored("Context replacement operations are not applied to archived original messages"),
+    ),
+    ("message.user", Indexed("message role user")),
+    ("message.assistant", Indexed("message role assistant")),
+    ("message.toolResult", Indexed("message role toolResult")),
+    ("message.bashExecution", Indexed("pi_native_input_record")),
+    (
+        "message.compactionSummary",
+        Indexed("pi_native_input_record"),
+    ),
+    ("message.compaction", Indexed("pi_native_input_record")),
+    ("message.branchSummary", Indexed("pi_native_input_record")),
+    ("message.branch_summary", Indexed("pi_native_input_record")),
+    ("message.custom", Indexed("pi_native_input_record")),
+    ("message.custom_message", Indexed("pi_native_input_record")),
+    (
+        "message.system",
+        Ignored("Standalone system-context messages are not imported as conversation"),
+    ),
+];
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -787,7 +868,7 @@ fn pi_native_input_record(
         .or_else(|| value.get("type").and_then(Value::as_str))?;
     let (input_key, generated_key, stored_role) = match role {
         "bashExecution" => ("command", "output", "user"),
-        "compactionSummary" | "compaction" | "branch_summary" => {
+        "compactionSummary" | "compaction" | "branchSummary" | "branch_summary" => {
             ("customInstructions", "summary", "compaction")
         }
         "custom" | "custom_message" => {

@@ -141,6 +141,16 @@ fn upgrade_retains_history(provider: Provider, previous: &str, expected: &str) {
         .as_object_mut()
         .unwrap()
         .remove(health::UNRECOGNIZED_RECORD_TYPES_KEY);
+    let stale_known = match provider {
+        Provider::Codex => Some("response_item.reasoning"),
+        Provider::Pi => Some("context_edit"),
+        Provider::PrimeAgent => Some("message.branchSummary"),
+        Provider::Antigravity => Some("MCP_TOOL"),
+        _ => None,
+    };
+    if let Some(known) = stale_known {
+        metadata[health::UNRECOGNIZED_RECORD_TYPES_KEY] = json!({known: 12, "future-kind":1});
+    }
     old.session.raw_metadata_json = Some(metadata.to_string());
 
     let upgraded_path = dir.path().join("upgraded.db");
@@ -259,24 +269,24 @@ fn claude_desktop_v20_upgrade_retains_history() {
     );
 }
 #[test]
-fn codex_v13_upgrade_retains_history() {
-    upgrade_retains_history(Provider::Codex, "codex-v12", "codex-v13");
+fn codex_v14_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Codex, "codex-v13", "codex-v14");
 }
 #[test]
 fn cursor_v6_upgrade_retains_history() {
     upgrade_retains_history(Provider::Cursor, "cursor-v5", "cursor-v6");
 }
 #[test]
-fn antigravity_v7_upgrade_retains_history() {
-    upgrade_retains_history(Provider::Antigravity, "antigravity-v6", "antigravity-v7");
+fn antigravity_v8_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Antigravity, "antigravity-v7", "antigravity-v8");
 }
 #[test]
-fn pi_v6_upgrade_retains_history() {
-    upgrade_retains_history(Provider::Pi, "pi-v5", "pi-v6");
+fn pi_v7_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Pi, "pi-v6", "pi-v7");
 }
 #[test]
-fn prime_agent_v4_upgrade_retains_history() {
-    upgrade_retains_history(Provider::PrimeAgent, "prime-agent-v3", "prime-agent-v4");
+fn prime_agent_v5_upgrade_retains_history() {
+    upgrade_retains_history(Provider::PrimeAgent, "prime-agent-v4", "prime-agent-v5");
 }
 #[test]
 fn aistudio_v5_upgrade_retains_history() {
@@ -376,7 +386,7 @@ fn gemini_cli_reports_unknown_types() {
 }
 
 #[test]
-fn nested_and_unimplemented_content_types_are_reported_without_new_indexing() {
+fn nested_types_follow_classification_without_new_indexing() {
     let cases = [
         (
             Provider::Codex,
@@ -389,15 +399,7 @@ fn nested_and_unimplemented_content_types_are_reported_without_new_indexing() {
                 json!({"type":"response_item","payload":{"type":"reasoning"}}),
                 json!({"type":"response_item","payload":{"type":"message","role":"developer"}}),
             ],
-            vec![
-                "event_msg.item_completed",
-                "inter_agent_communication_metadata",
-                "response_item.additional_tools",
-                "response_item.agent_message",
-                "response_item.message.developer",
-                "response_item.reasoning",
-                "world_state",
-            ],
+            vec![],
         ),
         (
             Provider::Pi,
@@ -405,7 +407,7 @@ fn nested_and_unimplemented_content_types_are_reported_without_new_indexing() {
                 json!({"type":"message","message":{"role":"future-role"}}),
                 json!({"type":"context_edit"}),
             ],
-            vec!["context_edit", "message.future-role"],
+            vec!["message.future-role"],
         ),
         (
             Provider::PrimeAgent,
@@ -445,6 +447,161 @@ fn nested_and_unimplemented_content_types_are_reported_without_new_indexing() {
         let metadata: Value =
             serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
         assert_ne!(metadata["requires_full_parse_for_tail"], true);
+    }
+}
+
+fn all_known_ignored_types_are_quiet(provider: Provider) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic.jsonl");
+    let rules = health::rules(provider);
+    let names = rules
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names.len(),
+        rules.len(),
+        "{provider:?}: duplicate classification"
+    );
+    let mut records = Vec::new();
+    for (name, disposition) in rules {
+        let health::RecordDisposition::Ignored(reason) = disposition else {
+            continue;
+        };
+        assert!(!reason.is_empty());
+        let record = if let Some(subtype) = name.strip_prefix("system/") {
+            json!({"type":"system","subtype":subtype})
+        } else if let Some(kind) = name.strip_prefix("attachment/") {
+            json!({"type":"attachment","attachment":{"type":kind}})
+        } else if let Some(role) = name.strip_prefix("response_item.message.") {
+            json!({"type":"response_item","payload":{"type":"message","role":role}})
+        } else if let Some(kind) = name.strip_prefix("response_item.") {
+            json!({"type":"response_item","payload":{"type":kind}})
+        } else if let Some(kind) = name.strip_prefix("event_msg.") {
+            json!({"type":"event_msg","payload":{"type":kind}})
+        } else if let Some(role) = name.strip_prefix("message.") {
+            json!({"type":"message","message":{"role":role}})
+        } else if let Some(key) = name
+            .strip_prefix("metadata.")
+            .or_else(|| name.strip_prefix("operation."))
+        {
+            json!({key: if key == "$set" { json!({}) } else { json!("synthetic") }})
+        } else {
+            json!({"type":name,"role":name})
+        };
+        records.push(record);
+    }
+    let inventory = |parsed: ParsedSession| {
+        let metadata: Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        metadata[health::UNRECOGNIZED_RECORD_TYPES_KEY].clone()
+    };
+    assert!(
+        inventory(parse(provider, &path, &records)).is_null(),
+        "{provider:?}"
+    );
+    records.push(json!({"type":"future-kind","role":"future-kind"}));
+    assert_eq!(
+        inventory(parse(provider, &path, &records)),
+        json!({"future-kind":1}),
+        "{provider:?}"
+    );
+}
+
+#[test]
+fn claude_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::Claude);
+}
+#[test]
+fn claude_desktop_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::ClaudeDesktop);
+}
+#[test]
+fn codex_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::Codex);
+}
+#[test]
+fn pi_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::Pi);
+}
+#[test]
+fn prime_agent_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::PrimeAgent);
+}
+#[test]
+fn cursor_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::Cursor);
+}
+#[test]
+fn antigravity_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::Antigravity);
+}
+#[test]
+fn aistudio_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::AiStudio);
+}
+#[test]
+fn gemini_cli_all_known_ignored_types_are_quiet() {
+    all_known_ignored_types_are_quiet(Provider::GeminiCli);
+}
+
+#[test]
+fn schema_known_unindexed_records_are_not_format_changes() {
+    for (provider, records) in [
+        (
+            Provider::Codex,
+            vec![
+                json!({"type":"world_state"}),
+                json!({"type":"inter_agent_communication_metadata"}),
+                json!({"type":"turn_context"}),
+                json!({"type":"response_item","payload":{"type":"reasoning"}}),
+                json!({"type":"response_item","payload":{"type":"additional_tools"}}),
+                json!({"type":"response_item","payload":{"type":"agent_message"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"developer"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"system"}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed"}}),
+            ],
+        ),
+        (Provider::Pi, vec![json!({"type":"context_edit"})]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let parsed = parse(provider, &dir.path().join("synthetic.jsonl"), &records);
+        let metadata: Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert!(
+            metadata
+                .get(health::UNRECOGNIZED_RECORD_TYPES_KEY)
+                .is_none(),
+            "{provider:?}: {metadata}"
+        );
+    }
+}
+
+#[test]
+fn pi_family_branch_summary_shapes_have_identical_content_and_authorship() {
+    for provider in [Provider::Pi, Provider::PrimeAgent] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.jsonl");
+        let entry = parse(
+            provider,
+            &path,
+            &[json!({"type":"branch_summary","summary":"synthetic branch context"})],
+        );
+        let message = parse(
+            provider,
+            &path,
+            &[
+                json!({"type":"message","message":{"role":"branchSummary","summary":"synthetic branch context"}}),
+            ],
+        );
+        assert_eq!(entry.messages.len(), 1);
+        assert_eq!(message.messages.len(), 1);
+        assert_eq!(entry.messages[0].content, message.messages[0].content);
+        assert_eq!(entry.messages[0].kind, message.messages[0].kind);
+        assert_eq!(
+            entry.messages[0].provenance.authorship,
+            message.messages[0].provenance.authorship
+        );
     }
 }
 

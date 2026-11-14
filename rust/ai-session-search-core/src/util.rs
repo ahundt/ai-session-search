@@ -2090,11 +2090,11 @@ fn parser_versions_pin_record_and_health_reconciliation() {
     for (provider, version) in [
         (Provider::Claude, "claude-v20"),
         (Provider::ClaudeDesktop, "claude-desktop-local-agent-v20"),
-        (Provider::Codex, "codex-v13"),
+        (Provider::Codex, "codex-v14"),
         (Provider::Cursor, "cursor-v6"),
-        (Provider::Antigravity, "antigravity-v7"),
-        (Provider::Pi, "pi-v6"),
-        (Provider::PrimeAgent, "prime-agent-v4"),
+        (Provider::Antigravity, "antigravity-v8"),
+        (Provider::Pi, "pi-v7"),
+        (Provider::PrimeAgent, "prime-agent-v5"),
         (Provider::AiStudio, "aistudio-v5"),
         (Provider::GeminiCli, "gemini-cli-v11"),
     ] {
@@ -2106,11 +2106,11 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude-v20",
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v20",
-        Provider::Codex => "codex-v13",
+        Provider::Codex => "codex-v14",
         Provider::Cursor => "cursor-v6",
-        Provider::Antigravity => "antigravity-v7",
-        Provider::Pi => "pi-v6",
-        Provider::PrimeAgent => "prime-agent-v4",
+        Provider::Antigravity => "antigravity-v8",
+        Provider::Pi => "pi-v7",
+        Provider::PrimeAgent => "prime-agent-v5",
         Provider::AiStudio => "aistudio-v5",
         Provider::GeminiCli => "gemini-cli-v11",
     }

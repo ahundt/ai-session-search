@@ -1,6 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Andrew Hundt
 // SPDX-License-Identifier: Apache-2.0
 
+use super::health::{RecordDisposition::Indexed, RecordTypeRule};
+
+// Native discriminator inventory. Unlisted names are unknown and reported.
+pub(crate) const RECORD_TYPES: &[RecordTypeRule] = &[
+    ("user", Indexed("chunk role user")),
+    ("model", Indexed("chunk role model")),
+    ("assistant", Indexed("chunk role assistant")),
+];
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

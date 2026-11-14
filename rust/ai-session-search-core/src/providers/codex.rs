@@ -2,6 +2,647 @@
 // SPDX-FileCopyrightText: 2026 Nisarg Patel
 // SPDX-License-Identifier: Apache-2.0
 
+use super::health::{
+    RecordDisposition::{Ignored, Indexed},
+    RecordTypeRule,
+};
+
+// Schema: openai/codex 81b995a6c9a4c978f399775cfa5ce50702368749,
+// codex-rs/protocol/src/{protocol,models}.rs and history/src/rollout_payload.rs.
+// Native discriminator inventory. Unlisted names are unknown and reported.
+pub(crate) const RECORD_TYPES: &[RecordTypeRule] = &[
+    ("session_meta", Indexed("session_meta dispatch")),
+    ("response_item", Indexed("response_item dispatch")),
+    ("compacted", Indexed("compacted dispatch")),
+    ("event_msg", Indexed("event_msg dispatch")),
+    (
+        "turn_context",
+        Ignored("Turn configuration is retained for resume, not imported as conversation"),
+    ),
+    (
+        "token_usage_record",
+        Ignored("Usage telemetry is not conversation"),
+    ),
+    (
+        "world_state",
+        Ignored("Resume comparison baselines and patches are not imported as conversation"),
+    ),
+    (
+        "inter_agent_communication_metadata",
+        Ignored("Turn-trigger routing metadata is not conversation"),
+    ),
+    (
+        "inter_agent_communication",
+        Ignored("Inter-agent delivery payloads are not imported as conversation"),
+    ),
+    (
+        "dynamic_tools_updated",
+        Ignored("Dynamic tool declarations are not imported as conversation"),
+    ),
+    (
+        "security_risk_score",
+        Ignored("Security risk telemetry is not conversation"),
+    ),
+    (
+        "retained_context",
+        Ignored("Retained model-context manifests are not imported as conversation"),
+    ),
+    (
+        "realtime_item",
+        Ignored("Realtime presentation facts are not imported as conversation"),
+    ),
+    ("response_item.message", Indexed("response_item message")),
+    (
+        "response_item.function_call",
+        Indexed("response_item function_call"),
+    ),
+    (
+        "response_item.custom_tool_call",
+        Indexed("response_item custom_tool_call"),
+    ),
+    (
+        "response_item.function_call_output",
+        Indexed("response_item function_call_output"),
+    ),
+    (
+        "response_item.custom_tool_call_output",
+        Indexed("response_item custom_tool_call_output"),
+    ),
+    (
+        "response_item.additional_tools",
+        Ignored("Tool declarations are not imported as conversation"),
+    ),
+    (
+        "response_item.agent_message",
+        Ignored("Inter-agent content is not imported as conversation"),
+    ),
+    (
+        "response_item.reasoning",
+        Ignored("Reasoning summaries and opaque/encrypted reasoning are not imported"),
+    ),
+    (
+        "response_item.local_shell_call",
+        Ignored("Legacy shell-call payloads are not imported by the function-call parser"),
+    ),
+    (
+        "response_item.tool_search_call",
+        Ignored("Tool-catalog search requests are not imported"),
+    ),
+    (
+        "response_item.tool_search_output",
+        Ignored("Tool-catalog search results are not imported"),
+    ),
+    (
+        "response_item.web_search_call",
+        Ignored(
+            "Web-search response items are not imported; web_search_end owns indexed search output",
+        ),
+    ),
+    (
+        "response_item.image_generation_call",
+        Ignored("Generated image payloads and revised prompts are not imported"),
+    ),
+    (
+        "response_item.compaction",
+        Ignored("Encrypted compaction payloads are not decoded"),
+    ),
+    (
+        "response_item.compaction_summary",
+        Ignored("Encrypted compaction payloads are not decoded"),
+    ),
+    (
+        "response_item.configuration_update",
+        Ignored("Backend configuration controls are not imported as conversation"),
+    ),
+    (
+        "response_item.compaction_trigger",
+        Ignored("Compaction request controls are not imported as conversation"),
+    ),
+    (
+        "response_item.context_compaction",
+        Ignored("Backend compaction controls are not imported as conversation"),
+    ),
+    (
+        "response_item.other",
+        Ignored("Protocol fallback response items are not imported"),
+    ),
+    (
+        "response_item.message.user",
+        Indexed("response_item message user"),
+    ),
+    (
+        "response_item.message.assistant",
+        Indexed("response_item message assistant"),
+    ),
+    (
+        "response_item.message.developer",
+        Ignored("Developer instruction context is not imported as conversation"),
+    ),
+    (
+        "response_item.message.system",
+        Ignored("System instruction context is not imported as conversation"),
+    ),
+    (
+        "event_msg.error",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.warning",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.auth_recovery_started",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.auth_recovery_completed",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.guardian_warning",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.realtime_conversation_started",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.realtime_conversation_realtime",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.realtime_conversation_closed",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.realtime_conversation_sdp",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.model_reroute",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.model_verification",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.turn_moderation_metadata",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.safety_buffering",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.context_compacted",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.thread_rolled_back",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.task_started",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.thread_settings_applied",
+        Indexed("event_msg thread_settings_applied"),
+    ),
+    (
+        "event_msg.task_complete",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.token_count",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.agent_message",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.user_message",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.agent_reasoning",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.agent_reasoning_raw_content",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.agent_reasoning_section_break",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.session_configured",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.environment_connected",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.environment_disconnected",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.thread_goal_updated",
+        Indexed("event_msg thread_goal_updated"),
+    ),
+    (
+        "event_msg.thread_queue_changed",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.mcp_startup_update",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.mcp_startup_complete",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.mcp_tool_call_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.mcp_tool_call_end",
+        Indexed("event_msg mcp_tool_call_end"),
+    ),
+    (
+        "event_msg.web_search_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.web_search_end",
+        Indexed("event_msg web_search_end"),
+    ),
+    (
+        "event_msg.image_generation_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.image_generation_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.exec_command_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.exec_command_output_delta",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.terminal_interaction",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.exec_command_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.view_image_tool_call",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.exec_approval_request",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.request_permissions",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.request_user_input",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.dynamic_tool_call_request",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.dynamic_tool_call_response",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.elicitation_request",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.elicitation_abandoned",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.apply_patch_approval_request",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.guardian_assessment",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.deprecation_notice",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.stream_error",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.patch_apply_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.patch_apply_updated",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.patch_apply_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.turn_diff",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.realtime_conversation_list_voices_response",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.plan_update",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    ("event_msg.turn_aborted", Indexed("event_msg turn_aborted")),
+    (
+        "event_msg.shutdown_complete",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.entered_review_mode",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.exited_review_mode",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.raw_response_item",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.raw_response_completed",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.item_started",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.item_completed",
+        Ignored(
+            "Canonical item/display events are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.hook_started",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.hook_completed",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.agent_message_content_delta",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.plan_delta",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.reasoning_content_delta",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.reasoning_raw_content_delta",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_agent_spawn_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_agent_spawn_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_agent_interaction_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_agent_interaction_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_waiting_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_waiting_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_close_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_close_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_resume_begin",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.collab_resume_end",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.sub_agent_activity",
+        Ignored(
+            "UI/progress event payloads are not imported independently of response-item history",
+        ),
+    ),
+    (
+        "event_msg.turn_started",
+        Ignored("Turn lifecycle alias is not imported as conversation"),
+    ),
+    (
+        "event_msg.turn_complete",
+        Ignored("Turn lifecycle alias is not imported as conversation"),
+    ),
+];
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
