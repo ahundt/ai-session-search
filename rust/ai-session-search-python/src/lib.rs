@@ -5145,13 +5145,6 @@ impl SessionSearch {
             .transpose()?;
         let limit = paging_argument(PagingArgument::Limit, limit)?;
         let offset = paging_argument(PagingArgument::Offset, offset)?;
-        // Reject an inverted range up front as a ValueError, so a caller mistake reads the same
-        // way as the other input errors here rather than surfacing later as a RuntimeError.
-        if let (Some(from), Some(to)) = (seq_from, seq_to) {
-            if from > to {
-                return Err(invalid_argument_error("seq_from must be <= seq_to"));
-            }
-        }
         py.detach(|| {
             let app = self.app()?;
             let session = app
