@@ -229,6 +229,7 @@ impl CodexAdapter {
         let mut first_user = None;
         let mut last_user = None;
         let mut latest_goal: Option<Value> = None;
+        let mut instruction_snapshots = std::collections::HashSet::new();
         // A fork replays its parent's history until its first `thread_settings_applied` event;
         // the parent's `session_meta` is optional. See `ForkReplay`.
         let mut fork_replay = ForkReplay::default();
@@ -257,6 +258,26 @@ impl CodexAdapter {
             match value.get("type").and_then(Value::as_str) {
                 Some("session_meta") => {
                     if let Some(payload) = value.get("payload") {
+                        if let Some(text) = payload
+                            .pointer("/base_instructions/text")
+                            .and_then(Value::as_str)
+                        {
+                            // Like Claude prompt snapshots, context is byte-exact, untimed and
+                            // content-addressed so resumed headers cannot multiply indexed text.
+                            if !text.is_empty() && instruction_snapshots.insert(text.to_owned()) {
+                                let identity = format!(
+                                    "snapshot:base_instructions:{}",
+                                    crate::hashing::sha256(text.as_bytes())
+                                );
+                                messages.push(
+                                    RawMessage::harness_notice(text.to_owned(), None)
+                                        .with_native_event_identity(
+                                            MessageCorrelationAuthority::OpenAi,
+                                            identity,
+                                        ),
+                                );
+                            }
+                        }
                         // First session_meta wins, matching cwd/created_at below. A fork's
                         // second session_meta carries the PARENT's id; taking it would bind
                         // this file's content to the parent's session, and the
@@ -2906,6 +2927,132 @@ mod tests {
             db.upsert_session(&parsed, 1, 1).unwrap();
             assert_eq!(db.file_edit_count().unwrap(), 2);
         }
+    }
+
+    #[test]
+    fn base_instructions_are_distinct_harness_snapshots() {
+        use crate::models::{MessageAuthorship, MessageFilters, MessageKind};
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-00000000-0000-0000-0000-000000000001.jsonl");
+        let adapter = CodexAdapter::new(vec![]);
+        let body = format!(" instruction sentinel\r\n{}\r\n", "x".repeat(100_000));
+        let meta = json!({"type":"session_meta","payload":{"id":"00000000-0000-0000-0000-000000000001","base_instructions":{"text":body}}}).to_string() + "\n";
+        let parse = |text: &str| {
+            adapter
+                .parse_reader(std::io::Cursor::new(text), &path)
+                .unwrap()
+        };
+        let once = parse(&meta);
+        let repeated = parse(&meta.repeat(100));
+        assert_eq!(repeated.messages.len(), 1);
+        assert_eq!(repeated.messages, once.messages);
+        let row = &repeated.messages[0];
+        assert_eq!(row.content, body);
+        assert_eq!(row.kind, MessageKind::HarnessNotice);
+        assert_eq!(row.provenance.authorship, MessageAuthorship::Harness);
+        assert!(row
+            .provenance
+            .correlation_identity
+            .as_ref()
+            .unwrap()
+            .id
+            .contains("base_instructions"));
+        assert!(repeated.transcript_text.is_empty());
+        let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(&repeated, 1, 1).unwrap();
+        assert!(db
+            .search_messages("instruction sentinel", &MessageFilters::default())
+            .unwrap()
+            .is_empty());
+        let notices = MessageFilters {
+            kinds: Some(vec![MessageKind::HarnessNotice]),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_messages("instruction sentinel", &notices)
+                .unwrap()
+                .len(),
+            1
+        );
+        let size = |_: &crate::db::Db| {
+            rusqlite::Connection::open(dir.path().join("index.db"))
+                .unwrap()
+                .query_row(
+                    "select sum(length(cast(content as blob))) from messages",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        println!(
+            "instruction fixture: copies=100 input_bytes={} indexed_content_bytes={}",
+            meta.len() * 100,
+            size(&db)
+        );
+        assert_eq!(size(&db), body.len() as i64);
+        // Empty older parses must not retract the retained snapshot.
+        let mut old = once.clone();
+        old.messages.clear();
+        old.session.parse_version = "codex-v12".into();
+        db.upsert_session(&old, 2, 1).unwrap();
+        db.upsert_session(&once, 3, 1).unwrap();
+        assert_eq!(
+            db.search_messages("instruction sentinel", &notices)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn base_instructions_tail_deduplicates_beyond_overlap() {
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-00000000-0000-0000-0000-000000000001.jsonl");
+        let adapter = CodexAdapter::new(vec![]);
+        let meta = json!({"type":"session_meta","payload":{"id":"00000000-0000-0000-0000-000000000001","base_instructions":{"text":"stable rule"}}}).to_string() + "\n";
+        let initial = format!(
+            "{meta}{}\n",
+            json!({"type":"ignored","padding":"x".repeat(300_000)})
+        );
+        fs::write(&path, &initial).unwrap();
+        let db = crate::db::Db::open(&dir.path().join("tail.db")).unwrap();
+        db.upsert_session(
+            &adapter
+                .parse_reader(std::io::Cursor::new(&initial), &path)
+                .unwrap(),
+            1,
+            initial.len() as i64,
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(meta.as_bytes())
+            .unwrap();
+        let run = crate::tail::tail_parse_until(
+            &path,
+            initial.len() as i64,
+            None,
+            &|| false,
+            |r, p, c| adapter.parse_reader_with_context(r, p, Some(c)),
+        )
+        .unwrap();
+        let crate::tail::TailParseRun::Complete(Some(tail)) = run else {
+            panic!("snapshot must stay append-only")
+        };
+        db.append_tail(&tail, 2, (initial.len() + meta.len()) as i64)
+            .unwrap();
+        let count: i64 = rusqlite::Connection::open(dir.path().join("tail.db"))
+            .unwrap()
+            .query_row("select count(*) from messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
