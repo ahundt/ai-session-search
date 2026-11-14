@@ -530,10 +530,12 @@ struct SessionFilterArgs {
 #[non_exhaustive]
 pub struct ExclusionArgs {
     /// Exclude sessions whose cwd, repo root, or transcript path is this directory or a
-    /// descendant of it (component boundary). Repeat to exclude multiple roots.
+    /// descendant of it (component boundary). Repeat to exclude multiple roots. Omit to exclude
+    /// no path.
     #[arg(long = "exclude-path")]
     pub exclude_paths: Vec<String>,
-    /// Exclude one exact canonical session id. Repeat to exclude multiple sessions.
+    /// Exclude one exact canonical session id. Repeat to exclude multiple sessions. Omit to
+    /// exclude no session.
     #[arg(long = "exclude-session")]
     pub exclude_sessions: Vec<String>,
 }
