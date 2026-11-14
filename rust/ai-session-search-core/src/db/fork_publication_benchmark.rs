@@ -6,9 +6,66 @@
 #[test]
 #[ignore]
 fn fork_publication_benchmark() {
+    let tail_ms = fork_large_family_case(2_000, true);
+    fork_large_family_case(2_000, false);
+    if tail_ms < 1_000.0 {
+        fork_large_family_case(20_000, true);
+    }
     for case in ["unique-path", "common-path-no-match", "common-path-match"] {
         fork_publication_case(case);
     }
+}
+
+// Publish through the real writers; setup and parsing are outside the timed region.
+fn fork_large_family_case(edits: i64, tail_only: bool) -> f64 {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("index.db")).unwrap();
+    let make_edit = |seq: i64| {
+        let mut edit = FileEdit::new(seq, "apply_patch", format!("/synthetic/path-{}.rs", seq % 50));
+        edit.new_content = Some(format!("publisher content {seq}"));
+        edit
+    };
+    let mut parent = archive_session(Vec::new(), (0..edits).map(make_edit).collect());
+    parent.session.source_path = dir.path().join("parent.jsonl").to_string_lossy().into_owned();
+    db.upsert_session(&parent, 1, 1).unwrap();
+    db.with_immediate_transaction(|| {
+        for child in 0..80 {
+            let id = format!("codex:child-{child}");
+            let path = dir.path().join(format!("child-{child}.jsonl")).to_string_lossy().into_owned();
+            db.conn.execute("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,raw_metadata_json,discovery_source) values (?1,'codex',?1,'',?2,'v1',?3,'test')", params![id, path, r#"{"forked_from_id":"archive"}"#])?;
+            db.conn.execute("insert into files_seen(provider,source_path,mtime_ns,size_bytes,last_indexed_at,parse_version) values ('codex',?1,1,1,'2026-11-01','v1')", [&path])?;
+            db.conn.execute("with recursive n(i) as (values(0) union all select i+1 from n where i+1<?2)
+                insert into file_edits(session_id,provider,seq,tool,file_path,file_name,new_content)
+                select ?1,'codex',i,'apply_patch','/synthetic/path-'||(i%50)||'.rs','path-'||(i%50)||'.rs','child content '||?1||':'||i from n", params![id, edits])?;
+        }
+        Ok(())
+    }).unwrap();
+    let mut times = Vec::new();
+    for trial in 0..5 {
+        // Restore P exactly: each sample appends one edit to the same stored publisher size.
+        db.conn.execute("delete from file_edits where session_id = ?1 and seq >= ?2", params![parent.session.id, edits]).unwrap();
+        let tail = crate::tail::TailParse {
+            session: parent.session.clone(),
+            overlap_digest: String::new(),
+            new_overlap_digest: String::new(),
+            new_messages: Vec::new(),
+            new_file_edits: vec![make_edit(edits)],
+            new_transcript: String::new(),
+            new_tail_offset: 2,
+            new_fingerprint: "synthetic".into(),
+        };
+        let start = std::time::Instant::now();
+        if tail_only {
+            db.append_tail(&tail, trial + 2, 2).unwrap();
+        } else {
+            db.upsert_session(&parent, trial + 2, 1).unwrap();
+        }
+        times.push(start.elapsed().as_secs_f64() * 1_000.0);
+        assert_eq!(db.file_edit_count().unwrap(), 81 * edits + i64::from(tail_only));
+    }
+    times.sort_by(f64::total_cmp);
+    println!("large-family: K=80, P=C={edits}, {}, 5 trials: min/median/max ms = {:.3}/{:.3}/{:.3}", if tail_only { "tail one edit" } else { "full" }, times[0], times[2], times[4]);
+    times[2]
 }
 
 fn fork_publication_case(case: &str) {

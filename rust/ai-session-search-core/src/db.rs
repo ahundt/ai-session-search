@@ -2981,7 +2981,7 @@ impl Db {
         )?;
 
         if !tail.new_file_edits.is_empty() {
-            reconcile_codex_fork_edits(&tx, session, Some(next_edit_seq))?;
+            reconcile_codex_fork_edits(&tx, session, Some(&tail.new_file_edits))?;
         }
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward,
@@ -8053,33 +8053,43 @@ const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f
           then 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id') end) = ?1";
 
 // Full publications can repair an empty ancestry link: include retained edits above that link.
-// UNION makes the indexed ancestry walk cycle-safe. Tail publications need only the new rows.
-pub(crate) const CODEX_FORK_MATCHING_EDIT_SQL: &str = "with recursive ancestry(id) as (
+// UNION makes the indexed ancestry walk cycle-safe. This runs once, never per child.
+const CODEX_FORK_PUBLISHER_EDITS_SQL: &str = "with recursive ancestry(id) as (
     select ?1
     union
     select 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id')
     from ancestry a join sessions s on s.id = a.id
-    where ?3 is null and s.provider = 'codex' and
+    where s.provider = 'codex' and
         case when json_valid(s.raw_metadata_json)
         then json_type(s.raw_metadata_json, '$.forked_from_id') = 'text' else 0 end
 )
-select 1 from ancestry a
+select p.tool, p.file_path, p.new_content, p.edits_json from ancestry a
 cross join file_edits p indexed by idx_file_edits_session
-cross join file_edits c indexed by idx_file_edits_session
-where p.session_id = a.id and (?3 is null or p.seq >= ?3)
-    and c.file_path = p.file_path and c.session_id = ?2
-    and c.tool = p.tool and c.new_content is p.new_content and c.edits_json is p.edits_json
-limit 1";
+where p.session_id = a.id";
+
+pub(crate) const CODEX_FORK_CHILD_EDITS_SQL: &str =
+    "select tool, file_path, new_content, edits_json
+     from file_edits indexed by idx_file_edits_session where session_id = ?1";
+
+fn fork_probe_edit_key(row: &rusqlite::Row<'_>) -> Result<RowDigest> {
+    Ok(file_edit_content_key(
+        row.get_ref(0)?.as_str()?,
+        row.get_ref(1)?.as_str()?,
+        row.get_ref(2)?.as_str_or_null()?,
+        row.get_ref(3)?.as_str_or_null()?,
+    ))
+}
 
 /// Reconcile indexed descendants before publishing changed Codex edits. For S sessions and R
 /// receipts, each parent lookup costs O(log S + K(log S + log R)) for K children, retaining
 /// O(K) paths plus O(D) visited identities for D reachable descendants. A no-fork publication
 /// visits no unrelated session metadata or source receipts.
-/// Candidate probes read both sides through the session edit index. For P publisher/ancestor
-/// edits and C child edits, each probe scans O(P) publisher rows and compares O(P * C) pairs
-/// in the worst case, plus index lookups; unrelated edits to the same path are never visited.
-/// A tail restricts comparisons to newly inserted publisher seqs (the index still scans P).
-/// Comparison time also depends on path/content bytes; probes retain only the current rows.
+/// For P publisher/ancestor edits and C total child edits, candidate selection hashes O(P + C)
+/// rows once (plus their bytes), retaining O(P) fixed-size digests and one borrowed SQLite row.
+/// Tail selection hashes only the A appended edits, for O(A + C) work and O(A) digest memory;
+/// it never reads the publisher's stored edits. Child rows use the session edit index, so
+/// unrelated edits to the same paths are never visited. Hash matches only authorize a reparse;
+/// the existing ancestry reconciliation still decides whether an edit may be retired.
 /// No candidate means no child source bytes are read. Each candidate is parsed at most once
 /// and reads its ancestry (bounded by chain depth, stopping at cycles). Memory adds one parsed
 /// fork, its stored/parsed keys and ancestor keys, plus visited ancestor identities and the
@@ -8088,7 +8098,7 @@ limit 1";
 fn reconcile_codex_fork_edits(
     tx: &Transaction<'_>,
     session: &SessionRecord,
-    first_new_edit_seq: Option<i64>,
+    new_edits: Option<&[FileEdit]>,
 ) -> Result<()> {
     if session.provider != Provider::Codex {
         return Ok(());
@@ -8097,7 +8107,22 @@ fn reconcile_codex_fork_edits(
     if !statement.exists([&session.id])? {
         return Ok(());
     }
-    let mut matching_edit = tx.prepare_cached(CODEX_FORK_MATCHING_EDIT_SQL)?;
+    let mut publisher_keys = std::collections::HashSet::new();
+    if let Some(edits) = new_edits {
+        for edit in edits {
+            publisher_keys.insert(parsed_file_edit_keys(edit)?.edit);
+        }
+    } else {
+        let mut publisher = tx.prepare_cached(CODEX_FORK_PUBLISHER_EDITS_SQL)?;
+        let mut rows = publisher.query([&session.id])?;
+        while let Some(row) = rows.next()? {
+            publisher_keys.insert(fork_probe_edit_key(row)?);
+        }
+    }
+    if publisher_keys.is_empty() {
+        return Ok(());
+    }
+    let mut child_edits = tx.prepare_cached(CODEX_FORK_CHILD_EDITS_SQL)?;
     let mut adapter = None;
     let mut pending = vec![session.id.clone()];
     let mut visited = std::collections::HashSet::from([session.id.clone()]);
@@ -8122,7 +8147,18 @@ fn reconcile_codex_fork_edits(
             }
             // Descendants can use a higher ancestor even if this source is unchanged or unavailable.
             pending.push(id.clone());
-            if !matching_edit.exists(params![session.id, id, first_new_edit_seq])? {
+            let matching = {
+                let mut rows = child_edits.query([&id])?;
+                let mut matching = false;
+                while let Some(row) = rows.next()? {
+                    if publisher_keys.contains(&fork_probe_edit_key(row)?) {
+                        matching = true;
+                        break;
+                    }
+                }
+                matching
+            };
+            if !matching {
                 continue;
             }
             let adapter = adapter
@@ -8485,6 +8521,20 @@ struct FileEditKeys {
     all_columns: RowDigest,
 }
 
+fn file_edit_content_key(
+    tool: &str,
+    file_path: &str,
+    new_content: Option<&str>,
+    edits_json: Option<&str>,
+) -> RowDigest {
+    let mut edit = FramedSha256::new(b"aise-archive-file-edit-content-v1");
+    edit.update_bytes(tool.as_bytes());
+    edit.update_bytes(file_path.as_bytes());
+    edit.update_optional_str(new_content);
+    edit.update_optional_str(edits_json);
+    edit.finish_bytes()
+}
+
 fn file_edit_keys(
     seq: i64,
     ts: Option<&str>,
@@ -8494,12 +8544,7 @@ fn file_edit_keys(
     new_content: Option<&str>,
     edits_json: Option<&str>,
 ) -> FileEditKeys {
-    let mut edit = FramedSha256::new(b"aise-archive-file-edit-content-v1");
-    edit.update_bytes(tool.as_bytes());
-    edit.update_bytes(file_path.as_bytes());
-    edit.update_optional_str(new_content);
-    edit.update_optional_str(edits_json);
-    let edit = edit.finish_bytes();
+    let edit = file_edit_content_key(tool, file_path, new_content, edits_json);
     let mut all_columns = FramedSha256::new(b"aise-archive-file-edit-row-v1");
     all_columns.update_i64(seq);
     all_columns.update_optional_str(ts);
@@ -9482,33 +9527,40 @@ mod tests {
     fn codex_fork_matching_edit_uses_family_session_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        for first_seq in [None, Some(1_i64)] {
+        for (sql, index_read) in [
+            (
+                CODEX_FORK_PUBLISHER_EDITS_SQL,
+                "SEARCH p USING INDEX idx_file_edits_session",
+            ),
+            (
+                CODEX_FORK_CHILD_EDITS_SQL,
+                "SEARCH file_edits USING INDEX idx_file_edits_session",
+            ),
+        ] {
             let plan = db
                 .conn
-                .prepare(&format!(
-                    "explain query plan {CODEX_FORK_MATCHING_EDIT_SQL}"
-                ))
+                .prepare(&format!("explain query plan {sql}"))
                 .unwrap()
-                .query_map(params!["codex:parent", "codex:child", first_seq], |row| {
-                    row.get::<_, String>(3)
-                })
+                .query_map(["codex:parent"], |row| row.get::<_, String>(3))
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
-            for expected in [
-                "SEARCH p USING INDEX idx_file_edits_session",
-                "SEARCH c USING INDEX idx_file_edits_session",
-            ] {
-                assert!(plan.iter().any(|line| line.contains(expected)), "{plan:?}");
-            }
             assert!(
-                !plan.iter().any(|line| line.contains("idx_file_edits_path")),
+                plan.iter().any(|line| line.contains(index_read)),
+                "{plan:?}"
+            );
+            // A second edit-table access would restore the per-pair publisher/child join.
+            assert_eq!(
+                plan.iter()
+                    .filter(|line| line.contains("file_edits"))
+                    .count(),
+                1,
                 "{plan:?}"
             );
             assert!(
-                !plan.iter().any(|line| ["SCAN p", "SCAN c", "SCAN s"]
+                !plan
                     .iter()
-                    .any(|scan| line.starts_with(scan))),
+                    .any(|line| line.contains("idx_file_edits_path") || line.starts_with("SCAN s")),
                 "{plan:?}"
             );
         }

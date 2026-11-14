@@ -2694,6 +2694,92 @@ mod tests {
     }
 
     #[test]
+    fn codex_parent_publication_filters_many_same_path_edits() {
+        use std::io::Write as _;
+        for matching in [false, true] {
+            for full in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let parent_root = dir.path().join("parent");
+                let child_root = dir.path().join("child");
+                std::fs::create_dir_all(&parent_root).unwrap();
+                std::fs::create_dir_all(&child_root).unwrap();
+                let parent = "00000000-0000-4000-8000-000000000091";
+                let child = "00000000-0000-4000-8000-000000000092";
+                let parent_path = parent_root.join(format!("rollout-{parent}.jsonl"));
+                let child_path = child_root.join(format!("rollout-{child}.jsonl"));
+                let mutation = |n: usize, content: &str| {
+                    let path = format!("/synthetic/path-{}.rs", n % 50);
+                    format!(
+                        "{}\n{}\n",
+                        serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":format!("edit-{n}"),"name":"apply_patch","input":format!("*** Begin Patch\n*** Add File: {path}\n+{content}\n*** End Patch")}}),
+                        serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":format!("edit-{n}"),"output":format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA {path}\n")}})
+                    )
+                };
+                let mut body = format!(
+                    "{}\n",
+                    serde_json::json!({"type":"session_meta","payload":{"id":parent}})
+                );
+                for n in 0..50 {
+                    body.push_str(&mutation(n, &format!("publisher initial {n}")));
+                }
+                std::fs::write(&parent_path, body).unwrap();
+                let mut body = format!(
+                    "{}\n",
+                    serde_json::json!({"type":"session_meta","payload":{"id":child,"forked_from_id":parent}})
+                );
+                for n in 0..300 {
+                    body.push_str(&mutation(n, &format!("child distinct {n}")));
+                }
+                if matching {
+                    body.push_str(&mutation(300, "publisher later"));
+                }
+                body.push_str(
+                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n",
+                );
+                std::fs::write(&child_path, body).unwrap();
+                let db_path = dir.path().join("index.db");
+                let db = Db::open(&db_path).unwrap();
+                let mut config = config_with_single_claude_fixture(&db_path, &child_root);
+                config.providers.claude.enabled = false;
+                config.providers.codex.enabled = true;
+                config.providers.codex.paths =
+                    vec![normalize_path(&child_root), normalize_path(&parent_root)];
+                reindex(&config, &db, false, None).unwrap();
+                assert_eq!(db.file_edit_count().unwrap(), 350 + i64::from(matching));
+                config.providers.codex.paths = vec![normalize_path(&parent_root)];
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&parent_path)
+                    .unwrap()
+                    .write_all(mutation(300, "publisher later").as_bytes())
+                    .unwrap();
+                crate::db::CODEX_FORK_AFTER_READ.with(|hook| hook.set(Some(|_| {})));
+                if full {
+                    reindex(&config, &db, true, None).unwrap();
+                } else {
+                    reindex_tail_outcome(&config, &db, TailOutcome::Appended);
+                }
+                assert_eq!(
+                    crate::db::CODEX_FORK_AFTER_READ
+                        .with(|hook| hook.take())
+                        .is_none(),
+                    matching
+                );
+                assert_eq!(db.file_edit_count().unwrap(), 351);
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                let child_edits: i64 = conn
+                    .query_row(
+                        "select count(*) from file_edits where session_id=?1",
+                        [format!("codex:{child}")],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(child_edits, 300);
+            }
+        }
+    }
+
+    #[test]
     fn codex_parent_publication_skips_forks_without_matching_stored_edits() {
         codex_parent_publication_filters_forks(false);
     }
@@ -2789,34 +2875,33 @@ mod tests {
             );
             assert_eq!(db.file_edit_count().unwrap(), if matching { 3 } else { 4 });
             let conn = rusqlite::Connection::open(&db_path).unwrap();
-            for first_seq in [None, Some(1_i64)] {
-                let plan = conn
-                    .prepare(&format!(
-                        "explain query plan {}",
-                        crate::db::CODEX_FORK_MATCHING_EDIT_SQL
-                    ))
-                    .unwrap()
-                    .query_map(
-                        rusqlite::params![
-                            format!("codex:{parent}"),
-                            format!("codex:{child}"),
-                            first_seq
-                        ],
-                        |r| r.get::<_, String>(3),
-                    )
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap();
-                assert!(
-                    plan.iter()
-                        .any(|line| line.contains("SEARCH c USING INDEX idx_file_edits_session")),
-                    "child probe must read its own edits: {plan:?}"
-                );
-                assert!(
-                    !plan.iter().any(|line| line.contains("idx_file_edits_path")),
-                    "{plan:?}"
-                );
-            }
+            let plan = conn
+                .prepare(&format!(
+                    "explain query plan {}",
+                    crate::db::CODEX_FORK_CHILD_EDITS_SQL
+                ))
+                .unwrap()
+                .query_map([format!("codex:{child}")], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|line| line
+                        .contains("SEARCH file_edits USING INDEX idx_file_edits_session")),
+                "child probe must read its own edits: {plan:?}"
+            );
+            assert_eq!(
+                plan.iter()
+                    .filter(|line| line.contains("file_edits"))
+                    .count(),
+                1,
+                "a child probe must not join edit pairs: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("idx_file_edits_path")),
+                "{plan:?}"
+            );
             let history = crate::files::history(&db, "later.rs", &Default::default()).unwrap();
             assert_eq!(history.len(), if matching { 1 } else { 2 });
             assert!(history
