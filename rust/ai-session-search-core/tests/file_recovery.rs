@@ -371,6 +371,190 @@ fn service_reconstruction_is_typed_scoped_and_read_only() {
 }
 
 #[test]
+fn service_file_dates_select_versions_after_causal_replay() {
+    let (_dir, db) = indexed();
+    let service = FileService::new(&db);
+    let mut query = FileQuery::default();
+    query.session_id = Some("claude:sess-fr-1".into());
+    query.since = Some("2026-06-02T10:01:00Z".parse().unwrap());
+    query.until = Some("2026-06-02T10:02:00Z".parse().unwrap());
+    let history = service.history("app.py", &query).unwrap();
+    assert_eq!(
+        history.iter().map(|v| v.version).collect::<Vec<_>>(),
+        [2, 3]
+    );
+    let versions = service
+        .reconstruct_versions("app.py", &query)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|v| (v.version, v.content.as_str()))
+            .collect::<Vec<_>>(),
+        [(2, "line1\nLINE2\nline3"), (3, "L1\nLINE2\nL3")]
+    );
+    assert_eq!(
+        service
+            .reconstruct("app.py", &query, Some(2))
+            .unwrap()
+            .content,
+        "line1\nLINE2\nline3"
+    );
+    assert!(service
+        .reconstruct("app.py", &query, Some(1))
+        .unwrap_err()
+        .to_string()
+        .contains("scope"));
+    query.limit = 1;
+    query.offset = 1;
+    let page = service
+        .reconstruct_versions("app.py", &query)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(page.len(), 1);
+    assert_eq!(
+        (page[0].version, page[0].content.as_str()),
+        (3, "L1\nLINE2\nL3")
+    );
+    assert!(service
+        .reconstruct("app.py", &query, None)
+        .unwrap_err()
+        .to_string()
+        .contains("paging"));
+    query.limit = 0;
+    query.offset = 0;
+    for (since, until) in [
+        (Some("2027-01-01T00:00:00Z"), None),
+        (None, Some("2025-01-01T00:00:00Z")),
+    ] {
+        query.since = since.map(|s| s.parse().unwrap());
+        query.until = until.map(|s| s.parse().unwrap());
+        assert!(service.history("app.py", &query).unwrap().is_empty());
+        assert_eq!(
+            service
+                .reconstruct_versions("app.py", &query)
+                .unwrap()
+                .count(),
+            0
+        );
+        let error = service.reconstruct("app.py", &query, None).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ai_session_search::ServiceError>()
+                .unwrap()
+                .code(),
+            "file-not-found"
+        );
+    }
+}
+
+#[test]
+fn cli_file_dates_replay_pre_interval_snapshot_and_preserve_versions() {
+    let (dir, _db) = indexed();
+    let run = |args: &[&str]| {
+        support::aise(dir.path())
+            .args(["--index-refresh", "existing-only"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let common = [
+        "--session-id",
+        "claude:sess-fr-1",
+        "--since",
+        "2026-06-02T10:01:00Z",
+        "--until",
+        "2026-06-02T10:02:00Z",
+    ];
+    let mut args = vec!["files", "history", "app.py", "--format", "json"];
+    args.extend(common);
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    let mut args = vec!["files", "extract", "app.py", "--version", "2"];
+    args.extend(common);
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"line1\nLINE2\nline3\n");
+    let mut args = vec!["files", "extract", "app.py", "--all", "--format", "jsonl"];
+    args.extend(common);
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["version"], 2);
+    assert_eq!(rows[0]["content"], "line1\nLINE2\nline3");
+    assert_eq!(rows[1]["version"], 3);
+    assert_eq!(rows[1]["content"], "L1\nLINE2\nL3");
+    args.extend(["--limit", "1", "--offset", "1"]);
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let page: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(page["version"], 3);
+    assert_eq!(page["content"], "L1\nLINE2\nL3");
+    let mut args = vec![
+        "files", "history", "app.py", "--limit", "1", "--offset", "1", "--format", "json",
+    ];
+    args.extend(common);
+    let out = run(&args);
+    let page: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["version"], 3);
+    for command in ["history", "extract"] {
+        let mut args = vec![
+            "files",
+            command,
+            "app.py",
+            "--session-id",
+            "claude:sess-fr-1",
+            "--when",
+            "2027-01-01",
+        ];
+        if command == "history" {
+            args.extend(["--format", "json"]);
+        }
+        let out = run(&args);
+        if command == "history" {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+                serde_json::json!([])
+            );
+        } else {
+            assert!(!out.status.success());
+        }
+    }
+}
+
+#[test]
 fn cross_ref_links_file_to_each_session() {
     let (_dir, db) = indexed();
     let xref = db

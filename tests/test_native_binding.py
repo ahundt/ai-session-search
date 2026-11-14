@@ -600,7 +600,7 @@ def test_native_session_search_surface_is_typed_and_callable_from_threads(tmp_pa
     assert search.cross_reference_files("*.py", file_query) == []
     with pytest.raises(RuntimeError, match="no file edits found"):
         search.file_history("missing.py", file_query)
-    with pytest.raises(RuntimeError, match="no file edits found"):
+    with pytest.raises(RuntimeError, match="does not accept paging"):
         search.reconstruct_file("missing.py", request=file_query)
     with pytest.raises(RuntimeError, match="no file edits found"):
         search.reconstruct_file_versions("missing.py", request=file_query)

@@ -3815,15 +3815,17 @@ impl<'db> FileService<'db> {
     ///
     /// # Complexity
     ///
-    /// Reconstruction work is proportional to matching versions and their stored edit payloads;
-    /// returned memory is bounded by `query.limit` unless it is explicitly zero. `query.offset`
-    /// skips versions after stable session/version ordering.
+    /// Replay includes out-of-period predecessors so line counts remain correct. Date bounds
+    /// select edits by their own timestamps without renumbering versions. Work and retained edit
+    /// payloads are proportional to the scoped history, plus one reconstructed content buffer;
+    /// `query.offset` and `query.limit` page the eligible versions after causal ordering.
     pub fn history(&self, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
         self.db.ensure_refreshed_for_read()?;
         crate::files::history(self.db, file, query)
     }
 
-    /// Replay edits through one requested version.
+    /// Replay edits through one requested version, or the last version in the date scope.
+    /// Paging fields are rejected; a requested version outside the date scope is an error.
     ///
     /// # Complexity
     ///
@@ -3839,7 +3841,8 @@ impl<'db> FileService<'db> {
         crate::files::reconstruct_query(self.db, file, query, version)
     }
 
-    /// Lazily reconstruct every causally ordered version with a complete replay path.
+    /// Replay all causal predecessors, yielding only reconstructable versions in the date scope.
+    /// Offset and limit apply to eligible yielded versions, preserving original version numbers.
     pub fn reconstruct_versions(
         &self,
         file: &str,
