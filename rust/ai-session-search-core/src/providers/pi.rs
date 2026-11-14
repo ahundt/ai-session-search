@@ -291,6 +291,32 @@ impl PiAdapter {
                     } else if role == Some("toolResult") {
                         // Pi's persisted ToolResultMessage has an explicit `isError` boolean.
                         // Missing/non-boolean flags are unknown, so they cannot prove a mutation.
+                        if self.provider == Provider::PrimeAgent
+                            && message.get("toolName").and_then(Value::as_str) == Some("ipython")
+                        {
+                            let payloads = message
+                                .pointer("/details/diffs")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|diff| {
+                                    Some((
+                                        diff.get("path")?.as_str()?.to_owned(),
+                                        None,
+                                        vec![EditOp::new(
+                                            diff.get("oldStr")?.as_str()?,
+                                            diff.get("newStr")?.as_str()?,
+                                        )],
+                                    ))
+                                })
+                                .collect();
+                            pending_file_mutations.stage_many(
+                                message.get("toolCallId").and_then(Value::as_str),
+                                timestamp,
+                                "ipython",
+                                payloads,
+                            );
+                        }
                         pending_file_mutations.finish(
                             message.get("toolCallId").and_then(Value::as_str),
                             message.get("isError").and_then(Value::as_bool) == Some(false),
@@ -1172,6 +1198,65 @@ mod tests {
                 format!("{parent_id}/agent01/run-0/session"),
                 format!("{parent_id}/agent02/run-0/session"),
             ]
+        );
+    }
+
+    #[test]
+    fn prime_ipython_diffs_replay_successful_results_only() {
+        use serde_json::json;
+        let mut rows = vec![
+            json!({"type":"session","id":"diff-session"}),
+            json!({"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"base","name":"write","arguments":{"path":"src/a.txt","content":"alpha β"}}]}}),
+            json!({"type":"message","message":{"role":"toolResult","toolName":"write","toolCallId":"base","isError":false}}),
+        ];
+        for (id, success, tool) in [
+            ("ok", Some(false), "ipython"),
+            ("failed", Some(true), "ipython"),
+            ("unknown", None, "ipython"),
+            ("other", Some(false), "bash"),
+        ] {
+            rows.push(json!({"type":"message","message":{"role":"toolResult","toolName":tool,"toolCallId":id,"isError":success,"details":{"diffs":[
+                {"path":"src/a.txt","oldStr":"alpha","newStr":"gamma","startLine":1},
+                {"path":"src/a.txt","oldStr":"β","newStr":"δ","startLine":1},
+                {"path":"src/b.txt","oldStr":"old","newStr":"new","startLine":4},
+                {"path":"src/invalid.txt","oldStr":4,"newStr":"ignored"}
+            ]}}}));
+        }
+        let text = rows
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = PiAdapter::prime_agent(vec![])
+            .parse_reader(
+                std::io::Cursor::new(text),
+                std::path::Path::new("/synthetic/diffs.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(parsed.file_edits.len(), 4);
+        assert_eq!(
+            parsed.file_edits.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        let dir = tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+        let mut old = parsed.clone();
+        old.session.parse_version = "prime-agent-v3".into();
+        old.file_edits.truncate(1);
+        db.upsert_session(&old, 1, 1).unwrap();
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        assert_eq!(db.file_edit_count().unwrap(), 4);
+        let edits = db
+            .file_edits_for_session_id("src/a.txt", &parsed.session.id)
+            .unwrap();
+        assert_eq!(edits.len(), 3);
+        let edits = edits
+            .into_iter()
+            .map(|(_, _, edit)| edit)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crate::files::reconstruct(&edits, 3).as_deref(),
+            Some("gamma δ")
         );
     }
 
