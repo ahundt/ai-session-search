@@ -377,10 +377,33 @@ impl DiscoveryResult {
             .iter()
             .map(source_identity)
             .collect::<HashSet<_>>();
+        // Native keys distinguish file names even when their display strings are identical.
+        // Stored keys remain compatible with existing indexes until a lossless-key migration.
+        let mut stored_keys = self
+            .sources
+            .iter()
+            .map(|source| (source.provider, normalize_path(&source.path)))
+            .collect::<HashSet<_>>();
         for source in discovered.sources {
-            if seen.insert(source_identity(&source)) {
-                self.sources.push(source);
+            let identity = source_identity(&source);
+            if !seen.insert(identity) {
+                continue;
             }
+            let stored_key = (source.provider, normalize_path(&source.path));
+            if !stored_keys.insert(stored_key) {
+                let verification_command = "aise doctor --format json".to_string();
+                self.warnings.push(ProviderDiscoveryWarning {
+                    provider,
+                    path: normalize_path(source.path.parent().unwrap_or_else(|| std::path::Path::new("."))),
+                    operation: "source-key".to_string(),
+                    message: "A distinct file name cannot be represented uniquely by the stored source key; this source was not indexed.".to_string(),
+                    readable_sources_preserved: !self.sources.is_empty(),
+                    guidance: format!("Rename the files in this directory to distinct UTF-8 names, then run `{verification_command}` and refresh the index."),
+                    verification_command,
+                });
+                continue;
+            }
+            self.sources.push(source);
         }
     }
 }
@@ -419,9 +442,9 @@ fn discovery_warning_guidance(preserved: bool, verification_command: &str) -> St
     format!("{preservation} Run `{verification_command}` to verify discovery status.")
 }
 
-fn source_identity(source: &SourceFile) -> (Provider, String) {
+fn source_identity(source: &SourceFile) -> (Provider, std::path::PathBuf) {
     let path = std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
-    (source.provider, normalize_path(&path))
+    (source.provider, path)
 }
 
 fn deduplicate_warnings(warnings: &mut Vec<ProviderDiscoveryWarning>) {
@@ -867,6 +890,136 @@ mod tests {
                 && warning.verification_command == "aise doctor --format json"
                 && warning.guidance.contains("preserved for indexing")
         }));
+    }
+
+    fn non_unicode_name(second: bool) -> std::ffi::OsString {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            std::ffi::OsString::from_vec(vec![b'x', if second { 0x81 } else { 0x80 }])
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            std::ffi::OsString::from_wide(&[b'x' as u16, if second { 0xd801 } else { 0xd800 }])
+        }
+    }
+
+    #[test]
+    fn native_discovery_identity_distinguishes_lossy_names() {
+        let source = |second| SourceFile {
+            provider: Provider::Claude,
+            path: std::path::PathBuf::from(non_unicode_name(second)),
+            sidecar: None,
+            mtime_ns: 0,
+            size_bytes: 0,
+        };
+        assert_eq!(
+            normalize_path(&source(false).path),
+            normalize_path(&source(true).path)
+        );
+        assert_ne!(
+            source_identity(&source(false)),
+            source_identity(&source(true))
+        );
+    }
+
+    #[test]
+    fn colliding_stored_source_keys_emit_an_actionable_directory_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = [false, true].map(|second| SourceFile {
+            provider: Provider::Claude,
+            path: dir.path().join(non_unicode_name(second)),
+            sidecar: None,
+            mtime_ns: 0,
+            size_bytes: 0,
+        });
+        let mut result = DiscoveryResult::default();
+        result.extend_provider(
+            Provider::Claude,
+            ProviderDiscovery {
+                sources: sources.to_vec(),
+                warnings: vec![],
+            },
+        );
+        assert_eq!(result.sources.len(), 1);
+        assert_eq!(result.sources[0].path, sources[0].path);
+        assert_eq!(result.warnings.len(), 1);
+        let warning = &result.warnings[0];
+        assert_eq!(warning.path, normalize_path(dir.path()));
+        assert_eq!(warning.operation, "source-key");
+        assert!(warning.message.contains("file name cannot be represented"));
+        assert!(warning.message.contains("not indexed"));
+        assert!(!warning.message.contains('\u{fffd}'));
+        assert!(warning.guidance.contains("Rename"));
+        assert_eq!(warning.verification_command, "aise doctor --format json");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_reports_distinct_non_utf8_names_with_colliding_stored_keys() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        for byte in [0x80, 0x81] {
+            let name =
+                std::ffi::OsString::from_vec(vec![b'x', byte, b'.', b'j', b's', b'o', b'n', b'l']);
+            std::fs::write(dir.path().join(name), "{}\n").unwrap();
+        }
+        let mut config = Config::default();
+        disable_all(&mut config);
+        config.providers.claude.enabled = true;
+        config.providers.claude.paths = vec![dir.path().display().to_string()];
+        let discovered = ProviderSet::new(&config).discover_enabled(&config);
+        assert_eq!(
+            discovered.sources.len(),
+            1,
+            "only one colliding stored key is safe to index"
+        );
+        assert_eq!(
+            discovered.warnings.len(),
+            1,
+            "the other source must not disappear silently"
+        );
+        let warning = &discovered.warnings[0];
+        assert_eq!(warning.path, normalize_path(dir.path()));
+        assert!(warning.message.contains("file name cannot be represented"));
+        assert!(warning.message.contains("not indexed"));
+        assert!(!warning.message.contains('\u{fffd}'));
+        assert_eq!(
+            inventory(&config)
+                .iter()
+                .find(|p| p.provider == Provider::Claude)
+                .unwrap()
+                .warnings
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn utf8_source_storage_keys_remain_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordinary.jsonl");
+        std::fs::write(&path, "{}").unwrap();
+        let source = SourceFile {
+            provider: Provider::Claude,
+            path: path.clone(),
+            sidecar: None,
+            mtime_ns: 0,
+            size_bytes: 2,
+        };
+        let mut result = DiscoveryResult::default();
+        result.extend_provider(
+            Provider::Claude,
+            ProviderDiscovery {
+                sources: vec![source],
+                warnings: vec![],
+            },
+        );
+        assert_eq!(
+            normalize_path(&result.sources[0].path).as_bytes(),
+            normalize_path(&path).as_bytes()
+        );
     }
 
     #[test]
