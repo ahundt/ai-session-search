@@ -6780,7 +6780,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains(plugin.to_str().unwrap()) && error.contains("unrecorded or modified"),
+            error
+                .replace('\\', "/")
+                .contains(&plugin.to_string_lossy().replace('\\', "/"))
+                && error.contains("unrecorded or modified"),
             "{error}"
         );
         assert_eq!(fs::read_to_string(&target.path).unwrap(), before);
