@@ -1358,7 +1358,9 @@ mod tests {
         let mut parent = std::io::BufWriter::new(fs::File::create(&parent_path).unwrap());
         let prefix = format!("{}\n{copied}\n", json!({"type":"session","id":"parent"}));
         parent.write_all(prefix.as_bytes()).unwrap();
-        let target = 50 * 1024 * 1024;
+        // The property is the number of parent reads, which does not depend on parent size;
+        // 2 MiB keeps the fixture small on slow or disk-constrained CI machines.
+        let target = 2 * 1024 * 1024;
         let mut remaining = target - prefix.len();
         let mut index = 0;
         while remaining > 0 {
@@ -1381,7 +1383,6 @@ mod tests {
         )
         .unwrap();
         super::PI_PARENT_READS.with(|reads| reads.set((0, 0)));
-        let start = std::time::Instant::now();
         for index in 0..10 {
             let checkpoint = fs::metadata(&child_path).unwrap().len() as i64;
             let mut child = fs::OpenOptions::new()
@@ -1409,13 +1410,11 @@ mod tests {
             );
         }
         let measured = super::PI_PARENT_READS.with(|reads| reads.get());
-        eprintln!(
-            "50 MiB parent, 10 appends: reads={}, bytes={}, elapsed={:?}",
-            measured.0,
-            measured.1,
-            start.elapsed()
+        assert_eq!(
+            measured,
+            (1, target as u64),
+            "ten appends to a fork must read its unchanged parent once (reads, bytes)"
         );
-        assert_eq!(measured, (1, target as u64));
     }
 
     #[test]
