@@ -5259,8 +5259,8 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     }
 
     if let Some(seq) = message_seq {
-        let session = db
-            .resolve_session_record(session_id)
+        let session = CatalogService::new(db)
+            .resolve_session(session_id)
             .map_err(|e| format!("{e:#}"))?;
         let context = mcp_nonnegative_i64_arg(args, "context", 0)?;
         let presentation = MessagePresentation::from_args(args, config)?;
@@ -5278,8 +5278,8 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
 
     if has_range {
         reject_present(args, "context", "context only applies with seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]")?;
-        let session = db
-            .resolve_session_record(session_id)
+        let session = CatalogService::new(db)
+            .resolve_session(session_id)
             .map_err(|e| format!("{e:#}"))?;
         let presentation = MessagePresentation::from_args(args, config)?;
         let (since, until) = parse_date_bounds(args, chrono::Utc::now())?;
