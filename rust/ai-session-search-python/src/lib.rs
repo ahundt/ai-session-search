@@ -4609,6 +4609,28 @@ impl From<CompactOutcome> for NativeCompactOutcome {
     }
 }
 
+/// Table descriptions or column notes returned by the shared SQL schema service.
+#[pyclass(name = "SqlSchemaResult", module = "ai_session_search._native", frozen)]
+struct NativeSqlSchemaResult {
+    inner: ai_session_search::sql_query::QueryResult,
+}
+
+python_value! { NativeSqlSchemaResult, slf => json_compatible(slf.py(), &slf.borrow().inner);
+    #[getter]
+    fn columns(&self) -> Vec<String> { self.inner.columns.clone() }
+
+    #[getter]
+    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        json_compatible(py, &self.inner.rows)
+    }
+
+    #[getter]
+    fn truncated(&self) -> bool { self.inner.truncated }
+
+    #[getter]
+    fn truncated_cell_char_limit(&self) -> Option<usize> { self.inner.truncated_cell_char_limit }
+}
+
 /// Rust-backed search, recovery, export, and analysis service.
 ///
 /// Opening loads configuration and the database, not transcripts. Call refresh() or
@@ -4932,6 +4954,25 @@ impl SessionSearch {
             ai_session_search::sql_query::query_result_payload(&result, query.offset, 0).value;
         payload["truncated_cell_char_limit"] = serde_json::json!(result.truncated_cell_char_limit);
         json_compatible(py, &payload)
+    }
+
+    /// List schema objects or one table's columns and semantic notes through SqlService.
+    /// Schema inspection exposes no session data and is allowed under every access scope.
+    #[pyo3(signature = (*, table=None, include_internal=false))]
+    fn schema(
+        &self,
+        py: Python<'_>,
+        table: Option<String>,
+        include_internal: bool,
+    ) -> PyResult<NativeSqlSchemaResult> {
+        let mut query = ai_session_search::SqlSchemaQuery::default();
+        query.table = table;
+        query.include_internal = include_internal;
+        let result = py.detach(|| {
+            let app = self.app()?;
+            app.sql().schema(&query).map_err(service_error)
+        })?;
+        Ok(NativeSqlSchemaResult { inner: result })
     }
 
     /// Return the native resume argv and cwd without executing a command.
@@ -5737,6 +5778,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativePlanningCount>()?;
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
+    module.add_class::<NativeSqlSchemaResult>()?;
     module.add_class::<NativeAnalysisRequest>()?;
     module.add_class::<QueryExclusions>()?;
     module.add_class::<DateRange>()?;

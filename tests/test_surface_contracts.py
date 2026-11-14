@@ -63,6 +63,21 @@ def test_read_event_dates_and_warning_scopes(tmp_path: Path) -> None:
         assert [(payload["session_id"], row["seq"]) for row in payload["messages"]] == expected
 
 
+def test_python_schema_returns_semantic_notes(tmp_path: Path) -> None:
+    with aise.SessionSearch(tmp_path / "index.db") as search:
+        result = search.schema(table="messages")
+        assert isinstance(result, aise.SqlSchemaResult)
+        payload = result.to_dict()
+        assert payload["columns"] == result.columns
+        assert payload["rows"] == result.rows
+        assert payload["truncated"] is False
+        assert payload["truncated_cell_char_limit"] is None
+        notes = {row["name"]: row["note"] for row in result.rows}
+        assert "underscores" in notes["kind"]
+        assert "Provider spelling" in notes["tool_name"]
+        assert search.schema().rows
+
+
 def test_result_dictionaries_preserve_shared_serialization(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     with aise.SessionSearch(database) as search:
